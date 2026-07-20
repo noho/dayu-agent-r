@@ -26,6 +26,7 @@ from dayu.host import (
     HostApiErrorCode,
     HostClosedError,
     OperationContext,
+    OpenHostAdminOptions,
     OpenHostOptions,
     OrdinaryRunExecutionBaseline,
     report_storage_usage,
@@ -60,7 +61,7 @@ from dayu.host.durable.storage_lifecycle import (
 )
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
-from dayu.host.open_host import open_host
+from dayu.host.open_host import open_host_admin
 
 _SQLITE_PAYLOAD_BYTES = b"sqlite-payload"
 _ORPHAN_SQLITE_PAYLOAD_BYTES = b"orphan-payload"
@@ -224,6 +225,8 @@ def _open_host_options(tmp_path: Path) -> OpenHostOptions:
                 continuation_max_attempts=0,
                 allow_tool_calls=False,
                 tool_execution_timeout_seconds=1.0,
+                fallback_prompt="test fallback prompt",
+                continuation_prompt="test continuation prompt",
             ),
         ),
         worker_factory=_NoopWorkerFactory(),
@@ -233,6 +236,34 @@ def _open_host_options(tmp_path: Path) -> OpenHostOptions:
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+    )
+
+
+def _open_host_admin_options(tmp_path: Path) -> OpenHostAdminOptions:
+    """从测试 execution options 投影同源 admin durable options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: HostAdmin opener options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    options = _open_host_options(tmp_path)
+    return OpenHostAdminOptions(
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
     )
 
 
@@ -478,10 +509,10 @@ def test_report_storage_usage_wraps_file_stat_os_error(
 
 @pytest.mark.asyncio
 async def test_open_host_async_handle_reports_storage_usage(tmp_path: Path) -> None:
-    """open_host async handle 暴露 storage usage report 读取入口。"""
+    """HostAdmin async handle 暴露 storage usage report 读取入口。"""
 
-    async with open_host(_open_host_options(tmp_path)) as host:
-        report = await host.report_storage_usage()
+    async with open_host_admin(_open_host_admin_options(tmp_path)) as host_admin:
+        report = await host_admin.report_storage_usage()
 
     assert isinstance(report, HostStorageUsageReport)
     assert report.event_log_rows == 0
@@ -493,12 +524,12 @@ async def test_open_host_report_storage_usage_fails_after_close(
 ) -> None:
     """public handle 关闭后读取 report 使用当前 closed handle 错误语义。"""
 
-    manager = open_host(_open_host_options(tmp_path))
-    host = await manager.__aenter__()
-    await host.close()
+    manager = open_host_admin(_open_host_admin_options(tmp_path))
+    host_admin = await manager.__aenter__()
+    await host_admin.close()
 
     with pytest.raises(HostClosedError):
-        await host.report_storage_usage()
+        await host_admin.report_storage_usage()
 
 
 def test_storage_usage_json_value_is_stable_self_explaining_and_non_negative(

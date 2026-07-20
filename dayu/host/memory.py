@@ -7,22 +7,25 @@ projection，不是事实真源，也不导入 Engine / Service / UI / Fins。
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.compact_payload import ContextCompactedSemanticPayload
+from dayu.host.compaction import (
+    ConversationCompactOutputVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityReasonVNext,
+)
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.evidence import (
-    accepted_evidence_envelope_from_payload,
-    accepted_tool_raw_outcome_text_from_payload,
-)
-from dayu.host.terminal_payload import (
-    PayloadTextReadPolicy,
-    assistant_final_answer_text_from_run_payload,
+    AcceptedToolEvidenceLLMMaterial,
+    render_accepted_tool_evidence_for_llm,
 )
 
 MemoryPolicyDigest: TypeAlias = str
@@ -75,32 +78,8 @@ _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_CONTENT = "content"
-_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
-_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
-_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
-_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
 _USER_INPUT_TEXT_UNAVAILABLE = "用户输入文本不可用。"
-_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
-_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
-_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
-_PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
-_PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
-_PAYLOAD_FIELD_ORDINAL = "ordinal"
-_PAYLOAD_FIELD_ANSWER_SOURCE_LABELS = "answer_source_labels"
-_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
-_PAYLOAD_FIELD_INTENT_TYPE = "intent_type"
-_PAYLOAD_FIELD_STATUS = "status"
-_PAYLOAD_FIELD_TEXT = "text"
-_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
-_PAYLOAD_FIELD_REASON = "reason"
-_PAYLOAD_FIELD_DIAGNOSTICS = "diagnostics"
 _PAYLOAD_FIELD_MESSAGE = "message"
-_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
-_PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
-ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT = "查询语义不可用；参数未安全展开。"
-"""Accepted tool evidence 缺少 LLM-safe request / query 语义时的文本。"""
 
 _MemoryItemT = TypeVar("_MemoryItemT", bound="_MemoryItemWithId")
 
@@ -178,9 +157,6 @@ class MemoryEvidenceBackedFactKind(StrEnum):
 class MemoryDiagnosticReason(StrEnum):
     """Memory diagnostic 的结构化原因。"""
 
-    EVIDENCE_BACKED_FACT_CANDIDATE_INVALID = (
-        "evidence_backed_fact_candidate_invalid"
-    )
     ACCEPTED_EVIDENCE_WITHOUT_FACT_CANDIDATE = (
         "accepted_evidence_without_fact_candidate"
     )
@@ -431,7 +407,7 @@ class ReferenceContinuityItem:
 
     item_id: str
     text: str
-    reason: str
+    reason: ReferenceContinuityReasonVNext
     source_refs: tuple[str, ...]
     event_id: str
     event_sequence: int
@@ -446,7 +422,8 @@ class ReferenceContinuityItem:
 
         _require_non_empty(self.item_id, "item_id")
         _require_non_empty(self.text, "text")
-        _require_non_empty(self.reason, "reason")
+        if not isinstance(self.reason, ReferenceContinuityReasonVNext):
+            raise ValueError("reason must be ReferenceContinuityReasonVNext")
         _require_non_empty_items(self.source_refs, "source_refs")
         _require_non_empty(self.event_id, "event_id")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -620,9 +597,9 @@ class ForwardIntent:
     """
 
     item_id: str
-    intent_type: str
+    intent_type: ForwardIntentTypeVNext
     text: str
-    status: str
+    status: ForwardIntentStatusVNext
     source_refs: tuple[str, ...]
     event_id: str
     event_sequence: int
@@ -636,9 +613,11 @@ class ForwardIntent:
         """
 
         _require_non_empty(self.item_id, "item_id")
-        _require_non_empty(self.intent_type, "intent_type")
+        if not isinstance(self.intent_type, ForwardIntentTypeVNext):
+            raise ValueError("intent_type must be ForwardIntentTypeVNext")
         _require_non_empty(self.text, "text")
-        _require_non_empty(self.status, "status")
+        if not isinstance(self.status, ForwardIntentStatusVNext):
+            raise ValueError("status must be ForwardIntentStatusVNext")
         _require_non_empty_items(self.source_refs, "source_refs")
         _require_non_empty(self.event_id, "event_id")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -968,7 +947,10 @@ class MemoryProjectionEvent:
     :param payload_ref: 可选 payload ref。
     :param payload_digest: 可选 payload digest。
     :param payload: 已解析 canonical payload。
-    :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
+    :param compacted_semantics: compact event 在持久化边界严格解析的 typed semantics。
+    :param accepted_tool_evidence: accepted tool result 的 LLM-facing typed material。
+    :param assistant_final_answer_text: 可选 LLM-facing assistant answer continuity
+        文本。它是 projection-internal typed material，不是 EventLog payload 字段。
     """
 
     event_sequence: int
@@ -983,7 +965,9 @@ class MemoryProjectionEvent:
     payload_ref: str | None
     payload_digest: str | None
     payload: Mapping[str, JsonValue]
-    evidence_query_text: str | None = None
+    compacted_semantics: ContextCompactedSemanticPayload | None = None
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None
+    assistant_final_answer_text: str | None = None
 
     def __post_init__(self) -> None:
         """校验 projection event。
@@ -1006,7 +990,25 @@ class MemoryProjectionEvent:
         _require_optional_non_empty(self.payload_digest, "payload_digest")
         if (self.payload_ref is None) != (self.payload_digest is None):
             raise ValueError("payload_ref and payload_digest must be paired")
-        _require_optional_non_empty(self.evidence_query_text, "evidence_query_text")
+        if self.event_type == _EVENT_TYPE_CONTEXT_COMPACTED:
+            if self.compacted_semantics is None:
+                raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
+        elif self.compacted_semantics is not None:
+            raise ValueError("non-compact event must not carry compacted_semantics")
+        if (
+            self.accepted_tool_evidence is not None
+            and not isinstance(
+                self.accepted_tool_evidence,
+                AcceptedToolEvidenceLLMMaterial,
+            )
+        ):
+            raise ValueError(
+                "accepted_tool_evidence must be AcceptedToolEvidenceLLMMaterial"
+            )
+        _require_optional_non_empty(
+            self.assistant_final_answer_text,
+            "assistant_final_answer_text",
+        )
 
 
 def default_memory_projection_policy(
@@ -1257,23 +1259,37 @@ def project_conversation_memory_event(
         selected = _replace_item_by_id(selected, evidence_item)
         recent_evidence = _replace_item_by_id(recent_evidence, evidence_item)
     elif event.event_type == _EVENT_TYPE_CONTEXT_COMPACTED:
-        accepted = _accepted_candidate_mapping(event.payload)
+        compacted_semantics = event.compacted_semantics
+        if compacted_semantics is None:
+            raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
+        accepted_candidate = compacted_semantics.accepted_candidate
         latest_compaction_event_ref = event.event_id
         session_summary, summary_diagnostics = _session_summary_from_accepted_event(
             event,
+            accepted_candidate,
             policy,
+            previous_summary=session_summary,
         )
         diagnostics = diagnostics + summary_diagnostics
-        new_facts, fact_diagnostics = _facts_from_accepted_event(event, policy)
+        new_facts, fact_diagnostics = _facts_from_accepted_event(
+            event,
+            compacted_semantics,
+            policy,
+        )
         diagnostics = diagnostics + fact_diagnostics
         facts = _merge_facts(facts, new_facts)
-        anchors = _merge_by_id(anchors, _answer_anchors_from_accepted_event(event))
-        intents = _merge_by_id(intents, _forward_intents_from_accepted_event(event))
+        anchors = _merge_by_id(
+            anchors,
+            _answer_anchors_from_accepted_event(event, accepted_candidate),
+        )
+        intents = _merge_by_id(
+            intents,
+            _forward_intents_from_accepted_event(event, accepted_candidate),
+        )
         reference_items = _merge_by_id(
             reference_items,
-            _reference_continuity_from_accepted_event(event),
+            _reference_continuity_from_accepted_event(event, accepted_candidate),
         )
-        del accepted
     else:
         diagnostics = diagnostics + (
             _unsupported_event_type_diagnostic(event, policy_digest=policy_digest),
@@ -1637,10 +1653,7 @@ def _selected_assistant_item(
     :returns: selected item；缺失 final answer continuity 时返回 ``None``。
     """
 
-    text = assistant_final_answer_text_from_run_payload(
-        event.payload,
-        text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
-    )
+    text = event.assistant_final_answer_text
     if text is None:
         return None
     return SelectedRecentWindowItem(
@@ -1683,89 +1696,39 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
     """读取 LLM-facing recent evidence 文本。
 
     :param event: ``TOOL_RESULT_ACCEPTED`` projection event。
-    :returns: 工具结果的业务可读文本或无内部引用的 limited-signal 文本。
-    :raises ValueError: accepted evidence envelope 或旧 result preview 非法时抛出。
+    :returns: 工具结果的业务可读文本。
+    :raises HostDurableError: canonical accepted result 缺 typed material 时抛出。
     """
 
-    envelope = accepted_evidence_envelope_from_payload(
-        event.payload,
-        producer_event_ref=event.event_id,
-    )
-    if envelope is not None:
-        raw_text = accepted_tool_raw_outcome_text_from_payload(event.payload)
-        if raw_text is not None:
-            return _accepted_evidence_readable_text(
-                tool_name=envelope.tool_name,
-                query_text=(
-                    event.evidence_query_text
-                    if event.evidence_query_text is not None
-                    else ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-                ),
-                response_text=raw_text,
-            )
-        raise ValueError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
-    return "工具结果已接受；原始工具响应不可用。"
-
-
-def _accepted_evidence_readable_text(
-    *, tool_name: str, query_text: str, response_text: str
-) -> str:
-    """构造自解释的 LLM-facing accepted evidence 文本。
-
-    :param tool_name: 工具名。
-    :param query_text: LLM-safe request / query 文本。
-    :param response_text: 工具结果响应文本。
-    :returns: 自解释工具证据文本。
-    :raises ValueError: 任一文本为空时抛出。
-    """
-
-    _require_non_empty(tool_name, "tool_name")
-    _require_non_empty(query_text, "query_text")
-    _require_non_empty(response_text, "response_text")
-    return "\n".join(
-        (
-            f"工具：{tool_name}",
-            f"查询：{query_text}",
-            f"结果：{response_text}",
+    material = event.accepted_tool_evidence
+    if material is None:
+        raise HostDurableError(
+            "TOOL_RESULT_ACCEPTED memory LLM material is missing"
         )
-    )
-
-
-def _accepted_candidate_mapping(
-    payload: Mapping[str, JsonValue],
-) -> Mapping[str, JsonValue]:
-    """读取 accepted vNext compact candidate。
-
-    :param payload: CONTEXT_COMPACTED payload。
-    :returns: accepted candidate mapping。
-    :raises ValueError: payload 不是 vNext accepted candidate 时抛出。
-    """
-
-    candidate = _required_payload_mapping(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
-    if (
-        _required_str(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
-        != "conversation_compact_output_v1"
-    ):
-        raise ValueError("accepted candidate schema_version is invalid")
-    return candidate
+    return render_accepted_tool_evidence_for_llm(material)
 
 
 def _session_summary_from_accepted_event(
-    event: MemoryProjectionEvent, policy: MemoryProjectionPolicy
+    event: MemoryProjectionEvent,
+    candidate: ConversationCompactOutputVNext,
+    policy: MemoryProjectionPolicy,
+    *,
+    previous_summary: SessionSummaryMemoryView,
 ) -> tuple[SessionSummaryMemoryView, tuple[MemoryDiagnostic, ...]]:
     """从 accepted compact event 物化 Session Summary Memory。
 
     :param event: CONTEXT_COMPACTED event。
+    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
     :param policy: memory policy。
+    :param previous_summary: compact owner 未提供 replacement 时保留的既有 summary。
     :returns: session summary view 与 diagnostics。
+    :raises ValueError: candidate 与 memory contract 不一致时抛出。
     """
 
-    candidate = _accepted_candidate_mapping(event.payload)
-    value = _required_value(candidate, _PAYLOAD_FIELD_SESSION_SUMMARY)
-    if value is None:
-        return _empty_session_summary_memory(), ()
-    summary = _as_mapping(value, _PAYLOAD_FIELD_SESSION_SUMMARY)
-    text = _required_str(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
+    summary = candidate.session_summary
+    if summary is None:
+        return previous_summary, ()
+    text = summary.summary_text
     if len(text) > policy.session_summary_char_cap:
         item_id = _item_id(event, "session_summary")
         return _empty_session_summary_memory(), (
@@ -1778,7 +1741,7 @@ def _session_summary_from_accepted_event(
         )
     return SessionSummaryMemoryView(
         summary_text=text,
-        source_refs=_required_text_tuple(summary, _PAYLOAD_FIELD_SOURCE_LABELS),
+        source_refs=summary.source_labels,
         event_id=event.event_id,
         event_sequence=event.event_sequence,
         size_units=estimate_memory_size_units(text),
@@ -1787,21 +1750,21 @@ def _session_summary_from_accepted_event(
 
 def _facts_from_accepted_event(
     event: MemoryProjectionEvent,
+    compacted_semantics: ContextCompactedSemanticPayload,
     policy: MemoryProjectionPolicy,
 ) -> tuple[tuple[EvidenceBackedFactView, ...], tuple[MemoryDiagnostic, ...]]:
     """从 accepted compact event 物化 evidence-backed facts。
 
     :param event: CONTEXT_COMPACTED event。
+    :param compacted_semantics: persisted semantic owner 产生的 typed view。
     :param policy: memory policy。
     :returns: facts 与 diagnostics。
+    :raises ValueError: typed semantics 与 memory contract 不一致时抛出。
     """
 
-    candidate = _accepted_candidate_mapping(event.payload)
-    evidence_refs = _required_text_tuple(
-        event.payload,
-        _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
-    )
-    fact_values = _required_mapping_list(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
+    candidate = compacted_semantics.accepted_candidate
+    evidence_refs = compacted_semantics.accepted_evidence_mapping_refs
+    fact_values = candidate.evidence_backed_facts
     if len(evidence_refs) > 0 and len(fact_values) == 0:
         return (
             (),
@@ -1838,15 +1801,12 @@ def _facts_from_accepted_event(
         digest_ref=event.payload_digest or sha256_digest_json(event.payload),
         source_refs=(),
     )
-    compact_artifact_ref = _optional_payload_str(
-        event.payload,
-        _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF,
-    )
+    compact_artifact_ref = compacted_semantics.compact_artifact_ref
     facts: list[EvidenceBackedFactView] = []
     diagnostics: list[MemoryDiagnostic] = []
     policy_digest = digest_memory_projection_policy(policy)
     for index, fact in enumerate(fact_values):
-        claim_text = _required_str(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
+        claim_text = fact.claim_text
         item_id = _item_id(event, f"evidence_fact:{index + 1}")
         if len(claim_text) > policy.evidence_fact_char_cap:
             diagnostics.append(
@@ -1855,16 +1815,6 @@ def _facts_from_accepted_event(
                     item_id=item_id,
                     policy_digest=policy_digest,
                     message="evidence fact dropped by memory policy",
-                )
-            )
-            continue
-        labels = _required_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
-        if len(labels) == 0:
-            diagnostics.append(
-                _fact_candidate_invalid_diagnostic(
-                    event,
-                    policy_digest=policy_digest,
-                    message="fact candidate has no evidence label",
                 )
             )
             continue
@@ -1903,37 +1853,34 @@ def _empty_session_summary_memory() -> SessionSummaryMemoryView:
 
 def _answer_anchors_from_accepted_event(
     event: MemoryProjectionEvent,
+    candidate: ConversationCompactOutputVNext,
 ) -> tuple[AnswerAnchor, ...]:
     """从 accepted compact event 物化 answer anchors。
 
     :param event: CONTEXT_COMPACTED event。
+    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
     :returns: answer anchors。
+    :raises ValueError: typed candidate 与 memory contract 不一致时抛出。
     """
 
-    candidate = _accepted_candidate_mapping(event.payload)
     result: list[AnswerAnchor] = []
-    for index, item in enumerate(
-        _required_mapping_list(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
-    ):
+    for index, item in enumerate(candidate.answer_anchors):
         children = tuple(
             AnswerAnchorChild(
-                display_text=_required_str(child, _PAYLOAD_FIELD_DISPLAY_TEXT),
-                ordinal=_optional_int(child, _PAYLOAD_FIELD_ORDINAL),
+                display_text=child.display_text,
+                ordinal=child.ordinal,
             )
-            for child in _required_mapping_list(item, _PAYLOAD_FIELD_ANCHOR_ITEMS)
+            for child in item.anchor_items
         )
         text = "\n".join(
-            ([_required_str(item, _PAYLOAD_FIELD_ANCHOR_TITLE)] + [c.display_text for c in children])
+            ([item.anchor_title] + [child.display_text for child in children])
         )
         result.append(
             AnswerAnchor(
                 item_id=_item_id(event, f"answer_anchor:{index + 1}"),
-                anchor_title=_required_str(item, _PAYLOAD_FIELD_ANCHOR_TITLE),
+                anchor_title=item.anchor_title,
                 anchor_items=children,
-                source_refs=_required_text_tuple(
-                    item,
-                    _PAYLOAD_FIELD_ANSWER_SOURCE_LABELS,
-                ),
+                source_refs=item.answer_source_labels,
                 event_id=event.event_id,
                 event_sequence=event.event_sequence,
                 size_units=estimate_memory_size_units(text),
@@ -1944,26 +1891,26 @@ def _answer_anchors_from_accepted_event(
 
 def _forward_intents_from_accepted_event(
     event: MemoryProjectionEvent,
+    candidate: ConversationCompactOutputVNext,
 ) -> tuple[ForwardIntent, ...]:
     """从 accepted compact event 物化 forward intents。
 
     :param event: CONTEXT_COMPACTED event。
+    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
     :returns: forward intents。
+    :raises ValueError: typed candidate 与 memory contract 不一致时抛出。
     """
 
-    candidate = _accepted_candidate_mapping(event.payload)
     result: list[ForwardIntent] = []
-    for index, item in enumerate(
-        _required_mapping_list(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    ):
-        text = _required_str(item, _PAYLOAD_FIELD_TEXT)
+    for index, item in enumerate(candidate.forward_intents):
+        text = item.text
         result.append(
             ForwardIntent(
                 item_id=_item_id(event, f"forward_intent:{index + 1}"),
-                intent_type=_required_str(item, _PAYLOAD_FIELD_INTENT_TYPE),
+                intent_type=item.intent_type,
                 text=text,
-                status=_required_str(item, _PAYLOAD_FIELD_STATUS),
-                source_refs=_required_text_tuple(item, _PAYLOAD_FIELD_SOURCE_LABELS),
+                status=item.status,
+                source_refs=item.source_labels,
                 event_id=event.event_id,
                 event_sequence=event.event_sequence,
                 size_units=estimate_memory_size_units(text),
@@ -1974,25 +1921,25 @@ def _forward_intents_from_accepted_event(
 
 def _reference_continuity_from_accepted_event(
     event: MemoryProjectionEvent,
+    candidate: ConversationCompactOutputVNext,
 ) -> tuple[ReferenceContinuityItem, ...]:
     """从 accepted compact event 物化 reference continuity items。
 
     :param event: CONTEXT_COMPACTED event。
+    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
     :returns: reference continuity items。
+    :raises ValueError: typed candidate 与 memory contract 不一致时抛出。
     """
 
-    candidate = _accepted_candidate_mapping(event.payload)
     result: list[ReferenceContinuityItem] = []
-    for index, item in enumerate(
-        _required_mapping_list(candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS)
-    ):
-        text = _required_str(item, _PAYLOAD_FIELD_TEXT)
+    for index, item in enumerate(candidate.reference_continuity_items):
+        text = item.text
         result.append(
             ReferenceContinuityItem(
                 item_id=_item_id(event, f"reference_continuity:{index + 1}"),
                 text=text,
-                reason=_required_str(item, _PAYLOAD_FIELD_REASON),
-                source_refs=_required_text_tuple(item, _PAYLOAD_FIELD_SOURCE_LABELS),
+                reason=item.reason,
+                source_refs=item.source_labels,
                 event_id=event.event_id,
                 event_sequence=event.event_sequence,
                 size_units=estimate_memory_size_units(text),
@@ -2622,7 +2569,7 @@ def _reference_item_to_json_value(item: ReferenceContinuityItem) -> JsonValue:
         "event_id": item.event_id,
         "event_sequence": item.event_sequence,
         "item_id": item.item_id,
-        "reason": item.reason,
+        "reason": item.reason.value,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
         "text": item.text,
@@ -2640,7 +2587,7 @@ def _reference_item_from_json_value(value: JsonValue) -> ReferenceContinuityItem
     return ReferenceContinuityItem(
         item_id=_required_str(mapping, "item_id"),
         text=_required_str(mapping, "text"),
-        reason=_required_str(mapping, "reason"),
+        reason=ReferenceContinuityReasonVNext(_required_str(mapping, "reason")),
         source_refs=_required_text_tuple(mapping, "source_refs"),
         event_id=_required_str(mapping, "event_id"),
         event_sequence=_required_int(mapping, "event_sequence"),
@@ -2756,11 +2703,11 @@ def _forward_intent_to_json_value(item: ForwardIntent) -> JsonValue:
     return {
         "event_id": item.event_id,
         "event_sequence": item.event_sequence,
-        "intent_type": item.intent_type,
+        "intent_type": item.intent_type.value,
         "item_id": item.item_id,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
-        "status": item.status,
+        "status": item.status.value,
         "text": item.text,
     }
 
@@ -2775,9 +2722,9 @@ def _forward_intent_from_json_value(value: JsonValue) -> ForwardIntent:
     mapping = _as_mapping(value, "forward_intent")
     return ForwardIntent(
         item_id=_required_str(mapping, "item_id"),
-        intent_type=_required_str(mapping, "intent_type"),
+        intent_type=ForwardIntentTypeVNext(_required_str(mapping, "intent_type")),
         text=_required_str(mapping, "text"),
-        status=_required_str(mapping, "status"),
+        status=ForwardIntentStatusVNext(_required_str(mapping, "status")),
         source_refs=_required_text_tuple(mapping, "source_refs"),
         event_id=_required_str(mapping, "event_id"),
         event_sequence=_required_int(mapping, "event_sequence"),
@@ -2870,36 +2817,6 @@ def _optional_excluded_reason(
 
     value = _optional_str(mapping, field_name)
     return None if value is None else MemoryExcludedReason(value)
-
-
-def _fact_candidate_invalid_diagnostic(
-    event: MemoryProjectionEvent,
-    *,
-    policy_digest: MemoryPolicyDigest,
-    message: str,
-) -> MemoryDiagnostic:
-    """构造 fact candidate invalid diagnostic。
-
-    :param event: compact event。
-    :param policy_digest: policy digest。
-    :param message: diagnostic message。
-    :returns: diagnostic。
-    """
-
-    item_id = _item_id(event, "evidence_fact_candidate_invalid")
-    return MemoryDiagnostic(
-        diagnostic_id=_diagnostic_id(
-            MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID,
-            event_sequence=event.event_sequence,
-            item_id=item_id,
-        ),
-        reason=MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID,
-        message=message,
-        event_sequence=event.event_sequence,
-        item_id=item_id,
-        policy_digest=policy_digest,
-        recorded_at=None,
-    )
 
 
 def _budget_diagnostic(
@@ -3315,7 +3232,6 @@ def _required_mapping_list(
 
 
 __all__ = [
-    "ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT",
     "CONVERSATION_MEMORY_CONSUMER_ID",
     "CONVERSATION_MEMORY_SNAPSHOT_SCHEMA_VERSION",
     "DEFAULT_ANSWER_ANCHOR_CHAR_CAP",

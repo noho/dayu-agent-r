@@ -8,4 +8,14 @@ inputs；Service 不持有 Host durable truth，不实现 Engine 状态机，也
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from dayu.service.host_admin import (
+    ServiceHostAdminRequest,
+    ServiceHostAdminResult,
+    prepare_host_admin,
+)
+
+__all__ = [
+    "ServiceHostAdminRequest",
+    "ServiceHostAdminResult",
+    "prepare_host_admin",
+]

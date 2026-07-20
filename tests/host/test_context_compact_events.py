@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -18,13 +19,16 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
     ReferenceContinuityCandidateVNext,
     ReferenceContinuityReasonVNext,
     SessionSummaryCandidateVNext,
+    CompactCandidateDiagnosticVNext,
+)
+from dayu.host.compact_payload import (
+    parse_context_compacted_semantic_payload,
 )
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_events import (
@@ -39,7 +43,7 @@ from dayu.host.context_events import (
     validate_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.codec import format_utc_timestamp
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import EventClass, EventLogRow
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import (
@@ -131,6 +135,204 @@ def test_compacted_payload_builder_emits_required_accepted_output() -> None:
     assert payload["accepted_attempt_number"] == 2
     assert payload["accepted_candidate_digest"] == _candidate().digest()
     assert payload["budget_after_compact"] == 512
+
+
+def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
+    """persisted semantic parser 保留五类语义、children、ordinal、digest 与 refs。"""
+
+    payload = _valid_compacted_payload()
+
+    semantic = parse_context_compacted_semantic_payload(payload)
+
+    assert semantic.accepted_candidate == _candidate()
+    assert semantic.accepted_candidate_digest == _candidate().digest()
+    assert semantic.accepted_evidence_mapping_refs == ("evidence:accepted-1",)
+    assert semantic.compact_artifact_ref == "compact-artifact:abc"
+    assert semantic.accepted_candidate.answer_anchors[0].anchor_items == (
+        AnswerAnchorChildVNext(display_text="Revenue increased.", ordinal=1),
+        AnswerAnchorChildVNext(display_text="Margin also expanded.", ordinal=2),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("intent_type", "unknown_intent"),
+        ("status", "unknown_status"),
+    ),
+)
+def test_compacted_semantic_parser_rejects_invalid_forward_intent_enum(
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    """persisted parser 对非法 forward intent enum fail closed。
+
+    :param field_name: 被破坏的 enum 字段。
+    :param invalid_value: 非法 enum value。
+    """
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    intents = _mapping_list(candidate["forward_intents"])
+    intents[0][field_name] = invalid_value
+    candidate["forward_intents"] = cast(list[JsonValue], intents)
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_invalid_reference_reason() -> None:
+    """persisted parser 对非法 reference continuity reason fail closed。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    references = _mapping_list(candidate["reference_continuity_items"])
+    references[0]["reason"] = "unknown_reason"
+    candidate["reference_continuity_items"] = cast(list[JsonValue], references)
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> None:
+    """persisted parser 不接受 unsupported evidence_kind 字段。
+
+    :returns: ``None``。
+    :raises AssertionError: persisted parser 接受 unsupported evidence_kind 字段时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    facts = _mapping_list(candidate["evidence_backed_facts"])
+    facts[0]["evidence_kind"] = "accepted_evidence_material"
+    candidate["evidence_backed_facts"] = cast(list[JsonValue], facts)
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError, match="evidence_kind is not supported"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path() -> None:
+    """persisted parser 在 owner boundary 拒绝空 summary source labels。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    summary = _payload_mapping(candidate["session_summary"])
+    summary["source_labels"] = []
+    candidate["session_summary"] = summary
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(
+        ValueError,
+        match=r"accepted_candidate\.session_summary\.source_labels",
+    ):
+        parse_context_compacted_semantic_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("label_field", "expected_path"),
+    (
+        (
+            "evidence_labels",
+            r"accepted_candidate\.evidence_backed_facts\[0\]\.evidence_labels\[1\]",
+        ),
+        (
+            "source_labels",
+            r"accepted_candidate\.evidence_backed_facts\[0\]\.source_labels\[1\]",
+        ),
+    ),
+)
+def test_compacted_semantic_parser_rejects_duplicate_fact_labels_with_indexed_path(
+    label_field: str,
+    expected_path: str,
+) -> None:
+    """persisted parser 拒绝重复 fact labels 并保留 indexed JSON path。
+
+    :param label_field: 被破坏的 fact label 字段。
+    :param expected_path: 预期错误路径 regex。
+    """
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    facts = _mapping_list(candidate["evidence_backed_facts"])
+    facts[0][label_field] = ["E1", "E1"]
+    candidate["evidence_backed_facts"] = cast(list[JsonValue], facts)
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError, match=expected_path):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_duplicate_intent_source_labels_with_indexed_path() -> None:
+    """persisted parser 拒绝重复 intent source labels 并保留 indexed JSON path。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    intents = _mapping_list(candidate["forward_intents"])
+    intents[0]["source_labels"] = ["A1", "A1"]
+    candidate["forward_intents"] = cast(list[JsonValue], intents)
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"accepted_candidate\.forward_intents\[0\]\."
+            r"source_labels\[1\]"
+        ),
+    ):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_wrong_nested_shape() -> None:
+    """persisted parser 拒绝错误 nested list/object shape。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate["answer_anchors"] = "not-a-list"
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError, match="answer_anchors must be list"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_negative_anchor_ordinal() -> None:
+    """persisted parser 拒绝负 anchor child ordinal。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    anchors = _mapping_list(candidate["answer_anchors"])
+    children = _mapping_list(anchors[0]["anchor_items"])
+    children[0]["ordinal"] = -1
+    anchors[0]["anchor_items"] = cast(list[JsonValue], children)
+    candidate["answer_anchors"] = cast(list[JsonValue], anchors)
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError, match="ordinal must be non-negative"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_unknown_old_candidate_field() -> None:
+    """persisted parser 不接受 current schema 之外的旧字段 alias。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate["episode_summary"] = "legacy"
+    _replace_candidate_and_digest(payload, candidate)
+
+    with pytest.raises(ValueError, match="episode_summary is not supported"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_candidate_digest_mismatch() -> None:
+    """persisted parser 不接受 candidate 与 persisted digest 不一致。"""
+
+    payload = _valid_compacted_payload()
+    payload["accepted_candidate_digest"] = _DIGEST_A
+
+    with pytest.raises(ValueError, match="accepted_candidate_digest mismatch"):
+        parse_context_compacted_semantic_payload(payload)
 
 
 def test_compacted_payload_rejects_missing_artifact_digest_pair() -> None:
@@ -885,7 +1087,6 @@ def _candidate() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="Revenue increased.",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
                 source_labels=("E1",),
             ),
         ),
@@ -893,7 +1094,14 @@ def _candidate() -> ConversationCompactOutputVNext:
             AnswerAnchorCandidateVNext(
                 anchor_title="Revenue answer",
                 anchor_items=(
-                    AnswerAnchorChildVNext(display_text="Revenue increased."),
+                    AnswerAnchorChildVNext(
+                        display_text="Revenue increased.",
+                        ordinal=1,
+                    ),
+                    AnswerAnchorChildVNext(
+                        display_text="Margin also expanded.",
+                        ordinal=2,
+                    ),
                 ),
                 answer_source_labels=("A1",),
             ),
@@ -913,7 +1121,13 @@ def _candidate() -> ConversationCompactOutputVNext:
                 source_labels=("A1",),
             ),
         ),
-        diagnostics=(),
+        diagnostics=(
+            CompactCandidateDiagnosticVNext(
+                code="kept",
+                text="Host-only diagnostic text.",
+                source_labels=("E1",),
+            ),
+        ),
     )
 
 
@@ -927,6 +1141,33 @@ def _payload_mapping(value: JsonValue) -> dict[str, JsonValue]:
 
     assert isinstance(value, Mapping)
     return dict(value)
+
+
+def _mapping_list(value: JsonValue) -> list[dict[str, JsonValue]]:
+    """把 JSON object list 复制为可变 list。
+
+    :param value: JSON 值。
+    :returns: 可变 JSON object list。
+    :raises AssertionError: value 不是 object list 时抛出。
+    """
+
+    assert isinstance(value, list)
+    return [_payload_mapping(item) for item in value]
+
+
+def _replace_candidate_and_digest(
+    payload: dict[str, JsonValue],
+    candidate: dict[str, JsonValue],
+) -> None:
+    """替换测试 payload candidate 并同步 digest。
+
+    :param payload: 可变 compacted payload。
+    :param candidate: 被测试的 candidate shape。
+    :returns: ``None``。
+    """
+
+    payload["accepted_candidate"] = candidate
+    payload["accepted_candidate_digest"] = sha256_digest_json(candidate)
 
 
 def _quality_result() -> CompactQualityCheckResultVNext:

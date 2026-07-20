@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.codec import canonical_json_dumps
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictError
 from dayu.host.durable.event_log import (
@@ -31,7 +33,10 @@ from dayu.host.durable.outbox import (
     read_outbox_terminal_items_after,
 )
 from dayu.host.durable.projection import advance_projection_checkpoint
-from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
+)
 from dayu.host.durable.transaction import HostTransactionRunner
 from dayu.host.outbox import (
     OUTBOX_TERMINAL_CONSUMER_ID,
@@ -42,6 +47,15 @@ _FIXED_NOW = datetime(2026, 5, 29, 2, 3, 4, tzinfo=UTC)
 _NOW_TEXT = "2026-05-29T02:03:04.000000Z"
 _DRAINED_AT = "2026-05-29T02:04:05.000000Z"
 _SUMMARY_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_FINAL_ANSWER_JSON = canonical_json_dumps(
+    {
+        "content": "durable final answer",
+        "filtered": False,
+        "degraded": False,
+        "finish_reason": "stop",
+        "terminal_status": "succeeded",
+    }
+)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -142,7 +156,7 @@ def _insert_item(
         run_id=run_id,
         terminal_status="succeeded",
         dedupe_key=event.event_id,
-        final_answer_json=None,
+        final_answer_json=_FINAL_ANSWER_JSON,
         error_message=None,
         cancel_reason=None,
         result_ref=None,
@@ -335,6 +349,50 @@ def test_projection_state_ignores_non_terminal_eventlog_tail(
         assert state.status is OutboxTerminalProjectionStatus.CAUGHT_UP
 
 
+def test_projection_state_ignores_run_lost_eventlog_tail(
+    tmp_path: Path,
+) -> None:
+    """checkpoint 追上 public terminal 后，后续 RUN_LOST 不应报告 outbox lag。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        terminal = _append_event(
+            store.transaction_runner,
+            event_id="event-terminal-public",
+            run_id="run-1",
+            payload={
+                "terminal_summary_ref": "summary-event-terminal-public",
+                "terminal_summary_digest": _SUMMARY_DIGEST,
+            },
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: advance_projection_checkpoint(
+                transaction,
+                OUTBOX_TERMINAL_CONSUMER_ID.value,
+                event_sequence=terminal.event_sequence,
+                event_id=terminal.event_id,
+                now=_NOW_TEXT,
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-run-lost-tail",
+            run_id="run-lost",
+            payload={"reason": "startup_orphan_attempt_lost"},
+            event_type="RUN_LOST",
+        )
+
+        state = store.transaction_runner.run_read(
+            lambda transaction: read_outbox_terminal_projection_state(
+                transaction,
+                OUTBOX_TERMINAL_CONSUMER_ID.value,
+                catchup_error=None,
+            )
+        )
+
+        assert state.checkpoint_event_sequence == terminal.event_sequence
+        assert state.status is OutboxTerminalProjectionStatus.CAUGHT_UP
+
+
 def test_drain_pending_cas_prevents_second_request_metadata_overwrite(
     tmp_path: Path,
 ) -> None:
@@ -414,5 +472,72 @@ def test_drain_request_idempotency_conflict(tmp_path: Path) -> None:
                     limit=1,
                     drain_request_id="drain-request-conflict",
                     drained_at=_DRAINED_AT,
+                )
+            )
+
+
+def test_item_write_rejects_invalid_terminal_final_answer_combinations(
+    tmp_path: Path,
+) -> None:
+    """durable write boundary 强制 succeeded 必填、非成功禁止 final answer。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 条件不变量未在 write boundary 生效时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        valid = _insert_item(
+            store.transaction_runner,
+            event_id="event-terminal-valid-invariant",
+            run_id="run-valid-invariant",
+        )
+        with pytest.raises(HostDurableError, match="requires final_answer_json"):
+            store.transaction_runner.run_write(
+                lambda transaction: insert_outbox_terminal_item_if_absent(
+                    transaction,
+                    replace(valid, final_answer_json=None),
+                )
+            )
+        with pytest.raises(HostDurableError, match="must not carry final_answer_json"):
+            store.transaction_runner.run_write(
+                lambda transaction: insert_outbox_terminal_item_if_absent(
+                    transaction,
+                    replace(valid, terminal_status="failed"),
+                )
+            )
+
+
+def test_durable_read_rejects_raw_succeeded_row_without_final_answer(
+    tmp_path: Path,
+) -> None:
+    """durable read boundary 对 raw DB 损坏的 succeeded NULL fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: raw row 损坏被公开读取时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        valid = _insert_item(
+            store.transaction_runner,
+            event_id="event-terminal-raw-corruption",
+            run_id="run-raw-corruption",
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_OUTBOX_TERMINAL_ITEMS}
+                SET final_answer_json = NULL
+                WHERE terminal_event_id = ?
+                """,
+                (valid.terminal_event_id,),
+            )
+        )
+        with pytest.raises(HostDurableError, match="requires final_answer_json"):
+            store.transaction_runner.run_read(
+                lambda transaction: read_outbox_terminal_item_by_event_id(
+                    transaction,
+                    valid.terminal_event_id,
                 )
             )

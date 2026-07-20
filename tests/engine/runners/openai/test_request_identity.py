@@ -19,9 +19,9 @@ from dayu.engine.contracts.runner_identity import (
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeResponseSpec,
     FakeSession,
 )
@@ -65,7 +65,7 @@ def _runner(
             client_correlation_policy=policy,
             max_retries=max_retries,
         ),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 

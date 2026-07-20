@@ -11,16 +11,16 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogRow
-from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
+from dayu.host.durable.payload import read_payload_descriptor
+from dayu.host.durable.payload_resolution import resolve_json_payload
 from dayu.host.durable.schema import (
-    TABLE_SQLITE_PAYLOADS,
-    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+    PayloadDescriptorKind,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
-    TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
+    parse_payload_descriptor_kind,
 )
 from dayu.host.durable.transaction import HostTransaction
 
@@ -35,9 +35,9 @@ class ToolCallRequestAtoms:
 
     :param tool_call_id: 工具调用 id。
     :param tool_name: 工具名。
-    :param arguments_json: 可安全进入 LLM replay 的参数 JSON 投影。
+    :param arguments_json: Host 已接受的 exact canonical 参数 JSON。
     :param normalized_arguments_digest: 参数 canonical digest。
-    :param arguments_payload_digest: 安全参数 JSON 投影 digest。
+    :param arguments_payload_digest: exact canonical 参数 JSON digest。
     :param semantic_input_digest: Host accept semantic input digest。
     :param semantic_query_text: 可选业务可读 semantic query。
     :param semantic_query_digest: semantic query digest；缺失时为 ``None``。
@@ -48,7 +48,7 @@ class ToolCallRequestAtoms:
     arguments_json: Mapping[str, JsonValue]
     normalized_arguments_digest: str
     arguments_payload_digest: str
-    semantic_input_digest: str | None
+    semantic_input_digest: str
     semantic_query_text: str | None
     semantic_query_digest: str | None
 
@@ -132,6 +132,10 @@ def tool_call_request_atoms(
     tool_name = _required_text(payload, "tool_name")
     normalized_digest = _required_text(payload, "normalized_arguments_digest")
     arguments_payload_digest = _required_text(payload, "arguments_payload_digest")
+    if arguments_payload_digest != normalized_digest:
+        raise HostDurableError(
+            "tool call arguments payload digest must match normalized digest"
+        )
     arguments_json = _read_arguments_json(
         transaction,
         payload,
@@ -149,7 +153,7 @@ def tool_call_request_atoms(
         arguments_json=arguments_json,
         normalized_arguments_digest=normalized_digest,
         arguments_payload_digest=arguments_payload_digest,
-        semantic_input_digest=_optional_text(payload, "semantic_input_digest"),
+        semantic_input_digest=_required_text(payload, "semantic_input_digest"),
         semantic_query_text=semantic_query_text,
         semantic_query_digest=semantic_query_digest,
     )
@@ -162,39 +166,27 @@ def sqlite_payload_object(
     payload_digest: str,
     payload_label: str,
 ) -> Mapping[str, JsonValue]:
-    """按 payload descriptor 读取 SQLite JSON object。
+    """按 payload descriptor 读取完整性已校验的 durable JSON object。
 
     :param transaction: 当前 Host transaction。
     :param payload_ref: payload descriptor ref。
     :param payload_digest: 调用方持有的 payload digest。
     :param payload_label: 错误消息中的 payload 名称。
     :returns: payload JSON object。
-    :raises HostDurableError: descriptor、digest 或 SQLite payload 非法时抛出。
+    :raises HostDurableError: descriptor、caller digest、row、artifact 或 canonical
+        JSON bytes 任一不一致时抛出。
     """
 
-    descriptor = read_payload_descriptor(transaction, payload_ref)
-    if descriptor is None:
-        raise HostDurableError(f"{payload_label} payload descriptor is missing")
-    if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
-        raise HostDurableError(f"{payload_label} payload must be sqlite payload")
-    if descriptor.payload_digest != payload_digest:
-        raise HostDurableError(f"{payload_label} payload digest mismatch")
-    if descriptor.sqlite_payload_id is None:
-        raise HostDurableError(f"{payload_label} sqlite payload id is missing")
-    row = transaction.fetchone(
-        f"""
-        SELECT payload_json
-        FROM {TABLE_SQLITE_PAYLOADS}
-        WHERE payload_id = ?
-        """,
-        (descriptor.sqlite_payload_id,),
-    )
-    if row is None:
-        raise HostDurableError(f"{payload_label} sqlite payload row is missing")
-    payload_json = row.get("payload_json")
-    if not isinstance(payload_json, str):
-        raise HostDurableError(f"{payload_label} sqlite payload JSON is invalid")
-    return _json_object(payload_json, payload_label=payload_label)
+    try:
+        return resolve_json_payload(
+            transaction,
+            payload_ref=payload_ref,
+            expected_digest=payload_digest,
+        ).payload
+    except HostDurableError as exc:
+        raise HostDurableError(
+            f"{payload_label} payload integrity validation failed: {exc}"
+        ) from exc
 
 
 def _json_object(payload_json: str, *, payload_label: str) -> Mapping[str, JsonValue]:
@@ -239,11 +231,15 @@ def _read_arguments_json(
             raise HostDurableError("tool call inline arguments must be object")
         arguments_json = cast(Mapping[str, JsonValue], value)
     elif storage_kind == TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR:
+        if payload.get("arguments_inline_json") is not None:
+            raise HostDurableError(
+                "descriptor tool call arguments must not carry inline JSON"
+            )
         payload_ref = _required_text(payload, "arguments_payload_ref")
         _validate_descriptor_kind(
             transaction,
             payload_ref=payload_ref,
-            expected_kind=TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+            expected_kind=PayloadDescriptorKind.TOOL_CALL_ARGUMENTS_JSON,
             payload_label="tool call arguments",
         )
         arguments_json = sqlite_payload_object(
@@ -254,8 +250,9 @@ def _read_arguments_json(
         )
     else:
         raise HostDurableError("tool call arguments storage kind is invalid")
-    if _FIELD_ARGUMENTS not in arguments_json:
-        raise HostDurableError("tool call arguments JSON missing arguments field")
+    accepted_arguments = arguments_json.get(_FIELD_ARGUMENTS)
+    if not isinstance(accepted_arguments, Mapping):
+        raise HostDurableError("tool call arguments JSON arguments must be object")
     if _payload_size_bytes(arguments_json) != _required_int(
         payload, "arguments_json_size_bytes"
     ):
@@ -290,11 +287,15 @@ def _read_semantic_query(
             raise HostDurableError("inline semantic query must not carry payload ref")
         query_text = _required_text(payload, "semantic_query_text")
     elif storage_kind == TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR:
+        if payload.get("semantic_query_text") is not None:
+            raise HostDurableError(
+                "descriptor semantic query must not carry inline text"
+            )
         payload_ref = _required_text(payload, "semantic_query_payload_ref")
         _validate_descriptor_kind(
             transaction,
             payload_ref=payload_ref,
-            expected_kind=TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
+            expected_kind=PayloadDescriptorKind.TOOL_CALL_SEMANTIC_QUERY_TEXT,
             payload_label="tool call semantic query",
         )
         query_json = sqlite_payload_object(
@@ -315,7 +316,7 @@ def _validate_descriptor_kind(
     transaction: HostTransaction,
     *,
     payload_ref: str,
-    expected_kind: str,
+    expected_kind: PayloadDescriptorKind,
     payload_label: str,
 ) -> None:
     """校验 payload descriptor metadata 中的业务 descriptor kind。
@@ -331,11 +332,16 @@ def _validate_descriptor_kind(
     descriptor = read_payload_descriptor(transaction, payload_ref)
     if descriptor is None:
         raise HostDurableError(f"{payload_label} payload descriptor is missing")
+    expected_descriptor_kind = parse_payload_descriptor_kind(expected_kind)
     metadata = _json_object(
         descriptor.metadata_json,
         payload_label=f"{payload_label} descriptor metadata",
     )
-    if metadata.get(_FIELD_DESCRIPTOR_KIND) != expected_kind:
+    descriptor_kind = metadata.get(_FIELD_DESCRIPTOR_KIND)
+    if not isinstance(descriptor_kind, str) or descriptor_kind.strip() == "":
+        raise HostDurableError(f"{payload_label} descriptor kind is missing")
+    actual_descriptor_kind = parse_payload_descriptor_kind(descriptor_kind)
+    if actual_descriptor_kind is not expected_descriptor_kind:
         raise HostDurableError(f"{payload_label} descriptor kind mismatch")
 
 
@@ -352,23 +358,6 @@ def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
     if isinstance(value, str) and value.strip() != "":
         return value
     raise HostDurableError(f"{field_name} must be non-empty text")
-
-
-def _optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
-    """读取 JSON object 中的可选非空文本字段。
-
-    :param payload: JSON object。
-    :param field_name: 字段名。
-    :returns: 文本值或 ``None``。
-    :raises HostDurableError: 字段存在但不是非空文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if value is None:
-        return None
-    if isinstance(value, str) and value.strip() != "":
-        return value
-    raise HostDurableError(f"{field_name} must be non-empty text when provided")
 
 
 def _required_int(payload: Mapping[str, JsonValue], field_name: str) -> int:

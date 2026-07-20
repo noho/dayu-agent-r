@@ -23,6 +23,7 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
@@ -38,7 +39,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import RunnerCallOptions
 from dayu.host import (
     AttemptDispatchSnapshot,
     CompactorRunnerBaseline,
@@ -50,8 +51,9 @@ from dayu.host import (
     OpenHostOptions,
     open_host,
 )
-from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
+from dayu.host.compact_payload import COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
+from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
 from dayu.host.durable.schema import RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.scene_prepare import (
@@ -88,10 +90,18 @@ _INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
 _INTERNAL_COMPACT_INPUT_TYPE_NAME = "ConversationCompactInputVNext"
 _COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
+_SCHEMA_VERSION_FIELD = "schema_version"
+_HOST_RUN_ID_FIELD = "host_run_id"
+_RUNNER_CALL_KIND_FIELD = "runner_call_kind"
+_COMPACTOR_PROPOSAL_RUNNER_CALL_KIND = "compactor_proposal"
+_COMPACTOR_IDENTITY_FIELD = "compactor_identity"
+_PARENT_HOST_RUN_ID_FIELD = "parent_host_run_id"
+_COMPACTION_REQUEST_DIGEST_FIELD = "compaction_request_digest"
 _ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
-_CANDIDATE_ID_FIELD = "candidate_id"
 _INPUT_SNAPSHOT_REFS_FIELD = "input_snapshot_refs"
-_CURRENT_USER_INPUT_REF_FIELD = "current_user_input_ref"
+_CURRENT_INPUT_REF_FIELD = "current_input_ref"
+_TEST_COMPACTION_REQUEST_DIGEST = "sha256:" + ("a" * 64)
+_OTHER_TEST_COMPACTION_REQUEST_DIGEST = "sha256:" + ("b" * 64)
 _UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
 _UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _FAKE_COMPACT_CONTEXT_WINDOW_SIZE = 12000
@@ -108,6 +118,11 @@ _PUBLIC_REACTIVE_FINAL_CONTENT = "reactive recovery final answer"
 _PUBLIC_REACTIVE_WORKER_ID = "public-reactive-worker"
 _PUBLIC_FINAL_WORKER_ID = "public-final-worker"
 _LONG_CHAPTER_MARKER = "DAYU_LONG_CHAPTER_RAW_EVIDENCE_OPERATING_MARGIN_42"
+_R03_PUBLIC_CITATION: dict[str, JsonValue] = {
+    "document_id": "mock-annual-report-2025",
+    "source_type": "public_compact_smoke",
+    "unknown_future_member": {"page": 42, "section": "Operating margin"},
+}
 _SECOND_FACTOR_MARKER = "第二个因素=库存周转率"
 _DUPLICATE_PROMPT_SENTENCE = "DAYU_DUPLICATE_PROMPT_COMPACT_SEGMENT。"
 _RUN_REAL_COMPACTOR_SMOKE_ENV = "DAYU_RUN_REAL_COMPACTOR_SMOKE"
@@ -313,6 +328,187 @@ def test_label_only_fake_proposal_rejects_canonical_ref_leakage() -> None:
         _assert_label_only_fake_proposal(proposal, marker=_LONG_CHAPTER_MARKER)
 
 
+def test_current_manifest_digest_associates_unique_compact_artifact(
+    tmp_path: pathlib.Path,
+) -> None:
+    """current manifest digest 应唯一关联 current compact artifact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: current schema 关联链路不唯一或字段非法时抛出。
+    """
+
+    run_id = "host-run-current"
+    _write_artifact_json(
+        tmp_path / "manifest.json",
+        _runner_call_manifest_json(
+            run_id=run_id,
+            compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+        ),
+    )
+    _write_artifact_json(
+        tmp_path / "compact.json",
+        _compact_artifact_json(
+            compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+        ),
+    )
+
+    paths = _compact_artifact_files(tmp_path)
+    digest = _runner_call_manifest_for_run(paths, run_id)
+    artifact = _compact_artifact_for_run(paths, digest)
+
+    assert digest == _TEST_COMPACTION_REQUEST_DIGEST
+    assert artifact[_COMPACTION_REQUEST_DIGEST_FIELD] == digest
+
+
+@pytest.mark.parametrize("manifest_count", [0, 2])
+def test_runner_call_manifest_association_fails_closed_on_missing_or_duplicate(
+    tmp_path: pathlib.Path,
+    manifest_count: int,
+) -> None:
+    """missing/duplicate current manifest 必须 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param manifest_count: 写入的 matching manifest 数量。
+    :returns: ``None``。
+    :raises AssertionError: helper 错误接受非唯一 manifest 时抛出。
+    """
+
+    run_id = "host-run-manifest-cardinality"
+    for index in range(manifest_count):
+        _write_artifact_json(
+            tmp_path / f"manifest-{index}.json",
+            _runner_call_manifest_json(
+                run_id=run_id,
+                compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+            ),
+        )
+
+    with pytest.raises(AssertionError, match="exactly one runner-call manifest"):
+        _runner_call_manifest_for_run(_compact_artifact_files(tmp_path), run_id)
+
+
+@pytest.mark.parametrize(
+    "invalid_digest",
+    [None, "not-a-sha256-digest"],
+)
+def test_runner_call_manifest_digest_fails_closed_when_missing_or_invalid(
+    tmp_path: pathlib.Path,
+    invalid_digest: str | None,
+) -> None:
+    """manifest 缺失或携带非法 request digest 时必须 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param invalid_digest: ``None`` 表示删除字段，否则写入该非法值。
+    :returns: ``None``。
+    :raises AssertionError: helper 错误接受缺失或非法 digest 时抛出。
+    """
+
+    run_id = "host-run-invalid-manifest-digest"
+    manifest = _runner_call_manifest_json(
+        run_id=run_id,
+        compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+    )
+    compactor_identity = cast(
+        dict[str, JsonValue],
+        manifest[_COMPACTOR_IDENTITY_FIELD],
+    )
+    if invalid_digest is None:
+        del compactor_identity[_COMPACTION_REQUEST_DIGEST_FIELD]
+    else:
+        compactor_identity[_COMPACTION_REQUEST_DIGEST_FIELD] = invalid_digest
+    _write_artifact_json(tmp_path / "manifest.json", manifest)
+
+    with pytest.raises(AssertionError, match="compaction_request_digest"):
+        _runner_call_manifest_for_run(_compact_artifact_files(tmp_path), run_id)
+
+
+def test_runner_call_manifest_parent_run_mismatch_fails_closed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """manifest parent Host Run 与 current run 不同必须 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: helper 错误接受不同源 parent run 时抛出。
+    """
+
+    run_id = "host-run-parent-mismatch"
+    manifest = _runner_call_manifest_json(
+        run_id=run_id,
+        compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+    )
+    compactor_identity = cast(
+        dict[str, JsonValue],
+        manifest[_COMPACTOR_IDENTITY_FIELD],
+    )
+    compactor_identity[_PARENT_HOST_RUN_ID_FIELD] = "different-host-run"
+    _write_artifact_json(tmp_path / "manifest.json", manifest)
+
+    with pytest.raises(AssertionError, match="parent_host_run_id"):
+        _runner_call_manifest_for_run(_compact_artifact_files(tmp_path), run_id)
+
+
+@pytest.mark.parametrize("compact_count", [0, 2])
+def test_compact_artifact_association_fails_closed_on_missing_or_duplicate(
+    tmp_path: pathlib.Path,
+    compact_count: int,
+) -> None:
+    """missing/duplicate matching compact artifact 必须 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param compact_count: 写入的 matching compact artifact 数量。
+    :returns: ``None``。
+    :raises AssertionError: helper 错误接受非唯一 artifact 时抛出。
+    """
+
+    for index in range(compact_count):
+        _write_artifact_json(
+            tmp_path / f"compact-{index}.json",
+            _compact_artifact_json(
+                compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+            ),
+        )
+
+    with pytest.raises(AssertionError, match="exactly one compact artifact"):
+        _compact_artifact_for_run(
+            _compact_artifact_files(tmp_path),
+            _TEST_COMPACTION_REQUEST_DIGEST,
+        )
+
+
+@pytest.mark.parametrize(
+    "artifact_digest",
+    [None, _OTHER_TEST_COMPACTION_REQUEST_DIGEST],
+)
+def test_compact_artifact_digest_fails_closed_when_missing_or_wrong(
+    tmp_path: pathlib.Path,
+    artifact_digest: str | None,
+) -> None:
+    """compact artifact 缺失或携带错误 request digest 时必须 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param artifact_digest: ``None`` 表示删除字段，否则写入错误 digest。
+    :returns: ``None``。
+    :raises AssertionError: helper 错误接受缺失或错误 digest 时抛出。
+    """
+
+    artifact = _compact_artifact_json(
+        compaction_request_digest=_TEST_COMPACTION_REQUEST_DIGEST,
+    )
+    if artifact_digest is None:
+        del artifact[_COMPACTION_REQUEST_DIGEST_FIELD]
+    else:
+        artifact[_COMPACTION_REQUEST_DIGEST_FIELD] = artifact_digest
+    _write_artifact_json(tmp_path / "compact.json", artifact)
+
+    with pytest.raises(AssertionError, match="compaction_request_digest|exactly one"):
+        _compact_artifact_for_run(
+            _compact_artifact_files(tmp_path),
+            _TEST_COMPACTION_REQUEST_DIGEST,
+        )
+
+
 @pytest.mark.asyncio
 async def test_no_compaction_recent_raw_turns_continuity(
     tmp_path: pathlib.Path,
@@ -392,6 +588,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
             allow_tool_calls=True,
             tooling_options=_long_chapter_tooling_options(),
             policy_ref="p12-6-public-tool-evidence",
+            selected_recent_window_turn_floor=0,
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-tool-evidence"))
@@ -434,6 +631,14 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         material_json, marker=_LONG_CHAPTER_MARKER
     )
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
+    evidence_material = material_json["evidence_material"]
+    assert isinstance(evidence_material, list)
+    assert len(evidence_material) >= 1
+    first_evidence = evidence_material[0]
+    assert isinstance(first_evidence, Mapping)
+    assert first_evidence["source_note"] == canonical_json_dumps(
+        _R03_PUBLIC_CITATION
+    )
     assert "result_preview" not in material_text
     assert "payload:" not in material_text
     assert "event-tool-result" not in material_text
@@ -862,14 +1067,21 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         path for path in artifact_files_after if path not in artifact_files_before
     )
     assert len(new_artifacts) > 0
-    artifact = _compact_artifact_for_run(new_artifacts, compacted.accepted_run_id)
+    compaction_request_digest = _runner_call_manifest_for_run(
+        new_artifacts,
+        compacted.accepted_run_id,
+    )
+    artifact = _compact_artifact_for_run(
+        new_artifacts,
+        compaction_request_digest,
+    )
     input_snapshot = _required_mapping(
         artifact[_INPUT_SNAPSHOT_REFS_FIELD],
         field_name=_INPUT_SNAPSHOT_REFS_FIELD,
     )
-    current_user_input_ref = input_snapshot[_CURRENT_USER_INPUT_REF_FIELD]
-    assert isinstance(current_user_input_ref, str)
-    assert current_user_input_ref.strip() != ""
+    current_input_ref = input_snapshot[_CURRENT_INPUT_REF_FIELD]
+    assert isinstance(current_input_ref, str)
+    assert current_input_ref.strip() != ""
 
 
 @dataclass(slots=True)
@@ -1096,6 +1308,7 @@ def _fake_compact_open_options(
     max_compaction_attempts_per_operation: int = (
         _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
     ),
+    selected_recent_window_turn_floor: int | None = None,
 ) -> OpenHostOptions:
     """构造带 deterministic compactor baseline 的 public ``OpenHostOptions``。
 
@@ -1106,6 +1319,7 @@ def _fake_compact_open_options(
     :param policy_ref: context policy ref。
     :param soft_threshold_tokens: proactive compact soft threshold。
     :param max_compaction_attempts_per_operation: 单次 compact operation proposal 上限。
+    :param selected_recent_window_turn_floor: 可选覆盖 recent raw turn floor。
     :returns: public OpenHostOptions。
     :raises ValueError: typed options 字段非法时由底层抛出。
     """
@@ -1131,6 +1345,14 @@ def _fake_compact_open_options(
             ),
         ),
         compactor_runner_baseline=_fake_compactor_baseline(tmp_path),
+        memory_projection_policy=(
+            base_options.memory_projection_policy
+            if selected_recent_window_turn_floor is None
+            else replace(
+                base_options.memory_projection_policy,
+                selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+            )
+        ),
     )
 
 
@@ -1155,6 +1377,8 @@ def _fake_compactor_baseline(tmp_path: pathlib.Path) -> CompactorRunnerBaseline:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         compactor_system_prompt="Deterministic P12.6 fake compactor.",
         compactor_user_prompt_template="<<compaction_request>>",
@@ -1532,6 +1756,7 @@ class _LongChapterMockTool:
                 ok=True,
                 value={
                     "chapter": _long_chapter_tool_result(),
+                    "citation": _R03_PUBLIC_CITATION,
                 },
                 meta=None,
             )
@@ -1730,6 +1955,63 @@ def _compactor_runner_options(model_id: str) -> RunnerCallOptions:
     )
 
 
+def _runner_call_manifest_json(
+    *,
+    run_id: str,
+    compaction_request_digest: str,
+) -> dict[str, JsonValue]:
+    """构造 current runner-call manifest association fixture。
+
+    :param run_id: current Host Run id。
+    :param compaction_request_digest: owner-published request digest。
+    :returns: 只包含 association oracle 必要 current 字段的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    compactor_identity: dict[str, JsonValue] = {
+        _PARENT_HOST_RUN_ID_FIELD: run_id,
+        _COMPACTION_REQUEST_DIGEST_FIELD: compaction_request_digest,
+    }
+    return {
+        _SCHEMA_VERSION_FIELD: RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+        _HOST_RUN_ID_FIELD: run_id,
+        _RUNNER_CALL_KIND_FIELD: _COMPACTOR_PROPOSAL_RUNNER_CALL_KIND,
+        _COMPACTOR_IDENTITY_FIELD: compactor_identity,
+    }
+
+
+def _compact_artifact_json(
+    *,
+    compaction_request_digest: str,
+) -> dict[str, JsonValue]:
+    """构造 current compact artifact association fixture。
+
+    :param compaction_request_digest: owner-published request digest。
+    :returns: 只包含 association oracle 必要 current 字段的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        _COMPACT_ARTIFACT_KIND_FIELD: _COMPACT_ARTIFACT_KIND,
+        _SCHEMA_VERSION_FIELD: COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
+        _COMPACTION_REQUEST_DIGEST_FIELD: compaction_request_digest,
+    }
+
+
+def _write_artifact_json(path: pathlib.Path, value: JsonValue) -> None:
+    """把 deterministic JSON fixture 写入 artifact 路径。
+
+    :param path: artifact 文件路径。
+    :param value: JSON-compatible fixture。
+    :returns: ``None``。
+    :raises OSError: 目录创建或文件写入失败时透传。
+    :raises TypeError: fixture 不能序列化为 JSON 时透传。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
 def _compact_artifact_files(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
     """返回 compact artifact 根目录下的已发布文件。
 
@@ -1744,51 +2026,109 @@ def _compact_artifact_files(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
 
 
 def _compact_artifact_for_run(
-    paths: tuple[pathlib.Path, ...], run_id: str
+    paths: tuple[pathlib.Path, ...], compaction_request_digest: str
 ) -> Mapping[str, JsonValue]:
-    """从 artifact 文件集合中找出匹配指定 Run 的 compact artifact。
+    """用 owner-published request digest 唯一定位 current compact artifact。
 
     :param paths: 候选 artifact 文件路径。
-    :param run_id: 本次 compact 关联的 Host Run id。
+    :param compaction_request_digest: current runner-call manifest 发布的 digest。
     :returns: artifact JSON object。
-    :raises AssertionError: 没有找到匹配 artifact 时抛出。
+    :raises AssertionError: digest 非法、schema 非 current 或匹配数不为一时抛出。
     """
 
-    expected_candidate_id = f"llm-compact:{run_id}"
+    assert is_sha256_digest(compaction_request_digest), (
+        "compaction_request_digest must be SHA-256 digest"
+    )
+    matches: list[Mapping[str, JsonValue]] = []
     for path in paths:
         artifact = _required_mapping(_read_json(path), field_name=str(path))
-        if artifact.get(_COMPACT_ARTIFACT_KIND_FIELD) != _COMPACT_ARTIFACT_KIND:
+        if _COMPACT_ARTIFACT_KIND_FIELD not in artifact:
             continue
-        candidate = _required_mapping(
-            artifact[_ACCEPTED_CANDIDATE_FIELD],
-            field_name=_ACCEPTED_CANDIDATE_FIELD,
+        artifact_kind = _required_text(
+            artifact,
+            field_name=_COMPACT_ARTIFACT_KIND_FIELD,
         )
-        if candidate.get(_CANDIDATE_ID_FIELD) == expected_candidate_id:
-            return artifact
-    raise AssertionError(f"compact artifact for run {run_id} was not found")
+        if artifact_kind != _COMPACT_ARTIFACT_KIND:
+            continue
+        assert _SCHEMA_VERSION_FIELD in artifact, (
+            f"{_SCHEMA_VERSION_FIELD} is required"
+        )
+        schema_version = artifact[_SCHEMA_VERSION_FIELD]
+        assert isinstance(schema_version, int) and not isinstance(
+            schema_version,
+            bool,
+        ), f"{_SCHEMA_VERSION_FIELD} must be integer"
+        assert schema_version == COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT, (
+            "compact artifact schema version is not current"
+        )
+        artifact_digest = _required_sha256_digest(
+            artifact,
+            field_name=_COMPACTION_REQUEST_DIGEST_FIELD,
+        )
+        if artifact_digest == compaction_request_digest:
+            matches.append(artifact)
+    assert len(matches) == 1, (
+        "expected exactly one compact artifact for compaction_request_digest; "
+        f"found {len(matches)}"
+    )
+    return matches[0]
 
 
 def _runner_call_manifest_for_run(
     paths: tuple[pathlib.Path, ...], run_id: str
-) -> Mapping[str, JsonValue]:
-    """从 artifact 文件集合中找出指定 Run 的 runner-call manifest。
+) -> str:
+    """唯一定位 current compactor manifest 并返回 typed request digest。
 
     :param paths: 候选 artifact 文件路径。
     :param run_id: Host Run id。
-    :returns: runner-call manifest JSON object。
-    :raises AssertionError: 没有找到匹配 manifest 时抛出。
+    :returns: manifest ``compactor_identity`` 发布的 SHA-256 digest。
+    :raises AssertionError: current manifest 不唯一或 association 字段非法时抛出。
     """
 
+    matches: list[Mapping[str, JsonValue]] = []
     for path in paths:
         artifact = _required_mapping(_read_json(path), field_name=str(path))
-        if artifact.get("schema_version") != RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION:
+        if _SCHEMA_VERSION_FIELD not in artifact:
             continue
-        if artifact.get("host_run_id") != run_id:
+        if (
+            artifact[_SCHEMA_VERSION_FIELD]
+            != RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
+        ):
             continue
-        if artifact.get("runner_call_kind") != "compactor_proposal":
+        host_run_id = _required_text(artifact, field_name=_HOST_RUN_ID_FIELD)
+        runner_call_kind = _required_text(
+            artifact,
+            field_name=_RUNNER_CALL_KIND_FIELD,
+        )
+        if host_run_id != run_id:
             continue
-        return artifact
-    raise AssertionError(f"runner-call manifest for run {run_id} was not found")
+        if runner_call_kind != _COMPACTOR_PROPOSAL_RUNNER_CALL_KIND:
+            continue
+        matches.append(artifact)
+    assert len(matches) == 1, (
+        f"expected exactly one runner-call manifest for run {run_id}; "
+        f"found {len(matches)}"
+    )
+    manifest = matches[0]
+    assert _COMPACTOR_IDENTITY_FIELD in manifest, (
+        f"{_COMPACTOR_IDENTITY_FIELD} is required"
+    )
+    compactor_identity = _required_mapping(
+        manifest[_COMPACTOR_IDENTITY_FIELD],
+        field_name=_COMPACTOR_IDENTITY_FIELD,
+    )
+    parent_host_run_id = _required_text(
+        compactor_identity,
+        field_name=_PARENT_HOST_RUN_ID_FIELD,
+    )
+    host_run_id = _required_text(manifest, field_name=_HOST_RUN_ID_FIELD)
+    assert parent_host_run_id == host_run_id == run_id, (
+        "compactor_identity.parent_host_run_id must equal manifest host_run_id"
+    )
+    return _required_sha256_digest(
+        compactor_identity,
+        field_name=_COMPACTION_REQUEST_DIGEST_FIELD,
+    )
 
 
 def _read_json(path: pathlib.Path) -> JsonValue:
@@ -1816,3 +2156,41 @@ def _required_mapping(
 
     assert isinstance(value, Mapping), f"{field_name} must be JSON object"
     return value
+
+
+def _required_text(
+    value: Mapping[str, JsonValue],
+    *,
+    field_name: str,
+) -> str:
+    """严格读取必填非空 JSON 文本字段。
+
+    :param value: JSON object。
+    :param field_name: 必填字段名。
+    :returns: 非空文本。
+    :raises AssertionError: 字段缺失、类型错误或为空时抛出。
+    """
+
+    assert field_name in value, f"{field_name} is required"
+    field_value = value[field_name]
+    assert isinstance(field_value, str), f"{field_name} must be text"
+    assert field_value.strip() != "", f"{field_name} must be non-empty"
+    return field_value
+
+
+def _required_sha256_digest(
+    value: Mapping[str, JsonValue],
+    *,
+    field_name: str,
+) -> str:
+    """严格读取必填 SHA-256 digest 字段。
+
+    :param value: JSON object。
+    :param field_name: digest 字段名。
+    :returns: 已校验 SHA-256 digest。
+    :raises AssertionError: 字段缺失、类型错误或 digest 非法时抛出。
+    """
+
+    digest = _required_text(value, field_name=field_name)
+    assert is_sha256_digest(digest), f"{field_name} must be SHA-256 digest"
+    return digest

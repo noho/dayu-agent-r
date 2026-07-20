@@ -31,8 +31,9 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run / Attempt 生命周期；EngineEvent 必须经 Host identity、状态与幂等校验后才能变成 Host facts。
 - 用户取消动作经 UI / Service 映射为 Host cancel command 后，Host 的公开承诺是 Codex / Claude Code 类体感：快速停止等待当前模型 / 工具执行并恢复可交互路径；旧模型输出、旧工具结果或旧 wait result 不能污染已取消 Run。该承诺不表示远端 LLM provider、外部 job 或第三方服务一定已经物理停止。
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
+- accepted 工具结果投影给 Tool Trace、Read API、Conversation Memory、RunInputBuilder 与 compact material 时，查询语义、状态语义、结果摘要和业务 source 由 Host 统一投影；需要进入 LLM 上下文的工具名称、查询语义、业务来源和工具结果会先形成 typed evidence material，再由唯一 renderer 输出四行业务可读文本。下游消费者只消费该投影，不重新回读或猜测 request atom，也不各自拼接 evidence 文本。
 - 上下文预算和 compact 治理由 Host 负责；Engine 只在 provider 明确报告上下文溢出时发出 `context_compaction_requested`。
-- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。
+- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；persisted accepted compact candidate 在唯一严格 typed read boundary 恢复，非法 shape、digest 或 enum fail closed，Memory projection、compact material 与 RunInputBuilder 不各自解释 nested candidate JSON。assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。descriptor-backed terminal answer continuity 由 Host terminal resolver 解析成 typed LLM-facing material，Memory projection 与 RunInputBuilder 不通过改写 EventLog payload 来投影回答文本。
 - 财报业务语义、财报文档下载、预处理、处理与存取不属于 Host；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 架构边界
@@ -63,15 +64,16 @@ Host 与其它层的稳定边界如下：
 
 ## 接口
 
-普通 Service-facing 入口是包根导出的 `open_host(options)`。它是异步 context manager，进入后返回异步 `Host` handle；Service 使用该 handle 发起 Session / Run / outbox / wait / cancel / purge 操作，不直接持有 durable store、scheduler、command handle、registry、wait poller 或 ToolRuntime 内部对象。`OpenHostOptions.wait_poller_policy=None` 时不启动 production wait poller；传入启用的 policy 时，`HostToolingOptions.wait_poll_adapter_registry` 必须同时提供，poller 才会由 `open_host` 装配。
+Service-facing opener 按 capability 分为两个无继承关系的异步协议：`open_host(options)` 返回 execution `Host`，`open_host_admin(options)` 返回纯 durable `HostAdmin`。execution opener 装配 scheduler、recovery、lane、worker 与可选 wait poller；admin opener 只接收 SQLite / artifact policy，不读取 scene、tool、model 或 secret，也不启动 recovery、projection catch-up、lane、worker 或 scheduler。两种 public handle 都不暴露 durable store、同步 command handle或内部 wakeup port。
+
+execution public command / read / watch 统一提交给单 worker durable actor；command handle、actor store 与 SQLite connection 从创建、使用到关闭始终归属该 actor thread。scheduler 使用另一条独立、同 policy 的 store connection。actor transaction 的 after-commit scheduler wake 与 active worker cancel 通过同步 bridge 回到 opener event loop；caller cancellation 不取消已经开始的 actor future。
 
 `Host` handle 当前提供：
 
 - `ensure_session(request)`：按 `(scope, slot_key)` 原子确保当前 Session。
 - `create_session(request)`：显式创建新 Session，可选择重绑定 slot。
 - `get_session(session_id)`：读取 Session snapshot。
-- `list_sessions()`：读取全部未 purge Session 的 durable 列表摘要。
-- `get_run(run_id)`：读取 Run snapshot。
+- `get_run(run_id)`：读取 Run snapshot。Run 是否终态以 Host public `is_terminal_run_status(status)` 为准；终态 `RunSnapshot` 必须携带同状态的 `TerminalResultSummary`，非终态不得携带 terminal summary。
 - `submit_followup(session_id, request)`：提交普通 queue 或 steer follow-up。
 - `retry_run(run_id, request)`：基于失败源 Run 创建关联的新 Run。
 - `replay_run(run_id, request)`：基于成功源 Run 创建 no-tool 结构修复 Run。
@@ -79,13 +81,17 @@ Host 与其它层的稳定边界如下：
 - `cancel_session_runs(session_id, request)`：取消 Session 下可治理的非终态 Run。
 - `resolve_wait(wait_id, request)`：接收外部 wait result，由 Host 恢复或收口 Run。
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
-- `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 本地可恢复事实。
-- `report_storage_usage()`：读取只读 storage usage report，包含 durable SQLite 表 row count、payload logical bytes、orphan SQLite payload 诊断计数以及 DB/WAL 文件大小。
-- `run_storage_maintenance(request)`：执行显式 maintenance，返回 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断；默认 dry-run 不删除文件，显式 `reclaim_orphan_artifacts=True` 时只回收删除前 recheck 仍未被引用的 orphan artifact 物理文件。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
 - `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
-- `close()`：关闭当前 opener runtime，先关闭 wait poller，再关闭 scheduler，并向 active worker 传播 lifecycle cancel；该操作不写用户 cancel / failed terminal facts。
+- `close()`：关闭当前 execution runtime；停止新 public call 后先用 finite shared deadline 关闭 wait poller、撤销全部 adapter observation token，再 drain actor command / wake，随后按 scheduler、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。仍阻塞的 provider thread 不持 Host durable authority，supervisor 保持 `CLOSING`，最后一个 thread finally 后才变为 `STOPPED`。该操作不写用户 cancel / failed terminal facts。
+
+`HostAdmin` handle 当前提供：
+
+- `get_session(session_id)` 与 `list_sessions()`：读取 durable Session truth，不触发执行。
+- `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 本地可恢复事实。
+- `report_storage_usage()` 与 `run_storage_maintenance(request)`：读取 storage usage 或执行显式 maintenance；默认 maintenance 为 dry-run。
+- `close()`：只关闭 admin actor、command handle、store 与 executor，重复关闭幂等。
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
@@ -195,7 +201,7 @@ cancel_request = CancelRunRequest(
 cancelled = await host.cancel_run(active_run_id, cancel_request)
 ```
 
-`cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；Host 关闭 / 取消本地 Engine worker event stream，向 Engine 注入 cancellation token，并由 ToolRuntime 对可抢占工具执行边界执行取消 / 超时治理。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
+`cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；Host 关闭 / 取消本地 Engine worker event stream，向 Engine 注入 cancellation token，并由 ToolRuntime 对可抢占工具执行边界执行取消 / 超时治理。进入取消生命周期的 Run 会在 durable Run row 上保存 typed `cancel_request_event_id`，active watchdog、Engine cooperative cancel、dispatch 与 recovery 都以该 typed link 回查同 Run 的 `CANCEL_REQUESTED`，不从 `RUN_CANCELLING` payload 解析关键链路。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
 
 ## Wait callback completion
 
@@ -215,12 +221,15 @@ Service / Web transport
 `DefaultWaitCallbackAdapter` 的职责是 callback 边界预处理，不拥有 durable state transition：
 
 - 先执行 callback authenticator；认证失败时不得读取 wait state，也不得调用 resolver。
-- 读取 wait state 只用于 unknown wait、stale、late cancel / lost 与 invalid wait state 的预分类。
+- 读取 wait state 只用于 unknown wait、late cancel / lost 与 invalid wait state 的预分类。
 - 使用与 direct `resolve_wait` 相同的 wait resolution digest helper 校验 callback payload；request id、认证材料、correlation metadata、`observed_at` 和 `completed_at` 不参与 outcome digest。
+- callback adapter 不解析 `deadline_at` / `expires_at`，过期或非法等待时间边界由 Host wait owner 在 `resolve_wait` 管线内统一判定。
 - 把通过预检的 callback completion 转成 `ResolveWaitRequest(source=CALLBACK)`，再通过 `CallbackWaitResolvePort` 进入 command-layer `resolve_wait`。
 - 只返回 typed `WaitCallbackAdapterResult` 与 stable status / diagnostic code；不回显 outcome payload 或 credential material。
 
 状态迁移仍由 Host 既有 `resolve_wait` 管线负责。同一 `(wait_id, idempotency_key)` 与相同 outcome digest 的重复 callback 是 replay；同 key 不同 outcome 是 idempotency conflict；已 cancel、已 terminal、已 resolved、failed 或 lost 的 late result 不恢复旧 Attempt。command-layer callback port 在非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
+
+durable deadline expiry 由 wait state machine 的 common transaction-local helper 拥有。poll、callback 或 direct result 在 `observed_at` 已越过 durable boundary 时，Host 先把 Wait / Run 同事务收为 `FAILED`，写入固定 `wait_deadline_expired` failure fact，commit 后完成 projection 与 queue-promotion wake，再向迟到 caller 返回 `INVALID_STATE`；expiry 不是 `LOST`，deadline 后 provider success 不会被接受。同步 poll / abandon adapter 调用由 Host-owned bounded observation runner 执行，policy 明确限制单次调用、outstanding invocation 与 close drain；timeout/close 先把 token 从 `ACTIVE` 置为 `INVALIDATED`，迟到线程只能 dropped publish，不能写 durable state。
 
 这个边界当前不包含真实 HTTP route、secret backend、HMAC / bearer verifier、生产 poller、physical cancel、Engine contract 或 UI surface。需要暴露 Web endpoint 时，应在 Host 外部的 Service / Web composition root 中注册路由，构造 framework-neutral request，注入 callback adapter，然后让 Host 按上述 typed callback path 处理。
 
@@ -241,7 +250,7 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
 - `HostToolingOptions` / `FrameworkToolName` / `FrameworkToolPolicyView` / `ProcessCapsuleInterruptPolicy`：业务 ToolBundle、Host framework tool 与 process-backed capsule cleanup interrupt policy 的 construction-time 输入边界。
 - `ContextBudgetPolicy` / `MemoryProjectionPolicy`：context governance 与 conversation memory projection 的 typed policy。
-- `WaitCallbackCompletionEnvelope` / `WaitCallbackAuthInput` / `WaitCallbackAuthAccepted` / `WaitCallbackAuthRejected` / `WaitCallbackAdapterResult` / `WaitCallbackAdapterStatus`：framework-independent wait callback completion 契约。调用方在 Service/Web transport 层完成请求解析后，把强类型 envelope 交给 `DefaultWaitCallbackAdapter`；adapter 只做认证、payload digest 校验、stale / late 预分类和 `ResolveWaitRequest(source=CALLBACK)` 转换，状态迁移仍进入 Host `resolve_wait` 管线。
+- `WaitCallbackCompletionEnvelope` / `WaitCallbackAuthInput` / `WaitCallbackAuthAccepted` / `WaitCallbackAuthRejected` / `WaitCallbackAdapterResult` / `WaitCallbackAdapterStatus`：framework-independent wait callback completion 契约。调用方在 Service/Web transport 层完成请求解析后，把强类型 envelope 交给 `DefaultWaitCallbackAdapter`；adapter 只做认证、payload digest 校验、late 预分类和 `ResolveWaitRequest(source=CALLBACK)` 转换，状态迁移与等待时间边界判定仍进入 Host `resolve_wait` 管线。
 - `CallbackWaitResolvePort` / `CallbackWaitResolveResult` / `WaitCallbackStateReadPort`：callback adapter 接入 command-layer wait resolve 与 wait state 预读的端口契约。command-layer 实现必须保留现有 resolve wakeup 语义：非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
 
 ### Dayu Agent 公共契约
@@ -323,7 +332,7 @@ dayu.host
 
 ## 稳定边界
 
-Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item 与 `open_host(options)` construction-time typed inputs。`list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
+Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
 
 Host 不负责：
 
@@ -344,11 +353,11 @@ Stream 术语固定如下：
 
 ### Public API 与 opener
 
-`api.py` 定义 public dataclass、enum、Protocol、error 与 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 durable store、admission service、scheduler、active worker registry、可选 wait poller supervisor、audit / tool trace / outbox projection catch-up ports、context compactor 和本地 worker typed port，并在 async context 退出时关闭当前 opener runtime。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
+`api.py` 定义 public dataclass、enum、独立 `Host` / `HostAdmin` Protocol、error 与两类 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 scheduler store、public durable actor、execution health gate、admission、scheduler、active worker registry、可选 wait poller、projection catch-up ports、context compactor 和本地 worker typed port；`open_host_admin(options)` 只装配 admin durable actor chain。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
 
 ### Admission 与 command
 
-Admission 是 Session active Run、queue、steer、retry、replay、cancel、resolve wait、close 与 purge 的写入边界。它在 durable transaction 内写入 canonical facts、状态索引、幂等记录和必要 dispatch / wait / purge 记录；commit 后再唤醒 scheduler 或 projection。
+Admission 是 Session active Run、queue、steer、retry、replay、cancel、resolve wait、close 与 purge 的写入边界。它在 durable transaction 内写入 canonical facts、状态索引、幂等记录和必要 dispatch / wait / purge 记录；commit 后再唤醒 scheduler 或 projection。幂等 replay 会从最新 Run、current Attempt 与 dispatch row 重新派生 matching dispatch 或 pre-start governance wake，不能用 replay bool 跳过全部 wake。冻结的 effective execution snapshot 在恢复时先对 config canonical JSON 重算 digest，并同时验证 `policy_snapshot_digest` 与由该 digest 派生的 `policy_snapshot_ref`，任一不一致都在反序列化 typed config 前 fail closed。
 
 ### Durable EventLog 与状态索引
 
@@ -356,19 +365,21 @@ EventLog 分配全局 `event_sequence`，记录 canonical facts、preview、diag
 
 ### Dispatch scheduler
 
-Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch facts。它负责 pre-start governance、本地 runtime lane capacity、worker accept、active worker registry、EngineEvent stream 消费、terminal closeout、queue promotion 和 startup recovery wakeup。
+Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch facts。它负责 pre-start governance、本地 runtime lane capacity、worker accept、active worker registry、EngineEvent stream 消费、terminal closeout、queue promotion 和 startup recovery wakeup。execution health gate 在 `STARTING / READY / UNAVAILABLE / CLOSING / CLOSED` 间提供 public new-work 与 scheduler fatal 的单一 lifecycle truth；new-work admission lease 覆盖 actor transaction、commit 后 wake 与 actor future。critical task 非预期退出提交稳定 typed fatal；durable transaction retry exhaustion 只按 poll interval 退避并重新 reconcile，不关闭 scheduler或取消 worker。
 
 ### RunInputBuilder
 
-RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest，并把完整 LLM-facing messages 与 selected tool schema full JSON 分别保存为可校验 payload descriptor，供 Tool Trace resolver 按需读取。
+RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact provenance、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。普通 RunInput 不把 accepted compact artifact 渲染成第二条 system message；accepted compact 事实必须先由 Conversation Memory 物化后再进入普通输入，compact artifact event ref 与 memory latest compaction ref 不一致时走 memory repair / catch-up 边界。accepted tool evidence 的 ordinary raw tail 和 fallback 渲染只消费 accepted-result projection 产出的 typed material，并调用 `dayu.host.evidence` 的唯一 renderer；section routing 仍由 RunInputBuilder 的 system envelope policy 决定。descriptor-backed terminal answer continuity 只以 typed answer text 进入 LLM-facing messages，不把 descriptor、digest 或治理 label 当作回答内容。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest；ordinary、Engine continuation 与 compactor 共用同一个私有 manifest / hot contract owner，hot payload 只有固定 scalar 与显式 fixed-shape diagnostic atoms，不包含逐消息或 projector metadata 数组。该 owner 同时解析完整 manifest graph，校验 schema/identity、message count/index、message-to-metadata 引用、closed projector/purpose、projection descriptor pair 与 hot/manifest 同源关系。完整 LLM-facing messages、selected tool schema full JSON 与六字段 projector metadata 保存在可校验 descriptor graph 中，供 Tool Trace resolver 按需读取。
 
 ### EngineEvent ingest
 
 EngineEvent ingest 校验 run / attempt / execution identity、当前 durable state 与 event type，再把 EngineEvent 转成 Host facts、preview 或 diagnostic。`EngineEvent` 本身不是 truth；final answer、failure、cancel、lost、usage、iteration_started、context compaction request 和 awaiting confirmation 都必须经 Host ingest 才能影响 Host 状态。
 
+worker clean EOF、stream error 与 worker crash 不是 EngineEvent。它们通过独立的 Host lifecycle closeout candidate、Host lifecycle event identity 与 source 进入同一个 durable terminal transaction；该路径不合成 `run_failed` EngineEvent，也不把 Host lifecycle source ref 写成 Engine event ref。
+
 ### ToolRuntime
 
-ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。
+ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。普通结果与 awaiting 接受路径共用同一个 canonical `TOOL_CALL_REQUESTED` writer contract：writer 只构造 request atom，调用方 append 后必须使用 EventLog 返回的真实 row / sequence。request atom 保存 Host 已接受的精确参数与同源 digest；`TOOL_AWAITING` 只保存等待治理字段和精确 `{event_id,event_sequence}` request link，不复制参数或 digest。
 
 ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule：`async_direct` 直接运行 async callable，`thread_backed` 只表示可取消 wrapper awaitable、不承诺停止 OS thread，`process_backed` 通过可序列化 target factory 构造子进程目标。process-backed 子进程只返回 `dayu.contracts` 定义的 JSON 信封，Host capsule 将 `completed` / `failed` 信封映射为工具 outcome；failed 信封的 `hint` 会映射到结构化 `ToolResultFailure.hint`，不拼入 `message`。取消和超时仍由父进程 Host 治理独占处理。execution capability 与 process-backed 信封字段不进入 Engine-facing `ToolSchema` 或 LLM-facing schema。
 
@@ -380,13 +391,22 @@ ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule�
 
 Engine 不拥有 wait record、activation 或外部 job 生命周期。Engine 只观察 ToolRuntime 返回的 awaiting outcome，并在本次 run 内产出诊断性的 awaiting / suspended 事件；等待真源、activation 时机和后续 resume 都由 Host / ToolRuntime 治理。
 
-Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 construction-time poll adapter registry 观察 durable wait record 指向的外部 job，并通过 durable claim / expiry / next-observe / backoff 控制可观察资格；完成或 lost 时仍调用同一个 `resolve_wait` command path。正常 `not_ready` 只表示外部 job 仍在运行，poller 会短间隔复查；adapter error、missing adapter、resolve error 或 shutdown-skipped 才进入可重试 backoff。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。poller runtime diagnostics 保持在内存中，不写 EventLog，不成为业务事实或用户结论。
+Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 construction-time poll adapter registry 观察 durable wait record 指向的外部 job，并通过 durable claim / expiry / next-observe / backoff 控制可观察资格；调用 provider adapter 前，Host 只把 durable row 投影成 `WaitAdapterSnapshot(tool_name, resume_token, created_at)`，adapter 不接收 Host wait row、deadline / expiry、claim 或 state mutator。完成或 lost 时仍调用同一个 `resolve_wait` command path。正常 `not_ready` 只表示外部 job 仍在运行，poller 会短间隔复查；Host 等待时间边界拒绝、adapter error、missing adapter、resolve error 或 shutdown-skipped 才进入可重试 backoff，并分别写入有界 durable poll outcome。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。poller runtime diagnostics 保持在内存中，不写 EventLog，不成为业务事实或用户结论。
 
-当 `WAITING` Run 已被 Host cancel 收口后，cancel command transaction 只写 Host durable wait / Run / Attempt 事实，不在事务内执行 provider I/O。后续由 production wait poller 在 cancelled wait row 上 claim 后调用 provider wait adapter 的 external lifecycle 端口。adapter 可以返回三类封闭结果：`WaitExternalJobLifecycleApplied` 表示已执行 `CANCEL` / `REVOKE` / `ABANDON` 中的外部 lifecycle 动作，`WaitExternalJobLifecycleUnsupported` 表示该 wait 明确不支持外部 lifecycle 动作，`WaitExternalJobLifecycleNoop` 表示当前 wait 已无需或无法继续处理。Host poller 只把这些结果折叠成有界 durable outcome：`abandoned`、`abandon_unsupported` 或 `abandon_noop`；adapter 异常记录为 `error` / `abandon_error` 类诊断并按 backoff 重试，缺失 adapter 记录为 missing-adapter retry 诊断。Fins 当前装配的 wait adapter 使用 `ABANDON` 语义做 best-effort observation cancel / cleanup；Host 不把 Fins observation 细节写入自身业务事实。
+同步 adapter observation timeout 只是 Host poller 的本地边界诊断，不是外部 job 的业务结果。poll observation 超时时，Host 撤销该 observation token 的发布权、释放 claim 并按统一 backoff 真源安排重试，Run 与 wait record 继续保持 `WAITING`；线程随后返回的迟到 Ready / Lost 不能进入 `resolve_wait`。cancelled wait 的 abandon observation 超时同样只释放 claim 并保持 `CANCELLED` 可重试，不写 `poll_abandoned_at`。只有 adapter 明确返回 Ready / Lost，或 cancelled external lifecycle 明确返回 applied / unsupported / noop，才可沿各自 owner path 写入对应 durable 语义。
+
+Host 不拥有 wait poller 的 deployment defaults。`WaitPollerRuntimePolicy` 的十二个字段、
+`WaitPoller` 与 `WaitPollerSupervisor` 的 policy 都必须由 composition root 显式提供；
+不存在无参 policy、模块数值默认或 `None` fallback。`OpenHostOptions.wait_poller_policy=None`
+只表示本次 opener 不装配 poller；disabled policy 也不启动。enabled policy 必须同时具有
+非空 poll adapter registry，否则在 opener 边界 fail closed。Host 只执行这些最终 typed
+值，不从 scene、provider raw config 或工具名发明部署策略。
+
+当 `WAITING` Run 已被 Host cancel 收口后，cancel command transaction 只写 Host durable wait / Run / Attempt 事实，不在事务内执行 provider I/O。后续由 production wait poller 在 cancelled wait row 上 claim，并把 row 投影为同一个 `WaitAdapterSnapshot` 后调用 provider wait adapter 的 external lifecycle 端口。adapter 可以返回三类封闭结果：`WaitExternalJobLifecycleApplied` 表示已执行 `CANCEL` / `REVOKE` / `ABANDON` 中的外部 lifecycle 动作，`WaitExternalJobLifecycleUnsupported` 表示该 wait 明确不支持外部 lifecycle 动作，`WaitExternalJobLifecycleNoop` 表示当前 wait 已无需或无法继续处理。Host poller 只把这些结果折叠成有界 durable outcome：`abandoned`、`abandon_unsupported` 或 `abandon_noop`；adapter 异常记录为 `error` / `abandon_error` 类诊断并按 backoff 重试，缺失 adapter 记录为 missing-adapter retry 诊断。Fins 当前装配的 wait adapter 使用 `ABANDON` 语义做 best-effort observation cancel / cleanup；Host 不把 Fins observation 细节写入自身业务事实。
 
 ### Context governance
 
-Context governance 使用 `ContextBudgetPolicy`、保守估算器、compact material、compact artifact store、LLM compactor 和 fallback selector 处理上下文预算。它只写 context compaction canonical facts 与 compact artifact refs；accepted compact 后由 memory projection 消费，不直接改写 memory snapshot。
+Context governance 使用 `ContextBudgetPolicy`、保守估算器、compact material、compact artifact store、LLM compactor 和 fallback selector 处理上下文预算。它只写 context compaction canonical facts 与 compact artifact refs；accepted compact 后由 memory projection 消费，不直接改写 memory snapshot。proactive 与 reactive compact 都必须在 operation owner 内基于 accepted candidate 的业务文本与当前输入通过 compact 后 hard threshold 验收；candidate diagnostics 不参与预算。
 
 ### Conversation Memory
 
@@ -394,7 +414,9 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 
 ### Outbox、audit 与 tool trace
 
-Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；hot row 与 cold JSONL 会保存 bounded、脱敏、业务可读的工具请求 / 结果摘要，但不内联大明文。`TOOL_CALL_REQUESTED` 摘要来自 request atom；`TOOL_RESULT_ACCEPTED` 摘要通过 accepted evidence envelope 回到同源 request atom，并从 raw tool outcome 派生结果 details。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
+Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；resolver 逐层验证调用方、descriptor、SQLite row 或 artifact 实际 bytes 的 ref / digest / size，并只接受 canonical JSON object。runner-call projector metadata summary 在查询时只从 full-manifest owner 返回的 typed validated manifest 重建，不从 hot arrays、raw strings 或只通过 bytes digest 的未校验 JSON 推断。hot row 与 cold JSONL 会保存 bounded 业务可读的工具请求 / 结果摘要；`TOOL_CALL_REQUESTED` 必须通过真实 EventLog row 和严格 request atom 解析 inline 或 descriptor-backed canonical arguments / query，再做 canonical JSON 序列化和长度限制，不按字段名屏蔽合法业务参数。request row 缺失、事件类型错误、storage 或 digest 损坏均 fail closed，不发布 hot/cold trace。`TOOL_RESULT_ACCEPTED` 只消费 accepted-result projection 的 typed LLM material：结果摘要来自 exact canonical result，业务来源只来自 producer 显式 `result.value.citation` object；无 citation 使用统一中性 unavailable 文案。opaque envelope refs、arguments descriptor ref / digest 与其它 internal provenance 只保留在 durable / audit / diagnostic row，不进入 readable summary。Tool Trace、Conversation Memory、RunInputBuilder 与 compact material 都把 canonical request material 和 typed accepted-result material 视为严格前置条件：envelope、request link、row、identity、request atom shape / digest 或 typed material 缺失、损坏或漂移时统一抛出 `HostDurableError`，不得 skip、fallback 或发布 limited evidence。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
+
+`PROVIDER_DIAGNOSTIC` 是非致命诊断，只能作为 Read API `provider_diagnostic` / `info` activity 与 Tool Trace diagnostic 展示，不写 failure metadata，不进入 Outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。fatal `PROVIDER_PROTOCOL_ERROR` 在 Read API 中使用独立 `provider_protocol_error` activity kind，避免 UI / Service 从 provider diagnostic kind 反推致命错误。
 
 ## 关键执行路径
 
@@ -404,10 +426,10 @@ Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 
 open_host(options)
   -> validate construction inputs
   -> open durable store and projection ports
-  -> create admission service and scheduler
+  -> create STARTING health gate, admission service and scheduler
   -> run startup recovery scan
-  -> return async Host handle
-  -> handle.close() / context exit closes scheduler, projections, command handle and store
+  -> mark READY and return async Host handle
+  -> handle.close() / context exit enters CLOSING, drains admitted actor wake, then closes scheduler, projections, actor and stores
 ```
 
 `Host.close()` 是 opener runtime lifecycle 操作，不等于 `close_session`，也不等于用户 cancel。关闭时 Host 会向 active worker 传播 lifecycle cancel 并释放本地资源；未终态 Run 的治理归下次 startup recovery。
@@ -456,6 +478,8 @@ ToolAwaitingOutcome
 proactive compact 发生在 Attempt 创建前。Host 在 dispatch 前估算当前输入与 memory / compact / evidence / tool schema 预算；超过 policy 阈值时写入 proactive `CONTEXT_COMPACTION_REQUESTED`，运行 compactor，接受合格 compact 后再继续普通 dispatch，或按 fallback / failure 路径收口。
 
 reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该事件来自 provider 明确报告输入上下文溢出，不来自 final candidate 的 `finish_reason=LENGTH`；`LENGTH` 表示模型达到输出上限，属于 Engine length continuation / degraded answer 机制。Host ingest reactive request 后会关闭当前 Attempt、把 Run 推进为 `RECOVERING`，冻结 overflow material，执行 compaction，再创建新的 recovery Attempt 或按 fallback / failure / cancel 路径收口。
+
+每次 compactor proposal 都使用新的 Host-private linked attempt token：provider timeout 只取消当前 attempt child，Run / reactive operation parent 保持生命周期真源并拥有取消原因优先级。prepared proposal 先提交 runner-call manifest，再用同一个 child 重新观察 parent；proactive path 因此会在 provider 调用前重新读取 durable Run 前置条件，且不会跨 provider await 持有 Host transaction。
 
 compact attempt 被拒绝时，Host 会在 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` canonical payload 中保留 operation、attempt、failure stage、parser / validator、offending block locator、digest 与 diagnostic artifact ref 等小字段；若失败发生在 material projection 或 proposal 准备边界，raw previous compacted view / offending block text 只写入 Host diagnostic artifact，并通过 `payload_descriptors` 的 artifact descriptor 追踪，不进入 EventLog canonical payload、Conversation Memory、LLM-facing compact material 或普通 RunInput。
 
@@ -532,10 +556,10 @@ Host EventLog event class 包括：
 
 - `CANONICAL_FACT`：恢复、状态索引、memory、outbox、audit 和 Run terminal truth 的事实来源。
 - `PREVIEW`：面向 UI 流式体验的展示事件，例如 iteration preview、reasoning delta、content completed、tool batch ready / done、tool request / result accepted preview。content / tool-call delta 默认只作为 transient ingest 信号接受，不写入主 EventLog，也不参与 durable replay；reasoning delta 写入 PREVIEW row 只用于 live thinking 展示。
-- `DIAGNOSTIC`：诊断、拒绝、provider protocol、closeout、projection 或 recovery 观察。
+- `DIAGNOSTIC`：诊断、拒绝、非致命 provider diagnostic、provider protocol、closeout、projection 或 recovery 观察。
 - `PROJECTION_SIGNAL`：projection catch-up 与派生视图状态信号。
 
-Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、可选 `HostThinkingView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity，其中 reasoning delta 通过独立 `HostThinkingView` 暴露给 UI / Service。
+Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、可选 `HostThinkingView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`RUN_LOST` 是 Host terminal / read API 的 `lost` 事实，但 public outbox terminal item 只覆盖 succeeded / failed / cancelled，不把 lost 伪装成可投递 terminal item。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity，其中 reasoning delta 通过独立 `HostThinkingView` 暴露给 UI / Service。
 
 EngineEvent ingest 与 HostEvent projection 是两条边界：
 
@@ -551,7 +575,7 @@ Runner call manifest 由 Host 在 RunInputBuilder 装配普通 runner input 时�
 
 Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session 状态、active / start-blocking Run、queue 顺序、steer 目标、tool selection、幂等语义和 request digest。显式请求字段必须进入 typed request；不得把语义字段塞进 metadata 或 extra payload。
 
-同一 Session 的 active slot 由 durable Run 状态决定，不由 scheduler 内存队列决定。`submit_followup(queue)` 在没有 active / start-blocking Run 时创建 `ACCEPTED` Run，有 active / start-blocking Run 时创建 `QUEUED` Run；queued promotion 按 accepted `event_sequence` FIFO。unknown tool name、closed Session、幂等语义冲突等错误都必须在 canonical facts 写入前 fail closed。
+同一 Session 的 active slot 由 durable Run 状态决定，不由 scheduler 内存队列决定。显式 start-run queue policy 只允许 `queue`、`reject`、`attach_active` 三种取值，并由 Host queue policy owner 统一校验；fresh durable schema 对 `host_runs.queue_policy` 使用同一闭集 CHECK。`submit_followup(queue)` 在没有 active / start-blocking Run 时创建 `ACCEPTED` Run，有 active / start-blocking Run 时创建 `QUEUED` Run；queued promotion 按 accepted `event_sequence` FIFO。unknown tool name、closed Session、幂等语义冲突等错误都必须在 canonical facts 写入前 fail closed。
 
 ### Steer
 
@@ -568,7 +592,7 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 
 - `ACCEPTED` / `QUEUED` Run 可直接写入 cancel request 与 `RUN_CANCELLED` terminal，并释放 queue promotion 资格。
 - pre-worker `STARTING` Attempt 可在 worker accept 前直接写入 Attempt / Run cancelled。
-- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。该收口不表示底层 provider / tool 已被物理杀停。
+- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING` 并在 Run row 保存 typed `cancel_request_event_id`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。watchdog wake 使用 opener-loop owned level-triggered `asyncio.Event`，每轮 tick 前 clear；tick 期间的新 wake 保留到下一轮，多个并发 wake 可以合并但不能丢失。watchdog 非取消异常由 execution health supervisor提交 typed fatal，正常 scheduler close 取消不误报。该收口不表示底层 provider / tool 已被物理杀停。
 - active worker event stream 在取消路径上会被关闭或取消，避免 Host 继续等待旧模型流自然结束；迟到 EngineEvent 进入 Host 前必须通过 identity 与状态校验，不匹配当前 durable state 时 fail closed 为 rejected / diagnostic。
 - Doc、Fins read 与 Web blocking 工具生产路径声明为 process-backed execution；取消或超时时，ToolRuntime 父进程治理返回 `tool_runtime_cancelled` / `tool_runtime_timeout` 类结果，并对进程边界执行 terminate / kill cleanup。子进程不得返回 `awaiting`、`cancelled`、`timeout` 或 `host_cancelled` 等 Host-governed 信封；迟到工具结果不能越过 Host accept barrier。
 - WAITING Run 取消只收口 Host durable wait / Run / Attempt 事实，不在 command transaction 内等待 provider I/O；外部 lifecycle 由 wait poller / adapter best-effort 处理，迟到 wait result 不会恢复旧 Attempt。
@@ -576,20 +600,24 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 - `RECOVERING` Run 可在 recovery dispatch 前直接 cancel，释放 active slot。
 - 已 terminal Run 的 cancel 只记录幂等 ack 并返回当前 terminal snapshot，不改写 terminal truth。
 
+单 Run cancel 的 supported、deferred、terminal 与 conflict 分类全部来自 admission write transaction 的同一 Run/Attempt/dispatch snapshot；command facade 不在错误后另开 read transaction重判。只有首次释放 active slot 的结果会投递 queue-promotion wake，幂等 replay、terminal loser 与未提交 mutation 的分类不会重复 wake。
+
 `cancel_session_runs` 按 Session 扫描当前支持的非终态目标，覆盖 queued、pre-dispatch、active worker、waiting 与 recovering Run；遇到不在支持子集内的非终态状态时 fail closed，避免部分状态被误取消。
 
 ### Resume
 
-resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长事务工具返回 `ToolAwaitingOutcome` 后，ToolRuntime 先进入 Host awaiting accept path；Host 在单个 durable transaction 内写入 LLM-safe `TOOL_CALL_REQUESTED` request atom、`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`。
+resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长事务工具返回 `ToolAwaitingOutcome` 后，ToolRuntime 先进入 Host awaiting accept path；Host 在单个 durable transaction 内写入 canonical `TOOL_CALL_REQUESTED` request atom、只含治理字段与显式 request link 的 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`。
 
 外部长事务完成后，调用方通过 `resolve_wait(wait_id, request)` 把结果交回 Host：
+
+wait resolution transition 在任何事实或状态写入前，要求 active WaitRecord 的 execution identity 与挂起的 source Attempt 完全一致；`TOOL_RESULT_ACCEPTED` 始终归属该 source Attempt / execution，不借用新建 resume Attempt 的 identity，也不留空 identity。
 
 - completed 或 tool-cancelled outcome 会关闭 wait record，写入 wait resolution 对应的 tool result facts，追加 `RESUME_REQUESTED`，再为同一 Run 创建新的 resume Attempt / execution / dispatch record。
 - failed outcome 使 Run 进入 `FAILED`。
 - lost outcome 使 Run 进入 `LOST`。
 - 已 cancel、已 terminal、已 resolved / failed / lost 的 late result 不会恢复 Run；Host 只返回幂等结果、冲突或 `WAIT_LATE_RESULT_REJECTED` 诊断。
 
-resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay 参数来自 `TOOL_RESULT_ACCEPTED` accepted evidence envelope 指向的 `TOOL_CALL_REQUESTED` request atom，并用原始参数 digest 关联 accepted truth。无法安全恢复 replay 参数时只投影自解释的恢复说明，不伪造工具调用。
+resume Attempt 的 runner input 会把当前用户请求、使用 exact canonical replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay identity 与参数只来自 `TOOL_RESULT_ACCEPTED` accepted evidence envelope 指向的 `TOOL_CALL_REQUESTED` request atom，并要求 arguments payload digest、normalized arguments digest 与 envelope identity 同源。canonical request material 缺失、错链或 digest 漂移时抛出 `HostDurableError`，不投影恢复说明或伪造工具调用。
 
 因此 wait-resume 的稳定边界是“新 Attempt 恢复同一 Run”，不是恢复旧 Engine 生成器、旧 Runner HTTP stream 或旧工具调用栈。
 
@@ -597,7 +625,7 @@ resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe repla
 
 Dispatch scheduler 不从内存队列恢复状态，只扫描 durable accepted / queued / pending dispatch facts。standard path 是 dispatch 前执行 context governance，写入 `RUN_STARTED` / `ATTEMPT_STARTED` / dispatch record，然后 acquire runtime lane、durable recheck、调用 `LocalEngineWorker.accept(...)`，最后写入 `ATTEMPT_RUNNING` 并消费 worker 的 EngineEvent stream。
 
-runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。active cancel watchdog 使用当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 与已接受 cancel fact 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
+runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。worker EOF / crash closeout 使用 Host lifecycle identity，不借用 EngineEvent identity；`CANCELLING` 下该 signal 只产生 Host lifecycle diagnostic，terminal cancel 仍由 accepted-cancel watchdog 或既有 terminal first-committer 拥有。active cancel watchdog 使用当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 与已接受 cancel fact 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
 
 ### Host 启动恢复
 
@@ -610,11 +638,13 @@ startup recovery 读取 durable Run / Attempt / dispatch / Host instance livenes
 - `RUNNING` / `CANCELLING` 只有在 positive orphan proof 成立并通过 CAS recheck 后才收口旧 Attempt；带 accepted cancel facts 的 `CANCELLING` Run 由 watchdog 收口为 `CANCELLED`，startup recovery 不先转为 `LOST`。
 - `RECOVERING` 若 recovery dispatch 次数未超过上限，会创建新的 recovery Attempt / execution / pending dispatch；超过上限或缺少可恢复事实时转为 `LOST`。
 
+scanner 在 durable actor 独占的连接上冻结本轮 `policy.now` 与 non-terminal Run upper watermark，并按 `(accepted_event_sequence, run_id)` keyset 读取有界 page；每个 page 独立提交 write transaction，默认最多处理 64 个 Run，不使用 offset。matching dispatch / queue-promotion wake 只在所属 page commit 后经 opener-loop bridge 投递。全部 page 与 wake 完成后 execution health 才从 `STARTING` 进入 `READY`；任一 batch、invariant 或 wake 失败都会中止 opener，后续 healthy opener 只依赖 durable facts 重新扫描，不依赖进程内 offset。
+
 positive orphan proof 需要 durable owner liveness 与本机进程证据支持，例如 owner 已 `STOPPED`、pid 缺失、pid 被复用且 start token / boot id 不匹配等。heartbeat stale 单独不构成 takeover proof；runtime lane TTL、projection lag 或 worker 没有返回也不构成 Host recovery truth。
 
 ### EngineEvent ingest
 
-Host ingest 对 final answer、run failed、cancelled、lost、usage、iteration_started、tool awaiting confirmation 与 context compaction request 分别建模。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。
+Host ingest 对 Engine-origin final answer、run failed、cancelled、usage、iteration_started、provider diagnostic、tool awaiting confirmation 与 context compaction request 分别建模；worker lost 属于独立 Host lifecycle path。final answer 内容有效性由 Engine 判定，Host ingest 只消费 Engine 已接受的 final answer；空白或纯空白回答必须由 Engine 以 `run_failed(runner_empty_final_content)` 上报，而不是由 Host 用另一套谓词修补。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。Host lifecycle path 同样校验 durable identity，但使用自己的 event namespace、source 与 late-event routing。Engine typed failure code 只在 ingest 边界通过 Engine serializer 写成 durable 文本；Read API、Tool Trace、Outbox 与 public HostEvent 只读取 durable payload，不检查 provider / runner-specific wrapper internals。
 
 同步 ingest 不处理需要异步 compact 的 reactive path；异步 ingest 在必要时执行 reactive compact / recovery。`iteration_started` 会显式链接 Host 先前写入的 `RUNNER_CALL_INPUT_ASSEMBLED` manifest；missing、ambiguous、mismatch 或 link conflict 都以 `ENGINE_EVENT_REJECTED` 收口，避免 provider observation 与 Host input manifest 脱节。已有 prior iteration 后的 Engine-only continuation 使用 `iteration_started.input_projection` 保存真实 runner input projection；projection 缺失时保留 limited diagnostic。
 
@@ -644,7 +674,7 @@ ToolRuntime 只有在 Host 接受工具事实后才向 Engine 返回 batch outco
 
 ### Context budget 与 compaction
 
-`ContextBudgetPolicy.context_window_size` 是 Host 的上下文窗口 typed 输入；Service / composition root 通常从模型配置的 `context_window_tokens` 映射而来。Host 以 ratio-first policy 派生 soft / hard threshold，并用保守估算器判断 proactive compact 或 reactive recovery。usage 是 provider capability 驱动的 post-call observation，只能用于诊断、校准和后续治理参考，不能回头修改已经完成的 dispatch decision。
+`ContextBudgetPolicy.context_window_size` 是 Host 的上下文窗口 typed 输入；Service / composition root 通常从模型配置的 `context_window_tokens` 映射而来。Host 以 ratio-first policy 派生 soft / hard threshold，并用保守估算器判断 proactive compact 或 reactive recovery。usage 是 provider capability 驱动的 post-call observation，只能用于诊断、校准和后续治理参考，不能回头修改已经完成的 dispatch decision。Engine usage 事件携带 provider request id 时，Host ingest 会把它写入 durable usage projection signal 与 usage observation diagnostic；缺失时保持 `None`，不使用 client correlation id 伪装 provider id。
 
 proactive compact 发生在 Attempt 创建前；预算超限时 Host 写入 proactive `CONTEXT_COMPACTION_REQUESTED`，运行 compactor，接受合格 compact 后继续普通 dispatch，失败时按 fallback / failure path 收口。reactive compact 只由 EngineEvent `context_compaction_requested` 触发；Host 关闭当前 Attempt、把 Run 推进为 `RECOVERING`，冻结 overflow material，再执行 compact 并创建 recovery Attempt。`finish_reason=LENGTH` 表示模型输出上限，不触发 reactive compact。
 
@@ -656,8 +686,8 @@ Memory 当前只投影这些事件：
 
 - `USER_INPUT_ACCEPTED`：生成 selected recent window 的 user item。
 - `RUN_SUCCEEDED`：从 terminal answer continuity 中提取 assistant item；缺失可读 final answer 时跳过，不用 payload ref / digest / event id 补洞。
-- `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；accepted evidence envelope 提供工具名、对应 `TOOL_CALL_REQUESTED` 引用与 digest，Memory projection 从该 request atom 回读 LLM-safe request / query 文本，并与 digest-checked raw tool outcome 合并为业务可读 evidence，不暴露 tool call id、EventLog id、payload / artifact ref、digest、wait / poll / cancel lifecycle 或实现类型名。wait-resolution 产生的 accepted result 也必须携带同一 envelope 与 raw outcome，使长事务完成后的 memory evidence 能说明“哪个工具按什么业务请求返回了什么结果”。
-- `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref。
+- `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；durable memory consumer 先通过 Host accepted result projection 取得非空 typed LLM evidence material，Conversation Memory 总是调用 `dayu.host.evidence` 的唯一 renderer 得到工具名称、查询语义、业务来源和工具结果四行文本。canonical accepted result 缺 typed material 时在 Memory owner boundary 抛出 `HostDurableError`，不 skip、不 fallback，也不从 envelope、request atom 或 raw outcome 重建 accepted evidence；正常 readable evidence 不暴露 tool call id、EventLog id、payload / artifact ref、digest、opaque provenance ref、wait / poll / cancel lifecycle或实现类型名。
+- `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref；candidate 未提供 session summary replacement 时保留既有 Session Summary Memory。
 
 Memory 不消费 Host waiting lifecycle 事件。`TOOL_AWAITING`、`RUN_WAITING`、`CANCEL_REQUESTED`、`RUN_CANCELLED`、wait record、poller outcome 与 abandon 只属于 Host durable / audit / wait governance，不进入 LLM-facing memory schema；有无 awaiting 执行机制不能改变下一轮 memory 语义。长事务完成后的可读结果必须经普通 tool result / resume summary 路径进入模型上下文。
 
@@ -673,7 +703,7 @@ Memory policy 是按语义分区的 budget 模型，不是简单截断全文。`
 
 snapshot 自带稳定 `snapshot_id`、policy digest、cursor、built_at 与 snapshot digest。cursor 记录当前覆盖到的 EventLog `checkpoint_event_sequence` / `checkpoint_event_id`；projection lag、snapshot missing / damaged、snapshot ahead、inline delta repair 等情况以 typed diagnostics 表达。RunInputBuilder 可以在 snapshot 轻微滞后时用 EventLog delta 做 inline repair；超过 policy 上限时必须走 repair / catch-up 路径，而不是让模型看到不一致 memory。Memory repair / catch-up 的 batch size 只控制单页读取和事务粒度；required path 会追到目标 cursor、idle 或 failure，不把 page size 当作正确性停止预算。
 
-Memory 与 compact 的关系必须保持单向：Context Governance / compactor 产出 accepted `CONTEXT_COMPACTED` fact 和 artifact；Memory projection 消费它并更新 read model。Memory 不直接写 compact artifact，不把 failed compact fallback 写成 compact 成功，也不把普通 final answer 或工具结果自动升级为 evidence-backed fact。ordinary RunInput 可以读取 memory snapshot 作为已物化 read model；pre-dispatch compact material 则由 EventLog / payload / artifact truth 构造 latest accepted compact、post-compact delta 与 current input anchor，不把 memory snapshot 当 compact input truth。任何 Run / Attempt truth 仍只来自 EventLog 与状态索引。
+Memory 与 compact 的关系必须保持单向：Context Governance / compactor 产出 accepted `CONTEXT_COMPACTED` fact 和 artifact；Memory projection 消费它并更新 read model。Memory 不直接写 compact artifact，不把 failed compact fallback 写成 compact 成功，也不把普通 final answer 或工具结果自动升级为 evidence-backed fact。ordinary RunInput 可以读取 memory snapshot 作为已物化 read model；pre-dispatch compact material 则由 EventLog / payload / artifact truth 构造 latest accepted compact、post-compact delta 与 current input anchor，不把 memory snapshot 当 compact input truth。latest accepted compact 会一次性生成 previous compacted blocks 与 typed readable view pair，后续 pipeline 只能同步过滤该 pair，不能从字符串或 snapshot 重新解析同一语义。任何 Run / Attempt truth 仍只来自 EventLog 与状态索引。
 
 ### LLM-facing 输入改写
 
@@ -684,6 +714,8 @@ LLM-facing 文本不得要求模型理解 event id、payload ref、dispatch id�
 ### Outbox terminal delivery
 
 Outbox 是 terminal fact 的派生通知队列。`read_outbox_terminal_items` 不改变 drain state；`drain_outbox_terminal_items` 只幂等更新 Host outbox projection queue state。Outbox projection lag 或 failure 不改写 Run terminal truth。
+
+成功终态的 live `HostEvent` 与 Outbox item 必须携带非空 final answer。两者共用 Host terminal-answer continuity resolver：优先读取 canonical `RUN_SUCCEEDED` 的 inline `final_answer`，否则校验 terminal descriptor / digest 后读取顶层 `content`；`filtered`、`degraded` 与 `finish_reason` 始终来自 canonical `RUN_SUCCEEDED`。failed、cancelled、lost 不得携带 final answer，其中 lost 不生成 public Outbox item。Outbox 在同一 projection transaction 内解析回答、写 item 并推进 checkpoint；resolver 失败会整体回滚并留下 projection failure，descriptor 原样恢复后可重试，同一 terminal identity 只生成一个 item。
 
 Outbox terminal item 的 failed `error_message` 与 live `HostEvent` 使用同一个 Host projection helper 追加 provider / client correlation 诊断后缀；该后缀属于 public projection 文本，不改变 terminal fact payload。
 

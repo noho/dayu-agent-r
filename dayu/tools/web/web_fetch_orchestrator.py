@@ -7,9 +7,14 @@ HTML/Docling 路由与浏览器升级判定，避免这些编排细节继续膨�
 
 from __future__ import annotations
 
+import importlib
 import re
-from collections.abc import Callable, Collection
+import zlib
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
+from io import BytesIO
+from types import ModuleType
+from typing import Protocol, cast
 from threading import Lock
 from urllib.parse import urljoin, urlparse
 
@@ -25,14 +30,39 @@ from bs4 import BeautifulSoup
 from dayu.documents.processors.html_pipeline import HtmlPipelineResult, HtmlPipelineStageError
 from dayu.documents.processors.text_utils import infer_suffix_from_uri
 
-from .web_challenge_detection import detect_bot_challenge
-from .web_http_encoding import _decode_response_text, _find_unsupported_content_encodings
+from .web_challenge_detection import BotChallengeDecision, detect_bot_challenge
+from .web_diagnostics import (
+    WebContentDiagnostic,
+    WebResponseHeaderProjection,
+    content_diagnostic_from_bytes,
+    project_response_headers,
+    project_safe_url_or_empty,
+)
+from .web_http_encoding import (
+    _decode_response_text,
+    _extract_content_encoding_tokens,
+    _find_unsupported_content_encodings,
+)
+from .web_egress_policy import (
+    AuthorizedHttpTarget,
+    WebEgressPolicy,
+    WebEgressPolicyError,
+)
+from .web_http_session import (
+    AuthorizedResponseLease,
+    WebHttpTransportPolicy,
+    _send_authorized_request,
+)
+from .web_resource_budget import BrowserResourceBudget, HttpResourceBudget
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
-_RESPONSE_SNIPPET_MAX_CHARS = 500
 _EMPTY_CONTENT_MIN_CHARS = 5
 _MAX_META_REFRESH_HOPS = 3
 _META_REFRESH_IMMEDIATE_MAX_SECONDS = 1.0
+_FETCH_BODY_CHUNK_BYTES = 64 * 1024
+_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES = 4096
+_MAX_HTTP_REDIRECT_HOPS = 30
+_HTTP_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _PLAYWRIGHT_HTTP_ESCALATION_STATUSES = frozenset(
     {
         412,
@@ -66,15 +96,61 @@ _PLAYWRIGHT_HTTP_ESCALATION_STATUSES = frozenset(
 _WARMED_HOSTS_LOCK = Lock()
 
 
+class _BoundedBinaryReader(Protocol):
+    """支持有界 ``read(size)`` 的二进制 reader。"""
+
+    def read(self, size: int = -1) -> bytes:
+        """读取不超过 ``size`` 的解码字节。"""
+        ...
+
+    def close(self) -> None:
+        """关闭 reader。"""
+        ...
+
+
+class _ZstandardDecompressor(Protocol):
+    """zstandard 增量解压器协议。"""
+
+    def stream_reader(self, source: BytesIO) -> _BoundedBinaryReader:
+        """创建支持有界读取的增量解码 reader。"""
+        ...
+
+
+class _ZstandardModule(Protocol):
+    """zstandard 模块协议。"""
+
+    def ZstdDecompressor(self) -> _ZstandardDecompressor:
+        """创建 zstd 解压器。"""
+        ...
+
+
+def _import_optional_module(module_name: str) -> ModuleType:
+    """按名称导入可选模块。
+
+    Args:
+        module_name: 模块名。
+
+    Returns:
+        导入的模块对象。
+
+    Raises:
+        ImportError: 模块不存在或导入失败时抛出。
+    """
+
+    return importlib.import_module(module_name)
+
+
 @dataclass(frozen=True)
 class _FetchContentRuntimeContext:
-    """抓取转换失败时保留的原始响应上下文。"""
+    """抓取转换失败时保留的不可逆响应证据。"""
 
     http_status: int | None
-    final_url: str
-    response_headers: dict[str, str]
-    response_excerpt: str
-    raw_content_text: str
+    safe_final_url: str
+    response_headers: WebResponseHeaderProjection
+    content: WebContentDiagnostic
+    challenge_decision: BotChallengeDecision
+    challenge_signals: tuple[str, ...]
+    has_client_rendering_markers: bool
 
 
 @dataclass(frozen=True)
@@ -118,6 +194,88 @@ class _FetchContentConversionError(RuntimeError):
         self.original_error = original_error
         self.failure_reason = str(failure_reason or "").strip()
 
+
+class _UnsupportedBoundedContentEncoding(RuntimeError):
+    """当前 encoding 缺少可在输出物化前执行 cap 的 streaming API。"""
+
+    def __init__(self, encoding: str) -> None:
+        """初始化 unsupported encoding 错误。
+
+        Args:
+            encoding: 无法有界增量解码的 Content-Encoding token。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        normalized_encoding = encoding.strip().lower()
+        super().__init__(f"当前运行时不支持有界 {normalized_encoding} 增量解码。")
+        self.encoding = normalized_encoding
+
+
+class _FetchBodyLimitExceeded(RuntimeError):
+    """响应 body 超过 Web fetch owner 允许的读取上限。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        final_url: str,
+        limit_kind: str,
+        limit_bytes: int,
+        observed_bytes: int,
+        response_context: _FetchContentRuntimeContext,
+    ) -> None:
+        """初始化 body 上限异常。
+
+        Args:
+            message: 错误消息。
+            final_url: 当前响应 URL。
+            limit_kind: 命中的限制类型。
+            limit_bytes: 对应上限字节数。
+            observed_bytes: 已观察到的字节数。
+            response_context: 原始响应上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(message)
+        self.final_url = final_url
+        self.limit_kind = limit_kind
+        self.limit_bytes = limit_bytes
+        self.observed_bytes = observed_bytes
+        self.response_context = response_context
+
+
+class _FetchUrlSafetyError(RuntimeError):
+    """网络跳转目标被 Web URL safety owner 拒绝。"""
+
+    def __init__(self, *, url: str, reason: str) -> None:
+        """初始化 URL safety 异常。
+
+        Args:
+            url: 被拒绝的 URL。
+            reason: 被拒绝的网络阶段。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(f"URL is blocked by fetch safety policy during {reason}: {url}")
+        self.url = url
+        self.reason = reason
+
+
 def _raise_if_cancelled(cancellation_token: CancellationToken | None) -> None:
     """在进入下一网络阶段前执行协作式取消检查。
 
@@ -136,60 +294,16 @@ def _raise_if_cancelled(cancellation_token: CancellationToken | None) -> None:
             raise RuntimeError(cancellation_token.cancel_reason() or "工具调用已取消")
 
 
-def _close_response_safely(response: requests.Response) -> None:
-    """尽力关闭响应对象，兼容测试桩。
-
-    Args:
-        response: 任意响应对象。
-
-    Returns:
-        无。
-
-    Raises:
-        无。
-    """
-
-    close = getattr(response, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            return
-
-
-def _extract_response_snippet(response: requests.Response | None) -> str:
-    """提取响应文本前缀用于诊断。
-
-    Args:
-        response: HTTP 响应对象。
-
-    Returns:
-        限长后的文本前缀。
-
-    Raises:
-        无。
-    """
-
-    if response is None:
-        return ""
-    try:
-        text = _decode_response_text(response).strip()
-    except Exception:
-        return ""
-    if not text:
-        return ""
-    compact = re.sub(r"\s+", " ", text)
-    return compact[:_RESPONSE_SNIPPET_MAX_CHARS]
-
-
-def _sanitize_response_headers(headers: CaseInsensitiveDict[str] | dict[str, str] | None) -> dict[str, str]:
-    """筛选可用于分析的关键响应头。
+def _sanitize_response_headers(
+    headers: CaseInsensitiveDict[str] | dict[str, str] | None,
+) -> dict[str, str]:
+    """筛选仅供抓取状态机内部判断的关键响应头。
 
     Args:
         headers: 原始响应头映射。
 
     Returns:
-        过滤后的响应头字典。
+        内部有界响应头字典；进入日志/artifact 前仍必须经过 diagnostic projection。
 
     Raises:
         无。
@@ -222,8 +336,551 @@ def _sanitize_response_headers(headers: CaseInsensitiveDict[str] | dict[str, str
     return normalized
 
 
+def _is_redirect_response(response: requests.Response) -> bool:
+    """判断响应是否为需要 Web fetch owner 手动处理的 HTTP redirect。
+
+    Args:
+        response: HTTP 响应。
+
+    Returns:
+        需要继续跳转时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return int(response.status_code) in _HTTP_REDIRECT_STATUSES
+
+
+def _resolve_redirect_target(
+    *,
+    response: requests.Response,
+    current_url: str,
+    normalize_url_for_http: Callable[[str], str],
+) -> str:
+    """解析 HTTP redirect 的下一跳 URL。
+
+    Args:
+        response: 当前 redirect 响应。
+        current_url: 当前请求 URL。
+        normalize_url_for_http: URL 规范化函数。
+
+    Returns:
+        已规范化的下一跳 URL。
+
+    Raises:
+        RuntimeError: redirect 响应缺少或包含非法 ``Location`` 时抛出。
+    """
+
+    location = str(response.headers.get("Location", "") or response.headers.get("location", "") or "").strip()
+    if not location:
+        raise RuntimeError("HTTP redirect 响应缺少 Location 头。")
+    try:
+        return normalize_url_for_http(urljoin(str(getattr(response, "url", "") or current_url), location))
+    except ValueError as exc:
+        raise RuntimeError(f"HTTP redirect Location 无法解析: {location}") from exc
+
+
+def _authorize_http_target(
+    egress_policy: WebEgressPolicy,
+    *,
+    url: str,
+    reason: str,
+) -> AuthorizedHttpTarget:
+    """把 policy 拒绝投影为 fetch 编排层的稳定异常。
+
+    Args:
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        url: 待授权 URL。
+        reason: 当前网络阶段。
+
+    Returns:
+        当前 hop 的不可变授权目标。
+
+    Raises:
+        _FetchUrlSafetyError: policy 拒绝 URL 时抛出。
+    """
+
+    try:
+        return egress_policy.authorize_http_target(url, stage=reason)
+    except WebEgressPolicyError as exc:
+        raise _FetchUrlSafetyError(url=exc.url, reason=reason) from exc
+
+
+def _validate_response_target(
+    egress_policy: WebEgressPolicy,
+    *,
+    url: str,
+    target: AuthorizedHttpTarget,
+    reason: str,
+) -> str:
+    """验证 response URL 未离开已授权 origin。
+
+    Args:
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        url: response 报告的 URL。
+        target: 发送该请求的已授权目标。
+        reason: 当前响应阶段。
+
+    Returns:
+        规范化后的 response URL。
+
+    Raises:
+        _FetchUrlSafetyError: response origin 被偷换时抛出。
+    """
+
+    try:
+        return egress_policy.validate_response_url(url, target=target, stage=reason)
+    except WebEgressPolicyError as exc:
+        raise _FetchUrlSafetyError(url=exc.url, reason=reason) from exc
+
+
+def _append_limited_body_chunk(
+    *,
+    chunks: list[bytes],
+    chunk: bytes,
+    observed_bytes: int,
+    limit_bytes: int,
+    limit_kind: str,
+    response: requests.Response,
+) -> int:
+    """累计 body chunk 并在超过上限时失败。
+
+    Args:
+        chunks: 已读取 chunk 列表。
+        chunk: 当前 chunk。
+        observed_bytes: 此前已观察字节数。
+        limit_bytes: 字节上限。
+        limit_kind: 限制类型。
+        response: 当前 HTTP 响应。
+
+    Returns:
+        新的已观察字节数。
+
+    Raises:
+        _FetchBodyLimitExceeded: body 超过上限时抛出。
+    """
+
+    if not chunk:
+        return observed_bytes
+    next_size = observed_bytes + len(chunk)
+    if next_size > limit_bytes:
+        raise _FetchBodyLimitExceeded(
+            f"HTTP response {limit_kind} body exceeded fetch limit.",
+            final_url=str(getattr(response, "url", "") or ""),
+            limit_kind=limit_kind,
+            limit_bytes=limit_bytes,
+            observed_bytes=next_size,
+            response_context=_build_fetch_body_limit_runtime_context(response),
+        )
+    chunks.append(chunk)
+    return next_size
+
+
+def _iter_raw_response_chunks(response: requests.Response) -> Iterable[bytes]:
+    """按 wire bytes 读取 ``requests`` 响应。
+
+    Args:
+        response: 使用 ``stream=True`` 创建的响应。
+
+    Returns:
+        原始 wire chunk 迭代器。
+
+    Raises:
+        requests.RequestException: 底层读取失败时由 requests/urllib3 抛出。
+    """
+
+    return response.raw.stream(_FETCH_BODY_CHUNK_BYTES, decode_content=False)
+
+
+def _zlib_wrapped_deflate(data: bytes) -> bool:
+    """判断 deflate body 是否带 RFC 1950 zlib wrapper。
+
+    Args:
+        data: deflate 压缩字节。
+
+    Returns:
+        header 满足 zlib wrapper 约束时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if len(data) < 2:
+        return False
+    compression_method_and_flags = data[0]
+    additional_flags = data[1]
+    return compression_method_and_flags & 0x0F == 8 and (compression_method_and_flags << 8 | additional_flags) % 31 == 0
+
+
+def _decode_zlib_layer(
+    response: requests.Response,
+    encoded: bytes,
+    *,
+    window_bits: int,
+    limit_bytes: int,
+) -> bytes:
+    """用 ``decompressobj`` 增量解码单个 zlib/gzip 层。
+
+    每次 decoder 调用的最大输出固定为当前剩余预算加一字节，使超限在
+    完整输出物化前可判定。
+
+    Args:
+        response: 当前 HTTP 响应，用于构造 typed limit context。
+        encoded: 当前编码层输入。
+        window_bits: zlib window bits；可表达 gzip、zlib 或 raw deflate。
+        limit_bytes: 当前解码层输出上限。
+
+    Returns:
+        解码后的有界字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: 当前层输出超过上限时抛出。
+        RuntimeError: 压缩流不完整或 decoder 无法前进时抛出。
+        zlib.error: 压缩流非法时抛出。
+    """
+
+    decoder = zlib.decompressobj(window_bits)
+    decoded_chunks: list[bytes] = []
+    observed_bytes = 0
+    for offset in range(0, len(encoded), _FETCH_BODY_CHUNK_BYTES):
+        pending = encoded[offset : offset + _FETCH_BODY_CHUNK_BYTES]
+        while pending:
+            remaining_bytes = limit_bytes - observed_bytes
+            decoded_chunk = decoder.decompress(pending, remaining_bytes + 1)
+            observed_bytes = _append_limited_body_chunk(
+                chunks=decoded_chunks,
+                chunk=decoded_chunk,
+                observed_bytes=observed_bytes,
+                limit_bytes=limit_bytes,
+                limit_kind="decompressed",
+                response=response,
+            )
+            next_pending = decoder.unconsumed_tail
+            if not next_pending:
+                break
+            if next_pending == pending and not decoded_chunk:
+                raise RuntimeError("HTTP content decoder made no progress")
+            pending = next_pending
+    if not decoder.eof:
+        raise RuntimeError("HTTP compressed response ended before decoder reached EOF")
+    if decoder.unused_data:
+        raise RuntimeError("HTTP compressed response contains trailing encoded data")
+    return b"".join(decoded_chunks)
+
+
+def _decode_zstd_layer(
+    response: requests.Response,
+    encoded: bytes,
+    *,
+    limit_bytes: int,
+) -> bytes:
+    """用 zstandard ``stream_reader`` 有界解码单层 zstd。
+
+    Args:
+        response: 当前 HTTP 响应，用于构造 typed limit context。
+        encoded: 当前编码层输入。
+        limit_bytes: 当前解码层输出上限。
+
+    Returns:
+        解码后的有界字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: 当前层输出超过上限时抛出。
+        RuntimeError: 缺少带有界 streaming API 的 zstandard 依赖时抛出。
+    """
+
+    try:
+        zstandard = cast(_ZstandardModule, _import_optional_module("zstandard"))
+    except ImportError as exc:
+        raise _UnsupportedBoundedContentEncoding("zstd") from exc
+
+    reader = zstandard.ZstdDecompressor().stream_reader(BytesIO(encoded))
+    decoded_chunks: list[bytes] = []
+    observed_bytes = 0
+    try:
+        while True:
+            remaining_bytes = limit_bytes - observed_bytes
+            decoded_chunk = reader.read(min(_FETCH_BODY_CHUNK_BYTES, remaining_bytes + 1))
+            if not decoded_chunk:
+                break
+            observed_bytes = _append_limited_body_chunk(
+                chunks=decoded_chunks,
+                chunk=decoded_chunk,
+                observed_bytes=observed_bytes,
+                limit_bytes=limit_bytes,
+                limit_kind="decompressed",
+                response=response,
+            )
+    finally:
+        reader.close()
+    return b"".join(decoded_chunks)
+
+
+def _bounded_identity_layer(
+    response: requests.Response,
+    body: bytes,
+    *,
+    limit_bytes: int,
+) -> bytes:
+    """校验未编码 body 也受 decoded cap 约束。
+
+    Args:
+        response: 当前 HTTP 响应。
+        body: 未编码 body。
+        limit_bytes: decoded body 上限。
+
+    Returns:
+        未超限的原 body。
+
+    Raises:
+        _FetchBodyLimitExceeded: body 超过 decoded cap 时抛出。
+    """
+
+    if len(body) <= limit_bytes:
+        return body
+    raise _FetchBodyLimitExceeded(
+        "HTTP response decompressed body exceeded fetch limit.",
+        final_url=str(response.url or ""),
+        limit_kind="decompressed",
+        limit_bytes=limit_bytes,
+        observed_bytes=limit_bytes + 1,
+        response_context=_build_fetch_body_limit_runtime_context(
+            response,
+            body_excerpt=body[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES],
+        ),
+    )
+
+
+def _decompress_limited_response_body(
+    response: requests.Response,
+    wire_body: bytes,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> bytes:
+    """按 ``Content-Encoding`` 解压并限制 decompressed body 大小。
+
+    Args:
+        response: 当前 HTTP 响应。
+        wire_body: 已按 wire 上限读取的原始字节。
+        http_resource_budget: HTTP decoded body 预算。
+
+    Returns:
+        解压后的 body 字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: 解压后字节数超过上限时抛出。
+        RuntimeError: 内容编码声明存在但当前运行时无法有界解码时抛出。
+    """
+
+    decoded = wire_body
+    for encoding in reversed(_extract_content_encoding_tokens(getattr(response, "headers", {}))):
+        if encoding == "identity":
+            continue
+        if encoding == "gzip":
+            decoded = _decode_zlib_layer(
+                response,
+                decoded,
+                window_bits=zlib.MAX_WBITS | 16,
+                limit_bytes=http_resource_budget.decoded_body_bytes,
+            )
+        elif encoding == "deflate":
+            decoded = _decode_zlib_layer(
+                response,
+                decoded,
+                window_bits=(zlib.MAX_WBITS if _zlib_wrapped_deflate(decoded) else -zlib.MAX_WBITS),
+                limit_bytes=http_resource_budget.decoded_body_bytes,
+            )
+        elif encoding == "br":
+            raise _UnsupportedBoundedContentEncoding("brotli")
+        elif encoding == "zstd":
+            decoded = _decode_zstd_layer(
+                response,
+                decoded,
+                limit_bytes=http_resource_budget.decoded_body_bytes,
+            )
+        else:
+            raise _UnsupportedBoundedContentEncoding(encoding)
+    return _bounded_identity_layer(
+        response,
+        decoded,
+        limit_bytes=http_resource_budget.decoded_body_bytes,
+    )
+
+
+def _read_limited_response_body(
+    response: requests.Response,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> bytes:
+    """读取响应 body，并同时执行 wire/decompressed 上限。
+
+    Args:
+        response: 使用 ``stream=True`` 创建的 HTTP 响应。
+        http_resource_budget: HTTP wire/decoded body 预算。
+
+    Returns:
+        已解压、可供后续 HTML/Docling 转换消费的 body 字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: wire 或 decompressed body 超过上限时抛出。
+        RuntimeError: 内容编码声明存在但当前运行时无法解码时抛出。
+    """
+
+    content_length = str(response.headers.get("Content-Length", "") or response.headers.get("content-length", ""))
+    if content_length.strip():
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = 0
+        if declared_length > http_resource_budget.wire_body_bytes:
+            raise _FetchBodyLimitExceeded(
+                "HTTP response declared body exceeded fetch wire limit.",
+                final_url=str(getattr(response, "url", "") or ""),
+                limit_kind="wire",
+                limit_bytes=http_resource_budget.wire_body_bytes,
+                observed_bytes=declared_length,
+                response_context=_build_fetch_body_limit_runtime_context(response),
+            )
+
+    chunks: list[bytes] = []
+    observed_bytes = 0
+    for chunk in _iter_raw_response_chunks(response):
+        observed_bytes = _append_limited_body_chunk(
+            chunks=chunks,
+            chunk=chunk,
+            observed_bytes=observed_bytes,
+            limit_bytes=http_resource_budget.wire_body_bytes,
+            limit_kind="wire",
+            response=response,
+        )
+    return _decompress_limited_response_body(
+        response,
+        b"".join(chunks),
+        http_resource_budget=http_resource_budget,
+    )
+
+
+def _materialize_response_body(
+    response: requests.Response,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> None:
+    """把有界读取后的响应 body 写回 ``requests.Response``。
+
+    Args:
+        response: 当前 HTTP 响应。
+        http_resource_budget: HTTP wire/decoded body 预算。
+
+    Returns:
+        无。
+
+    Raises:
+        _FetchBodyLimitExceeded: body 超过上限时抛出。
+        RuntimeError: body 解码失败时抛出。
+    """
+
+    decoded_body = _read_limited_response_body(
+        response,
+        http_resource_budget=http_resource_budget,
+    )
+    setattr(response, "_content", decoded_body)
+    response.raw.decode_content = False
+
+
+def _request_with_safe_redirects(
+    session: requests.Session,
+    *,
+    method: str,
+    url: str,
+    timeout: float,
+    headers: dict[str, str],
+    normalize_url_for_http: Callable[[str], str],
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    stream: bool,
+    cancellation_token: CancellationToken | None,
+) -> tuple[AuthorizedResponseLease, int, tuple[str, ...]]:
+    """执行带逐跳安全校验的 HTTP 请求。
+
+    Args:
+        session: requests Session。
+        method: HTTP 方法。
+        url: 初始 URL。
+        timeout: 请求超时。
+        headers: 请求头。
+        normalize_url_for_http: URL 规范化函数。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
+        stream: 是否以 stream 模式读取响应。
+        cancellation_token: 取消令牌。
+
+    Returns:
+        ``(最终 response lease, HTTP redirect 跳数, 已访问 URL 记录)``。
+
+    Raises:
+        requests.TooManyRedirects: redirect 超过上限时抛出。
+        RuntimeError: redirect 目标被安全策略拒绝时抛出。
+    """
+
+    current_target = _authorize_http_target(egress_policy, url=url, reason="http_request")
+    current_url = current_target.normalized_url
+    current_headers = dict(headers)
+    redirect_hops = 0
+    visited_urls = [current_url]
+    while True:
+        _raise_if_cancelled(cancellation_token)
+        lease = _send_authorized_request(
+            session,
+            target=current_target,
+            method=method,
+            timeout=timeout,
+            headers=current_headers,
+            stream=stream,
+            transport_policy=transport_policy,
+        )
+        transferred = False
+        try:
+            response = lease.response
+            _raise_if_cancelled(cancellation_token)
+            response_url = _validate_response_target(
+                egress_policy,
+                url=str(response.url or current_url),
+                target=current_target,
+                reason="http_response",
+            )
+            visited_urls.append(response_url)
+            if not _is_redirect_response(response):
+                transferred = True
+                return lease, redirect_hops, tuple(dict.fromkeys(visited_urls))
+            if redirect_hops >= _MAX_HTTP_REDIRECT_HOPS:
+                raise requests.TooManyRedirects(
+                    "HTTP redirect chain exceeded fetch limit",
+                    response=response,
+                )
+            next_url = _resolve_redirect_target(
+                response=response,
+                current_url=current_url,
+                normalize_url_for_http=normalize_url_for_http,
+            )
+            next_target = _authorize_http_target(
+                egress_policy,
+                url=next_url,
+                reason="http_redirect",
+            )
+            visited_urls.append(next_target.normalized_url)
+            current_headers = dict(headers)
+            current_headers["Referer"] = response_url
+            current_target = next_target
+            current_url = next_target.normalized_url
+            redirect_hops += 1
+        finally:
+            if not transferred:
+                lease.close()
+
+
 def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchContentRuntimeContext:
-    """从响应对象构造抓取转换失败上下文。
+    """从响应对象构造不可逆抓取转换失败上下文。
 
     Args:
         response: 原始 HTTP 响应。
@@ -235,16 +892,50 @@ def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchC
         无。
     """
 
+    response_bytes = bytes(response.content)
     try:
-        raw_content_text = _decode_response_text(response)
+        response_text = _decode_response_text(response)
     except Exception:
-        raw_content_text = ""
+        response_text = ""
+    challenge = detect_bot_challenge(response=response, content_text=response_text)
     return _FetchContentRuntimeContext(
-        http_status=getattr(response, "status_code", None),
-        final_url=str(getattr(response, "url", "") or ""),
-        response_headers={str(key): str(value) for key, value in dict(getattr(response, "headers", {}) or {}).items()},
-        response_excerpt=_extract_response_snippet(response),
-        raw_content_text=raw_content_text,
+        http_status=response.status_code,
+        safe_final_url=project_safe_url_or_empty(str(response.url or "")),
+        response_headers=project_response_headers(response.headers),
+        content=content_diagnostic_from_bytes(response_bytes),
+        challenge_decision=challenge.decision,
+        challenge_signals=challenge.challenge_signals,
+        has_client_rendering_markers=_html_text_has_client_rendering_markers(response_text),
+    )
+
+
+def _build_fetch_body_limit_runtime_context(
+    response: requests.Response,
+    *,
+    body_excerpt: bytes = b"",
+) -> _FetchContentRuntimeContext:
+    """为 body 上限异常构造不会读取响应剩余 body 的上下文。
+
+    Args:
+        response: 当前 HTTP 响应。
+        body_excerpt: 已读取且已裁剪的 body 前缀。
+
+    Returns:
+        body-limit 专用响应上下文。
+
+    Raises:
+        无。
+    """
+
+    bounded_excerpt = body_excerpt[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES]
+    return _FetchContentRuntimeContext(
+        http_status=response.status_code,
+        safe_final_url=project_safe_url_or_empty(str(response.url or "")),
+        response_headers=project_response_headers(response.headers),
+        content=content_diagnostic_from_bytes(bounded_excerpt),
+        challenge_decision=BotChallengeDecision.NONE,
+        challenge_signals=(),
+        has_client_rendering_markers=False,
     )
 
 
@@ -462,8 +1153,7 @@ def _should_escalate_conversion_failure_to_browser(
     ):
         return False
 
-    raw_text = str(response_context.raw_content_text or response_context.response_excerpt or "")
-    return _html_text_has_client_rendering_markers(raw_text)
+    return response_context.has_client_rendering_markers
 
 
 def _should_escalate_stage_result_to_browser(stage_result: dict[str, str | bool | int | float | None] | None) -> bool:
@@ -503,12 +1193,9 @@ def _should_escalate_pipeline_failure_to_browser(
         paragraph_count = 0
 
     quality_flags = {str(flag).strip().lower() for flag in pipeline_error.quality_flags}
-    raw_text = str(response_context.raw_content_text or response_context.response_excerpt or "").lower()
-
     extractor_found_no_body = text_length <= _EMPTY_CONTENT_MIN_CHARS or paragraph_count <= 0
     quality_indicates_empty_shell = bool({"too_short", "too_few_blocks"} & quality_flags)
-    has_client_rendering_markers = _html_text_has_client_rendering_markers(raw_text)
-    return (extractor_found_no_body or quality_indicates_empty_shell) and has_client_rendering_markers
+    return (extractor_found_no_body or quality_indicates_empty_shell) and response_context.has_client_rendering_markers
 
 
 def _get_session_warmed_hosts(session: requests.Session) -> set[str]:
@@ -522,6 +1209,34 @@ def _get_session_warmed_hosts(session: requests.Session) -> set[str]:
     return warmed_hosts
 
 
+def _consume_warmup_response_body(
+    response: requests.Response,
+    *,
+    max_bytes: int,
+) -> int:
+    """最多消费 warmup 预算允许的 wire body。
+
+    Args:
+        response: 使用 ``stream=True`` 创建的 warmup 响应。
+        max_bytes: 本次 warmup 最多消费的 wire bytes。
+
+    Returns:
+        实际消费的 wire bytes。
+
+    Raises:
+        requests.RequestException: 底层 response stream 读取失败时透出。
+    """
+
+    consumed_bytes = 0
+    while consumed_bytes < max_bytes:
+        remaining_bytes = max_bytes - consumed_bytes
+        chunk = response.raw.read(min(_FETCH_BODY_CHUNK_BYTES, remaining_bytes))
+        if not chunk:
+            break
+        consumed_bytes += len(chunk)
+    return consumed_bytes
+
+
 def _warmup_domain(
     session: requests.Session,
     *,
@@ -530,12 +1245,39 @@ def _warmup_domain(
     headers: dict[str, str],
     resolve_timeout_budget: Callable[..., float],
     build_domain_home_url: Callable[[str], str],
+    normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    browser_resource_budget: BrowserResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> dict[str, str | bool | int | float | None]:
-    """对目标域做一次预热请求以建立 Cookie。"""
+    """对目标域做一次有界预热请求以建立 Cookie。
+
+    Args:
+        session: 当前 requests Session。
+        url: 目标 URL。
+        timeout_seconds: 基础请求超时秒数。
+        headers: 请求头。
+        resolve_timeout_budget: 当前阶段 timeout 解析函数。
+        build_domain_home_url: 同域首页 URL 构造函数。
+        normalize_url_for_http: HTTP URL 规范化函数。
+        is_timeout_like_exception: timeout 异常识别函数。
+        egress_policy: 当前 Web 调用唯一出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
+        browser_resource_budget: warmup body 预算。
+        timeout_budget: 工具调用总预算。
+        deadline_monotonic: 当前工具调用 deadline。
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        warmup 尝试、状态、跳数和消费字节等事实。
+
+    Raises:
+        无。请求失败会投影为返回事实；取消由内部检查函数抛出。
+    """
 
     host = (urlparse(url).hostname or "").lower().strip()
     if not host:
@@ -558,21 +1300,36 @@ def _warmup_domain(
     )
     try:
         _raise_if_cancelled(cancellation_token)
-        response = session.get(
-            warmup_url,
+        lease, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+            session,
+            method="GET",
+            url=warmup_url,
             timeout=warmup_timeout,
             headers=headers,
-            allow_redirects=True,
+            normalize_url_for_http=normalize_url_for_http,
+            egress_policy=egress_policy,
+            transport_policy=transport_policy,
+            stream=True,
+            cancellation_token=cancellation_token,
         )
-        _raise_if_cancelled(cancellation_token)
+        with lease:
+            response = lease.response
+            _raise_if_cancelled(cancellation_token)
+            consumed_body_bytes = _consume_warmup_response_body(
+                response,
+                max_bytes=browser_resource_budget.warmup_body_bytes,
+            )
+            result: dict[str, str | bool | int | float | None] = {
+                "attempted": True,
+                "success": True,
+                "http_status": response.status_code,
+                "final_url": response.url,
+                "redirect_hops": redirect_hops,
+                "consumed_body_bytes": consumed_body_bytes,
+            }
         with _WARMED_HOSTS_LOCK:
             _get_session_warmed_hosts(session).add(host)
-        return {
-            "attempted": True,
-            "success": True,
-            "http_status": response.status_code,
-            "final_url": response.url,
-        }
+        return result
     except Exception as exc:
         _raise_if_cancelled(cancellation_token)
         return {
@@ -591,12 +1348,36 @@ def _probe_content_type(
     timeout_seconds: float,
     headers: dict[str, str],
     resolve_timeout_budget: Callable[..., float],
+    normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> dict[str, str | bool | int | None]:
-    """探测目标资源类型（HEAD 优先，失败降级到 GET）。"""
+    """探测目标资源类型（HEAD 优先，失败降级到零 body GET）。
+
+    Args:
+        session: 当前 requests Session。
+        url: 目标 URL。
+        timeout_seconds: 基础请求超时秒数。
+        headers: 请求头。
+        resolve_timeout_budget: 当前阶段 timeout 解析函数。
+        normalize_url_for_http: HTTP URL 规范化函数。
+        is_timeout_like_exception: timeout 异常识别函数。
+        egress_policy: 当前 Web 调用唯一出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
+        timeout_budget: 工具调用总预算。
+        deadline_monotonic: 当前工具调用 deadline。
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        HEAD 或零 body GET 观察到的内容类型与响应事实。
+
+    Raises:
+        无。两种探测失败均投影为返回事实；取消由内部检查函数抛出。
+    """
 
     timeout = min(
         resolve_timeout_budget(
@@ -608,31 +1389,58 @@ def _probe_content_type(
     )
     try:
         _raise_if_cancelled(cancellation_token)
-        response = session.head(url, timeout=timeout, headers=headers, allow_redirects=True)
-        _raise_if_cancelled(cancellation_token)
-        content_type = str(response.headers.get("Content-Type", "")).lower()
-        return {
-            "method": "HEAD",
-            "content_type": content_type,
-            "http_status": response.status_code,
-            "final_url": response.url,
-            "ok": True,
-        }
-    except Exception as head_exc:
-        try:
-            _raise_if_cancelled(cancellation_token)
-            response = session.get(url, timeout=timeout, headers=headers, stream=True, allow_redirects=True)
+        lease, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+            session,
+            method="HEAD",
+            url=url,
+            timeout=timeout,
+            headers=headers,
+            normalize_url_for_http=normalize_url_for_http,
+            egress_policy=egress_policy,
+            transport_policy=transport_policy,
+            stream=False,
+            cancellation_token=cancellation_token,
+        )
+        with lease:
+            response = lease.response
             _raise_if_cancelled(cancellation_token)
             content_type = str(response.headers.get("Content-Type", "")).lower()
-            response.close()
             return {
-                "method": "GET",
+                "method": "HEAD",
                 "content_type": content_type,
                 "http_status": response.status_code,
                 "final_url": response.url,
+                "redirect_hops": redirect_hops,
                 "ok": True,
-                "head_error": type(head_exc).__name__,
             }
+    except Exception as head_exc:
+        try:
+            _raise_if_cancelled(cancellation_token)
+            lease, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+                session,
+                method="GET",
+                url=url,
+                timeout=timeout,
+                headers=headers,
+                normalize_url_for_http=normalize_url_for_http,
+                egress_policy=egress_policy,
+                transport_policy=transport_policy,
+                stream=True,
+                cancellation_token=cancellation_token,
+            )
+            with lease:
+                response = lease.response
+                _raise_if_cancelled(cancellation_token)
+                content_type = str(response.headers.get("Content-Type", "")).lower()
+                return {
+                    "method": "GET",
+                    "content_type": content_type,
+                    "http_status": response.status_code,
+                    "final_url": response.url,
+                    "redirect_hops": redirect_hops,
+                    "ok": True,
+                    "head_error": type(head_exc).__name__,
+                }
         except Exception as get_exc:
             _raise_if_cancelled(cancellation_token)
             return {
@@ -660,7 +1468,7 @@ def _should_route_response_to_html_pipeline(
     if "html" in normalized_content_type:
         return True
 
-    uri_suffix = infer_suffix_from_uri(url)
+    uri_suffix = infer_suffix_from_uri(urlparse(url).path)
     if uri_suffix in {".html", ".htm", ".xhtml"}:
         return True
 
@@ -676,7 +1484,7 @@ def _infer_docling_stream_name(*, url: str, content_type: str) -> str:
     """为 Docling 推断更稳定的输入流名称。"""
 
     normalized_content_type = str(content_type or "").lower()
-    uri_suffix = infer_suffix_from_uri(url)
+    uri_suffix = infer_suffix_from_uri(urlparse(url).path)
 
     if "pdf" in normalized_content_type or uri_suffix == ".pdf":
         return "page.pdf"
@@ -743,11 +1551,14 @@ def _fetch_and_convert_content(
     get_web_session: Callable[[], requests.Session] | None = None,
     headers: dict[str, str] | None = None,
     build_fetch_headers: Callable[[str], dict[str, str]] | None = None,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    http_resource_budget: HttpResourceBudget,
     content_type_probe: dict[str, str | bool | int | None] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
-) -> dict[str, str | int | bool | list[str] | dict[str, int] | requests.Response | dict[str, str]]:
+) -> dict[str, str | int | bool | list[str] | dict[str, int] | dict[str, str]]:
     """先下载页面内容，再按内容类型转换为低噪音 Markdown。
 
     Args:
@@ -762,9 +1573,13 @@ def _fetch_and_convert_content(
         get_web_session: 默认 Session 提供器。
         headers: 可选请求头。
         build_fetch_headers: 默认请求头构造器。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
+        http_resource_budget: HTTP wire/decoded body 预算。
         content_type_probe: 可选内容类型探测结果。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        cancellation_token: 当前工具调用的可选取消令牌。
 
     Returns:
         抓取和转换结果，包含 ``title/content/http_status/final_url`` 等字段。
@@ -790,6 +1605,7 @@ def _fetch_and_convert_content(
     current_headers = dict(resolved_headers)
     visited_urls = {url}
     meta_refresh_hops = 0
+    http_redirect_hops = 0
 
     while True:
         _raise_if_cancelled(cancellation_token)
@@ -799,103 +1615,121 @@ def _fetch_and_convert_content(
             deadline_monotonic=deadline_monotonic,
         )
         _raise_if_cancelled(cancellation_token)
-        response = resolved_session.get(
-            current_url,
+        lease, current_redirect_hops, redirect_visited_urls = _request_with_safe_redirects(
+            resolved_session,
+            method="GET",
+            url=current_url,
             timeout=timeout,
             headers=current_headers,
-            allow_redirects=True,
+            normalize_url_for_http=normalize_url_for_http,
+            egress_policy=egress_policy,
+            transport_policy=transport_policy,
+            stream=True,
+            cancellation_token=cancellation_token,
         )
-        response.raise_for_status()
-        _raise_if_cancelled(cancellation_token)
-
-        probe = (
-            content_type_probe or {"ok": False, "content_type": ""}
-            if meta_refresh_hops == 0
-            else {"ok": False, "content_type": ""}
-        )
-        content_type = str(probe.get("content_type", "") or response.headers.get("Content-Type", "")).lower()
-        response_text = _decode_response_text(response)
-        if _should_route_response_to_html_pipeline(
-            url=getattr(response, "url", current_url),
-            content_type=content_type,
-            response_text=response_text,
-            response_content=response.content,
-        ):
-            html_text = _extract_html_response_text(response)
-            next_meta_refresh_url = _resolve_meta_refresh_follow_target(
-                response=response,
-                html_text=html_text,
-                visited_urls=visited_urls,
-                meta_refresh_hops=meta_refresh_hops,
-                normalize_url_for_http=normalize_url_for_http,
-            )
-            if next_meta_refresh_url is not None:
-                _raise_if_cancelled(cancellation_token)
-                current_headers = dict(resolved_headers)
-                current_headers["Referer"] = build_referer(str(getattr(response, "url", current_url) or current_url))
-                current_url = next_meta_refresh_url
-                visited_urls.add(next_meta_refresh_url)
-                meta_refresh_hops += 1
-                _close_response_safely(response)
-                continue
-
-            raw_challenge = detect_bot_challenge(
-                response=response,
-                content_text=html_text,
-            )
-            if raw_challenge.challenge_detected:
-                raise _FetchContentConversionError(
-                    "HTML 原始响应疑似反爬挑战页或访问门禁。",
-                    response_context=_build_fetch_content_runtime_context(response),
-                    original_error=RuntimeError("raw_html_bot_challenge"),
-                )
+        with lease:
+            response = lease.response
+            http_redirect_hops += current_redirect_hops
+            visited_urls.update(redirect_visited_urls)
+            _raise_if_cancelled(cancellation_token)
             try:
-                _raise_if_cancelled(cancellation_token)
-                pipeline_result = convert_html(
-                    html_text,
-                    url=getattr(response, "url", current_url),
+                _materialize_response_body(
+                    response,
+                    http_resource_budget=http_resource_budget,
                 )
-            except RuntimeError as exc:
+            except _UnsupportedBoundedContentEncoding as exc:
                 raise _FetchContentConversionError(
                     str(exc),
-                    response_context=_build_fetch_content_runtime_context(response),
+                    response_context=_build_fetch_body_limit_runtime_context(response),
                     original_error=exc,
+                    failure_reason="unsupported_content_encoding",
                 ) from exc
-            title = pipeline_result.title
-            markdown = pipeline_result.markdown
-            extraction_source = pipeline_result.extractor_source
-            renderer_source = pipeline_result.renderer_source
-            normalization_applied = pipeline_result.normalization_applied
-            quality_flags = list(pipeline_result.quality_flags)
-            content_stats = dict(pipeline_result.content_stats)
-        else:
             _raise_if_cancelled(cancellation_token)
-            title, markdown, extraction_source = convert_non_html(
-                response.content,
-                _infer_docling_stream_name(
-                    url=getattr(response, "url", current_url),
-                    content_type=content_type,
-                ),
+            response.raise_for_status()
+
+            probe = (
+                content_type_probe or {"ok": False, "content_type": ""}
+                if meta_refresh_hops == 0
+                else {"ok": False, "content_type": ""}
             )
-            renderer_source = "docling"
-            normalization_applied = False
-            quality_flags = []
-            content_stats = {
-                "text_length": len(markdown),
-                "markdown_length": len(markdown),
+            content_type = str(probe.get("content_type", "") or response.headers.get("Content-Type", "")).lower()
+            response_text = _decode_response_text(response)
+            response_content = content_diagnostic_from_bytes(bytes(response.content))
+            response_url = str(response.url or current_url)
+            if _should_route_response_to_html_pipeline(
+                url=response_url,
+                content_type=content_type,
+                response_text=response_text,
+                response_content=response.content,
+            ):
+                html_text = _extract_html_response_text(response)
+                next_meta_refresh_url = _resolve_meta_refresh_follow_target(
+                    response=response,
+                    html_text=html_text,
+                    visited_urls=visited_urls,
+                    meta_refresh_hops=meta_refresh_hops,
+                    normalize_url_for_http=normalize_url_for_http,
+                )
+                if next_meta_refresh_url is not None:
+                    _raise_if_cancelled(cancellation_token)
+                    current_headers = dict(resolved_headers)
+                    current_headers["Referer"] = build_referer(response_url)
+                    current_url = next_meta_refresh_url
+                    visited_urls.add(next_meta_refresh_url)
+                    meta_refresh_hops += 1
+                    continue
+
+                raw_challenge = detect_bot_challenge(
+                    response=response,
+                    content_text=html_text,
+                )
+                if raw_challenge.decision is BotChallengeDecision.CONFIRMED:
+                    raise _FetchContentConversionError(
+                        "HTML 原始响应疑似反爬挑战页或访问门禁。",
+                        response_context=_build_fetch_content_runtime_context(response),
+                        original_error=RuntimeError("raw_html_bot_challenge"),
+                    )
+                try:
+                    _raise_if_cancelled(cancellation_token)
+                    pipeline_result = convert_html(html_text, url=response_url)
+                except RuntimeError as exc:
+                    raise _FetchContentConversionError(
+                        str(exc),
+                        response_context=_build_fetch_content_runtime_context(response),
+                        original_error=exc,
+                    ) from exc
+                title = pipeline_result.title
+                markdown = pipeline_result.markdown
+                extraction_source = pipeline_result.extractor_source
+                renderer_source = pipeline_result.renderer_source
+                normalization_applied = pipeline_result.normalization_applied
+                quality_flags = list(pipeline_result.quality_flags)
+                content_stats = dict(pipeline_result.content_stats)
+            else:
+                _raise_if_cancelled(cancellation_token)
+                title, markdown, extraction_source = convert_non_html(
+                    response.content,
+                    _infer_docling_stream_name(url=response_url, content_type=content_type),
+                )
+                renderer_source = "docling"
+                normalization_applied = False
+                quality_flags = []
+                content_stats = {
+                    "text_length": len(markdown),
+                    "markdown_length": len(markdown),
+                }
+            return {
+                "title": title,
+                "content": markdown,
+                "extraction_source": extraction_source,
+                "renderer_source": renderer_source,
+                "normalization_applied": normalization_applied,
+                "quality_flags": quality_flags,
+                "content_stats": content_stats,
+                "http_status": response.status_code,
+                "final_url": response_url,
+                "redirect_hops": http_redirect_hops + meta_refresh_hops,
+                "response_headers": _sanitize_response_headers(response.headers),
+                "response_content_length": response_content.length,
+                "response_content_digest": response_content.digest,
             }
-        return {
-            "title": title,
-            "content": markdown,
-            "extraction_source": extraction_source,
-            "renderer_source": renderer_source,
-            "normalization_applied": normalization_applied,
-            "quality_flags": quality_flags,
-            "content_stats": content_stats,
-            "http_status": response.status_code,
-            "final_url": response.url,
-            "redirect_hops": len(response.history) + meta_refresh_hops,
-            "response": response,
-            "response_headers": dict(response.headers),
-            "response_excerpt": _extract_response_snippet(response),
-        }

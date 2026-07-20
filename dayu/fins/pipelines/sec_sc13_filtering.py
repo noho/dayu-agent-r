@@ -18,6 +18,8 @@ from dayu.fins.downloaders.sec_downloader import (
     accession_to_no_dash,
     build_source_fingerprint,
 )
+from dayu.fins.domain.document_models import DownloadRejectionRegistry
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
 from dayu.fins._log import Log
 
 from .sec_download_state import (
@@ -184,7 +186,7 @@ class SecSc13WorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[tuple[Sequence[Sc13FilingRecordProtocol], set[str]]]:
@@ -201,7 +203,7 @@ class SecSc13WorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[Sequence[Sc13FilingRecordProtocol]]:
@@ -216,7 +218,7 @@ class SecSc13WorkflowHost(Protocol):
         archive_cik: str,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[bool]:
@@ -372,7 +374,7 @@ async def filter_sc13_by_direction(
     target_cik: str,
     archive_cik: str,
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-    rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+    rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
@@ -409,7 +411,7 @@ async def should_keep_sc13_direction(
     target_cik: str,
     download_version: str,
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-    rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+    rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> bool:
@@ -524,7 +526,7 @@ async def extend_with_browse_edgar_sc13(
     parse_date: Callable[[str, bool], dt.date],
     create_filing_record: Callable[[str, str, Optional[str], str, str, Optional[str]], Sc13FilingRecordProtocol],
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-    rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+    rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
@@ -564,7 +566,9 @@ async def extend_with_browse_edgar_sc13(
                 _browse_edgar_filings_to_dicts(entries),
             )
         for entry in entries:
-            normalized_form = _normalize_form(entry.form_type)
+            normalized_form = normalize_sec_form_type_for_matching(entry.form_type)
+            if normalized_form is None:
+                continue
             if normalized_form not in form_windows:
                 continue
             try:
@@ -643,7 +647,7 @@ async def retry_sc13_if_empty(
     end_date: dt.date,
     target_cik: str,
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-    rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+    rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
@@ -694,27 +698,6 @@ async def retry_sc13_if_empty(
         )
 
     return list(filings)
-
-
-def _normalize_form(value: str) -> str:
-    """将 SC13 相关表单文本标准化。"""
-
-    normalized = str(value).strip().upper().replace("-", " ")
-    alias_map = {
-        "SCHEDULE 13D": "SC 13D",
-        "SCHEDULE 13D/A": "SC 13D/A",
-        "SCHEDULE 13G": "SC 13G",
-        "SCHEDULE 13G/A": "SC 13G/A",
-        "SC 13D": "SC 13D",
-        "SC 13D/A": "SC 13D/A",
-        "SC 13G": "SC 13G",
-        "SC 13G/A": "SC 13G/A",
-        "SC13D": "SC 13D",
-        "SC13D/A": "SC 13D/A",
-        "SC13G": "SC 13G",
-        "SC13G/A": "SC 13G/A",
-    }
-    return alias_map.get(normalized.replace("  ", " "), normalized)
 
 
 __all__ = [

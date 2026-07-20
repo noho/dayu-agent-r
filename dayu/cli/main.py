@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-import os
+import io
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
@@ -53,6 +53,8 @@ AUTO_LOG_FILE_OPEN_FAILED_TEMPLATE: str = (
 )
 AUTO_LOG_FILE_PREFIX: str = "dayu-cli-"
 AUTO_LOG_FILE_SUFFIX: str = ".log"
+CLI_STANDARD_STREAM_ENCODING: str = "utf-8"
+CLI_STANDARD_STREAM_ERRORS: str = "strict"
 
 COMMAND_RUNNERS: dict[str, CommandRunner] = {
     command_name: run_not_implemented_command for command_name in CLI_COMMAND_NAMES
@@ -75,8 +77,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     :param argv: 不含程序名的命令行参数；为 ``None`` 时使用进程参数。
     :returns: 进程退出码。
-    :raises OSError: 命令占位执行写 stderr 失败时由底层输出函数透传。
+    :raises OSError: 标准流重新配置或命令输出失败时透传。
+    :raises ValueError: 标准流状态不允许重新配置时透传。
     """
+
+    _configure_cli_standard_stream(sys.stdout)
+    _configure_cli_standard_stream(sys.stderr)
 
     opened_log_stream: TextIO | None = None
     log_level_for_cleanup: str | None = None
@@ -134,6 +140,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _normalize_system_exit_code(exc)
 
 
+def _configure_cli_standard_stream(stream: TextIO) -> None:
+    """把真实 CLI 标准文本流配置为严格 UTF-8 输出。
+
+    :param stream: 当前进程的 stdout 或 stderr 文本流。
+    :returns: ``None``；内存 capture 等非 ``TextIOWrapper`` 流保持原样。
+    :raises OSError: 底层标准流不支持重新配置时透传。
+    :raises ValueError: 文本流状态不允许重新配置时透传。
+    """
+
+    if isinstance(stream, io.TextIOWrapper):
+        stream.reconfigure(
+            encoding=CLI_STANDARD_STREAM_ENCODING,
+            errors=CLI_STANDARD_STREAM_ERRORS,
+        )
+
+
 def _open_log_file(log_file: str) -> TextIO | None:
     """打开 CLI 诊断日志文件。
 
@@ -166,12 +188,12 @@ def _open_default_log_file() -> TextIO | None:
     """
 
     try:
-        file_descriptor, log_file_path = tempfile.mkstemp(
+        return tempfile.TemporaryFile(
+            mode="w+",
+            encoding="utf-8",
             prefix=AUTO_LOG_FILE_PREFIX,
             suffix=AUTO_LOG_FILE_SUFFIX,
         )
-        os.close(file_descriptor)
-        return open(log_file_path, mode="a", encoding="utf-8")
     except OSError as exc:
         print(AUTO_LOG_FILE_OPEN_FAILED_TEMPLATE.format(error=exc), file=sys.stderr)
         return None

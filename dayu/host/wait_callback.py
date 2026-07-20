@@ -28,7 +28,7 @@ from dayu.host.api import (
     RunSnapshot,
     WaitResolutionSource,
 )
-from dayu.host.durable.codec import is_sha256_digest, parse_utc_timestamp
+from dayu.host.durable.codec import is_sha256_digest
 from dayu.host.durable.wait_resolution_digest import wait_resolution_digest
 
 
@@ -46,7 +46,6 @@ class WaitCallbackAdapterStatus(StrEnum):
     UNKNOWN_WAIT = "unknown_wait"
     LATE_WAIT_CANCELLED = "late_wait_cancelled"
     LATE_WAIT_LOST = "late_wait_lost"
-    STALE_CALLBACK = "stale_callback"
     DIGEST_MISMATCH = "digest_mismatch"
     AUTH_FAILED = "auth_failed"
     INVALID_WAIT_STATE = "invalid_wait_state"
@@ -420,9 +419,6 @@ class DefaultWaitCallbackAdapter:
                     message="wait record not found",
                     retryable=False,
                 )
-            stale_status = _stale_status_or_none(wait_state, envelope.completed_at)
-            if stale_status is not None:
-                return stale_status
             if _callback_payload_digest(envelope) != envelope.payload_digest:
                 return _result(
                     status=WaitCallbackAdapterStatus.DIGEST_MISMATCH,
@@ -520,42 +516,6 @@ def _callback_payload_digest(envelope: WaitCallbackCompletionEnvelope) -> str:
         envelope.idempotency_key,
         envelope.outcome,
     )
-
-
-def _stale_status_or_none(
-    wait_state: WaitCallbackStoredWaitState, completed_at: datetime
-) -> WaitCallbackAdapterResult | None:
-    """根据 wait deadline/expires 判断 callback 是否 stale。
-
-    :param wait_state: 预读 wait state。
-    :param completed_at: 外部完成时间。
-    :returns: stale/invalid 状态；未 stale 时返回 ``None``。
-    """
-
-    boundary_text = (
-        wait_state.deadline_at
-        if wait_state.deadline_at is not None
-        else wait_state.expires_at
-    )
-    if boundary_text is None:
-        return None
-    try:
-        boundary = parse_utc_timestamp(boundary_text)
-    except ValueError:
-        return _result(
-            status=WaitCallbackAdapterStatus.INVALID_WAIT_STATE,
-            diagnostic_code="invalid_wait_time_boundary",
-            message="wait record contains invalid time boundary",
-            retryable=False,
-        )
-    if completed_at > boundary:
-        return _result(
-            status=WaitCallbackAdapterStatus.STALE_CALLBACK,
-            diagnostic_code="stale_callback",
-            message="callback completed after wait deadline",
-            retryable=False,
-        )
-    return None
 
 
 def _result_from_host_api_error(

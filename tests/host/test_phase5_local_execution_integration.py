@@ -17,6 +17,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
@@ -26,6 +27,7 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host import (
     AuthorizationClaim,
     CancelRunRequest,
@@ -248,7 +250,7 @@ class _ScriptedLocalWorkerHandle:
                 run_id=self._bound_run_id(),
                 type=EngineEventType.RUN_FAILED,
                 data=RunFailedData(
-                    error_code="fake_worker_failed",
+                    error_code=adapter_error_code("fake_worker_failed"),
                     message="fake worker failed",
                     provider_request_id=None,
                     recoverable=False,
@@ -903,7 +905,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-phase5-local",
                 execution_target="target-phase5-local",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
@@ -1111,6 +1113,8 @@ async def _open_scheduler(
                 continuation_max_attempts=0,
                 allow_tool_calls=False,
                 tool_execution_timeout_seconds=1.0,
+                fallback_prompt="test fallback prompt",
+                continuation_prompt="test continuation prompt",
             ),
             worker_factory=worker_factory,
         ),

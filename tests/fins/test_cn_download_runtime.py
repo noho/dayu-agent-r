@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
+from dayu.fins.domain.document_models import FinsSourceProvider, ProcessedCreateRequest
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
@@ -20,6 +22,7 @@ from dayu.fins.ingestion_runtime import (
     FsFinsIngestionJobStore,
 )
 from dayu.fins.pipelines.cn_download_models import (
+    CnMarketKind,
     CnCompanyProfile,
     CnReportCandidate,
     CnReportQuery,
@@ -36,6 +39,7 @@ from dayu.fins.pipelines.cn_pipeline import (
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import (
+    FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
@@ -43,7 +47,7 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.ticker_normalization import NormalizedTicker
+from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"1" * 2048
 _DOCLING_BYTES = b'{"document": "runtime-ok"}'
@@ -81,6 +85,7 @@ class _RuntimeFakeDiscoveryClient:
     title: str
     source_id: str
     download_calls: int = 0
+    cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
 
     def resolve_company(self, query: CnReportQuery) -> CnCompanyProfile:
         """返回固定公司元数据。
@@ -106,12 +111,15 @@ class _RuntimeFakeDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """返回固定年度报告候选。
 
         Args:
             query: 下载查询。
             profile: 公司元数据。
+            cancellation_checkpoint: workflow-owned 无参取消检查点。
 
         Returns:
             候选报告 tuple。
@@ -121,6 +129,9 @@ class _RuntimeFakeDiscoveryClient:
         """
 
         del profile
+        self.cancellation_checkpoints.append(cancellation_checkpoint)
+        if cancellation_checkpoint is not None:
+            cancellation_checkpoint()
         fiscal_year = 2025 if query.market == "CN" else 2024
         filing_date = "2026-04-01" if query.market == "CN" else "2025-04-08"
         return (
@@ -141,7 +152,7 @@ class _RuntimeFakeDiscoveryClient:
         )
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
-        """返回本地 PDF 资产。
+        """返回内存 PDF 资产。
 
         Args:
             candidate: 远端候选。
@@ -150,15 +161,13 @@ class _RuntimeFakeDiscoveryClient:
             已下载 PDF 资产。
 
         Raises:
-            OSError: 临时文件写入失败时抛出。
+            无。
         """
 
         self.download_calls += 1
-        pdf_path = self.temp_dir / f"{candidate.source_id}_{self.download_calls}.pdf"
-        pdf_path.write_bytes(_PDF_BYTES)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_path=pdf_path,
+            pdf_bytes=_PDF_BYTES,
             sha256=hashlib.sha256(_PDF_BYTES).hexdigest(),
             content_length=len(_PDF_BYTES),
             downloaded_at="2026-05-02T00:00:00+00:00",
@@ -219,6 +228,7 @@ class _RecordingPipeline(CnPipeline):
             convert_pdf_to_docling_json=_RuntimeFakeConverter(),
         )
         self.recorded_rebuild_values: list[bool] = []
+        self.result_filings: list[JsonValue] = []
 
     def download(
         self,
@@ -262,10 +272,10 @@ class _RecordingPipeline(CnPipeline):
             "filters": {},
             "warnings": [],
             "notes": [],
-            "filings": [],
+            "filings": self.result_filings,
             "summary": {
-                "total": 0,
-                "downloaded": 0,
+                "total": len(self.result_filings),
+                "downloaded": len(self.result_filings),
                 "skipped": 0,
                 "failed": 0,
                 "elapsed_ms": 0,
@@ -327,6 +337,7 @@ class _RuntimeRepositorySet:
     """runtime 测试用仓储集合。"""
 
     workspace_root: Path
+    batching_repository: FsBatchingRepository
     company_repository: FsCompanyMetaRepository
     source_repository: FsSourceDocumentRepository
     processed_repository: FsProcessedDocumentRepository
@@ -372,6 +383,11 @@ def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Pa
     source_meta = runtime.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
     assert source_meta["source_provider"] == "cninfo"
     assert source_meta["ingest_complete"] is True
+    assert runtime.source_repository.get_source_document_provenance(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.CNINFO
 
 
 def test_start_download_auto_hk_uses_hkexnews_adapter(tmp_path: Path) -> None:
@@ -411,6 +427,11 @@ def test_start_download_auto_hk_uses_hkexnews_adapter(tmp_path: Path) -> None:
     source_meta = runtime.source_repository.get_source_meta("0700", document_id, SourceKind.FILING)
     assert source_meta["source_provider"] == "hkexnews"
     assert source_meta["company_id"] == "0700_HKEX"
+    assert runtime.source_repository.get_source_document_provenance(
+        "0700",
+        document_id,
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.HKEXNEWS
 
 
 def test_default_runtime_registers_cn_hk_download_adapters(tmp_path: Path) -> None:
@@ -465,6 +486,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
 
     cn_adapter = cn_pipeline_module.build_cn_download_adapter(
         workspace_root=repositories.workspace_root,
+        batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
         source_repository=repositories.source_repository,
         processed_repository=repositories.processed_repository,
@@ -473,6 +495,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
     )
     hk_adapter = cn_pipeline_module.build_hk_download_adapter(
         workspace_root=repositories.workspace_root,
+        batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
         source_repository=repositories.source_repository,
         processed_repository=repositories.processed_repository,
@@ -487,7 +510,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
 
 
 def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Path) -> None:
-    """adapter 应记录 NEW rebuild_processed，但不映射为 OLD download rebuild。
+    """adapter 应单独消费 NEW rebuild_processed，并保持 OLD download rebuild=False。
 
     Args:
         tmp_path: 临时目录。
@@ -516,6 +539,62 @@ def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Pat
     )
 
     assert pipeline.recorded_rebuild_values == [False]
+
+
+@pytest.mark.parametrize(
+    ("source", "market", "ticker", "exchange"),
+    [
+        (CN_DOWNLOAD_SOURCE, "CN", "600519", "SSE"),
+        (HK_DOWNLOAD_SOURCE, "HK", "0700", "HKEX"),
+    ],
+)
+def test_cn_hk_adapter_marks_processed_rebuild_for_written_documents(
+    tmp_path: Path,
+    source: str,
+    market: CnMarketKind,
+    ticker: str,
+    exchange: Exchange,
+) -> None:
+    """CN/HK adapter 应消费 rebuild_processed 并标记已写入文档的 processed。"""
+
+    pipeline = _RecordingPipeline(workspace_root=tmp_path)
+    document_id = "fil_cn_rebuild"
+    filing_payload: dict[str, JsonValue] = {"document_id": document_id, "status": "downloaded"}
+    pipeline.result_filings = [filing_payload]
+    setup_batch = pipeline.batching_repository.begin_batch(ticker)
+    pipeline.processed_repository.create_processed(
+        ProcessedCreateRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+            form_type="FY",
+            meta={"reprocess_required": False},
+            sections=[],
+            tables=[],
+        ),
+        batch=setup_batch,
+    )
+    pipeline.batching_repository.commit_batch(setup_batch)
+    adapter = CnDownloadAdapter(pipeline=pipeline, source=source, market=market)
+
+    adapter.download(
+        FinsSourceDownloadAdapterRequest(
+            normalized_ticker=NormalizedTicker(canonical=ticker, market=market, exchange=exchange, raw=ticker),
+            source=source,
+            form_types=("FY",),
+            filed_after=None,
+            filed_before=None,
+            overwrite_existing=False,
+            rebuild_processed=True,
+            cancellation_checker=lambda: False,
+        )
+    )
+
+    processed_meta = pipeline.processed_repository.get_processed_meta(ticker, document_id)
+
+    assert pipeline.recorded_rebuild_values == [False]
+    assert processed_meta["reprocess_required"] is True
 
 
 def _build_runtime_with_cn_hk_adapters(
@@ -558,6 +637,7 @@ def _build_runtime_with_cn_hk_adapters(
     )
     pipeline = CnPipeline(
         workspace_root=repositories.workspace_root,
+        batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
         source_repository=repositories.source_repository,
         processed_repository=repositories.processed_repository,
@@ -568,6 +648,7 @@ def _build_runtime_with_cn_hk_adapters(
         convert_pdf_to_docling_json=converter,
     )
     runtime = FinsIngestionRuntime.create(
+        batching_repository=repositories.batching_repository,
         source_repository=repositories.source_repository,
         blob_repository=repositories.blob_repository,
         filing_maintenance_repository=repositories.filing_maintenance_repository,
@@ -618,6 +699,7 @@ def _build_runtime_repositories(tmp_path: Path) -> _RuntimeRepositorySet:
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     return _RuntimeRepositorySet(
         workspace_root=workspace_root,
+        batching_repository=FsBatchingRepository(workspace_root, repository_set=repository_set),
         company_repository=FsCompanyMetaRepository(workspace_root, repository_set=repository_set),
         source_repository=FsSourceDocumentRepository(workspace_root, repository_set=repository_set),
         processed_repository=FsProcessedDocumentRepository(workspace_root, repository_set=repository_set),

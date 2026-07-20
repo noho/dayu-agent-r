@@ -20,6 +20,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from dayu.documents.processors.text_utils import normalize_whitespace as _normalize_whitespace
+from dayu.fins.domain.financial_result_contract import FinancialStatementReason
 
 from .html_financial_statement_common import (
     select_html_statement_tables_by_row_signals as _select_html_statement_tables_by_row_signals,
@@ -35,12 +36,10 @@ REPORT_FORM_SUPPORTED_STATEMENT_TYPES = frozenset(
     }
 )
 
-REPORT_FORM_HTML_FALLBACK_REASONS = frozenset(
+REPORT_FORM_HTML_FALLBACK_REASONS: frozenset[FinancialStatementReason] = frozenset(
     {
         "xbrl_not_available",
-        "statement_method_missing",
         "statement_not_found",
-        "statement_empty",
     }
 )
 
@@ -167,7 +166,9 @@ _RELAXED_STATEMENT_LINE_ITEM_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = 
 }
 
 
-def should_apply_report_statement_html_fallback(reason: Optional[str]) -> bool:
+def should_apply_report_statement_html_fallback(
+    reason: FinancialStatementReason | None,
+) -> bool:
     """判断是否应触发报告类 HTML fallback。
 
     Args:
@@ -180,8 +181,7 @@ def should_apply_report_statement_html_fallback(reason: Optional[str]) -> bool:
         RuntimeError: 判定失败时抛出。
     """
 
-    normalized_reason = str(reason or "").strip().lower()
-    return normalized_reason in REPORT_FORM_HTML_FALLBACK_REASONS
+    return reason in REPORT_FORM_HTML_FALLBACK_REASONS
 
 
 def classify_report_statement_type_for_table(

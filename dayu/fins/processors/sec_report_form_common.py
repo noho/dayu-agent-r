@@ -9,13 +9,15 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional, Protocol
 
 from bs4 import BeautifulSoup
 import pandas as pd
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 
 from dayu.documents.processors.text_utils import (
@@ -23,7 +25,7 @@ from dayu.documents.processors.text_utils import (
     normalize_whitespace as _normalize_whitespace,
 )
 
-from .form_type_utils import normalize_form_type as _normalize_report_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_report_sec_form
 from .sec_form_section_common import (
     _VirtualSection,
     _VirtualSectionProcessorMixin,
@@ -39,7 +41,8 @@ from .sec_section_build import (
     _safe_section_text,
 )
 from .sec_table_extraction import _safe_table_dataframe
-from .financial_base import FinancialMeta, FinancialStatementResult
+from dayu.fins.domain.financial_result_contract import FinancialStatementResult
+from .financial_base import FinancialMeta
 from .html_financial_statement_common import (
     build_html_statement_result_from_tables as _build_html_statement_result_from_tables,
 )
@@ -48,6 +51,7 @@ from .report_form_financial_statement_common import (
     select_report_statement_tables as _select_report_statement_tables,
     should_apply_report_statement_html_fallback as _should_apply_report_statement_html_fallback,
 )
+from .source_text import materialize_source_text
 
 _TABLE_OF_CONTENTS_TOKEN = "table of contents"
 _TABLE_OF_CONTENTS_CUTOFF_BUFFER_CHARS = 1500
@@ -57,6 +61,32 @@ _LATE_NOTES_TOC_CONTEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bnotes?\s+to\s+(?:the\s+)?consolidated\s+financial\s+statements?\b"),
     re.compile(r"(?i)\bnotes?\s+to\s+financial\s+statements?\b"),
 )
+
+
+class _EdgarSectionLike(Protocol):
+    """edgartools section 文本能力协议。"""
+
+    def text(self) -> str:
+        """读取章节文本。
+
+        Args:
+            无。
+
+        Returns:
+            章节文本。
+
+        Raises:
+            RuntimeError: 底层解析失败时可能抛出。
+        """
+
+        ...
+
+
+class _EdgarDocumentWithSections(Protocol):
+    """edgartools 文档 sections 能力协议。"""
+
+    sections: dict[str, _EdgarSectionLike]
+
 
 # ToC 条目自适应检测参数
 # 相邻 marker 之间 span 低于此阈值视为 ToC 条目（标题 + 页码，通常 < 300 字符）
@@ -362,7 +392,7 @@ class _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor):
             OSError: 文件访问失败时可能抛出。
         """
 
-        normalized_form = _normalize_report_form_type(form_type)
+        normalized_form = _parse_report_sec_form(form_type)
         if normalized_form not in cls._SUPPORTED_FORMS:
             return False
         # 复用 SecProcessor 的文件类型与底层可解析能力判断。
@@ -403,7 +433,7 @@ class _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor):
     def get_financial_statement(
         self,
         statement_type: str,
-        financials: Optional[dict[str, Any]] = None,
+        financials: Mapping[str, JsonValue] | None = None,
         *,
         meta: Optional[FinancialMeta] = None,
     ) -> FinancialStatementResult:
@@ -490,7 +520,7 @@ class _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor):
         )
 
 
-def _rebuild_virtual_sections_from_edgartools(document: object) -> list[_VirtualSection]:
+def _rebuild_virtual_sections_from_edgartools(document: _EdgarDocumentWithSections) -> list[_VirtualSection]:
     """从 edgartools sections 惰性重建虚拟章节。
 
     当 ``single_full_text`` 优化启用但 marker 检测不足时调用。
@@ -516,9 +546,7 @@ def _rebuild_virtual_sections_from_edgartools(document: object) -> list[_Virtual
         content = _normalize_whitespace(_safe_section_text(section_obj))
         if not content:
             continue
-        title = _normalize_optional_string(
-            _build_section_title(section_key=section_key, section_obj=section_obj)
-        )
+        title = _normalize_optional_string(_build_section_title(section_key=section_key, section_obj=section_obj))
         content = _trim_trailing_part_heading(content)
         content = _trim_trailing_page_locator(content, title)
         if not content:
@@ -574,21 +602,13 @@ def _extract_source_text_preserving_lines(source: Source) -> str:
         source: 文档来源抽象。
 
     Returns:
-        使用 DOM 顺序和换行分隔提取的文本；失败时返回空字符串。
+        使用 DOM 顺序和换行分隔提取的文本。
 
     Raises:
-        RuntimeError: 读取失败时抛出。
+        FinsSourceDecodeError: 物化、读取或 UTF-8 解码失败时抛出。
     """
 
-    try:
-        source_path = source.materialize(suffix=".html")
-    except Exception:
-        return ""
-    path = Path(source_path)
-    try:
-        raw_html = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
+    raw_html = materialize_source_text(source, suffix=".html")
     if not raw_html.strip():
         return ""
     parser = _LinePreservingHtmlTextExtractor()
@@ -1085,7 +1105,9 @@ def _skip_toc_like_markers(
         if len(retry) < min_items:
             break
         next_toc_end = _find_toc_cluster_end(
-            full_text, retry, check_partial_toc=False,
+            full_text,
+            retry,
+            check_partial_toc=False,
         )
         if next_toc_end is None:
             return retry
@@ -1161,7 +1183,9 @@ def _select_ordered_item_markers_after_toc(
         ):
             result = default_selected
         return _refine_inline_reference_markers(
-            full_text, result, item_pattern=item_pattern,
+            full_text,
+            result,
+            item_pattern=item_pattern,
         )
 
     # 自适应迭代：从 toc_start 开始，逐步跳过 ToC 条目
@@ -1182,7 +1206,8 @@ def _select_ordered_item_markers_after_toc(
         # 已完成 ToC 跳过后禁用部分 ToC 检测（check 1b），
         # 避免正文连续短节被误判
         toc_end = _find_toc_cluster_end(
-            full_text, selected,
+            full_text,
+            selected,
             check_partial_toc=not has_skipped_toc,
         )
         if toc_end is None:
@@ -1233,7 +1258,9 @@ def _select_ordered_item_markers_after_toc(
                 best_result = candidate
 
     return _refine_inline_reference_markers(
-        full_text, best_result, item_pattern=item_pattern,
+        full_text,
+        best_result,
+        item_pattern=item_pattern,
     )
 
 
@@ -1348,13 +1375,9 @@ def _find_item_token_position_after(
         return None
 
     filtered_positions = [
-        position
-        for position in candidate_positions
-        if not _looks_like_inline_item_reference(full_text, position)
+        position for position in candidate_positions if not _looks_like_inline_item_reference(full_text, position)
     ]
-    positions_for_selection = (
-        filtered_positions if filtered_positions else candidate_positions
-    )
+    positions_for_selection = filtered_positions if filtered_positions else candidate_positions
 
     # 优先选择“非行内引用”位置，减少 "see Item X ..." 被误当成标题。
     # 若全文结构已被压平（几乎无换行）导致所有候选都像行内引用，
@@ -1396,7 +1419,6 @@ def _looks_like_inline_item_reference(full_text: str, position: int) -> bool:
 
 __all__ = [
     "_BaseSecReportFormProcessor",
-    "_normalize_report_form_type",
     "_find_table_of_contents_cutoff",
     "_find_toc_cluster_end",
     "_looks_like_inline_toc_snippet",

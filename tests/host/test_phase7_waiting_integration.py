@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,11 @@ from dayu.contracts.tool_schema import (
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.messages import (
+    AssistantMessage,
+    ToolMessage,
+    UserMessage,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptStatus,
@@ -54,6 +60,7 @@ from dayu.host.api import (
     WaitAdapterKey,
 )
 from dayu.host.command import create_host_command_handle, start_run
+from dayu.host._wait_observation import WaitObservationRunner
 from dayu.host.dispatch import HostDispatchScheduler
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
@@ -95,6 +102,12 @@ from tests.host.test_resolve_wait_command import (
     _options,
     _read_wait,
     _seed_active_run,
+)
+from tests.host.test_wait_observation_runner import (
+    _BlockingAdapter,
+    _MutableClock,
+    _poller as _bounded_wait_poller,
+    _wait_for_runner_count,
 )
 
 _ITERATION_ID = "iteration-phase7-waiting-integration"
@@ -278,7 +291,13 @@ def test_phase7_resolve_wait_public_entry_is_importable() -> None:
 def test_local_awaiting_tool_manual_resolve_resumes_run(
     tmp_path: Path,
 ) -> None:
-    """本地 awaiting 工具进入 WAITING 后可通过 manual resolve 恢复 Run。"""
+    """本地 awaiting 工具进入 WAITING 后可通过 manual resolve 恢复 Run。
+
+    参数：
+        tmp_path: pytest 临时目录。
+    返回值：``None``。
+    异常：断言失败时由 pytest 报告；Host durable 写入异常透传。
+    """
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -340,16 +359,107 @@ def test_local_awaiting_tool_manual_resolve_resumes_run(
         assert snapshot.status is RunStatus.RUNNING
         assert snapshot.current_attempt_id is not None
         assert snapshot.current_attempt_id != seeded.attempt_id
-        assert any(
-            isinstance(message.content, str)
-            and "A previous interrupted step has an accepted wait result."
-            in message.content
-            and f"tool_name={_TOOL_NAME}" in message.content
-            and "resolution_kind=completed" in message.content
-            and '"answer":42' in message.content
-            for message in resume_request.messages
-        )
+        protocol_messages = resume_request.messages[-3:]
+        user_message, assistant_message, tool_message = protocol_messages
+        assert isinstance(user_message, UserMessage)
+        assert user_message.content == "hello"
+        assert isinstance(assistant_message, AssistantMessage)
+        assert len(assistant_message.tool_calls) == 1
+        assistant_tool_call = assistant_message.tool_calls[0]
+        assert assistant_tool_call.id == batch.calls[0].tool_call_id
+        assert assistant_tool_call.name == _TOOL_NAME
+        assert assistant_tool_call.arguments == {"ticker": "DAYU"}
+        assert isinstance(tool_message, ToolMessage)
+        assert tool_message.tool_call_id == assistant_tool_call.id
+        tool_content = json.loads(tool_message.content)
+        assert tool_content["answer"] == 42
     finally:
+        host.close()
+
+
+def test_poll_observation_timeout_keeps_waiting_then_ready_resumes_run(
+    tmp_path: Path,
+) -> None:
+    """真实 awaiting durable record 在 poll timeout 后仍可由下一轮 Ready 恢复。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    runner = WaitObservationRunner(
+        max_outstanding_adapter_calls=1,
+        thread_name_prefix="phase7-poll-observation-timeout",
+    )
+    adapter = _BlockingAdapter()
+    clock = _MutableClock()
+    try:
+        seeded = _seed_active_integration_run(host._transaction_runner())
+        tool = _AwaitingBusinessTool()
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=ToolBundle(definitions=(_definition(tool),)),
+                    source_refs=(_source_ref(),),
+                    framework_tool_policy=default_framework_tool_policy_view(),
+                    policy_snapshot_digest=_POLICY_DIGEST,
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    allow_tool_calls=True,
+                ),
+                accept_port=DefaultHostToolFactAcceptPort(
+                    transaction_runner=host._transaction_runner()
+                ),
+                awaiting_accept_port=DefaultHostToolAwaitingAcceptPort(
+                    transaction_runner=host._transaction_runner()
+                ),
+                wait_adapter_registry=_wait_adapter_registry(),
+            )
+        )
+        _execute_tool_runtime(
+            tool_runtime.tool_executor,
+            _awaiting_tool_request(seeded),
+        )
+        waiting = _active_wait(host._transaction_runner(), seeded.run_id)
+        poller = _bounded_wait_poller(
+            host,
+            waiting.wait_id,
+            adapter,
+            runner,
+            clock=clock,
+        )
+
+        timed_out = poller.poll_once()
+        after_timeout = _read_wait(host._transaction_runner(), waiting.wait_id)
+        assert timed_out.lost == 0
+        assert timed_out.adapter_errors == 1
+        assert after_timeout.status is WaitRecordStatus.WAITING
+        assert _run(host._transaction_runner(), seeded.run_id).status is RunStatus.WAITING
+        assert after_timeout.poll_claim_id is None
+        assert after_timeout.poll_next_observe_at is not None
+        assert after_timeout.poll_last_error_code == "wait_observation_timeout"
+
+        adapter.poll_release.set()
+        _wait_for_runner_count(runner, expected=0)
+        assert runner.diagnostics_snapshot().dropped_count == 1
+        assert (
+            _read_wait(host._transaction_runner(), waiting.wait_id).status
+            is WaitRecordStatus.WAITING
+        )
+
+        clock.advance(0.01)
+        ready = poller.poll_once()
+        assert ready.resolved == 1
+        assert ready.lost == 0
+        assert (
+            _read_wait(host._transaction_runner(), waiting.wait_id).status
+            is WaitRecordStatus.RESOLVED
+        )
+        assert _run(host._transaction_runner(), seeded.run_id).status is RunStatus.RUNNING
+    finally:
+        adapter.poll_release.set()
         host.close()
 
 
@@ -693,6 +803,8 @@ def _local_execution_options(
             continuation_max_attempts=0,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=10.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         worker_factory=factory,
         tooling_options=HostToolingOptions(

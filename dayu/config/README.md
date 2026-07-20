@@ -10,10 +10,28 @@ Dayu runtime assembly 配置分两层：
 2. 工作区覆盖配置：`<workspace>/config/`
 
 `dayu-cli init --base <workspace>` 会创建目标 workspace，并把当前包内默认配置文件和 `prompts/`
-资产复制到 `<workspace>/config/`。该命令只生成当前 schema 所需的 `models.json`、
+资产发布到 `<workspace>/config/`。该命令会先交互选择普通/思考模型组合，只生成当前 schema 所需的 `models.json`、
 `execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json`
-和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会写入明文 API key。
-目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。
+和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会把明文 API key 写入配置。
+
+配置 schema 与有效值的唯一 owner 仍是 `ConfigLoader` 和本目录当前 JSON；`init` 只构造
+transaction-private staging，再用真实 `ConfigLoader`、工具发现与 13 个 production scenes 校验，
+通过后才发布。它不实现第二套 loose parser，也不根据旧字段补默认。
+
+`init` 对 `<workspace>/config/` 的状态规则如下：
+
+- FIRST：目标不存在，从本目录默认值创建。
+- PRESERVE：目标已存在且无覆盖参数，完整保留用户配置、自建文件和自建 manifest，只补缺失的
+  package prompt 普通文件；随后只把本次选择写入相应模型记录和 16 个 package-known manifest
+  的 `model.default_model_id`，其它 manifest 字段保持不变。
+- OVERWRITE：`--overwrite` 从本目录默认值重建整个 `config/`，不合并旧树。
+- RESET：`--reset` 经默认 No 的明确确认后，从本目录默认值重建 `config/`；同时由 workspace
+  transaction 移除整个 `.dayu/`。RESET 优先于 `--overwrite`。
+
+四种状态都不把 `portfolio/` 或 `assets/` 纳入配置 manifest。`init` 会拒绝 workspace、
+受管树及其子树中的 symlink / Windows reparse entry，避免沿链接把配置或清理动作带出工作区。
+所选模型需要的 secret 仍只通过 `api_key_ref` 表达；用户确认后由 POSIX shell profile 或 Windows
+用户环境 owner 持久化，配置文件、异常和 CLI 输出都不保存 value。
 
 `dayu.runtime.location.resolve_runtime_locations` 负责把 workspace root 解析为 runtime assembly 位置：`<workspace>/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
@@ -23,9 +41,15 @@ Dayu runtime assembly 配置分两层：
 
 - 顶层 map 按稳定 id 合并。
 - workspace 中与包内同 id 的记录会整条替换包内记录。
+- 顶层非 map 字段也由 workspace 值整体替换；即使该值是 object，也不会做字段级合并。
+  因此 workspace 必须提供该字段的完整当前 schema，缺字段会在 typed 校验阶段直接失败。
 - 不做隐式 deep merge；复用配置只能用显式 `extends`。
 - `extends` 只允许单继承；循环、自引用、多父项、父项缺失、缺字段和非法类型都会加载失败。
 - catalog record id 只来自顶层 map key；record 内不得重复写 `model_id`、`provider_id`、`runtime_id`、`host_runtime_id`、`profile_id` 或 `execution_profile_id`。
+
+所有配置文件使用严格 JSON 数值边界：`NaN`、`Infinity`、`-Infinity` 以及解析后
+溢出为无穷的数字都会在文件读取时失败；timeout、backoff、TTL、heartbeat 等数值字段
+还会按各自 schema 校验正数或非负数。不要依赖 Python `json` 的非标准常量扩展。
 
 ## 当前文件
 
@@ -144,7 +168,19 @@ dayu/config/
 - `payload_inline_threshold_bytes`，包内默认值为 `65535` bytes。
 - `worker_startup_timeout_seconds`。
 - `memory_projection_catch_up_batch_size`。
+- 必填 `wait_poller_policy`：完整保存 production wait poller 的部署 snapshot；
+  ConfigLoader 只做层中立 typed projection，不解释 provider 或 Fins 语义。
 - 可选 `process_capsule_interrupt_policy`：process-backed 工具子进程取消 / 超时后的 cleanup interrupt 策略，只包含 `terminate_grace_seconds` 与 `kill_grace_seconds`。字段缺省时由 Host typed 默认值决定；显式配置必须是有限非负数，不能使用 boolean、NaN 或正负无穷。该策略只约束 cleanup grace，不是单次工具业务执行 deadline，不能替代 execution profile 中的 `agent_policy.tool_execution_timeout_seconds`。
+
+`wait_poller_policy` 必须同时提供 `enabled`、`poll_interval_seconds`、
+`claim_ttl_seconds`、`claim_batch_size`、`backoff_initial_delay_seconds`、
+`backoff_multiplier`、`backoff_max_delay_seconds`、
+`not_ready_observe_interval_seconds`、`idle_poll_interval_seconds`、
+`adapter_call_timeout_seconds`、`close_drain_timeout_seconds` 与
+`max_outstanding_adapter_calls`。除 `enabled` 外所有字段都是有限正数；两个整数位
+`claim_batch_size`、`max_outstanding_adapter_calls` 显式拒绝 JSON boolean。
+缺字段、多余字段、`null`、零、负数或非有限值都会加载失败。包内 snapshot 固定为
+`true, 1, 60, 100, 30, 2, 300, 1, 5, 30, 5, 8`，顺序与上述字段一致。
 
 这些配置都是 `open_host(options)` construction-time assembly inputs 的来源，不是单个 Run 的 override。prompt asset root 与 scene manifest root 不在 `host_runtime.json` 中配置，由 runtime location resolver 解析。
 
@@ -159,7 +195,10 @@ dayu/config/
 | `coordinator.poll_interval_seconds` | acquire 轮询间隔 |
 | `lanes` | 按 lane 名索引的容量配置 |
 
-单个 lane 包含 `capacity`、`default_timeout_seconds`、`claim_ttl_seconds` 与 `heartbeat_interval_seconds`。`claim_ttl_seconds` 必须大于 `heartbeat_interval_seconds`。
+单个 lane 包含 `capacity`、`default_timeout_seconds`、`claim_ttl_seconds` 与
+`heartbeat_interval_seconds`。timeout 必须是有限非负数；busy timeout、poll interval、
+TTL 与 heartbeat 必须是有限正数；`claim_ttl_seconds` 还必须大于
+`heartbeat_interval_seconds`。
 
 ## tool_discovery.json
 
@@ -187,11 +226,64 @@ provider 字段：
 | `financial-preprocess-tools` | `dayu.fins.tools.preprocess_provider:discover_tools` | 财报 preprocess awaiting tool |
 | `financial-upload-tools` | `dayu.fins.tools.upload_provider:discover_tools` | 财报 upload awaiting tool |
 
+三个 awaiting provider 的 `config.awaiting_resolution_mode` 都是必填 provider-owned
+字段，只允许精确的 `poll`、`callback`、`manual`；包内配置均显式写为 `poll`。
+ConfigLoader 仍把 `config` 当作 opaque JSON，不解析、规范化或默认该字段；唯一业务
+解析由 Fins 共享 parser 完成。即使 provider 为 disabled，Service 也会先把 raw config
+交给该 parser 严格校验，再做 active filtering。已识别的 Fins read / Web non-awaiting
+provider 声明该字段会作为 owner misuse 失败，未知第三方 provider 不由此配置契约扩展语义。
+
 启用任一 Fins provider 时，传给 provider 的 effective spec 必须包含绝对 `workspace_root`；该值可以来自 workspace overlay 的 `config.workspace_root`，也可以由 Service 调用方用当前 runtime workspace 注入。provider 不从 cwd 或环境变量猜路径。`financial-read-tools` 的 packaged `config.limits` 显式写入默认值：`processor_cache_max_entries=128`、`list_documents_max_items=300`、`get_document_sections_max_items=1200`、`search_document_max_items=20`、`list_tables_max_items=50`、`read_section_max_chars=80000`、`get_page_content_max_chars=80000`、`get_table_max_items=800`、`get_financial_statement_max_items=1200` 与 `query_xbrl_facts_max_items=1200`。workspace overlay 可用同名正整数字段覆盖这些 read limits。`financial-upload-tools` 启用时注册 `start_fins_upload`；上传工具只校验本地路径必须指向存在的非空普通文件，财报写入仍通过 Fins workspace repository 完成。Download / preprocess / upload 能力通过独立 provider 启用，不通过 read provider 的布尔开关混合启用。
 
 包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。只有在 workspace overlay 启用并在 `config.allowed_paths` 中显式配置可访问文件或目录根时才注册可执行文档工具。白名单为空时 provider 会 fail fast。Doc provider 的 packaged `config.limits` 显式写入默认值：`list_files_max=200`、`get_sections_max=200`、`search_files_max_results=50`、`read_file_max_chars=80000` 与 `read_file_section_max_chars=50000`；workspace overlay 可用同名正整数字段覆盖这些 Doc limits。
 
-包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 在配置中是 `.dayu/web_tools_storage_states`，Service discovery 会按当前 workspace root 解析为 `<workspace>/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、五个独立布尔 policy 字段、`playwright_channel`、`playwright_storage_state_dir` 与 nested `resource_budget`。默认 `playwright_storage_state_dir` 是 `.dayu/web_tools_storage_states`，Service discovery 会按当前 workspace root 解析为 `<workspace>/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。
+
+`ConfigLoader` 对同 id provider record 仍执行整条替换且不 deep merge；Web provider 只解析替换后的 final `config`。这个 final record 可以合法缺少已知字段，Web parser 会逐字段或逐 budget group 补对应 typed default，并保留已提供的 sibling；任何未知顶层字段（包括拼写错误）都会在读取其它字段前按 `web provider config.<field>` 精确 fail fast。
+
+五个布尔字段各自独立解析，缺失时使用以下 typed default，显式值只接受 JSON boolean：
+
+| 字段 | 默认值 | 当前配置事实 |
+|---|---:|---|
+| `allow_private_network_url` | `true` | 是否允许 private / local URL |
+| `allow_custom_port_url` | `true` | 是否允许非默认 HTTP(S) 端口；不再从 private policy 反推 |
+| `dns_peer_proof_enabled` | `false` | 是否要求 HTTP numeric target / peer proof |
+| `allow_environment_proxy` | `true` | 是否允许环境 proxy |
+| `browser_enabled` | `true` | browser capability 开关；不从 private policy 反推 |
+
+`dns_peer_proof_enabled`、`allow_environment_proxy` 与 `browser_enabled` 会在一次 Web tool 调用中冻结为不可变 typed snapshot，并由 search/fetch/browser 执行路径共同消费。peer proof 关闭时 HTTP 使用标准 Session；允许环境 proxy 时 `trust_env=true`，禁止时 `trust_env=false` 且发送设置中的 proxy 映射为空。peer proof 开启且当前 URL 未选择 proxy 时复用 numeric target 与实际 peer 校验；若当前 URL 实际选择了环境 proxy，则以稳定的 `proxy_peer_proof_incompatible` 失败，不会静默降级。proxy warning 只记录是否启用与稳定原因，不记录 URL、proxy 值或 credential。
+
+`browser_enabled` 与 `allow_private_network_url` 互不授权：关闭 browser 不会因允许 private URL 而启动浏览器，关闭 private URL 也不阻止公网 browser 访问；browser 的每次 route/navigation 仍逐目标执行同一出站策略。只有真实 browser fallback 即将启动且 peer proof 已开启时，才会在导入或启动 browser process 前以 `browser_peer_proof_unavailable` 失败。禁止环境 proxy 时 browser worker 会清理标准 proxy 环境变量，允许时沿用当前运行环境。
+
+Web 资源预算的唯一 raw 配置路径是 `providers["web-tools"].config.resource_budget`。Provider 把它解析为 `http`、`browser`、`diagnostics` 三个 owner group；group 或 field 缺失时只补对应 child owner 的 typed default，已提供 sibling 保持不变。未知 group、未知 field、错误 object 类型、布尔值、零或负数都会按完整字段路径 fail fast。当前完整默认与等价显式示例为：
+
+```json
+{
+  "providers": {
+    "web-tools": {
+      "config": {
+        "resource_budget": {
+          "http": {
+            "wire_body_bytes": 134217728,
+            "decoded_body_bytes": 268435456
+          },
+          "browser": {
+            "warmup_body_bytes": 1048576,
+            "dom_chars": 16777216,
+            "text_chars": 8388608
+          },
+          "diagnostics": {
+            "error_chars": 8192,
+            "events": 512
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+下游只接收自己消费的 child budget：HTTP search/fetch 使用 `http`，warmup 与 browser DOM/text/Markdown 使用 `browser`，browser failure / diagnostics projection 使用 `diagnostics`；`resource_budget` aggregate 不进入执行器。
 
 包内默认 `utils-tools` provider 指向 `dayu.tools.utils:discover_tools`，默认 `enabled=true`。Provider 当前只暴露 `get_current_time`，用于需要实时时钟的场景；工具只支持 `timezone="Asia/Shanghai"` 或省略该参数，并返回 `time`、`timezone`、`weekday` 与 `iso` 字段。该工具不提供财报、网页或文件事实。
 
@@ -212,6 +304,11 @@ Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固
 Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最终 system prompt。`<when_tag TAG>...</when_tag>` 只在当前 scene 选中对应工具 tag 时保留正文；`<when_tool NAME>...</when_tool>` 只在当前 scene 选中对应工具名时保留正文。条件块 marker 是 ScenePrepare 解释的 prompt asset 控制语法，渲染后的 LLM-facing system prompt 不应包含这些 marker。
 
 默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具，也不在 packaged manifest 中列出具体工具名；它们通过窄标签 `"fins-read"`、`"fins-download"`、`"fins-preprocess"` 选择财报 read / download / preprocess 工具。除 `conversation_compaction` 这类压缩 scene 外，包内 scene manifest 都声明 required `current_time` context slot，并在 scene prompt 的主要执行契约正文之后渲染 `{{current_time}}`。`current_time` 是 LLM-facing 当前时间文本，表示对话开始时的当前时间；回答普通“现在 / 今天 / 当前时间”问题默认使用它，且该时间不会自动更新。它不等同于工具暴露。
+
+`prompt` 与 `interactive` manifest 还声明 required `fins_default_subject` slot，并在 scene
+执行契约与 `current_time` 之后渲染 `{{fins_default_subject}}`。CLI 的可选 `--ticker`
+通过共享 Service scene-context builder 生成该模型可读文本；未提供 ticker 时 slot 值为空，
+不会把 CLI metadata 或内部标识伪装成财报事实。
 
 `prompt` 是单轮问答 scene，不暴露 download / preprocess / upload 这类长事务工具；需要模型在对话中触发 download / preprocess 时，使用 `interactive` 或 `wechat` scene。
 

@@ -30,7 +30,9 @@ from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictEr
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.projection import reset_projection_refs_for_deleted_events
@@ -56,13 +58,17 @@ from dayu.host.durable.schema import (
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
 )
-from dayu.host.durable.state import NON_TERMINAL_RUN_STATUSES, TERMINAL_RUN_STATUSES
+from dayu.host.durable.state import (
+    NON_TERMINAL_RUN_STATUSES,
+    TERMINAL_RUN_STATUSES,
+    serialized_run_status_values,
+)
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
-PURGE_IDEMPOTENCY_SCOPE_KIND = "purge_session"
+PURGE_IDEMPOTENCY_SCOPE_KIND = IdempotencyScopeKind.PURGE_SESSION
 """purge command 幂等记录的 scope kind。"""
 
-PURGE_IDEMPOTENCY_RESULT_KIND = "purge_tombstone"
+PURGE_IDEMPOTENCY_RESULT_KIND = IdempotencyResultKind.PURGE_TOMBSTONE
 """purge command 幂等记录的 result kind。"""
 
 _PURGE_OPERATION = "purge_session"
@@ -119,8 +125,12 @@ _PAYLOAD_KIND_SQLITE = "sqlite_payload"
 _TOMBSTONE_ID_PREFIX = "purge-tombstone-"
 _PURGE_ATTEMPT_REF_PREFIX = "purge-attempt:"
 
-_NON_TERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in NON_TERMINAL_RUN_STATUSES)
-_TERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in TERMINAL_RUN_STATUSES)
+_NON_TERMINAL_RUN_STATUS_VALUES = frozenset(
+    serialized_run_status_values(NON_TERMINAL_RUN_STATUSES)
+)
+_TERMINAL_RUN_STATUS_VALUES = frozenset(
+    serialized_run_status_values(TERMINAL_RUN_STATUSES)
+)
 _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS = (
     "host.minimal-read-model",
     "host.memory.session.v1",
@@ -129,16 +139,16 @@ _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS = (
     "host.outbox-terminal",
 )
 _SESSION_FACT_SCOPE_KINDS = (
-    "ensure_session",
-    "create_session",
-    "close_session",
-    "start_run",
-    "submit_followup_queue",
-    "submit_followup_steer",
-    "retry_run",
-    "replay_run",
-    "cancel_run",
-    "cancel_session_runs",
+    IdempotencyScopeKind.ENSURE_SESSION.value,
+    IdempotencyScopeKind.CREATE_SESSION.value,
+    IdempotencyScopeKind.CLOSE_SESSION.value,
+    IdempotencyScopeKind.START_RUN.value,
+    IdempotencyScopeKind.SUBMIT_FOLLOWUP_QUEUE.value,
+    IdempotencyScopeKind.SUBMIT_FOLLOWUP_STEER.value,
+    IdempotencyScopeKind.RETRY_RUN.value,
+    IdempotencyScopeKind.REPLAY_RUN.value,
+    IdempotencyScopeKind.CANCEL_RUN.value,
+    IdempotencyScopeKind.CANCEL_SESSION_RUNS.value,
 )
 
 _REFS_EVENT_IDS = "event_ids"

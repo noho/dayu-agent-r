@@ -62,7 +62,9 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.payload import (
@@ -108,6 +110,7 @@ from dayu.host.durable.state import (
     count_runs_by_source_relation,
     insert_attempt,
     insert_dispatch_record,
+    is_terminal_run_status,
     read_active_run_for_session,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
@@ -133,6 +136,11 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.queue_policy import (
+    RunQueuePolicy,
+    parse_run_queue_policy,
+    serialize_run_queue_policy,
+)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_runtime_schema_projection import (
     business_bundle_digest as _business_bundle_digest,
@@ -157,15 +165,15 @@ _RUN_ID_PREFIX = "run"
 _ATTEMPT_ID_PREFIX = "attempt"
 _EXECUTION_ID_PREFIX = "execution"
 _DISPATCH_RECORD_ID_PREFIX = "dispatch"
-_OPERATION_START_RUN = "start_run"
-_OPERATION_SUBMIT_FOLLOWUP_QUEUE = "submit_followup_queue"
-_OPERATION_SUBMIT_FOLLOWUP_STEER = "submit_followup_steer"
-_OPERATION_RETRY_RUN = "retry_run"
-_OPERATION_REPLAY_RUN = "replay_run"
-_OPERATION_CANCEL_RUN = "cancel_run"
-_OPERATION_CANCEL_SESSION_RUNS = "cancel_session_runs"
-_IDEMPOTENCY_RESULT_KIND_RUN = "run"
-_IDEMPOTENCY_RESULT_KIND_SESSION = "session"
+_OPERATION_START_RUN = IdempotencyScopeKind.START_RUN
+_OPERATION_SUBMIT_FOLLOWUP_QUEUE = IdempotencyScopeKind.SUBMIT_FOLLOWUP_QUEUE
+_OPERATION_SUBMIT_FOLLOWUP_STEER = IdempotencyScopeKind.SUBMIT_FOLLOWUP_STEER
+_OPERATION_RETRY_RUN = IdempotencyScopeKind.RETRY_RUN
+_OPERATION_REPLAY_RUN = IdempotencyScopeKind.REPLAY_RUN
+_OPERATION_CANCEL_RUN = IdempotencyScopeKind.CANCEL_RUN
+_OPERATION_CANCEL_SESSION_RUNS = IdempotencyScopeKind.CANCEL_SESSION_RUNS
+_IDEMPOTENCY_RESULT_KIND_RUN = IdempotencyResultKind.RUN
+_IDEMPOTENCY_RESULT_KIND_SESSION = IdempotencyResultKind.SESSION
 _QUEUE_REASON_ACTIVE_RUN_EXISTS = "active_run_exists"
 _TERMINAL_CLOSEOUT_REASON = "phase3_internal_closeout"
 _TOOL_SNAPSHOT_REF_PREFIX = "tools:"
@@ -173,14 +181,6 @@ _TOOL_SELECTION_ALL = "all"
 _TOOL_SELECTION_NONE = "none"
 _TOOL_SELECTION_SUBSET = "subset"
 _MAX_ORDINARY_RETRY_RUNS_PER_SOURCE = 1
-
-
-class AdmissionPolicy(StrEnum):
-    """start_run admission policy 文本常量。"""
-
-    QUEUE = "queue"
-    REJECT = "reject"
-    ATTACH_ACTIVE = "attach_active"
 
 
 class AdmissionClock(Protocol):
@@ -364,6 +364,27 @@ class ActiveCancelTarget:
     reason: str
 
 
+class _CancelRunClassification(StrEnum):
+    """单 Run cancel 在唯一 write snapshot 下的闭集分类。"""
+
+    SUPPORTED = "supported"
+    DEFERRED = "deferred"
+    TERMINAL = "terminal"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class _CancelRunOperationResult:
+    """``_CancelRunOperation`` 的 transaction-local 分类结果。
+
+    :param classification: 当前 write snapshot 的闭集分类。
+    :param result: supported/terminal 路径的 cancel result；其它分类为 ``None``。
+    """
+
+    classification: _CancelRunClassification
+    result: CancelRunResult | None
+
+
 @dataclass(frozen=True, slots=True)
 class CloseoutAttemptTerminalInput:
     """admission 层 internal terminal closeout 输入。
@@ -529,7 +550,7 @@ class HostAdmissionService:
         :raises HostDurableError: durable 写入失败时由底层抛出。
         """
 
-        policy = _parse_admission_policy(request.queue_policy)
+        policy = parse_run_queue_policy(request.queue_policy)
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
@@ -729,7 +750,7 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
-        result = self.transaction_runner.run_write(
+        operation_result = self.transaction_runner.run_write(
             _CancelRunOperation(
                 run_id=run_id,
                 request=request,
@@ -740,6 +761,25 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        if operation_result.classification is _CancelRunClassification.DEFERRED:
+            raise HostApiError(
+                code=HostApiErrorCode.UNSUPPORTED_OPERATION,
+                message="Run cancel requires a later cancel owner phase",
+                retryable=False,
+            )
+        if operation_result.classification is _CancelRunClassification.CONFLICT:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="Run state is not cancellable in Phase 5 admission",
+                retryable=False,
+            )
+        result = operation_result.result
+        if result is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INTERNAL_ERROR,
+                message="Cancel transaction classification is missing its result",
+                retryable=False,
+            )
         if result.released_active_slot:
             promotion = _promote_after_release(
                 service=self,
@@ -947,7 +987,7 @@ class _StartRunOperation:
     """start_run transaction body。"""
 
     request: StartRunRequest
-    policy: AdmissionPolicy
+    policy: RunQueuePolicy
     caller_semantic_digest: str
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
@@ -993,7 +1033,7 @@ class _StartRunOperation:
             request=_CreateAdmissionRequest.from_start_request(self.request),
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=self.policy.value,
+            queue_policy=self.policy,
         )
 
     def _handle_active_run(
@@ -1014,13 +1054,13 @@ class _StartRunOperation:
         :raises HostApiError: reject policy 命中 active Run 时抛出 conflict。
         """
 
-        if self.policy == AdmissionPolicy.REJECT:
+        if self.policy == RunQueuePolicy.REJECT:
             raise HostApiError(
                 code=HostApiErrorCode.CONFLICT,
                 message="Session already has an active Run",
                 retryable=False,
             )
-        if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
+        if self.policy == RunQueuePolicy.ATTACH_ACTIVE:
             if active.status == RunStatus.ACCEPTED:
                 self.idempotency_store.record_idempotent_result(
                     transaction,
@@ -1073,7 +1113,7 @@ class _StartRunOperation:
             request=_CreateAdmissionRequest.from_start_request(self.request),
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=self.policy.value,
+            queue_policy=self.policy,
             active_run_id=active.run_id,
         )
 
@@ -1128,7 +1168,7 @@ class _SubmitFollowupQueueOperation:
                 request=create_request,
                 semantic_digest=semantic_digest,
                 scope=scope,
-                queue_policy=AdmissionPolicy.QUEUE.value,
+                queue_policy=RunQueuePolicy.QUEUE,
                 active_run_id=active.run_id,
             )
         return _create_accepted_admission_result(
@@ -1140,7 +1180,7 @@ class _SubmitFollowupQueueOperation:
             request=create_request,
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=AdmissionPolicy.QUEUE.value,
+            queue_policy=RunQueuePolicy.QUEUE,
         )
 
 
@@ -1505,11 +1545,12 @@ class _CancelRunOperation:
     clock: AdmissionClock
     id_factory: AdmissionIdFactory
 
-    def __call__(self, transaction: HostTransaction) -> CancelRunResult:
+    def __call__(self, transaction: HostTransaction) -> _CancelRunOperationResult:
         """执行 cancel_run transaction。
 
         :param transaction: 当前 Host transaction。
-        :returns: cancel 结果；本 transaction 不执行 promotion。
+        :returns: 同一 write snapshot 下的 cancel 闭集分类与可选结果；本
+            transaction 不执行 promotion。
         :raises HostApiError: Run 缺失、幂等冲突或状态不支持时抛出。
         """
 
@@ -1524,7 +1565,13 @@ class _CancelRunOperation:
         existing = self.idempotency_store.read_idempotency_record(transaction, scope)
         if existing is not None:
             _raise_if_digest_conflict(existing, semantic_digest)
-            return _idempotent_cancel_result(transaction, existing)
+            result = _idempotent_cancel_result(transaction, existing)
+            return _classified_cancel_result(
+                _CancelRunClassification.TERMINAL
+                if is_terminal_run_status(result.run.status)
+                else _CancelRunClassification.SUPPORTED,
+                result,
+            )
 
         run = read_run_by_id(transaction, self.run_id)
         if run is None:
@@ -1534,10 +1581,13 @@ class _CancelRunOperation:
                 retryable=False,
             )
         if run.status in (RunStatus.ACCEPTED, RunStatus.QUEUED):
-            return self._cancel_queued(
-                transaction=transaction,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.SUPPORTED,
+                self._cancel_queued(
+                    transaction=transaction,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
         if run.status == RunStatus.RUNNING:
             predispatch = self._cancel_predispatch_starting_or_none(
@@ -1546,7 +1596,10 @@ class _CancelRunOperation:
                 scope=scope,
             )
             if predispatch is not None:
-                return predispatch
+                return _classified_cancel_result(
+                    _CancelRunClassification.SUPPORTED,
+                    predispatch,
+                )
             return self._cancel_active_attempt(
                 transaction=transaction,
                 semantic_digest=semantic_digest,
@@ -1559,28 +1612,36 @@ class _CancelRunOperation:
                 scope=scope,
             )
         if run.status == RunStatus.WAITING:
-            return self._cancel_waiting(
-                transaction=transaction,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.SUPPORTED,
+                self._cancel_waiting(
+                    transaction=transaction,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
         if run.status == RunStatus.RECOVERING:
-            return self._cancel_recovering(
-                transaction=transaction,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.SUPPORTED,
+                self._cancel_recovering(
+                    transaction=transaction,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
-        if _is_terminal_run_status(run.status):
-            return self._record_terminal_cancel_ack(
-                transaction=transaction,
-                run=run,
-                semantic_digest=semantic_digest,
-                scope=scope,
+        if is_terminal_run_status(run.status):
+            return _classified_cancel_result(
+                _CancelRunClassification.TERMINAL,
+                self._record_terminal_cancel_ack(
+                    transaction=transaction,
+                    run=run,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
-        raise HostApiError(
-            code=HostApiErrorCode.INVALID_STATE,
-            message="Run status is not cancellable in Phase 5 admission",
-            retryable=False,
+        return _CancelRunOperationResult(
+            classification=_CancelRunClassification.CONFLICT,
+            result=None,
         )
 
     def _cancel_queued(
@@ -1782,14 +1843,15 @@ class _CancelRunOperation:
         transaction: HostTransaction,
         semantic_digest: str,
         scope: IdempotencyScope,
-    ) -> CancelRunResult:
+    ) -> _CancelRunOperationResult:
         """请求取消 active RUNNING Attempt 并记录幂等结果。
 
         :param transaction: 当前 Host transaction。
         :param semantic_digest: cancel semantic digest。
         :param scope: 幂等 scope。
-        :returns: cancel 结果，包含 commit 后 active cancel 传播目标。
-        :raises HostApiError: 当前状态不是 Phase 5 active cancel 子集时抛出。
+        :returns: supported 结果，或由当前 transaction snapshot 派生的
+            deferred/conflict 分类。
+        :raises HostApiError: transition 返回不可恢复的 not-found 时抛出。
         """
 
         now = self.clock.now()
@@ -1811,7 +1873,20 @@ class _CancelRunOperation:
                 call_context_digest=_call_context_digest(self.request.context),
             ),
         )
-        _raise_for_cancel_transition_status(transition_result)
+        if transition_result.status != StateMutationStatus.UPDATED:
+            if transition_result.status == StateMutationStatus.NOT_FOUND:
+                _raise_for_cancel_transition_status(transition_result)
+            return _CancelRunOperationResult(
+                classification=(
+                    _CancelRunClassification.DEFERRED
+                    if transition_result.status == StateMutationStatus.INVALID_STATE
+                    and transition_result.run is not None
+                    and transition_result.run.status
+                    in (RunStatus.RUNNING, RunStatus.CANCELLING)
+                    else _CancelRunClassification.CONFLICT
+                ),
+                result=None,
+            )
         run = _require_transition_run(transition_result.run)
         cancel_request_sequence = _require_event_sequence_if_present(
             transaction,
@@ -1833,18 +1908,21 @@ class _CancelRunOperation:
                 created_event_sequence=cancel_request_sequence,
             ),
         )
-        return CancelRunResult(
-            run=run,
-            attempt=transition_result.attempt,
-            dispatch_record=transition_result.dispatch_record,
-            promotion=None,
-            active_cancel_target=_active_cancel_target_from_transition(
+        return _classified_cancel_result(
+            _CancelRunClassification.SUPPORTED,
+            CancelRunResult(
                 run=run,
                 attempt=transition_result.attempt,
-                reason=self.request.reason,
+                dispatch_record=transition_result.dispatch_record,
+                promotion=None,
+                active_cancel_target=_active_cancel_target_from_transition(
+                    run=run,
+                    attempt=transition_result.attempt,
+                    reason=self.request.reason,
+                ),
+                idempotent_replay=False,
+                released_active_slot=False,
             ),
-            idempotent_replay=False,
-            released_active_slot=False,
         )
 
     def _cancel_waiting(
@@ -1997,6 +2075,7 @@ class _CancelSessionRunsOperation:
             return _idempotent_session_cancel_result(
                 transaction,
                 existing,
+                event_log_store=self.event_log_store,
                 reason=self.request.reason,
             )
 
@@ -2520,7 +2599,7 @@ def _create_running_admission_result(
     request: _CreateAdmissionRequest,
     semantic_digest: str,
     scope: IdempotencyScope,
-    queue_policy: str,
+    queue_policy: RunQueuePolicy,
     start_reason: RunStartReason,
 ) -> RunAdmissionResult:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
@@ -2612,7 +2691,7 @@ def _create_accepted_admission_result(
     request: _CreateAdmissionRequest,
     semantic_digest: str,
     scope: IdempotencyScope,
-    queue_policy: str,
+    queue_policy: RunQueuePolicy,
 ) -> RunAdmissionResult:
     """创建 pre-start accepted Run admission 结果。
 
@@ -2691,7 +2770,7 @@ def _create_queued_admission_result(
     request: _CreateAdmissionRequest,
     semantic_digest: str,
     scope: IdempotencyScope,
-    queue_policy: str,
+    queue_policy: RunQueuePolicy,
     active_run_id: str,
 ) -> RunAdmissionResult:
     """创建 queued Run admission 结果。
@@ -2807,7 +2886,7 @@ def _create_source_related_admission_result(
             request=request,
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=AdmissionPolicy.QUEUE.value,
+            queue_policy=RunQueuePolicy.QUEUE,
             active_run_id=active.run_id,
         )
         if active is not None
@@ -2820,7 +2899,7 @@ def _create_source_related_admission_result(
             request=request,
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=AdmissionPolicy.QUEUE.value,
+            queue_policy=RunQueuePolicy.QUEUE,
         )
     )
     relation_result = set_new_run_source_relation_row(
@@ -3419,20 +3498,6 @@ def _event_ref_json(event: EventLogRow) -> JsonValue:
     return {"event_id": event.event_id, "event_sequence": event.event_sequence}
 
 
-def _parse_admission_policy(queue_policy: str) -> AdmissionPolicy:
-    """解析 start_run queue policy。
-
-    :param queue_policy: 请求中的 queue policy 文本。
-    :returns: admission policy enum。
-    :raises ValueError: policy 不是 Phase 3 允许值时抛出。
-    """
-
-    try:
-        return AdmissionPolicy(queue_policy)
-    except ValueError as exc:
-        raise ValueError("queue_policy must be queue, reject or attach_active") from exc
-
-
 def _validate_followup_queue_input(
     admission_input: SubmitFollowupQueueAdmissionInput,
 ) -> None:
@@ -3932,7 +3997,10 @@ def _require_existing_session(
 
 
 def _idempotency_scope(
-    *, operation: str, scope_id: str, idempotency_key: str
+    *,
+    operation: IdempotencyScopeKind,
+    scope_id: str,
+    idempotency_key: str,
 ) -> IdempotencyScope:
     """构造 admission 幂等 scope。
 
@@ -3992,16 +4060,58 @@ def _idempotent_run_result(
         )
     attempt = _read_current_attempt(transaction, run)
     dispatch_record = _read_current_dispatch_record(transaction, run)
+    pending_dispatch = _idempotent_replay_pending_dispatch(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+    )
     return RunAdmissionResult(
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
-        pending_dispatch=None,
+        pending_dispatch=pending_dispatch,
         created=False,
         queued=run.status == RunStatus.QUEUED,
         attached_active=record.created_event_id is None,
         idempotent_replay=True,
     )
+
+
+def _idempotent_replay_pending_dispatch(
+    *,
+    run: RunRow,
+    attempt: AttemptRow | None,
+    dispatch_record: DispatchRecordRow | None,
+) -> PendingDispatchRecord | None:
+    """从 durable snapshot 派生幂等 replay 的 matching dispatch wake。
+
+    只有仍处于 ``RUNNING / STARTING / PENDING`` 的同源 current Attempt 才需要
+    重投递 dispatch。ACCEPTED Run 的 pre-start governance wake 由同一 admission
+    service 的 ``_wake_start_governance_if_needed`` 派生；terminal、queued、已
+    取消或已进入 lane/worker 流程的记录不重投递。
+
+    :param run: idempotency record 指向的最新 Run row。
+    :param attempt: Run current Attempt row；无 current Attempt 时为 ``None``。
+    :param dispatch_record: current Attempt dispatch row；无时为 ``None``。
+    :returns: 需要重投递时返回 matching pending dispatch，否则返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if (
+        run.status is not RunStatus.RUNNING
+        or attempt is None
+        or attempt.status is not AttemptStatus.STARTING
+        or dispatch_record is None
+        or dispatch_record.status is not DispatchRecordStatus.PENDING
+        or run.current_attempt_id != attempt.attempt_id
+        or dispatch_record.run_id != run.run_id
+        or dispatch_record.attempt_id != attempt.attempt_id
+        or dispatch_record.execution_id != attempt.execution_id
+        or dispatch_record.cancelled_event_id is not None
+        or dispatch_record.worker_accept_event_id is not None
+    ):
+        return None
+    return _pending_dispatch_from_row(dispatch_record)
 
 
 def _idempotent_steer_result(
@@ -4028,6 +4138,29 @@ def _idempotent_steer_result(
             else run_result.run.input_event_id
         ),
         idempotent_replay=True,
+    )
+
+
+def _classified_cancel_result(
+    classification: _CancelRunClassification,
+    result: CancelRunResult,
+) -> _CancelRunOperationResult:
+    """构造带有效 cancel result 的 transaction-local 分类。
+
+    :param classification: 只允许 supported 或 terminal 分类。
+    :param result: 同一 transaction 产生或恢复的 cancel result。
+    :returns: immutable operation result。
+    :raises ValueError: classification 不携带成功 result 时抛出。
+    """
+
+    if classification not in (
+        _CancelRunClassification.SUPPORTED,
+        _CancelRunClassification.TERMINAL,
+    ):
+        raise ValueError("cancel result requires supported or terminal classification")
+    return _CancelRunOperationResult(
+        classification=classification,
+        result=result,
     )
 
 
@@ -4067,12 +4200,17 @@ def _idempotent_cancel_result(
 
 
 def _idempotent_session_cancel_result(
-    transaction: HostTransaction, record: IdempotencyRecord, *, reason: str
+    transaction: HostTransaction,
+    record: IdempotencyRecord,
+    *,
+    event_log_store: EventLogStore,
+    reason: str,
 ) -> SessionCancelResult:
     """从幂等记录恢复 cancel_session_runs 结果。
 
     :param transaction: 当前 Host transaction。
     :param record: 已持久化幂等记录。
+    :param event_log_store: 注入的 EventLog primitive。
     :param reason: 本次 replay 的取消原因，用于 best-effort 重新传播。
     :returns: 当前 Session snapshot；不会取消首次操作后新增的 Run。
     :raises HostApiError: 结果类型错误或 Session 缺失时抛出。
@@ -4099,6 +4237,7 @@ def _idempotent_session_cancel_result(
         ),
         active_cancel_targets=_active_cancelling_targets_for_session_replay(
             transaction,
+            event_log_store,
             session.session_id,
             record=record,
             reason=reason,
@@ -4225,6 +4364,7 @@ def _active_cancel_target_for_session_target(
 
 def _active_cancelling_targets_for_session_replay(
     transaction: HostTransaction,
+    event_log_store: EventLogStore,
     session_id: str,
     *,
     record: IdempotencyRecord,
@@ -4233,6 +4373,7 @@ def _active_cancelling_targets_for_session_replay(
     """读取 session cancel replay 可重新传播的同源 active CANCELLING 目标。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: 注入的 EventLog primitive。
     :param session_id: Session id。
     :param record: 首次 session cancel 的幂等记录。
     :param reason: replay 请求中的 cancel reason。
@@ -4241,7 +4382,7 @@ def _active_cancelling_targets_for_session_replay(
 
     if record.created_event_id is None:
         return ()
-    event = EventLogStore().read_event_by_id(transaction, record.created_event_id)
+    event = event_log_store.read_event_by_id(transaction, record.created_event_id)
     if event is None or event.session_id != session_id or event.run_id is None:
         return ()
     run = read_run_by_id(transaction, event.run_id)
@@ -4457,7 +4598,7 @@ def _promote_after_release(
         dispatch_record=None,
         pending_dispatch=None,
         skipped=True,
-        skip_reason=PromotionSkipReason.ACTIVE_RUN_EXISTS,
+        skip_reason=PromotionSkipReason.DELEGATED_TO_GOVERNANCE,
     )
 
 
@@ -4552,21 +4693,6 @@ def _require_event_sequence_if_present(
             retryable=False,
         )
     return value
-
-
-def _is_terminal_run_status(status: RunStatus) -> bool:
-    """判断 Run 状态是否为终态。
-
-    :param status: Run 状态。
-    :returns: 是终态时返回 ``True``。
-    """
-
-    return status in (
-        RunStatus.SUCCEEDED,
-        RunStatus.FAILED,
-        RunStatus.CANCELLED,
-        RunStatus.LOST,
-    )
 
 
 def _raise_for_cancel_transition_status(
@@ -4679,7 +4805,9 @@ def _start_run_semantic_digest(
             "operation": _OPERATION_START_RUN,
             "input_digest": _input_digest(request.input),
             "execution_target": request.execution_target,
-            "queue_policy": request.queue_policy,
+            "queue_policy": serialize_run_queue_policy(
+                parse_run_queue_policy(request.queue_policy)
+            ),
             "caller_semantic_digest": caller_semantic_digest,
             "call_context_digest": _call_context_digest(request.context),
         }

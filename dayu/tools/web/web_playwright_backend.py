@@ -15,10 +15,12 @@ import os
 import pickle
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from functools import partial
 from multiprocessing.process import BaseProcess
 from queue import Empty, Queue
 from threading import Lock, Thread
-from typing import Protocol, TypeAlias, TypedDict, cast
+from typing import Final, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse
 
 import requests
@@ -29,6 +31,17 @@ from dayu.runtime.interruptible_process import (
     ProcessInterruptResult,
     enter_new_process_session_if_supported,
     interrupt_multiprocessing_process,
+)
+
+from .web_fetch_orchestrator import _FetchUrlSafetyError
+from .web_challenge_detection import BotChallengeDecision
+from .web_egress_policy import WebEgressPolicy, WebEgressPolicyError
+from .web_http_session import WebHttpTransportPolicy
+from .web_resource_budget import BrowserResourceBudget, DiagnosticResourceBudget
+from .web_diagnostics import (
+    WebDiagnosticBackend,
+    failed_projection,
+    project_safe_url_or_empty,
 )
 
 MODULE = "ENGINE.WEB_PLAYWRIGHT"
@@ -77,6 +90,7 @@ class _RouteRequestProtocol(Protocol):
     """Playwright Route.request 的最小协议。"""
 
     resource_type: str
+    url: str
 
 
 class _RouteProtocol(Protocol):
@@ -117,8 +131,12 @@ class _PageProtocol(Protocol):
         """读取页面 HTML。"""
         ...
 
-    def evaluate(self, expression: str) -> str:
-        """执行页面脚本并返回字符串结果。"""
+    def evaluate(
+        self,
+        expression: str,
+        arg: Mapping[str, int] | None = None,
+    ) -> JsonValue:
+        """执行页面脚本并返回 JSON 值。"""
         ...
 
     def wait_for_load_state(self, state: str, *, timeout: int) -> None:
@@ -180,6 +198,68 @@ class _WorkerKwargs(TypedDict):
     headers: Mapping[str, str] | None
     playwright_channel: str | None
     playwright_storage_state_path: str
+    egress_policy: WebEgressPolicy
+    browser_resource_budget: BrowserResourceBudget
+
+
+class _BudgetedDomMetrics(TypedDict):
+    """浏览器 bounded TreeWalker 预检结果。"""
+
+    dom_chars: int
+    text_chars: int
+    dom_exceeded: bool
+    text_exceeded: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserPageProjection:
+    """预算预检通过后的完整浏览器页面投影。"""
+
+    html: str
+    page_text: str
+
+
+_BROWSER_DOM_TOO_LARGE_REASON: Final[str] = "browser_dom_too_large"
+_BROWSER_TEXT_TOO_LARGE_REASON: Final[str] = "browser_text_too_large"
+_BROWSER_RESOURCE_BUDGET_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        _BROWSER_DOM_TOO_LARGE_REASON,
+        _BROWSER_TEXT_TOO_LARGE_REASON,
+    }
+)
+_BROWSER_PEER_PROOF_UNAVAILABLE_REASON: Final[str] = "browser_peer_proof_unavailable"
+_PROXY_ENVIRONMENT_NAMES: Final[tuple[str, ...]] = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+
+
+class _BrowserResourceBudgetExceeded(RuntimeError):
+    """浏览器页面在完整投影前后超过资源预算。"""
+
+    def __init__(self, reason: str) -> None:
+        """初始化浏览器资源超限异常。
+
+        Args:
+            reason: 封闭的 browser DOM/text 超限码。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: reason 不是封闭超限码时抛出。
+        """
+
+        if reason not in _BROWSER_RESOURCE_BUDGET_FAILURE_REASONS:
+            raise ValueError(f"unsupported browser budget failure: {reason}")
+        super().__init__(reason)
+        self.reason = reason
 
 
 class _PlaywrightWorkerProtocol(Protocol):
@@ -193,8 +273,26 @@ class _PlaywrightWorkerProtocol(Protocol):
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        egress_policy: WebEgressPolicy,
+        browser_resource_budget: BrowserResourceBudget,
     ) -> WebPayload:
-        """执行一次 Playwright 抓取。"""
+        """执行一次 Playwright 抓取。
+
+        Args:
+            url: 已通过调用入口校验的 URL。
+            timeout_seconds: 单次浏览器抓取超时秒数。
+            headers: 可选请求头。
+            playwright_channel: 可选浏览器 channel。
+            playwright_storage_state_path: 可选 storage state 路径。
+            egress_policy: 浏览器导航和子请求出站策略。
+            browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
+
+        Returns:
+            浏览器抓取与转换后的 payload。
+
+        Raises:
+            Exception: 浏览器抓取或转换失败时透出。
+        """
         ...
 
 
@@ -277,8 +375,8 @@ class _ChallengeResultProtocol(Protocol):
     """Challenge 检测结果的最小协议。"""
 
     @property
-    def challenge_detected(self) -> bool:
-        """是否检测到挑战页。"""
+    def decision(self) -> BotChallengeDecision:
+        """返回挑战页证据强度判定。"""
         ...
 
     @property
@@ -315,6 +413,51 @@ _PW_NETWORK_IDLE_TIMEOUT_MS = 1500
 _PW_RESULT_POLL_INTERVAL_SECONDS = 0.05
 _PW_RESULT_DRAIN_GRACE_SECONDS = 0.5
 _PW_PROCESS_TERMINATE_GRACE_SECONDS = 1.0
+_PW_LAUNCH_FAILURE_RUNTIME_STOP_STAGE: Final = "browser_launch_failure_runtime_stop"
+_BUDGETED_DOM_METRICS_SCRIPT = """
+({domLimit, textLimit}) => {
+  let domChars = 0;
+  let textChars = 0;
+  let domExceeded = false;
+  let textExceeded = false;
+  const addDom = (value) => {
+    domChars = Math.min(domLimit + 1, domChars + value);
+    domExceeded = domChars > domLimit;
+  };
+  const addText = (value) => {
+    textChars = Math.min(textLimit + 1, textChars + value);
+    textExceeded = textChars > textLimit;
+  };
+  const walker = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const localName = node.localName || '';
+      addDom(2 * localName.length + 5);
+      for (const attribute of node.attributes) {
+        addDom(attribute.name.length + 6 * attribute.value.length + 4);
+        if (domExceeded) break;
+      }
+    } else if (node.nodeType === Node.TEXT_NODE) {
+      const length = (node.nodeValue || '').length;
+      addDom(5 * length);
+      addText(length);
+    } else if (node.nodeType === Node.COMMENT_NODE) {
+      addDom((node.nodeValue || '').length + 7);
+    } else if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
+      addDom(
+        (node.name || '').length +
+        (node.publicId || '').length +
+        (node.systemId || '').length +
+        32
+      );
+    }
+    if (domExceeded || textExceeded) break;
+  }
+  return {domChars, textChars, domExceeded, textExceeded};
+}
+""".strip()
+_FULL_PAGE_TEXT_SCRIPT = "() => document.body ? document.body.innerText : ''"
 
 
 class _PlaywrightProcessCleanup(TypedDict):
@@ -390,6 +533,8 @@ def _playwright_process_entry(
     result_queue: _ResultQueueProtocol,
     worker_callable: _PlaywrightWorkerProtocol,
     worker_kwargs: _WorkerKwargs,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
+    allow_environment_proxy: bool,
 ) -> None:
     """子进程入口：执行同步 Playwright worker 并回传结果。
 
@@ -397,6 +542,8 @@ def _playwright_process_entry(
         result_queue: 结果队列。
         worker_callable: 同步 worker 函数。
         worker_kwargs: worker 关键字参数。
+        diagnostic_resource_budget: process/failure 诊断投影预算。
+        allow_environment_proxy: 是否允许 worker 继承 proxy 环境变量。
 
     Returns:
         无。
@@ -405,20 +552,70 @@ def _playwright_process_entry(
         无。
     """
 
+    if not allow_environment_proxy:
+        _clear_proxy_environment()
     enter_new_process_session_if_supported()
+    diagnostic_url = worker_kwargs["url"]
+    max_error_chars = diagnostic_resource_budget.error_chars
     try:
-        result_queue.put({
-            "kind": "result",
-            "payload": worker_callable(**worker_kwargs),
-        })
+        result_queue.put(
+            {
+                "kind": "result",
+                "payload": worker_callable(**worker_kwargs),
+            }
+        )
+    except _FetchUrlSafetyError as exc:
+        result_queue.put(
+            {
+                "kind": "error",
+                "error_type": type(exc).__name__,
+                "message": failed_projection(
+                    stage="playwright_worker",
+                    url=diagnostic_url,
+                    elapsed_seconds=0.0,
+                    error_code="permission_denied",
+                    error_message=str(exc),
+                    max_error_chars=max_error_chars,
+                    backend=WebDiagnosticBackend.PLAYWRIGHT,
+                ).error_message,
+                "blocked_by_safety_policy": True,
+                "blocked_url": project_safe_url_or_empty(exc.url),
+                "blocked_stage": exc.reason,
+            }
+        )
     except BaseException as exc:
         result_queue.put(
             {
                 "kind": "error",
                 "error_type": type(exc).__name__,
-                "message": str(exc),
+                "message": failed_projection(
+                    stage="playwright_worker",
+                    url=diagnostic_url,
+                    elapsed_seconds=0.0,
+                    error_code="playwright_error",
+                    error_message=str(exc),
+                    max_error_chars=max_error_chars,
+                    backend=WebDiagnosticBackend.PLAYWRIGHT,
+                ).error_message,
             }
         )
+
+
+def _clear_proxy_environment() -> None:
+    """从当前 Playwright worker 进程删除标准 proxy 环境变量。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    for environment_name in _PROXY_ENVIRONMENT_NAMES:
+        os.environ.pop(environment_name, None)
 
 
 def _is_picklable_worker(worker_callable: _PlaywrightWorkerProtocol) -> bool:
@@ -636,6 +833,8 @@ def _run_playwright_worker_process(
     *,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
     worker_kwargs: _WorkerKwargs,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
+    allow_environment_proxy: bool,
     total_timeout: float,
     cancellation_token: CancellationToken | None,
 ) -> WebPayload:
@@ -644,6 +843,8 @@ def _run_playwright_worker_process(
     Args:
         playwright_sync_worker: 同步 worker 函数。
         worker_kwargs: worker 关键字参数。
+        diagnostic_resource_budget: process/failure 诊断投影预算。
+        allow_environment_proxy: 是否允许 worker 沿用 proxy 环境。
         total_timeout: 父进程等待总时长。
         cancellation_token: 当前工具调用的取消令牌。
 
@@ -660,7 +861,13 @@ def _run_playwright_worker_process(
     result_queue = cast(_ResultQueueProtocol, ctx.Queue(maxsize=1))
     process = ctx.Process(
         target=_playwright_process_entry,
-        args=(result_queue, playwright_sync_worker, worker_kwargs),
+        args=(
+            result_queue,
+            playwright_sync_worker,
+            worker_kwargs,
+            diagnostic_resource_budget,
+            allow_environment_proxy,
+        ),
     )
     process.daemon = True
     process.start()
@@ -696,9 +903,12 @@ def _run_playwright_worker_process(
                 continue
 
         if payload.get("kind") == "error":
-            raise RuntimeError(
-                f"{payload.get('error_type')}: {payload.get('message')}"
-            )
+            if payload.get("blocked_by_safety_policy") is True:
+                blocked_url = payload.get("blocked_url")
+                blocked_stage = payload.get("blocked_stage")
+                if isinstance(blocked_url, str) and isinstance(blocked_stage, str):
+                    raise _FetchUrlSafetyError(url=blocked_url, reason=blocked_stage)
+            raise RuntimeError(f"{payload.get('error_type')}: {payload.get('message')}")
         return cast(WebPayload, payload["payload"])
     finally:
         if process.is_alive():
@@ -844,6 +1054,7 @@ def _get_playwright_browser(
             return _PW_BROWSER
         if _PW_BROWSER is not None or _PW_INSTANCE is not None:
             _close_playwright_browser()
+        pw: _PlaywrightInstanceProtocol | None = None
         try:
             from playwright.sync_api import sync_playwright
 
@@ -857,16 +1068,53 @@ def _get_playwright_browser(
             _PW_BROWSER = browser
             _PW_BROWSER_KEY = browser_key
         except Exception as exc:
+            if pw is not None:
+                # runtime 尚未发布到全局，必须在当前 owner 异常边界就地回收。
+                try:
+                    pw.stop()
+                except Exception as stop_exc:
+                    Log.debug(
+                        "Playwright runtime cleanup failed "
+                        f"stage={_PW_LAUNCH_FAILURE_RUNTIME_STOP_STAGE} "
+                        f"exception_type={type(stop_exc).__name__}",
+                        module=MODULE,
+                    )
             Log.warning(f"Playwright 浏览器初始化失败，回退不可用: {exc}", module=MODULE)
             return None
     return _PW_BROWSER
 
 
-def _route_handler_abort_resources(route: _RouteProtocol) -> None:
-    """中止图片、字体、媒体请求，放行其余资源。
+def _raise_if_playwright_url_blocked(*, url: str, egress_policy: WebEgressPolicy, reason: str) -> None:
+    """在 Playwright 导航/request 边界复用 Web URL 安全谓词。
+
+    Args:
+        url: 待校验 URL。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        reason: 诊断用阶段标识。
+
+    Returns:
+        无。
+
+    Raises:
+        _FetchUrlSafetyError: URL 被安全策略拒绝时抛出。
+    """
+
+    try:
+        egress_policy.authorize_http_target(url, stage=reason)
+    except WebEgressPolicyError as exc:
+        raise _FetchUrlSafetyError(url=exc.url, reason=reason) from exc
+
+
+def _route_handler_abort_resources(
+    route: _RouteProtocol,
+    *,
+    egress_policy: WebEgressPolicy,
+) -> None:
+    """中止图片、字体、媒体请求，并拒绝不安全的浏览器 request。
 
     Args:
         route: Playwright Route 对象。
+        egress_policy: 当前 local/dev 浏览器 profile 的统一出站策略。
 
     Returns:
         无。
@@ -877,6 +1125,8 @@ def _route_handler_abort_resources(route: _RouteProtocol) -> None:
 
     abort_resource_types = {"image", "font", "media"}
     if route.request.resource_type in abort_resource_types:
+        route.abort()
+    elif not egress_policy.is_url_allowed(route.request.url):
         route.abort()
     else:
         route.continue_()
@@ -938,6 +1188,7 @@ def _maybe_warmup_playwright_page(
     deadline_monotonic: float,
     build_domain_home_url: Callable[[str], str],
     normalize_url_for_http: Callable[[str], str],
+    egress_policy: WebEgressPolicy,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """在浏览器回退前先做一次同域首页预热。
@@ -948,6 +1199,7 @@ def _maybe_warmup_playwright_page(
         deadline_monotonic: 本次浏览器抓取总预算 deadline。
         build_domain_home_url: 同域首页构造函数。
         normalize_url_for_http: URL 规范化函数。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -965,6 +1217,14 @@ def _maybe_warmup_playwright_page(
 
     if home_url == normalized_url:
         return
+    try:
+        _raise_if_playwright_url_blocked(
+            url=home_url,
+            egress_policy=egress_policy,
+            reason="playwright_warmup",
+        )
+    except RuntimeError:
+        return
 
     remaining_timeout_ms = _get_remaining_playwright_timeout_ms(
         deadline_monotonic,
@@ -976,6 +1236,11 @@ def _maybe_warmup_playwright_page(
 
     try:
         page.goto(home_url, wait_until="domcontentloaded", timeout=warmup_timeout_ms)
+        _raise_if_playwright_url_blocked(
+            url=page.url,
+            egress_policy=egress_policy,
+            reason="playwright_warmup_response",
+        )
     except Exception:
         return
 
@@ -1026,6 +1291,123 @@ def _settle_playwright_page(
     page.wait_for_timeout(step_timeout_ms)
 
 
+def _read_budgeted_dom_metrics(
+    page: _PageProtocol,
+    *,
+    browser_resource_budget: BrowserResourceBudget,
+) -> _BudgetedDomMetrics:
+    """执行不生成完整 DOM/text 的 bounded TreeWalker 预检。
+
+    Args:
+        page: 当前 Playwright Page。
+        browser_resource_budget: 浏览器 DOM/text 资源预算。
+
+    Returns:
+        有界 DOM/text counters 与超限标记。
+
+    Raises:
+        RuntimeError: 浏览器返回的 metrics shape 或字段类型非法时抛出。
+    """
+
+    raw_metrics = page.evaluate(
+        _BUDGETED_DOM_METRICS_SCRIPT,
+        {
+            "domLimit": browser_resource_budget.dom_chars,
+            "textLimit": browser_resource_budget.text_chars,
+        },
+    )
+    if not isinstance(raw_metrics, Mapping):
+        raise RuntimeError("Playwright DOM budget preflight returned invalid shape")
+    dom_chars = raw_metrics.get("domChars")
+    text_chars = raw_metrics.get("textChars")
+    dom_exceeded = raw_metrics.get("domExceeded")
+    text_exceeded = raw_metrics.get("textExceeded")
+    if (
+        isinstance(dom_chars, bool)
+        or not isinstance(dom_chars, int)
+        or dom_chars < 0
+        or isinstance(text_chars, bool)
+        or not isinstance(text_chars, int)
+        or text_chars < 0
+        or not isinstance(dom_exceeded, bool)
+        or not isinstance(text_exceeded, bool)
+    ):
+        raise RuntimeError("Playwright DOM budget preflight returned invalid fields")
+    return {
+        "dom_chars": dom_chars,
+        "text_chars": text_chars,
+        "dom_exceeded": dom_exceeded,
+        "text_exceeded": text_exceeded,
+    }
+
+
+def _materialize_bounded_page_projection(
+    page: _PageProtocol,
+    *,
+    browser_resource_budget: BrowserResourceBudget,
+) -> _BrowserPageProjection:
+    """先 bounded preflight，再生成并复核完整 HTML/text 投影。
+
+    Args:
+        page: 当前 Playwright Page。
+        browser_resource_budget: 浏览器 DOM/text 资源预算。
+
+    Returns:
+        实际长度复核通过的完整 HTML 与页面文本。
+
+    Raises:
+        _BrowserResourceBudgetExceeded: DOM/text 预检或实际投影超限时抛出。
+        RuntimeError: 浏览器返回的 metrics shape 非法时抛出。
+    """
+
+    metrics = _read_budgeted_dom_metrics(
+        page,
+        browser_resource_budget=browser_resource_budget,
+    )
+    if metrics["dom_exceeded"] or metrics["dom_chars"] > browser_resource_budget.dom_chars:
+        raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
+    if metrics["text_exceeded"] or metrics["text_chars"] > browser_resource_budget.text_chars:
+        raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
+
+    html = page.content()
+    if len(html) > browser_resource_budget.dom_chars:
+        raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
+    try:
+        raw_page_text = page.evaluate(_FULL_PAGE_TEXT_SCRIPT)
+        page_text = raw_page_text if isinstance(raw_page_text, str) else html
+    except Exception:
+        Log.debug(
+            "Playwright 页面全文本提取失败，回退到 HTML。",
+            module=MODULE,
+        )
+        page_text = html
+    if len(page_text) > browser_resource_budget.text_chars:
+        raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
+    return _BrowserPageProjection(html=html, page_text=page_text)
+
+
+def _browser_budget_failure(reason: str) -> WebPayload:
+    """构造浏览器资源超限的稳定失败事实。
+
+    Args:
+        reason: 封闭的 browser DOM/text 超限码。
+
+    Returns:
+        可跨进程投影的失败 payload。
+
+    Raises:
+        ValueError: reason 不是封闭资源失败码时抛出。
+    """
+
+    if reason not in _BROWSER_RESOURCE_BUDGET_FAILURE_REASONS:
+        raise ValueError(f"unsupported browser budget failure: {reason}")
+    return {
+        "ok": False,
+        "availability": "unprocessable",
+        "reason": reason,
+    }
+
+
 def _playwright_sync_worker(
     *,
     url: str,
@@ -1037,8 +1419,9 @@ def _playwright_sync_worker(
     build_domain_home_url: Callable[[str], str],
     normalize_url_for_http: Callable[[str], str],
     sanitize_response_headers: Callable[[Mapping[str, str]], dict[str, str]],
-    build_text_excerpt: Callable[[str], str],
     convert_html_to_markdown: _HtmlConverterProtocol,
+    egress_policy: WebEgressPolicy,
+    browser_resource_budget: BrowserResourceBudget,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
@@ -1053,8 +1436,9 @@ def _playwright_sync_worker(
         build_domain_home_url: 同域首页构造函数。
         normalize_url_for_http: URL 规范化函数。
         sanitize_response_headers: 响应头裁剪函数。
-        build_text_excerpt: 文本摘录构造函数。
         convert_html_to_markdown: HTML 四段式转换函数。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -1107,15 +1491,24 @@ def _playwright_sync_worker(
         page = context.new_page()
         if has_stealth and stealth_class is not None:
             stealth_class().apply_stealth_sync(page)
-        page.route("**/*", _route_handler_abort_resources)
+        page.route(
+            "**/*",
+            partial(_route_handler_abort_resources, egress_policy=egress_policy),
+        )
 
         deadline_monotonic = time_monotonic() + max(float(timeout_seconds), 0.0)
+        _raise_if_playwright_url_blocked(
+            url=url,
+            egress_policy=egress_policy,
+            reason="playwright_goto",
+        )
         _maybe_warmup_playwright_page(
             page=page,
             url=url,
             deadline_monotonic=deadline_monotonic,
             build_domain_home_url=build_domain_home_url,
             normalize_url_for_http=normalize_url_for_http,
+            egress_policy=egress_policy,
             time_monotonic=time_monotonic,
         )
         try:
@@ -1132,6 +1525,11 @@ def _playwright_sync_worker(
 
         if response is None:
             raise RuntimeError("Playwright page.goto 未返回 response 对象。")
+        _raise_if_playwright_url_blocked(
+            url=page.url,
+            egress_policy=egress_policy,
+            reason="playwright_response",
+        )
 
         content_type_value = (response.headers.get("content-type") or "").lower()
         if "text/html" not in content_type_value and content_type_value:
@@ -1150,12 +1548,22 @@ def _playwright_sync_worker(
             deadline_monotonic=deadline_monotonic,
             time_monotonic=time_monotonic,
         )
-        html = page.content()
-        final_url = page.url
+        _raise_if_playwright_url_blocked(
+            url=page.url,
+            egress_policy=egress_policy,
+            reason="playwright_settled_page",
+        )
         try:
-            page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
-        except Exception:
-            page_text = html
+            page_projection = _materialize_bounded_page_projection(
+                page,
+                browser_resource_budget=browser_resource_budget,
+            )
+        except _BrowserResourceBudgetExceeded as exc:
+            context.close()
+            return _browser_budget_failure(exc.reason)
+        html = page_projection.html
+        final_url = page.url
+        page_text = page_projection.page_text
     except Exception:
         context.close()
         raise
@@ -1163,6 +1571,8 @@ def _playwright_sync_worker(
         context.close()
 
     pipeline_result = convert_html_to_markdown(html, url=final_url)
+    if len(pipeline_result.markdown) > browser_resource_budget.text_chars:
+        return _browser_budget_failure(_BROWSER_TEXT_TOO_LARGE_REASON)
     return {
         "ok": True,
         "title": pipeline_result.title,
@@ -1175,7 +1585,6 @@ def _playwright_sync_worker(
         "content_stats": dict(pipeline_result.content_stats),
         "http_status": response.status,
         "response_headers": sanitize_response_headers(response.headers),
-        "response_excerpt": build_text_excerpt(page_text),
     }
 
 
@@ -1188,6 +1597,10 @@ def _fetch_and_convert_with_playwright(
     deadline_monotonic: float | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    browser_resource_budget: BrowserResourceBudget,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
     resolve_timeout_budget: _ResolveTimeoutBudgetProtocol,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
@@ -1203,6 +1616,11 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 attempt 的 HTTP/browser proxy 与 peer policy。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
+        diagnostic_resource_budget: process/failure 诊断投影预算。
+        cancellation_token: 当前工具调用的可选取消令牌。
         resolve_timeout_budget: timeout 预算解析函数。
         playwright_sync_worker: 同步 worker 函数。
         detect_bot_challenge: challenge 检测函数。
@@ -1211,8 +1629,15 @@ def _fetch_and_convert_with_playwright(
         成功时返回 `ok=True` 结果；失败时返回标准化失败字典。
 
     Raises:
-        无。
+        _FetchUrlSafetyError: Playwright 导航或最终页面 URL 被安全策略拒绝时抛出。
     """
+
+    if transport_policy.dns_peer_proof_enabled:
+        return {
+            "ok": False,
+            "availability": "unprocessable",
+            "reason": _BROWSER_PEER_PROOF_UNAVAILABLE_REASON,
+        }
 
     try:
         import playwright  # noqa: F401
@@ -1251,21 +1676,35 @@ def _fetch_and_convert_with_playwright(
                     "headers": headers,
                     "playwright_channel": playwright_channel,
                     "playwright_storage_state_path": playwright_storage_state_path,
+                    "egress_policy": egress_policy,
+                    "browser_resource_budget": browser_resource_budget,
                 },
+                diagnostic_resource_budget=diagnostic_resource_budget,
+                allow_environment_proxy=transport_policy.allow_environment_proxy,
                 total_timeout=total_timeout,
                 cancellation_token=cancellation_token,
             )
         else:
-            Log.warning(
-                "Playwright worker 不可序列化，已拒绝同进程 fallback。", module=MODULE
-            )
+            Log.warning("Playwright worker 不可序列化，已拒绝同进程 fallback。", module=MODULE)
             return {
                 "ok": False,
                 "availability": "unprocessable",
                 "reason": "playwright_worker_not_picklable",
             }
     except TimeoutError:
-        Log.debug(f"Playwright 浏览器回退在 {total_timeout}s 内未返回结果: {url}", module=MODULE)
+        timeout_projection = failed_projection(
+            stage="playwright_fallback",
+            url=url,
+            elapsed_seconds=total_timeout,
+            error_code="playwright_timeout",
+            error_message="Playwright 浏览器回退在预算内未返回结果。",
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        )
+        Log.debug(
+            f"Playwright 浏览器回退失败: {timeout_projection.to_json()}",
+            module=MODULE,
+        )
         return {
             "ok": False,
             "availability": "timeout",
@@ -1273,8 +1712,22 @@ def _fetch_and_convert_with_playwright(
         }
     except CancelledError:
         raise
+    except _FetchUrlSafetyError:
+        raise
     except Exception as exc:
-        Log.debug(f"Playwright 浏览器回退失败: {exc}", module=MODULE)
+        error_projection = failed_projection(
+            stage="playwright_fallback",
+            url=url,
+            elapsed_seconds=0.0,
+            error_code="playwright_error",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        )
+        Log.debug(
+            f"Playwright 浏览器回退失败: {error_projection.to_json()}",
+            module=MODULE,
+        )
         return {
             "ok": False,
             "availability": "unprocessable",
@@ -1287,24 +1740,20 @@ def _fetch_and_convert_with_playwright(
         result_status = result.get("http_status")
         http_status = result_status if isinstance(result_status, int) and not isinstance(result_status, bool) else None
         content_value = result.get("content")
-        excerpt_value = result.get("response_excerpt")
         content_text = content_value if isinstance(content_value, str) else ""
-        if not content_text and isinstance(excerpt_value, str):
-            content_text = excerpt_value
         challenge = detect_bot_challenge(
             response=None,
             response_headers=response_headers,
             http_status=http_status,
             content_text=content_text,
         )
-        if challenge.challenge_detected:
+        if challenge.decision is BotChallengeDecision.CONFIRMED:
             return {
                 "ok": False,
                 "availability": "blocked",
                 "reason": "bot_challenge",
                 "http_status": result.get("http_status"),
                 "response_headers": result.get("response_headers", {}),
-                "response_excerpt": result.get("response_excerpt", ""),
                 "challenge_signals": list(challenge.challenge_signals),
             }
     return result

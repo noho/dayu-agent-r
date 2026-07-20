@@ -106,7 +106,7 @@ class DuplicateGovernanceMessages:
         "或在改变证据范围后再调用工具。"
     )
     awaiting_fanout: str = (
-        "相同工具请求已经进入等待状态；当前重复请求共享同一个等待结果。"
+        "相同工具请求已有进行中的工具结果；当前重复请求共享同一个结果。"
     )
 
     def __post_init__(self) -> None:

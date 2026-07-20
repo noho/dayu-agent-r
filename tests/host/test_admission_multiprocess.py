@@ -11,14 +11,19 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from multiprocessing import Process
+from multiprocessing import Pipe, Process
+from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import Generic, TypeVar
+from unittest.mock import patch
 
+import dayu.host.admission as host_admission
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
     CloseoutAttemptTerminalInput,
     HostAdmissionService,
+    PendingDispatchRecord,
     SubmitFollowupQueueAdmissionInput,
     create_host_admission_service,
 )
@@ -26,6 +31,7 @@ from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
     CancelMode,
+    CancelRunRequest,
     EnsureSessionRequest,
     FollowupBehavior,
     HostApiError,
@@ -65,6 +71,7 @@ from dayu.host.durable.run_transition import (
 )
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_SESSION_SLOTS,
@@ -79,7 +86,12 @@ from dayu.host.durable.state import (
     mark_dispatching_after_lane_row,
     read_run_by_id,
 )
-from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostRow,
+    HostTransaction,
+    HostTransactionOperation,
+    HostTransactionRunner,
+)
 
 _PROCESS_COUNT = 4
 _START_GATE_TIMEOUT_SECONDS = 5.0
@@ -89,6 +101,7 @@ _CALLER_DIGEST = sha256_digest_json({"caller": "admission-multiprocess"})
 _SCOPE = "workspace"
 _SLOT_KEY = "multiprocess"
 _DEFAULT_TARGET = "target-default"
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +114,84 @@ class _QueuedRunSummary:
 
     run_id: str
     accepted_event_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BarrierWriteOperation(Generic[T]):
+    """在 operation 分类完成、transaction commit 前建立进程 barrier。
+
+    :param operation: 原始 typed write operation。
+    :param control: parent/child duplex control pipe。
+    """
+
+    operation: HostTransactionOperation[T]
+    control: Connection
+
+    def __call__(self, transaction: HostTransaction) -> T:
+        """执行 operation 后等待 parent 允许 transaction commit。
+
+        :param transaction: 当前已持有 SQLite write lock 的 transaction。
+        :returns: 原始 operation result。
+        :raises RuntimeError: parent 发送未知 barrier command 时抛出。
+        :raises Exception: 原始 operation 失败时透传。
+        """
+
+        result = self.operation(transaction)
+        self.control.send(("classified",))
+        command = self.control.recv()
+        if command != ("continue",):
+            raise RuntimeError("unexpected cancel snapshot barrier command")
+        return result
+
+
+class _RecordingAdmissionWakeupPort:
+    """记录 admission commit 后 typed wake 的测试端口。"""
+
+    def __init__(self) -> None:
+        """初始化空 wake 记录。
+
+        :returns: ``None``。
+        """
+
+        self.dispatches: list[PendingDispatchRecord] = []
+        self.promotions: list[str] = []
+        self.watchdog_wake_count = 0
+
+    def wake_dispatch(self, record: PendingDispatchRecord) -> None:
+        """记录 matching dispatch wake。
+
+        :param record: durable snapshot 派生的 pending dispatch。
+        :returns: ``None``。
+        """
+
+        self.dispatches.append(record)
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """记录 pre-start governance wake。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        """
+
+        self.promotions.append(session_id)
+
+    def wake_active_cancel_watchdog(self) -> None:
+        """记录 active cancel watchdog wake。
+
+        :returns: ``None``。
+        """
+
+        self.watchdog_wake_count += 1
+
+    def clear(self) -> None:
+        """清空全部 wake 记录。
+
+        :returns: ``None``。
+        """
+
+        self.dispatches.clear()
+        self.promotions.clear()
+        self.watchdog_wake_count = 0
 
 
 def test_multiprocess_same_slot_ensure_returns_one_bound_session(
@@ -480,6 +571,217 @@ def test_multiprocess_admission_event_sequence_is_global_unique_and_increasing(
         _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
 
 
+def test_multiprocess_cancel_error_uses_locked_write_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Attempt 状态在 write snapshot 前后改变时 cancel 只返回对应快照语义。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    before_db = tmp_path / "cancel-before.sqlite3"
+    before_artifacts = tmp_path / "cancel-before-artifacts"
+    before_run_id, before_attempt_id = _seed_deferred_cancel_snapshot(
+        before_db,
+        before_artifacts,
+        suffix="before",
+    )
+    mutation_parent, mutation_child = Pipe(duplex=True)
+    mutation = Process(
+        target=_mark_attempt_running_worker,
+        args=(
+            str(before_db),
+            str(before_artifacts),
+            before_attempt_id,
+            mutation_child,
+        ),
+    )
+    mutation.start()
+    assert mutation_parent.recv() == ("attempting",)
+    assert mutation_parent.recv() == ("committed",)
+    mutation.join()
+    assert mutation.exitcode == 0
+
+    with open_host_durable_store(_options(before_db, before_artifacts)) as store:
+        supported = _admission_service(store.transaction_runner).cancel_run(
+            before_run_id,
+            _cancel_request("cancel-after-attempt-running"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert supported.run.status is RunStatus.CANCELLING
+
+    after_db = tmp_path / "cancel-after.sqlite3"
+    after_artifacts = tmp_path / "cancel-after-artifacts"
+    after_run_id, after_attempt_id = _seed_deferred_cancel_snapshot(
+        after_db,
+        after_artifacts,
+        suffix="after",
+    )
+    cancel_parent, cancel_child = Pipe(duplex=True)
+    cancel_process = Process(
+        target=_cancel_with_commit_barrier_worker,
+        args=(
+            str(after_db),
+            str(after_artifacts),
+            after_run_id,
+            cancel_child,
+        ),
+    )
+    cancel_process.start()
+    assert cancel_parent.recv() == ("classified",)
+
+    after_mutation_parent, after_mutation_child = Pipe(duplex=True)
+    after_mutation = Process(
+        target=_mark_attempt_running_worker,
+        args=(
+            str(after_db),
+            str(after_artifacts),
+            after_attempt_id,
+            after_mutation_child,
+        ),
+    )
+    after_mutation.start()
+    assert after_mutation_parent.recv() == ("attempting",)
+    cancel_parent.send(("continue",))
+
+    assert cancel_parent.recv() == (
+        "error",
+        HostApiErrorCode.UNSUPPORTED_OPERATION.value,
+    )
+    assert after_mutation_parent.recv() == ("committed",)
+    cancel_process.join()
+    after_mutation.join()
+    assert cancel_process.exitcode == 0
+    assert after_mutation.exitcode == 0
+    assert _read_attempt_status(
+        after_db,
+        after_artifacts,
+        after_attempt_id,
+    ) == (
+        AttemptStatus.RUNNING.value
+    )
+
+
+def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
+    tmp_path: Path,
+) -> None:
+    """幂等 replay 对 ACCEPTED/PENDING 重唤醒且不误唤醒已取消记录。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    db_path = tmp_path / "durable.sqlite3"
+    artifact_root = tmp_path / "artifacts"
+    with open_host_durable_store(_options(db_path, artifact_root)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        wakeup = _RecordingAdmissionWakeupPort()
+        service = create_host_admission_service(
+            store.transaction_runner,
+            ordinary_run_baseline=_ordinary_run_baseline(),
+            wakeup_port=wakeup,
+        )
+        request = _start_request(
+            session_id=session_id,
+            client_request_id="idempotent-wake",
+            display_text="idempotent wake",
+        )
+
+        accepted = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert accepted.run.status is RunStatus.ACCEPTED
+        assert wakeup.promotions == [session_id]
+        assert wakeup.dispatches == []
+
+        wakeup.clear()
+        accepted_replay = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert accepted_replay.idempotent_replay is True
+        assert wakeup.promotions == [session_id]
+        assert wakeup.dispatches == []
+
+        attempt_id = _start_governed_pending(
+            store.transaction_runner,
+            run_id=accepted.run.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            id_suffix="idempotent-wake",
+        )
+        wakeup.clear()
+        pending_replay = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert pending_replay.idempotent_replay is True
+        assert len(wakeup.dispatches) == 1
+        pending = wakeup.dispatches[0]
+        assert pending.run_id == accepted.run.run_id
+        assert pending.attempt_id == attempt_id
+        assert pending.dispatch_record_id == (
+            pending_replay.dispatch_record.dispatch_record_id
+            if pending_replay.dispatch_record is not None
+            else ""
+        )
+        assert wakeup.promotions == []
+
+        cancel_request = CancelRunRequest(
+            context=_context(),
+            client_request_id="cancel-idempotent-wake",
+            reason="cancel_before_worker_accept",
+            mode=CancelMode.GRACEFUL,
+        )
+        cancel_digest = sha256_digest_json(
+            {"caller": "cancel-idempotent-wake"}
+        )
+        first_cancel = service.cancel_run(
+            accepted.run.run_id,
+            cancel_request,
+            caller_semantic_digest=cancel_digest,
+        )
+        assert first_cancel.released_active_slot is True
+        assert wakeup.promotions == [session_id]
+
+        wakeup.clear()
+        cancel_replay = service.cancel_run(
+            accepted.run.run_id,
+            cancel_request,
+            caller_semantic_digest=cancel_digest,
+        )
+        assert cancel_replay.idempotent_replay is True
+        assert cancel_replay.released_active_slot is False
+        assert wakeup.promotions == []
+
+        terminal_loser = service.cancel_run(
+            accepted.run.run_id,
+            CancelRunRequest(
+                context=_context(),
+                client_request_id="cancel-terminal-loser",
+                reason="cancel_after_terminal",
+                mode=CancelMode.GRACEFUL,
+            ),
+            caller_semantic_digest=sha256_digest_json(
+                {"caller": "cancel-terminal-loser"}
+            ),
+        )
+        assert terminal_loser.run.status is RunStatus.CANCELLED
+        assert terminal_loser.released_active_slot is False
+        assert wakeup.promotions == []
+
+        wakeup.clear()
+        cancelled_replay = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert cancelled_replay.run.status is RunStatus.CANCELLED
+        assert wakeup.dispatches == []
+        assert wakeup.promotions == []
+        assert wakeup.watchdog_wake_count == 0
+
+
 def _options(db_path: Path, artifact_root: Path) -> HostDurableStoreOptions:
     """构造多进程 Host durable store options。
 
@@ -516,6 +818,216 @@ def _admission_service(
     )
 
 
+def _cancel_request(client_request_id: str) -> CancelRunRequest:
+    """构造 multiprocess cancel request。
+
+    :param client_request_id: client request id。
+    :returns: cancel request。
+    """
+
+    return CancelRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="cancel_snapshot_race",
+        mode=CancelMode.GRACEFUL,
+    )
+
+
+def _seed_deferred_cancel_snapshot(
+    db_path: Path,
+    artifact_root: Path,
+    *,
+    suffix: str,
+) -> tuple[str, str]:
+    """创建 RUNNING/STARTING 且缺 dispatch 的 deferred cancel snapshot。
+
+    :param db_path: SQLite DB 路径。
+    :param artifact_root: artifact 根目录。
+    :param suffix: 测试 identity 后缀。
+    :returns: Run id 与 Attempt id。
+    """
+
+    run_id = ""
+    attempt_id = ""
+    with open_host_durable_store(_options(db_path, artifact_root)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        accepted = _admission_service(store.transaction_runner).start_run(
+            _start_request(
+                session_id=session_id,
+                client_request_id=f"start-cancel-snapshot-{suffix}",
+                display_text="cancel snapshot",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        attempt_id = _start_governed_pending(
+            store.transaction_runner,
+            run_id=accepted.run.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            id_suffix=f"cancel-snapshot-{suffix}",
+        )
+
+        def delete_dispatch(transaction: HostTransaction) -> None:
+            """删除 current Attempt 的 child dispatch row。
+
+            :param transaction: 当前 Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                f"""
+                DELETE FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+                WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            )
+
+        store.transaction_runner.run_write(delete_dispatch)
+        run_id = accepted.run.run_id
+    assert run_id != ""
+    assert attempt_id != ""
+    return run_id, attempt_id
+
+
+def _cancel_with_commit_barrier_worker(
+    db_path_text: str,
+    artifact_root_text: str,
+    run_id: str,
+    control: Connection,
+) -> None:
+    """子进程：在 cancel 分类完成、commit 前持锁等待 parent。
+
+    :param db_path_text: SQLite DB 路径文本。
+    :param artifact_root_text: artifact 根目录文本。
+    :param run_id: 目标 Run id。
+    :param control: parent/child control pipe。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(
+        _options(Path(db_path_text), Path(artifact_root_text))
+    ) as store:
+        original_run_write = HostTransactionRunner.run_write
+
+        def run_write_with_barrier(
+            self: HostTransactionRunner,
+            operation: HostTransactionOperation[T],
+        ) -> T:
+            """把 service write operation 包装为 commit barrier。
+
+            :param self: transaction runner。
+            :param operation: typed write operation。
+            :returns: 原始 operation result。
+            :raises Exception: transaction 或 barrier 失败时透传。
+            """
+
+            return original_run_write(
+                self,
+                _BarrierWriteOperation(operation=operation, control=control),
+            )
+
+        with patch.object(
+            HostTransactionRunner,
+            "run_write",
+            run_write_with_barrier,
+        ):
+            try:
+                result = _admission_service(store.transaction_runner).cancel_run(
+                    run_id,
+                    _cancel_request("cancel-held-snapshot"),
+                    caller_semantic_digest=_CALLER_DIGEST,
+                )
+            except HostApiError as exc:
+                control.send(("error", exc.code.value))
+            else:
+                control.send(("result", result.run.status.value))
+
+
+def _mark_attempt_running_worker(
+    db_path_text: str,
+    artifact_root_text: str,
+    attempt_id: str,
+    control: Connection,
+) -> None:
+    """子进程：尝试把 deferred STARTING Attempt 改为 RUNNING。
+
+    :param db_path_text: SQLite DB 路径文本。
+    :param artifact_root_text: artifact 根目录文本。
+    :param attempt_id: 目标 Attempt id。
+    :param control: parent/child control pipe。
+    :returns: ``None``。
+    """
+
+    control.send(("attempting",))
+    with open_host_durable_store(
+        _options(Path(db_path_text), Path(artifact_root_text))
+    ) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """在独立 write transaction 更新 Attempt 状态。
+
+            :param transaction: 当前 Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_ATTEMPTS}
+                SET status = ?, updated_at = ?
+                WHERE attempt_id = ? AND status = ?
+                """,
+                (
+                    AttemptStatus.RUNNING.value,
+                    _NOW.isoformat(),
+                    attempt_id,
+                    AttemptStatus.STARTING.value,
+                ),
+            )
+
+        store.transaction_runner.run_write(operation)
+    control.send(("committed",))
+
+
+def _read_attempt_status(
+    db_path: Path,
+    artifact_root: Path,
+    attempt_id: str,
+) -> str:
+    """读取 Attempt status 文本。
+
+    :param db_path: SQLite DB 路径。
+    :param artifact_root: artifact 根目录。
+    :param attempt_id: 目标 Attempt id。
+    :returns: durable status 文本。
+    :raises AssertionError: Attempt 缺失时抛出。
+    """
+
+    status = ""
+    with open_host_durable_store(_options(db_path, artifact_root)) as store:
+
+        def operation(transaction: HostTransaction) -> str:
+            """读取目标 Attempt status。
+
+            :param transaction: 当前 Host transaction。
+            :returns: status 文本。
+            :raises AssertionError: row 缺失时抛出。
+            """
+
+            row = transaction.fetchone(
+                f"""
+                SELECT status
+                FROM {TABLE_HOST_ATTEMPTS}
+                WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            )
+            assert row is not None
+            return _required_text(row, "status")
+
+        status = store.transaction_runner.run_read(operation)
+    assert status != ""
+    return status
+
+
 def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
     """构造多进程 follow-up 测试用 ordinary Run 执行基线。
 
@@ -548,6 +1060,8 @@ def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
     )
 
@@ -798,6 +1312,59 @@ def _start_governed_active(
             ),
         )
         assert accepted.status == StateMutationStatus.UPDATED
+        return result.attempt.attempt_id
+
+    return transaction_runner.run_write(operation)
+
+
+def _start_governed_pending(
+    transaction_runner: HostTransactionRunner,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    id_suffix: str,
+) -> str:
+    """把 Run 启动到尚未消费 wake 的 PENDING dispatch snapshot。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :param expected_status: 启动前 Run 状态。
+    :param id_suffix: 稳定测试 id 后缀。
+    :returns: 新建 current Attempt id。
+    :raises AssertionError: transition 未创建完整 pending snapshot 时抛出。
+    """
+
+    attempt_id = f"attempt-{id_suffix}"
+
+    def operation(transaction: HostTransaction) -> str:
+        """在单事务创建 PENDING dispatch snapshot。
+
+        :param transaction: 当前 Host transaction。
+        :returns: 新建 Attempt id。
+        :raises AssertionError: transition row 不完整时抛出。
+        """
+
+        result = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            StartGovernedRunInput(
+                run_id=run_id,
+                expected_status=expected_status,
+                run_started_event_id=f"event-run-started-{id_suffix}",
+                attempt_started_event_id=f"event-attempt-started-{id_suffix}",
+                attempt_id=attempt_id,
+                execution_id=f"execution-{id_suffix}",
+                dispatch_record_id=f"dispatch-{id_suffix}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="multiprocess-test",
+                start_reason=RunStartReason.INITIAL,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        assert result.attempt is not None
+        assert result.dispatch_record is not None
         return result.attempt.attempt_id
 
     return transaction_runner.run_write(operation)

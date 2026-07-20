@@ -6,17 +6,15 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Optional
-
-import pandas as pd
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from dayu.documents.processors.text_utils import (
     PREVIEW_MAX_CHARS as _PREVIEW_MAX_CHARS,
     format_section_ref as _format_section_ref,
-    normalize_optional_string as _normalize_optional_string_base,
     normalize_whitespace as _normalize_whitespace,
 )
 from dayu.fins._log import Log
+from dayu.fins.processors.value_normalization import normalize_optional_dataframe_string
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -50,6 +48,26 @@ class _SectionBlock:
     table_refs: list[str]
     table_fingerprints: set[str]
     contains_full_text: bool
+
+
+@runtime_checkable
+class _TableTextLike(Protocol):
+    """edgartools 表格文本能力协议。"""
+
+    def text(self) -> str:
+        """读取表格文本。
+
+        Args:
+            无。
+
+        Returns:
+            表格文本。
+
+        Raises:
+            RuntimeError: 底层读取失败时可能抛出。
+        """
+
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +443,7 @@ def _resolve_section_anchor_sequence(*, document: Any, section_key: str) -> Opti
         return None
     if not isinstance(info, dict):
         return None
-    anchor_id = _normalize_optional_string(info.get("anchor_id"))
+    anchor_id = normalize_optional_dataframe_string(info.get("anchor_id"))
     if not anchor_id:
         return None
     match = _SECTION_ANCHOR_SEQUENCE_PATTERN.search(anchor_id)
@@ -475,8 +493,8 @@ def _is_primary_body_anchor_section(*, section_key: str, section_obj: Any) -> bo
     normalized_key = str(section_key or "").strip().lower()
     if normalized_key in {"part_i_item_1", "part1_item1", "part_i_item_1."}:
         return True
-    part = _normalize_optional_string(getattr(section_obj, "part", None))
-    item = _normalize_optional_string(getattr(section_obj, "item", None))
+    part = normalize_optional_dataframe_string(getattr(section_obj, "part", None))
+    item = normalize_optional_dataframe_string(getattr(section_obj, "item", None))
     if not part or not item:
         return False
     return part.upper() == "I" and item.upper() == "1"
@@ -572,18 +590,18 @@ def _build_section_anchor_candidates(*, section_key: str, section_obj: Any) -> l
     """
 
     candidates: list[str] = []
-    part = _normalize_optional_string(getattr(section_obj, "part", None))
-    item = _normalize_optional_string(getattr(section_obj, "item", None))
+    part = normalize_optional_dataframe_string(getattr(section_obj, "part", None))
+    item = normalize_optional_dataframe_string(getattr(section_obj, "item", None))
     if part and item:
         candidates.append(f"part {part} item {item}")
     if item:
         candidates.append(f"item {item}")
 
-    key_anchor = _normalize_optional_string(section_key.replace("_", " "))
+    key_anchor = normalize_optional_dataframe_string(section_key.replace("_", " "))
     if key_anchor:
         candidates.append(key_anchor)
 
-    title = _normalize_optional_string(getattr(section_obj, "title", None))
+    title = normalize_optional_dataframe_string(getattr(section_obj, "title", None))
     if title:
         candidates.append(title)
 
@@ -772,7 +790,7 @@ def _safe_table_text(table_obj: Any) -> str:
     return str(text or "")
 
 
-def _normalize_table_objects(table_objects: object) -> list[object]:
+def _normalize_table_objects(table_objects: Iterable[_TableTextLike] | None) -> list[_TableTextLike]:
     """将动态表格结果收敛为可安全遍历的对象列表。
 
     Args:
@@ -804,10 +822,10 @@ def _build_section_title(section_key: str, section_obj: Any) -> Optional[str]:
         RuntimeError: 构建失败时抛出。
     """
 
-    title = _normalize_optional_string(getattr(section_obj, "title", None))
-    name = _normalize_optional_string(getattr(section_obj, "name", None))
-    part = _normalize_optional_string(getattr(section_obj, "part", None))
-    item = _normalize_optional_string(getattr(section_obj, "item", None))
+    title = normalize_optional_dataframe_string(getattr(section_obj, "title", None))
+    name = normalize_optional_dataframe_string(getattr(section_obj, "name", None))
+    part = normalize_optional_dataframe_string(getattr(section_obj, "part", None))
+    item = normalize_optional_dataframe_string(getattr(section_obj, "item", None))
 
     if part and item:
         return f"Part {part} Item {item}"
@@ -815,7 +833,7 @@ def _build_section_title(section_key: str, section_obj: Any) -> Optional[str]:
         return title
     if name:
         return name
-    normalized_key = _normalize_optional_string(section_key)
+    normalized_key = normalize_optional_dataframe_string(section_key)
     return normalized_key
 
 
@@ -837,9 +855,16 @@ def _extract_section_table_fingerprints(section_obj: Any) -> set[str]:
     if not callable(table_method):
         return table_fingerprints
     try:
-        section_tables = table_method()
+        raw_section_tables = table_method()
     except Exception:
         return table_fingerprints
+    if not isinstance(raw_section_tables, Iterable) or isinstance(raw_section_tables, (str, bytes)):
+        return table_fingerprints
+    section_tables: list[_TableTextLike] = []
+    for table_obj in raw_section_tables:
+        if not isinstance(table_obj, _TableTextLike):
+            continue
+        section_tables.append(table_obj)
     for table_obj in _normalize_table_objects(section_tables):
         fingerprint = _table_fingerprint(_normalize_whitespace(_safe_table_text(table_obj)))
         if fingerprint:
@@ -864,21 +889,3 @@ def _table_fingerprint(text: str) -> str:
     if not normalized:
         return ""
     return normalized[:_TABLE_FINGERPRINT_MAX_CHARS].lower()
-
-
-def _normalize_optional_string(value: Any) -> Optional[str]:
-    """将任意值转为可选字符串，额外处理 pandas NaN/NaT。
-
-    对 ``None``、空字符串、``float('nan')``、``pd.NaT`` 等无意义值统一返回 ``None``。
-
-    Args:
-        value: 任意输入值。
-
-    Returns:
-        标准化字符串；空值返回 ``None``。
-    """
-    if value is None:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    return _normalize_optional_string_base(value)

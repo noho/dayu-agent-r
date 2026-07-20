@@ -57,7 +57,6 @@ from dayu.host.compaction import (
     ConversationCompactOutputVNext,
     ContextCompactor,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -89,12 +88,6 @@ _UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN
 _UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
 _COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
-_POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
-    "Host post-compact run context includes session summary, current input, "
-    "evidence-backed facts, answer anchors, forward intents, and continuity items."
-)
-_POST_COMPACT_BASE_MESSAGE_COUNT = 2
-_POST_COMPACT_TOOL_SCHEMA_OVERHEAD_COUNT = 1
 _COMPACTOR_PROJECTION_SCHEMA_VERSION = "compactor_input_projection.v1"
 _SCHEMA_VERSION_FIELD = "schema_version"
 _SESSION_SUMMARY_FIELD = "session_summary"
@@ -107,7 +100,6 @@ _SUMMARY_TEXT_FIELD = "summary_text"
 _SOURCE_LABELS_FIELD = "source_labels"
 _CLAIM_TEXT_FIELD = "claim_text"
 _EVIDENCE_LABELS_FIELD = "evidence_labels"
-_EVIDENCE_KIND_FIELD = "evidence_kind"
 _ANCHOR_TITLE_FIELD = "anchor_title"
 _ANCHOR_ITEMS_FIELD = "anchor_items"
 _ANSWER_SOURCE_LABELS_FIELD = "answer_source_labels"
@@ -118,7 +110,6 @@ _TEXT_FIELD = "text"
 _STATUS_FIELD = "status"
 _REASON_FIELD = "reason"
 _CODE_FIELD = "code"
-_FACT_EVIDENCE_KIND_VALUES = frozenset(item.value for item in FactEvidenceKindVNext)
 _FORWARD_INTENT_TYPE_VALUES = frozenset(item.value for item in ForwardIntentTypeVNext)
 _FORWARD_INTENT_STATUS_VALUES = frozenset(item.value for item in ForwardIntentStatusVNext)
 _REFERENCE_CONTINUITY_REASON_VALUES = frozenset(item.value for item in ReferenceContinuityReasonVNext)
@@ -662,14 +653,6 @@ def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceB
             EvidenceBackedFactCandidateVNext(
                 claim_text=_required_string(data, _CLAIM_TEXT_FIELD, parent_path=item_path),
                 evidence_labels=_required_string_tuple(data, _EVIDENCE_LABELS_FIELD, parent_path=item_path),
-                evidence_kind=FactEvidenceKindVNext(
-                    _required_enum(
-                        data,
-                        _EVIDENCE_KIND_FIELD,
-                        parent_path=item_path,
-                        allowed_values=_FACT_EVIDENCE_KIND_VALUES,
-                    )
-                ),
                 source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )

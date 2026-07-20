@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
 
-import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from functools import partial
-from typing import BinaryIO, Final, Optional, Protocol, TypeVar
+from io import BytesIO
+from typing import BinaryIO, Final, Optional, Protocol
 
 from dayu.fins.domain.document_models import (
+    BatchToken,
     FileObjectMeta,
     RejectedFilingArtifactUpsertRequest,
     SourceFileEntry,
@@ -20,9 +21,11 @@ from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
     SecDownloadCancelledError,
+    StoreDownloadedFile,
 )
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
@@ -66,26 +69,42 @@ class RejectedArtifactFilingRecord(Protocol):
         ...
 
 
-_AwaitableResult = TypeVar("_AwaitableResult")
 _DOWNLOADER_EVENT_FILE_DOWNLOAD_STARTED: Final[str] = "file_download_started"
 
 
-async def _maybe_await(value: Awaitable[_AwaitableResult] | _AwaitableResult) -> _AwaitableResult:
-    """按需等待可等待对象。
+class DownloadFilesStream(Protocol):
+    """rejected artifact flow 消费的精确流式下载边界。"""
 
-    Args:
-        value: 可能为 awaitable 的值。
+    def __call__(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """逐文件下载并在每次存储回调 invocation 显式传入 batch。
 
-    Returns:
-        最终结果值。
+        Args:
+            remote_files: 远端文件描述。
+            overwrite: 是否覆盖已存在文件。
+            store_file: required-batch 文件写入回调。
+            batch: caller-owned batch capability。
+            existing_files: 既有文件映射。
+            primary_document: 主文档名。
+            cancellation_checker: 可选取消检查器。
 
-    Raises:
-        无。
-    """
+        Yields:
+            文件下载事件。
 
-    if inspect.isawaitable(value):
-        return await value
-    return value
+        Raises:
+            OSError: 下载或存储失败时抛出。
+        """
+
+        ...
 
 
 def build_file_entries(
@@ -139,12 +158,14 @@ def build_file_entries(
 def build_store_file(
     repository: DocumentBlobRepositoryProtocol,
     source_handle: SourceHandle,
-) -> Callable[[str, BinaryIO], FileObjectMeta]:
+    payload_sink: dict[str, bytes] | None,
+) -> StoreDownloadedFile:
     """构建 source 文件写入回调。
 
     Args:
         repository: 文档文件对象仓储。
         source_handle: 源文档句柄。
+        payload_sink: 需要在 publication 前消费内容时使用的有界单 filing payload 映射。
 
     Returns:
         store_file 回调。
@@ -153,7 +174,7 @@ def build_store_file(
         无。
     """
 
-    return partial(_store_file_callback, repository, source_handle)
+    return partial(_store_file_callback, repository, source_handle, payload_sink)
 
 
 def build_rejected_store_file(
@@ -161,7 +182,7 @@ def build_rejected_store_file(
     *,
     ticker: str,
     document_id: str,
-) -> Callable[[str, BinaryIO], FileObjectMeta]:
+) -> StoreDownloadedFile:
     """构建 rejected filing 文件写入回调。
 
     Args:
@@ -196,11 +217,10 @@ async def persist_rejected_filing_artifact(
     selected_primary_document: str,
     source_fingerprint: str,
     classification_version: str,
+    batching_repository: BatchingRepositoryProtocol,
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
-    download_files_stream: Optional[Callable[..., AsyncIterator[DownloaderEvent]]],
-    download_files: Callable[..., Awaitable[list[DownloadFileResult]] | list[DownloadFileResult]],
+    download_files_stream: DownloadFilesStream,
     build_file_result_from_downloader_event: Callable[[DownloaderEvent], DownloadFileResult],
-    normalize_download_file_result: Callable[[DownloadFileResult], DownloadFileResult],
     summarize_failed_download_file_reasons: Callable[[list[DownloadFileResult]], str],
     cancellation_checker: Callable[[], bool] | None = None,
 ) -> tuple[bool, Optional[str]]:
@@ -217,11 +237,10 @@ async def persist_rejected_filing_artifact(
         selected_primary_document: 当前规则选中的主文件。
         source_fingerprint: 远端文件指纹。
         classification_version: 当前下载链路版本号。
+        batching_repository: batch lifecycle 唯一仓储。
         filing_maintenance_repository: rejected artifact 仓储。
-        download_files_stream: 流式下载函数；为空时回退到 legacy 下载函数。
-        download_files: legacy 下载函数。
+        download_files_stream: required-batch 流式下载函数。
         build_file_result_from_downloader_event: 下载器事件转文件结果 helper。
-        normalize_download_file_result: legacy 文件结果规范化 helper。
         summarize_failed_download_file_reasons: 文件失败原因汇总 helper。
         cancellation_checker: 可选协作式取消检查器。
 
@@ -233,19 +252,21 @@ async def persist_rejected_filing_artifact(
         其他内部错误会转换为失败原因返回。
     """
 
-    document_id = f"fil_{filing.accession_number}"
-    store_file = build_rejected_store_file(
-        filing_maintenance_repository,
-        ticker=ticker,
-        document_id=document_id,
-    )
-    file_results: list[DownloadFileResult] = []
-    _raise_if_cancelled(cancellation_checker)
-    if download_files_stream is not None:
+    batch = batching_repository.begin_batch(ticker)
+    try:
+        document_id = f"fil_{filing.accession_number}"
+        store_file = build_rejected_store_file(
+            filing_maintenance_repository,
+            ticker=ticker,
+            document_id=document_id,
+        )
+        file_results: list[DownloadFileResult] = []
+        _raise_if_cancelled(cancellation_checker)
         async for event in download_files_stream(
             remote_files=remote_files,
             overwrite=overwrite,
             store_file=store_file,
+            batch=batch,
             existing_files={},
             primary_document=filing.primary_document,
             cancellation_checker=cancellation_checker,
@@ -254,53 +275,50 @@ async def persist_rejected_filing_artifact(
                 continue
             file_results.append(build_file_result_from_downloader_event(event))
         _raise_if_cancelled(cancellation_checker)
-    else:
-        legacy_results = await _maybe_await(
-            download_files(
-                remote_files=remote_files,
-                overwrite=overwrite,
-                store_file=store_file,
-                existing_files={},
-                primary_document=filing.primary_document,
-                cancellation_checker=cancellation_checker,
+
+        failed_files = [item for item in file_results if item.get("status") == "failed"]
+        failure_reason = (
+            summarize_failed_download_file_reasons(failed_files)
+            if failed_files
+            else None
+        )
+        if failure_reason is None:
+            file_entries = build_file_entries(file_results=file_results, previous_files={})
+            fiscal_year, fiscal_period = _infer_download_fiscal_fields(
+                filing.form_type,
+                filing.report_date,
             )
-        )
-        _raise_if_cancelled(cancellation_checker)
-        for item in legacy_results:
-            file_results.append(normalize_download_file_result(dict(item)))
-
-    failed_files = [item for item in file_results if item.get("status") == "failed"]
-    if failed_files:
-        return False, summarize_failed_download_file_reasons(failed_files)
-
-    file_entries = build_file_entries(file_results=file_results, previous_files={})
-    fiscal_year, fiscal_period = _infer_download_fiscal_fields(
-        filing.form_type,
-        filing.report_date,
-    )
-    filing_maintenance_repository.upsert_rejected_filing_artifact(
-        RejectedFilingArtifactUpsertRequest(
-            ticker=ticker,
-            document_id=document_id,
-            internal_document_id=filing.accession_number,
-            accession_number=filing.accession_number,
-            company_id=cik,
-            form_type=filing.form_type,
-            filing_date=filing.filing_date,
-            report_date=filing.report_date,
-            primary_document=filing.primary_document,
-            selected_primary_document=selected_primary_document or filing.primary_document,
-            rejection_reason=rejection_reason,
-            rejection_category=rejection_category,
-            classification_version=classification_version,
-            source_fingerprint=source_fingerprint,
-            files=_build_typed_source_file_entries(file_entries),
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            amended=filing.form_type.endswith("/A"),
-            has_xbrl=_remote_files_have_xbrl_instance(remote_files),
-        )
-    )
+            filing_maintenance_repository.upsert_rejected_filing_artifact(
+                RejectedFilingArtifactUpsertRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=filing.accession_number,
+                accession_number=filing.accession_number,
+                company_id=cik,
+                form_type=filing.form_type,
+                filing_date=filing.filing_date,
+                report_date=filing.report_date,
+                primary_document=filing.primary_document,
+                selected_primary_document=selected_primary_document or filing.primary_document,
+                rejection_reason=rejection_reason,
+                rejection_category=rejection_category,
+                classification_version=classification_version,
+                source_fingerprint=source_fingerprint,
+                files=_build_typed_source_file_entries(file_entries),
+                fiscal_year=fiscal_year,
+                fiscal_period=fiscal_period,
+                amended=filing.form_type.endswith("/A"),
+                has_xbrl=_remote_files_have_xbrl_instance(remote_files),
+                ),
+                batch=batch,
+            )
+    except BaseException:
+        batching_repository.rollback_batch(batch)
+        raise
+    if failure_reason is not None:
+        batching_repository.rollback_batch(batch)
+        return False, failure_reason
+    batching_repository.commit_batch(batch)
     return True, None
 
 
@@ -326,6 +344,7 @@ def mark_processed_reprocess_required(
     *,
     ticker: str,
     document_id: str,
+    batch: BatchToken,
 ) -> None:
     """标记 processed 产物需要重处理。
 
@@ -333,6 +352,7 @@ def mark_processed_reprocess_required(
         repository: processed 仓储。
         ticker: 股票代码。
         document_id: 文档 ID。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         无。
@@ -345,6 +365,7 @@ def mark_processed_reprocess_required(
         ticker=ticker,
         document_id=document_id,
         required=True,
+        batch=batch,
     )
 
 
@@ -459,16 +480,21 @@ def _normalize_optional_string(value: JsonValue) -> Optional[str]:
 def _store_file_callback(
     repository: DocumentBlobRepositoryProtocol,
     source_handle: SourceHandle,
+    payload_sink: dict[str, bytes] | None,
     filename: str,
     stream: BinaryIO,
+    *,
+    batch: BatchToken,
 ) -> FileObjectMeta:
     """通用文件落盘回调。
 
     Args:
         repository: 文档文件对象仓储。
         source_handle: 源文档句柄。
+        payload_sink: 可选单 filing payload 映射；不携带 batch authority。
         filename: 文件名。
         stream: 文件二进制流。
+        batch: 本次 invocation 显式传入的 batch capability。
 
     Returns:
         文件元数据。
@@ -477,7 +503,16 @@ def _store_file_callback(
         OSError: 写入失败时抛出。
     """
 
-    return repository.store_file(source_handle, filename, stream)
+    if payload_sink is None:
+        return repository.store_file(source_handle, filename, stream, batch=batch)
+    payload = stream.read()
+    payload_sink[filename] = payload
+    return repository.store_file(
+        source_handle,
+        filename,
+        BytesIO(payload),
+        batch=batch,
+    )
 
 
 def _store_rejected_filing_file_callback(
@@ -486,6 +521,8 @@ def _store_rejected_filing_file_callback(
     document_id: str,
     filename: str,
     stream: BinaryIO,
+    *,
+    batch: BatchToken,
 ) -> FileObjectMeta:
     """rejected filing 文件落盘回调。
 
@@ -495,6 +532,7 @@ def _store_rejected_filing_file_callback(
         document_id: rejected filing 文档 ID。
         filename: 文件名。
         stream: 文件二进制流。
+        batch: 本次 invocation 显式传入的 batch capability。
 
     Returns:
         文件元数据。
@@ -508,4 +546,5 @@ def _store_rejected_filing_file_callback(
         document_id=document_id,
         filename=filename,
         data=stream,
+        batch=batch,
     )

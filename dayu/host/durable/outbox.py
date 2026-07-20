@@ -34,6 +34,10 @@ from dayu.host.durable.schema import (
     TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.lifecycle_events import (
+    PUBLIC_OUTBOX_TERMINAL_EVENT_TYPES,
+    event_type_values,
+)
 
 OUTBOX_TERMINAL_READ_MAX_LIMIT = 500
 """Outbox terminal read / drain 单次返回 item 数上限。"""
@@ -45,10 +49,6 @@ _MIN_EVENT_CURSOR = 0
 _MIN_EVENT_SEQUENCE = 1
 _MIN_LIMIT = 1
 _EVENT_CLASS_CANONICAL_FACT = "canonical_fact"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _TERMINAL_STATUS_SUCCEEDED = "succeeded"
 _TERMINAL_STATUS_FAILED = "failed"
 _TERMINAL_STATUS_CANCELLED = "cancelled"
@@ -68,11 +68,8 @@ _TERMINAL_STATUSES = frozenset(
     )
 )
 _ITEM_STATES = frozenset((_ITEM_STATE_PENDING, _ITEM_STATE_DRAINED))
-_TERMINAL_EVENT_TYPES = (
-    _EVENT_TYPE_RUN_SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED,
-    _EVENT_TYPE_RUN_CANCELLED,
-    _EVENT_TYPE_RUN_LOST,
+_PUBLIC_TERMINAL_EVENT_TYPE_VALUES = event_type_values(
+    PUBLIC_OUTBOX_TERMINAL_EVENT_TYPES
 )
 
 
@@ -103,7 +100,8 @@ class OutboxTerminalItemRow:
     :param run_id: source Run id。
     :param terminal_status: public terminal 状态文本。
     :param dedupe_key: 与 live HostEvent 对齐的去重键。
-    :param final_answer_json: 可选 final answer JSON 文本；缺失时由 refs 承载。
+    :param final_answer_json: succeeded 必需的 final answer JSON 文本；其它终态为
+        ``None``。
     :param error_message: 可选失败展示消息。
     :param cancel_reason: 可选取消原因。
     :param result_ref: 可选结果 payload 引用。
@@ -747,9 +745,9 @@ def _latest_outbox_terminal_event_sequence(transaction: HostTransaction) -> int:
         SELECT COALESCE(MAX(event_sequence), 0) AS latest
         FROM {TABLE_EVENT_LOG}
         WHERE event_class = ?
-          AND event_type IN (?, ?, ?, ?)
+          AND event_type IN (?, ?, ?)
         """,
-        (_EVENT_CLASS_CANONICAL_FACT, *_TERMINAL_EVENT_TYPES),
+        (_EVENT_CLASS_CANONICAL_FACT, *_PUBLIC_TERMINAL_EVENT_TYPE_VALUES),
     )
     if row is None:
         return 0
@@ -842,6 +840,15 @@ def _validate_item_row(row: OutboxTerminalItemRow) -> None:
     if row.dedupe_key != row.terminal_event_id:
         raise HostDurableError("outbox dedupe_key must equal terminal_event_id")
     _require_optional_non_empty_text(row.final_answer_json, field_name="final_answer_json")
+    if row.terminal_status == _TERMINAL_STATUS_SUCCEEDED:
+        if row.final_answer_json is None:
+            raise HostDurableError(
+                "succeeded outbox item requires final_answer_json"
+            )
+    elif row.final_answer_json is not None:
+        raise HostDurableError(
+            "non-success outbox item must not carry final_answer_json"
+        )
     _require_optional_non_empty_text(row.error_message, field_name="error_message")
     _require_optional_non_empty_text(row.cancel_reason, field_name="cancel_reason")
     _require_optional_non_empty_text(row.result_ref, field_name="result_ref")
@@ -914,7 +921,7 @@ def _item_row_from_host_row(row: HostRow) -> OutboxTerminalItemRow:
     :raises HostDurableError: durable row 类型不符合预期时抛出。
     """
 
-    return OutboxTerminalItemRow(
+    item_row = OutboxTerminalItemRow(
         item_id=_require_text(row.get("item_id"), field_name="item_id"),
         idempotency_key=_require_text(
             row.get("idempotency_key"),
@@ -969,6 +976,8 @@ def _item_row_from_host_row(row: HostRow) -> OutboxTerminalItemRow:
             field_name="last_drain_request_id",
         ),
     )
+    _validate_item_row(item_row)
+    return item_row
 
 
 def _batch_item_ids_from_json(value: str) -> tuple[str, ...]:

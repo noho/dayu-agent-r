@@ -10,7 +10,7 @@ UI -> Service -> Host -> Engine
         |        v
         |    ToolRuntime -> dayu.fins
         v
-   Fins wait adapter assembly
+   Service Fins wait adapter assembly
 ```
 
 ## Agent更新约束【必须遵守】
@@ -27,7 +27,7 @@ UI -> Service -> Host -> Engine
 
 Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。
 
-在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、公司信息 resolver、read tools、download / preprocess / upload direct stream、awaiting tools、processor registry、XBRL / financial statement 能力，以及把 lightweight observation handle 映射到 Host wait-resume 的 adapter。
+在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、公司信息 resolver、read tools、download / preprocess / upload direct stream、awaiting tools、processor registry、XBRL / financial statement 能力，以及供 Service wait adapter 观察的 lightweight observation handle。
 
 `dayu.fins` 的设计重点是把财报业务能力从 Host / Engine 中剥离出来：
 
@@ -49,14 +49,14 @@ UI -> Service -> Host -> Engine
 - `Service` 负责业务入口、身份解析、配置 / scene / tool / runner 装配，并调用 Host。
 - `Host` 负责 Agent 运行宿主边界、状态治理、持久化、工具运行时治理、memory / context governance、projection、恢复和取消。
 - `Engine` 负责单次 run 的模型交互、Runner 协议归一、tool loop、取消观察和 `EngineEvent stream`。
-- `Fins` 是财报业务能力包；它通过工具 provider、Fins runtime、storage、processor 和 wait adapter integration 被装配到 Agent 中，不成为新的架构层。
+- `Fins` 是财报业务能力包；它通过工具 provider、Fins runtime、storage、processor 和 lightweight observation contract 被装配到 Agent 中，不成为新的架构层。
 
 Fins 与其它层的稳定边界如下：
 
 - Host 不导入 `dayu.fins`，不读取财报仓储，不执行财报下载 / 预处理，不解释财报业务规则；Host 只接收受治理工具结果或 wait adapter 映射后的 wait poll 结果。
 - Engine 不导入 `dayu.fins`，不感知财报业务语义；Engine 只看到 Host 传入的 `ToolSchema` 和 `ToolExecutor`。
-- Service / composition root 可以装配 Fins tools provider，也可以基于显式 Fins awaiting provider 配置构造 Host `WaitAdapterRegistry`；Service 负责把 raw config 映射为 typed assembly 输入。
-- 除 `dayu.fins.ingestion.wait_adapter` 这个 Host wait integration 模块外，`dayu.fins` 不依赖 Host。wait adapter 只使用 Host wait-resume typed contract，不读取 Host durable store，也不改变 Host / Engine contract。
+- Service / composition root 可以装配 Fins tools provider，也可以基于显式 Fins awaiting provider 配置构造 Host `WaitAdapterRegistry` 与 Service-owned Fins wait adapter；Service 只负责识别 provider identity，并把 raw provider config 交给 Fins 唯一 parser，再复用并行的私有 typed projection 完成 assembly。
+- `dayu.fins` 不依赖 Host。Fins awaiting observation 只暴露 lightweight handle、snapshot 与 observation runtime；Host wait-resume integration 位于 `dayu.service.fins_wait_adapter`，它只使用 Host wait adapter public snapshot / outcome contract，不读取 Host durable store，也不改变 Host / Engine contract。
 - Fins 不依赖 `dayu.service`、`dayu.ui` 或 `dayu.engine`；`dayu.engine` 与 `dayu.runtime` 也不得反向导入 Fins。
 
 公共包边界固定如下：
@@ -75,7 +75,7 @@ Fins 与其它层的稳定边界如下：
 `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins 默认共享装配根：
 
 - `DefaultFinsRuntime.create(workspace_root=Path)`：由显式 Fins workspace root 创建文件系统仓储、processor registry、ingestion runtime 和 legacy job store。
-- `get_read_runtime(processor_cache_max_entries=128)`：懒加载并缓存 `FinsReadRuntime`。
+- `get_read_runtime(processor_cache_max_entries=128)`：懒加载并缓存 `FinsReadRuntime`；`close()` 只关闭已经创建的 read runtime，不为清理触发惰性创建，关闭后拒绝新的 read runtime 获取。
 - `get_ingestion_runtime()`：懒加载并缓存 `FinsIngestionRuntime`。
 - `get_processor_registry()`：返回 Fins processor registry。
 
@@ -94,6 +94,32 @@ Fins 与其它层的稳定边界如下：
 - 对应 `Fs*Repository` 文件系统实现
 - `FileStore` / `LocalFileStore`
 
+source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。storage snapshot 负责把同版 source meta 投影为 typed provenance；read runtime 的 citation 只消费当前 processor borrow 所持 snapshot 的 provenance 来生成 LLM-facing `source_type` 与 `source_provider`，不重新读取仓储或猜测来源。
+
+source published revision 由 complete-source mutation owner 在每次 source create、update、replace、delete 或 restore 的最终 meta 中自动生成并持久化，随同一个 batch commit 与 source 内容原子发布。`SourceDocumentRevision.token` 只承诺非空字符串的 exact opaque equality，不承诺 prefix、长度、字符集、hash 算法或其它 grammar；producer 不能传入 token，processed / company / maintenance-only batch 与 rollback 不改变已发布 token。consumer 只通过 storage snapshot 取得同版 opaque revision，不按 meta、文件字段、时间或内容 hash 重建它。
+
+`SourceDocumentRepositoryProtocol.read_source_snapshot(...)` 是 storage-owned 单文档一致读取边界。light snapshot 在同一 publication guard 下返回 exact identity、typed source kind、完整 source meta、provenance、persisted revision、完整有序文件描述符与 primary filename，不暴露 published path 或 local URI；full snapshot 从同一次 guard 内打开的全部 regular file descriptors 复制到 snapshot 私有临时树，并在复制后核对同一 source kind 的 persisted revision、identity descriptor 与 deletion state。真实 publication 变化可由 storage 内部有界重取，持续变化抛出不携带 path/key/revision 的 typed consistency error；静态 inode/content/meta corruption 保持原有 corruption / I/O failure，不伪装为 publication change。snapshot 必须显式关闭且 close 幂等，关闭后其 `Source` 不可再读，full snapshot 的 `materialize()` 只返回临时树路径。
+
+read runtime 的每个 processor cache entry 独占一份 full snapshot，并从中取得 processor、source meta、provenance 与 citation 所需事实。单次 read 在同一 active borrow 内完成 processor 调用、结果与 citation 构造；replacement、LRU eviction、clear 与 runtime close 只 retire entry，若仍有 active borrow 则延迟到最后一次 release 后关闭 snapshot。相同文档的并发 cache miss 在 creation lock 内按 full snapshot 再次核对，只有一个 matching entry 被构建和发布，竞争失败的 snapshot 会立即关闭。storage typed consistency exhaustion 只在 read runtime 映射为既有 `source_changed_during_read` 业务错误。
+
+storage mutation authority 由显式 `BatchToken(transaction_id, ticker)` 承载。只有 `BatchingRepositoryProtocol` 提供 `begin_batch(...)`、`commit_batch(...)` 与 `rollback_batch(...)` lifecycle；source、blob、processed、company 与 filing maintenance 的所有 mutation 都要求 keyword-only `batch=`，并由 shared repository set 的同一 storage core 校验 token 仍开放且 ticker 匹配。异步 task、线程或 callback 不从上下文推断 authority；需要回调写文件时，每次 invocation 都显式接收并传递同一个 token。
+
+source publication 使用 blob-first、complete-source commit：producer 可以先在 caller-owned batch 中按 identity handle 写入全部 blob，published read 在 commit 前仍看不到该 source；随后 producer 只执行一次 final source create/update，完整提供 meta、files、primary、provenance 与 manifest 所需事实。commit validator 是完整 source 的资格 owner，拒绝缺失、悬空、重复、false completion、非法 provenance、symlink 或 containment escape；不存在 acknowledgement、半完成 source 或 stable re-entry 契约。
+
+文件系统实现对同 ticker writer 使用覆盖整个 transaction 的互斥锁，避免两个 writer 形成交错 staging；published read 不读取 staging，也不被长 staging / validator 阶段阻塞。commit 与 recovery 的物理目录切换另由短时 publication guard 保护，published meta、manifest、blob、processed 与 `LocalFileSource.open()` 在在线 rename 窗口只能观察完整 old 或完整 new。journal 只保存可校验的最小相对事实；进程崩溃后 fresh repository 会在相同锁序下恢复到完整 old/new，并清理未提交 staging。
+
+download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传覆盖路径先完成文件校验、Docling 转换和取消检查，再由顶层 caller 开启短 batch，在其中 reset 目标文档、blob-first 写入文件并发布一次完整 source；commit 前失败或取消只 rollback 一次并保留旧文档，commit 开始后 caller 不再二次 rollback。
+
+`FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
+
+文件系统仓储把 external ticker / document ID 作为 exact opaque identity 保存，并由 storage-private mapping key 与 identity descriptor 唯一完成业务 identity 到物理目录的双向映射；lookup、枚举、staging、publication、backup 与 recovery 都必须验证 descriptor，不从目录名、lock stem 或路径文本反推业务 identity。filename、primary filename、manifest entry、object key 与 local URI 仍保持单路径组件、containment 与 symlink fail-closed 边界；调用方不得把 identity 规则与 filename/path 规则混用，也不得在下游补偿损坏映射。
+
+financial statement result contract 由 `dayu.fins.domain.financial_result_contract` 持有。processor 必须显式产生 `statement_type`、`periods`、`rows`、`currency`、`units`、`scale` 与 `data_quality`；`reason` 仅在 `partial` 时出现并给出稳定、可操作的降级原因，`xbrl/extracted` 完整结果省略该字段。`units` 只表达货币或计量单位，`scale` 独立表达 `units/thousands/millions/billions` 数值倍率；存在 rows 但缺少直接 scale 或 fiscal 证据时保持已有数据并降级为 `partial`，不得由 read runtime 补默认值。工具公共结果只在同一 typed projection 中组合 ticker、document ID、同版 citation 与这些业务字段。
+
+XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract` 持有：`query_xbrl_facts` 必须包含扁平 `query_params`、`facts` 与 `data_quality`，可选过滤条件只在实际提供时出现；`reason` 仅在 `partial` 时出现。正常执行但零命中是 `xbrl` 结果；部分 concept 失败是带 reason 的 `partial`；全部 concept 失败抛 typed execution error。read runtime 先校验并独立复制输入，再规范化和稳定去重而不修改 producer 数据；唯一公共 projection 输出最终 `facts`，并只用 `fact_count=len(facts)` 表达同一结果实际返回的事实数量。
+
+上传链路的 company meta freshness 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验并写入。`updated_at` 仅是审计时间，不是 freshness TTL。SEC/CN/HK 下载链路仍由各自 producer 写入公司元数据，不经上传 freshness 逻辑；read runtime 只读取仓储中的 company meta，不刷新或推断 freshness。
+
 ### Resolver
 
 `dayu.fins.resolver` 是公司信息等财报业务标识解析能力的 public subpackage。`dayu.fins` 包根不 re-export resolver 符号，调用方应显式导入子包。
@@ -102,7 +128,7 @@ Fins 与其它层的稳定边界如下：
 
 - `FmpCompanyInfo(canonical_ticker, company_name, ticker_aliases)`：不可变解析结果，`ticker_aliases` 是 tuple，首项恒为 canonical ticker。
 - `FmpCompanyInfoResolver(api_key=..., http_client=..., timeout_seconds=...)`：显式接收 FMP API key 和 timeout，不读取环境变量。
-- `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回；HTTP、JSON、空结果、非法 payload 或第二跳失败都会收口为 `FmpCompanyInfoResolutionError`。
+- `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 精确匹配 canonical ticker 后定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回；HTTP、JSON、空结果、无精确 ticker 命中、非法 payload 或第二跳失败都会收口为 `FmpCompanyInfoResolutionError`。
 
 resolver 只提供业务解析能力；调用方负责读取环境变量、配置超时、处理失败回退和决定是否把公司名投影给 LLM。
 
@@ -119,6 +145,10 @@ resolver 只提供业务解析能力；调用方负责读取环境变量、配�
 - `get_page_content`
 - `get_financial_statement`
 - `query_xbrl_facts`
+
+read runtime 持有 `document_id -> storage snapshot -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 从当前 snapshot 收窄为本地 typed projection；fiscal year 只接受 producer 持久化的正整数，fiscal period 只接受 domain canonical 值，缺失值保持 `None`，不从 form、report date 或 filing date 补偿。processor cache 有界并拥有 snapshot 资源生命周期，不另设 source meta cache；`list_documents` 只组合 filing/material 两个 typed document list 与对应轻量 meta 投影，不为每个列表项创建 snapshot。
+
+read path 对 source decode、search index 构建、XBRL 查询全失败和读取期间 source 变化使用 typed failure code。非法 UTF-8 不以忽略字符或空文本继续；section/enrichment/BM25F 任一构建失败不返回空搜索成功；这些失败在工具边界投影为稳定业务错误，原始异常只作为内部 cause 保留。协作式取消仍优先传播，不被 degradation mapping 改写。
 
 `dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
@@ -144,17 +174,38 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 
 三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 启用时注册 `start_fins_upload`；上传工具只在工具边界校验本地路径存在、指向普通文件且文件非空。当前实现不把本地源文件授权建模为 upload provider 的配置职责；调用方仍需在进入工具前承担本地文件来源可信性与用户授权。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。上传后的 source/blob/processed 写入仍必须通过 Fins workspace repository 完成。
 
+三个 awaiting provider 还必须显式提供 provider-owned
+`config.awaiting_resolution_mode`。`dayu.fins.ingestion.awaiting_resolution` 是该字段、
+closed typed enum 与严格 parser 的唯一 public owner，
+只接受精确的 `poll`、`callback`、`manual`；缺失、`null`、非字符串、空串、大小写变体、
+前后空白和未知值都失败，不提供默认或 loose parsing。每个 provider 在创建 runtime/tool
+definition 前调用同一 parser；Service discovery 路径也在 enabled filtering 前调用该
+parser，并把 typed mode 保存到独立私有 metadata，而不是改写 raw provider config。
+
 ### Batch upload plan
 
-`dayu.fins.upload_batch` 提供本地批量上传计划生成能力。它接收 `UploadBatchPlanRequest`，扫描调用方显式传入的本地源目录，并返回 `UploadBatchPlanResult` 与结构化 `UploadBatchPlanEntry` 条目。该 helper 通过公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 固定 upload 输入后缀真源，只识别可作为 upload 输入的普通文件，并基于文件名中的 filing form token 或调用方传入的 `material_forms` 生成 `upload_filing` / `upload_material` 计划；它不启动 ingestion job、不读取 Fins storage、不创建 Host Run，也不输出 shell 文本。
+`dayu.fins.upload_batch` 是本地批量上传领域事实的唯一 owner。它接收不可变的
+`UploadBatchPlanRequest`，在 lexical / resolved containment 与内部 symlink fail-closed 边界内扫描调用方显式传入的
+源目录，并返回由 `UploadBatchFilingEntry`、`UploadBatchMaterialEntry` 和 `UploadBatchSkippedEntry` 组成的
+`UploadBatchPlan`。公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 是 upload 输入后缀真源；默认只扫描直属文件，显式
+recursive 或直接存在 `20YY` / `20YYQn` / `20YYH1` 结构目录时才递归。
 
-### Ingestion runtime 与 wait adapter
+Fins 根据文件名与直接结构父目录产生财年、财期、material routing/name、同期优先级、去重、数量限制和业务可读
+skip reason。年度 filing 最多保留 5 份；周期 filing 只保留最新财年并最多 6 份；presentation 最多 6 份；
+earnings-call 上限等于过滤后的 filing 数量；financial statements 不设数量上限。显式 fiscal metadata 只覆盖对应
+推断字段，material 与 filing 保持互斥，所有裁剪与安全拒绝都进入 typed skipped facts。
+
+该模块不构造 argv、不渲染平台脚本、不读取环境或 FMP、不启动 ingestion job、不读取 storage，也不创建 Host Run。
+CLI 只能机械消费 typed plan，把 filing/material entry 投影为当前 direct upload grammar，并把 skipped facts投影为人类可读
+摘要；文件名规则、caps 和 skip reason 不得在 CLI renderer 或测试 fixture 中重算。
+
+### Ingestion runtime 与 awaiting observation
 
 `dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载、预处理与上传的 typed runtime foundation。当前稳定入口分为 direct stream、awaiting observation 和 legacy durable job helpers：
 
-- `download(FinsDownloadRequest, *, cancellation_token: CancellationToken | None = None) -> AsyncIterator[FinsEvent]`
-- `preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> AsyncIterator[FinsEvent]`
-- `upload(FinsUploadRequest, *, cancellation_token: CancellationToken | None = None) -> AsyncIterator[FinsEvent]`
+- `def download(FinsDownloadRequest, *, cancellation_token: CancellationToken | None = None) -> ValidatedFinsEventStream`
+- `def preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> ValidatedFinsEventStream`
+- `def upload(FinsUploadRequest, *, cancellation_token: CancellationToken | None = None) -> ValidatedFinsEventStream`
 - `start_observed_download(...) -> FinsObservationHandle`
 - `start_observed_preprocess(...) -> FinsObservationHandle`
 - `start_observed_upload(...) -> FinsObservationHandle`
@@ -167,22 +218,12 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `abandon_observation(handle) -> None`
 - legacy helpers `start_download(...)` / `start_preprocess(...)` / `start_upload(...)` / `read_job(...)` / `read_job_events(...)` / `request_cancel(...)` 仍保留在 runtime foundation 中服务 legacy job-store 覆盖；Service direct 和 Fins awaiting tools 不消费这些入口。
 
-`dayu.fins.ingestion.wait_adapter` 提供 Host wait-resume integration：
-
-- `FINS_INGESTION_WAIT_ADAPTER_KEY = "poll:fins-ingestion"`
-- `FINS_DOWNLOAD_AWAITING_TOOL_NAME = "start_fins_download"`
-- `FINS_PREPROCESS_AWAITING_TOOL_NAME = "start_fins_preprocess"`
-- `FINS_UPLOAD_AWAITING_TOOL_NAME = "start_fins_upload"`
-- `FinsIngestionWaitPollAdapter`
-- `build_fins_wait_adapter_registry(workspace_root=..., tool_names=...)`
-- `FinsIngestionWaitActivationAdapter`
-- `build_fins_wait_activation_registry(runtime=..., tool_names=...)`
-- `build_fins_wait_poll_adapter_registry(runtime=..., tool_names=...)`
+Host wait-resume integration 位于 `dayu.service.fins_wait_adapter`。Fins package 只拥有 `FinsObservationHandle`、`FinsObservationSnapshot`、`FinsObservationStatus`、`FinsObservationRuntime` 与 observation handle token parser；它不导入 Host wait types，也不读取 Host durable wait row。
 
 ## 调用者装配示例
 
 调用者进入 Fins 的稳定入口是 `DefaultFinsRuntime`。不同入口可以创建各自的 runtime 实例，但同一 `workspace_root` 会使用同一套仓储布局、processor registry 构造逻辑和 legacy job store。
-awaiting tool callable 与 wait activation registry 例外：activation adapter 必须接收 awaiting tool callable 使用的同一个 `FinsIngestionRuntime` 实例，因为 prepared observation 是进程内 runtime 状态，不是可由 `workspace_root` 重新发现的持久事实。
+awaiting tool callable 与 Service wait activation adapter 例外：activation adapter 必须接收 awaiting tool callable 使用的同一个 `FinsIngestionRuntime` 实例，因为 prepared observation 是进程内 runtime 状态，不是可由 `workspace_root` 重新发现的持久事实。
 
 ### Read caller
 
@@ -318,7 +359,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 
 ### Fins 专属契约
 
-- `dayu.fins.domain`：财报领域模型与枚举，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact 等数据对象。
+- `dayu.fins.domain`：财报领域模型、枚举与共享业务值 parser，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact、SEC form parser / alias expansion、财期、文档质量与财务数据质量等数据对象和封闭值。
 - `dayu.fins.ticker_normalization`：ticker 标准化结果与 market / exchange 推导。
 - `dayu.fins.storage.repository_protocols`：公司、源文档、processed、blob、filing maintenance 与批处理事务仓储协议。
 - `FinsDownloadRequest` / `FinsPreprocessRequest` / `FinsUploadFilingRequest` / `FinsUploadMaterialRequest`：下载、预处理与上传请求。
@@ -355,7 +396,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 
 ## 架构
 
-`dayu.fins` 内部按 domain、storage、processors、read runtime、tools、ingestion 与 wait adapter 分工。
+`dayu.fins` 内部按 domain、storage、processors、read runtime、tools 与 ingestion observation 分工；Host wait integration 由 Service-owned adapter 装配。
 
 ```mermaid
 flowchart LR
@@ -371,7 +412,7 @@ flowchart LR
     read_tools["9 read ToolDefinitions"]
     ingestion["FinsIngestionRuntime\ndownload / preprocess / upload jobs"]
     job_store["FsFinsIngestionJobStore\n.dayu/fins_ingestion/jobs"]
-    wait_adapter["Fins wait adapter\npoll:fins-ingestion"]
+    service_wait_adapter["Service Fins wait adapter\npoll:fins-ingestion"]
     host_tool_runtime["Host ToolRuntime\naccept barrier"]
     host_wait["Host wait-resume"]
 
@@ -393,31 +434,32 @@ flowchart LR
     ingestion --> storage
     ingestion --> registry
     ingestion --> job_store
-    wait_adapter --> ingestion
+    service_wait_adapter --> ingestion
     read_tools --> host_tool_runtime
     download_provider --> host_tool_runtime
     preprocess_provider --> host_tool_runtime
     upload_provider --> host_tool_runtime
-    host_wait --> wait_adapter
+    host_wait --> service_wait_adapter
 ```
 
 ```text
 dayu.fins
-├── domain                    # 财报领域模型与枚举
+├── domain                    # 财报领域模型、枚举、SEC form / 财期 / 质量封闭值 parser
 ├── downloaders               # source-specific 低层下载器；当前包含 SEC / 巨潮 / 披露易 downloader
 ├── storage                   # 仓储协议、文件系统仓储、文件对象存储
 ├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC 与 CN/HK download / upload pipeline
 ├── processors                # 财报处理器、SEC 表单专项处理器、registry
 ├── tools                     # read tools、download/preprocess/upload awaiting tools、providers、read runtime
+├── direct_events.py          # direct 事件、结果、类型化协议错误与 ValidatedFinsEventStream 公共 owner
 ├── ingestion_runtime.py      # download/preprocess/upload direct stream、observation 与 legacy job runtime
-├── ingestion / wait_adapter  # Fins observation handle -> Host wait-resume contract
+├── ingestion                 # awaiting resolution、legacy job helper 与 lightweight observation contract
 ├── service_runtime.py        # DefaultFinsRuntime shared assembly root
 └── ticker_normalization.py   # ticker 标准化
 ```
 
 ## 稳定边界
 
-Fins 稳定边界是 workspace-scoped runtime、仓储协议、processor registry、tools provider 输出、direct event contract、lightweight observation contract 和 wait adapter binding。
+Fins 稳定边界是 workspace-scoped runtime、仓储协议、processor registry、tools provider 输出、direct event contract 和 lightweight observation contract。wait adapter binding 属于 Service assembly。
 
 Fins 不负责：
 
@@ -431,15 +473,25 @@ Fins workspace 规则固定如下：
 
 - 四个 Fins provider 的 effective spec 都必须提供非空绝对 `workspace_root`；provider 不从 cwd 或环境变量推断。
 - 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools`、`financial-upload-tools` 均为 enabled 且 raw config 不写 `workspace_root`；Service assembly 会用当前运行时 workspace root 注入绝对 `workspace_root`。upload provider 默认注册 `start_fins_upload`，默认非上传 scene 通过窄标签 `fins-read`、`fins-download`、`fins-preprocess` 选择 read/download/preprocess 工具，避免 broad `fins` tag 误选 upload。
-- Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
+- Service assembly 为 Fins awaiting providers 构造 Service-owned wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
 - legacy ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，保存 legacy job governance records 与每个 job 的 event sidecar，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。Direct stream 和 lightweight observation handle 不以该目录作为公共观察真源。
-- upload provider 不拥有本地源文件 allowlist 或授权配置；它只注册工具并做普通文件、存在性与非空校验。仓储写入边界仍属于 `dayu.fins.storage`，工具 caller 不能指定 source/blob/processed 的仓储写入目录。
+- upload provider 只注册工具并校验输入是存在、非空的普通文件；仓储写入边界仍属于 `dayu.fins.storage`，工具 caller 不能指定 source/blob/processed 的仓储写入目录。
 
 ## 主要组件
 
 ### Storage
 
 Storage 是财报文件系统的唯一访问边界。仓储协议按职责拆分为 company meta、source document、processed document、blob、filing maintenance 与 batching，避免把所有能力塞进单个宽仓储。文件系统实现通过 shared repository set 复用路径、锁和批处理事务语义。
+
+source repository 拥有完整 source meta、manifest 与 provenance；blob repository 拥有文件对象；processed、company 与 filing maintenance repository 分别拥有各自业务事实。它们只消费 caller 显式传入的 required `batch=`，不拥有 lifecycle，也不通过另一个 repository 的存在性确认 mutation authority。producer 先写全部 blob，再一次发布完整 source；public read 永远只读 published tree。
+
+batching repository 是 begin / commit / rollback 的唯一 lifecycle owner。production composition root 为 batching、source、blob、processed、company 与 filing maintenance wrappers 注入同一个 repository set/core；top-level publication unit 决定短 transaction 边界并显式传播 token。writer mutex、短时 publication swap guard、complete-source validator 与 crash recovery 都由 storage core 统一执行，非 owner 或跨 core token fail fast，不回退到 retry、展示层或兼容 facade。
+
+### Downloaders 与 CN/HK report selection
+
+CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。
+
+HKEXNews title search 由 downloader 内的 provider-private strict contract 持有官方 cumulative `rowRange` 完整性：每个语言/分类从 100 条开始，在不改变其余查询和排序条件的前提下扩大累计 range。每轮响应必须提供 exact-typed `hasNextRow` / `rowRange` / `loadedRecord` / `recordCnt` / 字符串化 `result`；只有最终响应同时满足 `hasNextRow=false` 且 `loadedRecord == recordCnt == len(rows)` 时才宣布完整。续取期间每轮 snapshot 替换上一轮，候选解析和 HEAD 只消费最后完整 snapshot；字段矛盾或加载无进展以 typed provider protocol failure 失败关闭。
 
 ### Processors
 
@@ -450,9 +502,13 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 - SEC 表单专项处理器通过虚拟章节 mixin 处理 `10-K`、`10-Q`、`20-F`、`8-K`、`DEF 14A`、`SC 13D/G`、`6-K` 等表单的章节切分、搜索和财务表回退。
 - `build_fins_processor_registry()` 在 documents 默认处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
 
+虚拟章节 mixin 是表单专项 section / table 发布语义的唯一 owner。刷新时先校验原始表格标记、章节树和同一份候选双向映射，再一次性发布结果：完整映射（包括零表格）发布虚拟章节；没有矛盾但映射缺失或不完整时整体发布基础处理器结果；悬空、重复或双向不一致等矛盾直接失败关闭。已发布模式是终态，重复刷新保持幂等；章节列表、章节读取、搜索、表格列表和表格读取五个公共消费者只读取同一已发布模式与映射，不按可用性静默过滤，也不按位置猜测归属。
+
+`dayu.fins.domain.filing_semantics` 是 fiscal year、fiscal period 与财期 recency rank 的 domain 真源；processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
+
 ### FinsReadRuntime
 
-`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 source / processor 的路由、processor LRU 缓存、not-supported 降级、列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。它不依赖 Host EventLog，也不把 processed 产物作为 read path 的唯一事实来源。
+`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 snapshot / processor 的路由、not-supported 降级、typed read failure 投影，以及列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。processor、meta、provenance、citation 与结果在同一 snapshot borrow 内保持同版；有界 processor LRU 把替换、淘汰和清空的资源交还 runtime 统一 retire/close，runtime close 后新 read fail fast。
 
 ### Tools providers
 
@@ -461,7 +517,7 @@ Read、download、preprocess、upload 是四个独立 provider：
 - read provider 只暴露 9 个 read tools。
 - download provider 只暴露 `start_fins_download`。
 - preprocess provider 只暴露 `start_fins_preprocess`。
-- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空；本地源文件授权不是 provider-owned config。
+- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空。
 
 四者都要求 effective spec 提供绝对 `workspace_root`，并通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
 
@@ -469,24 +525,32 @@ Read、download、preprocess、upload 是四个独立 provider：
 
 `FinsIngestionRuntime` 负责 download / preprocess / upload 的业务执行、direct event stream、awaiting observation 和 legacy job-store helper。下载 pipeline 通过 `FinsSourceDownloadAdapter` 返回待持久化文档，或在 adapter 内通过仓储完成 source / blob / rejected filing artifact 写入并返回有界已持久化摘要；预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload 通过 `FinsUploadRunner` 边界执行上传业务。runtime 的业务真源是仓储产物与有界 result summary，不是 Host EventLog，也不是 CLI-facing job id。
 
-Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 返回 `AsyncIterator[FinsEvent]`。`PROGRESS` 表示运行中进度，唯一 terminal `RESULT` 携带 `FinsResultSummary`，成功、失败和取消都必须有明确终态；stream 正常结束但 producer 未产出 result 时会收口为 failure result。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected` 与 `failed` 是同一批候选 filing 的互斥分类；`total` / `discovered` 必须等于这些分类之和，除非后续 schema 显式增加非互斥指标并在 LLM-facing 文本中说明。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
+Preprocess result summary 使用同一个 typed status helper 判定业务成功或失败。`skipped_count` 只表示已支持但因已有 processed 产物等原因跳过的文档；无可用 processor 的文档单独计入 `not_supported_count` 与 `not_supported_document_ids`，不会混入 skipped。
+
+Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 是 plain `def`，立即返回 `ValidatedFinsEventStream`。raw bridge 只转发 producer 事件；validator 是“恰好一个且最后一个 `RESULT`”的唯一 Fins owner：它缓存首个 `RESULT`，直到 raw source 正常耗尽后才发布，并在 clean exhaustion 后通过 `terminal_result` 返回同一个 `FinsResultSummary` 实例。缺少 `RESULT`、重复 `RESULT` 或 `RESULT` 后仍出现事件分别抛出同一 typed `FinsDirectStreamProtocolError` contract，Service 与 CLI 只机械消费，不再次扫描或重建错误。成功、失败和取消的合法业务 `RESULT` 仍保持明确终态，不会被改写成 protocol error。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected` 与 `failed` 是同一批候选 filing 的互斥分类；`total` / `discovered` 必须等于这些分类之和，除非后续 schema 显式增加非互斥指标并在 LLM-facing 文本中说明。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
 
 Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)` 和 `request_cancel(...)`。每个 legacy ingestion job 可追加 JSONL event sidecar，路径与 job record 同属 `<workspace_root>/.dayu/fins_ingestion/jobs`。该路径是 legacy runtime foundation，不是 Service direct 或 awaiting tool 的公共观察边界。
 
 当前 `DefaultFinsRuntime` 内置三个 production download adapter：`source="sec"` 与 `source="auto"` 且 market 为 `US` 时走 SEC 下载；`source="cninfo"` 与 `source="auto"` 且 market 为 `CN` 时走巨潮下载；`source="hkexnews"` 与 `source="auto"` 且 market 为 `HK` 时走披露易下载。没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
 
-当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
+production download overwrite 只替换本轮实际写入的目标文档。SEC 下载在单 filing staging、文件写入、final meta 与 reprocess 标记之间使用 storage batch；文件下载失败、取消或本轮无有效目标文档时，不提交本轮 staging，也不清理其它旧 filing。CN/HK 下载不再把 overwrite 映射成 ticker 级 filings 清空。
 
-### Wait adapter
+Production download adapter 必须消费 `FinsDownloadRequest.rebuild_processed`。对于已在 adapter 内完成持久化并返回 persisted summary 的 SEC、CNInfo 与 HKEXNews 下载路径，`rebuild_processed=true` 表示根据摘要中的 `written_document_ids` 标记既有 processed 产物需要重处理；它不等同于来源侧 pipeline 的本地 meta/manifest rebuild 开关。
 
-`FinsIngestionWaitPollAdapter` 把 lightweight observation handle 映射到 Host wait poll 结果：
+当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，runtime 不用缺省值伪造上传状态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
+
+production upload overwrite 的删除/替换动作由 `DoclingUploadService` 在 storage batch 内执行。SEC/CN/HK upload facade 只解析动作、写 company meta 并调用 upload service；它们不得在 Docling 转换、取消检查或新材料构建前删除旧 source document。
+
+### Awaiting observation 与 Service wait adapter
+
+`dayu.service.fins_wait_adapter.FinsIngestionWaitPollAdapter` 把 lightweight observation handle 映射到 Host wait poll 结果；Fins package 只拥有 observation handle 与 snapshot 语义：
 
 - `pending` / `running` -> not ready。
 - `succeeded` -> completed outcome。
 - `failed` -> failed outcome。
 - `cancelled` -> cancelled outcome。
 - `lost`、corrupt resume token 或当前进程找不到 handle -> lost outcome。
-- `TRANSIENT_UNAVAILABLE` 在有界窗口内保持 not ready，超过窗口后 lost，避免无限 pending。
+- `TRANSIENT_UNAVAILABLE` 只表达 provider observation 暂不可用，由 Host poll owner 基于 durable wait boundary 决定是否继续重试；Service wait adapter 不从 `created_at` 年龄自行制造终态 timeout。
 
 Host 取消 wait 时，adapter 通过 `cancel_observation(handle)` / `abandon_observation(handle)` 做 best-effort 取消和本地 observation record 清理，不删除 Fins source docs、processed docs、legacy job record 或 Host wait record。
 
@@ -511,13 +575,14 @@ ToolsDiscovery
   -> tool result accepted by Host ToolRuntime
 ```
 
-Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
+Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`，并在成功或失败终态的 `finally` 路径关闭 runtime 与 snapshot cache。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
 
 ### Download / preprocess / upload awaiting tool 路径
 
 ```text
 ToolsDiscovery
   -> dayu.fins.tools.download_provider / preprocess_provider / upload_provider
+  -> parse explicit awaiting_resolution_mode once at provider assembly boundary
   -> parse explicit absolute workspace_root
   -> upload provider builds start_fins_upload from Fins ingestion runtime
   -> DefaultFinsRuntime.create(workspace_root=...)
@@ -555,7 +620,7 @@ direct caller
   -> emit PROGRESS events and terminal RESULT
 ```
 
-当前 upload 同时具备 direct stream runtime contract、production runner、`start_fins_upload` awaiting tool provider 与 Host wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；direct result 只暴露有界业务字段和文件数量，不保存或输出本地文件路径。未装配 `FinsUploadRunner` 时，upload stream 产出 unsupported upload runtime 的 failed RESULT。
+当前 upload 同时具备 direct stream runtime contract、production runner、`start_fins_upload` awaiting tool provider 与 Service wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；direct result 只暴露有界业务字段和文件数量，不保存或输出本地文件路径。未装配 `FinsUploadRunner` 时，upload stream 产出 unsupported upload runtime 的 failed RESULT。
 
 ## 状态机
 
@@ -623,9 +688,9 @@ Fins 不产出 `EngineEvent stream` 或 `Host event stream`，也不写 Host Eve
 - read tools 的普通 `ToolExecutionOutcome`。
 - download / preprocess / upload direct stream 的 `FinsEvent(PROGRESS | RESULT)`。
 - download / preprocess / upload awaiting tools 的 `ToolAwaitingOutcome(EXTERNAL_JOB)`。
-- wait adapter poll 时把 Fins observation snapshot 映射成 Host resolve outcome。
+- Service wait adapter poll 时把 Fins observation snapshot 映射成 Host resolve outcome。
 
-Fins direct event、observation snapshot 和 legacy job record 都不是 Host durable truth；只有经 Host wait adapter 和 Host ingest / resolve 路径接受后，才会影响 Host Run / Attempt 状态。Download、preprocess 与 upload awaiting tools 都使用同一个 Fins wait adapter key，由 Service assembly 根据启用的 provider 显式绑定。
+Fins direct event、observation snapshot 和 legacy job record 都不是 Host durable truth；只有经 Service wait adapter 和 Host ingest / resolve 路径接受后，才会影响 Host Run / Attempt 状态。Download、preprocess 与 upload awaiting tools 都使用同一个 Fins wait adapter key，由 Service assembly 根据启用的 provider 显式绑定。
 
 ## Processors 的类继承关系
 
@@ -690,7 +755,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件只在工具调用时校验存在、普通文件与非空，本地源文件授权由调用方在 provider 外部承担。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件在工具调用时校验存在、普通文件与非空。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 
@@ -698,7 +763,7 @@ SecProcessor
 
 ### Processor registry 与 processor cache
 
-`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存 processor 实例；缓存只保存 processor，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
+`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。当前 `FinsReadRuntime` 按 ticker / document_id 向 storage 请求唯一 source snapshot，再把同一 full snapshot 交给 processor registry，并以有界 cache entry 共同持有 processor、typed source meta、provenance 与资源生命周期。cache replacement/eviction/clear/runtime close 使用 retire 与 active borrow 协调，避免正在读取的 processor 失去 source，同时保证无活动借用的临时资源及时关闭。Fins 不缓存 Host tool result、EventLog fact 或 LLM-facing material。
 
 ### Read tool 结果与截断
 
@@ -710,23 +775,23 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Preprocess / process pipeline
 
-`start_preprocess` 从 source repository 选择已存在源文档，按 `document_ids`、`form_types`、`source_kind` 和 `rebuild_processed` 控制处理范围。后台 pipeline 使用 processor registry 生成 sections / tables，并通过 processed repository create / update 写入 processed 产物。`rebuild_processed=false` 时跳过已有 processed 文档；`rebuild_processed=true` 时允许重建。
+`start_preprocess` 从 source repository 选择已存在源文档，按 `document_ids`、`form_types`、`source_kind` 和 `rebuild_processed` 控制处理范围。单文档处理先取得 caller-owned batch，再读取一份 full source snapshot；processor、source meta、sections 与 tables 都消费该 snapshot，snapshot 在 commit 前关闭，commit 前失败只 rollback 一次，commit 开始后 caller 不二次 rollback。后台 pipeline 通过 processed repository create / update 写入 processed 产物；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时允许重建。
 
 ### Direct stream / observation / legacy job 与取消
 
-Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只 prepare 并注册 process-local observation handle，返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host awaiting accept ack durable 成立后，ToolRuntime 通过 Fins activation adapter 调用 `activate_observation(handle)` 提交后台执行。Host wait cancel 通过 wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
+Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只 prepare 并注册 process-local observation handle，返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host awaiting accept ack durable 成立后，ToolRuntime 通过 Service Fins activation adapter 调用 `activate_observation(handle)` 提交后台执行。Host wait cancel 通过 Service wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
 
-Runtime producer 在进入 download / preprocess / upload 业务执行前检查取消，避免已取消 observation 再启动后续长事务。SEC 下载在公司解析、submissions / history 拉取、filing 选择、Browse EDGAR 补选、index / headers / candidate 文件收集、单 filing 文件列表、HTTP 限流 / 退避、HEAD / GET、文件循环和落盘前后检查取消；取消命中后停止后续 SEC 请求和文件处理，不把用户取消记为 failed file / failed filing。CN/HK 下载在 discovery、候选选择、overwrite 清理、单 filing asset 下载、PDF bytes 读取、PDF / Docling blob 写入、staging source 写入、Docling convert 前后和最终 source commit 前检查取消；取消命中后产出 cancelled summary，已经完成的原子落盘保持一致，不再启动后续耗时步骤。
+Runtime producer 在进入 download / preprocess / upload 业务执行前检查取消，避免已取消 observation 再启动后续长事务。SEC 下载在公司解析、submissions / history 拉取、filing 选择、Browse EDGAR 补选、index / headers / candidate 文件收集、单 filing 文件列表、HTTP 限流 / 退避、HEAD / GET、文件循环和落盘前后检查取消；取消命中后停止后续 SEC 请求和文件处理，不把用户取消记为 failed file / failed filing。CN/HK 下载在 discovery、候选选择、overwrite 清理、单 filing asset 下载、PDF bytes 读取、Docling convert、batch 内 blob-first 写入和完整 source 最终发布前后检查取消；取消命中后产出 cancelled summary，已经完成的原子落盘保持一致，不再启动后续耗时步骤。
 
 CN/HK Docling convert 当前通过 `asyncio.to_thread(...)` 调用同步第三方转换函数。转换线程运行期间不能观察 operation cancellation checker；当前可保证的是进入 convert 前、convert 返回后、写入 Docling blob 前后的合作式 checkpoint。需要在转换过程本身做到强中断时，应把 convert 隔离到 process-backed / subprocess 边界并配置 timeout，由父进程治理 terminate / kill；线程内同步第三方调用不能伪装成可强制取消。
 
-### Wait adapter 与 Host resume
+### Service wait adapter 与 Host resume
 
-Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry、wait activation registry 与 wait poll adapter registry，并确保 awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据 active typed provider metadata 显式构造 wait adapter registry 与 wait activation registry；只有 typed mode 为 `poll` 的工具进入 wait poll adapter registry，`manual` 不启动后台观察，`callback` 在当前缺少 authenticated transport 时于 Host 打开前失败。awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 Service `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Service wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器；等待 deadline / expiry 的 durable truth 属于 Host wait record，adapter 只返回 observation not-ready / ready / lost / lifecycle outcome。
 
 ### Ticker normalization
 
-Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。
+Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。upload company meta 的每个非空 `ticker_aliases` 输入都通过 `try_normalize_ticker(...)` 生成 canonical alias，主 ticker 始终位于首项且相同 canonical 只保存一次；无法识别的 alias 在仓储写入前失败关闭。
 
 ## 扩展点
 
@@ -740,4 +805,4 @@ Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` �
 
 扩展 preprocess / process 时，保持 source repository -> processor registry -> processed repository 的闭环；不要在 CLI、tools、CI 或测试夹具中复制独立处理逻辑。
 
-扩展 wait-resume 时，保持 Fins observation handle 与 Host wait record 分离。新增等待工具需要显式工具名、await kind、adapter key、resume policy 和 external job ref source，不得把 adapter object 塞进 ToolsDiscovery provider output。只有明确需要跨进程或跨重启恢复未完成 ingestion 时，才应单独设计最小 durable operation ledger；不得用 CLI direct 或“以后可能”作为 durable 需求。
+扩展 wait-resume 时，保持 Fins observation handle 与 Host wait record 分离。Fins package 新增等待工具只负责返回 `ToolAwaitingOutcome(EXTERNAL_JOB)` 与可被 Service adapter 解析的 observation handle；adapter key、resume policy、Host registry binding 与 wait poll adapter 属于 Service assembly，不得把 adapter object 塞进 ToolsDiscovery provider output。只有明确需要跨进程或跨重启恢复未完成 ingestion 时，才应单独设计最小 durable operation ledger；不得用 CLI direct 或“以后可能”作为 durable 需求。

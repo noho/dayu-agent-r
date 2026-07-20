@@ -15,7 +15,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_outcome import (
@@ -45,13 +45,9 @@ from dayu.fins.ingestion import (
     observation_status_resolution_kind,
     parse_observation_handle_id_token,
 )
-from dayu.fins.ingestion.wait_adapter import (
-    FINS_INGESTION_WAIT_ADAPTER_KEY,
-    FINS_UPLOAD_AWAITING_TOOL_NAME,
-    FinsIngestionWaitActivationAdapter,
-    FinsIngestionWaitPollAdapter,
-    build_fins_wait_activation_registry,
-    build_fins_wait_adapter_registry,
+from dayu.fins.ingestion.awaiting_resolution import (
+    AwaitingResolutionMode,
+    parse_awaiting_resolution_mode,
 )
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
@@ -63,40 +59,18 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
 from dayu.fins.tools import upload_provider
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME, FinsUploadToolCallable
-from dayu.host.api import (
-    ResolveWaitCancelledOutcome,
-    ResolveWaitCompletedOutcome,
-    ResolveWaitFailedOutcome,
-    ResolveWaitLostOutcome,
-)
-from dayu.host.durable.state import (
-    ExternalJobRef,
-    WaitRecordRow,
-    WaitRecordStatus,
-    WaitResumePolicy,
-)
-from dayu.host.wait_adapter import (
-    WaitExternalJobLifecycleAction,
-    WaitExternalJobLifecycleApplied,
-    WaitExternalJobLifecycleNoop,
-    WaitPollLost,
-    WaitPollNotReady,
-    WaitPollReady,
-)
-from dayu.host.wait_adapter import WaitActivationRequest
-from dayu.host.waiting import ToolAwaitingAcceptedAck, ToolAwaitingEventRef
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
     ToolsDiscoveryProviderBinding,
+    ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
 
@@ -117,11 +91,113 @@ _PREPROCESS_TOOLS_PATH: Final[Path] = (
 )
 _UPLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "upload_tools.py"
 _FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS: Final[tuple[str, ...]] = ("host", "Host")
-_WAIT_RECORD_TIME = "2026-01-01T00:00:00Z"
 _OBSERVATION_TIME: Final[datetime] = datetime(2026, 6, 16, tzinfo=timezone.utc)
 _OBSERVATION_HANDLE_ID: Final[str] = (
     f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaaaaaa"
 )
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected"),
+    (
+        ("poll", AwaitingResolutionMode.POLL),
+        ("callback", AwaitingResolutionMode.CALLBACK),
+        ("manual", AwaitingResolutionMode.MANUAL),
+    ),
+)
+def test_awaiting_resolution_mode_parser_accepts_closed_typed_modes(
+    raw_mode: str,
+    expected: AwaitingResolutionMode,
+) -> None:
+    """Fins 唯一 parser 必须精确接受三种 closed mode。
+
+    :param raw_mode: provider config 原始字符串。
+    :param expected: 预期 typed enum。
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回精确 enum 时抛出。
+    """
+
+    assert (
+        parse_awaiting_resolution_mode({"awaiting_resolution_mode": raw_mode})
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {},
+        {"awaiting_resolution_mode": None},
+        {"awaiting_resolution_mode": 1},
+        {"awaiting_resolution_mode": True},
+        {"awaiting_resolution_mode": ""},
+        {"awaiting_resolution_mode": "POLL"},
+        {"awaiting_resolution_mode": " poll"},
+        {"awaiting_resolution_mode": "automatic"},
+    ),
+)
+def test_awaiting_resolution_mode_parser_rejects_missing_or_illegal_values(
+    config: Mapping[str, JsonValue],
+) -> None:
+    """Fins 唯一 parser 不得默认、trim 或 loose parse raw mode。
+
+    :param config: 非法 provider config。
+    :returns: ``None``。
+    :raises AssertionError: 非法值未失败时抛出。
+    """
+
+    with pytest.raises(ValueError, match="awaiting_resolution_mode"):
+        parse_awaiting_resolution_mode(config)
+
+
+@pytest.mark.parametrize(
+    ("provider", "spec_id", "import_path"),
+    (
+        (
+            download_provider.discover_tools,
+            _DOWNLOAD_SPEC_ID,
+            "dayu.fins.tools.download_provider:discover_tools",
+        ),
+        (
+            preprocess_provider.discover_tools,
+            _PREPROCESS_SPEC_ID,
+            "dayu.fins.tools.preprocess_provider:discover_tools",
+        ),
+        (
+            upload_provider.discover_tools,
+            _UPLOAD_SPEC_ID,
+            "dayu.fins.tools.upload_provider:discover_tools",
+        ),
+    ),
+)
+def test_each_fins_awaiting_provider_validates_mode_before_runtime_creation(
+    tmp_path: Path,
+    provider: Callable[[ToolsDiscoveryProviderSpec], ToolsDiscoveryProviderOutput],
+    spec_id: str,
+    import_path: str,
+) -> None:
+    """三个 Fins provider 的直接 discovery 都必须先走同一 parser。
+
+    :param tmp_path: pytest 临时目录。
+    :param provider: 本 case 的 provider callable。
+    :param spec_id: provider spec id。
+    :param import_path: provider import path。
+    :returns: ``None``。
+    :raises AssertionError: 非法 mode 未在 runtime 创建前失败时抛出。
+    """
+
+    with pytest.raises(ValueError, match="awaiting_resolution_mode"):
+        provider(
+            ToolsDiscoveryProviderSpec(
+                spec_id=spec_id,
+                location=PythonImportPathProvider(import_path=import_path),
+                enabled=True,
+                config={
+                    "workspace_root": str(tmp_path.resolve(strict=False)),
+                    "awaiting_resolution_mode": "POLL",
+                },
+            )
+        )
 
 
 def test_observation_handle_resume_token_is_opaque_handle_id() -> None:
@@ -785,7 +861,10 @@ def test_upload_provider_registers_upload_tool_without_local_file_roots(
                 import_path="dayu.fins.tools.upload_provider:discover_tools"
             ),
             enabled=True,
-            config={"workspace_root": str(workspace_root)},
+            config={
+                "workspace_root": str(workspace_root),
+                "awaiting_resolution_mode": "poll",
+            },
         )
     )
 
@@ -804,7 +883,7 @@ def test_upload_provider_rejects_missing_workspace_root() -> None:
                     import_path="dayu.fins.tools.upload_provider:discover_tools"
                 ),
                 enabled=True,
-                config={},
+                config={"awaiting_resolution_mode": "poll"},
             )
         )
 
@@ -859,6 +938,95 @@ def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -
     _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
     assert outcome.snapshot is not None
     assert "finsjob_" not in outcome.snapshot.snapshot_id
+
+
+def test_preprocess_tool_accepts_material_filters_and_rebuild_flag(
+    tmp_path: Path,
+) -> None:
+    """公开工具契约必须接受 material、文档/表单过滤与重建开关。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 有效业务参数未创建 awaiting observation 时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(
+        workspace_root=workspace_root
+    ).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(
+                PREPROCESS_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "source_kind": "material",
+                    "document_ids": ["aapl-earnings-call-2024-q4"],
+                    "form_types": ["earnings-call"],
+                    "rebuild_processed": True,
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
+    _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
+    assert outcome.snapshot is not None
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "expected_message"),
+    (
+        (7, "source_kind must be a string"),
+        ("transcript", "source_kind must be one of"),
+    ),
+)
+def test_preprocess_tool_rejects_invalid_source_kind_before_creating_observation(
+    tmp_path: Path,
+    source_kind: JsonValue,
+    expected_message: str,
+) -> None:
+    """公开工具必须在 observation 创建前拒绝非法源文档类别。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        source_kind: 非字符串或未知的源文档类别。
+        expected_message: 预期的业务可读校验信息。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法参数未按 invalid_argument 失败时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(
+        workspace_root=workspace_root
+    ).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(
+                PREPROCESS_TOOL_NAME,
+                {"ticker": "AAPL", "source_kind": source_kind},
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert expected_message in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
 def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
@@ -1457,472 +1625,6 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
         assert "optional explicit material" not in lowered_schema_text
 
 
-def test_fins_wait_adapter_registry_binds_download_preprocess_and_upload_tools(
-    tmp_path: Path,
-) -> None:
-    """Fins wait adapter registry 应绑定稳定 awaiting 工具名。"""
-
-    registry = build_fins_wait_adapter_registry(
-        workspace_root=tmp_path.resolve(strict=False),
-        tool_names=(PREPROCESS_TOOL_NAME, UPLOAD_TOOL_NAME, DOWNLOAD_TOOL_NAME),
-    )
-
-    download_binding = registry.resolve_binding(
-        tool_name=DOWNLOAD_TOOL_NAME,
-        await_kind=ToolAwaitKind.EXTERNAL_JOB,
-    )
-    preprocess_binding = registry.resolve_binding(
-        tool_name=PREPROCESS_TOOL_NAME,
-        await_kind=ToolAwaitKind.EXTERNAL_JOB,
-    )
-    upload_binding = registry.resolve_binding(
-        tool_name=FINS_UPLOAD_AWAITING_TOOL_NAME,
-        await_kind=ToolAwaitKind.EXTERNAL_JOB,
-    )
-    assert download_binding is not None
-    assert preprocess_binding is not None
-    assert upload_binding is not None
-    assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
-    assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
-    assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
-    assert download_binding.resume_policy is WaitResumePolicy.POLL
-    assert preprocess_binding.resume_policy is WaitResumePolicy.POLL
-    assert upload_binding.resume_policy is WaitResumePolicy.POLL
-
-
-def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> None:
-    """重复 Fins wait binding 必须 deterministic fail fast。"""
-
-    workspace_root = tmp_path.resolve(strict=False)
-    try:
-        build_fins_wait_adapter_registry(
-            workspace_root=workspace_root,
-            tool_names=(DOWNLOAD_TOOL_NAME, DOWNLOAD_TOOL_NAME),
-        )
-    except ValueError as exc:
-        assert "duplicate Fins wait adapter binding" in str(exc)
-    else:
-        raise AssertionError("重复 Fins wait adapter binding 未失败")
-
-
-def test_fins_wait_activation_registry_binds_fins_adapter_key() -> None:
-    """Fins activation registry 应绑定稳定 key 并复用传入 runtime。"""
-
-    runtime = _FakeObservationRuntime(snapshots={})
-
-    registry = build_fins_wait_activation_registry(
-        runtime=runtime,
-        tool_names=(DOWNLOAD_TOOL_NAME, PREPROCESS_TOOL_NAME, UPLOAD_TOOL_NAME),
-    )
-
-    adapter = registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
-
-    assert isinstance(adapter, FinsIngestionWaitActivationAdapter)
-    assert adapter.runtime is runtime
-
-
-def test_fins_wait_activation_adapter_activates_existing_resume_token() -> None:
-    """Fins activation adapter 应解析现有 resume token 并调用 runtime activation。"""
-
-    handle = _observation_handle_with_id("1234567890abcdef")
-    runtime = _FakeObservationRuntime(snapshots={})
-    adapter = FinsIngestionWaitActivationAdapter(runtime=runtime)
-
-    adapter.activate_accepted_wait(
-        _activation_request(
-            tool_name=DOWNLOAD_TOOL_NAME,
-            resume_token=handle.handle_id,
-        )
-    )
-
-    assert runtime.activated_handles == (handle.handle_id,)
-
-
-def test_fins_wait_activation_adapter_rejects_corrupt_resume_token() -> None:
-    """Fins activation adapter 遇到 corrupt token 不得调用 runtime。"""
-
-    runtime = _FakeObservationRuntime(snapshots={})
-    adapter = FinsIngestionWaitActivationAdapter(runtime=runtime)
-
-    with pytest.raises(ValueError):
-        adapter.activate_accepted_wait(
-            _activation_request(
-                tool_name=DOWNLOAD_TOOL_NAME,
-                resume_token="finsjob_00000000000000000000000000000007",
-            )
-        )
-
-    assert runtime.activated_handles == ()
-
-
-def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
-    """Fins poll adapter 应把 lightweight observation 状态映射为 Host outcome。"""
-
-    succeeded = _observation_handle_with_id("bbbbbbbbbbbbbbbb")
-    failed = _observation_handle_with_id("cccccccccccccccc")
-    cancelled = _observation_handle_with_id("dddddddddddddddd")
-    pending = _observation_handle_with_id("eeeeeeeeeeeeeeee")
-    running = _observation_handle_with_id("ffffffffffffffff")
-    lost = _observation_handle_with_id("1111111111111111")
-    runtime = _FakeObservationRuntime(
-        snapshots={
-            succeeded.handle_id: _observation_snapshot(
-                succeeded,
-                FinsObservationStatus.SUCCEEDED,
-            ),
-            failed.handle_id: _observation_snapshot(
-                failed,
-                FinsObservationStatus.FAILED,
-            ),
-            cancelled.handle_id: _observation_snapshot(
-                cancelled,
-                FinsObservationStatus.CANCELLED,
-            ),
-            pending.handle_id: _observation_snapshot(
-                pending,
-                FinsObservationStatus.PENDING,
-            ),
-            running.handle_id: _observation_snapshot(
-                running,
-                FinsObservationStatus.RUNNING,
-            ),
-            lost.handle_id: _observation_snapshot(lost, FinsObservationStatus.LOST),
-        }
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    succeeded_poll = adapter.poll_wait(_wait_record(succeeded.handle_id, DOWNLOAD_TOOL_NAME))
-    failed_poll = adapter.poll_wait(_wait_record(failed.handle_id, DOWNLOAD_TOOL_NAME))
-    cancelled_poll = adapter.poll_wait(_wait_record(cancelled.handle_id, PREPROCESS_TOOL_NAME))
-    pending_poll = adapter.poll_wait(_wait_record(pending.handle_id, PREPROCESS_TOOL_NAME))
-    running_poll = adapter.poll_wait(_wait_record(running.handle_id, DOWNLOAD_TOOL_NAME))
-    lost_poll = adapter.poll_wait(_wait_record(lost.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(succeeded_poll, WaitPollReady)
-    assert isinstance(succeeded_poll.outcome, ResolveWaitCompletedOutcome)
-    assert isinstance(failed_poll, WaitPollReady)
-    assert isinstance(failed_poll.outcome, ResolveWaitFailedOutcome)
-    assert isinstance(cancelled_poll, WaitPollReady)
-    assert isinstance(cancelled_poll.outcome, ResolveWaitCancelledOutcome)
-    assert isinstance(pending_poll, WaitPollNotReady)
-    assert isinstance(running_poll, WaitPollNotReady)
-    assert isinstance(lost_poll, WaitPollLost)
-    assert isinstance(lost_poll.outcome, ResolveWaitLostOutcome)
-    value = succeeded_poll.outcome.result.value
-    assert isinstance(value, Mapping)
-    assert value["operation"] == "download"
-    assert "job_id" not in value
-
-
-def test_fins_wait_poll_adapter_corrupt_and_missing_handles_are_lost() -> None:
-    """corrupt token 或缺失 handle 必须 resolve LOST，不得无限 pending。"""
-
-    missing = _observation_handle_with_id("9999999999999999")
-    adapter = FinsIngestionWaitPollAdapter(runtime=_FakeObservationRuntime(snapshots={}))
-
-    corrupt_poll = adapter.poll_wait(_wait_record("finsjob_00000000000000000000000000000007", DOWNLOAD_TOOL_NAME))
-    missing_poll = adapter.poll_wait(_wait_record(missing.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(corrupt_poll, WaitPollLost)
-    assert isinstance(corrupt_poll.outcome, ResolveWaitLostOutcome)
-    assert isinstance(missing_poll, WaitPollLost)
-    assert isinstance(missing_poll.outcome, ResolveWaitLostOutcome)
-
-
-def test_fins_wait_poll_adapter_transient_unavailable_is_bounded_not_ready() -> None:
-    """transient unavailable 初期保持 not-ready，超过窗口后收口 LOST。"""
-
-    handle = _observation_handle_with_id("abababababababab")
-    runtime = _FakeObservationRuntime(
-        snapshots={},
-        poll_errors={
-            handle.handle_id: FinsObservationPollError(
-                FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE,
-                "Observation temporarily unavailable.",
-            )
-        },
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    not_ready = adapter.poll_wait(
-        _wait_record(
-            handle.handle_id,
-            DOWNLOAD_TOOL_NAME,
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-    )
-    expired = adapter.poll_wait(
-        _wait_record(
-            handle.handle_id,
-            DOWNLOAD_TOOL_NAME,
-            created_at="2020-01-01T00:00:00Z",
-        )
-    )
-
-    assert isinstance(not_ready, WaitPollNotReady)
-    assert isinstance(expired, WaitPollLost)
-
-
-def test_fins_wait_poll_adapter_abandon_cancels_and_cleans_observation() -> None:
-    """abandon_wait 应 best-effort cancel 并清理 observation record。"""
-
-    handle = _observation_handle_with_id("cdcdcdcdcdcdcdcd")
-    runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        }
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-    poll = adapter.poll_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(result, WaitExternalJobLifecycleApplied)
-    assert result.action is WaitExternalJobLifecycleAction.ABANDON
-    assert result.message is not None
-    assert "finsobs_" not in result.message
-    assert runtime.cancelled_handles == (handle.handle_id,)
-    assert runtime.abandoned_handles == (handle.handle_id,)
-    assert isinstance(poll, WaitPollLost)
-
-
-def test_fins_wait_poll_adapter_abandon_corrupt_token_is_noop() -> None:
-    """abandon_wait 遇到 corrupt token 时不应调用 observation runtime。"""
-
-    runtime = _FakeObservationRuntime(snapshots={})
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    result = adapter.abandon_wait(
-        _wait_record("finsjob_00000000000000000000000000000009", DOWNLOAD_TOOL_NAME)
-    )
-
-    assert isinstance(result, WaitExternalJobLifecycleNoop)
-    assert result.reason == "invalid_observation_handle"
-    assert runtime.cancelled_handles == ()
-    assert runtime.abandoned_handles == ()
-
-
-def test_fins_wait_poll_adapter_abandon_missing_observation_is_noop() -> None:
-    """abandon_wait 遇到缺失 observation 时应返回 missing no-op。"""
-
-    handle = _observation_handle_with_id("1212121212121212")
-    runtime = _FakeObservationRuntime(snapshots={})
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(result, WaitExternalJobLifecycleNoop)
-    assert result.reason == "observation_missing"
-    assert runtime.cancelled_handles == (handle.handle_id,)
-    assert runtime.abandoned_handles == ()
-
-
-def test_fins_wait_poll_adapter_abandon_lost_snapshot_is_noop() -> None:
-    """abandon_wait 遇到 LOST snapshot 时应返回 missing no-op。"""
-
-    handle = _observation_handle_with_id("3434343434343434")
-    runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.LOST)
-        }
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(result, WaitExternalJobLifecycleNoop)
-    assert result.reason == "observation_missing"
-    assert runtime.cancelled_handles == (handle.handle_id,)
-    assert runtime.abandoned_handles == ()
-
-
-def test_fins_wait_poll_adapter_abandon_non_transient_error_is_noop() -> None:
-    """abandon_wait 遇到非临时 observation 错误时应返回 error no-op。"""
-
-    handle = _observation_handle_with_id("5656565656565656")
-    runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        },
-        abandon_errors={
-            handle.handle_id: FinsObservationPollError(
-                FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE,
-                "Observation handle is corrupt.",
-            )
-        },
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(result, WaitExternalJobLifecycleNoop)
-    assert result.reason == "observation_error:permanent_corrupt_handle"
-    assert runtime.cancelled_handles == (handle.handle_id,)
-    assert runtime.abandoned_handles == (handle.handle_id,)
-
-
-def test_fins_wait_poll_adapter_abandon_cancel_non_transient_error_is_noop() -> None:
-    """abandon_wait 遇到 cancel 非临时 observation 错误时应返回 error no-op。"""
-
-    handle = _observation_handle_with_id("6767676767676767")
-    runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        },
-        cancel_errors={
-            handle.handle_id: FinsObservationPollError(
-                FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE,
-                "Observation handle is corrupt.",
-            )
-        },
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(result, WaitExternalJobLifecycleNoop)
-    assert result.reason == "observation_error:permanent_corrupt_handle"
-    assert runtime.cancelled_handles == (handle.handle_id,)
-    assert runtime.abandoned_handles == ()
-
-
-def test_fins_wait_poll_adapter_abandon_transient_unavailable_re_raises() -> None:
-    """abandon_wait 遇到 transient unavailable 时应抛出供 Host 重试。"""
-
-    handle = _observation_handle_with_id("7878787878787878")
-    runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        },
-        cancel_errors={
-            handle.handle_id: FinsObservationPollError(
-                FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE,
-                "Observation temporarily unavailable.",
-            )
-        },
-    )
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-
-    with pytest.raises(FinsObservationPollError) as exc_info:
-        adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
-
-    assert exc_info.value.error_kind is FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE
-    assert runtime.cancelled_handles == (handle.handle_id,)
-    assert runtime.abandoned_handles == ()
-
-
-def _wait_record(
-    resume_token: str,
-    tool_name: str,
-    *,
-    include_external_job_ref: bool = True,
-    created_at: str = _WAIT_RECORD_TIME,
-) -> WaitRecordRow:
-    """构造测试用 Host wait record。
-
-    Args:
-        resume_token: Fins observation resume token。
-        tool_name: 原始 awaiting 工具名。
-        include_external_job_ref: 是否带 external job ref。
-        created_at: wait record 创建时间。
-
-    Returns:
-        Host wait record row。
-
-    Raises:
-        ValueError: 字段非法时由 Host durable 类型抛出。
-    """
-
-    external_job_ref = (
-        ExternalJobRef(
-            adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-            external_job_id=resume_token,
-        )
-        if include_external_job_ref
-        else None
-    )
-    return WaitRecordRow(
-        wait_id=f"wait-{resume_token}",
-        session_id="session-fins",
-        run_id="run-fins",
-        attempt_id="attempt-fins",
-        execution_id="execution-fins",
-        tool_call_id=f"call-{tool_name}",
-        tool_name=tool_name,
-        adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-        await_kind=ToolAwaitKind.EXTERNAL_JOB.value,
-        resume_policy=WaitResumePolicy.POLL,
-        resume_token=resume_token,
-        snapshot_ref=None,
-        external_job_ref=external_job_ref,
-        accept_idempotency_key=f"accept-{resume_token}",
-        resolve_idempotency_key=None,
-        resolve_semantic_digest=None,
-        deadline_at=None,
-        expires_at=None,
-        status=WaitRecordStatus.WAITING,
-        created_event_id=f"event-created-{resume_token}",
-        created_event_sequence=1,
-        updated_event_id=f"event-updated-{resume_token}",
-        updated_event_sequence=1,
-        created_at=created_at,
-        updated_at=_WAIT_RECORD_TIME,
-        terminal_at=None,
-    )
-
-
-def _activation_request(tool_name: str, resume_token: str) -> WaitActivationRequest:
-    """构造测试用 accepted wait activation request。
-
-    Args:
-        tool_name: awaiting 工具名。
-        resume_token: awaiting resume token。
-
-    Returns:
-        typed activation request。
-
-    Raises:
-        ValueError: 字段非法时由 Host 契约抛出。
-    """
-
-    return WaitActivationRequest(
-        tool_name=tool_name,
-        await_spec=ToolAwaitSpec(
-            await_kind=ToolAwaitKind.EXTERNAL_JOB,
-            deadline=None,
-            resume_token=resume_token,
-        ),
-        accepted_ack=_accepted_ack(),
-    )
-
-
-def _accepted_ack() -> ToolAwaitingAcceptedAck:
-    """构造测试用 Host awaiting accepted ack。
-
-    Returns:
-        accepted ack。
-
-    Raises:
-        ValueError: ack 字段非法时由 Host 契约抛出。
-    """
-
-    tool_ref = ToolAwaitingEventRef(event_id="event-tool-awaiting-1", event_sequence=1)
-    run_ref = ToolAwaitingEventRef(event_id="event-run-waiting-1", event_sequence=2)
-    attempt_ref = ToolAwaitingEventRef(
-        event_id="event-attempt-suspended-1",
-        event_sequence=3,
-    )
-    return ToolAwaitingAcceptedAck(
-        accepted_event_refs=(tool_ref, run_ref, attempt_ref),
-        wait_id="wait-1",
-        tool_awaiting_event_ref=tool_ref,
-        run_waiting_event_ref=run_ref,
-        attempt_suspended_event_ref=attempt_ref,
-        result_digest="digest-1",
-        idempotency_record_ref="idempotency-1",
-    )
-
-
 def _build_workspace(tmp_path: Path) -> Path:
     """构造空 Fins workspace。
 
@@ -1977,6 +1679,7 @@ def _runtime_with_executor(
 
     base_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     return FinsIngestionRuntime.create(
+        batching_repository=base_runtime.batching_repository,
         source_repository=base_runtime.source_repository,
         blob_repository=base_runtime.blob_repository,
         filing_maintenance_repository=base_runtime.filing_maintenance_repository,
@@ -2023,7 +1726,10 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.download_provider",
                 "enabled": True,
-                "config": {"workspace_root": str(workspace_root)},
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "awaiting_resolution_mode": "poll",
+                },
             },
             _PREPROCESS_SPEC_ID: {
                 "import_path": "dayu.fins.tools.preprocess_provider:discover_tools",
@@ -2031,7 +1737,10 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.preprocess_provider",
                 "enabled": True,
-                "config": {"workspace_root": str(workspace_root)},
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "awaiting_resolution_mode": "poll",
+                },
             },
             _UPLOAD_SPEC_ID: {
                 "import_path": "dayu.fins.tools.upload_provider:discover_tools",
@@ -2039,7 +1748,10 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.upload_provider",
                 "enabled": True,
-                "config": {"workspace_root": str(workspace_root)},
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "awaiting_resolution_mode": "poll",
+                },
             },
         }
     }
@@ -2117,7 +1829,10 @@ def _spec(
         spec_id=spec_id,
         location=PythonImportPathProvider(import_path=import_path),
         enabled=True,
-        config={"workspace_root": str(workspace_root)},
+        config={
+            "workspace_root": str(workspace_root),
+            "awaiting_resolution_mode": "poll",
+        },
     )
 
 
@@ -2145,7 +1860,10 @@ def _upload_spec(
             import_path="dayu.fins.tools.upload_provider:discover_tools"
         ),
         enabled=True,
-        config={"workspace_root": str(workspace_root)},
+        config={
+            "workspace_root": str(workspace_root),
+            "awaiting_resolution_mode": "poll",
+        },
     )
 
 

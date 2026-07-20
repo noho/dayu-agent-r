@@ -20,6 +20,7 @@ from dayu.host.durable.event_log import (
     EventLogStore,
     FilteredEventLogPage,
     append_event,
+    count_recovery_dispatches_for_run,
     read_event_by_id,
     read_events_after,
     read_events_after_matching,
@@ -36,6 +37,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import RunStartReason, serialize_run_start_reason
 from dayu.host.durable.transaction import HostTransaction
 
 _CUSTOM_INLINE_THRESHOLD_BYTES = 8
@@ -77,7 +79,7 @@ def _request(
     *,
     event_class: EventClass = EventClass.CANONICAL_FACT,
     session_id: str = "session-1",
-    event_type: str = "host.test",
+    event_type: str = "USER_INPUT_ACCEPTED",
     payload_json: JsonValue = "payload",
     payload_ref: str | None = None,
     payload_digest: str | None = None,
@@ -151,6 +153,150 @@ def test_append_canonical_event_returns_first_sequence(tmp_path: Path) -> None:
             return result.row.event_sequence
 
         assert store.transaction_runner.run_write(operation) == 1
+
+
+def test_count_recovery_dispatches_uses_typed_run_started_payload(
+    tmp_path: Path,
+) -> None:
+    """recovery dispatch 计数必须通过 typed RUN_STARTED payload 判断。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> int:
+            """追加 RUN_STARTED 事件并统计 recovery 次数。
+
+            :param transaction: Host durable transaction。
+            :returns: recovery dispatch 次数。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-run-started-initial",
+                    event_type="RUN_STARTED",
+                    payload_json={
+                        "start_reason": serialize_run_start_reason(
+                            RunStartReason.INITIAL
+                        )
+                    },
+                ),
+            )
+            append_event(
+                transaction,
+                _request(
+                    "event-run-started-recovery",
+                    event_type="RUN_STARTED",
+                    payload_json={
+                        "start_reason": serialize_run_start_reason(
+                            RunStartReason.RECOVERY
+                        )
+                    },
+                ),
+            )
+            return count_recovery_dispatches_for_run(transaction, run_id="run-1")
+
+        assert store.transaction_runner.run_write(operation) == 1
+
+
+@pytest.mark.parametrize(
+    "payload_json",
+    (
+        {},
+        {"start_reason": "unknown"},
+    ),
+)
+def test_count_recovery_dispatches_fails_closed_for_invalid_start_reason(
+    tmp_path: Path,
+    payload_json: JsonValue,
+) -> None:
+    """recovery dispatch 计数遇到非法 RUN_STARTED payload 必须 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """追加非法 RUN_STARTED 事件并触发 recovery 计数。
+
+            :param transaction: Host durable transaction。
+            :returns: 无返回值。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-run-started-invalid",
+                    event_type="RUN_STARTED",
+                    payload_json=payload_json,
+                ),
+            )
+            count_recovery_dispatches_for_run(transaction, run_id="run-1")
+
+        with pytest.raises(HostDurableError, match="RunStartReason|start_reason"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_append_rejects_unknown_event_type(tmp_path: Path) -> None:
+    """EventLog append request 在 owner 边界拒绝未知 event type。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """尝试追加非法 event type。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            append_event(
+                transaction,
+                _request("event-invalid", event_type="INVALID_TEST_EVENT_TYPE"),
+            )
+
+        with pytest.raises(HostDurableError, match="event_type is unknown"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_row_decoder_rejects_mutated_unknown_event_type(tmp_path: Path) -> None:
+    """EventLog row decoder 在 durable row 被外部破坏时 fail-closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def write_valid_row(transaction: HostTransaction) -> None:
+            """追加合法 EventLog row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            append_event(transaction, _request("event-mutated"))
+
+        store.transaction_runner.run_write(write_valid_row)
+
+        connection = store.connect()
+        try:
+            connection.execute("PRAGMA ignore_check_constraints=ON")
+            connection.execute(
+                f"""
+                UPDATE {TABLE_EVENT_LOG}
+                SET event_type = ?
+                WHERE event_id = ?
+                """,
+                ("INVALID_MUTATED_EVENT_TYPE", "event-mutated"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        def read_mutated_row(transaction: HostTransaction) -> None:
+            """读取被外部破坏的 EventLog row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            read_event_by_id(transaction, "event-mutated")
+
+        with pytest.raises(HostDurableError, match="invalid event_type"):
+            store.transaction_runner.run_write(read_mutated_row)
 
 
 def test_multiple_event_classes_share_one_global_cursor(tmp_path: Path) -> None:
@@ -251,7 +397,7 @@ def test_append_optional_none_fields_preserves_nulls_and_digest_idempotency(
         run_id=None,
         attempt_id=None,
         execution_id=None,
-        event_type="host.nulls",
+        event_type="USER_INPUT_ACCEPTED",
         occurred_at=datetime(2026, 5, 14, 1, 2, 3, 123456, tzinfo=UTC),
         actor=None,
         source=None,
@@ -356,7 +502,7 @@ def test_duplicate_event_id_different_body_raises_identity_conflict(
                 _request(
                     "event-1",
                     session_id="session-2",
-                    event_type="host.other",
+                    event_type="RUN_ACCEPTED",
                     payload_json="different",
                 ),
             )
@@ -405,9 +551,9 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
 
     event_filter = EventLogReadFilter(
         (
-            EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),
+            EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("USER_INPUT_ACCEPTED",)),
             EventLogReadClassFilter(EventClass.PREVIEW, None),
-            EventLogReadClassFilter(EventClass.DIAGNOSTIC, ("DIAG_A",)),
+            EventLogReadClassFilter(EventClass.DIAGNOSTIC, ("ENGINE_EVENT_DIAGNOSTIC",)),
         )
     )
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -424,7 +570,7 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
                 _request(
                     "event-1",
                     event_class=EventClass.CANONICAL_FACT,
-                    event_type="TYPE_A",
+                    event_type="USER_INPUT_ACCEPTED",
                 ),
             )
             append_event(
@@ -432,7 +578,7 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
                 _request(
                     "event-2",
                     event_class=EventClass.CANONICAL_FACT,
-                    event_type="TYPE_B",
+                    event_type="RUN_ACCEPTED",
                 ),
             )
             append_event(
@@ -440,7 +586,7 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
                 _request(
                     "event-3",
                     event_class=EventClass.PREVIEW,
-                    event_type="PREVIEW_B",
+                    event_type="ITERATION_STARTED",
                 ),
             )
             append_event(
@@ -448,7 +594,7 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
                 _request(
                     "event-4",
                     event_class=EventClass.DIAGNOSTIC,
-                    event_type="DIAG_A",
+                    event_type="ENGINE_EVENT_DIAGNOSTIC",
                 ),
             )
             append_event(
@@ -456,7 +602,7 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
                 _request(
                     "event-5",
                     event_class=EventClass.PROJECTION_SIGNAL,
-                    event_type="SIGNAL_A",
+                    event_type="USAGE_REPORTED",
                 ),
             )
             page = read_events_after_matching(
@@ -486,7 +632,7 @@ def test_read_events_after_matching_limit_covers_last_matching_row(
     """matching rows 填满 page 时 covered cursor 停在最后一个匹配 row。"""
 
     event_filter = EventLogReadFilter(
-        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),)
+        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("USER_INPUT_ACCEPTED",)),)
     )
     with open_host_durable_store(_options(tmp_path)) as store:
 
@@ -498,9 +644,9 @@ def test_read_events_after_matching_limit_covers_last_matching_row(
             :raises AssertionError: covered cursor 断言失败时抛出。
             """
 
-            append_event(transaction, _request("event-1", event_type="TYPE_A"))
-            append_event(transaction, _request("event-2", event_type="TYPE_A"))
-            append_event(transaction, _request("event-3", event_type="TYPE_B"))
+            append_event(transaction, _request("event-1", event_type="USER_INPUT_ACCEPTED"))
+            append_event(transaction, _request("event-2", event_type="USER_INPUT_ACCEPTED"))
+            append_event(transaction, _request("event-3", event_type="RUN_ACCEPTED"))
             page = read_events_after_matching(
                 transaction,
                 0,
@@ -560,7 +706,7 @@ def test_read_events_after_matching_session_scope_limits_rows_and_covered_cursor
     """session_id 过滤同时约束返回 rows 与 covered cursor。"""
 
     event_filter = EventLogReadFilter(
-        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),)
+        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("USER_INPUT_ACCEPTED",)),)
     )
     with open_host_durable_store(_options(tmp_path)) as store:
 
@@ -574,19 +720,19 @@ def test_read_events_after_matching_session_scope_limits_rows_and_covered_cursor
 
             append_event(
                 transaction,
-                _request("event-1", session_id="session-a", event_type="TYPE_A"),
+                _request("event-1", session_id="session-a", event_type="USER_INPUT_ACCEPTED"),
             )
             append_event(
                 transaction,
-                _request("event-2", session_id="session-b", event_type="TYPE_A"),
+                _request("event-2", session_id="session-b", event_type="USER_INPUT_ACCEPTED"),
             )
             append_event(
                 transaction,
-                _request("event-3", session_id="session-a", event_type="TYPE_B"),
+                _request("event-3", session_id="session-a", event_type="RUN_ACCEPTED"),
             )
             append_event(
                 transaction,
-                _request("event-4", session_id="session-b", event_type="TYPE_A"),
+                _request("event-4", session_id="session-b", event_type="USER_INPUT_ACCEPTED"),
             )
             page = read_events_after_matching(
                 transaction,

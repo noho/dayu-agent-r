@@ -80,6 +80,8 @@ Phase 1 的 runtime 实施范围只包括 `lane` 与 `filelock` 的层中立基�
 
 ConfigLoader 是 scene / config hints 到 typed execution inputs 的前置配置能力。配置 schema 不沿用旧 `llm_models.json` / `run.json` 的混合职责；稳定配置视图拆分为 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json` 与 `tool_discovery.json`，并删除旧 `dayu/config/llm_models.json` 与 `dayu/config/run.json`，不保留兼容读取路径。ConfigLoader 不拥有 scene 解释权，不解释 Host lifecycle，不读取 EventLog；配置中的 provider API key、环境变量引用或其它 provider 参数都按配置 schema 原样读取并进入 typed config view。Service / execution environment 负责决定如何使用、脱敏、保护或解析这些配置值。若 Service 无法把 scene hints 与 ConfigLoader 输出映射为当前环境支持的 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy` 或其它 typed input，必须在调用 Host 前失败。
 
+本地 Config 与 Host SQLite / EventLog 属于同一受信任产品域。Service / execution environment 仍是 secret 解析 owner：它从 typed config 与当前运行环境解析 provider secret，并把解析后的 headers / API key 作为完整 typed `RunnerSpec` 的执行字段交给 Host。Host 可以接收该 resolved typed input，并把一次 Run 实际采用的 effective `RunnerSpec` 原样冻结到内部 durable canonical fact，供 dispatch、retry、replay 与 recovery 使用。这个内部持久化副本不是 public contract，也不得被直接复用为 Tool Trace、audit、HostEvent、outbox、memory、compact、runner-call observation、LLM-facing 文本或日志的输出 payload；这些 projection 必须只从各自 owner 的显式安全字段派生，且不得包含 provider secret 明文。
+
 Config catalog 的 record id 由顶层 map key 提供，record 内不重复 `runtime_id`、`model_id`、`profile_id`、`execution_profile_id` 等 id 字段；typed config view 如需 id，由 ConfigLoader 从 map key 注入。`extends` 引用同一 catalog 的 map key；ConfigLoader validation 不接受重复 id 字段，避免 key / value 不一致和新旧 schema 并存。
 
 `models.json` 是模型目录，只表达 provider / model 能力与请求基础参数：runner kind、provider、model、endpoint、`api_key_ref`、headers、tool calling / streaming / stream usage capability、default timeout、max retries、SSE idle timeout / heartbeat、provider request extension、context window tokens 与 provider/model-specific `runtime_hints.runner_option_hints`。`runner_option_hint_id` 是 semantic call style selector，例如 `interactive`、`overview`、`audit`、`decision`、`write`、`infer` 与 `conversation_compaction`；具体 `temperature`、`top_p`、`stream` 等 RunnerCallOptions 值由 effective model 的 hint 表解释，不放入全局 execution profile。默认 config 不使用 `max_tokens` 限制模型输出；若未来需要输出 token cap，必须作为显式 per-run / provider adapter override 或 provider-specific public contract 重新设计，不能回到默认 model hint。
@@ -98,6 +100,8 @@ usage 是 provider capability 驱动的治理观测信号，不是 scene / Servi
 
 `host_runtime.json` 表达 Host opener 的部署默认值：store / artifact roots、SQLite、`host_execution_lane_name`、worker backend、dispatch poll interval 与 memory projection catch-up page size 等。这些都是 `open_host(options)` construction-time assembly inputs，不是 per-run override。`memory_projection_catchup_batch_size` 只表示 required catch-up / rebuild 的内部读取页大小和单批 transaction 粒度，不表示“本次最多追多少事件”的语义预算，也不能作为 correctness 停止条件。顶层 selector 使用 `default_host_runtime_id`；host runtime record 不重复内部 id。`worker_backend` 当前支持 `local`，未来可扩展 `remote`；ConfigLoader 只读取该值，Service / composition root 负责映射为 `OpenHostOptions.worker_factory`。`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog；`host_runtime.json.host_execution_lane_name` 引用该 lane catalog，Service / composition root 再映射到 `OpenHostOptions` 的 lane fields。`tool_discovery.json` 表达 ToolsDiscovery provider 配置：provider id、import path 或 entry point、source kind、source id、enabled 与 provider config；ConfigLoader 只读出 typed provider specs，ToolsDiscovery 才负责 import provider、聚合 `ToolBundle` 与计算 digest。
 
+wait resolution 配置不得写入 scene manifest。具体 awaiting provider 选择 `poll`、`callback` 或 `manual` 的恢复策略属于该 provider / adapter binding 的工具级事实，写在 `tool_discovery.json` 对应 provider config，并由 provider assembly 校验所选策略确实可用；当前 product runtime 尚未装配真实 authenticated callback transport 时，选择 `callback` 必须在 Host 打开前 fail fast。wait poller 的启停、poll / idle cadence、retry / backoff、单次 adapter observation budget、close drain budget、claim 与 outstanding invocation 上限属于 Host opener runtime policy，写在 `host_runtime.json`，不得放进 per-Run `execution_profiles.json`。Service 只能在 effective Host runtime policy 已启用、当前工具集合至少包含一个选择 `poll` 的 awaiting provider、且匹配 poll adapter registry 存在时启动 poller；scene tool selection 只用于筛选本次实际暴露的工具，不拥有后台 runtime authority。
+
 ConfigLoader overlay 规则必须保持可预测：包内默认配置与 workspace 覆盖配置按配置文件类型分别加载；顶层 map 按稳定 id 合并，同 id 记录由 workspace 整条替换，不做隐式 deep merge。需要复用配置时使用显式 `extends`，且只允许单继承；继承解析后必须得到完整 typed record。ConfigLoader 不解析环境变量、不替换 secret、不脱敏，只原样读取 schema 表达的值。`dayu.runtime` 提供层中立 location resolver：当 `workspace/config` 存在时输出 `config_overlay_dir=workspace/config`，否则输出 `None`；同时解析 `prompt_asset_root` 与 `scene_manifest_root` 的实际可用路径。ConfigLoader 和 ScenePrepare 都不内置 workspace fallback 策略。
 
 多 Run 财报流程由 Service workflow 或未来 typed Skill orchestration 控制。scene manifest 不表达 step graph、next scene、产物传递、artifact store、structured parser、replay policy、retry / stop policy、failure classification 或 checkpoint / resume 语义。这些属于 Service workflow / skill orchestration 的状态机和持久化边界，不属于 `ScenePrepare`，也不得进入 Host 状态机。Scene manifest 只保留稳定 scene identity、capability tags / refs 与 source digest，作为后续 workflow / skill 可引用的 scene capability。
@@ -110,7 +114,7 @@ Scene manifest 支持 `extends`，但只允许单继承。`extends` 为空或单
 
 Phase 12 的 runtime assembly 边界由 `ScenePrepare`、`ConfigLoader` 与 `ToolsDiscovery` 三个独立组件组成。`ScenePrepare` 解释 scene manifest、读取 manifest 直接引用的 prompt fragment assets、接收 Service 传入的 typed context slot values，并输出已拼接 `system_messages`、tool selection、model hints、可选 agent policy override、fragment refs、source refs 与 content digest。`ConfigLoader` 原样读取 execution config、执行 overlay 与 typed validation，并输出层中立 typed config view。`ToolsDiscovery` 加载显式 provider callable 或 package entry point，聚合 provider 返回的 `ToolDefinition` 集合，输出业务 `ToolBundle`、source refs、content digest 与 provider report。三者互不替代：`ConfigLoader` 不解释 scene manifest，`ScenePrepare` 不做工具发现，`ToolsDiscovery` 不读取 scene manifest 或配置模型。
 
-Service / composition root 是三者输出进入 Host 的唯一映射方。Service 同时消费 `PreparedSceneInputs`、ConfigLoader 的 typed config view 与 ToolsDiscovery 的 discovered bundle，把它们显式映射为 `open_host` construction-time inputs、per-run request inputs、`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`HostToolingOptions` 或其它已冻结 typed input；映射失败必须在调用 Host 前失败。Service / execution environment 负责 provider client 创建、secret 使用 / 脱敏 / 保护、多 Run workflow、artifact、parser、replay、retry 与 stop policy。
+Service / composition root 是三者输出进入 Host 的唯一映射方。Service 同时消费 `PreparedSceneInputs`、ConfigLoader 的 typed config view 与 ToolsDiscovery 的 discovered bundle，把它们显式映射为 `open_host` construction-time inputs、per-run request inputs、resolved `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`HostToolingOptions` 或其它已冻结 typed input；映射失败必须在调用 Host 前失败。Service / execution environment 负责 provider client 创建、secret 解析 / 使用 / 脱敏 / 保护、多 Run workflow、artifact、parser、replay、retry 与 stop policy。Host 不重新读取 Config 或运行环境来解析 secret；它只消费 Service 已构造的 typed execution input。
 
 运行时 override 合并由 Service / composition root 执行，优先级固定为未来 UI 显式输入 > scene manifest hints > ConfigLoader typed config view > 代码默认值。该优先级只适用于 Host 外部装配阶段，Host 接收的仍然是最终 typed inputs，不解释 override provenance。当前 Host public contract 允许的 per-run override 仅限 `SubmitFollowupRequest` 的 `system_prompt`、`tool_names`、`runner_spec`、`runner_options` 与 `agent_policy`：`system_prompt` 承接 `ScenePrepare` 已装配的 system messages；`tool_names` 只在已发现业务 `ToolBundle` 内选择子集，`None` 表示使用全量业务工具，空集合表示禁用业务工具，非空集合表示显式白名单；`runner_spec`、`runner_options` 与 `agent_policy` 必须由 Service 映射为完整 typed value，不接受 patch dict、profile lookup、extra payload 或 raw config fragment。`SubmitFollowupRequest.user_prompt` 是调用方本次输入，不来自 scene / config；`behavior` 与 `target_run_id` 属于 Service / UI 请求控制，不属于 scene manifest 的稳定职责。
 
@@ -636,6 +640,12 @@ Engine final answer / failure ingest、Tool awaiting、`resolve_wait`、steer、
 | recovery scan | Run `RUNNING` / `CANCELLING` 且 active Attempt 不可确认 | Run `RECOVERING` 或 `LOST` | `ATTEMPT_LOST`、`RUN_RECOVERING` 或 `RUN_LOST` | 不 takeover |
 | recovery dispatch | Run `RECOVERING` 且可重建 messages | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 
+Host terminal / lifecycle event set 是 Run 生命周期的 canonical fact 集合。`RUN_SUCCEEDED`、`RUN_FAILED`、`RUN_CANCELLED` 与 `RUN_LOST` 都是 Host Run terminal canonical facts；其中 `RUN_LOST` 表达 recovery、worker lifecycle 或 waiting-result positive proof 得到的 lost terminal，不是用户 cancel，也不是 failure 的展示别名。Read Model、Read API 与 public HostEvent 必须能把 `RUN_LOST` 投影为 `lost` terminal。
+
+Public outbox terminal item set 只包含 `RUN_SUCCEEDED`、`RUN_FAILED` 与 `RUN_CANCELLED`。Outbox 是 public delivery work queue，不拥有 Run terminal truth，不得把 `RUN_LOST` 伪装成 success、failure 或 cancel 的 public terminal item。`RUN_LOST` 仍保留在 EventLog / Run row / read model 中作为 Host terminal truth，但不要求存在 public outbox item。
+
+Non-public terminal fact skip / diagnostic behavior 必须显式且可审计。Outbox consumer 遇到 `RUN_LOST` 时只能记录 skip / diagnostic，不能创建 public terminal item；public outbox watermark、latest item cursor 与 lag 判断只能以 public outbox terminal item event set 为准，不能把 `RUN_LOST` 当成必须投递的 item 候选。
+
 `RUN_STARTED` 表示 Run 进入 active Attempt lifecycle。它必须携带 `start_reason`，第一版枚举为 `initial`、`queue_promotion`、`resume`、`steer`、`recovery`。`start_reason=recovery` 覆盖 crash recovery 和 reactive context compaction recovery；具体原因通过关联的 `ATTEMPT_LOST`、`CONTEXT_COMPACTION_REQUESTED` 或 policy refs 区分。不得用新增的 `RUN_RESUMED` / `RUN_RECOVERED` event 表达同一治理事实。
 
 `RECOVERING` 的退出必须收敛：
@@ -710,6 +720,8 @@ Host durable store 是本地治理真源。第一版使用 SQLite 承载以下 d
 - queued Run promotion 到 `RUNNING` 与 Attempt 创建必须原子。
 - 小型 / 中型可恢复 payload 可以写入 SQLite payload table，并与引用它的 EventLog `canonical_fact` append 在同一 transaction 内提交。
 - projection checkpoint 不得先于对应 projection 持久化结果提交。
+
+Host SQLite / EventLog 是受信任内部 durable store。为冻结 exact effective execution，`USER_INPUT_ACCEPTED` 或等价 canonical fact 可以持久化 Service 已解析的 typed `RunnerSpec`，包括 resolved provider headers / API key；这是 retry / replay / recovery 的执行真源，不是新增 public projection。任何读取该 fact 的消费者都必须声明自己的 typed projection contract：dispatch / retry / replay / recovery 可以恢复完整执行配置，Tool Trace、audit、HostEvent / read API、outbox、memory / compact、LLM-facing runner input / observation 与 operator log 则只能选择各自安全字段，provider secret 明文必须为零。不得用字段名黑名单、下游字符串替换或展示层 repair 代替 owner 级白名单投影。
 
 状态迁移必须使用 CAS-style 条件更新。实现不得以“读出状态后无条件写回”的方式更新 Run / Attempt。
 
@@ -894,15 +906,36 @@ HostPolicyProviderSet at composition root
 
 子系统不得用字符串 key 反查全局 policy，也不得把 policy provider set 当作跨层 service locator。
 
+admission 冻结的 effective execution snapshot 必须把 canonical execution config digest 同时写为 `policy_snapshot_digest`，并把 `policy_snapshot_ref` 规范化为由该 digest 派生的不可变 ref。恢复边界必须先重算 config digest，再校验 digest 与 ref，全部通过后才能反序列化 runner / options / agent policy；不得把 snapshot 中自报的 digest 或 ref 当作可信输入。
+
 ## 11. Host 公共接口
+
+### 11.1 Execution / Admin capability 与 durable actor boundary
+
+Host 对 Service 提供两个无继承关系的 public Protocol：
+
+- execution `Host` 由 `open_host(OpenHostOptions)` 打开，承诺 Session / Run command、cancel、wait、outbox read/drain 与 live watch；它不承诺 Session list / purge 或 storage maintenance。
+- `HostAdmin` 由 `open_host_admin(OpenHostAdminOptions)` 打开，只承诺 `get_session`、`list_sessions`、`purge_session`、`report_storage_usage` 与 `run_storage_maintenance`；它不暴露 ensure/create/submit/retry/replay/resolve/cancel/watch 或任何 scheduler control。
+
+`OpenHostAdminOptions` 只包含 durable SQLite、artifact 与 payload policy。admin opener 不加载或接收 scene、tool、model、provider secret、lane、worker、wait poller 或 execution baseline，不执行 startup recovery、projection catch-up 或 scheduler/host-instance registration。CLI / Service 的 list 与 purge 必须走这条 admin assembly；resume 等执行入口仍走 `open_host`。
+
+所有 execution / admin public durable command 与 read 都提交到 opener 私有的 single-worker durable actor。actor 是 command handle、actor durable store 与 SQLite connection 的唯一线程 owner，负责它们的创建、使用、drain 和关闭；caller cancellation 只取消等待，不取消已经提交的底层 future。execution scheduler 使用独立 durable store / connection，两条连接共享同一个 SQLite / payload policy，但任何 live connection 都不得跨线程。
+
+actor transaction 的 after-commit scheduler wake 与 active worker cancel 必须同步桥接回 opener event loop；callback、`LocalWorkerHandle.on_cancel()` 与 asyncio primitive 只能在 opener loop thread 访问，bridge exception 必须返回原 actor caller。execution close 先停止新 call 并 drain actor command / wake，在 scheduler 仍存活时完成 bridge，然后按 `scheduler -> projection flush -> actor handle/store -> actor executor -> scheduler store` 关闭；admin close 只关闭 actor chain，重复关闭幂等。
+
+execution Host 的 lifecycle 与 new-work admission 由同一个 `HostExecutionHealthGate` 拥有，状态单向为 `STARTING -> READY -> UNAVAILABLE -> CLOSING -> CLOSED`。`submit_followup`、`retry_run`、`replay_run` 取得 admission lease 后才可提交 actor；lease 覆盖 transaction、commit 后 scheduler wake 与 actor future 收口，caller cancellation 不提前释放。scheduler fatal transition 取得同一 lease，因此 admission-first 只能先完成 commit+wake，fatal-first 则在 actor submission 前返回 retryable `unavailable`。read、cancel 与 close 不因 `UNAVAILABLE` 被 admission gate 拒绝，但仍受 close gate 与各自业务状态约束。
+
+heartbeat、dispatch drain、queue promotion 与 active-cancel watchdog critical task 的非预期退出通过同一 health gate 报告稳定 `component/reason_code`，public detail 不携带原始异常文本。`HostTransactionRetryExhaustedError` 是 transient，不提交 fatal、不关闭 scheduler、不取消 active worker；dispatch pending durable row 保持真源，scheduler 按 poll interval 退避后重新 reconcile。closed 或 unavailable scheduler 的 dispatch/promotion/watchdog wake 必须返回 typed internal unavailable，不能静默丢弃。
+
+admission 幂等 replay 必须在 transaction 内从最新 Run、current Attempt 与 dispatch row 重新派生 after-commit wake：`ACCEPTED` Run 重唤醒 pre-start governance，`RUNNING + STARTING + pending dispatch` 重投递 matching dispatch identity；queued、terminal、已取消或已进入 lane/worker 的 snapshot 不误 wake。`idempotent_replay` 只描述 durable 幂等命中，不能作为跳过全部 wake 的 shortcut。
 
 Host 公共接口采用函数式风格，但不得依赖全局隐式单例。公共函数接收明确的 Host handle / context 与 request，返回稳定 snapshot 或 Host event stream。
 
 Service-facing 第一版应表现为一个简单 Host opener / handle，而不是把 scheduler、runner、tooling、memory catch-up、wakeup 或 `HostLocalRuntime` 暴露给上层。调用方形态是打开 Host、取得 / 新建 / 读取 Session、提交 prompt 或控制命令、读取 / 订阅 Session 事件、在 terminal event 中观察 final answer、关闭 Host。内部可以使用 composition root / runtime 装配 command handle、durable store、scheduler、active registry、local execution、ToolRuntime、compactor 与 projection catch-up，但这些只是 Host 内部实现边界。
 
-P10.5 冻结 async-only Host opener / handle。Service-facing opener 名称固定为 `open_host(options)`，并且必须是 async context manager：`async with open_host(options) as host:`。handle methods 与 event stream consumption 均以 async public contract 为准。Host public contract 不提供同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，应在 Service / CLI adapter 边界用 `asyncio.run(...)` 或等价机制包装 async Host contract，不要求 Host 层维护第二套同步 API。
+Host Service-facing opener 固定为 capability-separated `open_host(options)` 与 `open_host_admin(options)`，两者都是 async context manager。handle methods 与 event stream consumption 均以 async public contract 为准。Host public contract 不提供同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，应在 Service / CLI adapter 边界用 `asyncio.run(...)` 或等价机制包装 async Host contract，不要求 Host 层维护第二套同步 API。
 
-Host opener close 是 Host handle lifecycle 语义，不是 Session / Run 治理事实。`host.close()` 与 `open_host(...).__aexit__` 必须幂等；重复 close 不报错。close 完成后，调用该 handle 上的 `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`、`get_run`、`watch_session_events`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run` 等 Host API，必须 fail-fast 抛出 typed `HostClosedError` 或等价 Host lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经进入 admission / command transaction 的调用按正常事务语义完成；close gate 之后新进入的调用统一抛 closed-handle exception。
+Host opener close 是 handle lifecycle 语义，不是 Session / Run 治理事实。execution `Host` 与 `HostAdmin` 的 `close()` / context exit 都必须幂等；close 完成后，调用同一 handle 能力面上的任一方法必须 fail-fast 抛出 typed `HostClosedError` 或等价 lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经提交给 durable actor 的调用按正常事务与 after-commit wake 语义完成；close gate 之后的新调用统一抛 closed-handle exception。
 
 Host opener close 会终止当前 handle 持有的本地运行环境，但不得伪装成用户取消。close 流程必须停止 scheduler / promotion / background supervisor，不再启动新的 Attempt；必须向 active worker registry 传播 lifecycle cancel，使 Host 注入 Engine 的 cancellation token 可见，并通知 `LocalWorkerHandle.on_cancel(reason)` 这个 best-effort hook；随后关闭或取消当前 handle 持有的 active worker task、lane wait、stream fanout task 与本地 runtime resource，避免进程内任务泄漏。若 close 过程中 active worker 已经产出可确认 terminal event，Host 按正常 ingest / terminal closeout 追加事实。若 active worker 没有可确认 terminal，Host close 不得写 `CANCEL_REQUESTED`、`RUN_CANCELLED`、`RUN_FAILED` 或其它伪装用户意图 / 确认失败的 canonical fact；未收口 active Attempt 后续必须通过 Host lifecycle / Recovery 的 positive orphan proof 路径进入 `ATTEMPT_LOST`，再按 policy 进入 `RUN_RECOVERING` 或 `RUN_LOST`。调用方若要表达用户明确停止，应在 close 前显式调用 `cancel_run(...)` 或 `cancel_session_runs(...)`。
 
@@ -912,7 +945,7 @@ P10.5 冻结的是后续真实生产系统 Service 使用的普通多轮生产�
 
 `open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、compactor runner / storage config、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。scheduler、wakeup、active worker registry、dispatch control 等 Host 内部接线由 `open_host` composition root 自行创建或连接，不作为 Service-facing 参数暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
 
-一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。override 是按字段 partial merge，不是 all-or-nothing profile：例如只传 `runner_options` 时，`RunnerSpec` 与 `AgentPolicy` 仍取 opener baseline；只传 `runner_spec` 时，runner call options 与 agent policy 仍取 opener baseline。每个出现的 override 对象本身必须是完整 typed value，不能是 patch dict、增量字段包或 extra payload。Host 不接收 raw provider client、API key 明文、callable、无结构 dict override、extra payload 或 `policy_overrides`。`RunnerSpec.api_key_ref` 仍只是 secret 引用名，不是 secret 本体。Host admission / dispatch 必须校验并冻结每个 Run 的 effective runner spec / runner options / agent policy 到 Run / Attempt 可解释 snapshot 或 source refs，保证 retry / replay / recovery 能解释当时使用的执行配置。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
+一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。override 是按字段 partial merge，不是 all-or-nothing profile：例如只传 `runner_options` 时，`RunnerSpec` 与 `AgentPolicy` 仍取 opener baseline；只传 `runner_spec` 时，runner call options 与 agent policy 仍取 opener baseline。每个出现的 override 对象本身必须是完整 typed value，不能是 patch dict、增量字段包或 extra payload。Host 不接收 raw provider client、callable、无结构 dict override、extra payload 或 `policy_overrides`；它可以接收 Service 已解析并封装进 typed `RunnerSpec.headers` 的 provider API key。`RunnerSpec.api_key_ref` 是 secret 来源引用名，不要求 `headers` 仍保持未解析。Host admission / dispatch 必须校验并把每个 Run 的 effective runner spec / runner options / agent policy 冻结到内部 durable canonical fact 或等价可恢复 snapshot，保证 retry / replay / recovery 使用并解释当时的准确执行配置；其中 resolved headers / API key 只属于受信任 Host internal durable state，不能进入 public / LLM-facing / log projection。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
 
 LLM compactor 与 ordinary Run 共享同一个 Host runtime environment、durable store、memory / artifact roots、budget governance 与 canonical event / artifact 接线，但不共享每个 Run 的 execution override。Service / `open_host(options)` 只能提供 compactor runner、scene/baseline prompt、compactor AgentPolicy 与 storage 配置，例如 `compactor_runner_spec`、`compactor_runner_options`、Service 从 compactor scene 装配的 system prompt、Service 从 compactor scene 装配的完整 `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 读取的 user prompt template、context budget policy 与 compact artifact root；不能提供 `ContextCompactor` 实例、policy ref、candidate builder、quality check、artifact writer 或 repair callback。当前只有一套 Host compactor policy，因此 compactor policy id / version 是 Host 内部常量或 typed policy snapshot ref，只用于 EventLog / artifact / diagnostic 审计，不进入 Service-facing opener contract。Host 在 opener composition root 内部构造 Host-owned LLM compactor，并把它接入 Context Governance internal seam。`SubmitFollowupRequest.runner_spec` / `runner_options` / `agent_policy`、`tool_names`、`system_prompt` 不影响 compactor；compactor 不创建用户可见 Run，不产出 final answer，不使用 business ToolRuntime。后续如需多套 compactor policy，必须先作为 Host-recognized typed policy profile 重新设计 public contract，不能先暴露 raw string `policy_ref`，也不能借用 ordinary Run override、metadata 或 extra payload。
 
@@ -994,7 +1027,7 @@ resolve_wait(host, wait_id, request) -> RunSnapshot
 以下能力不属于普通 Service-facing public contract：
 
 - `start_run(...)` / `_start_run(...)`：`_start_run` 是 Host 内部 admission primitive，普通 Service 不可调用。
-- `create_host_command_handle(...)`：降为 Host 内部 / 低层测试 composition primitive，不作为 Service 打开 Host 的入口；Service-facing 打开入口只有 `open_host(options)`。
+- `create_host_command_handle(...)`：降为 Host 内部 / 低层测试 composition primitive，不作为 Service 打开 Host 的入口；Service-facing opener 只有 capability-separated `open_host(options)` 与 `open_host_admin(options)`。
 - `HostLocalRuntime`、`HostLocalExecutionOptions`：均为 Host 内部 contract 或 implementation type，不从普通 Service-facing public namespace 暴露。
 - scheduler / wakeup / dispatch control API：Service 不得调用 scheduler wakeup、读取 dispatch row 或控制 dispatch；这些接线由 `open_host(options)` 内部完成。
 - `stream_run_events(...)` / `HostEventView`：只作为 Host 内部 diagnostic / detail / debug / drill-down 补读契约保留，不进入普通 Service-facing public contract。若未来需要公开 run-scoped diagnostic read API，必须另行讨论并定义不同于内部 `HostEventView` 的 public typed DTO。
@@ -1209,7 +1242,8 @@ Run 读取与结果边界：
 
 接口分层：
 
-- `ensure_session`、`create_session`、`get_session`、`list_sessions`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`report_storage_usage`、`run_storage_maintenance`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
+- execution `Host` 稳定能力包括 `ensure_session`、`create_session`、`get_session`、`close_session`、`get_run`、`watch_session_events`、outbox read/drain、`cancel_run`、`cancel_session_runs`、`submit_followup`、`retry_run`、`replay_run` 与 `resolve_wait`。
+- `HostAdmin` 稳定能力包括 `get_session`、`list_sessions`、`purge_session`、`report_storage_usage` 与 `run_storage_maintenance`；两个 Protocol 不互相继承，也不通过 wrapper/facade 重新合并能力面。
 - `stream_run_events` 不进入 P10.5 普通 Service-facing public contract；现有实现若保留，只能作为 Host 内部 diagnostic / detail read path。未来若要公开 run-scoped diagnostic read API，必须另行讨论 public contract，且不能直接暴露内部 `HostEventView`。
 - `cancel_session_runs` 是客户端退出 / supervisor shutdown 的便利公共能力；它只取消指定 Session 下未终态 Run，不表达客户端拥有的 Session 集合。
 - `ensure_session` 表示“给我这个 slot 的当前会话，必要时创建并绑定”。
@@ -1238,6 +1272,7 @@ Snapshot 最小语义：
 - `idempotency_conflict`
 - `permission_denied`
 - `unsupported_operation`
+- `unavailable`
 - `internal_error`
 
 错误分类语义：
@@ -1247,6 +1282,7 @@ Snapshot 最小语义：
 - `invalid_state`：目标对象存在，但该状态下不允许此操作。
 - `permission_denied`：上层传入的 authorization claims 不满足 Host policy。
 - `unsupported_operation`：public request / response envelope 已冻结，但完整语义由后续 phase 落地；它不表达目标对象状态错误，也不能伪装成 `invalid_state`。
+- `unavailable`：execution scheduler 已报告 fatal 或 Host 尚未完成 startup；固定为 retryable，detail 只包含稳定 component / reason code，不泄漏原始异常文本。
 
 `HostApiError` 必须是受限 typed contract：`code`、`message`、`retryable` 与 `detail?`。`detail` 只能是 Host 公共 API 中显式定义的 detail union 成员，禁止无结构 `extra` / `payload` / `metadata` god bag。第一版至少包含：
 
@@ -1256,6 +1292,10 @@ SteerConflictDetail:
   target_run_status?
   current_active_run_id?
   current_active_run_status?
+
+HostUnavailableDetail:
+  component
+  reason_code
 ```
 
 `SteerConflictDetail` 只携带足以解释 steer precondition 失败的 Run id 与状态摘要，不嵌入完整 `RunSnapshot`，不暴露 Host durable row。后续新增错误 detail 时必须新增具体 typed detail，不得把显式参数塞进无结构 payload。
@@ -1448,6 +1488,7 @@ canonical ingest 必须满足：
 - EventLog row 不应内嵌大 payload；canonical event 必须记录 payload ref / descriptor 与 digest，或其它可校验 ref。
 - 第一版使用 SQLite payload table 作为默认 durable payload store；小型 / 中型可恢复 payload 与引用它的 EventLog append 在同一 SQLite transaction 内提交。
 - Phase 2 payload foundation 支持两类最小 descriptor：`sqlite_payload` 与本地 `artifact_ref`。`sqlite_payload` 指向 SQLite payload table 中的 canonical JSON / bytes payload；`artifact_ref` 指向 Host composition root 注入的本地 artifact root 下的 durable artifact。
+- Host durable JSON resolver 是 descriptor 内容完整性的唯一读取 owner。读取 SQLite payload 时必须同时校验调用方 ref / digest、descriptor ref / digest / size、SQLite row identity / format / digest / size，以及实际 canonical bytes 的 digest / size，并拒绝非 canonical JSON 或非 object JSON；读取 artifact-backed payload 时还必须校验 artifact root containment、实际文件 digest / size 与 canonical object。任一层不一致都 fail closed，下游消费者不得只信 descriptor、row metadata 或调用方 digest 中的任意一份。
 - Host composition root 必须显式注入 `payload_inline_threshold_bytes` 与 artifact root。默认值只能在 construction root 应用，不能通过模块级全局变量、隐式环境变量或硬编码路径取得。
 - 小于等于 `payload_inline_threshold_bytes` 的可恢复 payload 可以作为 `sqlite_payload` 写入 SQLite payload table，并与引用它的 EventLog append 在同一 SQLite transaction 内提交。
 - `TOOL_RESULT_ACCEPTED` 的完整 accepted payload 是否可内联，由 ToolRuntime accept barrier 在 append transaction 内根据 durable policy 判断；超过阈值时必须写 SQLite payload descriptor，并让 EventLog hot payload 只保留 evidence envelope、status、metadata 与可校验 payload ref。工具实现、Service 或 smoke 脚本不得自行承担该冷热分离判断。
@@ -1509,6 +1550,7 @@ RUNNER_CALL_INPUT_ITERATION_LINKED
 CONTEXT_COMPACTION_REQUESTED
 CONTEXT_COMPACTED
 CONTEXT_COMPACTION_FAILED
+PROVIDER_DIAGNOSTIC
 PROVIDER_PROTOCOL_ERROR
 ```
 
@@ -1520,9 +1562,19 @@ EngineEvent ingest 的命名 diagnostic event 至少包括：
 
 ```text
 ENGINE_EVENT_REJECTED
+PROVIDER_DIAGNOSTIC
 ```
 
 `ENGINE_EVENT_REJECTED` 不是 Run / Attempt lifecycle fact，只记录 Host 拒绝某个 Engine event 的原因和是否要求停止当前 worker stream。它不得驱动 recovery、memory projection、dispatch decision、resume 或 Run / Attempt 状态迁移。
+
+`PROVIDER_DIAGNOSTIC` 是非致命 provider / adapter diagnostic，EventClass 固定为 `DIAGNOSTIC`。它持久化 bounded `diagnostic_code`、`severity`、`message`、`provider_request_id`、`diagnostic_source`、`payload_ref` 与 `payload_digest`，不得更新 Run / Attempt terminal state，不得写入 failure metadata，不得进入 outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。Read API 以 `provider_diagnostic` / `info` activity 展示非致命诊断，以独立 `provider_protocol_error` activity 展示 fatal provider protocol error；Tool Trace 可以把 provider diagnostic 作为诊断展示材料。
+
+Engine typed failure code 的唯一 Host 边界是 EngineEvent ingest。Host ingest
+必须调用 Engine serializer，把 `EngineRunErrorCode` 或
+`RunnerSpecificErrorCode` 写成 durable JSON 文本；`RUN_FAILED`、
+`PROVIDER_PROTOCOL_ERROR`、failure metadata、public HostEvent、Tool Trace 和
+Outbox 之后都只读取 durable 文本，不检查 provider / runner-specific wrapper
+内部字段，也不按 provider-specific code 分支。
 
 ### 13.3 Canonical Event Contract Matrix
 
@@ -1539,7 +1591,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `ATTEMPT_RUNNING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker accepted / dispatch accepted info | Attempt status=`RUNNING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_SUCCEEDED` / `ATTEMPT_FAILED` / `ATTEMPT_CANCELLED` / `ATTEMPT_SUSPENDED` / `ATTEMPT_STEERED` / `ATTEMPT_LOST` | `session_id`、`run_id`、`attempt_id`、`execution_id` | terminal reason / error / wait_id | 关闭 Attempt | resume 按需消费 suspended / lost reason | audit yes / Host event stream emit |
 | `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、operation idempotency key | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
-| `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / LLM-safe arguments atom / normalized args digest / optional semantic query atom | 记录工具调用 intent | resume、memory 与 compact evidence 可消费业务可读 tool name / query / bounded arguments projection | audit 是 / tool trace 是 |
+| `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / accepted arguments atom / normalized args digest / optional source-owned semantic query atom | 记录工具调用 intent | resume、memory 与 compact evidence 只消费业务可读 tool name / query / 参数文本；不得把 Host 内部字段或下游字段名过滤结果当作 LLM-facing 语义 | audit 是 / tool trace 是 |
 | `TOOL_CALL_GOVERNED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | policy decision / duplicate key / action | 不直接改 Run；可触发 guidance / hard stop | action 影响模型继续时进入 messages | audit 是 / tool trace 是 |
 | `TOOL_RESULT_ACCEPTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / accepted evidence envelope / raw outcome / status；wait terminal result 通过 wait-specific fields 表达来源与状态 | 记录工具事实；P1-P7 accepted waiting terminal result 不另建 `TOOL_TERMINAL_RESULT` canonical fact | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `TOOL_CALL_REQUESTED`、`RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | 不进入 LLM-facing memory；resume 参数不得从此治理事实推断 | audit 是 / tool trace 是 |
@@ -1548,7 +1600,8 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `RUNNER_CALL_INPUT_ITERATION_LINKED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id` | manifest_event_id / manifest_payload_ref / manifest_digest / manifest_schema_version / runner_call_index / runner_call_kind / runner_call_trigger_reason / iteration_id / iteration_index / engine_message_count / engine_role_sequence_digest / runner_input_serializer_schema_version / expected_message_count / expected_role_sequence_digest / validation_status / diagnostic | 无 Run / Attempt 状态副作用；只表达 prepared runner-call manifest 与 Engine `ITERATION_STARTED` observation 的追加式 link / validation fact | resume 不消费；reconstruction consumer 可用 refs / digests / observed-vs-expected summary 判断 Engine link 是否完成 | audit optional / tool trace optional |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
-| `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
+| `PROVIDER_DIAGNOSTIC` | `session_id`、`run_id`、`attempt_id`、`execution_id` | diagnostic code / severity / message / provider request id / diagnostic source / payload ref + digest | 无 Run / Attempt 状态副作用；非 terminal；不写 failure metadata | resume 不消费；memory 不消费；LLM-facing material 不消费 | audit optional / Host activity optional / tool trace diagnostic |
+| `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | serializer 输出的 provider / runner error code 文本 / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
 | `ENGINE_EVENT_REJECTED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id`、worker_event_index、engine_event_type | reason / stop_worker_stream / optional diagnostic_refs / optional runner-call link or manifest refs | 无 Run / Attempt 状态副作用；只表达 Host ingest fail-closed 或 unsupported event diagnostic；`stop_worker_stream` 是 worker stream 控制信号，不是 lifecycle transition | resume 不消费；memory 不消费 | audit yes / tool trace optional |
 
 canonical event 的 required fields 不能被塞进无结构 `metadata`；`metadata` 只能承载不参与状态机、幂等、恢复和审计主链的附加说明。
@@ -1563,9 +1616,11 @@ control event 的 `run_id` 绑定规则：
 
 Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表示对 contract 声明的 canonical bytes 计算出的 lowercase hex SHA-256；`HostInternalRef` 表示只供 Host / trace / smoke consumer 使用的 typed Host ref string 或 descriptor object，永远不进入 LLM-facing material；`JsonObject` 表示 JSON-compatible mapping，key 必须是 string，value 只能是 JSON scalar / list / object，不能是 provider object、binary blob、callable、Python `Any` 或无结构内部对象。
 
-`TOOL_CALL_REQUESTED` payload contract 固定为工具调用 intent、原始 accepted 参数 digest 与 LLM-safe 参数投影的同源 durable atom。payload required fields 至少包括 `tool_call_id`、`tool_name`、`normalized_arguments_digest`、`arguments_json_size_bytes`、`arguments_storage_kind`、`arguments_payload_digest`、`semantic_input_digest`、`semantic_query_storage_kind`。`normalized_arguments_digest` 绑定 ToolRuntime 已接受的原始 canonical arguments preimage；`arguments_inline_json` 或 `arguments_payload_ref` 只保存可进入 LLM replay / evidence 的安全参数投影，敏感字段必须已脱敏。`arguments_storage_kind` 只允许 `inline_json` 或 `payload_descriptor`：当安全参数 JSON 字节数小于等于 `payload_inline_threshold_bytes` 时必须使用 `inline_json` 并提供 `arguments_inline_json`；超过阈值时必须使用 `payload_descriptor` 并提供 `arguments_payload_ref`，descriptor kind 为 `tool_call_arguments_json`。`arguments_payload_digest` 校验安全参数 JSON 投影，不要求等于 `normalized_arguments_digest`；消费者配对 request/result 时必须用 `normalized_arguments_digest`，读取 LLM-facing 参数时必须校验 `arguments_payload_digest`。
+`TOOL_CALL_REQUESTED` payload contract 固定为工具调用 intent、原始 accepted 参数 atom 与可选 source-owned semantic query atom。payload required fields 至少包括 `tool_call_id`、`tool_name`、`normalized_arguments_digest`、`arguments_json_size_bytes`、`arguments_storage_kind`、`arguments_payload_digest`、`semantic_input_digest`、`semantic_query_storage_kind`。`normalized_arguments_digest` 绑定 ToolRuntime 已接受的原始 canonical arguments preimage；`arguments_inline_json` 或 `arguments_payload_ref` 保存同一份 accepted canonical arguments JSON，只服务幂等、audit、payload integrity、internal replay、tool trace 和诊断，不是 Host 新增的 LLM-safe 参数投影。`arguments_storage_kind` 只允许 `inline_json` 或 `payload_descriptor`：当 accepted canonical arguments JSON 字节数小于等于 `payload_inline_threshold_bytes` 时必须使用 `inline_json` 并提供 `arguments_inline_json`；超过阈值时必须使用 `payload_descriptor` 并提供 `arguments_payload_ref`，descriptor kind 为 `tool_call_arguments_json`。`arguments_payload_digest` 校验 accepted canonical arguments JSON，必须等于 `normalized_arguments_digest`。Host 不得创建第二份 normalized / redacted / LLM-safe arguments JSON，也不得用字段名黑名单把 raw arguments 事后改写成 LLM-facing 语义。
 
-可选 semantic query 是业务可读输入，不等同于 `semantic_input_digest` 的 preimage。`semantic_input_digest` 只表达幂等或语义归一 digest，可以没有可读文本；若工具/runtime 提供可读 query，`semantic_query_storage_kind` 可以是 `inline_text` 或 `payload_descriptor`，并必须提供 `semantic_query_digest`。长 query 使用 payload descriptor kind `tool_call_semantic_query_text`。缺少 semantic query 时 `semantic_query_storage_kind="absent"`，compact evidence projection 可以退回到 bounded arguments projection 或业务中性“工具参数不可读”说明，但不得把 `tool_call_id`、payload ref、digest、cursor 或 Host 内部账本字段渲染给 LLM。WU-CM-01-F02 的真实缺口是 query_text arguments / semantic query 的业务可读表达，不是 tool name 缺失。
+可选 semantic query 是业务可读输入，不等同于 `semantic_input_digest` 的 preimage。`semantic_input_digest` 只表达幂等或语义归一 digest，可以没有可读文本；若工具/runtime 提供可读 query，`semantic_query_storage_kind` 可以是 `inline_text` 或 `payload_descriptor`，并必须提供 `semantic_query_digest`。长 query 使用 payload descriptor kind `tool_call_semantic_query_text`。缺少 semantic query 时 `semantic_query_storage_kind="absent"`，compact evidence projection 只能使用源头符合 LLM-facing 文本约束的工具名、query 或参数文本，或使用业务中性“工具参数不可读”说明 / fail closed；不得把 `tool_call_id`、payload ref、digest、cursor、Host 内部账本字段或 projection 层字段名黑名单结果渲染给 LLM。WU-CM-01-F02 的真实缺口是 query_text / accepted arguments 的业务可读表达，不是 tool name 缺失。
+
+Host LLM-facing 参数文本不做独立 normalized/safe-args 层。LLM-facing 合规必须从源头保证：prompt assets、tool schema name/description、参数说明、枚举说明、错误说明、测试中模拟真实 LLM 的 prompt，以及 Host / Engine / Tool projection renderers 都必须遵守 `AGENTS.md` 的 LLM-facing 文本约束。若某个 schema、prompt 或 renderer 暴露 Host 内部术语、治理字段、裸 ref/digest/cursor、不可自解释缩写或安全敏感实现细节，必须在该 source owner 修正；Host projection 不得用下游 fallback、字段名 blacklist、兼容别名、`hasattr/getattr`、默认值或字符串猜测来补救。
 
 `ToolCallArgumentsAtom` 字段固定为：
 
@@ -1577,7 +1632,7 @@ Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表�
 | `normalized_arguments_digest` | `Digest` | yes | digest used for idempotency/tool intent validation | equals digest of normalized canonical arguments |
 | `arguments_json_size_bytes` | `int` | yes | canonical JSON byte size | non-negative |
 | `arguments_storage_kind` | `"inline_json" | "payload_descriptor"` | yes | storage form for accepted arguments | inline iff size `<= payload_inline_threshold_bytes`; descriptor otherwise |
-| `arguments_inline_json` | `JsonObject | null` | conditional | bounded accepted arguments when small | required for `inline_json`; forbidden for descriptor path |
+| `arguments_inline_json` | `JsonObject | null` | conditional | accepted canonical arguments when small; internal/audit/replay material, not a separate LLM-safe projection | required for `inline_json`; forbidden for descriptor path |
 | `arguments_payload_ref` | `HostInternalRef | null` | conditional | descriptor ref for accepted arguments JSON | required for descriptor path; forbidden for inline path |
 | `arguments_payload_digest` | `Digest` | yes | digest of canonical accepted arguments JSON | durable args digest must equal `normalized_arguments_digest` |
 | `semantic_input_digest` | `Digest | null` | no | existing idempotency semantic digest | retained; not assumed to be readable query preimage |
@@ -1611,6 +1666,7 @@ tool_calls_batch_done          -> preview or diagnostic
 tool_awaiting                  -> preview / diagnostic / idempotent confirmation with accepted refs; not canonical owner
 context_compaction_requested   -> CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive); must include attempt_id + execution_id
 usage_reported                 -> usage projection input; canonical only if needed for audit policy
+provider_diagnostic            -> PROVIDER_DIAGNOSTIC; diagnostic only, no Run / Attempt terminal state change
 provider_protocol_error        -> PROVIDER_PROTOCOL_ERROR
 iteration_completed            -> preview or diagnostic
 final_answer                   -> RUN_SUCCEEDED + ATTEMPT_SUCCEEDED
@@ -1665,6 +1721,8 @@ Sink semantic contract：
 
 Tool trace 是 EventLog 派生 projection，不是 Host durable truth。它必须支持冷热数据分离，避免把调试明细、长工具参数、长结果摘要和归档流混进 EventLog 或热查询表。
 
+Tool Trace 的 event filter 与 extract / render owner 必须显式白名单化；不得因为 source EventLog 内部 canonical fact 含 resolved `RunnerSpec` 就复制其 `effective_execution_config`、provider headers 或 API key。hot row、cold JSONL、readable summary 与 query 返回中的 provider secret 明文都必须为零。工具自身 source-owned request / result 文本仍按既有 Tool / LLM-facing 安全 contract 处理，不能把 configured provider secret 的排除责任退化为 header 字段名黑名单。
+
 存储口径：
 
 - 热数据使用结构化 JSON projection。热数据保存近期、可查询、可展示、可关联的 tool trace summary，例如 tool_call_id、tool name、normalized args digest、result digest、evidence anchors、truncate info、await info、policy decision、error code、duration、attempt refs。
@@ -1674,9 +1732,9 @@ Tool trace 是 EventLog 派生 projection，不是 Host durable truth。它必�
 - EventLog 对 tool trace 只记录必要 event、ref 与 digest；不得把 JSONL 当作恢复、resume、memory 或 Run 状态迁移真源。
 - tool trace projection 损坏或缺失时，应能从 EventLog 与外移 payload ref 尽力重建热数据；冷 JSONL 丢失只能影响深度诊断和离线审计。
 
-Tool Trace 的 hot `trace_summary_json` 与 cold JSONL summary 是日常排障入口，必须能直接回答“模型请求了什么工具、业务参数是什么、Host 接受了什么、工具最终返回了什么、哪些内容可进入 memory / 下一轮上下文”。`TOOL_CALL_REQUESTED` summary 必须从该 event 的 request atom 派生，包含业务可读工具名、tool call label、LLM-safe request / query 文本、脱敏后的参数摘要和参数 digest / ref 校验锚点；不得只保留 digest / ref。`TOOL_RESULT_ACCEPTED` summary 必须从 accepted evidence envelope 定位同源 `TOOL_CALL_REQUESTED` request atom，并从 digest-checked `raw_tool_outcome` 生成 bounded、脱敏的结果状态、details / summary 文本和 outcome digest / ref 校验锚点。wait-resolution result 与普通 tool result 使用同一 readable summary contract；Tool Trace 不得从 `TOOL_AWAITING`、wait record、poll 记录、observation handle、runtime 状态或当前代码路径反推 request / result 语义，也不得把 wait id、observation handle、runtime 等 Host / Tool 治理术语作为模型或开发者理解业务事实的主体。
+Tool Trace 的 hot `trace_summary_json` 与 cold JSONL summary 是日常排障入口，必须能直接回答“模型请求了什么工具、业务参数是什么、Host 接受了什么、工具最终返回了什么、哪些内容可进入 memory / 下一轮上下文”。`TOOL_CALL_REQUESTED` summary 必须从该 event 的 request atom 派生，包含业务可读工具名、tool call label、source-owned request / query 文本、符合 LLM-facing 文本约束的参数摘要（若有）和参数 digest / ref 校验锚点；不得只保留 digest / ref。`TOOL_RESULT_ACCEPTED` summary 必须从 accepted evidence envelope 定位同源 `TOOL_CALL_REQUESTED` request atom，并从 digest-checked `raw_tool_outcome` 生成 bounded、脱敏的结果状态、details / summary 文本和 outcome digest / ref 校验锚点。wait-resolution result 与普通 tool result 使用同一 readable summary contract；Tool Trace 不得从 `TOOL_AWAITING`、wait record、poll 记录、observation handle、runtime 状态或当前代码路径反推 request / result 语义，也不得把 wait id、observation handle、runtime 等 Host / Tool 治理术语作为模型或开发者理解业务事实的主体。
 
-Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only signal。它只能消费 `RUNNER_CALL_INPUT_ASSEMBLED` manifest refs / digests、`TOOL_CALL_REQUESTED` arguments / semantic query atoms、Projector metadata summary、Engine 可观察的 iteration/message count 以及 projection artifact refs；不得读取旧 provider request、EngineRunner 内存、当前 prompt builder 代码或重新运行 compact material selection 来猜测历史输入。Tool Trace hot projection 可以缓存以下 runner-call signal，但这些字段只是 projection copy，不是 recovery、memory、dispatch 或 Run 状态真源：
+Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only signal。它只能消费 `RUNNER_CALL_INPUT_ASSEMBLED` manifest refs / digests、`TOOL_CALL_REQUESTED` arguments / semantic query atoms、Engine 可观察的 iteration/message count 以及 projection artifact refs；不得读取旧 provider request、EngineRunner 内存、当前 prompt builder 代码或重新运行 compact material selection 来猜测历史输入。Tool Trace hot projection 只能缓存固定上界 scalar / diagnostic signal；projector metadata 的五字段 summary 必须在 query 时从 digest-verified manifest descriptor 的完整六字段 metadata 重建，不能读取 hot payload 中的数组或 raw string 作为语义真源。读取 descriptor bytes 后还必须经 shared runner-call manifest owner 解析完整 typed graph，至少校验当前 schema/version、scope 与 runner-call identity、message count 与连续 indexes、message-to-metadata 引用闭合、metadata id 唯一、projector/purpose closed enum、projection descriptor pair，以及 hot/manifest identity；只有该 typed manifest 可以产生 metadata summary。以下字段只是 projection copy，不是 recovery、memory、dispatch 或 Run 状态真源：
 
 `RUNNER_CALL_INPUT_ASSEMBLED.validation_status="complete"` 只表示 prepared manifest 完整；`RUNNER_CALL_INPUT_ITERATION_LINKED.validation_status="complete"` 才表示该 prepared input 已通过 Engine `ITERATION_STARTED` observation 校验。第一版 Tool Trace 最小实现不强制投影 `RUNNER_CALL_INPUT_ITERATION_LINKED`；若未来投影 link event，只能作为独立 read-only signal 复制 manifest ref/digest、iteration fields、expected/observed count/digest 与 typed diagnostic，不得改变现有 `RUNNER_CALL_INPUT_ASSEMBLED` reconstruction signal 的含义。
 
@@ -1694,10 +1752,9 @@ Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only sig
 | `runner_call_projection_artifact_ref` | `HostInternalRef | null` | no | ref to LLM-facing runner input projection payload/artifact | required for complete reconstruction |
 | `runner_call_projection_artifact_digest` | `Digest | null` | no | digest of runner input projection body | required when projection ref is present |
 | `runner_call_projection_artifact_size_bytes` | `int | null` | no | bounded size summary for projection payload/artifact | non-negative when present |
-| `projector_metadata_summary` | `list[ProjectorMetadataSummary]` | no | projector ids/schema versions/digests needed by analyzer | unsupported version emits diagnostic |
-| `diagnostic` | `RunnerCallReconstructionDiagnostic | null` | no | typed limited/mismatch signal | required unless status is `complete` |
+| `diagnostic` | `RunnerCallReconstructionDiagnostic` | yes | typed complete / limited / mismatch signal | always explicit；`complete` 必须携带与 validation status、message count、role digest 同源的固定 shape diagnostic，不得为 `null` |
 
-`ProjectorMetadataSummary` 只复制 manifest 中的 `projector_metadata_id`、`projector_id`、`projector_schema_version`、`projector_digest` 与 `purpose`。它不得包含 Python module path、source code text、完整 prompt、完整 messages 或 Host 私有 ledger dump。
+`ProjectorMetadataSummary` 只由已验证 manifest 中的完整 metadata descriptor 重建 `projector_metadata_id`、`projector_id`、`projector_schema_version`、`projector_digest` 与 `purpose`。完整 descriptor 固定包含这五个字段和 `source_contract_refs`，不得使用旧 `metadata_id` 别名或默认 schema version。summary 不得包含 Python module path、source code text、完整 prompt、完整 messages 或 Host 私有 ledger dump。
 
 `RunnerCallReconstructionDiagnostic` 是内部诊断 contract，状态只允许：
 
@@ -1728,6 +1785,8 @@ Engine ingest rejected reason 的 runner-call link 子集固定为：
 ## 15. Audit
 
 Audit 不是事实真源；audit sink 消费 committed EventLog 生成 audit projection。
+
+Audit 的输出 owner 只能投影固定审计字段、operation context refs / digest、policy / reason 摘要与 payload ref / digest；不得复制 canonical payload、`effective_execution_config`、provider headers 或 API key。即使内部 EventLog 合法持久化 resolved execution config，audit JSONL、audit query / analyze 输出与相关 operator log 中的 provider secret 明文也必须为零。
 
 第一版 Audit 默认落地为 `LogAuditSink(JSONL)`：
 
@@ -1792,7 +1851,7 @@ audit projection 可以为了查询重组，但不能反向成为恢复、resume
 
 ## 16. Read Model / Host Event Stream / Outbox
 
-EventLog 是真源；Run result、Session timeline、Host event stream、audit、usage、tool trace、memory snapshot、outbox 都是 read model 或 projection。
+EventLog 是真源；Run result、Session timeline、Host event stream、audit、usage、tool trace、memory snapshot、outbox 都是 read model 或 projection。public HostEvent / read API、outbox、memory / compact / evidence 与任何 LLM-facing material 只能输出各自 typed owner 明确选择的业务字段，不得透传内部 effective execution snapshot、provider headers 或 API key；Host / Service / Engine operator logs 同样不得记录这些 secret 明文。
 
 公共读取语义：
 
@@ -2158,7 +2217,7 @@ tool fact candidate 必须包含足以治理和追溯的信息：
 ToolRuntime 负责：
 
 - 消费 Host 传入的业务 `ToolBundle` 并生成 attempt-local effective `ToolBundle`。
-- 权限 / policy。
+- 消费当前已装配的权限 / policy；统一 tool authorization 目标边界见 18.4。
 - 并发 / timeout / orphan cleanup。
 - tool awaiting placeholder；wait record、`WAITING` 与 `resolve_wait` 由 Phase 7 实现。
 - truncation / fetch_more。
@@ -2210,6 +2269,37 @@ EventLog 规则：
 - 对财报读取类 read-only 工具，同一 Attempt 内重复调用默认优先 `reuse` / `hint`，除非参数或 evidence scope 明确变化；跨 Attempt 不默认复用。
 - 对外部写入或付费工具，必须依赖工具 schema / policy 提供 idempotency key；Host 的 duplicate governance 不能替代工具级幂等。
 - 该治理不能进入 Engine，也不能让 RemoteStub 拥有 Host 状态。
+
+### 18.4 Tool Authorization 与防御性安全边界
+
+Tool 的统一 security 设计主要指 authorization：谁发起的哪次 Run / Attempt 可以调用哪个
+工具，以及该调用允许读、写、执行或访问哪些资源。该授权决策的最终语义 owner 在 Host，
+执行 gate 位于 ToolRuntime 或与 ToolRuntime 同级、由 Host 拥有的 tool-governance boundary。
+Engine、LLM、Service adapter、CLI 和具体业务工具不得各自拥有第二套最终权限判断。
+
+当前 `HostCallContext.authorization_claims` 只记录上层已经验证的权限声明；它尚未定义 claims
+如何映射为 tool path roots、read/write operations、network targets、side-effect authority 或
+process capability。当前 WU 不实现 repository-wide tool authorization framework，也不提前冻结
+permission schema、角色模型、capability token、policy language、sandbox backend 或配置位置。
+
+未来设计统一权限时必须至少明确：
+
+- principal / actor 与 Run / Attempt / tool call 的绑定。
+- tool identity、允许操作类型和资源 scope，例如 read roots、write roots、network scope 与
+  destructive/paid side effects。
+- authorization claims、scene/tool selection、operator config 与 tool declaration 的组合及
+  deny precedence。
+- attempt snapshot、retry/resume/recovery 的权限冻结或重新授权规则。
+- dispatch 前决策、实际 I/O enforcement、process/remote backend 传播、audit/trace 和拒绝错误码。
+
+Host 拥有授权语义不等于 Host 可以只检查一次字符串后取消下层防御。路径 resolve、symlink
+containment、文件原子发布、socket peer/DNS/redirect 验证、资源预算和 provider protocol 校验必须
+在最接近实际 I/O 的 Tool/provider/storage/process boundary 继续执行。未来 Host authority 是调用
+可以做什么的上限；下层防御可以因实际环境 fail closed，但不得扩大 Host 已拒绝的权限。
+
+在统一 authorization 设计落地前，现有 Tool config 权限机制保持现状，例如 Doc
+`allowed_paths` 与 Web 网络策略。它们是当前有效执行约束，不因未来 owner 已确定而删除；未来
+迁移必须在一个独立 WU 中建立同源 Host authority 并移除重复真源，不保留长期双重权限配置。
 
 ## 19. TruncationManager / fetch_more
 
@@ -2328,6 +2418,29 @@ wait record 状态语义：
 - `cancelled`：Host 已取消 Run 或等待，不再接受该 wait record 的结果作为 `canonical_fact` 进入 EventLog。
 - `lost`：Host 无法确认外部 job 状态，且 policy 放弃继续等待。
 
+deadline 与 observation timeout 是两个不同的 Host 事实。Host 在 durable
+`deadline_at` / `expires_at` 到期后确认 expiry 时，必须在一个 write transaction
+内追加失败型 `TOOL_RESULT_ACCEPTED` 与 `RUN_FAILED`、把 wait 收为 `failed` 并释放
+Session active slot；该失败固定使用 `wait_deadline_expired`，不能解释为 `lost`，也不能
+接受 deadline 后到达的 provider success。poll、callback 与 direct/manual result 都委托
+同一个 transaction-local expiry helper；迟到结果只在 expiry commit 后追加 diagnostic，
+projection catch-up 与 queue promotion wake 必须先于向 caller 返回 late-result error。
+
+同步 wait adapter observation 受 Host runtime policy 的 finite-positive 单次调用预算、
+finite-positive close drain 预算与 positive outstanding cap 约束。每个 invocation 使用只持
+adapter、immutable wait snapshot、发布 token 与单槽结果通道的 daemon thread；token 按
+`ACTIVE -> INVALIDATED -> FINISHED` 迁移。timeout 或 supervisor close 必须先撤销发布权，
+迟到结果只能以 `publish=false` 丢弃，不能接触 resolver 或 durable authority。poll observation
+超时只证明本次状态查询没有在预算内返回，不证明外部 job 已丢失；poller 必须记录 transient
+diagnostic、释放 claim 并按 policy backoff，不得调用 `resolve_wait` 或把 wait / Run 收为 `LOST`。
+只有 adapter 基于 authoritative provider / external-job 状态显式返回 typed lost outcome，Host
+才能通过 common resolve path 收为 `LOST`。cancelled wait 的 abandon observation timeout 只写
+poll-local transient `wait_abandon_timeout` diagnostic、释放 claim 并按 Host policy backoff，durable
+status 保持 `CANCELLED` 且不写 terminal `poll_abandoned_at`；只有 provider 显式返回 applied、unsupported
+或 noop lifecycle outcome，才沿既有 transition 写 terminal abandon marker，且不调用 wait resolve。
+supervisor close 对 poller loop 与全部 observation thread 只使用一个 shared monotonic deadline；
+预算耗尽后可保持 `CLOSING` 有界返回，最后一个 tracked thread finally 结束后才进入 `STOPPED`。
+
 Resume 策略分层：
 
 ```text
@@ -2369,7 +2482,7 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - Engine 不读取 wait record，也不恢复旧 Agent / Runner。
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
 - wait record 的 `resume_policy` / `await_spec` / `external_job_id` 必须包含足以在 Host restart 后恢复 adapter observation 的 durable refs。adapter registry / lookup 由 Host composition root 提供 typed adapter binding；wait record 只保存 adapter key / policy ref / external job refs，不保存进程内 adapter 对象。
-- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / next-observe / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait。正常 `not_ready` 表示外部 job 仍在运行，只写入短间隔 next-observe，不增加错误 backoff attempt；adapter error、missing adapter、resolve error 或 shutdown-skipped 才写入可重试 backoff。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
+- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`；若 provider observation 前已确认 durable deadline，则调用 common expiry helper，provider call count 必须为零。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / next-observe / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait。正常 `not_ready` 表示外部 job 仍在运行，只写入短间隔 next-observe，不增加错误 backoff attempt；observation timeout、adapter error、missing adapter、capacity、resolve error 或 shutdown-skipped 写入可重试 backoff，不把 observation failure 猜成 external-job terminal fact。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
 - `callback` source 在 Phase 7 只保留 adapter contract 与 common pipeline 入口；专属 HTTP callback 服务、认证入口、复杂
   重放防护和外部系统专属 callback adapter 不属于第一版实现。后续 callback 产品化入口必须验证认证、重放防护和 idempotency
   key，然后调用同一个 `resolve_wait`。
@@ -2497,6 +2610,8 @@ client requests cancel
 - Attempt `STARTING` 且 dispatch record 仍为 `pending` / `waiting_for_lane` 时直接收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record cancelled，cancel lane wait / wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不通知 EngineWorker。
 - dispatch record 已进入 `dispatching` 但 Attempt 仍为 `STARTING` 时，表示 lane 已 acquire 且 dispatching commit 已完成，但 WorkerProxy 尚未 accepted。该窗口仍按 pre-worker direct cancel 收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record `cancelled`，wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不得进入 `CANCELLING`，不得等待不存在的 WorkerProxy。持有 lane token 的 dispatch scheduler 必须在 WorkerProxy 调用前做 final pre-call recheck；若看到 cancel / terminal 已提交或 dispatch record 已 `cancelled`，必须 release lane token 并跳过 WorkerProxy。
 - Attempt 已 `RUNNING` 时，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING` 并向 WorkerProxy 传播 cancel。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。`dispatching` 本身不等于 active worker；只有 `ATTEMPT_RUNNING` 已 durable accepted 后才说明 WorkerProxy / EngineWorker 已接受执行。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 post-cancel timeout budget；cancel commit 会唤醒 watchdog，watchdog tick 可在当前 Attempt 仍为 `RUNNING`、dispatch 已 worker accepted 且 terminal first-committer-wins recheck 通过时写入 `ATTEMPT_CANCELLED` + `RUN_CANCELLED`，释放 Session active slot 并触发 queue promotion。该 closeout 只表达 Host durable cancel 收口，不证明 provider、工具线程、子进程、HTTP 请求、远端 job 或外部长事务已经物理停止；后续旧 worker / tool 事件仍按 identity、state 与 first-committer-wins 规则接受或拒绝。
+- active cancel watchdog wake 是 opener-loop owned 的 level-triggered `asyncio.Event`。watchdog 必须在每轮 tick 前 clear event；tick 期间到达的新 wake 保持 set 并驱动下一轮，多个并发 wake 可合并但不能因 bounded queue/`QueueFull` 被吞。periodic scan 只负责 restart/fallback reconcile，不是丢 wake 的 correctness 补偿。watchdog loop 的非取消异常必须交给 execution health critical-task supervisor并提交稳定 typed fatal；scheduler 正常 close 对 task 的取消不报告 fatal。
+- `cancel_run` 的 supported、deferred、terminal 与 conflict 分类必须由 `_CancelRunOperation` 在同一个 SQLite write transaction snapshot 中产生。command facade 不得在 write transaction 返回错误后另开 read transaction重判 Run/Attempt/dispatch；并发状态在获锁 snapshot 之后变化时，当前调用的错误码仍只对应该 snapshot。只有首次真正释放 active slot 的分类可触发 queue-promotion wake；幂等 replay、terminal loser 与 conflict/deferred 分类不得重复 wake。
 - terminal fact 已提交后，cancel 不能改写 terminal。
 - cancel 只阻止未来工作，不覆盖已接受事实。
 - 已接受 tool result、awaiting outcome、final decision、canonical facts 继续保留。
@@ -2597,7 +2712,7 @@ system envelope 的 LLM-facing section 顺序、标题和分隔符是设计契�
 | 1 | `Task Instructions` | caller / Service system prompt 与场景约束 | 保留调用方给模型的任务规则；不得附带 prompt fragment ref、source digest 或 scene manifest 诊断。 |
 | 2 | `Execution Guidance` | Host-neutral execution instruction、当前运行约束、工具可用性或必要继续说明 | 只写模型需要遵守的业务动作和限制；不得暴露 policy snapshot ref、Attempt / execution ledger 或调度状态。 |
 | 3 | `Conversation Summary` | Session Summary Memory 或 accepted compacted view 中的会话摘要 | 只写 compact / memory 已接受的业务摘要；不得内联 raw compact artifact JSON 或 compact boundary。 |
-| 4 | `Verified Evidence and Facts` | Evidence / Fact Memory、accepted evidence-backed facts，以及 memory / fact pipeline 已接受的 evidence material | 写业务可读 tool name、query / arguments projection、response / source text 和 prompt-local source label；不得写 tool_call_id、event id、payload ref、digest 或 cursor。 |
+| 4 | `Verified Evidence and Facts` | Evidence / Fact Memory、accepted evidence-backed facts，以及 memory / fact pipeline 已接受的 evidence material | 写业务可读 tool name、query / 参数文本、response / source text 和 prompt-local source label；不得写 tool_call_id、event id、payload ref、digest 或 cursor。 |
 | 5 | `Prior Answer Anchors` | Answer Anchor Memory | 写可被后续指代的历史回答轮廓；不得把 anchor 当作事实证明。 |
 | 6 | `Open Follow-up Context` | Forward Intent Memory | 写未完成任务、待澄清点或下一步上下文；不得把 intent 当作工具执行计划或事实。 |
 | 7 | `Reference Continuity` | Trace Memory reference continuity items | 写解析“刚才”“第二点”等局部指代所需的最小文本。 |
@@ -2613,7 +2728,7 @@ ordinary RunInput 的 LLM-facing material 不得暴露内部治理标识。下�
 | 内部字段 / 标识 | LLM-facing 策略 | 可接受替代文本 |
 |---|---|---|
 | `policy_snapshot_ref`、policy ref、policy name | 删除 ref；如模型需要知道行为约束，只保留 Host-neutral 业务规则 | “Use the available context and tools under the current run limits.” |
-| `tool_call_id`、tool request id、tool result id | 删除 id；用业务 tool name、query / arguments projection、response / source text 表达 | “A previous tool call to `<tool name>` returned: ...”；若 query 不可读则写 “The original tool query is not available in readable form.” |
+| `tool_call_id`、tool request id、tool result id | 删除 id；用业务 tool name、query / 参数文本、response / source text 表达 | “A previous tool call to `<tool name>` returned: ...”；若 query 不可读则写 “The original tool query is not available in readable form.” |
 | EventLog event id、event sequence、durable event ref | 删除；如需顺序，只用自然语言或 prompt-local label 表达 | “Earlier in this conversation...” 或 `Source E1` 这类 prompt-local label。 |
 | payload ref、artifact ref、payload descriptor、artifact descriptor | 删除；改用已校验的 bounded readable content | 直接展示业务文本摘要或 “The detailed artifact is not available in readable form.” |
 | digest、content digest、semantic input digest、role sequence digest | 删除；不得把 digest 当作业务事实或 query 文本 | “The original query text is not available in readable form.” |
@@ -2652,9 +2767,9 @@ RunInputBuilder 不创建独立 RunInputBuildTrace 子系统；上下文构造�
 
 ### 23.1 Runner-call Input Assembly Manifest
 
-RunInputBuilder 每次完成 logical runner call input assembly 后，Host 必须写入 `RUNNER_CALL_INPUT_ASSEMBLED` canonical reconstruction event，并把完整 manifest body 存为 `runner_call_input_manifest` payload descriptor / artifact。该 event 的 hot payload 只记录 `session_id`、`host_run_id`、`attempt_id`、`execution_id`、`runner_call_index`、`runner_call_kind`、`runner_call_trigger_reason`、`manifest_payload_ref`、`manifest_digest`、`manifest_schema_version`、`validation_status`、message count / role digest / input projection digest、runner-call projection ref / digest / size、projector metadata summary 与 self-describing diagnostic 等 bounded 字段；complete hot payload 的 diagnostic 必须显式写 `status="complete"`，不得用 `null` 表达 complete。`manifest_digest` 必须等于 manifest body canonical JSON digest；hot payload scope fields 必须与 manifest identity fields 一致。该 event 没有 Run / Attempt 状态副作用，不驱动 recovery、memory、lifecycle、terminal decision 或 dispatch decision。
+RunInputBuilder 每次完成 logical runner call input assembly 后，Host 必须写入 `RUNNER_CALL_INPUT_ASSEMBLED` canonical reconstruction event，并把完整 manifest body 存为 `runner_call_input_manifest` payload descriptor / artifact。该 event 的 hot payload 只记录 `session_id`、`host_run_id`、`attempt_id`、`execution_id`、`runner_call_index`、`runner_call_kind`、`runner_call_trigger_reason`、`manifest_payload_ref`、`manifest_digest`、`manifest_schema_version`、`validation_status`、message count / role digest / input projection digest、runner-call projection ref / digest / size 与固定 shape self-describing diagnostic；hot payload 禁止逐消息内容、projector metadata 数组或其它随 message count 增长的字段。complete hot payload 的 diagnostic 必须显式写 `status="complete"`，不得用 `null` 表达 complete。`manifest_digest` 必须等于 manifest body canonical JSON digest；hot payload scope fields 必须与 manifest identity fields 一致。ordinary、Engine continuation 与 compactor producer 必须复用同一个 Host manifest / hot contract owner。该 event 没有 Run / Attempt 状态副作用，不驱动 recovery、memory、lifecycle、terminal decision 或 dispatch decision。
 
-ordinary RunInput 的 manifest 必须记录 one-system-message normalization 之后的最终 messages，而不是 merge 前候选 messages。`message_count`、`message_entries`、`role_sequence_digest`、每条 message 的 `index` / `role` / `content_digest` / `content_size_bytes` 必须与实际交给 Engine / Runner 的 `AgentRunRequest.messages` 同源。完整 LLM-facing message 明文写入 `runner_call_input_projection` payload/artifact，并由 manifest-level `runner_call_projection_artifact_ref` / `runner_call_projection_artifact_digest` 与每条 message entry 的 projection ref / digest 指向。manifest 可以保存 source refs、projector metadata、projection artifact refs、digests 和 cursor refs 来解释 section 来源；这些 internal fields 仍只属于 reconstruction / Tool Trace / audit / diagnostic 边界，不得泄漏到 LLM-facing envelope。
+ordinary RunInput 的 manifest 必须记录 one-system-message normalization 之后的最终 messages，而不是 merge 前候选 messages。`message_count`、`message_entries`、`role_sequence_digest`、每条 message 的 `index` / `role` / `content_digest` / `content_size_bytes` 必须与实际交给 Engine / Runner 的 `AgentRunRequest.messages` 同源。完整 LLM-facing message 明文写入 `runner_call_input_projection` payload/artifact，并由 manifest-level `runner_call_projection_artifact_ref` / `runner_call_projection_artifact_digest` 与每条 message entry 的 projection ref / digest 指向。manifest 中的每条 projector metadata 必须完整且只含 `projector_metadata_id`、`projector_id`、`projector_schema_version`、`projector_digest`、`purpose`、`source_contract_refs` 六个字段；compactor 也必须显式提供 schema version 与 source refs，不得为旧字段名、缺失版本或缺失来源提供 fallback。manifest 可以保存 source refs、projection artifact refs、digests 和 cursor refs 来解释 section 来源；这些 internal fields 仍只属于 reconstruction / Tool Trace / audit / diagnostic 边界，不得泄漏到 LLM-facing envelope。
 
 ordinary `RUNNER_CALL_INPUT_ASSEMBLED.validation_status="complete"` 只表示 Host prepared input manifest 自身完整，且与 Host-built final messages 同源；它不表示该 input 已被 Engine observation 校验。ordinary prepared manifest 的 `iteration_id` / `iteration_index` 可以为 `null`，因为它在 Engine `ITERATION_STARTED` 之前写入。RunInputBuilder 写入 ordinary prepared manifest 的 transaction 必须在 Attempt dispatch / worker start 前 durable commit；Engine ingest 若在当前 `attempt_id` / `execution_id` 的首次 accepted iteration observation 时看不到唯一 unlinked prepared ordinary manifest，必须 fail closed。
 
@@ -2701,7 +2816,7 @@ Engine ingest 接受 `ITERATION_STARTED` 后，Host 必须通过追加式 `RUNNE
 | `context_fallback_decision_ref` | `HostInternalRef | null` | no | tiered dispatch fallback decision when compaction recovery failed but dispatch continued | present only when tier 4/5 fallback affected this input |
 | `projector_metadata` | `list[ProjectorMetadata]` | yes | stable producer metadata for each message/source projection | every message `projector_metadata_id` must resolve here |
 | `compactor_identity` | `CompactorRunnerCallIdentity | null` | conditional | parent/self identity for Host-owned compactor calls | required when `runner_call_kind == "compactor_proposal"` |
-| `diagnostic` | `RunnerCallReconstructionDiagnostic | null` | no | typed incomplete/mismatch signal | required when validation status is not `complete` |
+| `diagnostic` | `RunnerCallReconstructionDiagnostic | null` | yes | manifest body 的 typed incomplete/mismatch signal | manifest body 在 `complete` 时固定为 `null`，非 `complete` 时必须携带 typed diagnostic；canonical event hot payload 无论状态都必须显式携带固定 shape diagnostic |
 
 `RunnerCallMessageEntry` 字段固定为：
 
@@ -2870,7 +2985,7 @@ prompt-local label 是本次 LLM 调用内的 opaque citation handle，只用于
 
 LLM compact output 只能返回业务语义字段和 prompt-local labels。Host 负责把 labels 映射回 durable refs，校验 provenance、长度、枚举、source boundary 和 quality gate。模型不得返回 durable refs、event ids、digests、artifact refs、policy decisions 或任何 Host 内部状态字段。
 
-compact material / prompt / query_text 的 LLM-facing 语义必须自解释。工具材料可以暴露业务可读 tool name、Host 改写后的业务可读 query text、bounded arguments projection 与工具响应/来源文本；不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、cursor、projection checkpoint、policy 名称、Attempt / execution ledger、Projector metadata 或 Host 内部账本字段。若工具只有 `semantic_input_digest` 而没有 durable semantic query text，Host 不得把 digest 当作 query 文本，也不得要求模型理解 digest；compact evidence projection 只能使用可读 arguments projection 或业务中性的 unavailable wording。若 accepted arguments atom 缺失，projection 必须产生 `missing_tool_call_arguments_atom` limited-signal，并避免向 LLM 展示内部诊断细节。
+compact material / prompt / query_text 的 LLM-facing 语义必须自解释。工具材料可以暴露业务可读 tool name、source-owned 业务可读 query text、符合 LLM-facing 文本约束的参数文本与工具响应/来源文本；不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、cursor、projection checkpoint、policy 名称、Attempt / execution ledger、Projector metadata 或 Host 内部账本字段。若工具只有 `semantic_input_digest` 而没有 durable semantic query text，Host 不得把 digest 当作 query 文本，也不得要求模型理解 digest；compact evidence projection 只能使用源头合规的 query / 参数文本或业务中性的 unavailable wording。若 accepted arguments atom 缺失，projection 必须产生 `missing_tool_call_arguments_atom` limited-signal，并避免向 LLM 展示内部诊断细节。
 
 F02 的稳定问题陈述固定为：`EvidenceReadableItem.tool_name` 已有业务可读位置；真实缺口是 `query_text` 缺少 durable arguments / semantic query 的业务可读表达。实现和测试不得把该问题降级成“tool name 缺失”，也不得用 `tool_call_id=...`、payload ref、digest 或 Host 内部 id 伪装成业务 query。
 
@@ -2932,7 +3047,7 @@ ReadableReferenceContinuityItem
 
 TraceReadableItem
   source_label: PromptLocalLabel
-  trace_kind: "user_input" | "assistant_final_answer" | "user_visible_run_state"
+  trace_kind: "user_input" | "assistant_final_answer" | "user_visible_progress"
   text: str
 
 EvidenceReadableItem
@@ -2957,7 +3072,7 @@ CompactInstruction
 
 所有 readable item 的 `source_label` 都是 prompt-local opaque label，只在本次 compact 调用内有效。`display_text`、`text`、`claim_text` 与 `answer_text` 是模型可读业务内容；这些字段不得承载 durable refs、digest、event sequence、policy name 或 compact boundary。`CompactInstruction` 只表达业务任务和目标输出 schema，不承载 Host budget policy、fallback decision、repair state 或内部 provenance map。
 
-`previous_compacted_view` 只包含上一轮 accepted compacted view 的业务可读 projection，包括 session summary、accepted evidence-backed facts、answer anchors、forward intents 与 reference continuity items；不得包含 raw compact artifact JSON。`trace_material` 只包含用户输入、助手最终回答和用户可见 Run 状态。`evidence_material` 只包含可读 tool、query、response / source text 与 prompt-local evidence label。`answer_material` 只包含可读 assistant final answer / conclusion 与 prompt-local answer label。`current_input_anchor` 只包含当前用户输入文本和 prompt-local anchor label；同一 current user payload 不得再作为 trace material 重复渲染。`instruction` 只表达本次 compact 的业务任务和输出 contract 要求，`output_schema_name` 是业务可读输出 contract 标识，不是 Python 类型名；`instruction` 不承载 Host policy internals。
+`previous_compacted_view` 只包含上一轮 accepted compacted view 的业务可读 projection，包括 session summary、accepted evidence-backed facts、answer anchors、forward intents 与 reference continuity items；不得包含 raw compact artifact JSON。`trace_material` 只包含用户输入、助手最终回答和用户可见进展 / 结果摘要，不暴露 Host run-state 字段名。`evidence_material` 只包含可读 tool、query、response / source text 与 prompt-local evidence label。`answer_material` 只包含可读 assistant final answer / conclusion 与 prompt-local answer label。`current_input_anchor` 只包含当前用户输入文本和 prompt-local anchor label；同一 current user payload 不得再作为 trace material 重复渲染。`instruction` 只表达本次 compact 的业务任务和输出 contract 要求，`output_schema_name` 是业务可读输出 contract 标识，不是 Python 类型名；`instruction` 不承载 Host policy internals。
 
 `current_input_anchor` 是 readable but not citable：LLM 可以读取它来理解本次 compact 的边界，Host 也用它确保当前用户输入不会被 compact / fallback 吞掉；但 `current_input_anchor.anchor_label` 不属于任何 compact candidate 的 allowed source label set。Host accept barrier 必须拒绝任何在 `source_labels`、`evidence_labels`、`answer_source_labels`、diagnostic `source_labels` 或其它 candidate source 字段中引用 `current_input_anchor.anchor_label` 的输出。当前输入只有到下一轮成为历史时，才可能作为 trace material 进入后续 compact。
 
@@ -2986,7 +3101,6 @@ SessionSummaryCandidate
 EvidenceBackedFactCandidate
   claim_text: str
   evidence_labels: list[str]
-  evidence_kind: "tool_result" | "tool_source_text" | "accepted_evidence_material"
   source_labels?: list[str]
 
 AnswerAnchorCandidate
@@ -3015,7 +3129,7 @@ CompactCandidateDiagnostic
   source_labels?: list[str]
 ```
 
-`EvidenceBackedFactCandidate` 只能引用 evidence material labels，不能引用 user input、assistant final answer、session summary、answer anchor 或 forward intent 后冒充工具事实。`AnswerAnchorCandidate` 只能引用 assistant final answer / conclusion labels。`ForwardIntentCandidate` 不能被当作工具执行计划或事实证明，也不能自动触发工具。`ReferenceContinuityCandidate` 只能保存理解局部指代所需的最小文本，不能保留整段长输入。
+`EvidenceBackedFactCandidate` 只能引用 evidence material labels，不能引用 user input、assistant final answer、session summary、answer anchor 或 forward intent 后冒充工具事实。LLM-facing candidate 不输出 `evidence_kind`；Host 根据 evidence labels 所属 material section 派生内部 evidence kind，并在 accepted typed candidate / memory projection 中保留 Host-owned typed value。`AnswerAnchorCandidate` 只能引用 assistant final answer / conclusion labels。`ForwardIntentCandidate` 不能被当作工具执行计划或事实证明，也不能自动触发工具。`ReferenceContinuityCandidate` 只能保存理解局部指代所需的最小文本，不能保留整段长输入。
 
 ### 24.4 Snapshot Typed Schema
 
@@ -3062,7 +3176,7 @@ Projection 规则：
 - compact 前，Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory 为空。
 - compact 前，Trace Memory 与 Evidence / Fact Memory 只能从 selected recent window 中的 user / assistant / user-visible state / readable tool material 表达；它们不自动生成高阶结构化 item。
 - `TOOL_AWAITING` 是 Host / ToolRuntime 之间的等待治理事实，对模型不可见。`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`、wait record、poll outcome、cancel / abandon lifecycle 等 Host / ToolRuntime 等待治理事实不得成为 Conversation Memory producer，也不得投影为 LLM-facing selected recent window、recent evidence、reference continuity 或 semantic memory item。对 LLM 来说，awaiting 与非 awaiting 不改变跨轮 memory 语义；同样的 user input、ordinary tool result 与 final answer，有无中间 awaiting governance event，LLM-facing memory 必须等价。
-- wait-resolution 的 `TOOL_RESULT_ACCEPTED` 必须与普通工具结果一样携带 accepted evidence envelope 和 digest-checked raw outcome。Envelope 必须指向同一工具调用的 `TOOL_CALL_REQUESTED` request atom；Conversation Memory 从 request atom 读取 LLM-safe request / query 语义，从 raw outcome 读取结果摘要，不从 `TOOL_AWAITING`、wait record、event id、payload ref 或 digest 推断模型需要理解的业务语义。
+- wait-resolution 的 `TOOL_RESULT_ACCEPTED` 必须与普通工具结果一样携带 accepted evidence envelope 和 digest-checked raw outcome。Envelope 必须指向同一工具调用的 `TOOL_CALL_REQUESTED` request atom；Conversation Memory 从 request atom 读取 source-owned 业务可读 request / query 语义，从 raw outcome 读取结果摘要，不从 `TOOL_AWAITING`、wait record、event id、payload ref 或 digest 推断模型需要理解的业务语义。
 - 当前 schema 下 awaiting accept 必须同事务写入 `TOOL_CALL_REQUESTED` request atom；wait-resolution 不实现旧库兼容读取分支。历史或测试构造的旧格式 wait result 若缺少 envelope / request atom，只能在 resume input 层降级为自解释 guidance，不能进入 self-explaining Conversation Memory evidence，也不能从 `TOOL_AWAITING` 反推 request/query 语义。
 - compact 成功后，accepted compact output 生成或更新五类 session memory；post-compact delta material 继续按 selected recent window 进入 prompt assembly。
 - fallback tier 1-3 属于 compact recovery fallback：它们仍送 LLM compactor；accepted output 可以提交 `CONTEXT_COMPACTED`，并由 projection 生成五类 Session Semantic Memory。
@@ -3074,7 +3188,7 @@ Snapshot 与 projection checkpoint 必须在同一 durable store transaction 提
 
 ### 24.5 五类 Session Semantic Memory
 
-Trace Memory 负责对话连续性，不负责事实证明。数据来源包括 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED.final_answer` 和用户可见 Run 状态。TraceMemoryView 当前字段为 selected recent window 与 reference continuity items；reference continuity item 用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文，不是 fact、summary、answer anchor 或 forward intent。
+Trace Memory 负责对话连续性，不负责事实证明。数据来源包括 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED` 的 assistant final-answer continuity 和用户可见 Run 状态。`RUN_SUCCEEDED` canonical terminal fact、payload descriptor 与 terminal artifact 是成功终态回答的真源；terminal answer continuity resolver 可以从已提交 terminal fact 的 inline `final_answer` 或 digest-checked terminal artifact `content` 读取 LLM-facing answer text。Conversation Memory projection 与 RunInputBuilder 只能消费该 resolver 产出的 typed continuity material，不能通过修改 EventLog payload mapping 让下游误以为 descriptor-backed answer 来自 canonical hot payload。TraceMemoryView 当前字段为 selected recent window 与 reference continuity items；reference continuity item 用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文，不是 fact、summary、answer anchor 或 forward intent。
 
 Evidence / Fact Memory 负责工具证据与基于证据的 claim。`TOOL_RESULT_ACCEPTED` 通过 Host accept barrier 后保存 accepted evidence envelope、payload / artifact refs 与 digest；LLM-facing evidence material 必须自解释，只包含可读 tool、必要 request / query 语义、response、source text 与 prompt-local opaque label。必要 request / query 语义用于让工具结果在下一轮可解释、可复用，例如“查询 Coinbase 的股票代码”或“读取 ticker=COIN 的财报列表”；它不是 `TOOL_CALL_REQUESTED` 原事件、原始参数或内部治理字段的原样回放，也不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、wait id、awaiting / poll / cancel 状态或 Python 类型名。wait-resolution accepted result 与普通 accepted result 使用同一 self-explaining evidence contract；若缺少 request atom、semantic query 或 raw outcome，只能降级为业务中性 unavailable 文本或 fail closed，不能投影“工具结果已接受；原始工具响应不可用”这类无业务语义占位。`evidence_backed_facts` 只来自 accepted `CONTEXT_COMPACTED` 中通过 Host accept barrier 的 fact candidates，或后续明确设计的非 compact producer。这里的 fact 表示 Host-accepted claim 绑定到 accepted evidence，不表示 Host 证明现实世界 truth。
 
@@ -3132,7 +3246,7 @@ compact accepted 后的 ordinary RunInput 不得只等价于 `latest_accepted_co
 
 ordinary path 不根据 token estimator 在 runtime 做字段级或逐 section silent truncation。各 section 必须在 projection / assembly 前通过配置化 item cap、char cap、selected recent window cap、selected recent window floor 与 per-semantic bounded working set 形成确定性上限；provider context length failure 由 Context Governance 的 reactive compact / fallback 收口。需要 floor 的 section 只固定两类：`selected_recent_window_turn_floor` 与 `evidence_fact_floor`。其它 section 默认只有 cap，没有 floor；`reference_continuity_item_floor = 0` 可以显式进入配置。fallback selected recent window caps 必须不小于 selected recent window floor 所需材料，并且不大于普通 selected recent window caps。
 
-Prompt Assembly 渲染给 ordinary RunInput 时必须遵守 23 节 one-system-message hard contract。Conversation Memory 可以在内部维护 snapshot cursor、compact event ref、source refs、source label mapping digest、producer policy ref、projection checkpoint、diagnostic 与 item digest；但投影给 LLM 的 system envelope 和 selected recent window 只能包含业务可读内容、必要短来源说明和 prompt-local opaque label。ordinary RunInput 不得暴露 EventLog id、event sequence、payload ref、artifact ref、digest、cursor、policy ref、projection checkpoint、projector metadata、Attempt / execution ledger、tool_call_id、Python 类型名或 Host 内部治理术语。
+Prompt Assembly 渲染给 ordinary RunInput 时必须遵守 23 节 one-system-message hard contract。Conversation Memory 可以在内部维护 snapshot cursor、compact event ref、source refs、source label mapping digest、producer policy ref、projection checkpoint、diagnostic 与 item digest；但投影给 LLM 的 system envelope 和 selected recent window 只能包含业务可读内容、必要短来源说明和 prompt-local opaque label。ordinary RunInput 不得暴露 EventLog id、event sequence、payload ref、artifact ref、digest、cursor、policy ref、projection checkpoint、projector metadata、Attempt / execution ledger、tool_call_id、Python 类型名或 Host 内部治理术语。terminal answer continuity 投影只能输出回答文本本身，不得输出 `terminal_summary_ref`、`terminal_summary_digest`、payload ref、artifact ref、EventLog id、digest、cursor 或 Host governance label。
 
 Conversation Memory section header 必须使用 23 节 system envelope section table 中对应内容来源的固定 LLM-facing title；23 节表格是 section title 与映射关系的唯一真源，本文不重复硬编码完整 title 列表。selected recent window 中的 user / assistant material 保留原 role；当前 Engine message contract 不支持 ordinary RunInput historical evidence 使用 `tool` role，因此 selected recent evidence 若不能保留为 `user` / `assistant` role，则进入 system envelope，并按 23 节 evidence material 唯一归属规则路由，用业务可读 tool / query / response / source text 表达。该迁移不得展开 compact 覆盖范围内的旧 raw history，也不得把 fallback diagnostic 或 compact failure payload 渲染给模型。
 
@@ -3205,7 +3319,8 @@ Compactor 与 retry / repair 的 owner 边界固定为：
 - Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
 - `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest`、Service 从 `compactor_baseline.scene_id` 指向的 scene 装配后传入的 system prompt / `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 指向的 prompt asset 读取后传入的 user prompt template，以及 Host lifecycle cancellation token 映射为一次 strict JSON proposal，并返回 typed candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection，也不得自行构造不可取消 token。Host 只把 request 渲染为 typed data block 并替换 user template 中的 compaction request 占位符，不从 config 读取 prompt asset。
 - Host Context Governance 拥有 semantic repair / retry：runner timeout、非 final outcome、`finish_reason=length`、空文本、非 JSON、top-level 非 object、缺必填 key、字段类型 / 值非法、未知 source label、provenance mismatch、source boundary violation、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 是 whole-candidate re-proposal：可以向 LLM 提供 Host-neutral 的失败类别 / validation issue 摘要，但每次必须重新产出完整 candidate；Host 不要求 LLM 返回 repair patch，不合并旧 proposal 的 valid fields 与新 patch，也不 partial materialize rejected candidate。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
-- stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。
+- 每个 semantic proposal attempt 必须创建新的 Host-private linked cancellation child。child 只拥有当前 provider attempt 的 timeout；parent 继续拥有 Run / reactive operation 生命周期，且 parent reason / requested-at 始终优先。timeout 不得写 parent，也不得把 writable cancellation 加入 Engine public `CancellationToken` 观察协议；repair / retry 必须使用新的 child。
+- stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。prepared proposal 在 runner-call manifest commit 后、provider call 前必须用同一个 attempt token 再检查一次；该检查可读取 durable snapshot，但不得跨 provider await 持有 Host transaction。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
 
 Context Governance fallback 是同一套 `assemble(...)` material 语义下的分级状态机，不是另一套 memory 逻辑：
@@ -3293,7 +3408,7 @@ CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, inpu
   -> CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
 ```
 
-`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 是 Host governance diagnostic canonical fact，用于回答尝试次数、失败类别、是否 exhaust budget 和最终接受的是哪次 attempt。EventLog 不能包含 API key、headers、完整 raw prompt 或完整 provider payload；大 payload、raw candidate、provider error body 或 repair prompt 如需保留，必须写 artifact / diagnostic ref 并做敏感信息过滤。
+`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 是 Host governance diagnostic canonical fact，用于回答尝试次数、失败类别、是否 exhaust budget 和最终接受的是哪次 attempt。内部 EventLog 可以在 effective execution canonical fact 中保存 resolved provider headers / API key，但 compact request、attempt rejection diagnostic、artifact、Tool Trace、audit、HostEvent、memory / evidence、LLM-facing material 与日志都不得包含这些 secret 明文。完整 raw prompt、完整 provider payload、大 raw candidate、provider error body 或 repair prompt 如需保留，必须写受控 artifact / diagnostic ref，并在进入任何 public、LLM-facing、audit、trace 或 log projection 前由其 source owner 做敏感信息过滤与有界化。
 
 HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
 
@@ -3317,13 +3432,15 @@ material data block 的 section 映射必须一对一，不允许同一 canonica
 - `evidence_material` 渲染 accepted tool evidence block。raw evidence 内容来自 `TOOL_RESULT_ACCEPTED` canonical fact 所引用且 digest 校验通过的 Host payload / raw result descriptor；accepted evidence envelope 只提供 Host 内部 provenance mapping，不作为 lossy result preview 或事实内容容器。
 - `answer_material` 渲染 assistant final answer / conclusion 的可读文本，用于 answer anchor candidate；它不得作为 evidence-backed fact 的 source。
 
-Compact material data block build 启动前必须校验 EventLog / payload / artifact source refs 与 digest 可读、可校验，并且 latest accepted compact boundary 与 post-compact delta boundary 一致。它不得因为 Conversation Memory snapshot lag 而要求先追平 memory projection；如果 EventLog-backed material source 不完整、payload 损坏、artifact 缺失或 source boundary 不可校验，按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
+`OpaqueEvidenceRef` 以及 accepted evidence envelope 的 `source_refs` / `locator_refs` 只拥有 Host 内部 provenance identity；其 `ref_kind`、`ref_id` 与 `digest` 不承诺业务可读语义。Host、Conversation Memory、RunInput、Compact 及其他 LLM-facing projection 不得用 kind 黑白名单、未知 kind 默认分支或 `kind:id` 拼接去猜测业务来源；仅当具体 Tool / Fins producer 通过显式 contract 直接提供任务所需、业务可读且自解释的来源语义时，该语义才能进入 LLM-facing source 文本，否则统一投影为来源不可用。Opaque ref 可以继续进入 EventLog、audit 与内部 provenance / diagnostic trace，但不得因此被包装成财报事实或业务来源。当前没有实际 producer 需要通用业务来源类型，因此本规则不要求预先新增 `BusinessSource` 抽象。
+
+Compact material data block build 启动前必须校验 EventLog / payload / artifact source refs 与 digest 可读、可校验，并且 latest accepted compact boundary 与 post-compact delta boundary 一致。对 `TOOL_RESULT_ACCEPTED`，strict compact consumer 必须先通过 shared durable JSON resolver 解析 result payload，再把已校验 payload 交给 accepted-result 业务投影；不得让 read/display 用的 lenient projection 把 descriptor、SQLite row、artifact 或 canonical JSON corruption 降级为“没有 evidence”。它不得因为 Conversation Memory snapshot lag 而要求先追平 memory projection；如果 EventLog-backed material source 不完整、payload 损坏、artifact 缺失或 source boundary 不可校验，按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
 
 Ordinary RunInput 的 memory section 仍依赖 Conversation Memory snapshot。若 ordinary dispatch 前 snapshot cursor 不能覆盖 required EventLog cursor，Host 必须执行 page-bounded memory projection catch-up / rebuild，直到达到 required cursor、确认当前已 idle，或遇到 projection failure；也可以在 policy 允许范围内做 inline delta repair。`memory_projection_catchup_batch_size` 与相关 page limit 只控制单批读取和单次 transaction 粒度，不是“最多追多少事件”的语义预算，不得作为 required catch-up / rebuild 的 correctness 停止条件。追到 idle 仍不能覆盖 required cursor，或 catch-up / rebuild / inline repair 失败时，必须产生结构化 diagnostic，并按 pre-dispatch failure / retry / defer 策略收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
 
 Dispatch hot path 不得做无上限同步补账。after-commit / after-compact hook 尤其不能为了追平 required cursor 执行无界 catch-up / rebuild；它们只能不执行机会性 projection，或执行有显式页数上限、只改善后续读取延迟的 latency-only maintenance。latency-only maintenance 的页数上限不得被解释为 memory 已追平，也不得用于判定 required cursor 是否满足；ordinary dispatch 的 correctness 仍必须由 required catch-up / rebuild / inline repair 的目标 cursor、idle 或 failure 结果决定。
 
-Host 必须同时维护 prompt-local label 到 canonical provenance 的内部映射，例如 `E1 -> TOOL_RESULT_ACCEPTED event -> TOOL_CALL_REQUESTED event -> payload / artifact / source locator refs`。该映射用于 accept barrier、audit 与 rebuild，不作为 LLM 主要语义输入。compact material data block 不得包含 full EventLog range wrapper、裸 event id / payload ref / digest / cursor / policy / artifact descriptor 作为模型阅读主体，也不得重复渲染同一 current input、raw turn 或 raw tool result。当单条 accepted evidence 被 chunk 成 `E1.1`、`E1.2` 等子 label 时，Host proposal parser 可以把父 label `E1` 解析为同一 canonical evidence 的 shorthand；该 shorthand 只允许用于 evidence section，仍必须拒绝未知 label 或跨 section label。
+Host 必须同时维护 prompt-local label 到 canonical provenance 的内部映射，例如 `E1 -> TOOL_RESULT_ACCEPTED event -> TOOL_CALL_REQUESTED event -> payload / artifact / source locator refs`。compact material 接受 evidence 前必须要求 `tool_call_requested_event_ref` 存在、解析到 canonical `TOOL_CALL_REQUESTED`，并与 accepted result 的 tool call id / tool name identity 一致；ref 缺失、指向 result event、类型错误或 identity mismatch 均 fail closed，绝不能把 `TOOL_RESULT_ACCEPTED.event_id` 当作 call ref fallback。该映射用于 accept barrier、audit 与 rebuild，不作为 LLM 主要语义输入。compact material data block 不得包含 full EventLog range wrapper、裸 event id / payload ref / digest / cursor / policy / artifact descriptor 作为模型阅读主体，也不得重复渲染同一 current input、raw turn 或 raw tool result。当单条 accepted evidence 被 chunk 成 `E1.1`、`E1.2` 等子 label 时，Host proposal parser 可以把父 label `E1` 解析为同一 canonical evidence 的 shorthand；该 shorthand 只允许用于 evidence section，仍必须拒绝未知 label 或跨 section label。
 
 proactive compact 的安全条件是：compactor material tokens 必须与触发 compact 的 ordinary input material 属于同一去重视图，
 不得显著大于 ordinary run input material。Context Governance 必须按即将发送给 compactor 的真实 messages 估算 budget；若
@@ -3434,6 +3551,10 @@ Host 启动时必须执行 recovery scan：
 Recovery scan 不得让旧 Attempt takeover。恢复必须创建新 Attempt。
 
 Recovery 的输入只能是 Host durable truth：Run / Attempt indexes、EventLog canonical facts、dispatch record、wait record、payload descriptors 和 host instance liveness record。Projection checkpoint、Session timeline、RunResult、audit、tool trace、outbox、memory snapshot lag 或其它 read model 不能作为 recovery scan 的前置条件或事实依据；这些 projection 只能在 recovery 提交 canonical facts 后按 `event_sequence` 追平。
+
+同一次 startup recovery scan 必须在开始时冻结 `policy.now`，并从 durable Run governance index 取得固定 upper watermark。扫描顺序固定为 `(accepted_event_sequence, run_id)` keyset 全序；同 sequence 由 `run_id` 稳定打破平局，不允许使用 offset。scanner 在 durable actor 独占连接上按有界 page 执行，每个 page 是独立 write transaction；默认 batch size 为 64。只有当前 page commit 成功后才能投递该 page 的 matching dispatch / queue-promotion wake；rollback page 不得 wake，先前已提交 page 不得因后续失败回滚。失败后的完整重跑只能依赖 durable CAS / idempotency 收敛，不得依赖内存 cursor。
+
+opener 在 execution health 仍为 `STARTING` 时完成全部 recovery pages 与 commit 后 wake；任一 batch、cursor invariant 或 wake bridge 失败时不得进入 `READY`。固定 watermark 之后新接受、且 keyset 高于该 watermark 的 Run 留给下一轮 scan，避免启动扫描因并发 admission 无限延长。
 
 Recovery scan semantic path：
 

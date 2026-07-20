@@ -42,6 +42,10 @@ from dataclasses import dataclass
 from typing import Final, Generic, TypeAlias, TypeVar
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.runtime.numeric import (
+    is_non_negative_finite_number,
+    is_positive_finite_number,
+)
 
 _DEFAULT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 _LOGGER = logging.getLogger(__name__)
@@ -178,6 +182,7 @@ async def wait_for_or_cancel(
     """
 
     _validate_poll_interval(poll_interval_seconds, awaitable=None)
+    _validate_timeout_seconds(timeout_seconds, awaitable=None)
     started_at = time.monotonic()
     if token.is_cancelled():
         return WaitCancelled(reason=token.cancel_reason())
@@ -237,6 +242,7 @@ async def await_or_cancel_or_timeout(
     """
 
     _validate_poll_interval(poll_interval_seconds, awaitable=awaitable)
+    _validate_timeout_seconds(timeout_seconds, awaitable=awaitable)
     if token.is_cancelled():
         if asyncio.iscoroutine(awaitable):
             awaitable.close()
@@ -288,16 +294,34 @@ def _validate_poll_interval(
     :raises ValueError: 轮询间隔小于或等于零时抛出。
     """
 
-    if poll_interval_seconds > 0:
+    if is_positive_finite_number(poll_interval_seconds):
         return
     if awaitable is not None and asyncio.iscoroutine(awaitable):
         awaitable.close()
-    raise ValueError("poll_interval_seconds must be positive")
+    raise ValueError("poll_interval_seconds must be positive and finite")
 
 
-async def _poll_cancellation(
-    token: CancellationToken, *, interval_seconds: float
+def _validate_timeout_seconds(
+    timeout_seconds: float | None,
+    *,
+    awaitable: Awaitable[T] | None,
 ) -> None:
+    """校验等待 timeout，并在拒绝 owned coroutine 时关闭它。
+
+    :param timeout_seconds: timeout 秒数；``None`` 表示无限等待。
+    :param awaitable: 当前 helper 拥有的 awaitable；无 owner 时为 ``None``。
+    :returns: ``None``。
+    :raises ValueError: timeout 为负数、NaN 或正负无穷时抛出。
+    """
+
+    if timeout_seconds is None or is_non_negative_finite_number(timeout_seconds):
+        return
+    if awaitable is not None and asyncio.iscoroutine(awaitable):
+        awaitable.close()
+    raise ValueError("timeout_seconds must be non-negative and finite")
+
+
+async def _poll_cancellation(token: CancellationToken, *, interval_seconds: float) -> None:
     """轮询 ``token``，命中后立即返回。
 
     :param token: 取消观察 token。

@@ -35,7 +35,6 @@ from dayu.host.admission import (
     create_host_admission_service,
 )
 from dayu.host.api import (
-    AttemptStatus,
     AuthorizationClaim,
     CancelRunRequest,
     CancelSessionRunsRequest,
@@ -83,9 +82,7 @@ from dayu.host.durable.errors import (
     HostUniqueConstraintError,
 )
 from dayu.host.durable.options import (
-    HostDurableStoreOptions,
-    HostSQLiteStoragePolicy,
-    PayloadStoragePolicy,
+    project_host_durable_store_options,
 )
 from dayu.host.durable.purge import (
     PurgeSessionAlreadyPurgedError,
@@ -103,15 +100,9 @@ from dayu.host.durable.session_lifecycle import (
     ensure_session as _ensure_session_in_durable,
 )
 from dayu.host.durable.state import (
-    AttemptRow,
     DispatchRecordRow,
-    DispatchRecordStatus,
-    RunRow,
     WaitRecordRow,
     WaitRecordStatus,
-    read_attempt_by_id,
-    read_dispatch_record_by_attempt_id,
-    read_run_by_id,
     read_wait_record_by_id,
     run_snapshot_from_row,
 )
@@ -124,6 +115,7 @@ from dayu.host.durable.transaction import (
 )
 from dayu.host.dispatch import (
     ActiveCancelMessage,
+    ActiveWorkerCancelPort,
     ActiveWorkerRegistry,
 )
 from dayu.host.projection import catch_up_projection_best_effort
@@ -134,7 +126,11 @@ from dayu.host.wait_callback import (
     WaitCallbackStoredWaitState,
     WaitCallbackStoredWaitStatus,
 )
-from dayu.host.waiting import DefaultHostResolveWaitService
+from dayu.host.waiting import (
+    DefaultHostResolveWaitService,
+    ExpireWaitInput,
+    ExpireWaitResult,
+)
 from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -197,7 +193,7 @@ class HostCommandHandle:
         host_handle_id: str,
         durable_store: HostDurableStore,
         admission_service: HostAdmissionService,
-        active_registry: ActiveWorkerRegistry,
+        active_registry: ActiveWorkerCancelPort,
         active_cancel_watchdog_wakeup_port: ActiveCancelWatchdogWakeupPort | None = None,
     ) -> None:
         """初始化 Host command handle。
@@ -358,7 +354,7 @@ class HostCommandHandle:
 def create_host_command_handle(
     options: HostCommandHandleOptions,
     *,
-    active_registry: ActiveWorkerRegistry | None = None,
+    active_registry: ActiveWorkerCancelPort | None = None,
 ) -> HostCommandHandle:
     """创建 Host public command handle。
 
@@ -374,7 +370,7 @@ def create_host_command_handle(
             "HostCommandHandleOptions.local_execution is not supported by "
             "create_host_command_handle; open HostDispatchScheduler explicitly"
         )
-    durable_options = _durable_options_from_public_options(options)
+    durable_options = project_host_durable_store_options(options)
     try:
         durable_store = open_host_durable_store(durable_options)
     except HostDurableError as exc:
@@ -650,14 +646,6 @@ def cancel_run(host: HostCommandHandle, run_id: str, request: CancelRunRequest) 
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
-    except HostApiError as exc:
-        if exc.code == HostApiErrorCode.INVALID_STATE and _is_deferred_cancel_state(host, run_id):
-            raise HostApiError(
-                code=HostApiErrorCode.UNSUPPORTED_OPERATION,
-                message="Run cancel requires a later cancel owner phase",
-                retryable=False,
-            ) from exc
-        raise
     _propagate_active_cancel_targets(
         host,
         (
@@ -794,6 +782,7 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
             event_log_store=host._admission_service.event_log_store,
             idempotency_store=host._admission_service.idempotency_store,
             projection_catchup_port=(host._admission_service.projection_catchup_port),
+            queue_promotion_wakeup_port=host._admission_service.wakeup_port,
         )
         result = service.resolve_wait(wait_id, request)
     except HostDurableError as exc:
@@ -813,6 +802,30 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
         None if result.dispatch_record is None else result.dispatch_record.dispatch_record_id,
     )
     return run_snapshot_from_row(result.run)
+
+
+def expire_wait(host: HostCommandHandle, request: ExpireWaitInput) -> ExpireWaitResult:
+    """通过 command handle 执行 Host-internal wait expiry。
+
+    :param host: poll round 私有 Host command handle。
+    :param request: expiry owner 输入。
+    :returns: expiry transition 结果。
+    :raises HostApiError: handle 已关闭、wait 缺失或边界无效时抛出。
+    :raises HostDurableError: durable transition 失败时转换或透传。
+    """
+
+    host._raise_if_closed()
+    try:
+        service = DefaultHostResolveWaitService(
+            transaction_runner=host._transaction_runner(),
+            event_log_store=host._admission_service.event_log_store,
+            idempotency_store=host._admission_service.idempotency_store,
+            projection_catchup_port=host._admission_service.projection_catchup_port,
+            queue_promotion_wakeup_port=host._admission_service.wakeup_port,
+        )
+        return service.expire_wait(request)
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -877,6 +890,9 @@ class HostCommandWaitCallbackPort(CallbackWaitResolvePort, WaitCallbackStateRead
                 idempotency_store=self.host._admission_service.idempotency_store,
                 projection_catchup_port=(
                     self.host._admission_service.projection_catchup_port
+                ),
+                queue_promotion_wakeup_port=(
+                    self.host._admission_service.wakeup_port
                 ),
             )
             result = service.resolve_wait(wait_id, request)
@@ -1272,33 +1288,6 @@ def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
     )
 
 
-def _durable_options_from_public_options(
-    options: HostCommandHandleOptions,
-) -> HostDurableStoreOptions:
-    """把 public handle options 映射为 durable store options。
-
-    :param options: Host command handle 公共构造选项。
-    :returns: Host durable store options。
-    """
-
-    return HostDurableStoreOptions(
-        db_path=options.db_path,
-        payload_policy=PayloadStoragePolicy(
-            artifact_root=options.artifact_root,
-            payload_inline_threshold_bytes=(options.payload_inline_threshold_bytes),
-            create_artifact_root=options.create_parent_dirs,
-        ),
-        create_parent_dirs=options.create_parent_dirs,
-        sqlite_policy=HostSQLiteStoragePolicy(
-            busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
-            write_busy_retry_count=options.sqlite_write_busy_retry_count,
-            write_retry_initial_delay_seconds=(options.sqlite_write_retry_initial_delay_seconds),
-            write_retry_backoff_multiplier=(options.sqlite_write_retry_backoff_multiplier),
-            write_retry_max_delay_seconds=(options.sqlite_write_retry_max_delay_seconds),
-        ),
-    )
-
-
 def _raise_unsupported_operation(operation_name: str) -> NoReturn:
     """抛出 stable unsupported public facade 错误。
 
@@ -1634,7 +1623,7 @@ def _propagate_active_cancel_targets(
 
 
 def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
-    """best-effort 唤醒 active cancel watchdog。
+    """唤醒 active cancel watchdog 并保留 bridge failure。
 
     :param host: Host command handle。
     :returns: ``None``。
@@ -1643,101 +1632,7 @@ def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
     wakeup_port = host._active_cancel_watchdog_wakeup_port
     if wakeup_port is None:
         return
-    try:
-        wakeup_port.wake_active_cancel_watchdog()
-    except RuntimeError:
-        _LOGGER.debug(
-            "command.active_cancel_watchdog_wakeup_closed host_handle_id=%s",
-            host.host_handle_id,
-        )
-
-
-def _is_deferred_cancel_state(host: HostCommandHandle, run_id: str) -> bool:
-    """判断当前 Run 状态是否属于后续 phase 的 cancel 能力。
-
-    :param host: Host command handle。
-    :param run_id: 目标 Run id。
-    :returns: 属于 deferred cancel 能力时返回 ``True``。
-    :raises HostApiError: handle 已关闭时由底层抛出。
-    """
-
-    return host._run_read(_IsDeferredCancelStateOperation(run_id=run_id))
-
-
-@dataclass(frozen=True, slots=True)
-class _IsDeferredCancelStateOperation:
-    """deferred cancel 状态判断 read transaction body。"""
-
-    run_id: str
-
-    def __call__(self, transaction: HostTransaction) -> bool:
-        """执行 deferred cancel 状态判断。
-
-        :param transaction: 当前 Host transaction。
-        :returns: 属于 deferred cancel 能力时返回 ``True``。
-        """
-
-        run = read_run_by_id(transaction, self.run_id)
-        if run is None:
-            return False
-        if run.status == RunStatus.WAITING:
-            return True
-        if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
-            return False
-        return not (
-            _is_predispatch_starting_run(transaction, run) or _is_active_worker_cancelable_run(transaction, run)
-        )
-
-
-def _is_predispatch_starting_run(transaction: HostTransaction, run: RunRow) -> bool:
-    """判断 Run 是否仍是可直接取消的 pre-dispatch STARTING。
-
-    :param transaction: 当前 Host transaction。
-    :param run: 目标 Run row。
-    :returns: 满足 pre-dispatch STARTING 前置时返回 ``True``。
-    """
-
-    attempt, dispatch_record = _read_attempt_and_dispatch_for_run(transaction, run)
-    return (
-        attempt is not None
-        and attempt.status == AttemptStatus.STARTING
-        and dispatch_record is not None
-        and _is_direct_cancelable_dispatch_record(dispatch_record)
-    )
-
-
-def _is_active_worker_cancelable_run(transaction: HostTransaction, run: RunRow) -> bool:
-    """判断 Run 是否处于 Phase 5 active worker cancel 子集。
-
-    :param transaction: 当前 Host transaction。
-    :param run: 目标 Run row。
-    :returns: 可 active cancel 时返回 ``True``。
-    """
-
-    attempt, _dispatch_record = _read_attempt_and_dispatch_for_run(transaction, run)
-    return attempt is not None and attempt.status == AttemptStatus.RUNNING
-
-
-def _is_direct_cancelable_dispatch_record(
-    dispatch_record: DispatchRecordRow,
-) -> bool:
-    """判断 dispatch record 是否仍可 pre-worker direct cancel。
-
-    :param dispatch_record: dispatch record row。
-    :returns: 可 direct cancel 时返回 ``True``。
-    """
-
-    if dispatch_record.status in (
-        DispatchRecordStatus.PENDING,
-        DispatchRecordStatus.WAITING_FOR_LANE,
-    ):
-        return True
-    return (
-        dispatch_record.status == DispatchRecordStatus.DISPATCHING
-        and dispatch_record.worker_accepted_at is None
-        and dispatch_record.worker_accept_event_id is None
-        and dispatch_record.worker_accept_event_sequence is None
-    )
+    wakeup_port.wake_active_cancel_watchdog()
 
 
 def _pending_dispatch_from_row(
@@ -1757,23 +1652,6 @@ def _pending_dispatch_from_row(
         execution_target=dispatch_record.execution_target,
         worker_kind=dispatch_record.worker_kind,
     )
-
-
-def _read_attempt_and_dispatch_for_run(
-    transaction: HostTransaction, run: RunRow
-) -> tuple[AttemptRow | None, DispatchRecordRow | None]:
-    """读取 Run 当前 Attempt 与 dispatch record。
-
-    :param transaction: 当前 Host transaction。
-    :param run: 目标 Run row。
-    :returns: Attempt 与 dispatch record；缺失时对应位置为 ``None``。
-    """
-
-    if run.current_attempt_id is None:
-        return None, None
-    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
-    dispatch_record = read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
-    return attempt, dispatch_record
 
 
 __all__ = [

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._event_payload import optional_payload_text
+from dayu.host.api import RunStatus
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass
@@ -26,6 +27,11 @@ from dayu.host.durable.read_model import (
     reset_minimal_read_model_projection,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    HOST_RUN_LIFECYCLE_EVENT_TYPES,
+    event_type_values,
+    run_status_for_terminal_event,
+)
 from dayu.host.projection import (
     ProjectionApplyResult,
     ProjectionApplyStatus,
@@ -40,15 +46,6 @@ MINIMAL_READ_MODEL_CONSUMER_ID = ProjectionConsumerId("host.minimal-read-model")
 """minimal read model projection consumer id。"""
 
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
-_EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
-_EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
-_EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
-_EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _ITEM_KIND_USER_INPUT = "user_input"
 _ITEM_KIND_RUN_LIFECYCLE = "run_lifecycle"
 _ITEM_KIND_RUN_TERMINAL = "run_terminal"
@@ -61,23 +58,9 @@ _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _MIN_REPAIR_BATCH_SIZE = 1
 
-_TERMINAL_STATUS_BY_EVENT_TYPE: Mapping[str, str] = {
-    _EVENT_TYPE_RUN_SUCCEEDED: "succeeded",
-    _EVENT_TYPE_RUN_FAILED: "failed",
-    _EVENT_TYPE_RUN_CANCELLED: "cancelled",
-    _EVENT_TYPE_RUN_LOST: "lost",
-}
 _TIMELINE_EVENT_TYPES: tuple[str, ...] = (
     _EVENT_TYPE_USER_INPUT_ACCEPTED,
-    _EVENT_TYPE_RUN_ACCEPTED,
-    _EVENT_TYPE_RUN_QUEUED,
-    _EVENT_TYPE_RUN_STARTED,
-    _EVENT_TYPE_RUN_WAITING,
-    _EVENT_TYPE_RUN_CANCELLING,
-    _EVENT_TYPE_RUN_SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED,
-    _EVENT_TYPE_RUN_CANCELLED,
-    _EVENT_TYPE_RUN_LOST,
+    *event_type_values(HOST_RUN_LIFECYCLE_EVENT_TYPES),
 )
 
 
@@ -145,7 +128,7 @@ class MinimalReadModelProjectionConsumer:
         if not self.event_filter.matches(event):
             return ProjectionApplyResult(ProjectionApplyStatus.SKIPPED)
         statuses = [_project_timeline_item(transaction, event)]
-        if event.event_type in _TERMINAL_STATUS_BY_EVENT_TYPE:
+        if run_status_for_terminal_event(event.event_type) is not None:
             statuses.append(_project_run_result(transaction, event))
         if ReadModelWriteStatus.INSERTED in statuses:
             return ProjectionApplyResult(
@@ -254,7 +237,7 @@ def _project_run_result(
         RunResultRow(
             run_id=event.run_id,
             session_id=event.session_id,
-            terminal_status=_TERMINAL_STATUS_BY_EVENT_TYPE[event.event_type],
+            terminal_status=_require_terminal_status(event.event_type),
             terminal_event_id=event.event_id,
             terminal_event_sequence=event.event_sequence,
             result_ref=result_ref,
@@ -303,6 +286,20 @@ def _project_timeline_item(
     )
 
 
+def _require_terminal_status(event_type: str) -> RunStatus:
+    """读取 terminal event 对应的 durable Run status。
+
+    :param event_type: EventLog row 中的原始 ``event_type``。
+    :returns: terminal Run status。
+    :raises HostDurableError: 非 Host terminal Run event 时抛出。
+    """
+
+    status = run_status_for_terminal_event(event_type)
+    if status is None:
+        raise HostDurableError("read model terminal event type is unsupported")
+    return status
+
+
 def _timeline_item_kind(event_type: str) -> str:
     """把 EventLog type 映射为 timeline item kind。
 
@@ -312,7 +309,7 @@ def _timeline_item_kind(event_type: str) -> str:
 
     if event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
         return _ITEM_KIND_USER_INPUT
-    if event_type in _TERMINAL_STATUS_BY_EVENT_TYPE:
+    if run_status_for_terminal_event(event_type) is not None:
         return _ITEM_KIND_RUN_TERMINAL
     return _ITEM_KIND_RUN_LIFECYCLE
 

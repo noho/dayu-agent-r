@@ -14,14 +14,302 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, Literal, Optional
+from enum import Enum
+from typing import Any, Literal, Optional, TypeAlias
+
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import (
+    normalize_document_quality,
+    normalize_fiscal_period,
+    parse_sec_form_type,
+)
 
 
 DocumentMeta = dict[str, Any]
 """文档元数据字典类型别名。"""
+
+
+class FinsIngestMethod(str, Enum):
+    """财报源文档进入仓储的业务方式。"""
+
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
+
+    @classmethod
+    def from_storage_value(cls, value: str, *, field_name: str = "ingest_method") -> "FinsIngestMethod":
+        """从 storage meta 字符串解析 ingest method。
+
+        Args:
+            value: storage meta 中的业务可读字符串值。
+            field_name: 报错使用的字段名。
+
+        Returns:
+            已校验的 ingest method 枚举值。
+
+        Raises:
+            ValueError: 字符串为空或不是合法 ingest method 时抛出。
+        """
+
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError(f"{field_name} 不能为空")
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 非法: {value}") from exc
+
+    def to_storage_value(self) -> str:
+        """转换为 storage JSON 使用的业务可读字符串。
+
+        Args:
+            无。
+
+        Returns:
+            storage meta 中持久化的字符串值。
+
+        Raises:
+            无。
+        """
+
+        return self.value
+
+
+class FinsSourceProvider(str, Enum):
+    """财报源文档提供方的仓储值。
+
+    该枚举表达 source meta 中持久化的 provider 真源，不直接作为
+    LLM-facing 展示值使用。
+    """
+
+    SEC_EDGAR = "sec_edgar"
+    CNINFO = "cninfo"
+    HKEXNEWS = "hkexnews"
+    USER_UPLOAD = "user_upload"
+
+    @classmethod
+    def from_storage_value(cls, value: str, *, field_name: str = "source_provider") -> "FinsSourceProvider":
+        """从 storage meta 字符串解析 source provider。
+
+        Args:
+            value: storage meta 中的 provider 字符串。
+            field_name: 报错使用的字段名。
+
+        Returns:
+            已校验的 provider 枚举值。
+
+        Raises:
+            ValueError: 字符串为空或不是合法 provider 时抛出。
+        """
+
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError(f"{field_name} 不能为空")
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 非法: {value}") from exc
+
+    def to_storage_value(self) -> str:
+        """转换为 source meta 使用的仓储字符串。
+
+        Args:
+            无。
+
+        Returns:
+            storage meta 中持久化的字符串值。
+
+        Raises:
+            无。
+        """
+
+        return self.value
+
+
+@dataclass(frozen=True)
+class SourceDocumentProvenance:
+    """源文档溯源事实投影。
+
+    Attributes:
+        source_kind: 源文档类型。
+        ingest_method: 文档进入仓储的业务方式。
+        source_provider: 文档来源提供方。
+        ingest_complete: source meta 是否为完成态。
+    """
+
+    source_kind: SourceKind
+    ingest_method: FinsIngestMethod
+    source_provider: FinsSourceProvider
+    ingest_complete: bool
+
+    @classmethod
+    def from_meta(
+        cls,
+        meta: Mapping[str, JsonValue],
+        source_kind: SourceKind,
+    ) -> "SourceDocumentProvenance":
+        """从 source meta 解析溯源事实。
+
+        Args:
+            meta: source repository 读取到的 meta 内容。
+            source_kind: 仓储路由已经确认的源文档类型。
+
+        Returns:
+            已校验的源文档溯源事实。
+
+        Raises:
+            KeyError: meta 缺少必需溯源字段时抛出。
+            ValueError: 字段类型或枚举值非法时抛出。
+        """
+
+        raw_ingest_method = meta["ingest_method"]
+        if not isinstance(raw_ingest_method, str):
+            raise ValueError("ingest_method 必须为字符串")
+        raw_provider = meta["source_provider"]
+        if not isinstance(raw_provider, str):
+            raise ValueError("source_provider 必须为字符串")
+        raw_ingest_complete = meta["ingest_complete"]
+        if not isinstance(raw_ingest_complete, bool):
+            raise ValueError("ingest_complete 必须为布尔值")
+        return cls(
+            source_kind=source_kind,
+            ingest_method=FinsIngestMethod.from_storage_value(raw_ingest_method),
+            source_provider=FinsSourceProvider.from_storage_value(raw_provider),
+            ingest_complete=raw_ingest_complete,
+        )
+
+
+@dataclass(frozen=True)
+class DownloadRejectionEntry:
+    """SEC 下载拒绝注册表条目。
+
+    该模型是下载拒绝事实的 typed contract，避免仓储与 pipeline 之间通过
+    松散嵌套字典重复解释同一业务语义。
+    """
+
+    document_id: str
+    reason: str
+    category: str
+    form_type: str
+    filing_date: str
+    download_version: str
+
+    def __post_init__(self) -> None:
+        """校验直接构造的下载拒绝条目字段。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 必填字段为空或 form 类型非法时抛出。
+        """
+
+        for field_name, value in (
+            ("document_id", self.document_id),
+            ("reason", self.reason),
+            ("category", self.category),
+            ("form_type", self.form_type),
+            ("filing_date", self.filing_date),
+            ("download_version", self.download_version),
+        ):
+            if not value.strip():
+                raise ValueError(f"{field_name} 不能为空")
+        canonical_form_type = parse_sec_form_type(self.form_type, field_name="form_type")
+        if canonical_form_type != self.form_type:
+            raise ValueError("form_type 必须使用 canonical SEC form")
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, JsonValue],
+        *,
+        expected_document_id: Optional[str] = None,
+    ) -> "DownloadRejectionEntry":
+        """从 JSON 对象解析下载拒绝条目。
+
+        Args:
+            data: registry JSON 中的单条拒绝记录。
+            expected_document_id: registry key 表达的预期 document id；提供时必须与条目字段一致。
+
+        Returns:
+            已校验的下载拒绝条目。
+
+        Raises:
+            KeyError: 缺少必需字段时抛出。
+            ValueError: 字段类型、空值、form 类型或 document id 不匹配时抛出。
+        """
+
+        document_id = _required_json_string(data, "document_id")
+        if expected_document_id is not None and document_id != expected_document_id:
+            raise ValueError("download rejection document_id 与 registry key 不一致")
+        form_type = parse_sec_form_type(_required_json_string(data, "form_type"), field_name="form_type")
+        return cls(
+            document_id=document_id,
+            reason=_required_json_string(data, "reason"),
+            category=_required_json_string(data, "category"),
+            form_type=form_type,
+            filing_date=_required_json_string(data, "filing_date"),
+            download_version=_required_json_string(data, "download_version"),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        """转换为 registry JSON 持久化字典。
+
+        Args:
+            无。
+
+        Returns:
+            JSON 可序列化的字符串字典。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "document_id": self.document_id,
+            "reason": self.reason,
+            "category": self.category,
+            "form_type": self.form_type,
+            "filing_date": self.filing_date,
+            "download_version": self.download_version,
+        }
+
+
+DownloadRejectionRegistry: TypeAlias = dict[str, DownloadRejectionEntry]
+"""SEC 下载拒绝注册表 typed 映射。"""
+
+
+@dataclass(frozen=True)
+class SourceDocumentRevision:
+    """源文档已发布版本的仓储投影。
+
+    Attributes:
+        token: storage publication owner 生成的非空 opaque equality token。
+    """
+
+    token: str
+
+    def __post_init__(self) -> None:
+        """校验 revision token 非空。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: token 为空字符串时抛出。
+        """
+
+        if self.token == "":
+            raise ValueError("source revision token 不能为空")
 
 
 @dataclass(frozen=True)
@@ -119,29 +407,15 @@ class DocumentEntry:
 
 @dataclass(frozen=True)
 class BatchToken:
-    """批处理事务 token。
+    """批处理事务显式 capability。
 
     Attributes:
-        token_id: 批处理唯一标识。
+        transaction_id: storage 生成的不透明事务标识。
         ticker: 对应股票代码。
-        target_ticker_dir: 正式 `portfolio/{ticker}` 目录。
-        staging_root_dir: 批处理暂存根目录。
-        staging_ticker_dir: 批处理暂存目录。
-        backup_dir: 提交阶段的备份目录。
-        journal_path: 事务 journal 路径。
-        ticker_lock_path: ticker 事务锁路径。
-        created_at: token 创建时间（ISO8601）。
     """
 
-    token_id: str
+    transaction_id: str
     ticker: str
-    target_ticker_dir: Path
-    staging_root_dir: Path
-    staging_ticker_dir: Path
-    backup_dir: Path
-    journal_path: Path
-    ticker_lock_path: Path
-    created_at: str
 
 
 @dataclass(frozen=True)
@@ -216,13 +490,13 @@ class CompanyMetaInventoryEntry:
     """公司目录扫描结果。
 
     Attributes:
-        directory_name: 公司目录名。
+        ticker: descriptor 可恢复时的 external ticker；损坏或 lock-only 条目为 ``None``。
         status: 扫描状态。
         company_meta: 当状态为 ``available`` 时的公司元数据。
         detail: 附加说明或错误信息。
     """
 
-    directory_name: str
+    ticker: Optional[str]
     status: CompanyMetaInventoryStatus
     company_meta: Optional[CompanyMeta] = None
     detail: str = ""
@@ -347,7 +621,7 @@ class RejectedFilingArtifactUpsertRequest:
     report_kind: Optional[str] = None
     amended: bool = False
     has_xbrl: Optional[bool] = None
-    ingest_method: str = "download"
+    ingest_method: FinsIngestMethod = FinsIngestMethod.DOWNLOAD
 
 
 @dataclass(frozen=True)
@@ -374,7 +648,7 @@ class RejectedFilingArtifact:
     report_kind: Optional[str] = None
     amended: bool = False
     has_xbrl: Optional[bool] = None
-    ingest_method: str = "download"
+    ingest_method: FinsIngestMethod = FinsIngestMethod.DOWNLOAD
     rejected_at: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -400,7 +674,7 @@ class RejectedFilingArtifact:
             internal_document_id=str(data["internal_document_id"]).strip(),
             accession_number=str(data["accession_number"]).strip(),
             company_id=str(data["company_id"]).strip(),
-            form_type=str(data["form_type"]).strip(),
+            form_type=parse_sec_form_type(str(data["form_type"])),
             filing_date=str(data["filing_date"]).strip(),
             report_date=_optional_str(data.get("report_date")),
             primary_document=str(data["primary_document"]).strip(),
@@ -415,11 +689,11 @@ class RejectedFilingArtifact:
                 if isinstance(item, dict)
             ],
             fiscal_year=int(data["fiscal_year"]) if isinstance(data.get("fiscal_year"), int) else None,
-            fiscal_period=_optional_str(data.get("fiscal_period")),
+            fiscal_period=normalize_fiscal_period(_optional_str(data.get("fiscal_period"))),
             report_kind=_optional_str(data.get("report_kind")),
             amended=bool(data.get("amended", False)),
             has_xbrl=data.get("has_xbrl") if isinstance(data.get("has_xbrl"), bool) else None,
-            ingest_method=str(data.get("ingest_method", "download")).strip() or "download",
+            ingest_method=FinsIngestMethod.from_storage_value(str(data["ingest_method"])),
             rejected_at=str(data.get("rejected_at", "")).strip(),
             created_at=str(data.get("created_at", "")).strip(),
             updated_at=str(data.get("updated_at", "")).strip(),
@@ -459,7 +733,7 @@ class RejectedFilingArtifact:
             "report_kind": self.report_kind,
             "amended": self.amended,
             "has_xbrl": self.has_xbrl,
-            "ingest_method": self.ingest_method,
+            "ingest_method": self.ingest_method.to_storage_value(),
             "rejected_at": self.rejected_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -565,16 +839,16 @@ class DocumentSummary:
             document_id=str(data["document_id"]),
             internal_document_id=str(data.get("internal_document_id", "")),
             source_kind=str(data.get("source_kind", "filing")),
-            form_type=data.get("form_type"),
+            form_type=_optional_str(data.get("form_type")),
             material_name=data.get("material_name"),
             fiscal_year=data.get("fiscal_year"),
-            fiscal_period=data.get("fiscal_period"),
+            fiscal_period=normalize_fiscal_period(_optional_str(data.get("fiscal_period"))),
             report_date=data.get("report_date"),
             filing_date=data.get("filing_date"),
             amended=bool(data.get("amended", False)),
             is_deleted=bool(data.get("is_deleted", False)),
             document_version=str(data.get("document_version", "v1")),
-            quality=str(data.get("quality", "full")),
+            quality=normalize_document_quality(_optional_str(data.get("quality"))),
             has_financials=bool(data.get("has_financials", False)),
             section_count=int(data.get("section_count", 0)),
             table_count=int(data.get("table_count", 0)),
@@ -621,19 +895,64 @@ class FilingManifestItem:
 
     document_id: str
     internal_document_id: str
+    ingest_method: FinsIngestMethod
+    source_provider: FinsSourceProvider
+    ingest_complete: bool
     form_type: Optional[str] = None
     fiscal_year: Optional[int] = None
     fiscal_period: Optional[str] = None
     report_date: Optional[str] = None
     filing_date: Optional[str] = None
     amended: bool = False
-    ingest_method: str = "download"
-    ingest_complete: bool = True
     is_deleted: bool = False
     deleted_at: Optional[str] = None
     document_version: str = "v1"
     source_fingerprint: str = ""
     has_xbrl: Optional[bool] = None
+
+    @classmethod
+    def from_source_meta(
+        cls,
+        meta: Mapping[str, JsonValue],
+    ) -> "FilingManifestItem":
+        """从完整 filing source meta 构建唯一 manifest 投影。
+
+        Args:
+            meta: storage owner 已补齐身份与完成态的 source meta。
+
+        Returns:
+            与 source meta 同源的 filing manifest 项目。
+
+        Raises:
+            KeyError: meta 缺少必需身份或 provenance 字段时抛出。
+            ValueError: 身份、provenance 或字段类型非法时抛出。
+        """
+
+        provenance = SourceDocumentProvenance.from_meta(meta, SourceKind.FILING)
+        document_id = meta["document_id"]
+        internal_document_id = meta["internal_document_id"]
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("document_id 必须为非空字符串")
+        if not isinstance(internal_document_id, str) or not internal_document_id.strip():
+            raise ValueError("internal_document_id 必须为非空字符串")
+        return cls(
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            ingest_method=provenance.ingest_method,
+            source_provider=provenance.source_provider,
+            ingest_complete=provenance.ingest_complete,
+            form_type=_optional_str(meta.get("form_type")),
+            fiscal_year=_optional_int(meta.get("fiscal_year")),
+            fiscal_period=_optional_str(meta.get("fiscal_period")),
+            report_date=_optional_str(meta.get("report_date")),
+            filing_date=_optional_str(meta.get("filing_date")),
+            amended=meta.get("amended") is True,
+            is_deleted=meta.get("is_deleted") is True,
+            deleted_at=_optional_str(meta.get("deleted_at")),
+            document_version=_optional_str(meta.get("document_version")) or "v1",
+            source_fingerprint=_optional_str(meta.get("source_fingerprint")) or "",
+            has_xbrl=_optional_bool(meta.get("has_xbrl")),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """将对象转换为 manifest 字典。
@@ -648,7 +967,10 @@ class FilingManifestItem:
             无。
         """
 
-        return asdict(self)
+        payload = asdict(self)
+        payload["ingest_method"] = self.ingest_method.to_storage_value()
+        payload["source_provider"] = self.source_provider.to_storage_value()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -657,15 +979,58 @@ class MaterialManifestItem:
 
     document_id: str
     internal_document_id: str
+    ingest_method: FinsIngestMethod
+    source_provider: FinsSourceProvider
+    ingest_complete: bool
     form_type: Optional[str] = None
     material_name: Optional[str] = None
     filing_date: Optional[str] = None
     report_date: Optional[str] = None
-    ingest_complete: bool = True
     is_deleted: bool = False
     deleted_at: Optional[str] = None
     document_version: str = "v1"
     source_fingerprint: str = ""
+
+    @classmethod
+    def from_source_meta(
+        cls,
+        meta: Mapping[str, JsonValue],
+    ) -> "MaterialManifestItem":
+        """从完整 material source meta 构建唯一 manifest 投影。
+
+        Args:
+            meta: storage owner 已补齐身份与完成态的 source meta。
+
+        Returns:
+            与 source meta 同源的 material manifest 项目。
+
+        Raises:
+            KeyError: meta 缺少必需身份或 provenance 字段时抛出。
+            ValueError: 身份、provenance 或字段类型非法时抛出。
+        """
+
+        provenance = SourceDocumentProvenance.from_meta(meta, SourceKind.MATERIAL)
+        document_id = meta["document_id"]
+        internal_document_id = meta["internal_document_id"]
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("document_id 必须为非空字符串")
+        if not isinstance(internal_document_id, str) or not internal_document_id.strip():
+            raise ValueError("internal_document_id 必须为非空字符串")
+        return cls(
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            ingest_method=provenance.ingest_method,
+            source_provider=provenance.source_provider,
+            ingest_complete=provenance.ingest_complete,
+            form_type=_optional_str(meta.get("form_type")),
+            material_name=_optional_str(meta.get("material_name")),
+            filing_date=_optional_str(meta.get("filing_date")),
+            report_date=_optional_str(meta.get("report_date")),
+            is_deleted=meta.get("is_deleted") is True,
+            deleted_at=_optional_str(meta.get("deleted_at")),
+            document_version=_optional_str(meta.get("document_version")) or "v1",
+            source_fingerprint=_optional_str(meta.get("source_fingerprint")) or "",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """将对象转换为 manifest 字典。
@@ -680,7 +1045,10 @@ class MaterialManifestItem:
             无。
         """
 
-        return asdict(self)
+        payload = asdict(self)
+        payload["ingest_method"] = self.ingest_method.to_storage_value()
+        payload["source_provider"] = self.source_provider.to_storage_value()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -736,6 +1104,30 @@ def now_iso8601() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def _required_json_string(data: Mapping[str, JsonValue], field_name: str) -> str:
+    """从 JSON 对象读取必填非空字符串。
+
+    Args:
+        data: JSON 对象。
+        field_name: 字段名。
+
+    Returns:
+        去除首尾空白后的字符串。
+
+    Raises:
+        KeyError: 字段缺失时抛出。
+        ValueError: 字段不是字符串或字符串为空时抛出。
+    """
+
+    value = data[field_name]
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} 必须为字符串")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} 不能为空")
+    return normalized
+
+
 def _optional_str(value: Any) -> Optional[str]:
     """将任意值标准化为可选字符串。
 
@@ -753,3 +1145,39 @@ def _optional_str(value: Any) -> Optional[str]:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _optional_int(value: JsonValue) -> int | None:
+    """将 JSON 值收窄为可选整数。
+
+    Args:
+        value: 原始 JSON 值。
+
+    Returns:
+        非布尔整数；其它值返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _optional_bool(value: JsonValue) -> bool | None:
+    """将 JSON 值收窄为可选布尔值。
+
+    Args:
+        value: 原始 JSON 值。
+
+    Returns:
+        布尔值；其它值返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if not isinstance(value, bool):
+        return None
+    return value

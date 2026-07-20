@@ -587,6 +587,19 @@ def test_cancel_run_recovering_replay_is_idempotent_per_run_id(
         peer_recovering = start_run(
             host, _start_request(peer_session_id, "start-recovering-peer")
         )
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            _start_governed_run(
+                store.transaction_runner,
+                run_id=recovering.run_id,
+                expected_status=RunStatus.ACCEPTED,
+                id_suffix="recovering-idempotent",
+            )
+            _start_governed_run(
+                store.transaction_runner,
+                run_id=peer_recovering.run_id,
+                expected_status=RunStatus.ACCEPTED,
+                id_suffix="recovering-peer",
+            )
         _mark_run_status(options.db_path, recovering.run_id, RunStatus.RECOVERING)
         _mark_run_status(options.db_path, peer_recovering.run_id, RunStatus.RECOVERING)
         request = _cancel_run_request("cancel-recovering-idempotent")
@@ -622,6 +635,13 @@ def test_cancel_session_runs_includes_recovering_without_fail_closed(
         session_id = _session_id(host, "slot-a")
         recovering = start_run(host, _start_request(session_id, "start-active"))
         queued = start_run(host, _start_request(session_id, "start-queued"))
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            _start_governed_run(
+                store.transaction_runner,
+                run_id=recovering.run_id,
+                expected_status=RunStatus.ACCEPTED,
+                id_suffix="recovering-cancel-session",
+            )
         _mark_run_status(options.db_path, recovering.run_id, RunStatus.RECOVERING)
 
         snapshot = cancel_session_runs(

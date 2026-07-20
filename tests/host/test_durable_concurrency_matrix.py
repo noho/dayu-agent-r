@@ -34,7 +34,9 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     record_idempotent_result,
 )
 from dayu.host.durable.memory import (
@@ -71,10 +73,10 @@ _STATUS_OK = "ok"
 _STATUS_CONFLICT = "conflict"
 _MODE_SAME_DIGEST = "same_digest"
 _MODE_DIFFERENT_DIGEST = "different_digest"
-_SCOPE_KIND = "durable_matrix"
+_SCOPE_KIND = IdempotencyScopeKind.CLOSE_SESSION
 _SCOPE_ID = "session-1"
 _IDEMPOTENCY_KEY = "client-request-1"
-_RESULT_KIND = "event"
+_RESULT_KIND = IdempotencyResultKind.SESSION
 _CONSUMER_ID = "host.matrix.consumer"
 _SESSION_ID = "session-1"
 _NOW = "2026-06-01T00:00:00.000000Z"
@@ -162,7 +164,7 @@ class _ReadIdempotencySummaryOperation:
                   AND scope_id = ?
                   AND idempotency_key = ?
                 """,
-                (_SCOPE_KIND, _SCOPE_ID, _IDEMPOTENCY_KEY),
+                (_SCOPE_KIND.value, _SCOPE_ID, _IDEMPOTENCY_KEY),
             ),
             "idempotency record",
         )
@@ -478,10 +480,10 @@ def test_projection_checkpoint_lost_cas_keeps_persisted_checkpoint(
     options = _options(tmp_path / "durable.sqlite3", tmp_path / "artifacts")
     with open_host_durable_store(options) as store:
         first_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-projection-1", "TYPE_A")
+            _AppendEventOperation("event-projection-1", "USER_INPUT_ACCEPTED")
         )
         second_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-projection-2", "TYPE_B")
+            _AppendEventOperation("event-projection-2", "RUN_ACCEPTED")
         )
         store.transaction_runner.run_write(_AdvanceCheckpointOperation(first_event))
 
@@ -512,10 +514,10 @@ def test_memory_snapshot_checkpoint_lost_cas_rolls_back_snapshot(
     snapshot_id = "snapshot-stale-cas"
     with open_host_durable_store(options) as store:
         first_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-memory-1", "TYPE_A")
+            _AppendEventOperation("event-memory-1", "USER_INPUT_ACCEPTED")
         )
         second_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-memory-2", "TYPE_B")
+            _AppendEventOperation("event-memory-2", "RUN_ACCEPTED")
         )
         store.transaction_runner.run_write(_AdvanceCheckpointOperation(first_event))
         snapshot = _memory_snapshot_for_event(
@@ -555,7 +557,7 @@ def test_memory_snapshot_write_and_checkpoint_commit_together(
     snapshot_id = "snapshot-same-transaction"
     with open_host_durable_store(options) as store:
         first_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-memory-positive-1", "TYPE_A")
+            _AppendEventOperation("event-memory-positive-1", "USER_INPUT_ACCEPTED")
         )
         snapshot = _memory_snapshot_for_event(
             snapshot_id=snapshot_id,

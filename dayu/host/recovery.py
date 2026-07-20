@@ -11,17 +11,15 @@ transition helper 完成旧 Attempt closeout。Slice 3 起，本模块还负责�
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Final
 from uuid import uuid4
 
-from dayu.contracts.json_value import JsonValue
 from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.event_log import EventLogStore
-from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.liveness import HostInstanceRow, read_host_instance
 from dayu.host.durable.run_transition import (
     RunTransitionResult,
@@ -30,22 +28,24 @@ from dayu.host.durable.run_transition import (
     StartupRecoveringLostInput,
     close_startup_orphan_attempt_in_transaction,
     lose_recovering_run_in_transaction,
+    read_cancel_requested_event_from_run_link,
     start_recovery_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
+    NonTerminalRunKeysetCursor,
     RunRow,
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
-    read_non_terminal_runs,
+    read_non_terminal_run_upper_watermark,
+    read_non_terminal_runs_keyset_page,
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
-from dayu.host.payload_resolution import event_payload_object
 from dayu.host.recovery_process import (
     DurableOrphanCandidate,
     OrphanClassification,
@@ -64,6 +64,8 @@ _RECOVERY_SOURCE = "startup_scan"
 # heartbeat 周期必须显著小于 stale 阈值，避免破坏 positive orphan proof。
 _DEFAULT_STALE_AFTER_SECONDS = 30
 _DEFAULT_RECOVERY_DISPATCH_LIMIT = 1
+DEFAULT_STARTUP_RECOVERY_BATCH_SIZE: Final[int] = 64
+"""单个 startup recovery write transaction 最多处理的 Run 数。"""
 _ATTEMPT_ID_PREFIX = "attempt-recovery"
 _EXECUTION_ID_PREFIX = "execution-recovery"
 _DISPATCH_RECORD_ID_PREFIX = "dispatch-recovery"
@@ -76,8 +78,6 @@ _REASON_RECOVERY_DISPATCH_LIMIT_EXCEEDED = (
 _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP = (
     "startup_recovery_dispatch_pending_follow_up"
 )
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
-_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -159,6 +159,87 @@ class StartupRecoveryScanResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _StartupRecoveryBatchResult:
+    """单个已提交 recovery batch 的 immutable 结果。
+
+    :param result: 本批 actions 与 commit 后 wakes。
+    :param next_cursor: 本批最后一行 keyset；空页沿用输入 cursor。
+    :param page_size: 本批实际读取并分类的 Run row 数。
+    """
+
+    result: StartupRecoveryScanResult
+    next_cursor: NonTerminalRunKeysetCursor | None
+    page_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _StartupRecoveryBatchOperation:
+    """单个 bounded startup recovery write transaction body。
+
+    :param scanner: 提供既有业务分类的 recovery owner。
+    :param upper_watermark: scan 开始时固定的 durable upper watermark。
+    :param cursor: 上一批最后提交的 keyset。
+    :param batch_size: 本批最大 Run row 数。
+    :param policy: 整个 scan 共享的 fixed policy。
+    :param policy_now: scan 开始时冻结的 policy time invariant。
+    :param seen_queue_promotion_sessions: 先前已提交批次唤醒过的 Session ids。
+    """
+
+    scanner: "StartupRecoveryScanner"
+    upper_watermark: NonTerminalRunKeysetCursor
+    cursor: NonTerminalRunKeysetCursor | None
+    batch_size: int
+    policy: StartupRecoveryPolicy
+    policy_now: datetime
+    seen_queue_promotion_sessions: frozenset[str]
+
+    def __call__(self, transaction: HostTransaction) -> _StartupRecoveryBatchResult:
+        """读取一个 keyset page 并在同一 write transaction 分类/迁移。
+
+        :param transaction: 当前 bounded Host write transaction。
+        :returns: immutable batch result；只可在 commit 成功后消费其中 wake。
+        :raises RuntimeError: scan policy time 在批间发生漂移时抛出。
+        :raises HostDurableError: durable read/mutation 失败时由底层抛出。
+        """
+
+        if self.policy.now != self.policy_now:
+            raise RuntimeError("startup recovery policy time changed within scan")
+        runs = read_non_terminal_runs_keyset_page(
+            transaction,
+            upper_watermark=self.upper_watermark,
+            cursor=self.cursor,
+            batch_size=self.batch_size,
+        )
+        actions: list[StartupRecoveryAction] = []
+        pending_dispatches: list[PendingDispatchRecord] = []
+        queue_promotion_sessions: list[str] = []
+        seen_queue_promotion_sessions = set(self.seen_queue_promotion_sessions)
+        for run in runs:
+            actions.append(
+                self.scanner._classify_run(
+                    transaction,
+                    run,
+                    self.policy,
+                    pending_dispatches,
+                    queue_promotion_sessions,
+                    seen_queue_promotion_sessions,
+                )
+            )
+        next_cursor = self.cursor
+        if runs:
+            next_cursor = _keyset_cursor_from_run(runs[-1])
+        return _StartupRecoveryBatchResult(
+            result=StartupRecoveryScanResult(
+                actions=tuple(actions),
+                pending_dispatches=tuple(pending_dispatches),
+                queue_promotion_sessions=tuple(queue_promotion_sessions),
+            ),
+            next_cursor=next_cursor,
+            page_size=len(runs),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StartupRecoveryScanner:
     """startup recovery scanner。
 
@@ -169,9 +250,11 @@ class StartupRecoveryScanner:
         Slice 2 closeout / classification，不创建 startup recovery dispatch。
     :param recovery_owner_host_instance_id: 当前 opener 的 Host instance id；
         创建 recovery dispatch record 时写入 owner 诊断字段。
-    :param defer_accepted_cancel_to_watchdog: 为 ``True`` 时，带有已接受 active
-        cancel durable facts 的 ``CANCELLING`` Run 由 active cancel watchdog
-        收口，startup recovery 不把它转成 ``LOST``。
+    :param defer_accepted_cancel_to_watchdog: 为 ``True`` 且已注入 scheduler
+        wakeup port 时，带有已接受 active cancel durable facts 的
+        ``CANCELLING`` Run 由 active cancel watchdog 收口；未注入 scheduler
+        时 recovery 按 orphan proof 执行 fallback closeout。
+    :param batch_size: 单个 recovery write transaction 最大处理 Run row 数。
     """
 
     transaction_runner: HostTransactionRunner
@@ -180,6 +263,7 @@ class StartupRecoveryScanner:
     dispatch_wakeup_port: AdmissionWakeupPort | None = None
     recovery_owner_host_instance_id: str | None = None
     defer_accepted_cancel_to_watchdog: bool = False
+    batch_size: int = DEFAULT_STARTUP_RECOVERY_BATCH_SIZE
 
     def scan(
         self, policy: StartupRecoveryPolicy | None = None
@@ -193,36 +277,62 @@ class StartupRecoveryScanner:
 
         effective_policy = policy if policy is not None else StartupRecoveryPolicy.default()
         _validate_policy(effective_policy)
+        _validate_batch_size(self.batch_size)
+        policy_now = effective_policy.now
+        upper_watermark = self.transaction_runner.run_read(
+            read_non_terminal_run_upper_watermark
+        )
+        if upper_watermark is None:
+            return StartupRecoveryScanResult(actions=())
 
-        def operation(transaction: HostTransaction) -> StartupRecoveryScanResult:
-            """在单个 write transaction 内读取并提交必要 closeout。
-
-            :param transaction: Host transaction。
-            :returns: scan 结果。
-            """
-
-            actions: list[StartupRecoveryAction] = []
-            pending_dispatches: list[PendingDispatchRecord] = []
-            queue_promotion_sessions: list[str] = []
-            seen_queue_promotion_sessions: set[str] = set()
-            for run in read_non_terminal_runs(transaction):
-                actions.append(
-                    self._classify_run(
-                        transaction,
-                        run,
-                        effective_policy,
-                        pending_dispatches,
-                        queue_promotion_sessions,
-                        seen_queue_promotion_sessions,
-                    )
+        cursor: NonTerminalRunKeysetCursor | None = None
+        actions: list[StartupRecoveryAction] = []
+        pending_dispatches: list[PendingDispatchRecord] = []
+        queue_promotion_sessions: list[str] = []
+        seen_queue_promotion_sessions: set[str] = set()
+        while cursor != upper_watermark:
+            batch = self.transaction_runner.run_write(
+                _StartupRecoveryBatchOperation(
+                    scanner=self,
+                    upper_watermark=upper_watermark,
+                    cursor=cursor,
+                    batch_size=self.batch_size,
+                    policy=effective_policy,
+                    policy_now=policy_now,
+                    seen_queue_promotion_sessions=frozenset(
+                        seen_queue_promotion_sessions
+                    ),
                 )
-            return StartupRecoveryScanResult(
-                actions=tuple(actions),
-                pending_dispatches=tuple(pending_dispatches),
-                queue_promotion_sessions=tuple(queue_promotion_sessions),
             )
+            if batch.page_size == 0:
+                break
+            self._wake_after_committed_batch(batch.result)
+            actions.extend(batch.result.actions)
+            pending_dispatches.extend(batch.result.pending_dispatches)
+            queue_promotion_sessions.extend(
+                batch.result.queue_promotion_sessions
+            )
+            seen_queue_promotion_sessions.update(
+                batch.result.queue_promotion_sessions
+            )
+            if batch.next_cursor is None or batch.next_cursor == cursor:
+                raise RuntimeError("startup recovery keyset cursor did not advance")
+            cursor = batch.next_cursor
 
-        result = self.transaction_runner.run_write(operation)
+        return StartupRecoveryScanResult(
+            actions=tuple(actions),
+            pending_dispatches=tuple(pending_dispatches),
+            queue_promotion_sessions=tuple(queue_promotion_sessions),
+        )
+
+    def _wake_after_committed_batch(self, result: StartupRecoveryScanResult) -> None:
+        """只在当前 batch commit 成功后同步投递其 matching wake。
+
+        :param result: 已提交 batch 返回的 immutable actions/wakes。
+        :returns: ``None``。
+        :raises Exception: scheduler wake bridge 失败时透传，中止 startup READY。
+        """
+
         if self.dispatch_wakeup_port is not None:
             for pending_dispatch in result.pending_dispatches:
                 self.dispatch_wakeup_port.wake_dispatch(pending_dispatch)
@@ -235,7 +345,6 @@ class StartupRecoveryScanner:
                 len(result.queue_promotion_sessions),
                 ",".join(result.queue_promotion_sessions),
             )
-        return result
 
     def _classify_run(
         self,
@@ -293,10 +402,11 @@ class StartupRecoveryScanner:
             if (
                 run.status is RunStatus.CANCELLING
                 and self.defer_accepted_cancel_to_watchdog
+                and self.dispatch_wakeup_port is not None
                 and _has_accepted_cancel_fact(
                     transaction,
                     self.event_log_store,
-                    run.run_id,
+                    run,
                 )
             ):
                 return _action(
@@ -614,6 +724,35 @@ def _validate_policy(policy: StartupRecoveryPolicy) -> None:
         raise ValueError("policy.recovery_dispatch_limit must be positive")
 
 
+def _validate_batch_size(batch_size: int) -> None:
+    """校验 startup recovery batch size。
+
+    :param batch_size: 待校验单批最大行数。
+    :returns: ``None``。
+    :raises TypeError: batch size 不是严格整数时抛出。
+    :raises ValueError: batch size 非正时抛出。
+    """
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size must be int")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+
+def _keyset_cursor_from_run(run: RunRow) -> NonTerminalRunKeysetCursor:
+    """从已校验 Run row 派生 recovery keyset cursor。
+
+    :param run: 当前 batch 最后一条 Run row。
+    :returns: 对应 accepted sequence/run id keyset。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return NonTerminalRunKeysetCursor(
+        accepted_event_sequence=run.accepted_event_sequence,
+        run_id=run.run_id,
+    )
+
+
 def _collect_process_evidence(
     probe: ProcessLivenessProbe, owner_liveness: HostInstanceRow | None
 ) -> ProcessEvidence | None:
@@ -654,44 +793,20 @@ def _read_current_attempt_and_dispatch(
 def _has_accepted_cancel_fact(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
-    run_id: str,
+    run: RunRow,
 ) -> bool:
     """判断 Run 是否具有完整 accepted active cancel durable facts。
 
     :param transaction: Host transaction。
     :param event_log_store: EventLog primitive。
-    :param run_id: 目标 Run id。
-    :returns: 存在 ``RUN_CANCELLING`` 且能链接到同 Run 的
-        ``CANCEL_REQUESTED`` 时返回 ``True``。
+    :param run: 目标 Run row。
+    :returns: Run row typed link 能指向同 Run 的 ``CANCEL_REQUESTED`` 时返回
+        ``True``。
     """
 
-    cancelling = event_log_store.read_latest_run_event_by_type(
-        transaction,
-        run_id=run_id,
-        event_type=_EVENT_TYPE_RUN_CANCELLING,
-    )
-    if cancelling is None:
-        return False
-    payload: Mapping[str, JsonValue]
-    try:
-        payload = event_payload_object(
-            transaction,
-            cancelling,
-            payload_label=_EVENT_TYPE_RUN_CANCELLING,
-        )
-    except HostDurableError:
-        return False
-    raw_cancel_request_event_id = payload.get("cancel_request_event_id")
-    if not isinstance(raw_cancel_request_event_id, str):
-        return False
-    cancel_requested = event_log_store.read_event_by_id(
-        transaction,
-        raw_cancel_request_event_id,
-    )
     return (
-        cancel_requested is not None
-        and cancel_requested.run_id == run_id
-        and cancel_requested.event_type == _EVENT_TYPE_CANCEL_REQUESTED
+        read_cancel_requested_event_from_run_link(transaction, event_log_store, run)
+        is not None
     )
 
 

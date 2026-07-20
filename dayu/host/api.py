@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import pathlib
 import re
+import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Final, Protocol, TypeAlias, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -42,6 +43,7 @@ from dayu.host.memory import (
     MemoryProjectionPolicy,
     default_memory_projection_policy,
 )
+from dayu.host.queue_policy import parse_run_queue_policy
 from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
 
 if TYPE_CHECKING:
@@ -51,6 +53,24 @@ if TYPE_CHECKING:
         HostStorageUsageReport,
     )
     from dayu.host.wait_adapter import WaitPollerRuntimePolicy
+else:
+
+    @runtime_checkable
+    class WaitPollerRuntimePolicy(Protocol):
+        """Host opener 接收的 wait poller runtime policy 运行时契约。"""
+
+        enabled: bool
+        poll_interval_seconds: float
+        claim_ttl_seconds: float
+        claim_batch_size: int
+        backoff_initial_delay_seconds: float
+        backoff_multiplier: float
+        backoff_max_delay_seconds: float
+        not_ready_observe_interval_seconds: float
+        idle_poll_interval_seconds: float
+        adapter_call_timeout_seconds: float
+        close_drain_timeout_seconds: float
+        max_outstanding_adapter_calls: int
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -132,6 +152,22 @@ def _require_positive_float(value: float, *, field_name: str) -> None:
         raise TypeError(f"{field_name} must be float")
     if value <= 0:
         raise ValueError(f"{field_name} must be positive")
+
+
+def _require_optional_positive_float(
+    value: float | None, *, field_name: str
+) -> None:
+    """校验可选浮点配置值存在时大于零。
+
+    :param value: 待校验的浮点值或 ``None``。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 存在但不是严格数值时抛出。
+    :raises ValueError: ``value`` 存在但小于或等于零时抛出。
+    """
+
+    if value is not None:
+        _require_positive_float(value, field_name=field_name)
 
 
 def _require_path(value: pathlib.Path, *, field_name: str) -> None:
@@ -261,6 +297,86 @@ def _require_graceful_cancel(mode: "CancelMode", *, field_name: str) -> None:
         raise ValueError(f"{field_name} must be graceful")
 
 
+def _validate_wait_poller_policy(policy: WaitPollerRuntimePolicy) -> None:
+    """校验 Host opener wait poller runtime policy。
+
+    :param policy: 待校验的 wait poller runtime policy。
+    :returns: 无返回值。
+    :raises TypeError: ``policy`` 不是运行时可解析的 policy 契约，或字段类型非法时抛出。
+    :raises ValueError: 数值字段不满足正数约束时抛出。
+    """
+
+    if not isinstance(policy, WaitPollerRuntimePolicy):
+        raise TypeError(
+            "OpenHostOptions.wait_poller_policy must be WaitPollerRuntimePolicy"
+        )
+    _require_bool(
+        policy.enabled,
+        field_name="OpenHostOptions.wait_poller_policy.enabled",
+    )
+    _require_positive_float(
+        policy.poll_interval_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.poll_interval_seconds",
+    )
+    _require_positive_float(
+        policy.claim_ttl_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.claim_ttl_seconds",
+    )
+    _require_positive_int(
+        policy.claim_batch_size,
+        field_name="OpenHostOptions.wait_poller_policy.claim_batch_size",
+    )
+    _require_positive_float(
+        policy.backoff_initial_delay_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.backoff_initial_delay_seconds",
+    )
+    _require_positive_float(
+        policy.backoff_multiplier,
+        field_name="OpenHostOptions.wait_poller_policy.backoff_multiplier",
+    )
+    _require_positive_float(
+        policy.backoff_max_delay_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.backoff_max_delay_seconds",
+    )
+    _require_positive_float(
+        policy.not_ready_observe_interval_seconds,
+        field_name=(
+            "OpenHostOptions.wait_poller_policy."
+            "not_ready_observe_interval_seconds"
+        ),
+    )
+    _require_positive_float(
+        policy.idle_poll_interval_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.idle_poll_interval_seconds",
+    )
+    _require_positive_float(
+        policy.adapter_call_timeout_seconds,
+        field_name=(
+            "OpenHostOptions.wait_poller_policy.adapter_call_timeout_seconds"
+        ),
+    )
+    if not math.isfinite(float(policy.adapter_call_timeout_seconds)):
+        raise ValueError(
+            "OpenHostOptions.wait_poller_policy.adapter_call_timeout_seconds "
+            "must be finite"
+        )
+    _require_positive_float(
+        policy.close_drain_timeout_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds",
+    )
+    if not math.isfinite(float(policy.close_drain_timeout_seconds)):
+        raise ValueError(
+            "OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds "
+            "must be finite"
+        )
+    _require_positive_int(
+        policy.max_outstanding_adapter_calls,
+        field_name=(
+            "OpenHostOptions.wait_poller_policy.max_outstanding_adapter_calls"
+        ),
+    )
+
+
 class SessionStatus(StrEnum):
     """Session 生命周期状态。
 
@@ -292,6 +408,30 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     LOST = "lost"
+
+
+TERMINAL_RUN_STATUSES: Final[frozenset[RunStatus]] = frozenset(
+    {
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    }
+)
+"""Host public Run 终态集合。"""
+
+
+def is_terminal_run_status(status: RunStatus) -> bool:
+    """判断 Host public Run 状态是否为终态。
+
+    :param status: Host public ``RunStatus``。
+    :returns: 终态返回 ``True``，非终态返回 ``False``。
+    :raises TypeError: ``status`` 不是 ``RunStatus`` 时抛出。
+    """
+
+    if not isinstance(status, RunStatus):
+        raise TypeError("status must be RunStatus")
+    return status in TERMINAL_RUN_STATUSES
 
 
 class AttemptStatus(StrEnum):
@@ -1163,6 +1303,81 @@ class OpenHostOptions:
             self.enable_truncation_manager,
             field_name="OpenHostOptions.enable_truncation_manager",
         )
+        if self.wait_poller_policy is not None:
+            _validate_wait_poller_policy(self.wait_poller_policy)
+
+
+@dataclass(frozen=True, slots=True)
+class OpenHostAdminOptions:
+    """``open_host_admin`` 的纯 durable 管理构造选项。
+
+    该契约只包含打开 Host durable store 所需的存储参数，不包含 scheduler、
+    recovery、lane、worker、scene、tool、model 或 secret 输入。
+
+    :param db_path: Host durable SQLite 数据库路径。
+    :param artifact_root: Host artifact 根目录。
+    :param create_parent_dirs: 打开 store / artifact 前是否创建父目录。
+    :param sqlite_busy_timeout_seconds: durable SQLite busy timeout 秒数。
+    :param sqlite_write_busy_retry_count: 写事务 busy 重试次数。
+    :param sqlite_write_retry_initial_delay_seconds: 首次写重试等待秒数。
+    :param sqlite_write_retry_backoff_multiplier: 写重试退避倍率。
+    :param sqlite_write_retry_max_delay_seconds: 写重试最大等待秒数。
+    :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
+    """
+
+    db_path: pathlib.Path
+    artifact_root: pathlib.Path
+    create_parent_dirs: bool
+    sqlite_busy_timeout_seconds: float
+    sqlite_write_busy_retry_count: int
+    sqlite_write_retry_initial_delay_seconds: float
+    sqlite_write_retry_backoff_multiplier: float
+    sqlite_write_retry_max_delay_seconds: float
+    payload_inline_threshold_bytes: int
+
+    def __post_init__(self) -> None:
+        """校验纯 durable 管理构造选项。
+
+        :returns: ``None``。
+        :raises TypeError: 路径、布尔或数值字段类型非法时抛出。
+        :raises ValueError: timeout、重试或 payload 阈值非法时抛出。
+        """
+
+        _require_path(self.db_path, field_name="OpenHostAdminOptions.db_path")
+        _require_path(
+            self.artifact_root,
+            field_name="OpenHostAdminOptions.artifact_root",
+        )
+        _require_bool(
+            self.create_parent_dirs,
+            field_name="OpenHostAdminOptions.create_parent_dirs",
+        )
+        _require_positive_float(
+            self.sqlite_busy_timeout_seconds,
+            field_name="OpenHostAdminOptions.sqlite_busy_timeout_seconds",
+        )
+        _require_non_negative_int(
+            self.sqlite_write_busy_retry_count,
+            field_name="OpenHostAdminOptions.sqlite_write_busy_retry_count",
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_initial_delay_seconds,
+            field_name=(
+                "OpenHostAdminOptions.sqlite_write_retry_initial_delay_seconds"
+            ),
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_backoff_multiplier,
+            field_name="OpenHostAdminOptions.sqlite_write_retry_backoff_multiplier",
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_max_delay_seconds,
+            field_name="OpenHostAdminOptions.sqlite_write_retry_max_delay_seconds",
+        )
+        _require_positive_int(
+            self.payload_inline_threshold_bytes,
+            field_name="OpenHostAdminOptions.payload_inline_threshold_bytes",
+        )
 
 
 class HostApiErrorCode(StrEnum):
@@ -1177,6 +1392,7 @@ class HostApiErrorCode(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     PERMISSION_DENIED = "permission_denied"
     UNSUPPORTED_OPERATION = "unsupported_operation"
+    UNAVAILABLE = "unavailable"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -1213,7 +1429,35 @@ class SteerConflictDetail:
         )
 
 
-HostApiErrorDetail: TypeAlias = SteerConflictDetail
+@dataclass(frozen=True, slots=True)
+class HostUnavailableDetail:
+    """execution Host 暂不可用的稳定 typed detail。
+
+    :param component: 首个 fatal 的稳定组件标识。
+    :param reason_code: 不含原始异常消息的稳定原因码。
+    """
+
+    component: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        """校验 unavailable detail 字段非空。
+
+        :returns: ``None``。
+        :raises ValueError: component 或 reason_code 为空时抛出。
+        """
+
+        _require_non_empty(
+            self.component,
+            field_name="HostUnavailableDetail.component",
+        )
+        _require_non_empty(
+            self.reason_code,
+            field_name="HostUnavailableDetail.reason_code",
+        )
+
+
+HostApiErrorDetail: TypeAlias = SteerConflictDetail | HostUnavailableDetail
 
 
 @dataclass(frozen=True, slots=True)
@@ -1815,6 +2059,7 @@ class StartRunRequest:
             field_name="StartRunRequest.execution_target",
         )
         _require_non_empty(self.queue_policy, field_name="StartRunRequest.queue_policy")
+        parse_run_queue_policy(self.queue_policy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2120,9 +2365,14 @@ class TerminalResultSummary:
         """校验终态结果摘要引用字段。
 
         :returns: 无返回值。
-        :raises ValueError: 可选引用或摘要存在但为空时抛出。
+        :raises TypeError: ``status`` 类型非法时抛出。
+        :raises ValueError: ``status`` 不是终态，或可选引用、摘要存在但为空时抛出。
         """
 
+        if not isinstance(self.status, RunStatus):
+            raise TypeError("TerminalResultSummary.status must be RunStatus")
+        if not is_terminal_run_status(self.status):
+            raise ValueError("TerminalResultSummary.status must be terminal")
         _require_optional_non_empty(
             self.summary_ref, field_name="TerminalResultSummary.summary_ref"
         )
@@ -2316,11 +2566,34 @@ class RunSnapshot:
         """校验 Run 快照 id 字段。
 
         :returns: 无返回值。
-        :raises ValueError: id 字段为空，或 source relation 与 source id 不一致时抛出。
+        :raises TypeError: ``status`` 或终态摘要字段类型非法时抛出。
+        :raises ValueError: id 字段为空，source relation 与 source id 不一致，
+            或终态 status 与终态摘要不一致时抛出。
         """
 
         _require_non_empty(self.run_id, field_name="RunSnapshot.run_id")
         _require_non_empty(self.session_id, field_name="RunSnapshot.session_id")
+        if not isinstance(self.status, RunStatus):
+            raise TypeError("RunSnapshot.status must be RunStatus")
+        if self.terminal_result_summary is not None and not isinstance(
+            self.terminal_result_summary, TerminalResultSummary
+        ):
+            raise TypeError(
+                "RunSnapshot.terminal_result_summary must be TerminalResultSummary"
+            )
+        if is_terminal_run_status(self.status):
+            if self.terminal_result_summary is None:
+                raise ValueError(
+                    "RunSnapshot.terminal_result_summary is required for terminal status"
+                )
+            if self.terminal_result_summary.status is not self.status:
+                raise ValueError(
+                    "RunSnapshot.terminal_result_summary.status must match status"
+                )
+        elif self.terminal_result_summary is not None:
+            raise ValueError(
+                "RunSnapshot.terminal_result_summary requires terminal status"
+            )
         _require_optional_non_empty(
             self.current_attempt_id,
             field_name="RunSnapshot.current_attempt_id",
@@ -2534,6 +2807,7 @@ class HostActivityKind(StrEnum):
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION = "context_compaction"
     PROVIDER_DIAGNOSTIC = "provider_diagnostic"
+    PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
 
 
 class HostActivityStatus(StrEnum):
@@ -2736,6 +3010,10 @@ class HostFinalAnswerView:
 
         if not isinstance(self.content, str):
             raise TypeError("HostFinalAnswerView.content must be str")
+        _require_non_empty(
+            self.content,
+            field_name="HostFinalAnswerView.content",
+        )
         _require_bool(self.filtered, field_name="HostFinalAnswerView.filtered")
         _require_bool(self.degraded, field_name="HostFinalAnswerView.degraded")
         _require_optional_non_empty(
@@ -3155,6 +3433,10 @@ def _validate_outbox_terminal_payload(item: OutboxTerminalItem) -> None:
     """
 
     if item.terminal_status is HostTerminalStatus.SUCCEEDED:
+        if item.final_answer is None:
+            raise ValueError(
+                "OutboxTerminalItem succeeded item requires final_answer"
+            )
         if item.error_message is not None or item.cancel_reason is not None:
             raise ValueError(
                 "OutboxTerminalItem succeeded item cannot carry error or cancel"
@@ -3162,7 +3444,7 @@ def _validate_outbox_terminal_payload(item: OutboxTerminalItem) -> None:
         return
     if item.final_answer is not None:
         raise ValueError(
-            "OutboxTerminalItem failed or cancelled item must not carry final_answer"
+            "OutboxTerminalItem failed, cancelled or lost item must not carry final_answer"
         )
 
 
@@ -3269,6 +3551,82 @@ class HostClosedError(Exception):
         super().__init__(message)
 
 
+class HostAdmin(Protocol):
+    """Service 使用的异步 Host durable 管理协议。
+
+    该协议只承诺列表、清理与存储维护能力；它不继承 execution ``Host``，
+    也不暴露 submit、cancel、watch、scheduler 或 worker 生命周期。
+    """
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """读取单个 Session snapshot。
+
+        :param session_id: 目标 Session id。
+        :returns: durable truth 生成的 Session snapshot。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def list_sessions(self) -> ListSessionsResult:
+        """读取全部未 purge Session 的列表摘要。
+
+        :returns: durable truth 生成的 Session 列表结果。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> PurgeSessionResult:
+        """清理已关闭且所有 Run 已终态的 Session 本地事实。
+
+        :param session_id: 目标 Session id。
+        :param request: purge session 请求。
+        :returns: purge tombstone ref 与删除计数摘要。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: purge 前置条件不满足、幂等冲突或写入失败时抛出。
+        """
+
+        ...
+
+    async def report_storage_usage(self) -> HostStorageUsageReport:
+        """读取 Host durable storage usage report。
+
+        :returns: storage usage report。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def run_storage_maintenance(
+        self,
+        request: HostStorageMaintenanceRequest,
+    ) -> HostStorageMaintenanceResult:
+        """执行 Host storage maintenance。
+
+        :param request: maintenance 请求。
+        :returns: maintenance 结果。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: maintenance 执行失败时抛出。
+        """
+
+        ...
+
+    async def close(self) -> None:
+        """关闭当前 admin handle lifecycle。
+
+        :returns: ``None``。
+        :raises Exception: actor durable chain 关闭失败时透传。
+        """
+
+        ...
+
+
 class Host(Protocol):
     """普通 Service 使用的异步 Host handle 协议。
 
@@ -3305,16 +3663,6 @@ class Host(Protocol):
         :returns: Session snapshot。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: Session 不存在或读取失败时抛出。
-        """
-
-        ...
-
-    async def list_sessions(self) -> ListSessionsResult:
-        """读取全部未 purge Session 的列表摘要。
-
-        :returns: durable truth 生成的 Session 列表结果。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: durable 读取失败时抛出。
         """
 
         ...
@@ -3454,48 +3802,6 @@ class Host(Protocol):
 
         ...
 
-    async def purge_session(
-        self, session_id: str, request: PurgeSessionRequest
-    ) -> PurgeSessionResult:
-        """清理已关闭且所有 Run 已终态的 Session 本地事实。
-
-        :param session_id: 目标 Session id。
-        :param request: purge session 请求。
-        :returns: purge tombstone ref 与删除计数摘要。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: purge 前置条件不满足、幂等冲突或写入失败时抛出。
-        """
-
-        ...
-
-    async def report_storage_usage(self) -> HostStorageUsageReport:
-        """读取 Host durable storage usage report。
-
-        :returns: storage usage report。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: durable 读取失败时抛出。
-        """
-
-        ...
-
-    async def run_storage_maintenance(
-        self,
-        request: HostStorageMaintenanceRequest,
-    ) -> HostStorageMaintenanceResult:
-        """执行 Host storage maintenance。
-
-        :param request: maintenance 请求。
-            默认 dry-run 不删除文件；当
-            ``request.reclaim_orphan_artifacts`` 为 ``True`` 时，会执行破坏性
-            orphan artifact 回收。
-        :returns: maintenance 结果。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: maintenance 读取、扫描、checkpoint 或 orphan artifact
-            回收失败时抛出。
-        """
-
-        ...
-
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
 
@@ -3534,6 +3840,7 @@ __all__ = [
     "HOST_EVENT_STREAM_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
+    "TERMINAL_RUN_STATUSES",
     "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
     "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
     "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -3548,6 +3855,7 @@ __all__ = [
     "HostApiErrorDetail",
     "HostCallContext",
     "Host",
+    "HostAdmin",
     "HostClosedError",
     "HostActivityCounts",
     "HostActivityKind",
@@ -3563,11 +3871,13 @@ __all__ = [
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostThinkingView",
+    "HostUnavailableDetail",
     "ListSessionsResult",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
     "OperationContext",
+    "OpenHostAdminOptions",
     "OpenHostOptions",
     "OrdinaryRunExecutionBaseline",
     "OutboxProjectionStatus",
@@ -3601,4 +3911,5 @@ __all__ = [
     "WaitAdapterKey",
     "WaitProviderStatusRef",
     "WaitResolutionSource",
+    "is_terminal_run_status",
 ]

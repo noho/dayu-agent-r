@@ -217,6 +217,8 @@ def _metadata_boundary_request() -> AgentRunRequest:
             continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=(),
         tool_executor=_MetadataBoundaryToolExecutor(),
@@ -250,7 +252,6 @@ async def test_agent_event_metadata_does_not_carry_log_records(
                 RunnerContentCompletedData(
                     content="answer",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _runner_event(
@@ -281,14 +282,25 @@ def test_usage_reported_data_uses_split_token_fields() -> None:
     """Engine 侧用量上报事件必须使用拆分字段，不允许整 dict。"""
 
     fields = _field_names(UsageReportedData)
-    assert {"prompt_tokens", "completion_tokens", "total_tokens"}.issubset(fields)
+    assert {
+        "iteration_id",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "provider_request_id",
+    } == fields
 
 
 def test_runner_usage_recorded_data_uses_split_token_fields() -> None:
     """Runner 侧用量事件必须使用拆分字段。"""
 
     fields = _field_names(RunnerUsageRecordedData)
-    assert {"prompt_tokens", "completion_tokens", "total_tokens"} == fields
+    assert {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "provider_request_id",
+    } == fields
 
 
 def test_provider_protocol_error_engine_data_has_explicit_fields() -> None:
@@ -338,8 +350,8 @@ def test_partial_tool_call_summary_excludes_raw_arguments() -> None:
     assert "arguments" not in fields
 
 
-def test_runner_content_completed_data_has_finish_reason() -> None:
-    """正文完成事件必须显式承载 ``finish_reason``。"""
+def test_runner_content_completed_data_excludes_finish_reason() -> None:
+    """正文完成事件不得承载 Runner 完成原因。"""
 
     fields = _field_names(RunnerContentCompletedData)
-    assert "finish_reason" in fields
+    assert fields == {"content", "reasoning_content"}

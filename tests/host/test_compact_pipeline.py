@@ -8,6 +8,7 @@ import pytest
 
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole
 from dayu.host.api import RunStatus
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
     PreDispatchCompactMaterialView,
@@ -30,11 +31,12 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
+    CompactReadableViewVNext,
     CompactMaterialSection,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     CompactQualityCheckResultVNext,
+    ReadableFactItemVNext,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_fallback import (
@@ -46,6 +48,10 @@ from dayu.host.context_policy import (
     context_budget_policy_from_threshold_tokens,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.evidence import (
+    AcceptedToolEvidenceLLMMaterial,
+    render_accepted_tool_evidence_for_llm,
+)
 from dayu.host.durable.state import RunRow
 from dayu.host.memory import (
     default_memory_projection_policy,
@@ -329,15 +335,21 @@ def test_ordinary_protected_raw_tail_selects_recent_group_and_memory_dedupes() -
     assert deduped.messages == ()
 
 
-def test_ordinary_protected_raw_tail_filters_internal_evidence_source() -> None:
-    """ordinary raw-tail evidence message 不暴露内部 provenance refs。"""
+def test_ordinary_protected_raw_tail_consumes_projection_cleaned_source() -> None:
+    """ordinary raw-tail evidence message 消费 projection-cleaned source。"""
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
+    material = AcceptedToolEvidenceLLMMaterial(
+        tool_name="fins.search",
+        query_text="query new",
+        source_text="filing page 12",
+        result_text="raw evidence new",
+    )
     evidence = run_input_material_block(
         block_id="evidence-new",
         section=CompactMaterialSection.EVIDENCE_MATERIAL,
         kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-        text="raw evidence new",
+        text=render_accepted_tool_evidence_for_llm(material),
         canonical_source_refs=("evidence:new",),
         event_sequence=4,
         turn_group_id="run-new",
@@ -345,12 +357,7 @@ def test_ordinary_protected_raw_tail_filters_internal_evidence_source() -> None:
         tool_result_event_ref="event-tool-result-new",
         tool_call_event_ref="event-tool-call-new",
         payload_refs=("payload-new",),
-        readable_tool_name="fins.search",
-        readable_query_text="query new",
-        readable_source_text=(
-            "event:event-tool-result-new, filing page 12, "
-            "payload:payload-new"
-        ),
+        accepted_tool_evidence=material,
     )
     raw_tail_snapshot = replace(
         snapshot,
@@ -368,7 +375,7 @@ def test_ordinary_protected_raw_tail_filters_internal_evidence_source() -> None:
         if message.content is not None
     )
 
-    assert any("source=filing page 12" in content for content in contents)
+    assert any("业务来源：filing page 12" in content for content in contents)
     assert all("event-tool-result-new" not in content for content in contents)
     assert all("payload-new" not in content for content in contents)
 
@@ -423,6 +430,18 @@ def _material_view(*, current_input_sequence: int) -> PreDispatchCompactMaterial
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
                 text="previous evidence fact",
             ),
+        ),
+        previous_compacted_readable_view=CompactReadableViewVNext(
+            session_summary="previous summary",
+            evidence_backed_facts=(
+                ReadableFactItemVNext(
+                    source_label="P2",
+                    claim_text="previous evidence fact",
+                ),
+            ),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity_items=(),
         ),
         current_input_text="current user input",
         source_boundary=boundary,
@@ -490,11 +509,17 @@ def _evidence_block(
     :returns: run input material block。
     """
 
+    material = AcceptedToolEvidenceLLMMaterial(
+        tool_name="fins.search",
+        query_text=f"query {suffix}",
+        source_text=f"source {suffix}",
+        result_text=f"raw evidence {suffix}",
+    )
     return run_input_material_block(
         block_id=f"evidence-{suffix}",
         section=CompactMaterialSection.EVIDENCE_MATERIAL,
         kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-        text=f"raw evidence {suffix}",
+        text=render_accepted_tool_evidence_for_llm(material),
         canonical_source_refs=(f"evidence:{suffix}",),
         event_sequence=event_sequence,
         turn_group_id=turn_group_id,
@@ -502,9 +527,7 @@ def _evidence_block(
         tool_result_event_ref=f"event-tool-result-{suffix}",
         tool_call_event_ref=f"event-tool-call-{suffix}",
         payload_refs=(f"payload-{suffix}",),
-        readable_tool_name="fins.search",
-        readable_query_text=f"query {suffix}",
-        readable_source_text=f"source {suffix}",
+        accepted_tool_evidence=material,
     )
 
 
@@ -553,11 +576,12 @@ def _run_row(*, input_event_sequence: int) -> RunRow:
         started_event_sequence=None,
         terminal_event_id=None,
         terminal_event_sequence=None,
+        cancel_request_event_id=None,
         current_attempt_id=None,
         source_run_id=None,
         source_run_relation=None,
         execution_target="local",
-        queue_policy="fifo",
+        queue_policy=RunQueuePolicy.QUEUE,
         created_at="2026-06-19T00:00:00.000000Z",
         updated_at="2026-06-19T00:00:00.000000Z",
         terminal_at=None,
@@ -594,7 +618,6 @@ def _candidate_with_evidence_fact() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="accepted fact",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
         ),
         answer_anchors=(),

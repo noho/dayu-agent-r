@@ -181,13 +181,25 @@ def test_compute_retry_decision_capped_backoff() -> None:
     assert d.sleep_seconds == 5.0
 
 
-def test_compute_retry_decision_exhausted_when_attempt_exceeds_max() -> None:
-    """``attempt > max_retries`` → 不重试。"""
+def test_compute_retry_decision_exhausted_after_retry_count_used() -> None:
+    """``max_retries`` 表示首败后的重试次数。"""
 
     d = compute_retry_decision(
         error_code=RunnerHTTPErrorCode.SERVER_ERROR,
         attempt=2,
         max_retries=1,
+        retry_after_seconds=None,
+    )
+    assert d.should_retry is False
+
+
+def test_compute_retry_decision_zero_max_retries_disables_retry() -> None:
+    """``max_retries=0`` 时首次失败后不得重试。"""
+
+    d = compute_retry_decision(
+        error_code=RunnerHTTPErrorCode.SERVER_ERROR,
+        attempt=1,
+        max_retries=0,
         retry_after_seconds=None,
     )
     assert d.should_retry is False
@@ -215,12 +227,12 @@ async def test_runner_sleeps_between_retries(
     from dayu.engine.contracts.runner_events import RunnerEventType
     from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+    from tests.host.fake_cancellation import ControllableCancellationToken
     from tests.engine.runners.openai._factories import (
         make_options,
         make_spec,
     )
     from tests.engine.runners.openai._fakes import (
-        FakeCancellationToken,
         FakeResponseSpec,
         FakeSession,
     )
@@ -235,7 +247,7 @@ async def test_runner_sleeps_between_retries(
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     runner = AsyncOpenAIRunner(
         spec=make_spec(max_retries=2),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     # 第一次 429 with Retry-After=3 → sleep 3

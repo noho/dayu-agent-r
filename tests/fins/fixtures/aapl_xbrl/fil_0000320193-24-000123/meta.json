@@ -3,6 +3,7 @@
   "internal_document_id": "0000320193-24-000123",
   "accession_number": "0000320193-24-000123",
   "ingest_method": "download",
+  "source_provider": "sec_edgar",
   "ticker": "AAPL",
   "company_id": "320193",
   "form_type": "10-K",

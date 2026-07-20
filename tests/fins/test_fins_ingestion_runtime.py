@@ -20,6 +20,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.documents.processors.source import Source
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.enums import SourceKind
@@ -31,29 +32,36 @@ from dayu.fins.direct_events import (
     FinsOperationKind,
     FinsResultStatus,
 )
+from dayu.fins.direct_event_text import (
+    direct_download_no_source_documents_message,
+    direct_failure_message,
+    direct_preprocess_no_requested_documents_message,
+    direct_progress_message,
+    direct_result_title,
+    direct_upload_failed_status_message,
+    direct_upload_runtime_unavailable_message,
+    wait_cancelled_hint,
+    wait_cancelled_message,
+    wait_failed_hint,
+)
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
     FinsIngestionJobEventRecord,
     FinsIngestionJobEventType,
 )
-from dayu.fins.ingestion.wait_adapter import FinsIngestionWaitPollAdapter
-from dayu.fins.ingestion.wait_adapter import FINS_INGESTION_WAIT_ADAPTER_KEY
 from dayu.fins.ingestion.observation_handle import (
-    FinsObservationHandle,
     FinsObservationStatus,
 )
-from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
-from dayu.host.durable.state import (
-    ExternalJobRef,
-    WaitRecordRow,
-    WaitRecordStatus,
-    WaitResumePolicy,
-)
-from dayu.host.api import ResolveWaitFailedOutcome
-from dayu.host.wait_adapter import WaitPollReady
 from dayu.fins.domain.document_models import (
+    BatchToken,
     CompanyMeta,
+    FinsSourceProvider,
+    FinsIngestMethod,
+    ProcessedCreateRequest,
+    RejectedFilingArtifactUpsertRequest,
+    SourceDocumentRevision,
     SourceDocumentUpsertRequest,
+    SourceHandle,
     now_iso8601,
 )
 from dayu.fins.ingestion_runtime import (
@@ -68,12 +76,14 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionJobStatus,
     FinsPreprocessRequest,
     FinsPreprocessResultSummary,
+    FinsPreprocessResultStatus,
     FinsRejectedFilingDownloadArtifact,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
+    FinsUploadPipelineResult,
     FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
@@ -82,15 +92,240 @@ from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
 from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    DocumentBlobRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
+    FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     SourceDocumentRepositoryProtocol,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+
+
+class _CommitFailingDownloadBatchingRepository(FsBatchingRepository):
+    """模拟 storage 消费 token 后抛出 generic download commit 异常。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet) -> None:
+        """初始化 commit failure batching spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.caller_rollback_calls = 0
+
+    def commit_batch(self, batch: BatchToken) -> None:
+        """由 storage owner 回滚并消费 token 后抛出 commit 主异常。"""
+
+        FsBatchingRepository.rollback_batch(self, batch)
+        raise OSError("forced generic commit failure")
+
+    def rollback_batch(self, batch: BatchToken) -> None:
+        """记录不应发生的 caller 二次 rollback。"""
+
+        self.caller_rollback_calls += 1
+        super().rollback_batch(batch)
+
+
+class _RollbackFailingIngestionBatchingRepository(FsBatchingRepository):
+    """执行真实 ingestion rollback 后注入指定次级失败并记录调用次数。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        rollback_error: BaseException,
+    ) -> None:
+        """初始化 rollback failure batching spy。
+
+        Args:
+            workspace_root: 测试工作区根目录。
+            repository_set: 与 ingestion repositories 共享的 repository set。
+            rollback_error: 真实 rollback 完成后抛出的次级异常。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 仓储初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.rollback_error = rollback_error
+        self.rollback_calls = 0
+
+    def rollback_batch(self, batch: BatchToken) -> None:
+        """执行并记录真实 rollback，随后抛出预置次级异常。
+
+        Args:
+            batch: 当前 shared core 登记的 open batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 rollback 次级异常。
+            OSError: 真实 rollback 失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        self.rollback_calls += 1
+        super().rollback_batch(batch)
+        raise self.rollback_error
+
+
+class _RejectedArtifactUpsertFailure:
+    """在 rejected artifact owner mutation 边界抛出指定 operation 异常。"""
+
+    def __init__(self, operation_error: BaseException) -> None:
+        """保存需要原样抛出的 operation 异常。
+
+        Args:
+            operation_error: rejected artifact upsert 时抛出的主异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.operation_error = operation_error
+
+    def __call__(
+        self,
+        request: RejectedFilingArtifactUpsertRequest,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """接收真实 mutation 输入后抛出预置 operation 异常。
+
+        Args:
+            request: rejected filing artifact upsert 请求。
+            batch: caller-owned batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 operation 异常。
+        """
+
+        del request, batch
+        raise self.operation_error
+
+
+class _ProcessedCreateFailure:
+    """在 preprocess processed-create owner 边界抛出指定 operation 异常。"""
+
+    def __init__(self, operation_error: BaseException) -> None:
+        """保存需要原样抛出的 operation 异常。
+
+        Args:
+            operation_error: processed create 时抛出的主异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.operation_error = operation_error
+
+    def __call__(
+        self,
+        request: ProcessedCreateRequest,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """接收真实 preprocess mutation 输入后抛出预置 operation 异常。
+
+        Args:
+            request: processed create 请求。
+            batch: caller-owned batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 operation 异常。
+        """
+
+        del request, batch
+        raise self.operation_error
+
+
+def test_direct_event_text_helper_owns_result_titles_and_failure_messages() -> None:
+    """direct 文案 helper 应统一选择 result 标题与失败说明。"""
+
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            status=FinsResultStatus.SUCCESS,
+        )
+        == "操作完成"
+    )
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            status=FinsResultStatus.FAILURE,
+        )
+        == "下载失败"
+    )
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.PROCESS_MATERIAL,
+            status=FinsResultStatus.FAILURE,
+        )
+        == "预处理失败"
+    )
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.UPLOAD_FILING,
+            status=FinsResultStatus.CANCELLED,
+        )
+        == "操作已取消"
+    )
+    assert (
+        direct_failure_message(
+            error_kind=FinsErrorKind.STORAGE,
+            fallback_message=None,
+        )
+        == "财报资料读写失败"
+    )
+    assert (
+        direct_failure_message(
+            error_kind=FinsErrorKind.PROVIDER,
+            fallback_message="  provider failed safely  ",
+        )
+        == "provider failed safely"
+    )
+    assert direct_download_no_source_documents_message() == "下载请求未写入任何源文档"
+    assert direct_preprocess_no_requested_documents_message() == "没有任何请求文档完成预处理"
+    assert direct_upload_failed_status_message() == "上传运行时返回失败状态"
+    assert direct_upload_runtime_unavailable_message() == "当前环境未装配财报上传能力"
+
+
+def test_direct_event_text_helper_owns_progress_and_wait_copy() -> None:
+    """direct/wait 文案 helper 应输出业务可读文案且不暴露内部等待术语。"""
+
+    assert direct_progress_message(stage="download.preparing") == "下载准备中"
+    assert direct_progress_message(stage="download.completed_with_failures") == "下载已完成，存在失败候选"
+    assert direct_progress_message(stage="preprocess.document_not_supported") == "预处理源文档不支持"
+    assert direct_progress_message(stage="upload.completed_with_failures") == "上传已完成，存在失败"
+    assert direct_progress_message(stage="unknown.stage") == "财报处理进度已更新"
+    assert wait_failed_hint() == "请检查财报处理摘要，必要时重新发起对应操作。"
+    assert wait_cancelled_message() == "财报处理已取消。"
+    assert wait_cancelled_hint() == "如仍需要该财报资料，请重新发起对应操作。"
+    visible_wait_text = " ".join(
+        (wait_failed_hint(), wait_cancelled_message(), wait_cancelled_hint())
+    )
+    for forbidden in ("Host", "Engine", "wait", "poll", "runtime", "Fins ingestion"):
+        assert forbidden not in visible_wait_text
 
 
 class _HoldingExecutor(FinsIngestionExecutor):
@@ -285,6 +520,8 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
                 "fiscal_year": 2024,
                 "fiscal_period": "FY",
                 "amended": False,
+                "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+                "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
             },
             files=(
                 FinsDownloadedFile(
@@ -449,6 +686,67 @@ class _CancellationAwareDownloadAdapter(FinsSourceDownloadAdapter):
         )
 
 
+class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
+    """以同步 barrier 观察 direct consumer abort 取消因果链的 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化 adapter 的跨线程观察信号。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.entered = Event()
+        self.allow_cancellation_check = Event()
+        self.cancellation_checks: tuple[bool, ...] = ()
+        self.late_progress_returned = Event()
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """等待 consumer abort，再观察取消并尝试一次 late progress。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            固定 persisted summary。
+
+        Raises:
+            TimeoutError: 测试没有在边界内释放 cancellation check 时抛出。
+            ValueError: late progress 事件违反 typed contract 时抛出。
+        """
+
+        self.entered.set()
+        if not self.allow_cancellation_check.wait(timeout=1.0):
+            raise TimeoutError("consumer abort cancellation check was not released")
+        self.cancellation_checks = self.cancellation_checks + (
+            request.cancellation_checker(),
+        )
+        if request.progress_sink is not None:
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.late_after_abort",
+                    message="consumer abort 后的迟到进度",
+                    document_id="fil-late-after-abort",
+                    file_name="late-after-abort.htm",
+                )
+            )
+        self.late_progress_returned.set()
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=1,
+                written_document_ids=("fil-late-after-abort",),
+            ),
+        )
+
+
 class _FakeUploadRunner(FinsUploadRunner):
     """测试用确定性上传 runner。"""
 
@@ -497,20 +795,26 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
     def __init__(
         self,
         *,
+        batching_repository: BatchingRepositoryProtocol,
         source_repository: SourceDocumentRepositoryProtocol,
+        blob_repository: DocumentBlobRepositoryProtocol,
         document_id: str,
     ) -> None:
         """初始化 runner。
 
         Args:
+            batching_repository: batch lifecycle 唯一仓储。
             source_repository: Fins 源文档仓储协议实现。
+            blob_repository: Fins blob 仓储协议实现。
             document_id: 测试写入的源文档 id。
 
         Returns:
             无。
         """
 
+        self.batching_repository = batching_repository
         self.source_repository = source_repository
+        self.blob_repository = blob_repository
         self.document_id = document_id
         self.artifact_written = Event()
         self.allow_finish = Event()
@@ -538,13 +842,27 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         """
 
         self.requests = self.requests + (request,)
-        self.source_repository.create_source_document(
-            SourceDocumentUpsertRequest(
+        batch = self.batching_repository.begin_batch(request.ticker)
+        try:
+            filename = f"{self.document_id}.md"
+            file_meta = self.blob_repository.store_file(
+                SourceHandle(
+                    ticker=request.ticker,
+                    document_id=self.document_id,
+                    source_kind=SourceKind.FILING.value,
+                ),
+                filename,
+                io.BytesIO(b"# observed upload fixture"),
+                batch=batch,
+                content_type="text/markdown",
+            )
+            self.source_repository.create_source_document(
+                SourceDocumentUpsertRequest(
                 ticker=request.ticker,
                 document_id=self.document_id,
                 internal_document_id=self.document_id,
                 form_type="10-K",
-                primary_document=f"{self.document_id}.md",
+                primary_document=filename,
                 meta={
                     "fiscal_year": 2024,
                     "fiscal_period": "FY",
@@ -552,10 +870,17 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                 },
-            ),
-            SourceKind.FILING,
-        )
+                files=[file_meta],
+                ),
+                SourceKind.FILING,
+                batch=batch,
+            )
+        except BaseException:
+            self.batching_repository.rollback_batch(batch)
+            raise
+        self.batching_repository.commit_batch(batch)
         self.artifact_written.set()
         self.allow_finish.wait(timeout=1.0)
         self.cancellation_checks = self.cancellation_checks + (cancellation_checker(),)
@@ -1115,6 +1440,256 @@ def test_start_download_persists_queued_record_and_uses_public_ticker_normalizat
     assert len(executor.operations) == 1
 
 
+def test_store_downloaded_document_overwrite_failure_rolls_back_target_scope(tmp_path: Path) -> None:
+    """download overwrite 单文档写入失败时应保留旧目标和非目标文档。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    _add_unmatched_source_documents(workspace_root=workspace_root, count=1)
+    runtime = _build_ingestion_runtime(workspace_root, executor=_HoldingExecutor())
+    old_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING)
+    non_target_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10q-00", SourceKind.FILING)
+    document = FinsDownloadedSourceDocument(
+        source_kind=SourceKind.FILING,
+        document_id="aapl-2024-10k",
+        internal_document_id="aapl-2024-10k-new",
+        form_type="10-K",
+        primary_document="aapl-2024-10k-new.md",
+        meta={
+            "form_type": "10-K",
+            "filing_date": "2025-11-01",
+            "report_date": "2025-09-28",
+            "fiscal_year": 2025,
+            "fiscal_period": "FY",
+            "amended": False,
+        },
+        files=(
+            FinsDownloadedFile(
+                filename="",
+                content=b"broken",
+                content_type="text/markdown",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="filename 不能为空"):
+        runtime._store_downloaded_document(
+            ticker="AAPL",
+            document=document,
+            overwrite_existing=True,
+            rebuild_processed=False,
+        )
+
+    assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING) == old_meta
+    assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10q-00", SourceKind.FILING) == non_target_meta
+
+
+def test_store_downloaded_document_create_failure_leaves_document_absent(tmp_path: Path) -> None:
+    """generic download create 的 blob 校验失败必须回滚 source 与 blob。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = _build_ingestion_runtime(workspace_root, executor=_HoldingExecutor())
+    document = FinsDownloadedSourceDocument(
+        source_kind=SourceKind.FILING,
+        document_id="aapl-new-10k",
+        internal_document_id="aapl-new-10k",
+        form_type="10-K",
+        primary_document="aapl-new-10k.md",
+        meta={
+            "form_type": "10-K",
+            "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+            "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+        },
+        files=(FinsDownloadedFile(filename="", content=b"broken"),),
+    )
+
+    with pytest.raises(ValueError, match="filename 不能为空"):
+        runtime._store_downloaded_document(
+            ticker="AAPL",
+            document=document,
+            overwrite_existing=False,
+            rebuild_processed=False,
+        )
+
+    with pytest.raises(FileNotFoundError):
+        runtime.source_repository.get_source_meta(
+            "AAPL",
+            "aapl-new-10k",
+            SourceKind.FILING,
+        )
+
+
+def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_path: Path) -> None:
+    """generic commit 失败后 caller 不得对 storage-owned token 二次 rollback。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = _CommitFailingDownloadBatchingRepository(workspace_root, repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=batching_repository,
+        source_repository=source_repository,
+        blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processed_repository=FsProcessedDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=_HoldingExecutor(),
+    )
+    document = FinsDownloadedSourceDocument(
+        source_kind=SourceKind.FILING,
+        document_id="aapl-commit-failed",
+        internal_document_id="aapl-commit-failed",
+        form_type="10-K",
+        primary_document="report.md",
+        meta={
+            "form_type": "10-K",
+            "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+            "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+        },
+        files=(FinsDownloadedFile(filename="report.md", content=b"report"),),
+    )
+
+    with pytest.raises(OSError, match="forced generic commit failure"):
+        runtime._store_downloaded_document(
+            ticker="AAPL",
+            document=document,
+            overwrite_existing=False,
+            rebuild_processed=False,
+        )
+
+    assert batching_repository.caller_rollback_calls == 0
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta(
+            "AAPL",
+            "aapl-commit-failed",
+            SourceKind.FILING,
+        )
+
+
+def test_store_rejected_artifact_double_failure_preserves_operation_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rejected artifact 双失败必须以 operation 为主、rollback 为 cause且仅回滚一次。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主异常 identity、cause、note 或 rollback 次数漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    operation_error = OSError("injected rejected artifact operation failure")
+    rollback_error = RuntimeError("injected rejected artifact rollback failure")
+    batching_repository = _RollbackFailingIngestionBatchingRepository(
+        workspace_root,
+        repository_set,
+        rollback_error,
+    )
+    runtime = _build_ingestion_runtime_with_repository_set(
+        workspace_root,
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    monkeypatch.setattr(
+        runtime.filing_maintenance_repository,
+        "upsert_rejected_filing_artifact",
+        _RejectedArtifactUpsertFailure(operation_error),
+    )
+    artifact = FinsRejectedFilingDownloadArtifact(
+        document_id="fil-rejected",
+        internal_document_id="rejected-internal",
+        accession_number="0000000000-25-000001",
+        company_id="0000320193",
+        form_type="8-K",
+        filing_date="2025-02-01",
+        report_date=None,
+        primary_document="rejected.htm",
+        selected_primary_document="rejected.htm",
+        rejection_reason="不属于请求范围",
+        rejection_category="form_filter",
+        source_fingerprint="rejected-fingerprint",
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        runtime._store_rejected_filing_artifact(ticker="AAPL", artifact=artifact)
+
+    assert exc_info.value is operation_error
+    assert exc_info.value.__cause__ is rollback_error
+    assert exc_info.value.__notes__ == [
+        "rollback_batch failed; recovery evidence retained: "
+        "injected rejected artifact rollback failure"
+    ]
+    assert batching_repository.rollback_calls == 1
+
+
+def test_preprocess_double_failure_preserves_operation_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """preprocess 双失败必须以 operation 为主、rollback 为 cause且仅回滚一次。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主异常 identity、cause、note 或 rollback 次数漂移时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    operation_error = OSError("injected preprocess operation failure")
+    rollback_error = RuntimeError("injected preprocess rollback failure")
+    batching_repository = _RollbackFailingIngestionBatchingRepository(
+        workspace_root,
+        repository_set,
+        rollback_error,
+    )
+    runtime = _build_ingestion_runtime_with_repository_set(
+        workspace_root,
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    monkeypatch.setattr(
+        runtime.processed_repository,
+        "create_processed",
+        _ProcessedCreateFailure(operation_error),
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        runtime._preprocess_one_document(
+            ticker="AAPL",
+            document_id="aapl-2024-10k",
+            source_kind=SourceKind.FILING,
+            rebuild_processed=False,
+        )
+
+    assert exc_info.value is operation_error
+    assert exc_info.value.__cause__ is rollback_error
+    assert exc_info.value.__notes__ == [
+        "rollback_batch failed; recovery evidence retained: "
+        "injected preprocess rollback failure"
+    ]
+    assert batching_repository.rollback_calls == 1
+
+
 def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
     """下载请求应允许 SEC 修正表单类型中的业务合法斜杠。"""
 
@@ -1340,47 +1915,6 @@ async def test_direct_download_unsupported_source_returns_failure_result(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_direct_stream_missing_result_returns_failure_result(tmp_path: Path) -> None:
-    """direct producer 静默结束时 runtime 自身应补齐失败 RESULT。"""
-
-    workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    normalized = ticker_normalization.normalize_ticker("AAPL")
-
-    def quiet_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
-        """模拟未产出 RESULT 的 producer。
-
-        Args:
-            context: direct stream 执行上下文。
-
-        Returns:
-            无。
-
-        Raises:
-            无。
-        """
-
-        del context
-
-    events = await _collect_direct_events(
-        ingestion._run_direct_stream(
-            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-            direct_operation_kind=FinsOperationKind.DOWNLOAD,
-            normalized=normalized,
-            source="fake",
-            source_kind=SourceKind.FILING,
-            cancellation_token=None,
-            producer=quiet_producer,
-        )
-    )
-
-    assert [event.event_type for event in events] == [FinsEventType.RESULT]
-    assert events[-1].result is not None
-    assert events[-1].result.status is FinsResultStatus.FAILURE
-    assert events[-1].result.exit_code == 1
-
-
-@pytest.mark.asyncio
 async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path: Path) -> None:
     """direct download 取消应使用 operation-scoped token/checker 并返回 cancelled RESULT。"""
 
@@ -1406,6 +1940,49 @@ async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path
     assert events[-1].result is not None
     assert events[-1].result.status is FinsResultStatus.CANCELLED
     assert events[-1].result.exit_code == 130
+
+
+@pytest.mark.asyncio
+async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
+    tmp_path: Path,
+) -> None:
+    """consumer abort 必须经真实 raw generator finally 请求取消并阻止 late event。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw close、取消因果链或 late-publication fence 失效时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _ConsumerAbortDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        download_adapters={("abort", "US"): adapter},
+    )
+    stream = ingestion.download(
+        FinsDownloadRequest(ticker="AAPL", source="abort")
+    )
+
+    first_event = await anext(stream)
+    assert first_event.event_type is FinsEventType.PROGRESS
+    assert await asyncio.to_thread(adapter.entered.wait, 1.0)
+
+    await stream.aclose()
+    await stream.aclose()
+    adapter.allow_cancellation_check.set()
+
+    assert await asyncio.to_thread(adapter.late_progress_returned.wait, 1.0)
+    assert adapter.cancellation_checks == (True,)
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    with pytest.raises(RuntimeError):
+        _ = stream.terminal_result
 
 
 def test_start_download_production_adapter_boundary_emits_progress_events(
@@ -1578,6 +2155,7 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     record = ingestion.read_job(start.job_id)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     artifacts = runtime.filing_maintenance_repository.list_rejected_filing_artifacts("AAPL")
+    registry = runtime.filing_maintenance_repository.load_download_rejection_registry("AAPL")
     content = runtime.filing_maintenance_repository.read_rejected_filing_file_bytes(
         "AAPL",
         "aapl-fake-rejected",
@@ -1591,6 +2169,9 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     assert len(artifacts) == 1
     assert artifacts[0].document_id == "aapl-fake-rejected"
     assert artifacts[0].rejection_category == "form_filter"
+    assert registry["aapl-fake-rejected"].document_id == "aapl-fake-rejected"
+    assert registry["aapl-fake-rejected"].reason == "表单类型不在请求范围内"
+    assert registry["aapl-fake-rejected"].category == "form_filter"
     assert content == b"<html>rejected</html>"
 
 
@@ -1693,6 +2274,77 @@ def test_start_preprocess_allows_slash_in_document_ids(tmp_path: Path) -> None:
 
     assert record.request_summary["document_ids"] == ["sec/aapl-2024-10ka"]
     assert record.request_summary["form_types"] == ["10-K/A"]
+
+
+def test_preprocess_request_round_trips_hierarchical_document_id_through_storage(
+    tmp_path: Path,
+) -> None:
+    """hierarchical document ID 应从 preprocess 请求精确往返到 processed storage。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: document ID 被路径解释、归一化或丢失时抛出。
+    """
+
+    workspace_root = tmp_path / "hierarchical-preprocess"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    document_id = "sec/苹果\\2024/C:10-k/.."
+    batch = batching.begin_batch("AAPL")
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    file_meta = blob.store_file(
+        handle,
+        "report.md",
+        io.BytesIO(_fixture_markdown().encode("utf-8")),
+        batch=batch,
+        content_type="text/markdown",
+    )
+    source.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            primary_document="report.md",
+            files=[file_meta],
+            meta={
+                "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
+                "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+            },
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+    batching.commit_batch(batch)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+
+    start = ingestion.start_preprocess(
+        FinsPreprocessRequest(
+            ticker="AAPL",
+            document_ids=(document_id,),
+            form_types=("10-K",),
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["processed_document_ids"] == [document_id]
+    assert runtime.processed_repository.get_processed_meta(
+        "AAPL",
+        document_id,
+    )["document_id"] == document_id
 
 
 def test_preprocess_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
@@ -2130,9 +2782,14 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     """结果摘要中的 document-id 类字段应允许业务合法斜杠。"""
 
     download_summary = FinsDownloadResultSummary(written_document_ids=("sec/aapl-2024-10ka",))
-    preprocess_summary = FinsPreprocessResultSummary(processed_document_ids=("processed/aapl-2024-10ka",))
+    preprocess_summary = FinsPreprocessResultSummary(
+        selected_count=1,
+        processed_count=1,
+        processed_document_ids=("processed/aapl-2024-10ka",),
+    )
     upload_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
+        status="uploaded",
         document_id="sec/aapl-2024-10ka",
         internal_document_id="sec/aapl-2024-10ka-internal",
     )
@@ -2141,6 +2798,54 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     assert preprocess_summary.to_json_summary()["processed_document_ids"] == ["processed/aapl-2024-10ka"]
     assert upload_summary.to_json_summary()["document_id"] == "sec/aapl-2024-10ka"
     assert upload_summary.to_json_summary()["internal_document_id"] == "sec/aapl-2024-10ka-internal"
+
+
+def test_preprocess_result_status_separates_skipped_and_not_supported() -> None:
+    """预处理状态 helper 应区分 skipped 与 not_supported 语义。"""
+
+    skipped_only = FinsPreprocessResultSummary(
+        selected_count=1,
+        skipped_count=1,
+        skipped_document_ids=("aapl-2024-10k",),
+    )
+    unsupported_only = FinsPreprocessResultSummary(
+        selected_count=1,
+        not_supported_count=1,
+        not_supported_document_ids=("aapl-2024-10k",),
+    )
+
+    assert skipped_only.result_status() is FinsPreprocessResultStatus.SUCCEEDED
+    assert unsupported_only.result_status() is FinsPreprocessResultStatus.FAILED
+    assert unsupported_only.to_json_summary()["skipped_count"] == 0
+    assert unsupported_only.to_json_summary()["not_supported_count"] == 1
+
+
+def test_preprocess_result_status_rejects_over_classified_counts() -> None:
+    """预处理状态 helper 应拒绝分类计数超过选择数量的摘要。"""
+
+    over_classified = FinsPreprocessResultSummary(
+        selected_count=1,
+        processed_count=1,
+        skipped_count=1,
+        processed_document_ids=("aapl-2024-10k",),
+        skipped_document_ids=("msft-2024-10k",),
+    )
+    cancellation_partial = FinsPreprocessResultSummary(
+        selected_count=2,
+        skipped_count=1,
+        skipped_document_ids=("aapl-2024-10k",),
+    )
+
+    with pytest.raises(ValueError, match="selected_count"):
+        over_classified.result_status()
+    assert cancellation_partial.result_status() is FinsPreprocessResultStatus.SUCCEEDED
+
+
+def test_upload_pipeline_result_requires_status() -> None:
+    """upload pipeline typed result 不得用 unknown 伪造缺失状态。"""
+
+    with pytest.raises(ValueError, match="status"):
+        FinsUploadPipelineResult.from_pipeline_json({"document_id": "aapl-2024-10k"})
 
 
 def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Path) -> None:
@@ -2210,7 +2915,13 @@ def test_cancel_prepared_observation_prevents_later_activation_submit(
     assert cancelled.result is not None
     assert cancelled.result.status is FinsResultStatus.CANCELLED
     assert cancelled.result.error_kind is FinsErrorKind.CANCELLED
-    assert cancelled.result.error_message == "Observation was cancelled before activation."
+    assert cancelled.result.error_message == direct_failure_message(
+        error_kind=FinsErrorKind.CANCELLED,
+        fallback_message=None,
+    )
+    cancelled_error_message = cancelled.result.error_message
+    assert cancelled_error_message is not None
+    assert "Observation" not in cancelled_error_message
     assert polled.status is FinsObservationStatus.CANCELLED
     assert executor.operations == []
 
@@ -2286,10 +2997,13 @@ def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
     executor = _HoldingExecutor()
     document_id = "aapl-observed-upload"
     runner = _BlockingArtifactUploadRunner(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
+        blob_repository=default_runtime.blob_repository,
         document_id=document_id,
     )
     runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -2379,10 +3093,10 @@ def test_cancel_and_activate_share_observation_lock_without_timing_sleep(
     assert executor.operations == []
 
 
-def test_activation_submit_failure_is_observed_as_failed_by_wait_adapter(
+def test_activation_submit_failure_terminalizes_prepared_observation(
     tmp_path: Path,
 ) -> None:
-    """activation submit failure 必须转为 FAILED，且现有 wait adapter 可观察。"""
+    """activation submit failure 必须把 prepared observation 转为 FAILED。"""
 
     workspace_root = tmp_path / "fins-workspace"
     runtime = _build_ingestion_runtime(
@@ -2396,13 +3110,9 @@ def test_activation_submit_failure_is_observed_as_failed_by_wait_adapter(
 
     with pytest.raises(OSError):
         runtime.activate_observation(handle)
+    snapshot = asyncio.run(runtime.poll_observation(handle))
 
-    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(
-        _observation_wait_record(handle, DOWNLOAD_TOOL_NAME)
-    )
-
-    assert isinstance(poll, WaitPollReady)
-    assert isinstance(poll.outcome, ResolveWaitFailedOutcome)
+    assert snapshot.status is FinsObservationStatus.FAILED
 
 
 def test_unexpected_activation_exception_terminalizes_prepared_observation(
@@ -2426,7 +3136,63 @@ def test_unexpected_activation_exception_terminalizes_prepared_observation(
 
     assert snapshot.status is FinsObservationStatus.FAILED
     assert snapshot.result is not None
-    assert snapshot.result.error_message == "Observation activation failed."
+    assert snapshot.result.error_message == direct_failure_message(
+        error_kind=FinsErrorKind.EXECUTION,
+        fallback_message=None,
+    )
+    activation_error_message = snapshot.result.error_message
+    assert activation_error_message is not None
+    assert "Observation" not in activation_error_message
+
+
+def test_observed_producer_without_result_uses_helper_failure_message(
+    tmp_path: Path,
+) -> None:
+    """observed producer 静默结束时终态错误说明不得泄漏 observation 诊断文本。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    normalized = ticker_normalization.normalize_ticker("AAPL")
+
+    def quiet_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
+        """模拟未投递 RESULT 的 observed producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del context
+
+    handle = runtime._prepare_observed_stream(
+        direct_operation_kind=FinsOperationKind.DOWNLOAD,
+        operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+        normalized=normalized,
+        source="fake",
+        source_kind=SourceKind.FILING,
+        cancellation_token=_NeverCancelledToken(),
+        producer=quiet_producer,
+    )
+
+    runtime.activate_observation(handle)
+    executor.run_all()
+    snapshot = asyncio.run(runtime.poll_observation(handle))
+
+    assert snapshot.status is FinsObservationStatus.FAILED
+    assert snapshot.result is not None
+    assert snapshot.result.error_message == direct_failure_message(
+        error_kind=FinsErrorKind.EXECUTION,
+        fallback_message=None,
+    )
+    missing_result_error_message = snapshot.result.error_message
+    assert missing_result_error_message is not None
+    assert "Observation" not in missing_result_error_message
 
 
 def test_job_serialization_validates_upload_operation_shape(tmp_path: Path) -> None:
@@ -3037,6 +3803,178 @@ def test_start_preprocess_processes_source_document_to_processed_repository(tmp_
     assert progress_events[3].payload["processed_count"] == 1
 
 
+def test_preprocess_snapshot_and_processed_publication_share_source_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """preprocess 应先持 writer batch，再消费一份 snapshot 并在 commit 前关闭。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: begin/snapshot/close/commit 顺序或 revision preservation 漂移时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+    published_revision = _read_snapshot_revision(
+        runtime.source_repository,
+        "AAPL",
+        "aapl-2024-10k",
+        SourceKind.FILING,
+    )
+    batch_started = False
+    snapshot_revisions: list[SourceDocumentRevision] = []
+    snapshot_sources: list[Source] = []
+    snapshot_roots: list[Path] = []
+    original_begin = ingestion.batching_repository.begin_batch
+    original_commit = ingestion.batching_repository.commit_batch
+    original_snapshot = ingestion.source_repository.read_source_snapshot
+
+    def _observe_begin(ticker: str) -> BatchToken:
+        """记录 writer batch 已在 snapshot 前开始。
+
+        Args:
+            ticker: preprocess ticker。
+
+        Returns:
+            真实 batching owner 返回的 capability。
+
+        Raises:
+            RuntimeError: 真实 writer mutex 获取失败时抛出。
+            OSError: 真实 staging 初始化失败时抛出。
+        """
+
+        nonlocal batch_started
+        token = original_begin(ticker)
+        batch_started = True
+        return token
+
+    def _observe_snapshot(
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind | None = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """消费真实 full snapshot 并记录同版 revision 与临时资源。
+
+        Args:
+            ticker: preprocess ticker。
+            document_id: preprocess document ID。
+            source_kind: 显式 source kind。
+            materialize_files: 是否物化文件。
+
+        Returns:
+            真实 storage snapshot resource。
+
+        Raises:
+            AssertionError: snapshot 发生在 begin 前或不是 full snapshot 时抛出。
+            OSError: 真实 snapshot 读取失败时抛出。
+            ValueError: 真实 source 完整性非法时抛出。
+        """
+
+        assert batch_started
+        assert materialize_files
+        snapshot = original_snapshot(
+            ticker,
+            document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
+        primary_source = snapshot.get_primary_source()
+        snapshot_revisions.append(snapshot.revision)
+        snapshot_sources.append(primary_source)
+        snapshot_roots.append(primary_source.materialize().parent)
+        return snapshot
+
+    def _observe_commit(batch: BatchToken) -> None:
+        """确认 snapshot 已在 storage commit authority 接管前关闭。
+
+        Args:
+            batch: preprocess caller 即将交给 storage 的 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: snapshot 临时树仍存在或 Source 仍可读时抛出。
+            OSError: 真实 commit 失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
+
+        assert snapshot_roots
+        assert all(not root.exists() for root in snapshot_roots)
+        for source in snapshot_sources:
+            with pytest.raises(RuntimeError, match="已关闭"):
+                source.open()
+        original_commit(batch)
+
+    monkeypatch.setattr(ingestion.batching_repository, "begin_batch", _observe_begin)
+    monkeypatch.setattr(
+        ingestion.source_repository,
+        "read_source_snapshot",
+        _observe_snapshot,
+    )
+    monkeypatch.setattr(ingestion.batching_repository, "commit_batch", _observe_commit)
+
+    result = ingestion._preprocess_one_document(
+        ticker="AAPL",
+        document_id="aapl-2024-10k",
+        source_kind=SourceKind.FILING,
+        rebuild_processed=False,
+    )
+    with original_snapshot(
+        "AAPL",
+        "aapl-2024-10k",
+        SourceKind.FILING,
+        materialize_files=False,
+    ) as preserved_snapshot:
+        preserved_revision = preserved_snapshot.revision
+    processed_meta = runtime.processed_repository.get_processed_meta(
+        "AAPL",
+        "aapl-2024-10k",
+    )
+
+    assert result == "processed"
+    assert snapshot_revisions == [published_revision]
+    assert preserved_revision == published_revision
+    assert published_revision.token not in json.dumps(processed_meta, ensure_ascii=False)
+    assert all(not root.exists() for root in snapshot_roots)
+
+
+def test_default_runtime_close_is_idempotent_and_preserves_lazy_read_creation(
+    tmp_path: Path,
+) -> None:
+    """DefaultFinsRuntime.close 不得为清理创建 read runtime，且关闭保持幂等。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: close 破坏 lazy assembly、幂等或关闭后 fail-fast 时抛出。
+    """
+
+    runtime = DefaultFinsRuntime.create(workspace_root=tmp_path / "lazy-close")
+    assert runtime._read_runtime is None
+
+    runtime.close()
+    runtime.close()
+
+    assert runtime._read_runtime is None
+    with pytest.raises(RuntimeError, match="已关闭"):
+        runtime.get_read_runtime()
+
+
 def test_start_preprocess_whole_ticker_applies_limit_after_form_filter(tmp_path: Path) -> None:
     """整 ticker 预处理上限应作用于表单过滤后的实际工作集。"""
 
@@ -3060,6 +3998,68 @@ def test_start_preprocess_whole_ticker_applies_limit_after_form_filter(tmp_path:
     assert record.result_summary["selected_count"] == 1
     assert record.result_summary["processed_count"] == 1
     assert record.result_summary["processed_document_ids"] == ["aapl-2024-10k"]
+
+
+def test_preprocess_selection_rejects_missing_completion_and_keeps_complete_source(
+    tmp_path: Path,
+) -> None:
+    """预处理选择应拒绝缺失完成事实的 source，并保留显式完成态 source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 缺失完成事实的 source 被选择，或完成态 source 未被保留时抛出。
+        OSError: fixture 文件读写失败时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    _add_unmatched_source_documents(workspace_root=workspace_root, count=1)
+    incomplete_document_id = "aapl-2024-10q-00"
+    incomplete_meta_path = build_fs_repository_set(
+        workspace_root=workspace_root,
+    ).core._source_meta_path_for_read(
+        "AAPL",
+        incomplete_document_id,
+        SourceKind.FILING,
+    )
+    incomplete_meta = cast(
+        dict[str, JsonValue],
+        json.loads(incomplete_meta_path.read_text(encoding="utf-8")),
+    )
+    assert incomplete_meta.pop("ingest_complete") is True
+    incomplete_meta_path.write_text(
+        json.dumps(incomplete_meta, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+    complete_meta = runtime.source_repository.get_source_meta(
+        "AAPL",
+        "aapl-2024-10k",
+        SourceKind.FILING,
+    )
+    corrupted_meta = runtime.source_repository.get_source_meta(
+        "AAPL",
+        incomplete_document_id,
+        SourceKind.FILING,
+    )
+
+    assert complete_meta["ingest_complete"] is True
+    assert "ingest_complete" not in corrupted_meta
+
+    selected_document_ids = ingestion._select_preprocess_documents(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_ids=("aapl-2024-10k", incomplete_document_id),
+        form_types=(),
+    )
+
+    assert selected_document_ids == ("aapl-2024-10k",)
 
 
 def test_start_preprocess_skips_existing_processed_document_without_rebuild(tmp_path: Path) -> None:
@@ -3139,6 +4139,7 @@ def test_claim_running_preserves_cancel_between_read_and_running_write(
     executor = _HoldingExecutor()
     job_store = _ClaimRaceJobStore()
     ingestion = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -3370,6 +4371,7 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
     workspace_root = _build_fins_workspace(tmp_path)
     default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     ingestion = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -3385,6 +4387,8 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["selected_count"] == 1
     assert record.result_summary["processed_count"] == 0
+    assert record.result_summary["skipped_count"] == 0
+    assert record.result_summary["not_supported_count"] == 1
     assert record.result_summary["not_supported_document_ids"] == ["aapl-2024-10k"]
     assert "没有任何请求文档完成预处理" in str(record.failure_summary["message"])
     assert [event.source_event_type for event in progress_events] == [
@@ -3395,6 +4399,8 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
     ]
     assert progress_events[2].message == "预处理源文档不支持"
     assert progress_events[2].document_id == "aapl-2024-10k"
+    assert progress_events[3].payload["skipped_count"] == 0
+    assert progress_events[3].payload["not_supported_count"] == 1
 
 
 def test_save_failed_from_exception_logs_secondary_job_store_failure(
@@ -3559,6 +4565,7 @@ def _build_ingestion_runtime(
 
     default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     return ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -3571,53 +4578,48 @@ def _build_ingestion_runtime(
     )
 
 
-def _observation_wait_record(
-    handle: FinsObservationHandle,
-    tool_name: str,
-) -> WaitRecordRow:
-    """构造 observation wait adapter 测试用 Host wait record。
+def _build_ingestion_runtime_with_repository_set(
+    workspace_root: Path,
+    *,
+    repository_set: _FsRepositorySet,
+    batching_repository: BatchingRepositoryProtocol,
+) -> ingestion_runtime.FinsIngestionRuntime:
+    """用显式 shared repository set 构造 owner-failure ingestion runtime。
 
     Args:
-        handle: Fins observation handle。
-        tool_name: awaiting 工具名。
+        workspace_root: Fins workspace root。
+        repository_set: 所有 mutation wrapper 共用的 repository set。
+        batching_repository: 注入 rollback 行为的 batch lifecycle 仓储。
 
     Returns:
-        Host wait record row。
+        与 batching repository 共享同一 storage core 的 ingestion runtime。
 
     Raises:
-        ValueError: 字段非法时由 Host durable 类型抛出。
+        OSError: 仓储、processor registry 或 job store 初始化失败时抛出。
     """
 
-    return WaitRecordRow(
-        wait_id=f"wait-{handle.handle_id}",
-        session_id="session-fins",
-        run_id="run-fins",
-        attempt_id="attempt-fins",
-        execution_id="execution-fins",
-        tool_call_id=f"call-{tool_name}",
-        tool_name=tool_name,
-        adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-        await_kind="external_job",
-        resume_policy=WaitResumePolicy.POLL,
-        resume_token=handle.handle_id,
-        snapshot_ref=None,
-        external_job_ref=ExternalJobRef(
-            adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-            external_job_id=handle.handle_id,
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    return ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=batching_repository,
+        source_repository=FsSourceDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
         ),
-        accept_idempotency_key=f"accept-{handle.handle_id}",
-        resolve_idempotency_key=None,
-        resolve_semantic_digest=None,
-        deadline_at=None,
-        expires_at=None,
-        status=WaitRecordStatus.WAITING,
-        created_event_id=f"event-created-{handle.handle_id}",
-        created_event_sequence=1,
-        updated_event_id=f"event-updated-{handle.handle_id}",
-        updated_event_sequence=1,
-        created_at="2026-01-01T00:00:00Z",
-        updated_at="2026-01-01T00:00:00Z",
-        terminal_at=None,
+        blob_repository=FsDocumentBlobRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processed_repository=FsProcessedDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=_HoldingExecutor(),
     )
 
 
@@ -3643,17 +4645,31 @@ def _add_unmatched_source_documents(
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     token = batching_repository.begin_batch("AAPL")
     try:
         for index in range(count):
             document_id = f"aapl-2024-10q-{index:02d}"
+            filename = f"{document_id}.md"
+            handle = SourceHandle(
+                ticker="AAPL",
+                document_id=document_id,
+                source_kind=SourceKind.FILING.value,
+            )
+            file_meta = blob_repository.store_file(
+                handle,
+                filename,
+                io.BytesIO(b"# Unmatched fixture"),
+                batch=token,
+                content_type="text/markdown",
+            )
             source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
                     ticker="AAPL",
                     document_id=document_id,
                     internal_document_id=document_id,
                     form_type="10-Q",
-                    primary_document=f"{document_id}.md",
+                    primary_document=filename,
                     meta={
                         "fiscal_year": 2024,
                         "fiscal_period": "Q",
@@ -3661,14 +4677,17 @@ def _add_unmatched_source_documents(
                         "report_date": "2024-06-29",
                         "amended": False,
                         "ingest_method": "upload",
+                        "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                     },
+                    files=[file_meta],
                 ),
                 SourceKind.FILING,
+                batch=token,
             )
-        batching_repository.commit_batch(token)
-    except Exception:
+    except BaseException:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
 
 
 def _wait_terminal(
@@ -3746,6 +4765,38 @@ async def _collect_direct_events(events: AsyncIterator[FinsEvent]) -> tuple[Fins
     return tuple(collected)
 
 
+def _read_snapshot_revision(
+    repository: SourceDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+    source_kind: SourceKind,
+) -> SourceDocumentRevision:
+    """从 storage-owned light snapshot 读取 opaque published revision。
+
+    Args:
+        repository: source repository protocol。
+        ticker: exact external ticker。
+        document_id: exact external document ID。
+        source_kind: 显式 source kind。
+
+    Returns:
+        snapshot 同版 revision。
+
+    Raises:
+        FileNotFoundError: source 不存在或已删除时抛出。
+        ValueError: snapshot descriptor 非法时抛出。
+        OSError: snapshot I/O 或 close 失败时抛出。
+    """
+
+    with repository.read_source_snapshot(
+        ticker,
+        document_id,
+        source_kind,
+        materialize_files=False,
+    ) as snapshot:
+        return snapshot.revision
+
+
 def _build_fins_workspace(
     tmp_path: Path,
     *,
@@ -3770,6 +4821,7 @@ def _build_fins_workspace(
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    company_batch = batching_repository.begin_batch("AAPL")
     company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="0000320193",
@@ -3779,10 +4831,24 @@ def _build_fins_workspace(
             resolver_version="test",
             updated_at=now_iso8601(),
             ticker_aliases=["APPLE"],
-        )
+        ),
+        batch=company_batch,
     )
+    batching_repository.commit_batch(company_batch)
     token = batching_repository.begin_batch("AAPL")
     try:
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id="aapl-2024-10k",
+            source_kind=SourceKind.FILING.value,
+        )
+        file_meta = blob_repository.store_file(
+            handle,
+            "aapl-2024-10k.md",
+            io.BytesIO(_fixture_markdown().encode("utf-8")),
+            batch=token,
+            content_type=content_type,
+        )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -3797,40 +4863,17 @@ def _build_fins_workspace(
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
-                },
-            ),
-            SourceKind.FILING,
-        )
-        handle = source_repository.get_source_handle("AAPL", "aapl-2024-10k", SourceKind.FILING)
-        file_meta = blob_repository.store_file(
-            handle,
-            "aapl-2024-10k.md",
-            io.BytesIO(_fixture_markdown().encode("utf-8")),
-            content_type=content_type,
-        )
-        source_repository.update_source_document(
-            SourceDocumentUpsertRequest(
-                ticker="AAPL",
-                document_id="aapl-2024-10k",
-                internal_document_id="aapl-2024-10k",
-                form_type="10-K",
-                primary_document="aapl-2024-10k.md",
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                 },
                 files=[file_meta],
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        batching_repository.commit_batch(token)
-    except Exception:
+    except BaseException:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
     return workspace_root
 
 

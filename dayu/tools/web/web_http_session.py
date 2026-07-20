@@ -1,17 +1,39 @@
-"""网页抓取的 Session 与 timeout 基础设施。
+"""网页抓取的 Session、已授权 transport 与 timeout 基础设施。
 
-本模块只承载 requests Session 复用、重试策略与 tool deadline 相关的
-超时预算解析，不包含网页抓取编排、内容转换或浏览器回退逻辑。
+本模块消费 :class:`AuthorizedHttpTarget` 与 attempt-local transport policy，
+在标准 Session 或 numeric peer proof transport 间作唯一选择，并管理 response
+lease。它不拥有 URL 安全语义，也不包含内容转换或浏览器回退逻辑。
 """
 
 from __future__ import annotations
 
+import ipaddress
+import logging
+import socket
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from threading import Lock
+from types import TracebackType
+from typing import TYPE_CHECKING, Final, TypedDict, cast
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import InvalidURL
+from requests.models import PreparedRequest
+from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.exceptions import NewConnectionError
+from urllib3.util import connection as urllib3_connection
 from urllib3.util.retry import Retry
+
+from dayu.contracts.json_value import JsonValue
+
+from .web_egress_policy import AuthorizedHttpTarget, WebEgressPolicy
+
+if TYPE_CHECKING:
+    from urllib3._base_connection import BaseHTTPConnection, BaseHTTPSConnection
 
 _RETRY_TOTAL = 3
 _RETRY_CONNECT = 3
@@ -20,10 +42,710 @@ _RETRY_BACKOFF_FACTOR = 0.8
 _RETRY_STATUS_FORCELIST = (429, 500, 502, 503, 504)
 _MAX_REDIRECTS = 8
 _MIN_TIMEOUT_BUDGET_SECONDS = 0.05
+_PROXY_WITHOUT_PEER_PROOF_WARNING_REASON: Final[str] = "environment_proxy_active_without_peer_proof"
+_PROXY_PEER_PROOF_INCOMPATIBLE_REASON: Final[str] = "proxy_peer_proof_incompatible"
 
 _WEB_SESSION: requests.Session | None = None
 _WEB_NO_RETRY_SESSION: requests.Session | None = None
 _WEB_SESSION_LOCK = Lock()
+_LOGGER = logging.getLogger(__name__)
+
+
+class _MergedEnvironmentSettings(TypedDict):
+    """约束同一次 prepared request 合并出的 transport settings 结构。
+
+    Fields:
+        proxies: 当前 prepared URL 实际可选择的 proxy 映射。
+        stream: 当前响应是否采用流式读取。
+        verify: TLS 证书校验设置。
+        cert: 可选 client certificate 路径或证书/密钥路径对。
+
+    Call contract:
+        由 ``Session.merge_environment_settings`` 的同次结果构造，并原样交给
+        proxy selection 与 ``Session.send``；调用方不得二次读取环境或重建字段。
+
+    Returns:
+        具有上述四个必填字段的 typed mapping。
+
+    Raises:
+        无。
+    """
+
+    proxies: dict[str, str]
+    stream: bool
+    verify: bool | str
+    cert: str | tuple[str, str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class WebHttpTransportPolicy:
+    """一次 Web tool attempt 的 HTTP transport 配置快照。
+
+    sender 在每个 HTTP attempt 内只消费该不可变 snapshot，不重读部署配置。
+
+    Args:
+        dns_peer_proof_enabled: 是否要求 numeric target 与实际 peer proof。
+        allow_environment_proxy: 是否允许 ``requests`` 读取环境 proxy。
+
+    Returns:
+        不可变 transport policy。
+
+    Raises:
+        无。
+    """
+
+    dns_peer_proof_enabled: bool
+    allow_environment_proxy: bool
+
+
+class ProxyPeerProofIncompatibleError(requests.RequestException):
+    """active proxy 与 origin numeric peer proof 不可同时成立的 typed 失败。
+
+    Args:
+        无。
+
+    Returns:
+        带稳定 ``reason`` 的 requests transport 异常。
+
+    Raises:
+        无。
+
+    Attributes:
+        reason: 不含 URL、proxy 值或 credential 的稳定失败原因。
+
+    Call contract:
+        sender 只在当前 URL 实际选择到 proxy 且同时要求 numeric peer proof 时
+        抛出；调用方必须保持 typed fail closed，不得转为 provider fallback。
+    """
+
+    reason: str
+
+    def __init__(self) -> None:
+        """初始化不包含 URL、proxy 值或 credential 的稳定失败。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(_PROXY_PEER_PROOF_INCOMPATIBLE_REASON)
+        self.reason = _PROXY_PEER_PROOF_INCOMPATIBLE_REASON
+
+
+class _PinnedHTTPConnection(HTTPConnection):
+    """只连接当前 pool 绑定 numeric address 的 HTTPConnection。"""
+
+    _approved_addresses: tuple[str, ...] = ()
+
+    def bind_approved_addresses(self, approved_addresses: tuple[str, ...]) -> None:
+        """绑定本连接可使用的不可变 numeric address 集合。
+
+        Args:
+            approved_addresses: 当前 HTTP hop 的授权地址。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 地址集合为空时抛出。
+        """
+
+        if not approved_addresses:
+            raise ValueError("approved address set must not be empty")
+        self._approved_addresses = approved_addresses
+
+    def _new_conn(self) -> socket.socket:
+        """建立并验证只指向 approved address 的 socket。
+
+        Args:
+            无。
+
+        Returns:
+            peer 已验证的 TCP socket。
+
+        Raises:
+            NewConnectionError: 所有 approved address 均连接失败或 peer 不匹配时抛出。
+        """
+
+        return _connect_to_approved_addresses(self, self._approved_addresses)
+
+
+class _PinnedHTTPSConnection(HTTPSConnection):
+    """只连接当前 pool 绑定 numeric address 的 HTTPSConnection。"""
+
+    _approved_addresses: tuple[str, ...] = ()
+
+    def bind_approved_addresses(self, approved_addresses: tuple[str, ...]) -> None:
+        """绑定本连接可使用的不可变 numeric address 集合。
+
+        Args:
+            approved_addresses: 当前 HTTPS hop 的授权地址。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 地址集合为空时抛出。
+        """
+
+        if not approved_addresses:
+            raise ValueError("approved address set must not be empty")
+        self._approved_addresses = approved_addresses
+
+    def _new_conn(self) -> socket.socket:
+        """建立并验证只指向 approved address 的 socket。
+
+        Args:
+            无。
+
+        Returns:
+            peer 已验证的 TCP socket；TLS 包装仍由父类以原 hostname 执行。
+
+        Raises:
+            NewConnectionError: 所有 approved address 均连接失败或 peer 不匹配时抛出。
+        """
+
+        return _connect_to_approved_addresses(self, self._approved_addresses)
+
+
+def _connect_to_approved_addresses(
+    connection: _PinnedHTTPConnection | _PinnedHTTPSConnection,
+    approved_addresses: tuple[str, ...],
+) -> socket.socket:
+    """按确定顺序连接 approved numeric address 并验证实际 peer。
+
+    Args:
+        connection: 当前 urllib3 connection。
+        approved_addresses: 当前 hop 冻结的授权地址。
+
+    Returns:
+        peer 属于授权集合的 socket。
+
+    Raises:
+        NewConnectionError: 未绑定地址、连接失败或 peer 不属于授权集合时抛出。
+    """
+
+    if not approved_addresses:
+        raise NewConnectionError(connection, "No approved numeric address is bound")
+    approved_values = {ipaddress.ip_address(address) for address in approved_addresses}
+    failures: list[str] = []
+    for address in approved_addresses:
+        sock: socket.socket | None = None
+        try:
+            sock = urllib3_connection.create_connection(
+                (address, connection.port),
+                connection.timeout,
+                source_address=connection.source_address,
+                socket_options=connection.socket_options,
+            )
+            peer_text = str(sock.getpeername()[0]).split("%", 1)[0]
+            peer = ipaddress.ip_address(peer_text)
+            if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped is not None:
+                peer = peer.ipv4_mapped
+            if peer not in approved_values:
+                failures.append(f"peer mismatch: {peer}")
+                sock.close()
+                sock = None
+                continue
+            return sock
+        except OSError as exc:
+            failures.append(f"{address}: {exc}")
+            if sock is not None:
+                sock.close()
+    detail = "; ".join(failures) or "no connection attempt completed"
+    raise NewConnectionError(connection, f"Failed to connect to approved addresses: {detail}")
+
+
+class _PinnedHTTPConnectionPool(HTTPConnectionPool):
+    """把 approved address 集合注入每个新 HTTPConnection 的私有 pool。"""
+
+    ConnectionCls = cast("type[BaseHTTPConnection]", _PinnedHTTPConnection)
+    _approved_addresses: tuple[str, ...] = ()
+
+    def bind_approved_addresses(self, approved_addresses: tuple[str, ...]) -> None:
+        """绑定 pool 后续所有连接使用的地址集合。
+
+        Args:
+            approved_addresses: 当前 target 的不可变授权地址。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 地址集合为空时抛出。
+        """
+
+        if not approved_addresses:
+            raise ValueError("approved address set must not be empty")
+        self._approved_addresses = approved_addresses
+
+    def _new_conn(self) -> BaseHTTPConnection:
+        """创建已绑定 approved address 的 HTTP connection。
+
+        Args:
+            无。
+
+        Returns:
+            已绑定地址的 connection。
+
+        Raises:
+            RuntimeError: urllib3 未使用预期 connection class 时抛出。
+        """
+
+        connection = super()._new_conn()
+        if not isinstance(connection, _PinnedHTTPConnection):
+            raise RuntimeError("urllib3 returned an unexpected HTTP connection class")
+        connection.bind_approved_addresses(self._approved_addresses)
+        return connection
+
+
+class _PinnedHTTPSConnectionPool(HTTPSConnectionPool):
+    """把 approved address 集合注入每个新 HTTPSConnection 的私有 pool。"""
+
+    ConnectionCls = cast("type[BaseHTTPSConnection]", _PinnedHTTPSConnection)
+    _approved_addresses: tuple[str, ...] = ()
+
+    def bind_approved_addresses(self, approved_addresses: tuple[str, ...]) -> None:
+        """绑定 pool 后续所有连接使用的地址集合。
+
+        Args:
+            approved_addresses: 当前 target 的不可变授权地址。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 地址集合为空时抛出。
+        """
+
+        if not approved_addresses:
+            raise ValueError("approved address set must not be empty")
+        self._approved_addresses = approved_addresses
+
+    def _new_conn(self) -> BaseHTTPSConnection:
+        """创建已绑定 approved address 的 HTTPS connection。
+
+        Args:
+            无。
+
+        Returns:
+            已绑定地址的 connection。
+
+        Raises:
+            RuntimeError: urllib3 未使用预期 connection class 时抛出。
+        """
+
+        connection = super()._new_conn()
+        if not isinstance(connection, _PinnedHTTPSConnection):
+            raise RuntimeError("urllib3 returned an unexpected HTTPS connection class")
+        connection.bind_approved_addresses(self._approved_addresses)
+        return connection
+
+
+class _TargetBoundHTTPAdapter(HTTPAdapter):
+    """只服务单个 :class:`AuthorizedHttpTarget` 的 requests adapter。"""
+
+    def __init__(self, *, target: AuthorizedHttpTarget, max_retries: Retry) -> None:
+        """初始化 target-bound adapter。
+
+        Args:
+            target: 当前 HTTP hop 的授权目标。
+            max_retries: 沿用 source session 的 urllib3 retry policy。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._target = target
+        super().__init__(max_retries=max_retries, pool_connections=1, pool_maxsize=1, pool_block=True)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _PinnedHTTPConnectionPool,
+            "https": _PinnedHTTPSConnectionPool,
+        }
+
+    def get_connection_with_tls_context(
+        self,
+        request: PreparedRequest,
+        verify: bool | str | None,
+        proxies: Mapping[str, str] | None = None,
+        cert: str | tuple[str, str] | None = None,
+    ) -> HTTPConnectionPool | HTTPSConnectionPool:
+        """获取并绑定当前 target 的私有 pool。
+
+        Args:
+            request: requests 已准备请求。
+            verify: TLS CA 校验配置。
+            proxies: proxy 配置；本 owner 不支持 proxy。
+            cert: 可选客户端证书配置。
+
+        Returns:
+            host 仍为原 IDNA hostname、destination 已绑定 numeric address 的 pool。
+
+        Raises:
+            requests.InvalidURL: 请求 origin 与 target 不一致或配置了 proxy 时抛出。
+            RuntimeError: requests/urllib3 未返回预期 pool class 时抛出。
+        """
+
+        if proxies:
+            raise InvalidURL("Target-bound Web egress transport does not support proxies")
+        _validate_prepared_request_target(request, target=self._target)
+        pool = super().get_connection_with_tls_context(request, verify, proxies={}, cert=cert)
+        if isinstance(pool, _PinnedHTTPConnectionPool | _PinnedHTTPSConnectionPool):
+            if pool.host != self._target.hostname or int(pool.port or 0) != self._target.port:
+                raise InvalidURL("Connection pool origin does not match authorized target")
+            pool.bind_approved_addresses(self._target.approved_addresses)
+            return pool
+        raise RuntimeError("requests/urllib3 returned an unexpected connection pool class")
+
+
+def _validate_prepared_request_target(
+    request: PreparedRequest,
+    *,
+    target: AuthorizedHttpTarget,
+) -> None:
+    """验证 PreparedRequest 未离开 adapter 绑定 target。
+
+    Args:
+        request: requests 已准备请求。
+        target: adapter 唯一允许的目标。
+
+    Returns:
+        无。
+
+    Raises:
+        requests.InvalidURL: 请求缺少 URL、userinfo/端口非法或 origin 不匹配时抛出。
+    """
+
+    request_url = request.url or ""
+    try:
+        parsed = urlsplit(request_url)
+        hostname = (parsed.hostname or "").encode("idna").decode("ascii").lower()
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme.lower() == "https" else 80)
+    except (UnicodeError, ValueError) as exc:
+        raise InvalidURL("Prepared request target is invalid") from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise InvalidURL("Prepared request userinfo is not allowed")
+    if (parsed.scheme.lower(), hostname, port) != (target.scheme, target.hostname, target.port):
+        raise InvalidURL("Prepared request origin does not match authorized target")
+
+
+class AuthorizedResponseLease:
+    """持有一个 response 及其 target-bound transport 的唯一关闭权。"""
+
+    def __init__(self, *, response: requests.Response, session: requests.Session) -> None:
+        """初始化 response lease。
+
+        Args:
+            response: 已创建的 response。
+            session: 持有 target-bound adapter/pool 的私有 session。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.response = response
+        self._session = session
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """返回 lease 是否已关闭。
+
+        Args:
+            无。
+
+        Returns:
+            已关闭返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        return self._closed
+
+    def close(self) -> None:
+        """幂等关闭 response 与其私有 transport。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。关闭异常不会覆盖当前业务异常。
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.response.close()
+        except Exception:
+            pass
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> AuthorizedResponseLease:
+        """进入 lease context。
+
+        Args:
+            无。
+
+        Returns:
+            当前 lease。
+
+        Raises:
+            无。
+        """
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """退出 context 并关闭 lease。
+
+        Args:
+            exc_type: 当前异常类型。
+            exc: 当前异常。
+            traceback: 当前 traceback；不读取。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del exc_type, exc, traceback
+        self.close()
+
+
+def _send_authorized_request(
+    source_session: requests.Session,
+    *,
+    target: AuthorizedHttpTarget,
+    method: str,
+    timeout: float,
+    headers: Mapping[str, str],
+    stream: bool,
+    transport_policy: WebHttpTransportPolicy,
+) -> AuthorizedResponseLease:
+    """按 attempt-local transport policy 发送单个已授权 HTTP hop。
+
+    Args:
+        source_session: 仅提供 retry、headers、cookies 与 TLS 配置的 source session。
+        target: 当前 hop 的不可变授权目标。
+        method: HTTP 方法。
+        timeout: 当前 hop 超时秒数。
+        headers: 请求头。
+        stream: 是否流式读取响应。
+        transport_policy: 当前 tool attempt 的不可变 HTTP transport policy。
+
+    Returns:
+        唯一拥有 response 与 pool 的 lease。
+
+    Raises:
+        requests.RequestException: prepare、connect、TLS 或请求失败时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 numeric peer proof 冲突时抛出。
+    """
+
+    return _send_authorized_request_attempt(
+        source_session,
+        target=target,
+        method=method,
+        timeout=timeout,
+        headers=headers,
+        stream=stream,
+        transport_policy=transport_policy,
+        request_params=None,
+        request_json=None,
+    )
+
+
+def _send_authorized_plain_request(
+    *,
+    egress_policy: WebEgressPolicy,
+    url: str,
+    method: str,
+    timeout: float,
+    headers: Mapping[str, str],
+    stream: bool,
+    transport_policy: WebHttpTransportPolicy,
+    request_params: Mapping[str, str] | None,
+    request_json: Mapping[str, JsonValue] | None,
+) -> AuthorizedResponseLease:
+    """授权固定 provider endpoint 并发送单次无自动 redirect 请求。
+
+    Args:
+        egress_policy: 与 fetch 同源的 scheme/host/port/address policy。
+        url: provider 初始 endpoint。
+        method: HTTP 方法。
+        timeout: 当前请求超时秒数。
+        headers: provider 原始请求头。
+        stream: 是否流式读取响应。
+        transport_policy: 当前 tool attempt 的不可变 HTTP transport policy。
+        request_params: 原始 query 参数；没有时为 ``None``。
+        request_json: 原始 JSON body；没有时为 ``None``。
+
+    Returns:
+        唯一拥有 response 与 attempt-local Session 的 lease。
+
+    Raises:
+        WebEgressPolicyError: endpoint 未通过初始 egress/DNS/custom-port 校验时抛出。
+        requests.RequestException: prepare、connect、TLS 或请求失败时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 numeric peer proof 冲突时抛出。
+    """
+
+    target = egress_policy.authorize_http_target(
+        url,
+        stage="search_provider_request",
+    )
+    source_session = _create_no_retry_session()
+    try:
+        return _send_authorized_request_attempt(
+            source_session,
+            target=target,
+            method=method,
+            timeout=timeout,
+            headers=headers,
+            stream=stream,
+            transport_policy=transport_policy,
+            request_params=request_params,
+            request_json=request_json,
+        )
+    finally:
+        source_session.close()
+
+
+def _send_authorized_request_attempt(
+    source_session: requests.Session,
+    *,
+    target: AuthorizedHttpTarget,
+    method: str,
+    timeout: float,
+    headers: Mapping[str, str],
+    stream: bool,
+    transport_policy: WebHttpTransportPolicy,
+    request_params: Mapping[str, str] | None,
+    request_json: Mapping[str, JsonValue] | None,
+) -> AuthorizedResponseLease:
+    """构造单次 Session、只 prepare 一次并完成 transport 发送。
+
+    Args:
+        source_session: retry/cookie/TLS 设置来源。
+        target: 当前请求已授权目标。
+        method: HTTP 方法。
+        timeout: 当前请求超时秒数。
+        headers: 请求头。
+        stream: 是否流式读取响应。
+        transport_policy: 当前 attempt 的 transport policy。
+        request_params: 可选 query 参数。
+        request_json: 可选 JSON body。
+
+    Returns:
+        唯一拥有 response 与 attempt-local Session 的 lease。
+
+    Raises:
+        RuntimeError: source adapter 或 merged settings 不满足 requests contract 时抛出。
+        requests.RequestException: prepare、connect、TLS 或请求失败时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 numeric peer proof 冲突时抛出。
+    """
+
+    source_adapter = source_session.get_adapter(target.normalized_url)
+    if not isinstance(source_adapter, HTTPAdapter):
+        raise RuntimeError("source session adapter must be requests.HTTPAdapter")
+    retry = source_adapter.max_retries
+    call_session = requests.Session()
+    call_session.trust_env = transport_policy.allow_environment_proxy
+    call_session.headers.clear()
+    call_session.headers.update(source_session.headers)
+    call_session.cookies.update(source_session.cookies)
+    call_session.auth = source_session.auth
+    call_session.verify = source_session.verify
+    call_session.cert = source_session.cert
+    call_session.max_redirects = source_session.max_redirects
+    call_session.proxies.clear()
+    adapter: HTTPAdapter
+    if transport_policy.dns_peer_proof_enabled:
+        adapter = _TargetBoundHTTPAdapter(target=target, max_retries=retry)
+    else:
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=1,
+            pool_maxsize=1,
+            pool_block=True,
+        )
+    replaced_adapter = call_session.get_adapter(target.normalized_url)
+    call_session.mount(f"{target.scheme}://", adapter)
+    replaced_adapter.close()
+    response: requests.Response | None = None
+    try:
+        request = requests.Request(
+            method=method,
+            url=target.normalized_url,
+            headers=dict(headers),
+            params=dict(request_params) if request_params is not None else None,
+            json=dict(request_json) if request_json is not None else None,
+        )
+        prepared = call_session.prepare_request(request)
+        _validate_prepared_request_target(prepared, target=target)
+        settings = cast(
+            _MergedEnvironmentSettings,
+            call_session.merge_environment_settings(
+                prepared.url or target.normalized_url,
+                {},
+                stream,
+                call_session.verify,
+                call_session.cert,
+            ),
+        )
+        if not transport_policy.allow_environment_proxy and settings["proxies"]:
+            raise RuntimeError("proxy-denied attempt produced non-empty proxy settings")
+        selected_proxy = requests.utils.select_proxy(
+            prepared.url or target.normalized_url,
+            settings["proxies"],
+        )
+        if selected_proxy is not None and transport_policy.dns_peer_proof_enabled:
+            raise ProxyPeerProofIncompatibleError()
+        if selected_proxy is not None:
+            _LOGGER.warning(
+                "environment_proxy_active=true reason=%s",
+                _PROXY_WITHOUT_PEER_PROOF_WARNING_REASON,
+            )
+        response = call_session.send(
+            prepared,
+            timeout=timeout,
+            allow_redirects=False,
+            **settings,
+        )
+        source_session.cookies.update(call_session.cookies)
+        return AuthorizedResponseLease(response=response, session=call_session)
+    except Exception:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        call_session.close()
+        raise
 
 
 def _create_retry_session() -> requests.Session:
@@ -74,7 +796,7 @@ def _create_no_retry_session(*, source_session: requests.Session | None = None) 
     if isinstance(source_session, requests.Session):
         session.headers.update(source_session.headers)
         session.cookies.update(source_session.cookies)
-        session.max_redirects = getattr(source_session, "max_redirects", _MAX_REDIRECTS)
+        session.max_redirects = source_session.max_redirects
     else:
         session.max_redirects = _MAX_REDIRECTS
 

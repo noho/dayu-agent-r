@@ -98,9 +98,9 @@ class _UrllibFmpHttpClient:
 class FmpCompanyInfoResolver:
     """FMP 公司信息 resolver。
 
-    resolver 执行 OLD 两跳算法：先通过 ``search-symbol`` 定位公司名，再
-    通过 ``search-name`` 搜索严格同名证券，并保证 canonical ticker 在
-    alias tuple 首位。
+    resolver 执行两跳算法：先通过 ``search-symbol`` 精确定位 canonical
+    ticker 对应公司名，再通过 ``search-name`` 搜索严格同名证券，并保证
+    canonical ticker 在 alias tuple 首位。无精确 symbol 命中时不得注入公司身份。
     """
 
     _api_key: str
@@ -283,7 +283,7 @@ def _select_symbol_result(
     :param results: ``search-symbol`` 返回结果。
     :param canonical_ticker: 规范 ticker。
     :returns: 选中的搜索结果。
-    :raises FmpCompanyInfoResolutionError: 搜索结果为空时抛出。
+    :raises FmpCompanyInfoResolutionError: 搜索结果为空或无精确 symbol 命中时抛出。
     """
 
     if len(results) == 0:
@@ -294,7 +294,9 @@ def _select_symbol_result(
         normalized_symbol = _normalize_ticker_token(item.symbol)
         if normalized_symbol == canonical_ticker:
             return item
-    return results[0]
+    raise FmpCompanyInfoResolutionError(
+        f"FMP search-symbol 未返回精确 ticker 命中: ticker={canonical_ticker}"
+    )
 
 
 def _filter_same_name_results(

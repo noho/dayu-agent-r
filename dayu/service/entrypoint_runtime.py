@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -36,11 +35,12 @@ from dayu.host.api import (
     OutboxTerminalCursor,
     OutboxTerminalItem,
     ReadOutboxTerminalItemsRequest,
-    RunStatus,
     SessionSnapshot,
+    is_terminal_run_status,
 )
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
+from dayu.runtime.numeric import is_positive_finite_number
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
     ScenePrepareRequest,
@@ -57,7 +57,6 @@ from dayu.service.host_assembly import (
     compose_open_host_options,
     compose_submit_followup_request_with_overrides,
     discover_service_tools,
-    with_entrypoint_wait_poller_policy,
 )
 
 DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS: Final[float] = 0.05
@@ -69,16 +68,6 @@ _WATCHER_FAILURE_DIAGNOSTIC_PREFIX: Final[str] = "watcher drain failed"
 _WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY: Final[str] = "entrypoint_watcher_failure"
 _WATCHER_FAILURE_ACTIVITY_TITLE: Final[str] = "运行事件流诊断"
 _WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT: Final[int] = 240
-_TERMINAL_RUN_STATUSES: Final[frozenset[RunStatus]] = frozenset(
-    {
-        RunStatus.SUCCEEDED,
-        RunStatus.FAILED,
-        RunStatus.CANCELLED,
-        RunStatus.LOST,
-    }
-)
-
-
 class EntrypointRuntimeError(RuntimeError):
     """entrypoint runtime Service helper 观察 Host 终态失败时抛出的错误。"""
 
@@ -101,6 +90,7 @@ class EntrypointActivityKind(StrEnum):
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION = "context_compaction"
     PROVIDER_DIAGNOSTIC = "provider_diagnostic"
+    PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     WATCHER_DIAGNOSTIC = "watcher_diagnostic"
 
 
@@ -524,6 +514,7 @@ async def prepare_entrypoint_runtime(
         assemble_effective_tool_provider_configs(
             tuple(runtime_config.tool_discovery.providers.values()),
             workspace_root=request.workspace_root,
+            fins_workspace_root_override=None,
         )
     )
     scene_inputs = prepare_scene(
@@ -542,11 +533,7 @@ async def prepare_entrypoint_runtime(
             locations=locations,
             scene_inputs=scene_inputs,
             discovered_tools=discovered_tools,
-            overrides=with_entrypoint_wait_poller_policy(
-                overrides=request.assembly_overrides,
-                scene_inputs=scene_inputs,
-                discovered_tools=discovered_tools,
-            ),
+            overrides=request.assembly_overrides,
             env=request.env,
         )
     )
@@ -716,7 +703,7 @@ async def cancel_entrypoint_run_and_wait(
     _require_positive_poll_interval(poll_interval_seconds)
     run_snapshot = await host.get_run(request.run_id)
     state = _new_terminal_observation_state()
-    if _is_terminal_run_status(run_snapshot.status):
+    if is_terminal_run_status(run_snapshot.status):
         queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
         return await _wait_for_terminal(
             host,
@@ -745,7 +732,7 @@ async def cancel_entrypoint_run_and_wait(
             )
         except HostApiError:
             latest_run_snapshot = await host.get_run(request.run_id)
-            if not _is_terminal_run_status(latest_run_snapshot.status):
+            if not is_terminal_run_status(latest_run_snapshot.status):
                 raise
             allow_outbox_terminal_fallback = True
         return await _wait_for_terminal(
@@ -1078,7 +1065,7 @@ async def _wait_for_terminal(
         if live_terminal is not None:
             return live_terminal
         run_snapshot = await host.get_run(run_id)
-        if _is_terminal_run_status(
+        if is_terminal_run_status(
             run_snapshot.status
         ) and _should_read_outbox_terminal(
             state=state,
@@ -1287,6 +1274,8 @@ def _entrypoint_activity_kind_from_host(kind: HostActivityKind) -> EntrypointAct
         return EntrypointActivityKind.CONTEXT_COMPACTION
     if kind is HostActivityKind.PROVIDER_DIAGNOSTIC:
         return EntrypointActivityKind.PROVIDER_DIAGNOSTIC
+    if kind is HostActivityKind.PROVIDER_PROTOCOL_ERROR:
+        return EntrypointActivityKind.PROVIDER_PROTOCOL_ERROR
     raise AssertionError(f"unexpected HostActivityKind: {kind}")
 
 
@@ -1792,17 +1781,6 @@ def _observation_error_message(*, state: _TerminalObservationState, message: str
     return f"{message}; {state.watcher_failure_message}"
 
 
-def _is_terminal_run_status(status: RunStatus) -> bool:
-    """判断 RunStatus 是否为终态。
-
-    :param status: Host public RunStatus。
-    :returns: 终态返回 ``True``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return status in _TERMINAL_RUN_STATUSES
-
-
 def _new_terminal_observation_state(
     *,
     terminal_cursor: OutboxTerminalCursor | None = None,
@@ -1885,5 +1863,5 @@ def _require_positive_poll_interval(value: float) -> None:
     :raises ValueError: 间隔不是正数时抛出。
     """
 
-    if not math.isfinite(value) or value <= 0:
+    if not is_positive_finite_number(value):
         raise ValueError("poll_interval_seconds must be finite and > 0")

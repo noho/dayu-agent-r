@@ -38,6 +38,8 @@ DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN = 1
 DEFAULT_ESTIMATOR_JSON_BYTES_PER_TOKEN = 3
 DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS = 12
 DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS = 16
+# Post-compact ordinary dispatch 固定为一条 system envelope 加当前输入 user message。
+POST_COMPACT_BASE_MESSAGE_COUNT = 2
 USAGE_OBSERVATION_STATUS_OBSERVED = "observed"
 USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE = "estimate_unavailable"
 _MIN_SOFT_THRESHOLD_TOKENS = 1
@@ -489,6 +491,32 @@ def estimate_budget_text_tokens(text: str) -> int:
     return cjk_tokens + non_cjk_tokens
 
 
+def estimate_post_compact_budget(
+    *,
+    compacted_business_texts: tuple[str, ...],
+    current_input_text: str,
+) -> int:
+    """估算 accepted compact 后 ordinary dispatch 的输入预算。
+
+    :param compacted_business_texts: accepted compact 会投影给 LLM 的业务文本。
+    :param current_input_text: 当前用户输入文本。
+    :returns: 非负 token 估算。
+    :raises TypeError: tuple 或文本类型非法时抛出。
+    """
+
+    _require_text_tuple(
+        compacted_business_texts,
+        field_name="compacted_business_texts",
+    )
+    if not isinstance(current_input_text, str):
+        raise TypeError("current_input_text must be str")
+    fragments = (*compacted_business_texts, current_input_text)
+    token_count = sum(max(1, estimate_budget_text_tokens(fragment)) for fragment in fragments)
+    return token_count + (
+        DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS * POST_COMPACT_BASE_MESSAGE_COUNT
+    )
+
+
 def _soft_threshold_tokens(policy: ContextBudgetPolicy) -> int:
     """计算 soft threshold。
 
@@ -707,6 +735,22 @@ def _require_tuple_items(
             raise TypeError(f"{field_name} items must be {item_type.__name__}")
 
 
+def _require_text_tuple(value: tuple[str, ...], *, field_name: str) -> None:
+    """校验文本 tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型错误时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError(f"{field_name} items must be str")
+
+
 def _require_utc_datetime(value: datetime, *, field_name: str) -> None:
     """校验 UTC aware datetime。
 
@@ -736,6 +780,7 @@ __all__ = [
     "DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS",
     "DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS",
     "DEFAULT_INPUT_SOFT_THRESHOLD_RATIO",
+    "POST_COMPACT_BASE_MESSAGE_COUNT",
     "UsageObservation",
     "UsageObservationDiagnostic",
     "USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE",
@@ -744,4 +789,5 @@ __all__ = [
     "decide_context_budget",
     "estimate_budget_text_tokens",
     "estimate_context_budget",
+    "estimate_post_compact_budget",
 ]

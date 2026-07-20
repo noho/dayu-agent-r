@@ -6,3 +6,5 @@
 - 输出 Markdown 格式。
 
 {{current_time}}
+
+{{fins_default_subject}}

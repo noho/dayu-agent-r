@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
+from typing import Protocol
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
@@ -69,6 +70,7 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     active_cancel_watchdog_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
+    read_cancel_requested_event_from_run_link,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
@@ -97,6 +99,7 @@ from dayu.host.durable.state import (
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host._execution_health import HostExecutionHealthGate
 from dayu.host._execution_config_projection import (
     effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
     required_json_mapping as _required_json_mapping,
@@ -219,8 +222,6 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 _EVENT_SOURCE = "host.dispatch"
 _EVENT_ACTOR = "host.dispatch"
 _EVENT_TYPE_ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
-_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _WORKER_ACCEPT_REASON = "local_worker_accepted"
 _ACTIVE_CANCEL_WATCHDOG_ACTOR = "host.active_cancel_watchdog"
 _ACTIVE_CANCEL_WATCHDOG_SOURCE = "host.dispatch"
@@ -253,7 +254,12 @@ _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _LOCAL_WORKER_CLOSE_GRACE_SECONDS = 3.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
-_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
+_SCHEDULER_UNAVAILABLE_REASON = "scheduler_not_accepting_wake"
+_CRITICAL_FATAL_REASON = "critical_task_unexpected_exit"
+_CRITICAL_COMPONENT_HEARTBEAT = "heartbeat"
+_CRITICAL_COMPONENT_DISPATCH = "dispatch"
+_CRITICAL_COMPONENT_PROMOTION = "promotion"
+_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG = "active_cancel_watchdog"
 
 
 class _MemoryProjectionDispatchDiagnosticError(HostDurableError):
@@ -313,14 +319,12 @@ _LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handl
 _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = "dispatch drain loop cancelled during close host_handle_id=%s"
 _LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY = "dispatch drain loop cancelled externally host_handle_id=%s"
 _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION = (
-    "dispatch drain loop stopped unexpectedly; continuing host_handle_id=%s " "error_type=%s"
+    "dispatch drain loop stopped unexpectedly; reporting fatal host_handle_id=%s "
+    "error_type=%s"
 )
 _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED = (
-    "dispatch drain loop durable retry exhausted; closing scheduler " "host_handle_id=%s error_type=%s"
-)
-_LOG_DRAIN_LOOP_QUEUE_CLOSEOUT = (
-    "dispatch.drain_loop.queue_closeout host_handle_id=%s reason=%s "
-    "closeout_count=%s"
+    "dispatch drain loop durable retry exhausted; backing off and retrying "
+    "host_handle_id=%s error_type=%s"
 )
 _LOG_WORKER_LOST_CLOSEOUT_FAILED = (
     "dispatch.worker_events.close_worker_lost_failed run_id=%s "
@@ -443,6 +447,38 @@ class _ActiveCancelWatchdogOperationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReadCommittedCancelRequestedAtOperation:
+    """读取 Run linked ``CANCEL_REQUESTED`` canonical fact 的发生时间。
+
+    :param event_log_store: EventLog primitive。
+    :param run_id: 目标 Run id。
+    """
+
+    event_log_store: EventLogStore
+    run_id: str
+
+    def __call__(self, transaction: HostTransaction) -> datetime | None:
+        """执行 durable read 并返回 committed cancel 请求时间。
+
+        :param transaction: Host durable read transaction。
+        :returns: linked ``CANCEL_REQUESTED`` 发生时间；Run 缺失或 link
+            不存在时返回 ``None``。
+        """
+
+        run = read_run_by_id(transaction, self.run_id)
+        if run is None:
+            return None
+        cancel_requested = read_cancel_requested_event_from_run_link(
+            transaction,
+            self.event_log_store,
+            run,
+        )
+        if cancel_requested is None:
+            return None
+        return parse_utc_timestamp(cancel_requested.occurred_at)
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveCancelMessage:
     """active worker cancel registry 的最小取消消息。
 
@@ -456,6 +492,34 @@ class ActiveCancelMessage:
     attempt_id: str
     execution_id: str
     reason: str
+
+
+class ActiveWorkerCancelPort(Protocol):
+    """command path 传播 active worker cancel 的最小 typed port。"""
+
+    def cancel(self, message: ActiveCancelMessage) -> bool:
+        """向匹配的 active execution 传播取消。
+
+        :param message: durable commit 后的 active cancel 消息。
+        :returns: 找到匹配 active execution 时返回 ``True``。
+        :raises Exception: port 或 event-loop bridge 失败时透传。
+        """
+
+        ...
+
+
+class NoActiveWorkerCancelPort:
+    """未装配 execution worker 时使用的显式空 cancel port。"""
+
+    def cancel(self, message: ActiveCancelMessage) -> bool:
+        """确认当前没有可传播的 active worker。
+
+        :param message: durable commit 后的 active cancel 消息。
+        :returns: 固定返回 ``False``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -896,6 +960,7 @@ class HostDispatchScheduler:
         host_instance_identity: HostInstanceIdentity | None = None,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        health_gate: HostExecutionHealthGate | None = None,
     ) -> None:
         """初始化 dispatch scheduler。
 
@@ -908,6 +973,8 @@ class HostDispatchScheduler:
             不传时创建仅供测试直接构造使用的身份。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+        :param health_gate: execution opener 与 scheduler critical task 共享的 health
+            gate；直接测试未传时创建并立即置为 READY。
         :returns: ``None``。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -926,9 +993,13 @@ class HostDispatchScheduler:
         )
         self._active_registry = active_registry if active_registry is not None else ActiveWorkerRegistry()
         self._projection_catchup_port = projection_catchup_port
+        if health_gate is None:
+            health_gate = HostExecutionHealthGate()
+            health_gate.mark_ready()
+        self._health_gate = health_gate
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._active_cancel_watchdog_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+        self._active_cancel_watchdog_event = asyncio.Event()
         self._closed = False
         self._close_cleanup_done = False
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -947,6 +1018,7 @@ class HostDispatchScheduler:
         host_handle_id: str,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        health_gate: HostExecutionHealthGate | None = None,
     ) -> "HostDispatchScheduler":
         """打开本地 dispatch scheduler。
 
@@ -955,6 +1027,7 @@ class HostDispatchScheduler:
         :param host_handle_id: Host handle 诊断 id。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+        :param health_gate: execution opener 持有的共享 health gate。
         :returns: 已打开 scheduler。
         """
 
@@ -995,6 +1068,7 @@ class HostDispatchScheduler:
             host_instance_identity=host_identity,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
+            health_gate=health_gate,
         )
         scheduler._start_host_instance_heartbeat()
         scheduler._start_active_cancel_watchdog_loop()
@@ -1014,11 +1088,10 @@ class HostDispatchScheduler:
 
         :param record: 已持久化的 pending dispatch 摘要。
         :returns: ``None``。
-        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostApiError: scheduler 已关闭或 execution unavailable 时抛出。
         """
 
-        if self._closed:
-            raise RuntimeError("HostDispatchScheduler is closed")
+        self._raise_if_wake_unavailable(component=_CRITICAL_COMPONENT_DISPATCH)
         self._queue.put_nowait(record)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1030,18 +1103,20 @@ class HostDispatchScheduler:
             self._queue.qsize(),
         )
         if self._drain_task is None or self._drain_task.done():
-            self._drain_task = asyncio.create_task(self._drain_loop())
+            self._drain_task = self._start_critical_task(
+                self._drain_loop,
+                component=_CRITICAL_COMPONENT_DISPATCH,
+            )
 
     def wake_queue_promotion(self, session_id: str) -> None:
         """唤醒同 Session 的 queued Run promotion。
 
         :param session_id: 目标 Session id。
         :returns: ``None``。
-        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostApiError: scheduler lifecycle 不可用时抛出。
         """
 
-        if self._closed:
-            raise RuntimeError("HostDispatchScheduler is closed")
+        self._raise_if_wake_unavailable(component=_CRITICAL_COMPONENT_PROMOTION)
         self._promotion_queue.put_nowait(session_id)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1050,21 +1125,22 @@ class HostDispatchScheduler:
             self._promotion_queue.qsize(),
         )
         if self._promotion_drain_task is None or self._promotion_drain_task.done():
-            self._promotion_drain_task = asyncio.create_task(self._promotion_drain_loop())
+            self._promotion_drain_task = self._start_critical_task(
+                self._promotion_drain_loop,
+                component=_CRITICAL_COMPONENT_PROMOTION,
+            )
 
     def wake_active_cancel_watchdog(self) -> None:
         """唤醒 active cancel watchdog 执行一次 accepted-cancel 收口扫描。
 
         :returns: ``None``。
-        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostApiError: scheduler 已关闭或 execution unavailable 时抛出。
         """
 
-        if self._closed:
-            raise RuntimeError("HostDispatchScheduler is closed")
-        try:
-            self._active_cancel_watchdog_queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        self._raise_if_wake_unavailable(
+            component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG
+        )
+        self._active_cancel_watchdog_event.set()
         self._start_active_cancel_watchdog_loop()
 
     def tick_active_cancel_watchdog(
@@ -2460,7 +2536,11 @@ class HostDispatchScheduler:
         while not self._queue.empty():
             record = self._queue.get_nowait()
             processed += 1
-            outcome = await self._dispatch_one(record)
+            try:
+                outcome = await self._dispatch_one(record)
+            except HostTransactionRetryExhaustedError:
+                self._queue.put_nowait(record)
+                raise
             if outcome == "dispatched":
                 dispatched += 1
             elif outcome == "timed_out":
@@ -2534,7 +2614,10 @@ class HostDispatchScheduler:
         """
 
         if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(self._host_instance_heartbeat_loop())
+            self._heartbeat_task = self._start_critical_task(
+                self._host_instance_heartbeat_loop,
+                component=_CRITICAL_COMPONENT_HEARTBEAT,
+            )
 
     def _start_active_cancel_watchdog_loop(self) -> None:
         """启动 active cancel watchdog 后台任务。
@@ -2543,15 +2626,99 @@ class HostDispatchScheduler:
         """
 
         if self._active_cancel_watchdog_task is None or self._active_cancel_watchdog_task.done():
-            self._active_cancel_watchdog_task = asyncio.create_task(
-                self._active_cancel_watchdog_loop()
+            self._active_cancel_watchdog_task = self._start_critical_task(
+                self._active_cancel_watchdog_loop,
+                component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG,
             )
+
+    def _start_critical_task(
+        self,
+        operation_factory: Callable[[], Awaitable[None]],
+        *,
+        component: str,
+    ) -> asyncio.Task[None]:
+        """启动由 shared health gate 监督的 scheduler critical task。
+
+        :param operation_factory: 延迟创建 critical loop awaitable 的 factory。
+        :param component: 稳定 fatal component 标识。
+        :returns: 已启动的 asyncio task。
+        :raises RuntimeError: 当前没有 running event loop 时抛出。
+        """
+
+        return asyncio.create_task(
+            self._supervise_critical_task(
+                operation_factory,
+                component=component,
+            )
+        )
+
+    async def _supervise_critical_task(
+        self,
+        operation_factory: Callable[[], Awaitable[None]],
+        *,
+        component: str,
+    ) -> None:
+        """把 critical task 非预期异常或提前退出映射为 typed fatal。
+
+        :param operation_factory: 延迟创建 critical loop awaitable 的 factory。
+        :param component: 稳定 fatal component 标识。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler 正常 close 取消时透传。
+        """
+
+        try:
+            await operation_factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOGGER.error(
+                "dispatch.critical_task.fatal component=%s host_handle_id=%s "
+                "error_type=%s",
+                component,
+                self._host_handle_id,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+        else:
+            if self._closed:
+                return
+            _LOGGER.error(
+                "dispatch.critical_task.unexpected_exit component=%s "
+                "host_handle_id=%s",
+                component,
+                self._host_handle_id,
+            )
+        if not self._closed:
+            await self._health_gate.report_fatal(
+                component=component,
+                reason_code=_CRITICAL_FATAL_REASON,
+            )
+
+    def _raise_if_wake_unavailable(self, *, component: str) -> None:
+        """让 scheduler wake 对 lifecycle 不可用 fail closed。
+
+        :param component: 当前 wake component。
+        :returns: ``None``。
+        :raises HostApiError: scheduler 已关闭或 shared health 已不可用时抛出。
+        """
+
+        if self._closed:
+            self._health_gate.raise_if_scheduler_unavailable(
+                component=component,
+                reason_code=_SCHEDULER_UNAVAILABLE_REASON,
+                force=True,
+            )
+        self._health_gate.raise_if_scheduler_unavailable(
+            component=component,
+            reason_code=_SCHEDULER_UNAVAILABLE_REASON,
+        )
 
     async def _active_cancel_watchdog_loop(self) -> None:
         """active cancel watchdog 后台循环。
 
-        循环通过 cancel commit wakeup 降低延迟，并通过 periodic fallback scan
-        覆盖丢失 wakeup 或重启后的剩余 ``CANCELLING`` 状态。
+        循环通过 level-triggered cancel commit wakeup 降低延迟，并通过 periodic
+        fallback scan 覆盖重启后的剩余 ``CANCELLING`` 状态。event 必须在 tick
+        前 clear，使 tick 期间到达的新 wake 保持 set 并驱动下一轮。
 
         :returns: ``None``。
         :raises asyncio.CancelledError: scheduler close 时透传取消。
@@ -2562,26 +2729,15 @@ class HostDispatchScheduler:
             while not self._closed:
                 try:
                     await asyncio.wait_for(
-                        self._active_cancel_watchdog_queue.get(),
+                        self._active_cancel_watchdog_event.wait(),
                         timeout=interval,
                     )
                 except TimeoutError:
                     pass
                 if self._closed:
                     break
-                try:
-                    result = self.tick_active_cancel_watchdog(datetime.now(UTC))
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    _LOGGER.error(
-                        "dispatch.active_cancel_watchdog.tick_failed "
-                        "host_handle_id=%s error_type=%s",
-                        self._host_handle_id,
-                        exc.__class__.__name__,
-                        exc_info=True,
-                    )
-                    continue
+                self._active_cancel_watchdog_event.clear()
+                result = self.tick_active_cancel_watchdog(datetime.now(UTC))
                 if result.scanned > 0 or result.closed > 0:
                     _LOGGER.log(
                         VERBOSE_LOG_LEVEL,
@@ -2598,14 +2754,6 @@ class HostDispatchScheduler:
                 self._host_handle_id,
             )
             raise
-        except Exception as exc:
-            _LOGGER.error(
-                "dispatch.active_cancel_watchdog.fatal_exit host_handle_id=%s "
-                "error_type=%s",
-                self._host_handle_id,
-                exc.__class__.__name__,
-                exc_info=True,
-            )
 
     async def _host_instance_heartbeat_loop(self) -> None:
         """后台刷新当前 Host instance heartbeat。
@@ -2738,22 +2886,14 @@ class HostDispatchScheduler:
                     if result.processed > 0:
                         idle_sleep_logged = False
                 except HostTransactionRetryExhaustedError as exc:
-                    _LOGGER.error(
+                    _LOGGER.warning(
                         _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED,
                         self._host_handle_id,
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    self._best_effort_closeout_pending_queue_for_shutdown(
-                        reason=_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON,
-                        original_error=exc,
-                    )
-                    self._closed = True
-                    self._active_registry.cancel_all(
-                        _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
-                    )
-                    self._best_effort_mark_host_instance_stopped(
-                        _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
+                    await asyncio.sleep(
+                        self._local_execution.dispatch_poll_interval_seconds
                     )
                 except Exception as exc:
                     _LOGGER.warning(
@@ -2762,8 +2902,7 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    if not self._closed:
-                        await asyncio.sleep(self._local_execution.dispatch_poll_interval_seconds)
+                    raise
             _LOGGER.debug(_LOG_DRAIN_LOOP_CLOSE_EXIT, self._host_handle_id)
         except asyncio.CancelledError:
             _LOGGER.debug(
@@ -2792,14 +2931,27 @@ class HostDispatchScheduler:
                             session_id,
                         )
                     else:
+                        self._requeue_promotion_after_backoff(session_id)
                         _LOGGER.warning(
-                            "dispatch.queue_promotion.runtime_error " "host_handle_id=%s session_id=%s error_type=%s",
+                            "dispatch.queue_promotion.runtime_error "
+                            "host_handle_id=%s session_id=%s error_type=%s",
                             self._host_handle_id,
                             session_id,
                             exc.__class__.__name__,
                             exc_info=True,
                         )
+                except HostTransactionRetryExhaustedError as exc:
+                    self._requeue_promotion_after_backoff(session_id)
+                    _LOGGER.warning(
+                        "dispatch.queue_promotion.durable_retry_exhausted "
+                        "host_handle_id=%s session_id=%s error_type=%s",
+                        self._host_handle_id,
+                        session_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
                 except Exception as exc:
+                    self._requeue_promotion_after_backoff(session_id)
                     _LOGGER.warning(
                         "dispatch.queue_promotion.unexpected_exception "
                         "host_handle_id=%s session_id=%s error_type=%s",
@@ -2808,12 +2960,29 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
+                    raise
         except asyncio.CancelledError:
             _LOGGER.debug(
                 "dispatch.queue_promotion.cancelled host_handle_id=%s",
                 self._host_handle_id,
             )
             raise
+
+    def _requeue_promotion_after_backoff(self, session_id: str) -> None:
+        """在 promotion transient failure 后重新投递 session wakeup。
+
+        :param session_id: 需要重新执行 promotion reconciliation 的 Session id。
+        :returns: ``None``。
+        """
+
+        if self._closed:
+            return
+        loop = asyncio.get_running_loop()
+        loop.call_later(
+            self._local_execution.dispatch_poll_interval_seconds,
+            self._promotion_queue.put_nowait,
+            session_id,
+        )
 
     async def _dispatch_one(self, record: PendingDispatchRecord) -> str:
         """处理一个 dispatch wakeup。
@@ -3652,37 +3821,6 @@ class HostDispatchScheduler:
                 exc_info=True,
             )
 
-    def _best_effort_closeout_pending_queue_for_shutdown(
-        self,
-        *,
-        reason: str,
-        original_error: BaseException,
-    ) -> None:
-        """关闭 scheduler 前尽力收口尚未 dispatch 的队列记录。
-
-        :param reason: 写入 terminal closeout 的结构化原因。
-        :param original_error: 触发 scheduler shutdown 的原始异常。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        closeout_count = 0
-        while not self._queue.empty():
-            record = self._queue.get_nowait()
-            self._safe_closeout_worker_startup_timeout(
-                record,
-                reason=reason,
-                original_error=original_error,
-            )
-            closeout_count += 1
-        if closeout_count > 0:
-            _LOGGER.warning(
-                _LOG_DRAIN_LOOP_QUEUE_CLOSEOUT,
-                self._host_handle_id,
-                reason,
-                closeout_count,
-            )
-
     def _safe_close_worker_lost(
         self,
         *,
@@ -3800,16 +3938,23 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
-                        if cancellation_token.is_cancelled() and not self._closed:
-                            result = ingestor.ingest(
-                                _cancelled_eof_candidate(
-                                    envelope=envelope,
-                                    worker_event_index=worker_event_index + 1,
-                                    observed_at=datetime.now(UTC),
-                                    cancellation_token=cancellation_token,
-                                )
+                        if cancellation_token.is_cancelled():
+                            cancel_requested_at = _read_committed_cancel_requested_at(
+                                transaction_runner=self._transaction_runner,
+                                event_log_store=self._event_log_store,
+                                run_id=record.run_id,
                             )
-                            run_terminal_closed = _ingest_closed_run(result)
+                            if cancel_requested_at is not None:
+                                result = ingestor.ingest(
+                                    _cancelled_eof_candidate(
+                                        envelope=envelope,
+                                        worker_event_index=worker_event_index + 1,
+                                        observed_at=datetime.now(UTC),
+                                        cancel_requested_at=cancel_requested_at,
+                                        cancellation_token=cancellation_token,
+                                    )
+                                )
+                                run_terminal_closed = _ingest_closed_run(result)
                         if not run_terminal_closed:
                             _LOGGER.critical(
                                 "dispatch.worker_events.clean_eof_without_terminal "
@@ -3831,6 +3976,36 @@ class HostDispatchScheduler:
                             run_terminal_closed = _ingest_closed_run(result)
                     break
                 except asyncio.CancelledError:
+                    if cancellation_token.is_cancelled():
+                        try:
+                            cancel_requested_at = _read_committed_cancel_requested_at(
+                                transaction_runner=self._transaction_runner,
+                                event_log_store=self._event_log_store,
+                                run_id=record.run_id,
+                            )
+                            if cancel_requested_at is not None:
+                                result = ingestor.ingest(
+                                    _cancelled_eof_candidate(
+                                        envelope=envelope,
+                                        worker_event_index=worker_event_index + 1,
+                                        observed_at=datetime.now(UTC),
+                                        cancel_requested_at=cancel_requested_at,
+                                        cancellation_token=cancellation_token,
+                                    )
+                                )
+                                run_terminal_closed = _ingest_closed_run(result)
+                        except Exception as closeout_exc:
+                            run_terminal_closed = self._safe_close_worker_lost(
+                                ingestor=ingestor,
+                                envelope=envelope,
+                                record=record,
+                                local_worker_id=local_worker_id,
+                                worker_lifecycle_signal="worker_stream_cancelled",
+                                stream_error_code=closeout_exc.__class__.__name__,
+                                last_observed_worker_event_index=worker_event_index,
+                                last_accepted_event_id=last_accepted_event_id,
+                                original_error=closeout_exc,
+                            )
                     raise
                 except Exception as exc:
                     _LOGGER.error(
@@ -3978,11 +4153,37 @@ def _is_dispatchable_recheck(
     )
 
 
+def _read_committed_cancel_requested_at(
+    *,
+    transaction_runner: HostTransactionRunner,
+    event_log_store: EventLogStore,
+    run_id: str,
+) -> datetime | None:
+    """读取 Run linked ``CANCEL_REQUESTED`` canonical fact 的发生时间。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_log_store: EventLog primitive。
+    :param run_id: 目标 Run id。
+    :returns: committed cancel 请求时间；Run 缺失或 link 不存在时返回
+        ``None``。
+    :raises HostTransactionRetryExhaustedError: durable read transaction 重试耗尽时抛出。
+    :raises HostDurableError: durable read 失败时抛出。
+    """
+
+    return transaction_runner.run_read(
+        _ReadCommittedCancelRequestedAtOperation(
+            event_log_store=event_log_store,
+            run_id=run_id,
+        )
+    )
+
+
 def _cancelled_eof_candidate(
     *,
     envelope: LocalEngineEnvelope,
     worker_event_index: int,
     observed_at: datetime,
+    cancel_requested_at: datetime,
     cancellation_token: _HostCancellationToken,
 ) -> EngineEventCandidate:
     """把 cancel 后的 clean EOF 转为明确 run_cancelled candidate。
@@ -3990,14 +4191,13 @@ def _cancelled_eof_candidate(
     :param envelope: 当前 worker envelope。
     :param worker_event_index: 合成 EngineEvent 的 worker event 序号。
     :param observed_at: Host 观察时间。
+    :param cancel_requested_at: committed ``CANCEL_REQUESTED`` canonical fact
+        的发生时间。
     :param cancellation_token: Host 注入 Engine 的取消 token。
     :returns: 可交给 EngineEventIngestor 的 cancel candidate。
     :raises Exception: 不主动抛出异常。
     """
 
-    requested_at = cancellation_token.requested_at()
-    if requested_at is None:
-        requested_at = observed_at
     reason = cancellation_token.cancel_reason()
     if reason is None:
         reason = "host_cancelled"
@@ -4012,7 +4212,7 @@ def _cancelled_eof_candidate(
             type=EngineEventType.RUN_CANCELLED,
             data=RunCancelledData(
                 reason=reason,
-                requested_at=requested_at,
+                requested_at=cancel_requested_at,
                 accepted_at=observed_at,
                 finished_at=observed_at,
             ),
@@ -4089,7 +4289,7 @@ def _active_cancel_watchdog_candidate_from_run(
     cancel_requested = _read_linked_cancel_requested_event(
         transaction,
         event_log_store,
-        run.run_id,
+        run,
     )
     if cancel_requested is None:
         return None
@@ -4122,46 +4322,17 @@ def _dispatch_record_has_worker_accept(
 def _read_linked_cancel_requested_event(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
-    run_id: str,
+    run: RunRow,
 ) -> EventLogRow | None:
-    """读取 ``RUN_CANCELLING`` 链接的 ``CANCEL_REQUESTED`` fact。
+    """读取 Run row typed cancel link 指向的 ``CANCEL_REQUESTED`` fact。
 
     :param transaction: Host transaction。
     :param event_log_store: EventLog primitive。
-    :param run_id: 目标 Run id。
-    :returns: 同 Run 的 ``CANCEL_REQUESTED`` event；缺失或 payload 非法时返回
-        ``None``。
+    :param run: 目标 Run row。
+    :returns: 同 Run 的 ``CANCEL_REQUESTED`` event；缺失或 link 无效时返回 ``None``。
     """
 
-    cancelling = event_log_store.read_latest_run_event_by_type(
-        transaction,
-        run_id=run_id,
-        event_type=_EVENT_TYPE_RUN_CANCELLING,
-    )
-    if cancelling is None:
-        return None
-    try:
-        payload = event_payload_object(
-            transaction,
-            cancelling,
-            payload_label=_EVENT_TYPE_RUN_CANCELLING,
-        )
-    except HostDurableError:
-        return None
-    raw_cancel_request_event_id = payload.get("cancel_request_event_id")
-    if not isinstance(raw_cancel_request_event_id, str):
-        return None
-    cancel_requested = event_log_store.read_event_by_id(
-        transaction,
-        raw_cancel_request_event_id,
-    )
-    if (
-        cancel_requested is None
-        or cancel_requested.run_id != run_id
-        or cancel_requested.event_type != _EVENT_TYPE_CANCEL_REQUESTED
-    ):
-        return None
-    return cancel_requested
+    return read_cancel_requested_event_from_run_link(transaction, event_log_store, run)
 
 
 def _read_startable_run(transaction: HostTransaction, session_id: str) -> RunRow | None:

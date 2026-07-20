@@ -304,21 +304,21 @@ def test_runner_filters_matching_events_in_sequence_order(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="one",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-2",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="two",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-3",
             event_class=EventClass.DIAGNOSTIC,
-            event_type="DIAG_A",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
             marker="three",
         )
         consumer = _FakeConsumer(
@@ -326,7 +326,7 @@ def test_runner_filters_matching_events_in_sequence_order(
             ProjectionEventFilter(
                 (
                     ProjectionEventClassFilter(
-                        EventClass.CANONICAL_FACT, ("TYPE_A",)
+                        EventClass.CANONICAL_FACT, ("USER_INPUT_ACCEPTED",)
                     ),
                     ProjectionEventClassFilter(EventClass.DIAGNOSTIC, None),
                 )
@@ -360,21 +360,21 @@ def test_per_class_filters_do_not_share_event_type_sets(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="canonical",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-2",
             event_class=EventClass.DIAGNOSTIC,
-            event_type="DIAG_B",
+            event_type="PROVIDER_DIAGNOSTIC",
             marker="diagnostic-b",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-3",
             event_class=EventClass.DIAGNOSTIC,
-            event_type="DIAG_A",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
             marker="diagnostic-a",
         )
         consumer = _FakeConsumer(
@@ -382,7 +382,7 @@ def test_per_class_filters_do_not_share_event_type_sets(
             ProjectionEventFilter(
                 (
                     ProjectionEventClassFilter(EventClass.CANONICAL_FACT, None),
-                    ProjectionEventClassFilter(EventClass.DIAGNOSTIC, ("DIAG_A",)),
+                    ProjectionEventClassFilter(EventClass.DIAGNOSTIC, ("ENGINE_EVENT_DIAGNOSTIC",)),
                 )
             ),
         )
@@ -407,12 +407,12 @@ def test_runner_commits_projection_write_and_checkpoint_together(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="one",
         )
         consumer = _FakeConsumer(
             "consumer",
-            _canonical_type_filter("TYPE_A"),
+            _canonical_type_filter("USER_INPUT_ACCEPTED"),
             write_seen_rows=True,
         )
         ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -439,12 +439,12 @@ def test_consumer_write_failure_rolls_back_write_and_checkpoint(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="one",
         )
         consumer = _FakeConsumer(
             "consumer",
-            _canonical_type_filter("TYPE_A"),
+            _canonical_type_filter("USER_INPUT_ACCEPTED"),
             write_seen_rows=True,
             fail_event_ids=frozenset({"event-1"}),
         )
@@ -487,7 +487,7 @@ def test_payload_parsing_failure_records_failure_without_advancing_checkpoint(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="one",
         )
         _replace_event_payload_json(
@@ -495,7 +495,7 @@ def test_payload_parsing_failure_records_failure_without_advancing_checkpoint(
             event_id=event.event_id,
             payload_json=payload_json,
         )
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=1
         )
@@ -529,12 +529,12 @@ def test_duplicate_apply_result_still_advances_checkpoint(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="one",
         )
         consumer = _FakeConsumer(
             "consumer",
-            _canonical_type_filter("TYPE_A"),
+            _canonical_type_filter("USER_INPUT_ACCEPTED"),
             duplicate_event_ids=frozenset({"event-1"}),
         )
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -557,18 +557,18 @@ def test_success_after_failure_clears_failure_row(tmp_path: Path) -> None:
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="one",
         )
         failing_consumer = _FakeConsumer(
             "consumer",
-            _canonical_type_filter("TYPE_A"),
+            _canonical_type_filter("USER_INPUT_ACCEPTED"),
             fail_event_ids=frozenset({"event-1"}),
         )
         ProjectionRunner(store.transaction_runner, (failing_consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=1
         )
-        successful_consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        successful_consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         ProjectionRunner(store.transaction_runner, (successful_consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=1
         )
@@ -589,24 +589,24 @@ def test_runner_skips_unmatched_events_and_advances_to_matching_checkpoint(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="unmatched-canonical",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-2",
             event_class=EventClass.DIAGNOSTIC,
-            event_type="DIAG_A",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
             marker="unmatched-diagnostic",
         )
         matched = _append_event(
             store.transaction_runner,
             event_id="event-3",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="matched",
         )
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=1
         )
@@ -632,17 +632,17 @@ def test_runner_advances_covered_cursor_without_apply_when_no_matching_rows(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="one",
         )
         latest = _append_event(
             store.transaction_runner,
             event_id="event-2",
             event_class=EventClass.DIAGNOSTIC,
-            event_type="DIAG_A",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
             marker="two",
         )
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=10
         )
@@ -669,7 +669,7 @@ def test_runner_clears_failure_when_covered_cursor_advances_without_match(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="unmatched",
         )
 
@@ -691,7 +691,7 @@ def test_runner_clears_failure_when_covered_cursor_advances_without_match(
             )
 
         store.transaction_runner.run_write(write_failure)
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=10
         )
@@ -715,17 +715,17 @@ def test_runner_target_before_next_matching_row_advances_to_target_without_apply
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="target",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-2",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="future-match",
         )
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
             ProjectionConsumerId("consumer"),
             limit=10,
@@ -754,26 +754,26 @@ def test_matching_row_failure_does_not_advance_past_failed_row(
             store.transaction_runner,
             event_id="event-1",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_B",
+            event_type="RUN_ACCEPTED",
             marker="unmatched",
         )
         failed = _append_event(
             store.transaction_runner,
             event_id="event-2",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="failed",
         )
         _append_event(
             store.transaction_runner,
             event_id="event-3",
             event_class=EventClass.CANONICAL_FACT,
-            event_type="TYPE_A",
+            event_type="USER_INPUT_ACCEPTED",
             marker="not-reached",
         )
         consumer = _FakeConsumer(
             "consumer",
-            _canonical_type_filter("TYPE_A"),
+            _canonical_type_filter("USER_INPUT_ACCEPTED"),
             fail_event_ids=frozenset({"event-2"}),
         )
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -807,12 +807,12 @@ def test_run_once_limit_caps_steps_when_matching_events_remain(
                 store.transaction_runner,
                 event_id=f"event-{index}",
                 event_class=EventClass.CANONICAL_FACT,
-                event_type="TYPE_A",
+                event_type="USER_INPUT_ACCEPTED",
                 marker=f"marker-{index}",
             )
             for index in range(1, 6)
         )
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
             ProjectionConsumerId("consumer"), limit=3
         )
@@ -838,7 +838,7 @@ def test_runner_rejects_unknown_consumer(tmp_path: Path) -> None:
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
-        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("USER_INPUT_ACCEPTED"))
         runner = ProjectionRunner(store.transaction_runner, (consumer,))
         with pytest.raises(HostDurableError):
             runner.run_once(ProjectionConsumerId("missing"), limit=1)

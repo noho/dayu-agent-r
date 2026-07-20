@@ -16,7 +16,13 @@ import dayu.cli.commands.session as session_command
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
-from dayu.cli.agent_entrypoint import CliSigintMonitor
+import dayu.cli.session_execution as session_execution
+from dayu.cli.host_api_errors import (
+    CliHostApiErrorTarget,
+    exit_code_for_host_api_error,
+    format_host_api_error,
+)
+from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
 from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -30,15 +36,20 @@ from dayu.cli.session_identity import (
     display_identity_from_slot,
     slot_ref_for_cli_label,
 )
+from dayu.contracts import JsonValue
 from dayu.host.api import (
+    CloseSessionRequest,
+    CreateSessionRequest,
     FollowupBehavior,
     FollowupSnapshot,
     Host,
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
+    HostCommandHandleOptions,
     HostStreamCursor,
     ListSessionsResult,
+    OperationContext,
     PurgeSessionRequest,
     PurgeSessionResult,
     SessionSnapshot,
@@ -48,17 +59,103 @@ from dayu.host.api import (
     SubmitFollowupRequest,
     RunStatus,
 )
+from dayu.host.command import (
+    close_session as command_close_session,
+    create_host_command_handle,
+    create_session as command_create_session,
+)
 from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeError,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
 )
 from dayu.service.host_assembly import ServiceRunOverrides
+from dayu.service.host_admin import ServiceHostAdminRequest, prepare_host_admin
+
+
+def test_host_api_error_policy_maps_explicit_selector_not_found_to_usage() -> None:
+    """显式 session id selector 的 NOT_FOUND 必须映射为 usage error。"""
+
+    error = HostApiError(
+        code=HostApiErrorCode.NOT_FOUND,
+        message="session not found",
+        retryable=False,
+    )
+
+    exit_code = exit_code_for_host_api_error(
+        error,
+        target=CliHostApiErrorTarget(
+            selector="--session-id missing",
+            session_id="missing",
+            explicit_session_id_selector=True,
+            resolved_from_label=False,
+        ),
+    )
+
+    assert exit_code == EXIT_USAGE_ERROR
+
+
+def test_host_api_error_policy_maps_label_toctou_not_found_to_failure() -> None:
+    """label 已解析后的 NOT_FOUND TOCTOU 必须映射为 failure。"""
+
+    error = HostApiError(
+        code=HostApiErrorCode.NOT_FOUND,
+        message="session vanished",
+        retryable=False,
+    )
+
+    exit_code = exit_code_for_host_api_error(
+        error,
+        target=CliHostApiErrorTarget(
+            selector="--label alpha --kind prompt",
+            session_id="session-A",
+            explicit_session_id_selector=False,
+            resolved_from_label=True,
+        ),
+    )
+
+    assert exit_code == EXIT_FAILURE
+
+
+def test_host_api_error_policy_maps_prompt_interactive_not_found_to_failure() -> None:
+    """prompt/interactive 无显式 session selector 时 NOT_FOUND 必须是 failure。"""
+
+    error = HostApiError(
+        code=HostApiErrorCode.NOT_FOUND,
+        message="slot missing",
+        retryable=False,
+    )
+
+    assert exit_code_for_host_api_error(error) == EXIT_FAILURE
+
+
+def test_host_api_error_formatter_keeps_core_code_and_message() -> None:
+    """HostApiError formatter 必须保留统一 host_code / host_message 核心。"""
+
+    error = HostApiError(
+        code=HostApiErrorCode.CONFLICT,
+        message="write conflict",
+        retryable=True,
+    )
+
+    rendered = format_host_api_error("prompt", error)
+
+    assert "dayu-cli prompt" in rendered
+    assert "host_code=conflict" in rendered
+    assert "host_message=write conflict" in rendered
+    assert exit_code_for_host_api_error(error) == EXIT_FAILURE
 
 
 @dataclass(frozen=True, slots=True)
 class _FakeHostAssembly:
     """测试用 Host assembly。"""
+
+    options: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeAdminAssembly:
+    """测试用 HostAdmin assembly。"""
 
     options: str
 
@@ -72,9 +169,9 @@ class _FakeRuntime:
 
 @dataclass(slots=True)
 class _FakeRuntimeCapture:
-    """测试用 runtime request capture。"""
+    """测试用 admin assembly request capture。"""
 
-    requests: list[EntrypointRuntimeRequest]
+    requests: list[ParsedCliArgs]
 
 
 @dataclass(slots=True)
@@ -484,11 +581,148 @@ def test_session_list_calls_host_public_api_and_renders_sessions(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_SUCCESS
-    _assert_session_runtime_uses_prompt_carrier(runtime_capture)
+    _assert_session_uses_admin_assembly(runtime_capture)
     assert host.calls == ["list_sessions"]
     assert "session-anonymous\topen\tanonymous\t-" in captured.out
     assert "session-prompt\topen\tprompt\tproj.v1\trun-active\t0" in captured.out
     assert "session-closed\tclosed\tinteractive\tops\t-\t0" in captured.out
+    assert captured.err == ""
+
+
+def test_real_session_list_succeeds_without_model_api_keys(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """真实 CLI list 只走 admin assembly，全部 model secret 缺失仍成功。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: CLI 错误打开 execution runtime 时抛出。
+    """
+
+    for env_name in (
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "MIMO_API_KEY",
+        "MIMO_PLAN_API_KEY",
+        "MIMO_PLAN_SG_API_KEY",
+        "OPENAI_API_KEY",
+        "QWEN_API_KEY",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    exit_code = cli_main.main(("session", "list", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.err == ""
+
+
+def test_real_session_purge_succeeds_without_model_api_keys(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """真实 CLI purge 只走 admin opener，全部 model secret 缺失仍成功。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: CLI 错误装配 execution capability 时抛出。
+    """
+
+    for env_name in (
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "MIMO_API_KEY",
+        "MIMO_PLAN_API_KEY",
+        "MIMO_PLAN_SG_API_KEY",
+        "OPENAI_API_KEY",
+        "QWEN_API_KEY",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    admin_assembly = prepare_host_admin(
+        ServiceHostAdminRequest(
+            workspace_root=tmp_path,
+            package_config_root=package_config_root(),
+            config_overlay_dir=None,
+        )
+    )
+    admin_options = admin_assembly.options
+    command_handle = create_host_command_handle(
+        HostCommandHandleOptions(
+            host_handle_id="cli-real-purge-seed",
+            db_path=admin_options.db_path,
+            artifact_root=admin_options.artifact_root,
+            create_parent_dirs=admin_options.create_parent_dirs,
+            sqlite_busy_timeout_seconds=(
+                admin_options.sqlite_busy_timeout_seconds
+            ),
+            sqlite_write_busy_retry_count=(
+                admin_options.sqlite_write_busy_retry_count
+            ),
+            sqlite_write_retry_initial_delay_seconds=(
+                admin_options.sqlite_write_retry_initial_delay_seconds
+            ),
+            sqlite_write_retry_backoff_multiplier=(
+                admin_options.sqlite_write_retry_backoff_multiplier
+            ),
+            sqlite_write_retry_max_delay_seconds=(
+                admin_options.sqlite_write_retry_max_delay_seconds
+            ),
+            payload_inline_threshold_bytes=(
+                admin_options.payload_inline_threshold_bytes
+            ),
+            context_window_size=8192,
+            reserved_output_tokens=1024,
+        )
+    )
+    try:
+        context = _real_admin_seed_context("create")
+        session = command_create_session(
+            command_handle,
+            CreateSessionRequest(
+                context=context,
+                client_request_id="cli-real-purge-create",
+                bind_slot=False,
+                scope=None,
+                slot_key=None,
+                metadata=(),
+            ),
+        )
+        command_close_session(
+            command_handle,
+            session.session_id,
+            CloseSessionRequest(
+                context=_real_admin_seed_context("close"),
+                client_request_id="cli-real-purge-close",
+                reason="cli_real_purge_seed",
+            ),
+        )
+    finally:
+        command_handle.close()
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "purge",
+            "--session-id",
+            session.session_id,
+            "--yes",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert session.session_id in captured.out
     assert captured.err == ""
 
 
@@ -545,7 +779,7 @@ def test_session_purge_by_session_id_calls_host_purge(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_SUCCESS
-    _assert_session_runtime_uses_prompt_carrier(runtime_capture)
+    _assert_session_uses_admin_assembly(runtime_capture)
     assert host.calls == ["purge:session-1"]
     assert len(host.purge_requests) == 1
     session_id, request = host.purge_requests[0]
@@ -608,7 +842,7 @@ def test_session_purge_by_label_resolves_slot_then_purges(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_SUCCESS
-    _assert_session_runtime_uses_prompt_carrier(runtime_capture)
+    _assert_session_uses_admin_assembly(runtime_capture)
     assert host.calls == ["list_sessions", "purge:session-A"]
     assert captured.out == "Purged session session-A (tombstone: tombstone-re...)\n"
     assert captured.err == ""
@@ -652,7 +886,7 @@ def test_session_purge_invalid_state_explains_closed_terminal_precondition(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_FAILURE
-    _assert_session_runtime_uses_prompt_carrier(runtime_capture)
+    _assert_session_uses_admin_assembly(runtime_capture)
     assert "closed Session" in captured.err
     assert "terminal Runs" in captured.err
     assert "no close/cancel" in captured.err
@@ -711,7 +945,7 @@ def test_session_purge_by_label_toctou_error_includes_selector_and_host_context(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_FAILURE
-    _assert_session_runtime_uses_prompt_carrier(runtime_capture)
+    _assert_session_uses_admin_assembly(runtime_capture)
     assert "--label proj.v1 --kind prompt" in captured.err
     assert "session-A" in captured.err
     assert "conflict" in captured.err
@@ -1094,10 +1328,10 @@ def test_session_resume_interactive_startup_error_includes_selector_and_session(
     _install_fake_open_host(monkeypatch, host)
     _install_fake_resume_execution(monkeypatch)
 
-    async def fake_execute_interactive_on_existing_session(
+    async def fake_execute_interactive_on_session(
         *,
         host: Host,
-        prepared: interactive_command._PreparedInteractiveExistingSessionExecution,
+        prepared: session_execution.PreparedInteractiveSessionExecution,
         session_id: str,
         detail: bool = True,
         thinking: bool = True,
@@ -1117,8 +1351,8 @@ def test_session_resume_interactive_startup_error_includes_selector_and_session(
 
     monkeypatch.setattr(
         session_command,
-        "_execute_interactive_on_existing_session",
-        fake_execute_interactive_on_existing_session,
+        "execute_interactive_on_session",
+        fake_execute_interactive_on_session,
     )
 
     exit_code = cli_main.main(
@@ -1177,6 +1411,31 @@ def _session_list_item(
         timeline_cursor=HostStreamCursor(event_sequence=123),
         created_at=datetime(2026, 6, 16, 1, 2, 3, tzinfo=UTC),
         closed_at=closed_at,
+    )
+
+
+def _real_admin_seed_context(operation: str) -> HostCallContext:
+    """构造真实 CLI admin seed 使用的 Host context。
+
+    :param operation: seed operation 名称。
+    :returns: Host call context。
+    :raises Exception: typed contract 校验失败时透传。
+    """
+
+    return HostCallContext(
+        actor="test",
+        source="test_session_command",
+        request_id=f"cli-real-purge-{operation}",
+        authorization_claims=(),
+        operation_context=OperationContext(
+            operation_name=f"cli_real_purge_{operation}",
+            operation_kind="test",
+            business_domain="host",
+            business_object_type=None,
+            business_object_id=None,
+            scenario="cli_session_admin",
+            correlation_id=f"cli-real-purge-{operation}",
+        ),
     )
 
 
@@ -1255,7 +1514,23 @@ def _install_fake_open_host(
 
         return _FakeHostContext(host)
 
+    def fake_prepare_session_admin(_args: ParsedCliArgs) -> _FakeAdminAssembly:
+        """返回不读取真实配置的 fake admin assembly。
+
+        :param _args: argparse 已解析参数。
+        :returns: fake admin assembly。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return _FakeAdminAssembly(options="fake-admin-options")
+
     monkeypatch.setattr(session_command, "open_host", fake_open_host)
+    monkeypatch.setattr(session_command, "open_host_admin", fake_open_host)
+    monkeypatch.setattr(
+        session_command,
+        "_prepare_session_admin",
+        fake_prepare_session_admin,
+    )
 
 
 def _install_fake_resume_execution(
@@ -1277,13 +1552,16 @@ def _install_fake_resume_execution(
         interactive_display_flags=[],
     )
 
-    async def fake_prepare_prompt_existing_session_execution(
+    async def fake_prepare_prompt_session_execution(
         args: ParsedCliArgs,
         *,
         command_name: str,
         scenario: str,
         user_prompt: str,
-    ) -> prompt_command._PreparedPromptExistingSessionExecution:
+        ticker: str | None,
+        context_slot_values: dict[str, JsonValue],
+        usage_error_factory: Callable[[str], ValueError],
+    ) -> session_execution.PreparedPromptSessionExecution:
         """返回 fake prompt existing-session 准备结果。
 
         :param args: session resume 参数。
@@ -1294,8 +1572,9 @@ def _install_fake_resume_execution(
         :raises Exception: 不主动抛出异常。
         """
 
+        del context_slot_values, usage_error_factory
         capture.prompt_prepare_calls.append(user_prompt)
-        return prompt_command._PreparedPromptExistingSessionExecution(
+        return session_execution.PreparedPromptSessionExecution(
             runtime=cast(
                 EntrypointRuntimeResult,
                 _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
@@ -1305,16 +1584,16 @@ def _install_fake_resume_execution(
                 command_name=command_name,
                 scenario=scenario,
                 display_user="本地 CLI 用户",
-                ticker=args.ticker,
+                ticker=ticker,
             ),
             user_prompt=user_prompt,
             run_overrides=ServiceRunOverrides(),
         )
 
-    async def fake_execute_prompt_on_existing_session(
+    async def fake_execute_prompt_on_session(
         *,
         host: Host,
-        prepared: prompt_command._PreparedPromptExistingSessionExecution,
+        prepared: session_execution.PreparedPromptSessionExecution,
         session_id: str,
         sigint_monitor: CliSigintMonitor,
         detail: bool = True,
@@ -1348,12 +1627,15 @@ def _install_fake_resume_execution(
         )
         return EXIT_SUCCESS
 
-    async def fake_prepare_interactive_existing_session_execution(
+    async def fake_prepare_interactive_session_execution(
         args: ParsedCliArgs,
         *,
         command_name: str,
         scenario: str,
-    ) -> interactive_command._PreparedInteractiveExistingSessionExecution:
+        ticker: str | None,
+        context_slot_values: dict[str, JsonValue],
+        usage_error_factory: Callable[[str], ValueError],
+    ) -> session_execution.PreparedInteractiveSessionExecution:
         """返回 fake interactive existing-session 准备结果。
 
         :param args: session resume 参数。
@@ -1363,8 +1645,9 @@ def _install_fake_resume_execution(
         :raises Exception: 不主动抛出异常。
         """
 
+        del context_slot_values, usage_error_factory
         capture.interactive_prepare_calls.append(args.mode or "")
-        return interactive_command._PreparedInteractiveExistingSessionExecution(
+        return session_execution.PreparedInteractiveSessionExecution(
             runtime=cast(
                 EntrypointRuntimeResult,
                 _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
@@ -1374,15 +1657,15 @@ def _install_fake_resume_execution(
                 command_name=command_name,
                 scenario=scenario,
                 display_user="本地 CLI 用户",
-                ticker=args.ticker,
+                ticker=ticker,
             ),
             run_overrides=ServiceRunOverrides(),
         )
 
-    async def fake_execute_interactive_on_existing_session(
+    async def fake_execute_interactive_on_session(
         *,
         host: Host,
-        prepared: interactive_command._PreparedInteractiveExistingSessionExecution,
+        prepared: session_execution.PreparedInteractiveSessionExecution,
         session_id: str,
         input_reader: Callable[[str], str] | None = None,
         sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
@@ -1420,23 +1703,23 @@ def _install_fake_resume_execution(
 
     monkeypatch.setattr(
         session_command,
-        "_prepare_prompt_existing_session_execution",
-        fake_prepare_prompt_existing_session_execution,
+        "prepare_prompt_session_execution",
+        fake_prepare_prompt_session_execution,
     )
     monkeypatch.setattr(
         session_command,
-        "_execute_prompt_on_existing_session",
-        fake_execute_prompt_on_existing_session,
+        "execute_prompt_on_session",
+        fake_execute_prompt_on_session,
     )
     monkeypatch.setattr(
         session_command,
-        "_prepare_interactive_existing_session_execution",
-        fake_prepare_interactive_existing_session_execution,
+        "prepare_interactive_session_execution",
+        fake_prepare_interactive_session_execution,
     )
     monkeypatch.setattr(
         session_command,
-        "_execute_interactive_on_existing_session",
-        fake_execute_interactive_on_existing_session,
+        "execute_interactive_on_session",
+        fake_execute_interactive_on_session,
     )
     return capture
 
@@ -1455,43 +1738,39 @@ def _install_fake_session_runtime(
 
     capture = _FakeRuntimeCapture(requests=[])
 
-    async def fake_prepare_entrypoint_runtime(
-        request: EntrypointRuntimeRequest,
-    ) -> EntrypointRuntimeResult:
-        """返回最小 fake runtime。
+    def fake_prepare_session_admin(
+        args: ParsedCliArgs,
+    ) -> _FakeAdminAssembly:
+        """返回最小 fake admin assembly。
 
-        :param request: runtime 准备请求。
-        :returns: 经测试边界 cast 的 fake runtime result。
+        :param args: argparse 已解析参数。
+        :returns: fake admin assembly。
         :raises Exception: 不主动抛出异常。
         """
 
-        capture.requests.append(request)
-        return cast(
-            EntrypointRuntimeResult,
-            _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
-        )
+        capture.requests.append(args)
+        return _FakeAdminAssembly(options="fake-admin-options")
 
+    _install_fake_open_host(monkeypatch, host)
     monkeypatch.setattr(
         session_command,
-        "prepare_entrypoint_runtime",
-        fake_prepare_entrypoint_runtime,
+        "_prepare_session_admin",
+        fake_prepare_session_admin,
     )
-    _install_fake_open_host(monkeypatch, host)
     return capture
 
 
-def _assert_session_runtime_uses_prompt_carrier(
+def _assert_session_uses_admin_assembly(
     capture: _FakeRuntimeCapture,
 ) -> None:
-    """断言 session 命令 runtime assembly 使用已存在 prompt scene carrier。
+    """断言 list/purge 只准备一次 admin assembly，不准备 execution scene。
 
     :param capture: fake runtime 捕获到的请求。
     :returns: ``None``。
-    :raises AssertionError: runtime scene 或 required slots 不符合真实 manifest 时抛出。
+    :raises AssertionError: admin routing 次数或 action 不符合预期时抛出。
     """
 
     assert len(capture.requests) == 1
     request = capture.requests[0]
-    assert request.scene_id == "prompt"
-    assert request.context_slot_values["fins_default_subject"] == ""
-    assert "Asia/Shanghai" in str(request.context_slot_values["current_time"])
+    assert request.session_action in {"list", "purge"}
+    assert not hasattr(session_command, "prepare_entrypoint_runtime")

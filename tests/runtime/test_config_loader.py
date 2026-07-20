@@ -19,11 +19,13 @@ from dayu.runtime.config_loader import (
     RuntimeConfig,
     config_file_names,
     default_fallback_prompt,
-    legacy_config_file_names,
     load_runtime_config,
 )
 
 _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION: Final[int] = 5
+_REMOVED_CONFIG_FILE_NAMES: Final[frozenset[str]] = frozenset(
+    {"llm_models.json", "run.json"}
+)
 
 
 def _write_json(path: Path, value: JsonValue) -> None:
@@ -217,6 +219,29 @@ def _agent_policy_record() -> dict[str, JsonValue]:
     }
 
 
+def _wait_poller_policy_record() -> dict[str, JsonValue]:
+    """构造完整 wait poller policy fixture。
+
+    :returns: 与 packaged contract 字段一致的测试 policy。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "enabled": True,
+        "poll_interval_seconds": 1,
+        "claim_ttl_seconds": 60,
+        "claim_batch_size": 100,
+        "backoff_initial_delay_seconds": 30,
+        "backoff_multiplier": 2,
+        "backoff_max_delay_seconds": 300,
+        "not_ready_observe_interval_seconds": 1,
+        "idle_poll_interval_seconds": 5,
+        "adapter_call_timeout_seconds": 30,
+        "close_drain_timeout_seconds": 5,
+        "max_outstanding_adapter_calls": 8,
+    }
+
+
 def _host_runtime_config_record(
     *,
     include_process_capsule_interrupt_policy: bool = False,
@@ -250,6 +275,7 @@ def _host_runtime_config_record(
         "payload_inline_threshold_bytes": 4096,
         "worker_startup_timeout_seconds": 10.0,
         "memory_projection_catch_up_batch_size": 10,
+        "wait_poller_policy": _wait_poller_policy_record(),
     }
     if include_process_capsule_interrupt_policy:
         runtime_record["process_capsule_interrupt_policy"] = (
@@ -261,6 +287,25 @@ def _host_runtime_config_record(
             "local": runtime_record,
         },
     }
+
+
+def _local_host_runtime_record(
+    config: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """取得 host runtime fixture 的 local record。
+
+    :param config: ``_host_runtime_config_record`` 产出的顶层对象。
+    :returns: 可供 negative case 修改的 local runtime record。
+    :raises AssertionError: fixture 形状不符合预期时抛出。
+    """
+
+    runtimes = config["runtimes"]
+    if not isinstance(runtimes, dict):
+        raise AssertionError("host runtime fixture runtimes must be an object")
+    local = runtimes["local"]
+    if not isinstance(local, dict):
+        raise AssertionError("host runtime fixture local must be an object")
+    return local
 
 
 def _minimal_package_config(root: Path) -> None:
@@ -406,6 +451,18 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert host_runtime.sqlite.path == ".dayu/host/dayu_host.sqlite3"
     assert host_runtime.payload_inline_threshold_bytes == 65535
     assert host_runtime.worker_startup_timeout_seconds == 10.0
+    assert host_runtime.wait_poller_policy.enabled is True
+    assert host_runtime.wait_poller_policy.poll_interval_seconds == 1.0
+    assert host_runtime.wait_poller_policy.claim_ttl_seconds == 60.0
+    assert host_runtime.wait_poller_policy.claim_batch_size == 100
+    assert host_runtime.wait_poller_policy.backoff_initial_delay_seconds == 30.0
+    assert host_runtime.wait_poller_policy.backoff_multiplier == 2.0
+    assert host_runtime.wait_poller_policy.backoff_max_delay_seconds == 300.0
+    assert host_runtime.wait_poller_policy.not_ready_observe_interval_seconds == 1.0
+    assert host_runtime.wait_poller_policy.idle_poll_interval_seconds == 5.0
+    assert host_runtime.wait_poller_policy.adapter_call_timeout_seconds == 30.0
+    assert host_runtime.wait_poller_policy.close_drain_timeout_seconds == 5.0
+    assert host_runtime.wait_poller_policy.max_outstanding_adapter_calls == 8
     assert host_runtime.process_capsule_interrupt_policy is None
     assert (
         config.runtime_lanes.coordinator.db_path
@@ -438,13 +495,16 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     )
     assert download_provider.enabled is True
     assert "workspace_root" not in download_provider.config
+    assert download_provider.config["awaiting_resolution_mode"] == "poll"
     assert preprocess_provider.import_path == (
         "dayu.fins.tools.preprocess_provider:discover_tools"
     )
     assert preprocess_provider.enabled is True
     assert "workspace_root" not in preprocess_provider.config
+    assert preprocess_provider.config["awaiting_resolution_mode"] == "poll"
     assert upload_provider.enabled is True
     assert "workspace_root" not in upload_provider.config
+    assert upload_provider.config["awaiting_resolution_mode"] == "poll"
     assert "allowed_upload_roots" not in upload_provider.config
     doc_provider = config.tool_discovery.providers["doc-tools"]
     assert doc_provider.enabled is False
@@ -466,7 +526,26 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
         web_provider.config["playwright_storage_state_dir"]
         == ".dayu/web_tools_storage_states"
     )
-    assert web_provider.config["allow_private_network_url"] is False
+    assert web_provider.config["allow_private_network_url"] is True
+    assert web_provider.config["allow_custom_port_url"] is True
+    assert web_provider.config["dns_peer_proof_enabled"] is False
+    assert web_provider.config["allow_environment_proxy"] is True
+    assert web_provider.config["browser_enabled"] is True
+    assert web_provider.config["resource_budget"] == {
+        "http": {
+            "wire_body_bytes": 134217728,
+            "decoded_body_bytes": 268435456,
+        },
+        "browser": {
+            "warmup_body_bytes": 1048576,
+            "dom_chars": 16777216,
+            "text_chars": 8388608,
+        },
+        "diagnostics": {
+            "error_chars": 8192,
+            "events": 512,
+        },
+    }
     utils_provider = config.tool_discovery.providers["utils-tools"]
     assert utils_provider.enabled is True
     assert utils_provider.import_path == "dayu.tools.utils:discover_tools"
@@ -487,6 +566,149 @@ def test_host_runtime_process_capsule_policy_missing_block_is_valid(
     assert (
         config.runtimes["local"].process_capsule_interrupt_policy is None
     )
+
+
+def test_host_runtime_wait_poller_policy_block_is_required(tmp_path: Path) -> None:
+    """host runtime record 缺少 wait poller policy 必须失败。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 缺失 block 未在 ConfigLoader owner 失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    del _local_host_runtime_record(record)["wait_poller_policy"]
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match="wait_poller_policy"):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize("missing_field", tuple(_wait_poller_policy_record()))
+def test_host_runtime_wait_poller_policy_fields_are_all_required(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    """wait poller policy 的 12 个字段均不可缺失。
+
+    :param tmp_path: pytest 临时目录。
+    :param missing_field: 本 case 删除的字段。
+    :returns: ``None``。
+    :raises AssertionError: 缺失字段未失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy = _wait_poller_policy_record()
+    del policy[missing_field]
+    _local_host_runtime_record(record)["wait_poller_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match=missing_field):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+def test_host_runtime_wait_poller_policy_rejects_unknown_field(
+    tmp_path: Path,
+) -> None:
+    """wait poller policy 不接受多余字段。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 未知字段未失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy = _wait_poller_policy_record()
+    policy["unexpected_policy_field"] = "unsupported"
+    _local_host_runtime_record(record)["wait_poller_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("claim_batch_size", True),
+        ("max_outstanding_adapter_calls", False),
+        ("poll_interval_seconds", True),
+        ("enabled", 1),
+    ),
+)
+def test_host_runtime_wait_poller_policy_rejects_bool_numeric_substitution(
+    tmp_path: Path,
+    field_name: str,
+    value: JsonValue,
+) -> None:
+    """policy 数值位必须显式拒绝 Python bool，enabled 也只接受 bool。
+
+    :param tmp_path: pytest 临时目录。
+    :param field_name: 本 case 修改的 policy 字段。
+    :param value: 非法 JSON 值。
+    :returns: ``None``。
+    :raises AssertionError: bool/int 混淆未失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy = _wait_poller_policy_record()
+    policy[field_name] = value
+    _local_host_runtime_record(record)["wait_poller_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match=field_name):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "poll_interval_seconds",
+        "claim_ttl_seconds",
+        "claim_batch_size",
+        "backoff_initial_delay_seconds",
+        "backoff_multiplier",
+        "backoff_max_delay_seconds",
+        "not_ready_observe_interval_seconds",
+        "idle_poll_interval_seconds",
+        "adapter_call_timeout_seconds",
+        "close_drain_timeout_seconds",
+        "max_outstanding_adapter_calls",
+    ),
+)
+@pytest.mark.parametrize("value", (0, -1))
+def test_host_runtime_wait_poller_policy_rejects_non_positive_values(
+    tmp_path: Path,
+    field_name: str,
+    value: int,
+) -> None:
+    """policy 的 duration、multiplier 与 count 均必须为正。
+
+    :param tmp_path: pytest 临时目录。
+    :param field_name: 本 case 修改的 policy 数值字段。
+    :param value: 零或负数。
+    :returns: ``None``。
+    :raises AssertionError: 非正数未失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy = _wait_poller_policy_record()
+    policy[field_name] = value
+    _local_host_runtime_record(record)["wait_poller_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match=field_name):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
 
 
 def test_host_runtime_process_capsule_policy_valid_block_parses(
@@ -520,14 +742,8 @@ def test_host_runtime_process_capsule_policy_valid_block_parses(
     (
         ("terminate_grace_seconds", True),
         ("terminate_grace_seconds", -0.1),
-        ("terminate_grace_seconds", float("nan")),
-        ("terminate_grace_seconds", float("inf")),
-        ("terminate_grace_seconds", float("-inf")),
         ("kill_grace_seconds", True),
         ("kill_grace_seconds", -0.1),
-        ("kill_grace_seconds", float("nan")),
-        ("kill_grace_seconds", float("inf")),
-        ("kill_grace_seconds", float("-inf")),
     ),
 )
 def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
@@ -535,7 +751,7 @@ def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
     field_name: str,
     value: JsonValue,
 ) -> None:
-    """host_runtime process capsule cleanup grace 拒绝 bool、负数、NaN 与无穷。"""
+    """host_runtime process capsule cleanup grace 拒绝 bool 与负数。"""
 
     package_root = tmp_path / "package"
     _minimal_package_config(package_root)
@@ -554,6 +770,30 @@ def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
 
     with pytest.raises(ConfigFieldError, match=field_name):
         ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize("numeric_literal", ("NaN", "Infinity", "-Infinity", "1e400"))
+def test_config_json_boundary_rejects_non_finite_number_literals(
+    tmp_path: Path,
+    numeric_literal: str,
+) -> None:
+    """所有配置文件必须在 JSON 读取 owner 拒绝非有限数字面量。
+
+    :param tmp_path: pytest 临时目录。
+    :param numeric_literal: Python JSON 扩展常量或溢出浮点数字面量。
+    :returns: ``None``。
+    :raises AssertionError: 非有限值进入 schema 字段校验之后才失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    (package_root / "models.json").write_text(
+        f'{{"unexpected": {numeric_literal}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigShapeError, match="invalid JSON config file"):
+        ConfigLoader(package_config_dir=package_root).load_models()
 
 
 def test_host_runtime_process_capsule_policy_rejects_unknown_fields(
@@ -802,7 +1042,9 @@ def test_legacy_files_do_not_exist_and_are_not_read(tmp_path: Path) -> None:
     config = load_runtime_config(workspace_config_dir=workspace_root)
 
     assert isinstance(config, RuntimeConfig)
-    for file_name in legacy_config_file_names():
+    current_file_names = set(config_file_names())
+    for file_name in _REMOVED_CONFIG_FILE_NAMES:
+        assert file_name not in current_file_names
         assert not (Path("dayu/config") / file_name).exists()
 
 
@@ -1305,6 +1547,7 @@ def test_host_runtime_lane_reference_must_exist(tmp_path: Path) -> None:
                     "payload_inline_threshold_bytes": 4096,
                     "worker_startup_timeout_seconds": 10.0,
                     "memory_projection_catch_up_batch_size": 10,
+                    "wait_poller_policy": _wait_poller_policy_record(),
                 }
             },
         },

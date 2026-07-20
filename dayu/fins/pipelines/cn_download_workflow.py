@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Callable
+from functools import partial
 from typing import TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
@@ -197,6 +198,15 @@ async def run_cn_download_stream_impl(
         end_date=window.end_date,
         target_periods=periods.target_periods,
     )
+    cancellation_checkpoint: Callable[[], None] | None = None
+    if cancel_checker is not None:
+        cancellation_checkpoint = partial(
+            _raise_if_cancelled,
+            module=module,
+            ticker=normalized_ticker,
+            document_id="",
+            cancel_checker=cancel_checker,
+        )
     filings: list[JsonObject] = []
     warnings: list[str] = []
     notes = list(periods.notes)
@@ -205,12 +215,19 @@ async def run_cn_download_stream_impl(
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
-        company_meta = upsert_company_meta_for_cn_download(
-            repository=host.company_meta_repository,
-            profile=profile,
-            normalized_ticker=normalized_ticker,
-            ticker_aliases=ticker_aliases,
-        )
+        company_batch = host.batching_repository.begin_batch(normalized_ticker)
+        try:
+            company_meta = upsert_company_meta_for_cn_download(
+                repository=host.company_meta_repository,
+                profile=profile,
+                normalized_ticker=normalized_ticker,
+                ticker_aliases=ticker_aliases,
+                batch=company_batch,
+            )
+        except BaseException:
+            host.batching_repository.rollback_batch(company_batch)
+            raise
+        host.batching_repository.commit_batch(company_batch)
         company_info = {
             "company_id": company_meta.company_id,
             "provider_company_id": profile.company_id,
@@ -223,17 +240,17 @@ async def run_cn_download_stream_impl(
             ticker=normalized_ticker,
             payload=company_info,
         )
-        candidates = discovery.list_report_candidates(query, profile)
+        candidates = discovery.list_report_candidates(
+            query,
+            profile,
+            cancellation_checkpoint=cancellation_checkpoint,
+        )
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         selected = _select_candidates_for_a4(
             candidates,
             period_windows=period_windows,
             use_default_business_limits=start_date is None,
         )
-        if overwrite:
-            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
-            host.filing_maintenance_repository.clear_filing_documents(normalized_ticker)
-            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         missing_periods = _resolve_missing_periods(periods.target_periods, selected)
         for period in missing_periods:
             skipped = _build_missing_period_result(period=period)
@@ -269,6 +286,7 @@ async def run_cn_download_stream_impl(
             )
             try:
                 async for event in run_cn_download_single_filing_stream(
+                    batching_repository=host.batching_repository,
                     source_repository=host.source_repository,
                     blob_repository=host.blob_repository,
                     processed_repository=host.processed_repository,

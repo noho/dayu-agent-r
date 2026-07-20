@@ -4,7 +4,7 @@
 
 - 按当前 ``ToolParametersSchema`` 的窄 JSON Schema 子集校验
   ``ToolCallRequest.arguments``，并应用字段默认值。
-- 构造 completed / failed / host-cancelled outcome，保证三类终态使用一致
+- 构造 completed / failed / cancelled outcome，保证三类终态使用一致
   的 ``ToolResultMeta``。
 
 本模块是层中立 runtime helper，只依赖标准库与 ``dayu.contracts``；
@@ -18,7 +18,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, Literal, TypeAlias, cast
+from typing import Final, Literal, TypeAlias, TypeGuard, cast
 
 from dayu.contracts import (
     JsonValue,
@@ -36,8 +36,6 @@ from dayu.contracts import (
 INVALID_ARGUMENT_ERROR: Final[Literal["invalid_argument"]] = "invalid_argument"
 """工具参数校验失败的固定错误码。"""
 
-_DEFAULT_HOST_CANCELLED_MESSAGE: Final[str] = "工具调用已被宿主取消。"
-_DEFAULT_HOST_CANCELLED_HINT: Final[str] = "不要把本次取消视为业务失败；如仍需要结果，请在后续步骤重新发起请求。"
 _DEFAULT_EXECUTION_ERROR: Final[str] = "execution_error"
 _DEFAULT_FAILURE_MESSAGE: Final[str] = "Tool execution failed."
 
@@ -45,6 +43,12 @@ _SUPPORTED_JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset(
     {"string", "integer", "number", "boolean", "array", "object"}
 )
 _SUPPORTED_ARRAY_ITEM_TYPES: Final[frozenset[str]] = frozenset({"string", "integer", "number", "boolean"})
+_COUNT_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+)
 _SUPPORTED_FIELD_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
     {
         "default",
@@ -101,14 +105,26 @@ class ToolBusinessCancelled:
     该类型只用于后续 callable slice 在自身边界内表达“应返回取消 outcome”；
     它不观察 cancellation token，也不承载 Host governance 字段。
 
-    :param message: 可选取消说明；为空时由 ``host_cancelled_outcome`` 填充默认说明。
-    :param hint: 可选恢复提示；为空时由 ``host_cancelled_outcome`` 填充默认提示。
+    :param message: 业务可读取消说明，必须非空。
+    :param hint: 业务可读恢复提示，必须非空。
     :returns: dataclass 实例本身。
-    :raises Exception: 构造期不主动抛出异常。
+    :raises ValueError: message 或 hint 为空时抛出。
     """
 
-    message: str | None
-    hint: str | None
+    message: str
+    hint: str
+
+    def __post_init__(self) -> None:
+        """校验取消说明与恢复提示均由调用方显式提供。
+
+        :returns: ``None``。
+        :raises ValueError: 文本为空或纯空白时抛出。
+        """
+
+        if self.message.strip() == "":
+            raise ValueError("ToolBusinessCancelled.message must be non-empty")
+        if self.hint.strip() == "":
+            raise ValueError("ToolBusinessCancelled.hint must be non-empty")
 
 
 ToolArgumentValidationResult: TypeAlias = ValidatedToolArguments | ToolArgumentValidationFailure
@@ -273,25 +289,32 @@ def host_cancelled_outcome(
     tool_name: str,
     started_at: datetime,
     finished_at: datetime,
-    message: str | None = None,
-    hint: str | None = None,
+    message: str,
+    hint: str,
 ) -> ToolCancelledOutcome:
-    """构造 Host 语义取消 outcome。
+    """构造调用方显式说明的取消 outcome。
 
     :param tool_name: 工具名。
     :param started_at: 工具执行开始时间。
     :param finished_at: 工具执行结束时间。
-    :param message: 可选取消说明；为 ``None`` 或空白时使用非空默认说明。
-    :param hint: 可选恢复提示；为 ``None`` 或空白时使用非空默认提示。
+    :param message: 业务可读取消说明，必须非空。
+    :param hint: 业务可读恢复提示，必须非空。
     :returns: ``ToolCancelledOutcome``，reason 固定为
         ``TOOL_CANCELLED_REASON_HOST_CANCELLED``。
+    :raises ValueError: message 或 hint 为空时抛出。
     :raises Exception: ``ToolResultMeta`` 或 ``ToolCancelledOutcome`` 契约构造失败时透出。
     """
 
+    normalized_message = _blank_to_none(message)
+    if normalized_message is None:
+        raise ValueError("host_cancelled_outcome.message must be non-empty")
+    normalized_hint = _blank_to_none(hint)
+    if normalized_hint is None:
+        raise ValueError("host_cancelled_outcome.hint must be non-empty")
     return ToolCancelledOutcome(
         reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
-        message=_blank_to_default_optional(message, _DEFAULT_HOST_CANCELLED_MESSAGE),
-        hint=_blank_to_default_optional(hint, _DEFAULT_HOST_CANCELLED_HINT),
+        message=normalized_message,
+        hint=normalized_hint,
         meta=_meta(
             tool_name=tool_name,
             started_at=started_at,
@@ -356,6 +379,12 @@ def _project_field(
             field_name=field_name,
             message=(f"Tool schema for {field_name!r} uses unsupported keyword " f"{unsupported_key!r}."),
             hint="Fix the provider tool schema before retrying.",
+        )
+    invalid_count_bound = _first_invalid_count_bound(field_schema)
+    if invalid_count_bound is not None:
+        return _schema_bound_failure(
+            field_name=field_name,
+            bound_name=invalid_count_bound,
         )
 
     type_value = field_schema.get("type")
@@ -432,7 +461,7 @@ def _project_string(
         return _type_failure(field_name=field_name, expected="string")
     min_length = field_schema.get("minLength")
     if min_length is not None:
-        if isinstance(min_length, bool) or not isinstance(min_length, int):
+        if not _is_valid_count_bound(min_length):
             return _schema_bound_failure(field_name=field_name, bound_name="minLength")
         if len(value) < min_length:
             return _range_failure(
@@ -441,7 +470,7 @@ def _project_string(
             )
     max_length = field_schema.get("maxLength")
     if max_length is not None:
-        if isinstance(max_length, bool) or not isinstance(max_length, int):
+        if not _is_valid_count_bound(max_length):
             return _schema_bound_failure(field_name=field_name, bound_name="maxLength")
         if len(value) > max_length:
             return _range_failure(
@@ -548,7 +577,7 @@ def _project_array(
         return _type_failure(field_name=field_name, expected="array")
     min_items = field_schema.get("minItems")
     if min_items is not None:
-        if isinstance(min_items, bool) or not isinstance(min_items, int):
+        if not _is_valid_count_bound(min_items):
             return _schema_bound_failure(field_name=field_name, bound_name="minItems")
         if len(value) < min_items:
             return _range_failure(
@@ -557,7 +586,7 @@ def _project_array(
             )
     max_items = field_schema.get("maxItems")
     if max_items is not None:
-        if isinstance(max_items, bool) or not isinstance(max_items, int):
+        if not _is_valid_count_bound(max_items):
             return _schema_bound_failure(field_name=field_name, bound_name="maxItems")
         if len(value) > max_items:
             return _range_failure(
@@ -629,13 +658,93 @@ def _validate_enum(
             message=f"Tool schema enum for {field_name!r} must be an array.",
             hint="Fix the provider tool schema before retrying.",
         )
-    if value not in enum_value:
+    if not any(_json_values_equal(value, candidate) for candidate in enum_value):
         allowed = ", ".join(str(item) for item in enum_value)
         return _failure(
             field_name=field_name,
             message=f"Tool argument {field_name!r} must be one of: {allowed}.",
             hint=f"Set {field_name} to one of: {allowed}.",
         )
+    return None
+
+
+def _json_values_equal(left: JsonValue, right: JsonValue) -> bool:
+    """按 JSON 类型语义递归比较两个值。
+
+    JSON boolean 与 number 是不同类型；有限 int / float 都属于 JSON
+    number，并按数学值比较。array 与 object 递归应用同一规则。
+
+    :param left: 左侧 JSON 值。
+    :param right: 右侧 JSON 值。
+    :returns: 两值按 JSON 类型语义相等时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        if not isinstance(left, (int, float)) or not isinstance(
+            right, (int, float)
+        ):
+            return False
+        if isinstance(left, float) and not math.isfinite(left):
+            return False
+        if isinstance(right, float) and not math.isfinite(right):
+            return False
+        return left == right
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list):
+            return False
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    if set(left) != set(right):
+        return False
+    return all(_json_values_equal(left[key], right[key]) for key in left)
+
+
+def _is_valid_count_bound(value: JsonValue) -> TypeGuard[int]:
+    """判断 count bound 是否为合法非负整数。
+
+    :param value: schema 中的计数边界值。
+    :returns: 非 bool 的非负整数返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _first_invalid_count_bound(
+    field_schema: Mapping[str, JsonValue],
+    *,
+    path: str = "",
+) -> str | None:
+    """查找字段或 array items schema 的首个非法 count bound。
+
+    该检查是对构造后 mutable mapping 被外部篡改的防御，不替代
+    :class:`ToolParametersSchema` 的声明期校验。
+
+    :param field_schema: 当前字段或 array items schema。
+    :param path: 当前嵌套路径前缀。
+    :returns: 非法 bound 的路径；全部合法时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for bound_name in _COUNT_BOUND_KEYS:
+        if bound_name not in field_schema:
+            continue
+        if not _is_valid_count_bound(field_schema[bound_name]):
+            return f"{path}{bound_name}"
+    items_schema = field_schema.get("items")
+    if isinstance(items_schema, Mapping):
+        return _first_invalid_count_bound(items_schema, path=f"{path}items.")
     return None
 
 
@@ -803,21 +912,6 @@ def _blank_to_default(value: str, default: str) -> str:
     """
 
     return value if value.strip() != "" else default
-
-
-def _blank_to_default_optional(value: str | None, default: str) -> str:
-    """把可选空白字符串替换为默认值。
-
-    :param value: 原始可选文本。
-    :param default: 默认文本。
-    :returns: 非空文本。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if value is None:
-        return default
-    normalized = value.strip()
-    return normalized if normalized else default
 
 
 def _blank_to_none(value: str | None) -> str | None:

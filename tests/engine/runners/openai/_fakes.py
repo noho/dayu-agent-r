@@ -23,7 +23,6 @@ import asyncio
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 from types import TracebackType
 from typing import Self
 
@@ -247,46 +246,6 @@ class FakeSession:
         await self.close()
 
 
-@dataclass(slots=True)
-class FakeCancellationToken:
-    """简易 :class:`CancellationToken` 实现。
-
-    :param cancelled: 是否已取消。
-    :param reason: 取消原因。
-    :param requested: 请求时间戳。
-    """
-
-    cancelled: bool = False
-    reason: str | None = None
-    requested: datetime | None = None
-
-    def is_cancelled(self) -> bool:
-        """返回是否已取消。"""
-
-        return self.cancelled
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。"""
-
-        return self.reason
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间戳。"""
-
-        return self.requested
-
-    def trigger(self, reason: str = "test") -> None:
-        """触发取消。
-
-        :param reason: 取消原因。
-        :returns: 无返回值。
-        """
-
-        self.cancelled = True
-        self.reason = reason
-        self.requested = datetime.now()
-
-
 def make_async_iter(chunks: Sequence[bytes]) -> "AsyncByteIter":
     """构造异步字节迭代器。
 
@@ -329,7 +288,6 @@ __all__ = [
     "FakeContent",
     "FakeResponse",
     "FakeSession",
-    "FakeCancellationToken",
     "AsyncByteIter",
     "make_async_iter",
 ]

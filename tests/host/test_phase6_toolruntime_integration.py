@@ -30,6 +30,7 @@ from dayu.contracts.tool_schema import (
 from dayu.engine.agent import _AsyncAgent
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.engine_events import EngineEvent, EngineEventType
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
     AgentMessage,
@@ -489,7 +490,6 @@ def _tool_script(*tool_calls: ToolCallRequest) -> tuple[RunnerEvent, ...]:
             RunnerContentCompletedData(
                 content=None,
                 reasoning_content=None,
-                finish_reason=FinishReason.TOOL_CALLS,
             ),
         ),
         _event(
@@ -519,7 +519,6 @@ def _final_script(content: str) -> tuple[RunnerEvent, ...]:
             RunnerContentCompletedData(
                 content=content,
                 reasoning_content=None,
-                finish_reason=FinishReason.STOP,
             ),
         ),
         _event(
@@ -702,6 +701,8 @@ def _policy_snapshot() -> PolicySnapshot:
             continuation_max_attempts=1,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=10.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         policy_snapshot_ref="phase6-policy",
     )
@@ -828,7 +829,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-phase6",
                 execution_target="target-phase6",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

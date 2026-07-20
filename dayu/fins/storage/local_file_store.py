@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO, Optional
 
 from dayu.fins.domain.document_models import FileObjectMeta
 
+from ._fs_storage_utils import _fsync_directory, _normalize_object_key
 from .file_store import FileStore
 
 
@@ -60,24 +63,30 @@ class LocalFileStore(FileStore):
             OSError: 写入失败时抛出。
         """
 
-        path = self._resolve_key(key)
+        normalized_key = _normalize_object_key(key)
+        path = self._resolve_normalized_key(normalized_key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".part")
-        if temp_path.exists():
-            temp_path.unlink()
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         sha256 = hashlib.sha256()
         size = 0
-        with temp_path.open("wb") as stream:
-            while True:
-                chunk = data.read(1024 * 64)
-                if not chunk:
-                    break
-                stream.write(chunk)
-                sha256.update(chunk)
-                size += len(chunk)
-        temp_path.replace(path)
+        try:
+            with temp_path.open("wb") as stream:
+                while True:
+                    chunk = data.read(1024 * 64)
+                    if not chunk:
+                        break
+                    stream.write(chunk)
+                    sha256.update(chunk)
+                    size += len(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # 复杂逻辑说明：对象内容 durable 后才原子替换正式 key，避免暴露半写入内容。
+            os.replace(temp_path, path)
+            _fsync_directory(path.parent)
+        finally:
+            temp_path.unlink(missing_ok=True)
         return FileObjectMeta(
-            uri=self._build_uri(key),
+            uri=self._build_normalized_uri(normalized_key),
             etag=sha256.hexdigest(),
             last_modified=_iso_now(),
             size=size,
@@ -98,7 +107,8 @@ class LocalFileStore(FileStore):
             FileNotFoundError: 对象不存在时抛出。
         """
 
-        path = self._resolve_key(key)
+        normalized_key = _normalize_object_key(key)
+        path = self._resolve_normalized_key(normalized_key)
         if not path.exists():
             raise FileNotFoundError(f"对象不存在: {path}")
         return path.open("rb")
@@ -116,13 +126,14 @@ class LocalFileStore(FileStore):
             FileNotFoundError: 对象不存在时抛出。
         """
 
-        path = self._resolve_key(key)
+        normalized_key = _normalize_object_key(key)
+        path = self._resolve_normalized_key(normalized_key)
         if not path.exists():
             raise FileNotFoundError(f"对象不存在: {path}")
         sha256 = _hash_file_sha256(path)
         stat = path.stat()
         return FileObjectMeta(
-            uri=self._build_uri(key),
+            uri=self._build_normalized_uri(normalized_key),
             etag=sha256,
             last_modified=_iso_from_timestamp(stat.st_mtime),
             size=stat.st_size,
@@ -142,7 +153,8 @@ class LocalFileStore(FileStore):
             FileNotFoundError: 对象不存在时抛出。
         """
 
-        path = self._resolve_key(key)
+        normalized_key = _normalize_object_key(key)
+        path = self._resolve_normalized_key(normalized_key)
         if not path.exists():
             raise FileNotFoundError(f"对象不存在: {path}")
         path.unlink()
@@ -176,7 +188,8 @@ class LocalFileStore(FileStore):
             OSError: 读取失败时抛出。
         """
 
-        root = self._resolve_key(prefix)
+        normalized_prefix = _normalize_object_key(prefix)
+        root = self._resolve_normalized_key(normalized_prefix)
         if not root.exists():
             return []
         items: list[FileObjectMeta] = []
@@ -187,44 +200,38 @@ class LocalFileStore(FileStore):
             items.append(self.stat_object(key))
         return items
 
-    def _resolve_key(self, key: str) -> Path:
-        """将对象 key 解析为本地路径。
+    def _resolve_normalized_key(self, normalized_key: str) -> Path:
+        """将已校验对象 key 解析为本地路径。
 
         Args:
-            key: 对象键。
+            normalized_key: 已经由对象 key owner 校验的 canonical key。
 
         Returns:
             本地路径。
 
         Raises:
-            ValueError: key 非法或路径越界时抛出。
+            ValueError: 解析结果越界时抛出。
         """
 
-        normalized = key.strip().lstrip("/")
-        if not normalized:
-            raise ValueError("key 不能为空")
-        path = (self._root / Path(*normalized.split("/"))).resolve()
+        path = (self._root / Path(*normalized_key.split("/"))).resolve()
         if self._root not in path.parents and path != self._root:
             raise ValueError("key 越界，禁止访问根目录外路径")
         return path
 
-    def _build_uri(self, key: str) -> str:
-        """构造对象 URI。
+    def _build_normalized_uri(self, normalized_key: str) -> str:
+        """由已校验对象 key 构造对象 URI。
 
         Args:
-            key: 对象键。
+            normalized_key: 已经由对象 key owner 校验的 canonical key。
 
         Returns:
             对象 URI。
 
         Raises:
-            ValueError: key 为空时抛出。
+            无。
         """
 
-        normalized = key.strip().lstrip("/")
-        if not normalized:
-            raise ValueError("key 不能为空")
-        return f"{self._scheme}://{normalized}"
+        return f"{self._scheme}://{normalized_key}"
 
 
 def _hash_file_sha256(path: Path) -> str:

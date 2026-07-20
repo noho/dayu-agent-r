@@ -1,7 +1,8 @@
-"""联网检索 provider 与结果组装。
+"""联网检索 provider 与结构化事实组装。
 
 本模块只负责 `search_web` 的 provider 选择、请求发送、结果解析与
-返回结果组装，不承载网页抓取、HTML 转换或浏览器回退逻辑。
+返回结构化检索事实，不承载网页抓取、HTML 转换、浏览器回退逻辑或
+面向 LLM 的下一步动作提示。
 """
 
 from __future__ import annotations
@@ -15,16 +16,43 @@ import requests
 from bs4 import BeautifulSoup
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
+
+from . import web_fetch_orchestrator as _web_fetch_orchestrator
+from .web_challenge_detection import BotChallengeDecision, detect_bot_challenge
+from .web_egress_policy import WebEgressPolicy
+from .web_http_session import (
+    ProxyPeerProofIncompatibleError,
+    WebHttpTransportPolicy,
+    _send_authorized_plain_request,
+)
+from .web_resource_budget import HttpResourceBudget
 
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
 SERPER_API_KEY_ENV = "SERPER_API_KEY"
 TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
+_TAVILY_ENDPOINT: Final[str] = "https://api.tavily.com/search"
+_SERPER_ENDPOINT: Final[str] = "https://google.serper.dev/search"
+_DUCKDUCKGO_ENDPOINT: Final[str] = "https://duckduckgo.com/html/"
 
-_SEARCH_WEB_SNIPPET_PREVIEW_CHARS = 240
-_SEARCH_WEB_NEXT_ACTION_FETCH_PAGE = "fetch_web_page"
-_SEARCH_WEB_NEXT_ACTION_REFINE_QUERY = "refine_query"
 _ALL_PROVIDERS_UNAVAILABLE_MESSAGE: Final[str] = "联网检索失败：所有 provider 均不可用"
+_SEARCH_CANCELLED_MESSAGE: Final[str] = "工具调用已取消"
+_SEARCH_ACCEPT_ENCODING: Final[str] = "gzip, deflate"
+_DUCKDUCKGO_NO_RESULTS_TEXT: Final[frozenset[str]] = frozenset({"No results.", "No more results."})
+_DUCKDUCKGO_CHALLENGE_SELECTORS: Final[tuple[str, ...]] = (
+    "form#challenge-form",
+    "form[action*='challenge']",
+    ".anomaly-modal",
+    "#anomaly-modal",
+    "div.captcha",
+    "input[name='captcha']",
+)
+_DUCKDUCKGO_LOGIN_ACTION_TOKENS: Final[tuple[str, ...]] = (
+    "login",
+    "signin",
+    "auth",
+)
 
 
 class Log:
@@ -67,47 +95,40 @@ class SearchResultRow(TypedDict):
     published_date: str
 
 
-class SearchWebOutput(TypedDict):
-    """`search_web` 对外返回结构。"""
+class SearchWebProviderResult(TypedDict):
+    """联网检索 provider 返回的结构化事实。"""
 
     query: str
     domains: list[str]
     total: int
     preferred_result: SearchResultRow | None
-    preferred_result_summary: str
-    next_action: str
-    next_action_args: dict[str, str]
-    hint: str
     results: list[SearchResultRow]
 
 
 class WebSearchCancelledError(Exception):
     """联网检索观察到 Host 取消时的模块内异常。
 
-    :param message: 面向 LLM 的取消说明。
-    :param hint: 恢复提示。
+    :param message: 中性的取消说明；不包含 Host 治理字段或恢复提示。
     :returns: 无。
     :raises Exception: 构造期不主动抛出异常。
     """
 
-    def __init__(self, message: str, hint: str) -> None:
+    def __init__(self, message: str) -> None:
         """初始化取消异常。
 
-        :param message: 取消说明。
-        :param hint: 恢复提示。
+        :param message: 中性的取消说明。
         :returns: ``None``。
         :raises Exception: 构造期不主动抛出异常。
         """
 
         super().__init__(message)
         self.message = message
-        self.hint = hint
 
 
 class WebSearchProviderUnavailableError(RuntimeError):
     """所有搜索 provider 均不可用时的稳定业务失败。
 
-    :param message: 面向 LLM 的失败说明。
+    :param message: 稳定业务失败说明。
     :returns: 无。
     :raises Exception: 构造期不主动抛出异常。
     """
@@ -115,9 +136,72 @@ class WebSearchProviderUnavailableError(RuntimeError):
     def __init__(self, message: str) -> None:
         """初始化 provider 不可用异常。
 
-        :param message: 失败说明。
+        :param message: 稳定业务失败说明。
         :returns: ``None``。
         :raises Exception: 构造期不主动抛出异常。
+        """
+
+        super().__init__(message)
+        self.message = message
+
+
+class WebSearchProviderResponseError(RuntimeError):
+    """搜索 provider response shape 无法按冻结协议解释。
+
+    Args:
+        reason: provider response 失败原因。
+        message: 中性诊断说明。
+
+    Returns:
+        异常实例。
+
+    Raises:
+        无。
+    """
+
+    def __init__(self, *, reason: str, message: str) -> None:
+        """初始化 provider response error。
+
+        Args:
+            reason: provider response 失败原因。
+            message: 中性诊断说明。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+
+
+class WebSearchProviderResourceError(RuntimeError):
+    """搜索 provider response 超过 Web 资源预算。
+
+    Args:
+        message: 中性的资源失败说明。
+
+    Returns:
+        异常实例。
+
+    Raises:
+        无。
+    """
+
+    def __init__(self, message: str) -> None:
+        """初始化 provider response 资源错误。
+
+        Args:
+            message: 中性的资源失败说明。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
         """
 
         super().__init__(message)
@@ -168,15 +252,6 @@ class _TimeoutBudgetResolver(Protocol):
         ...
 
 
-class _PublicUrlSafetyChecker(Protocol):
-    """公网 URL 安全校验协议。"""
-
-    def __call__(self, url: str, *, allow_private_network_url: bool = False) -> bool:
-        """判断 URL 是否允许暴露给上层。"""
-
-        ...
-
-
 def search_public_web(
     *,
     query: str,
@@ -188,13 +263,14 @@ def search_public_web(
     request_timeout_seconds: float,
     timeout_budget: float | None,
     deadline_monotonic: float | None,
-    allow_private_network_url: bool,
-    is_safe_public_url: _PublicUrlSafetyChecker,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     normalize_whitespace: Callable[[str], str],
     resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     cancellation_token: CancellationToken | None = None,
-) -> SearchWebOutput:
-    """执行公开网页检索并组装 tool 输出。
+) -> SearchWebProviderResult:
+    """执行公开网页检索并组装结构化 provider 事实。
 
     Args:
         query: 原始查询文本。
@@ -206,18 +282,21 @@ def search_public_web(
         request_timeout_seconds: provider 请求超时秒数。
         timeout_budget: 单次 tool call 总预算。
         deadline_monotonic: 当前调用 deadline。
-        allow_private_network_url: 是否允许保留私网 URL 结果。
-        is_safe_public_url: 公网 URL 安全校验函数。
+        egress_policy: 与 fetch 同源的 private/custom-port typed policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
+        http_resource_budget: 搜索响应 wire/decoded body 预算。
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
-        `search_web` 对外返回字典。
+        结构化联网检索事实，尚未包含面向 LLM 的下一步动作提示。
 
     Raises:
         ValueError: 当 query 或 domains 非法时抛出。
         WebSearchProviderUnavailableError: 当所有 provider 都失败时抛出。
+        WebSearchProviderResourceError: 最终决定性失败为响应资源超限时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 peer proof 冲突时抛出。
     """
 
     normalized_query = query.strip()
@@ -228,6 +307,7 @@ def search_public_web(
     limited_results = max(1, min(int(max_results), max_search_results))
     resolved_provider = _resolve_provider(preferred=provider)
     _raise_if_search_cancelled(cancellation_token)
+    last_decisive_error: WebSearchProviderResponseError | WebSearchProviderResourceError | None = None
 
     for candidate_provider in _candidate_providers(resolved_provider):
         _raise_if_search_cancelled(cancellation_token)
@@ -242,7 +322,10 @@ def search_public_web(
                     timeout_seconds=request_timeout_seconds,
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
+                    egress_policy=egress_policy,
+                    transport_policy=transport_policy,
                     resolve_timeout_budget=resolve_timeout_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             elif candidate_provider == "serper":
                 rows = _search_with_serper(
@@ -253,7 +336,10 @@ def search_public_web(
                     timeout_seconds=request_timeout_seconds,
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
+                    egress_policy=egress_policy,
+                    transport_policy=transport_policy,
                     resolve_timeout_budget=resolve_timeout_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             else:
                 rows = _search_with_duckduckgo(
@@ -263,13 +349,23 @@ def search_public_web(
                     timeout_seconds=request_timeout_seconds,
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
+                    egress_policy=egress_policy,
+                    transport_policy=transport_policy,
                     normalize_whitespace=normalize_whitespace,
                     resolve_timeout_budget=resolve_timeout_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             _raise_if_search_cancelled(cancellation_token)
         except Exception as exc:  # pragma: no cover - 失败路径由单测通过 monkeypatch 覆盖
             if _is_search_cancelled_error(exc):
                 raise
+            if isinstance(exc, ProxyPeerProofIncompatibleError):
+                raise
+            if isinstance(
+                exc,
+                (WebSearchProviderResponseError, WebSearchProviderResourceError),
+            ):
+                last_decisive_error = exc
             _log_search_provider_failure(
                 candidate_provider=candidate_provider,
                 error=exc,
@@ -278,8 +374,7 @@ def search_public_web(
 
         visible_results = _filter_visible_results(
             rows=rows,
-            allow_private_network_url=allow_private_network_url,
-            is_safe_public_url=is_safe_public_url,
+            egress_policy=egress_policy,
         )[:limited_results]
         preferred_result = _build_search_web_preferred_result(visible_results)
         return {
@@ -287,19 +382,11 @@ def search_public_web(
             "domains": normalized_domains,
             "total": len(visible_results),
             "preferred_result": preferred_result,
-            "preferred_result_summary": _build_search_web_preferred_summary(
-                preferred_result=preferred_result,
-                normalize_whitespace=normalize_whitespace,
-            ),
-            "next_action": _build_search_web_next_action(preferred_result=preferred_result),
-            "next_action_args": _build_search_web_next_action_args(preferred_result=preferred_result),
-            "hint": _build_search_web_hint(
-                preferred_result=preferred_result,
-                normalize_whitespace=normalize_whitespace,
-            ),
             "results": visible_results,
         }
 
+    if last_decisive_error is not None:
+        raise last_decisive_error
     raise WebSearchProviderUnavailableError(_ALL_PROVIDERS_UNAVAILABLE_MESSAGE)
 
 
@@ -318,13 +405,8 @@ def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> 
 
     if cancellation_token is None or not cancellation_token.is_cancelled():
         return
-    raise WebSearchCancelledError(
-        message=cancellation_token.cancel_reason() or "工具调用已取消",
-        hint=(
-            "[continue_without_web] The host cancelled this web search; "
-            "continue without this web search unless the user asks to retry."
-        ),
-    )
+    _ = cancellation_token.cancel_reason()
+    raise WebSearchCancelledError(message=_SEARCH_CANCELLED_MESSAGE)
 
 
 def _is_search_cancelled_error(error: Exception) -> bool:
@@ -346,15 +428,13 @@ def _is_search_cancelled_error(error: Exception) -> bool:
 def _filter_visible_results(
     *,
     rows: list[SearchResultRow],
-    allow_private_network_url: bool,
-    is_safe_public_url: _PublicUrlSafetyChecker,
+    egress_policy: WebEgressPolicy,
 ) -> list[SearchResultRow]:
     """按 URL 安全策略过滤 provider 结果。
 
     Args:
         rows: provider 返回的原始结果列表。
-        allow_private_network_url: 是否允许保留私网 URL。
-        is_safe_public_url: 公网 URL 安全校验函数。
+        egress_policy: 与 fetch 同源的 private/custom-port typed policy。
 
     Returns:
         通过安全过滤的结果列表。
@@ -363,14 +443,7 @@ def _filter_visible_results(
         无。
     """
 
-    return [
-        row
-        for row in rows
-        if is_safe_public_url(
-            row["url"],
-            allow_private_network_url=allow_private_network_url,
-        )
-    ]
+    return [row for row in rows if egress_policy.is_url_allowed(row["url"])]
 
 
 def _default_resolve_timeout_budget(
@@ -534,9 +607,12 @@ def _search_with_tavily(
     recency_days: Optional[int],
     max_results: int,
     timeout_seconds: float,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
 ) -> list[SearchResultRow]:
     """使用 Tavily API 搜索。
 
@@ -546,9 +622,12 @@ def _search_with_tavily(
         recency_days: 最近天数。
         max_results: 返回数量。
         timeout_seconds: HTTP 请求超时秒数。
+        egress_policy: 与 fetch 同源的 endpoint egress policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
+        resolve_timeout_budget: timeout 预算解析函数。
+        http_resource_budget: Web response 资源预算唯一真源。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
-        resolve_timeout_budget: timeout 预算解析函数。
 
     Returns:
         结果列表。
@@ -561,28 +640,40 @@ def _search_with_tavily(
     if not api_key:
         raise RuntimeError("TAVILY_API_KEY 未配置")
 
-    payload: dict[str, str | int | list[str]] = {
+    payload: dict[str, JsonValue] = {
         "api_key": api_key,
         "query": query,
         "max_results": max_results,
         "search_depth": "advanced",
     }
     if domains:
-        payload["include_domains"] = domains
+        payload["include_domains"] = [domain for domain in domains]
     if recency_days is not None and recency_days >= 0:
         payload["days"] = int(recency_days)
 
-    response = requests.post(
-        "https://api.tavily.com/search",
-        json=payload,
+    lease = _send_authorized_plain_request(
+        egress_policy=egress_policy,
+        url=_TAVILY_ENDPOINT,
+        method="POST",
+        headers={"Accept-Encoding": _SEARCH_ACCEPT_ENCODING},
         timeout=resolve_timeout_budget(
             timeout_seconds,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
         ),
+        stream=True,
+        transport_policy=transport_policy,
+        request_params=None,
+        request_json=payload,
     )
-    response.raise_for_status()
-    data = response.json()
+    with lease:
+        response = lease.response
+        _materialize_bounded_search_response(
+            response,
+            http_resource_budget=http_resource_budget,
+        )
+        _raise_for_search_provider_status(response)
+        data = response.json()
     if not isinstance(data, dict):
         return []
 
@@ -608,9 +699,12 @@ def _search_with_serper(
     recency_days: Optional[int],
     max_results: int,
     timeout_seconds: float,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
 ) -> list[SearchResultRow]:
     """使用 Serper API 搜索。
 
@@ -620,9 +714,12 @@ def _search_with_serper(
         recency_days: 最近天数。
         max_results: 返回数量。
         timeout_seconds: HTTP 请求超时秒数。
+        egress_policy: 与 fetch 同源的 endpoint egress policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
+        resolve_timeout_budget: timeout 预算解析函数。
+        http_resource_budget: Web response 资源预算唯一真源。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
-        resolve_timeout_budget: timeout 预算解析函数。
 
     Returns:
         结果列表。
@@ -640,25 +737,40 @@ def _search_with_serper(
         domain_expr = " OR ".join(f"site:{domain}" for domain in domains)
         query_with_domain = f"({query}) ({domain_expr})"
 
-    payload: dict[str, str | int] = {
+    payload: dict[str, JsonValue] = {
         "q": query_with_domain,
         "num": max_results,
     }
     if recency_days is not None and recency_days >= 0:
         payload["tbs"] = f"qdr:d{int(recency_days)}"
 
-    response = requests.post(
-        "https://google.serper.dev/search",
-        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
-        json=payload,
+    lease = _send_authorized_plain_request(
+        egress_policy=egress_policy,
+        url=_SERPER_ENDPOINT,
+        method="POST",
+        headers={
+            "X-API-KEY": api_key,
+            "Content-Type": "application/json",
+            "Accept-Encoding": _SEARCH_ACCEPT_ENCODING,
+        },
         timeout=resolve_timeout_budget(
             timeout_seconds,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
         ),
+        stream=True,
+        transport_policy=transport_policy,
+        request_params=None,
+        request_json=payload,
     )
-    response.raise_for_status()
-    data = response.json()
+    with lease:
+        response = lease.response
+        _materialize_bounded_search_response(
+            response,
+            http_resource_budget=http_resource_budget,
+        )
+        _raise_for_search_provider_status(response)
+        data = response.json()
     if not isinstance(data, dict):
         return []
 
@@ -683,10 +795,13 @@ def _search_with_duckduckgo(
     domains: list[str],
     max_results: int,
     timeout_seconds: float,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    normalize_whitespace: Callable[[str], str],
+    resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    normalize_whitespace: Callable[[str], str] = lambda value: " ".join(value.split()),
-    resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
 ) -> list[SearchResultRow]:
     """使用 DuckDuckGo HTML 页面搜索。
 
@@ -695,10 +810,13 @@ def _search_with_duckduckgo(
         domains: 域名过滤。
         max_results: 返回数量。
         timeout_seconds: HTTP 请求超时秒数。
-        timeout_budget: Runner 注入的单次 tool call 总预算。
-        deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        egress_policy: 与 fetch 同源的 endpoint egress policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
+        http_resource_budget: Web response 资源预算唯一真源。
+        timeout_budget: Runner 注入的单次 tool call 总预算。
+        deadline_monotonic: 当前工具调用的单调时钟 deadline。
 
     Returns:
         结果列表。
@@ -711,31 +829,161 @@ def _search_with_duckduckgo(
     if domains:
         query_with_domain = f"{query} " + " ".join(f"site:{domain}" for domain in domains)
 
-    response = requests.get(
-        "https://duckduckgo.com/html/",
-        params={"q": query_with_domain},
+    lease = _send_authorized_plain_request(
+        egress_policy=egress_policy,
+        url=_DUCKDUCKGO_ENDPOINT,
+        method="GET",
         timeout=resolve_timeout_budget(
             timeout_seconds,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
         ),
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Encoding": _SEARCH_ACCEPT_ENCODING,
+        },
+        stream=True,
+        transport_policy=transport_policy,
+        request_params={"q": query_with_domain},
+        request_json=None,
     )
+    with lease:
+        response = lease.response
+        _materialize_bounded_search_response(
+            response,
+            http_resource_budget=http_resource_budget,
+        )
+        _raise_for_search_provider_status(response)
+        return _parse_duckduckgo_html(
+            html=response.text,
+            response=response,
+            max_results=max_results,
+            normalize_whitespace=normalize_whitespace,
+        )
+
+
+def _materialize_bounded_search_response(
+    response: requests.Response,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> None:
+    """在解析 provider payload 前执行共享 wire/codec 资源预算。
+
+    Args:
+        response: 使用 ``stream=True`` 获得的 provider response。
+        http_resource_budget: Web response 资源预算唯一真源。
+
+    Returns:
+        无。
+
+    Raises:
+        WebSearchProviderResourceError: wire 或 decoded body 超限时抛出。
+        RuntimeError: content encoding 无法安全有界解码时透出。
+    """
+
+    try:
+        _web_fetch_orchestrator._materialize_response_body(
+            response,
+            http_resource_budget=http_resource_budget,
+        )
+    except _web_fetch_orchestrator._FetchBodyLimitExceeded as exc:
+        raise WebSearchProviderResourceError(
+            "Search provider response body exceeded the configured Web resource limit."
+        ) from exc
+
+
+def _raise_for_search_provider_status(response: requests.Response) -> None:
+    """拒绝 redirect，并对 HTTP error status 使用 requests 标准异常。
+
+    固定 provider endpoint 不跟随自动 redirect，避免在 search module 内建立
+    第二套 redirect/egress owner。
+
+    Args:
+        response: 已有界物化的 provider response。
+
+    Returns:
+        无。
+
+    Raises:
+        requests.HTTPError: response 是 redirect 或标准 HTTP error 时抛出。
+    """
+
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError(
+            "Search provider redirect is not allowed.",
+            response=response,
+        )
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "lxml")
+
+def _parse_duckduckgo_html(
+    *,
+    html: str,
+    response: requests.Response | None,
+    max_results: int,
+    normalize_whitespace: Callable[[str], str],
+) -> list[SearchResultRow]:
+    """按冻结的 DuckDuckGo HTML shape 解析结果。
+
+    Args:
+        html: DuckDuckGo HTML response 文本。
+        response: 可选原始响应，只用于共享 challenge detector 的状态与头部证据。
+        max_results: 通过完整 shape 校验后最多投影的结果数。
+        normalize_whitespace: 文本空白规整函数。
+
+    Returns:
+        已知结果 shape 的有界结果，或 explicit no-results 对应的空列表。
+
+    Raises:
+        WebSearchProviderResponseError: challenge/login shape、未知 shape 或
+            malformed 比例超过冻结阈值时抛出。
+    """
+
+    soup = BeautifulSoup(html, "lxml")
+    challenge = detect_bot_challenge(
+        response=response,
+        content_text=html,
+    )
+    if challenge.decision is BotChallengeDecision.CONFIRMED:
+        raise WebSearchProviderResponseError(
+            reason="challenge_response",
+            message="DuckDuckGo returned a challenge response.",
+        )
+    if _duckduckgo_has_login_or_anomaly_shape(soup):
+        raise WebSearchProviderResponseError(
+            reason="challenge_or_login_shape",
+            message="DuckDuckGo returned a challenge or login shape.",
+        )
+
+    containers = soup.select("div.result")
+    if not containers:
+        no_result_markers = soup.select(".no-results")
+        if len(no_result_markers) == 1:
+            marker_text = normalize_whitespace(no_result_markers[0].get_text(" ", strip=True))
+            if marker_text in _DUCKDUCKGO_NO_RESULTS_TEXT:
+                return []
+        raise WebSearchProviderResponseError(
+            reason="response_shape_changed",
+            message="DuckDuckGo response did not match a known result or no-results shape.",
+        )
+
     results: list[SearchResultRow] = []
-    for node in soup.select("div.result"):
+    malformed_count = 0
+    for node in containers:
         anchor = node.select_one("a.result__a")
         if anchor is None:
+            malformed_count += 1
             continue
         snippet_node = node.select_one("a.result__snippet") or node.select_one("div.result__snippet")
         title = normalize_whitespace(anchor.get_text(" ", strip=True))
         raw_href = anchor.get("href")
-        if not isinstance(raw_href, str):
+        if not title or not isinstance(raw_href, str) or not raw_href.strip():
+            malformed_count += 1
             continue
         url = _resolve_duckduckgo_result_url(raw_href)
-        if not url:
+        parsed_url = urlparse(url)
+        if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.hostname:
+            malformed_count += 1
             continue
         snippet = normalize_whitespace(snippet_node.get_text(" ", strip=True) if snippet_node else "")
         results.append(
@@ -746,9 +994,40 @@ def _search_with_duckduckgo(
                 "published_date": "",
             }
         )
-        if len(results) >= max_results:
-            break
-    return results
+    container_count = len(containers)
+    if not results or malformed_count * 2 > container_count:
+        raise WebSearchProviderResponseError(
+            reason="response_shape_changed",
+            message=("DuckDuckGo result containers exceeded the malformed response threshold."),
+        )
+    return results[:max_results]
+
+
+def _duckduckgo_has_login_or_anomaly_shape(soup: BeautifulSoup) -> bool:
+    """识别覆盖 result/no-results 的 challenge、anomaly 或 login shape。
+
+    Args:
+        soup: 已解析的 DuckDuckGo DOM。
+
+    Returns:
+        命中封闭 anomaly/challenge/password/login selector 时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if any(soup.select_one(selector) is not None for selector in _DUCKDUCKGO_CHALLENGE_SELECTORS):
+        return True
+    if soup.select_one("input[type='password']") is not None:
+        return True
+    for form in soup.select("form[action]"):
+        action = form.get("action")
+        if not isinstance(action, str):
+            continue
+        normalized_action = action.strip().lower()
+        if any(token in normalized_action for token in _DUCKDUCKGO_LOGIN_ACTION_TOKENS):
+            return True
+    return False
 
 
 def _resolve_duckduckgo_result_url(raw_url: str) -> str:
@@ -790,7 +1069,7 @@ def _resolve_duckduckgo_result_url(raw_url: str) -> str:
 def _build_search_web_preferred_result(
     results: list[SearchResultRow],
 ) -> SearchResultRow | None:
-    """提取 `search_web` 的首选结果。
+    """提取 `search_web` 的首个可见结果。
 
     Args:
         results: 已完成安全过滤与数量裁剪的结果列表。
@@ -811,116 +1090,3 @@ def _build_search_web_preferred_result(
         "snippet": first_result["snippet"],
         "published_date": first_result["published_date"],
     }
-
-
-def _build_search_web_preferred_summary(
-    *,
-    preferred_result: SearchResultRow | None,
-    normalize_whitespace: Callable[[str], str],
-) -> str:
-    """构建 `search_web` 的首选结果摘要。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-        normalize_whitespace: 文本空白规整函数。
-
-    Returns:
-        面向 LLM 的单行摘要。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return "未找到可直接抓取正文的公开网页结果。"
-
-    title = normalize_whitespace(preferred_result["title"].strip())
-    url = preferred_result["url"].strip()
-    published_date = preferred_result["published_date"].strip()
-    snippet = normalize_whitespace(preferred_result["snippet"].strip())
-    snippet_preview = snippet[:_SEARCH_WEB_SNIPPET_PREVIEW_CHARS]
-    if len(snippet) > _SEARCH_WEB_SNIPPET_PREVIEW_CHARS:
-        snippet_preview = f"{snippet_preview}..."
-
-    summary_parts = ["首选结果"]
-    if title:
-        summary_parts.append(f"标题：{title}")
-    if published_date:
-        summary_parts.append(f"日期：{published_date}")
-    if url:
-        summary_parts.append(f"URL：{url}")
-    if snippet_preview:
-        summary_parts.append(f"摘要：{snippet_preview}")
-    return "；".join(summary_parts)
-
-
-def _build_search_web_next_action(*, preferred_result: SearchResultRow | None) -> str:
-    """构建 `search_web` 的下一步动作。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-
-    Returns:
-        下一步动作名称。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return _SEARCH_WEB_NEXT_ACTION_REFINE_QUERY
-    return _SEARCH_WEB_NEXT_ACTION_FETCH_PAGE
-
-
-def _build_search_web_next_action_args(
-    *,
-    preferred_result: SearchResultRow | None,
-) -> dict[str, str]:
-    """构建 `search_web` 的下一步动作参数。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-
-    Returns:
-        下一步动作参数字典。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return {}
-    return {"url": preferred_result["url"].strip()}
-
-
-def _build_search_web_hint(
-    *,
-    preferred_result: SearchResultRow | None,
-    normalize_whitespace: Callable[[str], str],
-) -> str:
-    """构建 `search_web` 成功返回的下一步提示。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-        normalize_whitespace: 文本空白规整函数。
-
-    Returns:
-        直接指向下一步动作的提示文案。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return (
-            "当前没有可直接抓取的网页正文。下一步应改写 query，或放宽 domains/recency_days 后重新调用 "
-            "search_web；不要对空结果调用 fetch_web_page。"
-        )
-
-    url = preferred_result["url"].strip()
-    title = normalize_whitespace(preferred_result["title"].strip())
-    target_label = f"《{title}》" if title else url
-    return (
-        f"优先抓取首选结果正文：下一步直接调用 fetch_web_page(url='{url}') 读取 {target_label}。"
-        "只有当首选结果抓取失败或正文不相关时，再回看 results 中其他候选。"
-    )

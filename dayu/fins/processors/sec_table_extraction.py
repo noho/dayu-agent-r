@@ -32,7 +32,6 @@ from dayu.documents.processors.text_utils import (
     format_table_placeholder as _format_table_placeholder,
     format_table_ref as _format_table_ref,
     infer_caption_from_context as _infer_caption_from_context,
-    normalize_optional_string as _normalize_optional_string_base,
     normalize_whitespace as _normalize_whitespace,
 )
 from dayu.fins.processors.sec_html_rules import is_sec_cover_page_table, is_sec_section_heading_table
@@ -44,6 +43,7 @@ from dayu.fins.processors.sec_section_build import (
     _safe_table_text,
     _table_fingerprint,
 )
+from dayu.fins.processors.value_normalization import normalize_optional_dataframe_string
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -88,29 +88,6 @@ _CONTEXT_TAIL_MARKER_MIN_CHARS = 48
 _TABLE_FINGERPRINT_MAX_CHARS = 240
 _TABLE_DISAMBIGUATION_MARKER_CHARS = (720, 480, 360, 300)
 _CURRENCY_SYMBOL_TOKENS = frozenset({"$", "¥", "€", "£", "%", "%%"})
-
-
-# ---------------------------------------------------------------------------
-# Helper: pandas NaN-aware normalize_optional_string
-# ---------------------------------------------------------------------------
-
-
-def _normalize_optional_string(value: Any) -> Optional[str]:
-    """将任意值转为可选字符串，额外处理 pandas NaN/NaT。
-
-    对 ``None``、空字符串、``float('nan')``、``pd.NaT`` 等无意义值统一返回 ``None``。
-
-    Args:
-        value: 任意输入值。
-
-    Returns:
-        标准化字符串；空值返回 ``None``。
-    """
-    if value is None:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    return _normalize_optional_string_base(value)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +282,7 @@ def _build_tables(
 
     for index, table_obj in enumerate(_iter_document_tables(document), start=1):
         table_text = _normalize_whitespace(_safe_table_text(table_obj))
-        caption = _normalize_optional_string(getattr(table_obj, "caption", None))
+        caption = normalize_optional_dataframe_string(getattr(table_obj, "caption", None))
         fingerprint = _table_fingerprint(table_text)
         dataframe_provider = _TableDataFrameProvider(table_obj)
         row_count, col_count = _resolve_table_dimensions(table_obj, dataframe_provider)
@@ -940,7 +917,7 @@ def _extract_headers_from_dataframe(table_df: pd.DataFrame) -> Optional[list[str
         RuntimeError: 提取失败时抛出。
     """
 
-    columns = [_normalize_optional_string(column) for column in table_df.columns]
+    columns = [normalize_optional_dataframe_string(column) for column in table_df.columns]
     normalized = _normalize_header_list(columns)
     if not normalized:
         return None
@@ -1029,7 +1006,7 @@ def _pick_row_header_from_values(values: list[Any]) -> str:
     """
 
     for value in values:
-        candidate = _normalize_optional_string(value)
+        candidate = normalize_optional_dataframe_string(value)
         if not candidate:
             continue
         if _is_low_information_header(candidate):
@@ -1078,7 +1055,7 @@ def _normalize_header_list(headers: Sequence[Optional[str]]) -> list[str]:
 
     normalized: list[str] = []
     for header in headers:
-        value = _normalize_optional_string(header)
+        value = normalize_optional_dataframe_string(header)
         if not value:
             continue
         normalized.append(value)
@@ -1723,7 +1700,7 @@ def _render_records_from_dataframe(
     columns = _extract_headers_from_dataframe(table_df)
     normalized_df = table_df.copy()
     if not columns:
-        candidate_columns = [_normalize_optional_string(column) for column in normalized_df.columns]
+        candidate_columns = [normalize_optional_dataframe_string(column) for column in normalized_df.columns]
         columns = _build_table_columns(
             candidate_columns=candidate_columns,
             col_count=normalized_df.shape[1],
@@ -1915,7 +1892,7 @@ def _collapse_header_rows(header_rows: list[list[str]], col_count: int) -> list[
     merged: list[list[str]] = [[] for _ in range(col_count)]
     for row in header_rows:
         for index in range(col_count):
-            token = _normalize_optional_string(row[index] if index < len(row) else None)
+            token = normalize_optional_dataframe_string(row[index] if index < len(row) else None)
             if not token:
                 continue
             if token in merged[index]:
@@ -1948,7 +1925,7 @@ def _build_table_columns(
         return None
     normalized_columns: list[str] = []
     for index in range(col_count):
-        candidate = _normalize_optional_string(candidate_columns[index] if index < len(candidate_columns) else None)
+        candidate = normalize_optional_dataframe_string(candidate_columns[index] if index < len(candidate_columns) else None)
         if candidate and not _is_low_information_header(candidate):
             normalized_columns.append(candidate)
             continue

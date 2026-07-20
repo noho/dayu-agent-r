@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import hashlib
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -36,17 +38,24 @@ from dayu.host.durable.projection import (
     read_projection_failure,
 )
 from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_TOOL_TRACE_HOT,
     TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+    TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
 )
-from dayu.host.durable.tool_trace import read_tool_trace_hot_row
+from dayu.host.durable.tool_trace import (
+    read_tool_trace_by_run,
+    read_tool_trace_hot_row,
+)
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
+    OpaqueEvidenceRef,
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.open_host import _default_tool_trace_cold_jsonl_path
@@ -57,6 +66,11 @@ from dayu.host.tool_trace import (
     ToolTraceProjectionConsumer,
     ToolTraceSinkOptions,
     catch_up_tool_trace_projection,
+)
+from dayu.host.tool_call_request import (
+    AcceptedToolCallRequestAtomInput,
+    ToolCallRequestEventOrigin,
+    build_tool_call_requested_event_request,
 )
 
 _FIXED_NOW = datetime(2026, 5, 29, 2, 3, 4, tzinfo=UTC)
@@ -70,6 +84,31 @@ _SIGNAL_FIELD_NAMES: tuple[str, ...] = (
     _FIELD_FAILURE_METADATA,
     _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
 )
+_CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
+
+
+class _AcceptedTraceCorruption(StrEnum):
+    """accepted result canonical request material 损坏分类。"""
+
+    MISSING_ENVELOPE = "missing_envelope"
+    MISSING_REQUEST_ROW = "missing_request_row"
+    REQUEST_IDENTITY_MISMATCH = "request_identity_mismatch"
+    ARGUMENTS_DIGEST_MISMATCH = "arguments_digest_mismatch"
+    ARGUMENTS_DESCRIPTOR_WITH_INLINE = "arguments_descriptor_with_inline"
+    SEMANTIC_QUERY_DESCRIPTOR_WITH_INLINE = (
+        "semantic_query_descriptor_with_inline"
+    )
+    RESULT_EXECUTION_MISSING = "result_execution_missing"
+    RESULT_EXECUTION_MISMATCH = "result_execution_mismatch"
+
+
+class _RequestedRowCorruption(StrEnum):
+    """direct TOOL_CALL_REQUESTED canonical row 损坏分类。"""
+
+    MISSING_ROW = "missing_row"
+    WRONG_EVENT_TYPE = "wrong_event_type"
+    STORAGE_CONFLICT = "storage_conflict"
+    DIGEST_MISMATCH = "digest_mismatch"
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -130,6 +169,7 @@ def _append_tool_event_in_transaction(
     event_class: EventClass,
     payload_ref: str | None,
     payload_digest: str | None,
+    execution_id: str | None = "execution-1",
 ) -> EventLogRow:
     """在单个 transaction 内追加 Tool Trace 测试 EventLog row。
 
@@ -140,7 +180,9 @@ def _append_tool_event_in_transaction(
     :param event_class: EventLog class。
     :param payload_ref: 可选 payload descriptor ref。
     :param payload_digest: 可选 payload digest。
+    :param execution_id: EventLog execution id。
     :returns: 已追加 EventLog row。
+    :raises HostDurableError: payload 或 EventLog durable 写入失败时抛出。
     """
 
     actual_payload_ref = payload_ref
@@ -168,7 +210,7 @@ def _append_tool_event_in_transaction(
             session_id="session-1",
             run_id="run-1",
             attempt_id="attempt-1",
-            execution_id="execution-1",
+            execution_id=execution_id,
             event_type=event_type,
             occurred_at=_FIXED_NOW,
             actor="host",
@@ -182,6 +224,424 @@ def _append_tool_event_in_transaction(
             payload_digest=actual_payload_digest,
         ),
     ).row
+
+
+def _accepted_request_atom(
+    *,
+    event_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    run_id: str = "run-1",
+) -> AcceptedToolCallRequestAtomInput:
+    """构造 identity/digest 同源的 canonical request atom 输入。
+
+    :param event_id: request event id，用于生成稳定测试参数。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :param run_id: request row Run id。
+    :returns: 可交给共享 request writer 的 accepted atom。
+    :raises ValueError: 构造的 request atom 字段违反基础约束时抛出。
+    """
+
+    accepted_arguments: Mapping[str, JsonValue] = {"fixture": event_id}
+    arguments_digest = sha256_digest_json({"arguments": accepted_arguments})
+    semantic_input_digest = sha256_digest_json(
+        {"semantic_input": f"trace fixture {event_id}"}
+    )
+    return AcceptedToolCallRequestAtomInput(
+        session_id="session-1",
+        run_id=run_id,
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        iteration_id="iteration-1",
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_schema_digest=sha256_digest_json({"tool_schema": tool_name}),
+        tool_identity_digest=sha256_digest_json(
+            {"tool_name": tool_name, "tool_call_id": tool_call_id}
+        ),
+        accepted_arguments=accepted_arguments,
+        normalized_arguments_digest=arguments_digest,
+        tool_fact_kind="completed",
+        accept_idempotency_key=f"accept:{event_id}",
+        semantic_input_digest=semantic_input_digest,
+        semantic_query_text=f"查询 trace fixture {event_id}",
+    )
+
+
+def _append_canonical_tool_request_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    tool_name: str,
+) -> EventLogRow:
+    """通过共享 writer 追加 canonical ``TOOL_CALL_REQUESTED``。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: request event id。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :returns: 数据库返回的真实 request row。
+    :raises ValueError: request atom 基础字段非法时抛出。
+    :raises HostDurableError: request atom 或 EventLog 写入失败时抛出。
+    """
+
+    return transaction_runner.run_write(
+        lambda transaction: append_event(
+            transaction,
+            build_tool_call_requested_event_request(
+                transaction,
+                atom=_accepted_request_atom(
+                    event_id=event_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                ),
+                event_id=event_id,
+                occurred_at=_FIXED_NOW,
+                origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+            ),
+        ).row
+    )
+
+
+def _append_accepted_tool_result_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    additional_payload: Mapping[str, JsonValue],
+    include_raw_outcome: bool = True,
+) -> EventLogRow:
+    """原子追加 canonical request 与 accepted result 成功夹具。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: result event id。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :param additional_payload: signal 等 result-owned 附加字段。
+    :param include_raw_outcome: 是否写入 canonical raw outcome。
+    :returns: 数据库返回的真实 result row。
+    :raises ValueError: request/envelope 基础字段非法时抛出。
+    :raises HostDurableError: request、envelope 或 EventLog 写入失败时抛出。
+    """
+
+    return transaction_runner.run_write(
+        lambda transaction: _append_accepted_tool_result_in_transaction(
+            transaction,
+            event_id=event_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            additional_payload=additional_payload,
+            include_raw_outcome=include_raw_outcome,
+        )
+    )
+
+
+def _append_accepted_tool_result_in_transaction(
+    transaction: HostTransaction,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    additional_payload: Mapping[str, JsonValue],
+    include_raw_outcome: bool = True,
+) -> EventLogRow:
+    """在同一 transaction 内追加 canonical request/result pair。
+
+    :param transaction: Host durable transaction。
+    :param event_id: result event id。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :param additional_payload: signal 等 result-owned 附加字段。
+    :param include_raw_outcome: 是否写入 canonical raw outcome。
+    :returns: 数据库返回的真实 result row。
+    :raises ValueError: request/envelope 基础字段非法时抛出。
+    :raises HostDurableError: request、envelope 或 EventLog 写入失败时抛出。
+    """
+
+    request_event_id = f"{event_id}-request"
+    atom = _accepted_request_atom(
+        event_id=request_event_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+    )
+    request = append_event(
+        transaction,
+        build_tool_call_requested_event_request(
+            transaction,
+            atom=atom,
+            event_id=request_event_id,
+            occurred_at=_FIXED_NOW,
+            origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+        ),
+    ).row
+    raw_tool_outcome: JsonValue = {
+        "kind": "completed",
+        "result": {"content": f"trace result {event_id}"},
+    }
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{event_id}",
+        producer_event_ref=event_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=request.event_id,
+            normalized_arguments_digest=atom.normalized_arguments_digest,
+            semantic_input_digest=atom.semantic_input_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=sha256_digest_json(raw_tool_outcome),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+    result_payload: dict[str, JsonValue] = dict(additional_payload)
+    result_payload.update(
+        {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "normalized_arguments_digest": atom.normalized_arguments_digest,
+            "semantic_input_digest": atom.semantic_input_digest,
+            "outcome_digest": sha256_digest_json(raw_tool_outcome),
+            "accepted_evidence_envelope": (
+                accepted_evidence_envelope_to_json_value(envelope)
+            ),
+        }
+    )
+    if include_raw_outcome:
+        result_payload["raw_tool_outcome"] = raw_tool_outcome
+    return _append_tool_event_in_transaction(
+        transaction,
+        event_id=event_id,
+        event_type="TOOL_RESULT_ACCEPTED",
+        payload=result_payload,
+        event_class=EventClass.CANONICAL_FACT,
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _append_broken_accepted_tool_result_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    corruption: _AcceptedTraceCorruption,
+) -> EventLogRow:
+    """追加 canonical request material 损坏的 accepted result。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: result event id。
+    :param corruption: envelope、request row、identity 或 digest 损坏分类。
+    :returns: 数据库返回的真实 result row。
+    :raises ValueError: corruption 或 envelope 基础字段非法时抛出。
+    :raises HostDurableError: request、envelope 或 EventLog 写入失败时抛出。
+    """
+
+    return transaction_runner.run_write(
+        lambda transaction: _append_broken_accepted_tool_result_in_transaction(
+            transaction,
+            event_id=event_id,
+            corruption=corruption,
+        )
+    )
+
+
+def _append_broken_accepted_tool_result_in_transaction(
+    transaction: HostTransaction,
+    *,
+    event_id: str,
+    corruption: _AcceptedTraceCorruption,
+) -> EventLogRow:
+    """在单个 transaction 内追加损坏 request/result fixture。
+
+    :param transaction: Host durable transaction。
+    :param event_id: result event id。
+    :param corruption: envelope、request row、identity 或 digest 损坏分类。
+    :returns: 数据库返回的真实 result row。
+    :raises ValueError: corruption 或 envelope 基础字段非法时抛出。
+    :raises HostDurableError: request、envelope 或 EventLog 写入失败时抛出。
+    """
+
+    tool_call_id = f"tool-call-{corruption.value}"
+    tool_name = "lookup_filing"
+    request_event_id = f"{event_id}-request"
+    atom = _accepted_request_atom(
+        event_id=request_event_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        run_id=(
+            "run-other"
+            if corruption is _AcceptedTraceCorruption.REQUEST_IDENTITY_MISMATCH
+            else "run-1"
+        ),
+    )
+    if corruption is _AcceptedTraceCorruption.ARGUMENTS_DESCRIPTOR_WITH_INLINE:
+        descriptor_arguments: Mapping[str, JsonValue] = {
+            "fixture": "x" * 70_000
+        }
+        atom = replace(
+            atom,
+            accepted_arguments=descriptor_arguments,
+            normalized_arguments_digest=sha256_digest_json(
+                {"arguments": descriptor_arguments}
+            ),
+        )
+    elif (
+        corruption
+        is _AcceptedTraceCorruption.SEMANTIC_QUERY_DESCRIPTOR_WITH_INLINE
+    ):
+        atom = replace(atom, semantic_query_text="query " + ("x" * 70_000))
+    if corruption is not _AcceptedTraceCorruption.MISSING_REQUEST_ROW:
+        request_append = build_tool_call_requested_event_request(
+            transaction,
+            atom=atom,
+            event_id=request_event_id,
+            occurred_at=_FIXED_NOW,
+            origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+        )
+        if corruption in {
+            _AcceptedTraceCorruption.ARGUMENTS_DESCRIPTOR_WITH_INLINE,
+            _AcceptedTraceCorruption.SEMANTIC_QUERY_DESCRIPTOR_WITH_INLINE,
+        }:
+            assert isinstance(request_append.payload_json, Mapping)
+            request_payload = dict(
+                cast(Mapping[str, JsonValue], request_append.payload_json)
+            )
+            if (
+                corruption
+                is _AcceptedTraceCorruption.ARGUMENTS_DESCRIPTOR_WITH_INLINE
+            ):
+                assert request_payload["arguments_storage_kind"] == (
+                    TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR
+                )
+                request_payload["arguments_inline_json"] = {
+                    "arguments": {"fixture": "stale"}
+                }
+            else:
+                assert request_payload["semantic_query_storage_kind"] == (
+                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR
+                )
+                request_payload["semantic_query_text"] = "stale inline query"
+            request_append = replace(request_append, payload_json=request_payload)
+        request = append_event(
+            transaction,
+            request_append,
+        ).row
+        request_event_ref = request.event_id
+    else:
+        request_event_ref = request_event_id
+    raw_tool_outcome: JsonValue = {
+        "kind": "completed",
+        "result": {"content": "must not be traced"},
+    }
+    payload: dict[str, JsonValue] = {
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "raw_tool_outcome": raw_tool_outcome,
+    }
+    if corruption is not _AcceptedTraceCorruption.MISSING_ENVELOPE:
+        normalized_arguments_digest = atom.normalized_arguments_digest
+        if corruption is _AcceptedTraceCorruption.ARGUMENTS_DIGEST_MISMATCH:
+            normalized_arguments_digest = sha256_digest_json(
+                {"arguments": {"fixture": "wrong"}}
+            )
+        envelope = AcceptedEvidenceEnvelope(
+            evidence_id=f"evidence:{event_id}",
+            producer_event_ref=event_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_query=AcceptedEvidenceToolQuery(
+                tool_call_requested_event_ref=request_event_ref,
+                normalized_arguments_digest=normalized_arguments_digest,
+                semantic_input_digest=atom.semantic_input_digest,
+            ),
+            result_ref=AcceptedEvidenceResultRef(
+                payload_ref=None,
+                payload_digest=None,
+                outcome_digest=sha256_digest_json(raw_tool_outcome),
+                truncation_applied=False,
+            ),
+            source_refs=(),
+            locator_refs=(),
+        )
+        payload["accepted_evidence_envelope"] = (
+            accepted_evidence_envelope_to_json_value(envelope)
+        )
+    result_execution_id: str | None = "execution-1"
+    if corruption is _AcceptedTraceCorruption.RESULT_EXECUTION_MISSING:
+        result_execution_id = None
+    elif corruption is _AcceptedTraceCorruption.RESULT_EXECUTION_MISMATCH:
+        result_execution_id = "execution-other"
+    return _append_tool_event_in_transaction(
+        transaction,
+        event_id=event_id,
+        event_type="TOOL_RESULT_ACCEPTED",
+        payload=payload,
+        event_class=EventClass.CANONICAL_FACT,
+        payload_ref=None,
+        payload_digest=None,
+        execution_id=result_execution_id,
+    )
+
+
+def _append_corrupt_tool_request_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    corruption: _RequestedRowCorruption,
+) -> EventLogRow:
+    """追加 direct Tool Trace request corruption fixture。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param corruption: request row 损坏分类。
+    :returns: 已持久化的 request-like row。
+    :raises HostDurableError: EventLog 写入失败时抛出。
+    """
+
+    event_id = f"event-request-direct-{corruption.value}"
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """在单 transaction 中写入 request-like row。
+
+        :param transaction: Host transaction。
+        :returns: 已持久化 row。
+        """
+
+        request = build_tool_call_requested_event_request(
+            transaction,
+            atom=_accepted_request_atom(
+                event_id=event_id,
+                tool_call_id=f"tool-call-direct-{corruption.value}",
+                tool_name="lookup_filing",
+            ),
+            event_id=event_id,
+            occurred_at=_FIXED_NOW,
+            origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+        )
+        if corruption is _RequestedRowCorruption.WRONG_EVENT_TYPE:
+            request = replace(request, event_type="TOOL_CALL_GOVERNED")
+        elif corruption in {
+            _RequestedRowCorruption.STORAGE_CONFLICT,
+            _RequestedRowCorruption.DIGEST_MISMATCH,
+        }:
+            assert isinstance(request.payload_json, Mapping)
+            payload = dict(cast(Mapping[str, JsonValue], request.payload_json))
+            if corruption is _RequestedRowCorruption.STORAGE_CONFLICT:
+                payload["arguments_storage_kind"] = (
+                    TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR
+                )
+            else:
+                payload["normalized_arguments_digest"] = sha256_digest_json(
+                    {"arguments": {"fixture": "corrupt"}}
+                )
+            request = replace(request, payload_json=payload)
+        return append_event(transaction, request).row
+
+    return transaction_runner.run_write(operation)
 
 
 def _run_trace_once(
@@ -292,6 +752,262 @@ def _cold_trace_summary(
     return cast(Mapping[str, JsonValue], summary)
 
 
+def _cold_trace_summary_for_event(
+    cold_lines: tuple[Mapping[str, JsonValue], ...],
+    *,
+    event_id: str,
+) -> Mapping[str, JsonValue]:
+    """按 event id 读取 cold JSONL 的 trace summary。
+
+    :param cold_lines: 已解析的 cold JSONL 行。
+    :param event_id: 目标 EventLog id。
+    :returns: 对应 cold line 的 trace summary。
+    :raises AssertionError: event 不存在或 summary 不是 JSON object 时抛出。
+    """
+
+    matching = tuple(line for line in cold_lines if line["event_id"] == event_id)
+    assert len(matching) == 1
+    summary = matching[0]["trace_summary"]
+    assert isinstance(summary, Mapping)
+    return cast(Mapping[str, JsonValue], summary)
+
+
+def test_tool_trace_excludes_internal_effective_execution_value(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace filter、hot、cold 与 query 均不投影 Host 内部执行配置值。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 任一投影面包含 synthetic sentinel 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "internal-config.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        row = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-user-input-internal-config",
+            event_type="USER_INPUT_ACCEPTED",
+            payload={
+                "display_text": "分析本期经营情况",
+                "effective_execution_config": {
+                    "config": {
+                        "runner_spec": {
+                            "headers": {
+                                "X-Synthetic-Execution-Value": (
+                                    _CONFIGURED_SECRET_SENTINEL
+                                )
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        run_id = row.run_id
+        assert isinstance(run_id, str)
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(
+                cold_jsonl_path=cold_path,
+                create_parent_dirs=True,
+            )
+        )
+
+        assert not consumer.event_filter.matches(
+            projection_event_view_from_row(row)
+        )
+        _run_trace_once(store.transaction_runner, cold_path)
+
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, row.event_id
+            )
+        )
+        query_page = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_by_run(
+                transaction,
+                run_id,
+                after_event_sequence=0,
+                limit=10,
+            )
+        )
+
+        assert hot_row is None
+        assert query_page.rows == ()
+        assert _CONFIGURED_SECRET_SENTINEL not in repr(query_page)
+
+    assert _json_lines(cold_path) == ()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    tuple(_AcceptedTraceCorruption),
+)
+def test_tool_trace_request_corruption_records_failure_without_result_trace(
+    tmp_path: Path,
+    corruption: _AcceptedTraceCorruption,
+) -> None:
+    """canonical request material 损坏时记录 HostDurableError 且不发布结果 trace。
+
+    :param tmp_path: pytest 临时目录。
+    :param corruption: envelope、request row、identity、storage 或 digest 损坏分类。
+    :returns: ``None``。
+    :raises AssertionError: result trace 被发布或 failure 类型不是 HostDurableError 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "request-corruption.jsonl"
+    result_event_id = f"event-result-{corruption.value}"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        result_event = _append_broken_accepted_tool_result_event(
+            store.transaction_runner,
+            event_id=result_event_id,
+            corruption=corruption,
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(
+                cold_jsonl_path=cold_path,
+                create_parent_dirs=True,
+            )
+        )
+        projection_result = ProjectionRunner(
+            store.transaction_runner,
+            (consumer,),
+        ).run_once(TOOL_TRACE_CONSUMER_ID, limit=10)
+        failure = store.transaction_runner.run_read(
+            lambda transaction: read_projection_failure(
+                transaction,
+                TOOL_TRACE_CONSUMER_ID.value,
+            )
+        )
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction,
+                result_event.event_id,
+            )
+        )
+        checkpoint = store.transaction_runner.run_read(
+            lambda transaction: read_projection_checkpoint(
+                transaction,
+                TOOL_TRACE_CONSUMER_ID.value,
+            )
+        )
+
+        assert projection_result.failures == 1
+        assert hot_row is None
+        assert failure is not None
+        expected_failed_event_id = (
+            f"{result_event.event_id}-request"
+            if corruption
+            in {
+                _AcceptedTraceCorruption.ARGUMENTS_DESCRIPTOR_WITH_INLINE,
+                _AcceptedTraceCorruption.SEMANTIC_QUERY_DESCRIPTOR_WITH_INLINE,
+            }
+            else result_event.event_id
+        )
+        assert failure.failed_event_id == expected_failed_event_id
+        assert failure.last_error_code == HostDurableError.__name__
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence < result_event.event_sequence
+        cold_event_ids = (
+            tuple(line["event_id"] for line in _json_lines(cold_path))
+            if cold_path.exists()
+            else ()
+        )
+        assert result_event.event_id not in cold_event_ids
+
+
+@pytest.mark.parametrize("corruption", tuple(_RequestedRowCorruption))
+def test_tool_trace_direct_request_row_corruption_fails_closed(
+    tmp_path: Path,
+    corruption: _RequestedRowCorruption,
+) -> None:
+    """direct request missing/type/storage/digest corruption 均 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param corruption: direct request row 损坏分类。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 发布 limited/placeholder summary 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "direct-request-corruption.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        row = _append_corrupt_tool_request_event(
+            store.transaction_runner,
+            corruption=corruption,
+        )
+        event = projection_event_view_from_row(row)
+        if corruption is _RequestedRowCorruption.WRONG_EVENT_TYPE:
+            event = replace(event, event_type="TOOL_CALL_REQUESTED")
+        if corruption is _RequestedRowCorruption.MISSING_ROW:
+            store.transaction_runner.run_write(
+                lambda transaction: transaction.execute(
+                    f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+                    (row.event_id,),
+                )
+            )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=cold_path)
+        )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(transaction, event)
+            )
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction,
+                row.event_id,
+            )
+        )
+        assert hot_row is None
+
+    assert _json_lines(cold_path) == ()
+
+
+def test_tool_trace_canonical_result_without_llm_material_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """LLM-ready Tool Trace 拒绝缺 typed material 的 canonical result。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 生成 fallback/limited result summary 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "missing-llm-material.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        result = _append_accepted_tool_result_event(
+            store.transaction_runner,
+            event_id="event-result-missing-llm-material",
+            tool_call_id="tool-call-missing-llm-material",
+            tool_name="lookup_filing",
+            additional_payload={},
+            include_raw_outcome=False,
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=cold_path)
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match="TOOL_RESULT_ACCEPTED tool trace LLM material is missing",
+        ):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(result),
+                )
+            )
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction,
+                result.event_id,
+            )
+        )
+        assert hot_row is None
+
+    assert _json_lines(cold_path) == ()
+
+
 def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> None:
     """TOOL_CALL_REQUESTED / GOVERNED / RESULT_ACCEPTED 投影关键字段。"""
 
@@ -327,7 +1043,13 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             outcome_digest=outcome_digest,
             truncation_applied=False,
         ),
-        source_refs=(),
+        source_refs=(
+            OpaqueEvidenceRef(
+                ref_kind="payload",
+                ref_id="payload-source-internal",
+                digest=None,
+            ),
+        ),
         locator_refs=(),
     )
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -341,7 +1063,9 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                 "tool_schema_digest": "sha256:schema",
                 "tool_identity_digest": "sha256:identity",
                 "normalized_arguments_digest": arguments_digest,
-                "arguments_json_size_bytes": 48,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
                 "arguments_storage_kind": "inline_json",
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,
@@ -381,6 +1105,8 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                 "tool_name": "lookup_filing",
                 "normalized_arguments_digest": arguments_digest,
                 "semantic_input_digest": semantic_query_digest,
+                "resolution_kind": "completed",
+                "tool_fact_kind": "completed",
                 "outcome_digest": outcome_digest,
                 "payload_ref": {
                     "payload_ref": "artifact://tool-result",
@@ -513,9 +1239,11 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
     cold_path = tmp_path / "trace" / "wait-resolution.jsonl"
     arguments_json: Mapping[str, JsonValue] = {
         "arguments": {
+            "file_path": "reports/ATAT/annual-report.pdf",
+            "password_policy_name": "research-read-policy",
+            "scope_token": "scope-atat-visible",
             "ticker": "ATAT",
             "source": "auto",
-            "api_token": "<redacted>",
         }
     }
     arguments_digest = sha256_digest_json(arguments_json)
@@ -541,7 +1269,13 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
             outcome_digest=sha256_digest_json({"result": "atat"}),
             truncation_applied=False,
         ),
-        source_refs=(),
+        source_refs=(
+            OpaqueEvidenceRef(
+                ref_kind="payload",
+                ref_id="payload-source-internal",
+                digest=None,
+            ),
+        ),
         locator_refs=(),
     )
     raw_outcome: JsonValue = {
@@ -572,7 +1306,9 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
                 "tool_schema_digest": "sha256:schema",
                 "tool_identity_digest": "sha256:identity",
                 "normalized_arguments_digest": arguments_digest,
-                "arguments_json_size_bytes": 72,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
                 "arguments_storage_kind": "inline_json",
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,
@@ -619,7 +1355,17 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
         assert request_summary["tool_name"] == "start_fins_download"
         assert request_summary["query_text"] == semantic_query_text
         assert "ticker=ATAT" in str(request_summary["arguments_summary_text"])
-        assert "<redacted>" in json.dumps(request_summary, ensure_ascii=False)
+        assert request_summary["arguments"] == arguments_json["arguments"]
+        assert "file_path=reports/ATAT/annual-report.pdf" in str(
+            request_summary["arguments_summary_text"]
+        )
+        assert "password_policy_name=research-read-policy" in str(
+            request_summary["arguments_summary_text"]
+        )
+        assert "scope_token=scope-atat-visible" in str(
+            request_summary["arguments_summary_text"]
+        )
+        assert "<redacted>" not in json.dumps(request_summary, ensure_ascii=False)
         assert result_row is not None
         result_request = result_row.trace_summary["tool_request"]
         result_summary = result_row.trace_summary["tool_result"]
@@ -627,14 +1373,19 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
         assert isinstance(result_summary, Mapping)
         assert result_request["tool_name"] == "start_fins_download"
         assert "ticker=ATAT" in str(result_request["arguments_summary_text"])
+        assert result_request["arguments"] == arguments_json["arguments"]
         assert result_summary["result_status"] == "completed"
         assert "discovered=27" in str(result_summary["result_details"])
         assert "downloaded=12" in str(result_summary["result_details"])
         assert "downloaded=12" in str(result_summary["result_summary_text"])
         cold_text = json.dumps(cold_lines, ensure_ascii=False, sort_keys=True)
         assert "ticker=ATAT" in cold_text
+        assert "reports/ATAT/annual-report.pdf" in cold_text
+        assert "research-read-policy" in cold_text
+        assert "scope-atat-visible" in cold_text
         assert "discovered=27" in cold_text
         assert "wait-atat-should-not-project" not in cold_text
+        assert "payload-source-internal" not in cold_text
         assert "observation handle" not in cold_text
         assert "runtime" not in cold_text
 
@@ -642,7 +1393,12 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
 def test_tool_trace_copies_optional_summary_signal_objects(
     tmp_path: Path,
 ) -> None:
-    """Tool Trace 将已存在的四类 signal object 复制进 hot/cold summary。"""
+    """Tool Trace 将已存在的四类 signal object 复制进 hot/cold summary。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: canonical result 未投影 signal 或 hot/cold 不一致时抛出。
+    """
 
     cold_path = tmp_path / "trace" / "signals.jsonl"
     context_pressure: Mapping[str, JsonValue] = {
@@ -677,14 +1433,12 @@ def test_tool_trace_copies_optional_summary_signal_objects(
         "partial_tool_calls": [],
     }
     with open_host_durable_store(_options(tmp_path)) as store:
-        event = _append_tool_event(
+        event = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-signals",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-signals",
-                "tool_name": "lookup_filing",
-                "outcome_digest": "sha256:outcome",
+            tool_call_id="tool-call-signals",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_CONTEXT_PRESSURE: context_pressure,
                 _FIELD_TOOL_TIMING: tool_timing,
                 _FIELD_FAILURE_METADATA: failure_metadata,
@@ -706,13 +1460,21 @@ def test_tool_trace_copies_optional_summary_signal_objects(
             row.trace_summary[_FIELD_PARTIAL_TOOL_CALL_SIGNAL]
             == partial_tool_call_signal
         )
-        assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+        assert _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=event.event_id,
+        ) == row.trace_summary
 
 
 def test_tool_trace_projects_tool_timing_available_and_missing_signals(
     tmp_path: Path,
 ) -> None:
-    """TOOL_RESULT_ACCEPTED 的 tool_timing 同步进入 hot / cold summary。"""
+    """TOOL_RESULT_ACCEPTED 的 tool_timing 同步进入 hot / cold summary。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: available/missing timing 未按原 object 投影时抛出。
+    """
 
     cold_path = tmp_path / "trace" / "tool-timing.jsonl"
     available_timing: Mapping[str, JsonValue] = {
@@ -732,25 +1494,21 @@ def test_tool_trace_projects_tool_timing_available_and_missing_signals(
         "duration_source": None,
     }
     with open_host_durable_store(_options(tmp_path)) as store:
-        available = _append_tool_event(
+        available = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-tool-timing-available",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-duration",
-                "tool_name": "lookup_filing",
-                "outcome_digest": "sha256:outcome-duration",
+            tool_call_id="tool-call-duration",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_TOOL_TIMING: available_timing,
             },
         )
-        missing = _append_tool_event(
+        missing = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-tool-timing-missing",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-missing-meta",
-                "tool_name": "lookup_filing",
-                "outcome_digest": "sha256:outcome-missing",
+            tool_call_id="tool-call-missing-meta",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_TOOL_TIMING: missing_timing,
             },
         )
@@ -770,16 +1528,23 @@ def test_tool_trace_projects_tool_timing_available_and_missing_signals(
         assert missing_row is not None
         assert available_row.trace_summary[_FIELD_TOOL_TIMING] == available_timing
         assert missing_row.trace_summary[_FIELD_TOOL_TIMING] == missing_timing
-        assert _cold_trace_summary(cold_lines, 0)[_FIELD_TOOL_TIMING] == (
-            available_timing
-        )
-        assert _cold_trace_summary(cold_lines, 1)[_FIELD_TOOL_TIMING] == (
-            missing_timing
-        )
+        assert _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=available.event_id,
+        )[_FIELD_TOOL_TIMING] == available_timing
+        assert _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=missing.event_id,
+        )[_FIELD_TOOL_TIMING] == missing_timing
 
 
 def test_tool_trace_projects_failure_metadata_variants(tmp_path: Path) -> None:
-    """Tool Trace 投影 tool failure / cancel / policy block 失败元数据。"""
+    """Tool Trace 投影 tool failure / cancel / policy block 失败元数据。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 任一 accepted result 的 failure metadata 丢失时抛出。
+    """
 
     cold_path = tmp_path / "trace" / "failure-metadata.jsonl"
     failed_metadata: Mapping[str, JsonValue] = {
@@ -814,33 +1579,30 @@ def test_tool_trace_projects_failure_metadata_variants(tmp_path: Path) -> None:
         "diagnostic_refs": ["diag-policy"],
     }
     with open_host_durable_store(_options(tmp_path)) as store:
-        failed = _append_tool_event(
+        failed = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-tool-failed-metadata",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-failed",
-                "tool_name": "lookup_filing",
+            tool_call_id="tool-call-failed",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_FAILURE_METADATA: failed_metadata,
             },
         )
-        cancelled = _append_tool_event(
+        cancelled = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-tool-cancelled-metadata",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-cancelled",
-                "tool_name": "lookup_filing",
+            tool_call_id="tool-call-cancelled",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_FAILURE_METADATA: cancelled_metadata,
             },
         )
-        policy = _append_tool_event(
+        policy = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-tool-policy-metadata",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-policy",
-                "tool_name": "lookup_filing",
+            tool_call_id="tool-call-policy",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_FAILURE_METADATA: policy_metadata,
             },
         )
@@ -871,9 +1633,18 @@ def test_tool_trace_projects_failure_metadata_variants(tmp_path: Path) -> None:
         assert isinstance(cancelled_summary, Mapping)
         assert cancelled_summary["failure_kind"] != "tool_failed"
         assert policy_row.trace_summary[_FIELD_FAILURE_METADATA] == policy_metadata
-        assert _cold_trace_summary(cold_lines, 0) == failed_row.trace_summary
-        assert _cold_trace_summary(cold_lines, 1) == cancelled_row.trace_summary
-        assert _cold_trace_summary(cold_lines, 2) == policy_row.trace_summary
+        assert _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=failed.event_id,
+        ) == failed_row.trace_summary
+        assert _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=cancelled.event_id,
+        ) == cancelled_row.trace_summary
+        assert _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=policy.event_id,
+        ) == policy_row.trace_summary
 
 
 def test_tool_trace_projects_provider_protocol_failure_metadata(
@@ -910,6 +1681,59 @@ def test_tool_trace_projects_provider_protocol_failure_metadata(
 
         assert row is not None
         assert row.trace_summary[_FIELD_FAILURE_METADATA] == metadata
+        assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+
+
+def test_tool_trace_projects_provider_diagnostic_without_failure_metadata(
+    tmp_path: Path,
+) -> None:
+    """PROVIDER_DIAGNOSTIC 只作为诊断展示，不生成失败元数据。"""
+
+    cold_path = tmp_path / "trace" / "provider-diagnostic.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-provider-diagnostic",
+            event_type="PROVIDER_DIAGNOSTIC",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-diagnostic",
+                "client_correlation_id": "client-diagnostic",
+                "diagnostic_code": "usage_field_malformed",
+                "severity": "warning",
+                "message": "usage ignored",
+                "diagnostic_source": "sse_parser",
+                "payload_ref": "payload-provider-diagnostic",
+                "payload_digest": (
+                    "sha256:"
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                ),
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.provider_request_id == "provider-req-diagnostic"
+        assert row.diagnostic_ref == "payload-provider-diagnostic"
+        assert _FIELD_FAILURE_METADATA not in row.trace_summary
+        assert row.trace_summary["client_correlation_id"] == "client-diagnostic"
+        assert row.trace_summary["provider_error_ref"] is None
+        assert row.trace_summary["diagnostic_refs"] == [
+            "payload-provider-diagnostic",
+            "provider-req-diagnostic",
+        ]
+        assert "provider_error_code" not in row.trace_summary
+        assert len(cold_lines) == 1
+        assert cold_lines[0]["diagnostic_refs"] == [
+            "payload-provider-diagnostic",
+            "provider-req-diagnostic",
+        ]
+        assert cold_lines[0]["client_correlation_id"] == "client-diagnostic"
         assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
 
 
@@ -1392,26 +2216,27 @@ def test_tool_trace_derives_context_pressure_from_compaction_rejected_payload(
 def test_tool_trace_omits_missing_or_null_summary_signal_objects(
     tmp_path: Path,
 ) -> None:
-    """缺失或 null 的 signal 不写入 summary，避免表达不存在的事实。"""
+    """缺失或 null 的 signal 不写入 summary，避免表达不存在的事实。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: hot/cold summary 错误保留空 signal 时抛出。
+    """
 
     cold_path = tmp_path / "trace" / "signals-null.jsonl"
     with open_host_durable_store(_options(tmp_path)) as store:
-        missing_event = _append_tool_event(
+        missing_event = _append_canonical_tool_request_event(
             store.transaction_runner,
             event_id="event-signals-missing",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-missing",
-                "tool_name": "lookup_filing",
-            },
+            tool_call_id="tool-call-missing",
+            tool_name="lookup_filing",
         )
-        null_event = _append_tool_event(
+        null_event = _append_accepted_tool_result_event(
             store.transaction_runner,
             event_id="event-signals-null",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-null",
-                "tool_name": "lookup_filing",
+            tool_call_id="tool-call-null",
+            tool_name="lookup_filing",
+            additional_payload={
                 _FIELD_CONTEXT_PRESSURE: None,
                 _FIELD_TOOL_TIMING: None,
                 _FIELD_FAILURE_METADATA: None,
@@ -1432,8 +2257,14 @@ def test_tool_trace_omits_missing_or_null_summary_signal_objects(
 
         assert missing_row is not None
         assert null_row is not None
-        missing_summary = _cold_trace_summary(cold_lines, 0)
-        null_summary = _cold_trace_summary(cold_lines, 1)
+        missing_summary = _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=missing_event.event_id,
+        )
+        null_summary = _cold_trace_summary_for_event(
+            cold_lines,
+            event_id=null_event.event_id,
+        )
         for field_name in _SIGNAL_FIELD_NAMES:
             assert field_name not in missing_row.trace_summary
             assert field_name not in null_row.trace_summary
@@ -1479,10 +2310,10 @@ def test_tool_trace_rejects_non_object_summary_signal_fields(
             )
 
 
-def test_tool_trace_does_not_inline_large_tool_call_arguments(
+def test_tool_trace_resolves_large_tool_call_arguments_without_internal_refs(
     tmp_path: Path,
 ) -> None:
-    """Tool Trace 投影 TOOL_CALL_REQUESTED 时不展开大参数 descriptor。"""
+    """Tool Trace 严格解析 descriptor 并只展示 bounded exact 参数。"""
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     large_arguments: Mapping[str, JsonValue] = {
@@ -1508,40 +2339,60 @@ def test_tool_trace_does_not_inline_large_tool_call_arguments(
                 ),
             )
         )
+        request_payload: Mapping[str, JsonValue] = {
+            "tool_call_id": "tool-call-large-arguments",
+            "tool_name": "lookup_filing",
+            "tool_schema_digest": "sha256:schema",
+            "tool_identity_digest": "sha256:identity",
+            "normalized_arguments_digest": arguments_digest,
+            "arguments_json_size_bytes": len(
+                canonical_json_dumps(arguments_json).encode("utf-8")
+            ),
+            "arguments_storage_kind": "payload_descriptor",
+            "arguments_inline_json": None,
+            "arguments_payload_ref": "payload-tool-call-arguments-large",
+            "arguments_payload_digest": arguments_digest,
+            "semantic_input_digest": "sha256:semantic",
+            "semantic_query_storage_kind": "absent",
+            "semantic_query_text": None,
+            "semantic_query_payload_ref": None,
+            "semantic_query_digest": None,
+        }
         _append_tool_event(
             store.transaction_runner,
             event_id="event-requested-large-arguments",
             event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-large-arguments",
-                "tool_name": "lookup_filing",
-                "tool_schema_digest": "sha256:schema",
-                "tool_identity_digest": "sha256:identity",
-                "normalized_arguments_digest": arguments_digest,
-                "arguments_json_size_bytes": 2048,
-                "arguments_storage_kind": "payload_descriptor",
-                "arguments_inline_json": None,
-                "arguments_payload_ref": "payload-tool-call-arguments-large",
-                "arguments_payload_digest": arguments_digest,
-                "semantic_input_digest": "sha256:semantic",
-                "semantic_query_storage_kind": "absent",
-                "semantic_query_text": None,
-                "semantic_query_payload_ref": None,
-                "semantic_query_digest": None,
-            },
+            payload=cast(JsonValue, request_payload),
         )
 
         _run_trace_once(store.transaction_runner, cold_path)
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, "event-requested-large-arguments"
+            )
+        )
         cold_lines = _json_lines(cold_path)
 
+        assert request_payload["arguments_payload_ref"] == (
+            "payload-tool-call-arguments-large"
+        )
+        assert request_payload["arguments_payload_digest"] == arguments_digest
+        assert hot_row is not None
+        assert hot_row.normalized_arguments_digest == arguments_digest
         assert len(cold_lines) == 1
         line_text = json.dumps(cold_lines[0], sort_keys=True)
+        readable_text = json.dumps(
+            cold_lines[0]["trace_summary"], sort_keys=True
+        )
         assert arguments_digest in line_text
-        assert "x" * 128 not in line_text
+        assert "payload-tool-call-arguments-large" not in readable_text
+        assert arguments_digest not in readable_text
+        assert "x" * 128 in readable_text
+        assert "arguments payload" not in readable_text
 
 
 def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
-    """Tool Trace 只复制 runner-call manifest refs/digests 与摘要 signal。"""
+    """Tool Trace hot row 只复制 shared owner 校验后的 fixed scalars。"""
 
     cold_path = tmp_path / "trace" / "runner-call.jsonl"
     manifest_digest = sha256_digest_json({"manifest": "runner-call"})
@@ -1561,6 +2412,7 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "runner_call_kind": "initial_user_dispatch",
                 "runner_call_trigger_reason": "initial_user_input",
                 "iteration_id": "iteration-1",
+                "iteration_index": 0,
                 "manifest_payload_ref": "payload-runner-call-manifest",
                 "manifest_digest": manifest_digest,
                 "manifest_schema_version": "runner_call_input_manifest.v1",
@@ -1568,18 +2420,21 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "message_count": 2,
                 "role_sequence_digest": role_digest,
                 "input_projection_digest": projection_digest,
-                "projector_metadata_summary": [
-                    {
-                        "projector_metadata_id": "projector:0:system",
-                        "projector_id": "run_input_system_context",
-                        "projector_schema_version": "run_input_projector.v1",
-                        "projector_digest": sha256_digest_json(
-                            {"projector": "system"}
-                        ),
-                        "purpose": "ordinary_run_input",
-                    }
-                ],
-                "diagnostic": None,
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
+                "diagnostic": {
+                    "status": "complete",
+                    "reason": None,
+                    "missing_atom_kind": None,
+                    "missing_ref_kind": None,
+                    "missing_ref": None,
+                    "observed_count": 2,
+                    "expected_count": 2,
+                    "observed_digest": role_digest,
+                    "expected_digest": role_digest,
+                    "consumer_boundary": "host.run_input.builder",
+                },
             },
         )
 
@@ -1597,16 +2452,17 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
         assert row.trace_summary["message_count"] == 2
         assert row.trace_summary["role_sequence_digest"] == role_digest
         assert row.trace_summary["input_projection_digest"] == projection_digest
+        assert "projector_metadata_summary" not in row.trace_summary
         assert row.trace_summary["diagnostic"] == {
             "status": "complete",
             "reason": None,
             "missing_atom_kind": None,
             "missing_ref_kind": None,
             "missing_ref": None,
-            "observed_count": None,
-            "expected_count": None,
-            "observed_digest": None,
-            "expected_digest": None,
+            "observed_count": 2,
+            "expected_count": 2,
+            "observed_digest": role_digest,
+            "expected_digest": role_digest,
             "consumer_boundary": "tool_trace_query",
         }
         assert cold_lines[0]["trace_summary"] == row.trace_summary
@@ -1625,7 +2481,7 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
         "status": "limited_signal",
         "reason": "missing_projection_artifact",
         "missing_atom_kind": None,
-        "missing_ref_kind": "runner_call_projection_artifact",
+        "missing_ref_kind": "artifact_ref",
         "missing_ref": None,
         "observed_count": 3,
         "expected_count": None,
@@ -1647,6 +2503,7 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
                 "runner_call_kind": "tool_result_continuation",
                 "runner_call_trigger_reason": "tool_results_available",
                 "iteration_id": "iteration-2",
+                "iteration_index": 1,
                 "manifest_payload_ref": "payload-runner-call-manifest-limited",
                 "manifest_digest": manifest_digest,
                 "manifest_schema_version": "runner_call_input_manifest.v1",
@@ -1654,7 +2511,9 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
                 "message_count": 3,
                 "role_sequence_digest": role_digest,
                 "input_projection_digest": projection_digest,
-                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
                 "diagnostic": diagnostic,
             },
         )
@@ -1703,6 +2562,8 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
                 "runner_call_index": 2,
                 "runner_call_kind": "tool_result_continuation",
                 "runner_call_trigger_reason": "tool_results_available",
+                "iteration_id": None,
+                "iteration_index": None,
                 "manifest_payload_ref": "payload-runner-call-manifest-missing",
                 "manifest_digest": sha256_digest_json(
                     {"manifest": "runner-call-missing-diagnostic"}
@@ -1714,7 +2575,9 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
                 "input_projection_digest": sha256_digest_json(
                     {"projection": "missing-diagnostic"}
                 ),
-                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
                 "diagnostic": None,
             },
         )
@@ -1722,7 +2585,7 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
             ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
         )
 
-        with pytest.raises(HostDurableError, match="runner-call diagnostic"):
+        with pytest.raises(HostDurableError, match="hot diagnostic"):
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
@@ -1753,6 +2616,7 @@ def test_tool_trace_projects_mismatch_runner_call_diagnostic(
                 "runner_call_kind": "tool_result_continuation",
                 "runner_call_trigger_reason": "tool_results_available",
                 "iteration_id": "iteration-3",
+                "iteration_index": 2,
                 "manifest_payload_ref": "payload-runner-call-manifest-mismatch",
                 "manifest_digest": sha256_digest_json(
                     {"manifest": "runner-call-mismatch"}
@@ -1764,7 +2628,9 @@ def test_tool_trace_projects_mismatch_runner_call_diagnostic(
                 "input_projection_digest": sha256_digest_json(
                     {"projection": "mismatch"}
                 ),
-                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
                 "diagnostic": {
                     "status": "mismatch",
                     "reason": "role_sequence_digest_mismatch",
@@ -2012,15 +2878,11 @@ def test_projection_rebuild_from_event_log_restores_hot_rows(
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     with open_host_durable_store(_options(tmp_path)) as store:
-        _append_tool_event(
+        _append_canonical_tool_request_event(
             store.transaction_runner,
             event_id="event-requested",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-1",
-                "tool_name": "lookup_filing",
-                "normalized_arguments_digest": "sha256:args",
-            },
+            tool_call_id="tool-call-1",
+            tool_name="lookup_filing",
         )
         catch_up_tool_trace_projection(
             store.transaction_runner,
@@ -2063,15 +2925,11 @@ def test_cold_jsonl_source_key_digest_conflict_records_failure_without_hot_row(
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     with open_host_durable_store(_options(tmp_path)) as store:
-        event = _append_tool_event(
+        event = _append_canonical_tool_request_event(
             store.transaction_runner,
             event_id="event-requested",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-1",
-                "tool_name": "lookup_filing",
-                "normalized_arguments_digest": "sha256:args",
-            },
+            tool_call_id="tool-call-1",
+            tool_name="lookup_filing",
         )
         catch_up_tool_trace_projection(
             store.transaction_runner,

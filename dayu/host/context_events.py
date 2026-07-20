@@ -15,9 +15,10 @@ from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
     ConversationCompactOutputVNext,
 )
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
+from dayu.host.durable.codec import is_sha256_digest
 
 CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 """Context compaction requested canonical event type。"""
@@ -344,12 +345,7 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _required_digest(payload, _FIELD_ACCEPTED_CANDIDATE_DIGEST)
     _required_text(payload, _FIELD_COMPACT_ARTIFACT_REF)
     _required_digest(payload, _FIELD_COMPACT_ARTIFACT_DIGEST)
-    candidate = _required_mapping(payload, _FIELD_ACCEPTED_CANDIDATE)
-    if _required_text(candidate, "schema_version") != "conversation_compact_output_v1":
-        raise ValueError("accepted_candidate schema_version is invalid")
-    if _required_text(payload, _FIELD_ACCEPTED_CANDIDATE_DIGEST) != sha256_digest_json(candidate):
-        raise ValueError("accepted_candidate_digest mismatch")
-    _validate_vnext_candidate_payload(candidate)
+    parse_context_compacted_semantic_payload(payload)
     _required_text_list(payload, _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS)
     _required_text_list(payload, _FIELD_SOURCE_BOUNDARY_REFS)
     _required_text_list(payload, _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
@@ -511,40 +507,6 @@ def _reject_old_compacted_fields(payload: Mapping[str, JsonValue]) -> None:
     for field_name in _COMPACTED_OLD_FIELDS:
         if field_name in payload:
             raise ValueError(f"{field_name} is not supported in vNext compacted payload")
-
-
-def _validate_vnext_candidate_payload(candidate: Mapping[str, JsonValue]) -> None:
-    """校验 vNext accepted candidate payload 基础形状。
-
-    :param candidate: ``accepted_candidate`` JSON object。
-    :returns: ``None``。
-    :raises ValueError: candidate 缺少 vNext 字段或字段类型非法时抛出。
-    """
-
-    session_summary = candidate.get("session_summary")
-    if session_summary is not None:
-        summary = _required_mapping(candidate, "session_summary")
-        _required_text(summary, "summary_text")
-        _required_text_list(summary, "source_labels")
-    _validate_mapping_list(candidate, "evidence_backed_facts")
-    _validate_mapping_list(candidate, "answer_anchors")
-    _validate_mapping_list(candidate, "forward_intents")
-    _validate_mapping_list(candidate, "reference_continuity_items")
-    _validate_mapping_list(candidate, "diagnostics")
-
-
-def _validate_mapping_list(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """校验必填 JSON object list 字段。
-
-    :param payload: JSON object。
-    :param field_name: 字段名。
-    :returns: JSON object tuple。
-    :raises ValueError: 字段缺失或元素类型非法时抛出。
-    """
-
-    return _required_mapping_list(payload, field_name)
 
 
 def _validate_quality_check_result_vnext(payload: Mapping[str, JsonValue]) -> None:

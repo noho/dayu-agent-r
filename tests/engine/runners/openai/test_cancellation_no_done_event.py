@@ -10,10 +10,10 @@ from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_events import RunnerEvent, RunnerEventType
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
     AsyncByteIter,
-    FakeCancellationToken,
 )
 
 
@@ -27,9 +27,9 @@ class _ChunkedFakeContent:
         self._chunks = chunks
         self._index = 0
         self._cancel_after = cancel_after
-        self._token: FakeCancellationToken | None = None
+        self._token: ControllableCancellationToken | None = None
 
-    def attach_token(self, token: FakeCancellationToken) -> None:
+    def attach_token(self, token: ControllableCancellationToken) -> None:
         """绑定 token 以便在指定 chunk 后触发取消。"""
 
         self._token = token
@@ -42,7 +42,7 @@ class _ChunkedFakeContent:
         # 所有 chunk 已吐完，第一次进入这里才触发取消，
         # 这样能保证 SSEParser 已完整消费首个 chunk 并 yield delta。
         if self._token is not None and not self._token.is_cancelled():
-            self._token.trigger("after stream drained")
+            self._token.request_cancel("after stream drained")
         await asyncio.sleep(10.0)
         return b""
 
@@ -90,7 +90,7 @@ class _StreamingSession:
 async def test_cancel_mid_stream_no_done_event() -> None:
     """流中触发取消后，事件序列**不**包含 :class:`RunnerDoneData`。"""
 
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     chunks = [
         b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n',
     ]

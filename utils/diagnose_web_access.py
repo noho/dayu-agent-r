@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import ipaddress
 import json
 import re
 import subprocess
@@ -20,6 +19,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 from typing import Final, Protocol, TypeAlias, cast, runtime_checkable
@@ -42,30 +42,49 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
 )
 from dayu.tools.web import web_tools as _web_tools_module
-from dayu.tools.web.provider import discover_tools
-from dayu.tools.web.web_challenge_detection import detect_bot_challenge
+from dayu.tools.web import web_fetch_orchestrator as _web_fetch_orchestrator
+from dayu.tools.web import web_playwright_backend as _web_playwright_backend
+from dayu.tools.web.provider import _parse_config, discover_tools
+from dayu.tools.web.web_challenge_detection import (
+    BotChallengeDecision,
+    detect_bot_challenge,
+)
+from dayu.tools.web.web_egress_policy import WebEgressPolicy, WebEgressPolicyError
+from dayu.tools.web.web_http_session import WebHttpTransportPolicy
+from dayu.tools.web.web_resource_budget import (
+    DEFAULT_BROWSER_RESOURCE_BUDGET,
+    DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    DEFAULT_HTTP_RESOURCE_BUDGET,
+    BrowserResourceBudget,
+    DiagnosticResourceBudget,
+    HttpResourceBudget,
+)
+from dayu.tools.web.web_diagnostics import (
+    WEB_DIAGNOSTIC_SCHEMA_REVISION,
+    WEB_DIAGNOSTIC_SCHEMA_VERSION,
+    WebDiagnosticBackend,
+    WebDiagnosticOutcome,
+    WebDiagnosticProjection,
+    completed_bytes_projection,
+    completed_text_projection,
+    content_diagnostic_from_text,
+    failed_projection,
+    project_error_message,
+    project_network_event,
+    project_response_headers,
+    project_safe_url_or_empty,
+)
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 _DoclingConvertCallable: TypeAlias = Callable[[bytes, str], tuple[str, str, str]]
 
 # schema_version 标识 diagnostics artifact schema；diagnostic_schema_version/revision
 # 是 F03 smoke 校验同一 artifact 时使用的显式标记。
-_SCHEMA_VERSION: Final[str] = "web-diagnostics-v1"
-_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = 1
+_SCHEMA_VERSION: Final[str] = WEB_DIAGNOSTIC_SCHEMA_VERSION
+_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = WEB_DIAGNOSTIC_SCHEMA_REVISION
 _FETCH_TOOL_NAME: Final[str] = "fetch_web_page"
 _DEFAULT_BATCH_OUTPUT_ROOT: Final[Path] = Path("workspace/output/web_diagnostics")
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
-_SENSITIVE_HEADER_FRAGMENTS: Final[tuple[str, ...]] = (
-    "authorization",
-    "cookie",
-    "token",
-    "secret",
-    "key",
-)
-_REDACTED: Final[str] = "<redacted>"
-_TEXT_PREFIX_CHARS: Final[int] = 4_000
-_STDIO_PREFIX_CHARS: Final[int] = 4_000
-_HTML_PREFIX_CHARS: Final[int] = 4_000
 _DEFAULT_FETCH_TRUNCATE_CHARS: Final[int] = 80_000
 _DEFAULT_USER_AGENT: Final[str] = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -96,6 +115,16 @@ _PATH_DOCLING_CONVERSION: Final[str] = "docling_conversion"
 _DOCLING_DEPENDENCY_EXCEPTION_TYPES: Final[frozenset[str]] = frozenset(
     {"DoclingRuntimeInitializationError", "ModuleNotFoundError", "ImportError"}
 )
+_DIAGNOSTIC_HTTP_RESOURCE_BUDGET: Final[HttpResourceBudget] = (
+    DEFAULT_HTTP_RESOURCE_BUDGET
+)
+_DIAGNOSTIC_BROWSER_RESOURCE_BUDGET: Final[BrowserResourceBudget] = (
+    DEFAULT_BROWSER_RESOURCE_BUDGET
+)
+
+
+class _DiagnosticBrowserBodyLimitExceeded(RuntimeError):
+    """Playwright diagnostic response body 超过共享 decoded-body 上限。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,13 +170,12 @@ class CliOptions:
         manual_wait_seconds: 导航后人工等待秒数。
         pause_before_snapshot: 采样页面状态前是否等待人工确认。
         storage_state_in: Playwright storage state 输入路径。
-        storage_state_out: Playwright storage state 输出路径。
-        storage_state_dir: host 级 storage state 目录。
+        storage_state_dir: production Web provider 的 storage state 输入目录。
         skip_playwright: 是否跳过浏览器路径。
+        skip_requests: 是否跳过 raw requests 路径。
         skip_tool_fetch: 是否跳过 current fetch 工具路径。
-        max_network: 最多记录的浏览器网络摘要数。
+        max_network: 可选的本次浏览器网络摘要数 typed override。
         fetch_truncate_chars: 传给 current provider 的截断声明字符数。
-        allow_private_network_url: 是否允许诊断内网或本地 URL。
 
     Returns:
         无。
@@ -169,13 +197,12 @@ class CliOptions:
     manual_wait_seconds: float
     pause_before_snapshot: bool
     storage_state_in: str
-    storage_state_out: str
     storage_state_dir: str
     skip_playwright: bool
+    skip_requests: bool
     skip_tool_fetch: bool
-    max_network: int
+    max_network: int | None
     fetch_truncate_chars: int
-    allow_private_network_url: bool
 
 
 @dataclass(slots=True)
@@ -287,7 +314,7 @@ class _DoclingInvocationEvidence:
             "original_completed": self.original_completed,
             "original_exception_type": self.original_exception_type,
             "docling_runtime_initialization_error": self.docling_runtime_initialization_error,
-            "diagnostic_url": self.diagnostic_url,
+            "safe_url": project_safe_url_or_empty(self.diagnostic_url),
             "diagnostic_only_reason": (
                 "该字段只记录本次诊断是否观察到非 HTML 内容转换 callable 调用；"
                 "它不是网页业务事实，也不会写入生产 fetch_web_page 返回给 LLM 的成功 payload。"
@@ -588,21 +615,6 @@ class _BrowserContextProtocol(Protocol):
 
         ...
 
-    def storage_state(self, *, path: str | None = None) -> JsonValue:
-        """读取或保存 storage state。
-
-        Args:
-            path: 可选输出路径；存在时写入文件。
-
-        Returns:
-            Playwright 返回的 storage state JSON 载荷。
-
-        Raises:
-            Exception: 读取或写入失败时抛出。
-        """
-
-        ...
-
     def close(self) -> None:
         """关闭浏览器上下文。
 
@@ -614,6 +626,76 @@ class _BrowserContextProtocol(Protocol):
 
         Raises:
             Exception: Playwright 内部关闭失败时抛出。
+        """
+
+        ...
+
+
+class _RouteRequestProtocol(Protocol):
+    """Playwright route request 的最小协议。"""
+
+    @property
+    def url(self) -> str:
+        """返回 request URL。
+
+        Args:
+            无。
+
+        Returns:
+            request URL。
+
+        Raises:
+            无。
+        """
+
+        ...
+
+
+class _RouteProtocol(Protocol):
+    """Playwright route 的最小协议。"""
+
+    @property
+    def request(self) -> _RouteRequestProtocol:
+        """返回当前 request。
+
+        Args:
+            无。
+
+        Returns:
+            当前 request。
+
+        Raises:
+            无。
+        """
+
+        ...
+
+    def abort(self) -> None:
+        """中止 request。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 浏览器拒绝中止时抛出。
+        """
+
+        ...
+
+    def continue_(self) -> None:
+        """继续 request。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 浏览器拒绝继续时抛出。
         """
 
         ...
@@ -644,6 +726,26 @@ class _PageProtocol(Protocol):
 
         Raises:
             Exception: Playwright 内部注册失败时抛出。
+        """
+
+        ...
+
+    def route(
+        self,
+        pattern: str,
+        handler: Callable[[_RouteProtocol, _RequestProtocol], None],
+    ) -> None:
+        """注册浏览器 request 路由。
+
+        Args:
+            pattern: Playwright URL pattern。
+            handler: request route handler。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 路由注册失败时抛出。
         """
 
         ...
@@ -711,14 +813,18 @@ class _PageProtocol(Protocol):
 
         ...
 
-    def evaluate(self, expression: str) -> str:
+    def evaluate(
+        self,
+        expression: str,
+        arg: Mapping[str, int] | None = None,
+    ) -> JsonValue:
         """执行页面脚本并返回字符串结果。
 
         Args:
             expression: JavaScript 表达式。
 
         Returns:
-            表达式结果的字符串形式。
+            表达式结果的 JSON 值。
 
         Raises:
             Exception: 脚本执行失败时抛出。
@@ -883,6 +989,21 @@ class _ResponseProtocol(Protocol):
 
         ...
 
+    def body(self) -> bytes:
+        """返回当前 response 的原始响应 bytes。
+
+        Args:
+            无。
+
+        Returns:
+            response body bytes。
+
+        Raises:
+            Exception: Playwright 无法读取 body 时抛出。
+        """
+
+        ...
+
 
 _PlaywrightNetworkEvent: TypeAlias = _RequestProtocol | _ResponseProtocol
 
@@ -914,18 +1035,26 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manual-wait-seconds", type=float, default=0.0, help="导航后额外等待秒数。")
     parser.add_argument("--pause-before-snapshot", action="store_true", help="采样页面前等待人工确认。")
     parser.add_argument("--storage-state-in", default="", help="Playwright storage state 输入文件。")
-    parser.add_argument("--storage-state-out", default="", help="Playwright storage state 输出文件。")
-    parser.add_argument("--storage-state-dir", default="", help="按 host 自动读写 storage state 的目录。")
+    parser.add_argument(
+        "--storage-state-dir",
+        default="",
+        help="传给 production Web provider 的 storage state 输入目录。",
+    )
     parser.add_argument("--skip-playwright", action="store_true", help="跳过 Playwright 浏览器路径。")
+    parser.add_argument("--skip-requests", action="store_true", help="跳过 raw requests 对照路径。")
     parser.add_argument("--skip-tool-fetch", action="store_true", help="跳过 current fetch_web_page 工具路径。")
-    parser.add_argument("--max-network", type=int, default=80, help="最多记录的 Playwright 网络摘要条数。")
+    parser.add_argument(
+        "--max-network",
+        type=int,
+        default=None,
+        help="显式覆盖本次 Playwright 网络摘要条数；未提供时使用 typed Web 配置。",
+    )
     parser.add_argument(
         "--fetch-truncate-chars",
         type=int,
         default=_DEFAULT_FETCH_TRUNCATE_CHARS,
         help="传给 current provider 的 fetch 内容截断字符数。",
     )
-    parser.add_argument("--allow-private-network-url", action="store_true", help="允许诊断内网或本地 URL。")
     return parser
 
 
@@ -957,13 +1086,14 @@ def _parse_options(argv: Sequence[str] | None) -> CliOptions:
         manual_wait_seconds=max(float(namespace.manual_wait_seconds), 0.0),
         pause_before_snapshot=bool(namespace.pause_before_snapshot),
         storage_state_in=str(namespace.storage_state_in or "").strip(),
-        storage_state_out=str(namespace.storage_state_out or "").strip(),
         storage_state_dir=str(namespace.storage_state_dir or "").strip(),
         skip_playwright=bool(namespace.skip_playwright),
+        skip_requests=bool(namespace.skip_requests),
         skip_tool_fetch=bool(namespace.skip_tool_fetch),
-        max_network=max(int(namespace.max_network), 1),
+        max_network=(
+            None if namespace.max_network is None else int(namespace.max_network)
+        ),
         fetch_truncate_chars=max(int(namespace.fetch_truncate_chars), 1),
-        allow_private_network_url=bool(namespace.allow_private_network_url),
     )
 
 
@@ -1034,7 +1164,7 @@ def _slugify_for_filename(url: str) -> str:
     """
 
     parsed = urlparse(url)
-    raw = f"{parsed.netloc}{parsed.path}".strip("/") or "web_diagnostic"
+    raw = f"{parsed.hostname or ''}{parsed.path}".strip("/") or "web_diagnostic"
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
     normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
     return normalized or "web_diagnostic"
@@ -1097,61 +1227,6 @@ def _normalize_url_for_http(url: str) -> str:
     return raw
 
 
-def _is_private_or_local_host(host: str) -> bool:
-    """判断 host 是否指向内网或本地目标。
-
-    Args:
-        host: URL host。
-
-    Returns:
-        是内网或本地目标时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    normalized = host.strip().lower().strip("[]")
-    if not normalized:
-        return True
-    if normalized in {"localhost", "0.0.0.0"} or normalized.endswith(".localhost") or normalized.endswith(".local"):
-        return True
-    try:
-        ip_address = ipaddress.ip_address(normalized)
-    except ValueError:
-        return False
-    return (
-        ip_address.is_private
-        or ip_address.is_loopback
-        or ip_address.is_link_local
-        or ip_address.is_reserved
-        or ip_address.is_multicast
-        or ip_address.is_unspecified
-    )
-
-
-def _validate_url_safety(url: str, *, allow_private_network_url: bool) -> str:
-    """校验诊断 URL 的基础网络安全边界。
-
-    Args:
-        url: 用户输入 URL。
-        allow_private_network_url: 是否允许内网或本地 URL。
-
-    Returns:
-        规范化 URL。
-
-    Raises:
-        ValueError: URL 非 http/https，或默认策略下指向内网/本地目标时抛出。
-    """
-
-    normalized_url = _normalize_url_for_http(url)
-    host = urlparse(normalized_url).hostname or ""
-    if not allow_private_network_url and _is_private_or_local_host(host):
-        raise ValueError(
-            "URL 被诊断脚本安全策略阻止；如需诊断内网或本地 URL，请显式传入 --allow-private-network-url。"
-        )
-    return normalized_url
-
-
 def _build_diagnostic_headers(url: str) -> Mapping[str, str]:
     """构造 raw requests 诊断路径使用的本地 headers。
 
@@ -1178,45 +1253,19 @@ def _build_diagnostic_headers(url: str) -> Mapping[str, str]:
 
 
 def _redact_headers(headers: Mapping[str, str]) -> JsonObject:
-    """脱敏 HTTP headers。
+    """投影 HTTP headers 的最小安全信息。
 
     Args:
         headers: 原始 header 映射。
 
     Returns:
-        可写入 JSON 的脱敏 header 对象。
+        只包含 allowlist values 与敏感 header presence 的 JSON 对象。
 
     Raises:
         无。
     """
 
-    result: JsonObject = {}
-    for key, value in headers.items():
-        normalized_key = str(key)
-        lowered = normalized_key.lower()
-        result[normalized_key] = (
-            _REDACTED
-            if any(fragment in lowered for fragment in _SENSITIVE_HEADER_FRAGMENTS)
-            else str(value)
-        )
-    return result
-
-
-def _prefix_text(value: str, max_chars: int) -> str:
-    """截取文本前缀。
-
-    Args:
-        value: 原始文本。
-        max_chars: 最大字符数。
-
-    Returns:
-        文本前缀。
-
-    Raises:
-        无。
-    """
-
-    return value[: max(max_chars, 0)]
+    return project_response_headers(headers).to_json()
 
 
 def _round_elapsed(started_at: float) -> float:
@@ -1239,14 +1288,18 @@ def _build_requests_profile(
     url: str,
     *,
     timeout_seconds: float,
-    allow_private_network_url: bool,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
     """采集 raw requests 诊断路径证据。
 
     Args:
         url: 待诊断 URL。
         timeout_seconds: requests 超时秒数。
-        allow_private_network_url: 是否允许内网或本地 URL。
+        egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
+        transport_policy: provider parser 产生的本次 HTTP transport 策略快照。
+        diagnostic_resource_budget: provider parser 产生的本次诊断预算。
 
     Returns:
         raw requests profile JSON 对象。
@@ -1257,68 +1310,99 @@ def _build_requests_profile(
 
     started_at = time.perf_counter()
     try:
-        normalized_url = _validate_url_safety(url, allow_private_network_url=allow_private_network_url)
+        normalized_url = _normalize_url_for_http(url)
     except ValueError as exc:
-        return {
-            "sampled": False,
-            "ok": False,
-            "status": "blocked_by_diagnostic_url_policy",
-            "error": str(exc),
-            "raw_requests_header_source": "diagnostic_local",
-        }
+        return failed_projection(
+            stage="requests",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="blocked_by_web_egress_policy",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.REQUESTS,
+            sampled=False,
+        ).to_json()
 
     session = requests.Session()
     headers = _build_diagnostic_headers(normalized_url)
-    prepared_request = requests.Request("GET", normalized_url, headers=headers)
-    prepared = session.prepare_request(prepared_request)
-    profile: JsonObject = {
-        "sampled": True,
-        "ok": False,
-        "status": "attempted",
-        "normalized_url": normalized_url,
-        "raw_requests_header_source": "diagnostic_local",
-        "header_source_note": (
-            "raw requests 使用诊断脚本本地 headers；它是对照路径，不代表生产 fetch_web_page 的完整抓取路径。"
-        ),
-        "prepared_headers": _redact_headers(cast(Mapping[str, str], prepared.headers)),
-        "timeout_seconds": timeout_seconds,
-    }
     try:
-        response = session.send(prepared, timeout=timeout_seconds, allow_redirects=True)
-    except requests.RequestException as exc:
-        profile["status"] = "request_exception"
-        profile["error"] = str(exc)
-        profile["result"] = {
-            "ok": False,
-            "status": "request_exception",
-            "error_type": type(exc).__name__,
-            "error_message": str(exc),
-            "elapsed_seconds": _round_elapsed(started_at),
-        }
+        lease, redirect_hops, _visited_urls = _web_fetch_orchestrator._request_with_safe_redirects(
+            session,
+            method="GET",
+            url=normalized_url,
+            timeout=timeout_seconds,
+            headers=dict(headers),
+            normalize_url_for_http=_normalize_url_for_http,
+            egress_policy=egress_policy,
+            transport_policy=transport_policy,
+            stream=True,
+            cancellation_token=None,
+        )
+    except _web_fetch_orchestrator._FetchUrlSafetyError as exc:
+        profile = failed_projection(
+            stage="requests",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="blocked_by_web_egress_policy",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.REQUESTS,
+            sampled=False,
+        ).to_json()
+        session.close()
         return profile
+    except (requests.RequestException, RuntimeError) as exc:
+        profile = failed_projection(
+            stage="requests",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="request_exception",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.REQUESTS,
+        ).to_json()
+        session.close()
+        return profile
+
+    try:
+        with lease:
+            response = lease.response
+            _web_fetch_orchestrator._materialize_response_body(
+                response,
+                http_resource_budget=_DIAGNOSTIC_HTTP_RESOURCE_BUDGET,
+            )
+            response_text = response.text
+            response_bytes = bytes(response.content)
+            challenge = detect_bot_challenge(response=response, content_text=response_text)
+            profile = completed_bytes_projection(
+                stage="requests",
+                url=str(response.url or normalized_url),
+                elapsed_seconds=_round_elapsed(started_at),
+                backend=WebDiagnosticBackend.REQUESTS,
+                content=response_bytes,
+                http_status=response.status_code,
+                response_headers=response.headers,
+            ).to_json()
+            profile["redirect_hops"] = redirect_hops
+            response_header_projection = _nested_object(profile, "response_headers")
+            profile["content_type"] = str(
+                response_header_projection.get("content_type", "") or ""
+            )
+            profile["challenge_decision"] = challenge.decision.value
+            profile["challenge_signals"] = list(challenge.challenge_signals)
+            return profile
+    except (requests.RequestException, RuntimeError) as exc:
+        return failed_projection(
+            stage="requests",
+            url=normalized_url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="request_exception",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.REQUESTS,
+        ).to_json()
     finally:
         session.close()
-
-    response_text = response.text
-    response_bytes = response.content
-    challenge = detect_bot_challenge(response=response, content_text=response_text)
-    profile["ok"] = True
-    profile["status"] = "completed"
-    profile["result"] = {
-        "ok": True,
-        "status": "completed",
-        "status_code": response.status_code,
-        "final_url": response.url,
-        "elapsed_seconds": _round_elapsed(started_at),
-        "response_headers": _redact_headers(cast(Mapping[str, str], response.headers)),
-        "content_type": response.headers.get("Content-Type", ""),
-        "content_length": len(response_bytes),
-        "text_prefix": _prefix_text(response_text, _TEXT_PREFIX_CHARS),
-        "text_length": len(response_text),
-        "challenge_detected": challenge.challenge_detected,
-        "challenge_signals": list(challenge.challenge_signals),
-    }
-    return profile
 
 
 def _provider_config(options: CliOptions) -> JsonObject:
@@ -1338,8 +1422,6 @@ def _provider_config(options: CliOptions) -> JsonObject:
         "request_timeout_seconds": options.request_timeout,
         "fetch_truncate_chars": options.fetch_truncate_chars,
     }
-    if options.allow_private_network_url:
-        config["allow_private_network_url"] = True
     if options.playwright_channel:
         config["playwright_channel"] = options.playwright_channel
     else:
@@ -1349,11 +1431,13 @@ def _provider_config(options: CliOptions) -> JsonObject:
     return config
 
 
-def _fetch_web_page_definition(options: CliOptions) -> ToolDefinition:
+def _fetch_web_page_definition(
+    provider_config: Mapping[str, JsonValue],
+) -> ToolDefinition:
     """通过 current provider discovery 取得 ``fetch_web_page`` 定义。
 
     Args:
-        options: CLI 选项。
+        provider_config: single-diagnostic orchestration 生成的 raw provider 配置。
 
     Returns:
         current ``fetch_web_page`` 的 ``ToolDefinition``。
@@ -1367,7 +1451,7 @@ def _fetch_web_page_definition(options: CliOptions) -> ToolDefinition:
         spec_id="diagnose-web-tools",
         location=PythonImportPathProvider("dayu.tools.web.provider:discover_tools"),
         enabled=True,
-        config=_provider_config(options),
+        config=provider_config,
     )
     output = discover_tools(spec)
     for definition in output.definitions:
@@ -1508,12 +1592,20 @@ def _attach_docling_evidence(
     return profile
 
 
-def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
+def _build_tool_fetch_profile(
+    url: str,
+    options: CliOptions,
+    *,
+    provider_config: Mapping[str, JsonValue],
+    diagnostic_resource_budget: DiagnosticResourceBudget,
+) -> JsonObject:
     """采集 current ``fetch_web_page`` 工具路径证据。
 
     Args:
         url: 待诊断 URL。
         options: CLI 选项。
+        provider_config: 与 raw requests transport snapshot 同源的 provider 配置。
+        diagnostic_resource_budget: provider parser 产生的本次诊断预算。
 
     Returns:
         current fetch 工具 profile JSON 对象。
@@ -1528,19 +1620,20 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
     wrapper = _DoclingInvocationWrapper(original=original_docling_callable, evidence=evidence)
     _web_tools_module._docling_convert_to_markdown = wrapper
     try:
-        definition = _fetch_web_page_definition(options)
+        definition = _fetch_web_page_definition(provider_config)
         outcome = asyncio.run(_call_fetch_tool_async(definition, url, options))
     except Exception as exc:
+        failure = failed_projection(
+            stage="fetch_web_page",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="callable_exception",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.TOOL,
+        ).to_json()
         return _attach_docling_evidence(
-            profile={
-                "sampled": True,
-                "ok": False,
-                "status": "callable_exception",
-                "elapsed_seconds": _round_elapsed(started_at),
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-                "message": "current fetch_web_page callable 调用边界抛出异常。",
-            },
+            profile=failure,
             evidence=evidence,
         )
     finally:
@@ -1550,73 +1643,99 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
     if isinstance(outcome, ToolCompletedOutcome):
         payload = _json_object_from_value(outcome.result.value)
         content = str(payload.get("content", "") or "")
+        backend_text = str(payload.get("fetch_backend", "") or "")
+        backend = (
+            WebDiagnosticBackend.PLAYWRIGHT
+            if backend_text == WebDiagnosticBackend.PLAYWRIGHT.value
+            else WebDiagnosticBackend.REQUESTS
+            if backend_text == WebDiagnosticBackend.REQUESTS.value
+            else WebDiagnosticBackend.TOOL
+        )
+        completed = completed_text_projection(
+            stage="fetch_web_page",
+            url=str(payload.get("final_url", url) or url),
+            elapsed_seconds=elapsed,
+            backend=backend,
+            content=content,
+            http_status=None,
+        ).to_json()
+        projected_content = content_diagnostic_from_text(content)
+        response_length = payload.get("response_content_length")
+        response_digest = payload.get("response_content_digest")
+        if (
+            isinstance(response_length, int)
+            and not isinstance(response_length, bool)
+            and response_length >= 0
+            and isinstance(response_digest, str)
+        ):
+            completed["content_length"] = response_length
+            completed["content_digest"] = response_digest
+        completed["projected_content_length"] = projected_content.length
+        completed["projected_content_digest"] = projected_content.digest
         return _attach_docling_evidence(
-            profile={
-                "sampled": True,
-                "ok": True,
-                "status": "completed",
-                "elapsed_seconds": elapsed,
-                "title": str(payload.get("title", "") or ""),
-                "final_url": str(payload.get("final_url", url) or url),
-                "fetch_backend": str(payload.get("fetch_backend", "") or ""),
-                "content_prefix": _prefix_text(content, _TEXT_PREFIX_CHARS),
-                "content_length": len(content),
-            },
+            profile=completed,
             evidence=evidence,
         )
     if isinstance(outcome, ToolFailedOutcome):
         hint = outcome.result.hint or ""
+        failure = failed_projection(
+            stage="fetch_web_page",
+            url=url,
+            elapsed_seconds=elapsed,
+            error_code=outcome.result.error,
+            error_message=outcome.result.message,
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.TOOL,
+        ).to_json()
+        failure["next_action"] = _next_action_from_hint(hint)
+        failure["diagnostics"] = _tool_failed_outcome_diagnostics(outcome.result.error)
         return _attach_docling_evidence(
-            profile={
-                "sampled": True,
-                "ok": False,
-                "status": "failed",
-                "elapsed_seconds": elapsed,
-                "error_code": outcome.result.error,
-                "error": outcome.result.error,
-                "message": outcome.result.message,
-                "hint": hint,
-                "next_action": _next_action_from_hint(hint),
-                "http_status": None,
-                "diagnostics": _tool_failed_outcome_diagnostics(outcome.result.error),
-            },
+            profile=failure,
             evidence=evidence,
         )
     if isinstance(outcome, ToolCancelledOutcome):
+        cancelled = WebDiagnosticProjection(
+            stage="fetch_web_page",
+            sampled=True,
+            outcome=WebDiagnosticOutcome.CANCELLED,
+            safe_url=project_safe_url_or_empty(url),
+            elapsed_seconds=elapsed,
+            backend=WebDiagnosticBackend.TOOL,
+            error_code=outcome.reason,
+            error_message=project_error_message(
+                outcome.message,
+                max_chars=diagnostic_resource_budget.error_chars,
+            ),
+        ).to_json()
         return _attach_docling_evidence(
-            profile={
-                "sampled": True,
-                "ok": False,
-                "status": "cancelled",
-                "elapsed_seconds": elapsed,
-                "error_code": outcome.reason,
-                "error": outcome.message,
-                "message": outcome.message,
-                "hint": outcome.hint or "",
-            },
+            profile=cancelled,
             evidence=evidence,
         )
     if isinstance(outcome, ToolAwaitingOutcome):
+        awaiting = failed_projection(
+            stage="fetch_web_page",
+            url=url,
+            elapsed_seconds=elapsed,
+            error_code="unexpected_awaiting_outcome",
+            error_message="fetch_web_page returned awaiting outcome in diagnostics.",
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.TOOL,
+        ).to_json()
         return _attach_docling_evidence(
-            profile={
-                "sampled": True,
-                "ok": False,
-                "status": "awaiting",
-                "elapsed_seconds": elapsed,
-                "error_code": "unexpected_awaiting_outcome",
-                "error": "fetch_web_page returned awaiting outcome in diagnostics.",
-                "message": "current fetch_web_page 返回了等待型 outcome；该工具预期应同步完成。",
-            },
+            profile=awaiting,
             evidence=evidence,
         )
+    unknown = failed_projection(
+        stage="fetch_web_page",
+        url=url,
+        elapsed_seconds=elapsed,
+        error_code="unknown_outcome",
+        error_message="current fetch_web_page returned an unknown outcome.",
+        max_error_chars=diagnostic_resource_budget.error_chars,
+        backend=WebDiagnosticBackend.TOOL,
+    ).to_json()
     return _attach_docling_evidence(
-        profile={
-            "sampled": True,
-            "ok": False,
-            "status": "unknown_outcome",
-            "elapsed_seconds": elapsed,
-            "error": "current fetch_web_page returned an unknown outcome.",
-        },
+        profile=unknown,
         evidence=evidence,
     )
 
@@ -1669,34 +1788,32 @@ def _tool_failed_outcome_diagnostics(error_code: str) -> JsonObject:
     }
 
 
-def _resolve_storage_state_paths(options: CliOptions, url: str) -> tuple[str, str]:
-    """解析单 URL 的 storage state 输入与输出路径。
+def _resolve_explicit_storage_state_input(path_value: str) -> Path | None:
+    """校验并解析显式 Playwright storage state 输入文件。
 
     Args:
-        options: CLI 选项。
-        url: 当前 URL。
+        path_value: ``--storage-state-in`` 提供的文件路径；空字符串表示未提供。
 
     Returns:
-        ``(storage_state_in, storage_state_out)``。
+        已校验 JSON object 的绝对常规文件路径；未提供时返回 ``None``。
 
     Raises:
-        无。
+        OSError: 文件读取失败时抛出。
+        ValueError: 路径不存在、不是常规文件、JSON 非法或根值不是 object 时抛出。
     """
 
-    storage_state_in = options.storage_state_in
-    storage_state_out = options.storage_state_out
-    if not options.storage_state_dir:
-        return storage_state_in, storage_state_out
-
-    storage_dir = Path(options.storage_state_dir).expanduser().resolve()
-    host = (urlparse(_normalize_url_for_http(url)).hostname or "").strip().lower()
-    if host:
-        host_path = str(storage_dir / f"{host}.json")
-        if not storage_state_in and Path(host_path).is_file():
-            storage_state_in = host_path
-        if not storage_state_out:
-            storage_state_out = host_path
-    return storage_state_in, storage_state_out
+    if not path_value:
+        return None
+    input_path = Path(path_value).expanduser().resolve()
+    if not input_path.is_file():
+        raise ValueError("--storage-state-in 必须指向存在的常规文件。")
+    try:
+        payload = json.loads(input_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("--storage-state-in 必须包含合法 JSON object。") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("--storage-state-in 的 JSON 根值必须是 object。")
+    return input_path
 
 
 def _safe_close_context(context: _BrowserContextProtocol | None) -> None:
@@ -1755,11 +1872,13 @@ def _request_event_summary(event: _RequestProtocol) -> JsonObject:
     """
 
     return {
-        "event": "request",
-        "url": event.url,
-        "method": event.method,
-        "resource_type": event.resource_type,
-        "headers": _redact_headers(event.headers),
+        **project_network_event(
+            event="request",
+            url=event.url,
+            method=event.method,
+            resource_type=event.resource_type,
+            status_code=None,
+        )
     }
 
 
@@ -1776,14 +1895,13 @@ def _response_event_summary(event: _ResponseProtocol) -> JsonObject:
         无。
     """
 
-    return {
-        "event": "response",
-        "url": event.url,
-        "status_code": event.status,
-        "request_method": event.request.method,
-        "resource_type": event.request.resource_type,
-        "headers": _redact_headers(event.headers),
-    }
+    return project_network_event(
+        event="response",
+        url=event.url,
+        method=event.request.method,
+        resource_type=event.request.resource_type,
+        status_code=event.status,
+    )
 
 
 def _network_event_summary(event: _PlaywrightNetworkEvent) -> JsonObject:
@@ -1808,14 +1926,14 @@ def _append_bounded_network_event(
     events: list[JsonValue],
     event: _PlaywrightNetworkEvent,
     *,
-    max_network: int,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> None:
     """追加有上限的网络事件摘要。
 
     Args:
         events: 已收集事件列表。
         event: Playwright 网络事件。
-        max_network: 最大事件数。
+        diagnostic_resource_budget: 本次诊断的 typed 事件与错误文本预算。
 
     Returns:
         无。
@@ -1824,7 +1942,7 @@ def _append_bounded_network_event(
         无。
     """
 
-    if len(events) >= max_network:
+    if len(events) >= diagnostic_resource_budget.events:
         return
     try:
         events.append(_network_event_summary(event))
@@ -1833,7 +1951,10 @@ def _append_bounded_network_event(
             {
                 "event": "network_summary_error",
                 "error_type": type(exc).__name__,
-                "message": str(exc),
+                "error_message": project_error_message(
+                    str(exc),
+                    max_chars=diagnostic_resource_budget.error_chars,
+                ),
             }
         )
 
@@ -1857,12 +1978,92 @@ def _wait_for_manual_confirmation(prompt_text: str) -> None:
         print("[诊断] stdin 不可交互，跳过人工确认等待。")
 
 
-def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
+def _route_diagnostic_browser_request(
+    route: _RouteProtocol,
+    request: _RequestProtocol,
+    *,
+    egress_policy: WebEgressPolicy,
+) -> None:
+    """按 local/dev policy 裁决 diagnostic browser subrequest。
+
+    Args:
+        route: 当前 Playwright route。
+        request: Playwright 传入的同一 request 事件；URL 仍从 route owner 读取。
+        egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
+
+    Returns:
+        无。
+
+    Raises:
+        无。被拒绝 request 会直接 abort。
+    """
+
+    del request
+    if egress_policy.is_url_allowed(route.request.url):
+        route.continue_()
+    else:
+        route.abort()
+
+
+def _read_bounded_playwright_response_body(
+    response: _ResponseProtocol,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> bytes:
+    """读取 Playwright 主响应 bytes，并复用共享 decoded-body budget。
+
+    Playwright 不提供 response body 流式迭代接口，因此先用可信度较低的
+    Content-Length 做早拒绝，再对实际返回 bytes 做强制后验上限。该 helper
+    只用于显式 private/local diagnostic profile；公网 direct browser 默认不可用。
+
+    Args:
+        response: Playwright 主导航 response。
+        http_resource_budget: HTTP decoded body 预算。
+
+    Returns:
+        未超过上限的 response body bytes。
+
+    Raises:
+        _DiagnosticBrowserBodyLimitExceeded: 声明值或实读值超过上限时抛出。
+        Exception: Playwright body 读取失败时透出。
+    """
+
+    raw_content_length = response.headers.get("content-length") or response.headers.get(
+        "Content-Length"
+    )
+    if raw_content_length is not None:
+        try:
+            declared_length = int(str(raw_content_length).strip())
+        except ValueError:
+            declared_length = 0
+        if declared_length > http_resource_budget.decoded_body_bytes:
+            raise _DiagnosticBrowserBodyLimitExceeded(
+                "Playwright diagnostic response body exceeds decoded-body limit."
+            )
+    body = response.body()
+    if len(body) > http_resource_budget.decoded_body_bytes:
+        raise _DiagnosticBrowserBodyLimitExceeded(
+            "Playwright diagnostic response body exceeds decoded-body limit."
+        )
+    return body
+
+
+def _build_playwright_profile(
+    url: str,
+    options: CliOptions,
+    *,
+    egress_policy: WebEgressPolicy,
+    storage_state_input: Path | None,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
+) -> JsonObject:
     """采集 Playwright 浏览器路径证据。
 
     Args:
         url: 待诊断 URL。
         options: CLI 选项。
+        egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
+        storage_state_input: 已校验的显式 storage state 输入文件。
+        diagnostic_resource_budget: provider parser 产生或显式覆盖的本次诊断预算。
 
     Returns:
         Playwright profile JSON 对象。
@@ -1871,35 +2072,42 @@ def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
         无。
     """
 
-    storage_state_in, storage_state_out = _resolve_storage_state_paths(options, url)
     started_at = time.perf_counter()
     try:
-        normalized_url = _validate_url_safety(url, allow_private_network_url=options.allow_private_network_url)
-    except ValueError as exc:
-        return {
-            "sampled": False,
-            "ok": False,
-            "skipped": True,
-            "status": "blocked_by_diagnostic_url_policy",
-            "error": str(exc),
-            "storage_state_in": storage_state_in,
-            "storage_state_out": storage_state_out,
-        }
+        target = egress_policy.authorize_http_target(
+            _normalize_url_for_http(url),
+            stage="diagnostic_playwright_input",
+        )
+        normalized_url = target.normalized_url
+    except (ValueError, WebEgressPolicyError) as exc:
+        profile = failed_projection(
+            stage="playwright",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="blocked_by_web_egress_policy",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+            sampled=False,
+        ).to_json()
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
+        return profile
 
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        return {
-            "sampled": True,
-            "ok": False,
-            "status": "playwright_package_missing",
-            "elapsed_seconds": _round_elapsed(started_at),
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-            "message": "未安装 Playwright Python package；浏览器路径未采样成功。",
-            "storage_state_in": storage_state_in,
-            "storage_state_out": storage_state_out,
-        }
+        profile = failed_projection(
+            stage="playwright",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="playwright_package_missing",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+            sampled=False,
+        ).to_json()
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
+        return profile
 
     browser: _BrowserProtocol | None = None
     context: _BrowserContextProtocol | None = None
@@ -1911,8 +2119,8 @@ def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
         "user_agent": _DEFAULT_USER_AGENT,
         "ignore_https_errors": True,
     }
-    if storage_state_in:
-        context_options["storage_state"] = storage_state_in
+    if storage_state_input is not None:
+        context_options["storage_state"] = str(storage_state_input)
 
     try:
         manager = cast(_PlaywrightContextManagerProtocol, sync_playwright())
@@ -1920,13 +2128,25 @@ def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
             browser = playwright.chromium.launch(**launch_options)
             context = browser.new_context(**context_options)
             page = context.new_page()
+            page.route(
+                "**/*",
+                partial(_route_diagnostic_browser_request, egress_policy=egress_policy),
+            )
             page.on(
                 "request",
-                lambda event: _append_bounded_network_event(network_events, event, max_network=options.max_network),
+                lambda event: _append_bounded_network_event(
+                    network_events,
+                    event,
+                    diagnostic_resource_budget=diagnostic_resource_budget,
+                ),
             )
             page.on(
                 "response",
-                lambda event: _append_bounded_network_event(network_events, event, max_network=options.max_network),
+                lambda event: _append_bounded_network_event(
+                    network_events,
+                    event,
+                    diagnostic_resource_budget=diagnostic_resource_budget,
+                ),
             )
             response = page.goto(
                 normalized_url,
@@ -1936,87 +2156,102 @@ def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
             if options.manual_wait_seconds > 0:
                 time.sleep(options.manual_wait_seconds)
             if options.pause_before_snapshot:
-                _wait_for_manual_confirmation("[诊断] 按 Enter 后采样页面并保存 storage state...")
-            title = page.title()
-            html = page.content()
-            try:
-                page_text = page.inner_text("body", timeout=2_000.0)
-            except Exception:
-                page_text = ""
-            try:
-                user_agent = page.evaluate("() => navigator.userAgent")
-            except Exception:
-                user_agent = ""
-            if storage_state_out:
-                Path(storage_state_out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-                context.storage_state(path=str(Path(storage_state_out).expanduser().resolve()))
+                _wait_for_manual_confirmation("[诊断] 按 Enter 后采样页面状态...")
+            page_projection = _web_playwright_backend._materialize_bounded_page_projection(
+                cast(_web_playwright_backend._PageProtocol, page),
+                browser_resource_budget=_DIAGNOSTIC_BROWSER_RESOURCE_BUDGET,
+            )
+            html = page_projection.html
+            page_text = page_projection.page_text
             status_code = response.status if response is not None else None
             final_url = response.url if response is not None else normalized_url
-            response_headers = _redact_headers(response.headers) if response is not None else {}
+            response_headers = response.headers if response is not None else {}
+            response_body = (
+                _read_bounded_playwright_response_body(
+                    response,
+                    http_resource_budget=_DIAGNOSTIC_HTTP_RESOURCE_BUDGET,
+                )
+                if response is not None
+                else b""
+            )
             challenge = detect_bot_challenge(
                 response=None,
-                response_headers=cast(Mapping[str, str], response_headers),
+                response_headers=response_headers,
                 http_status=status_code,
-                content_text=f"{title}\n{page_text}\n{html[:_HTML_PREFIX_CHARS]}",
+                content_text=f"{page_text}\n{html}",
             )
-            return {
-                "sampled": True,
-                "ok": True,
-                "status": "completed",
-                "elapsed_seconds": _round_elapsed(started_at),
-                "browser": "chromium",
-                "channel": options.playwright_channel,
-                "headed": options.headed,
-                "timeout_seconds": options.playwright_timeout,
-                "storage_state_in": storage_state_in,
-                "storage_state_out": storage_state_out,
-                "storage_state_note": "仅记录 storage state 路径，不内联 cookie、localStorage 或其它敏感状态内容。",
-                "navigation": {
-                    "response_status": status_code,
-                    "final_url": final_url,
-                    "title": title,
-                    "user_agent": user_agent,
-                    "response_headers": response_headers,
-                },
-                "page_text_prefix": _prefix_text(page_text, _TEXT_PREFIX_CHARS),
-                "page_text_length": len(page_text),
-                "html_prefix": _prefix_text(html, _HTML_PREFIX_CHARS),
-                "html_length": len(html),
-                "challenge_detected": challenge.challenge_detected,
-                "challenge_signals": list(challenge.challenge_signals),
-                "network_events": network_events,
-                "network_event_count": len(network_events),
-                "network_event_limit": options.max_network,
-            }
+            profile = completed_bytes_projection(
+                stage="playwright",
+                url=final_url,
+                elapsed_seconds=_round_elapsed(started_at),
+                backend=WebDiagnosticBackend.PLAYWRIGHT,
+                content=response_body,
+                http_status=status_code,
+                response_headers=response_headers,
+            ).to_json()
+            rendered_html_diagnostic = content_diagnostic_from_text(html)
+            rendered_text_diagnostic = content_diagnostic_from_text(page_text)
+            profile["rendered_html_length"] = rendered_html_diagnostic.length
+            profile["rendered_html_digest"] = rendered_html_diagnostic.digest
+            profile["rendered_text_length"] = rendered_text_diagnostic.length
+            profile["rendered_text_digest"] = rendered_text_diagnostic.digest
+            profile["browser_executed"] = True
+            profile["challenge_decision"] = challenge.decision.value
+            profile["challenge_signals"] = list(challenge.challenge_signals)
+            profile["network_events"] = network_events
+            profile["network_event_count"] = len(network_events)
+            profile["network_event_limit"] = diagnostic_resource_budget.events
+            profile["storage_state"] = {"input_used": storage_state_input is not None}
+            return profile
+    except _DiagnosticBrowserBodyLimitExceeded as exc:
+        profile = failed_projection(
+            stage="playwright",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="response_body_too_large",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        ).to_json()
+        profile["browser_executed"] = True
+        profile["network_events"] = network_events
+        profile["network_event_count"] = len(network_events)
+        profile["network_event_limit"] = diagnostic_resource_budget.events
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
+        return profile
     except Exception as exc:
-        return {
-            "sampled": True,
-            "ok": False,
-            "status": "playwright_error",
-            "elapsed_seconds": _round_elapsed(started_at),
-            "browser": "chromium",
-            "channel": options.playwright_channel,
-            "headed": options.headed,
-            "timeout_seconds": options.playwright_timeout,
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-            "message": "Playwright 浏览器路径采样失败。",
-            "storage_state_in": storage_state_in,
-            "storage_state_out": storage_state_out,
-            "network_events": network_events,
-            "network_event_count": len(network_events),
-            "network_event_limit": options.max_network,
-        }
+        profile = failed_projection(
+            stage="playwright",
+            url=url,
+            elapsed_seconds=_round_elapsed(started_at),
+            error_code="playwright_error",
+            error_message=str(exc),
+            max_error_chars=diagnostic_resource_budget.error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        ).to_json()
+        profile["browser_executed"] = True
+        profile["network_events"] = network_events
+        profile["network_event_count"] = len(network_events)
+        profile["network_event_limit"] = diagnostic_resource_budget.events
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
+        return profile
     finally:
         _safe_close_context(context)
         _safe_close_browser(browser)
 
 
-def _skipped_profile(reason: str) -> JsonObject:
+def _skipped_profile(
+    reason: str,
+    *,
+    url: str,
+    backend: WebDiagnosticBackend,
+) -> JsonObject:
     """构造未采样路径 profile。
 
     Args:
-        reason: 业务可读跳过原因。
+        reason: 稳定跳过原因。
+        url: 原始 URL。
+        backend: 被跳过的 backend。
 
     Returns:
         JSON profile。
@@ -2025,14 +2260,15 @@ def _skipped_profile(reason: str) -> JsonObject:
         无。
     """
 
-    return {
-        "sampled": False,
-        "skipped": True,
-        "ok": False,
-        "status": "skipped",
-        "error": "",
-        "skip_reason": reason,
-    }
+    return WebDiagnosticProjection(
+        stage=backend.value,
+        sampled=False,
+        outcome=WebDiagnosticOutcome.SKIPPED,
+        safe_url=project_safe_url_or_empty(url),
+        elapsed_seconds=0.0,
+        backend=backend,
+        error_code=reason,
+    ).to_json()
 
 
 def _bool_from_mapping(mapping: Mapping[str, JsonValue], key: str) -> bool:
@@ -2105,17 +2341,18 @@ def _classify_diagnostic_bucket(payload: Mapping[str, JsonValue]) -> str:
 
     playwright_profile = _nested_object(payload, "playwright_profile")
     requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
 
     playwright_sampled = _bool_from_mapping(playwright_profile, "sampled")
     requests_sampled = _bool_from_mapping(requests_profile, "sampled")
     fetch_sampled = _bool_from_mapping(fetch_profile, "sampled")
-    playwright_ok = _bool_from_mapping(playwright_profile, "ok")
-    requests_ok = _bool_from_mapping(requests_result, "ok")
-    fetch_ok = _bool_from_mapping(fetch_profile, "ok")
+    playwright_ok = playwright_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value
+    requests_ok = requests_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value
+    fetch_ok = fetch_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value
     child_process_error = str(payload.get("status", "") or "") == "child_process_error"
-    challenge_detected = _bool_from_mapping(playwright_profile, "challenge_detected")
+    challenge_detected = (
+        playwright_profile.get("challenge_decision") == BotChallengeDecision.CONFIRMED.value
+    )
     playwright_failed = playwright_sampled and not playwright_ok
     requests_failed = requests_sampled and not requests_ok
     fetch_failed = fetch_sampled and not fetch_ok
@@ -2123,10 +2360,10 @@ def _classify_diagnostic_bucket(payload: Mapping[str, JsonValue]) -> str:
 
     if child_process_error:
         return "child_process_error"
-    if playwright_sampled and fetch_sampled and requests_sampled and playwright_ok and requests_ok and fetch_ok:
-        return "all_success"
     if playwright_sampled and challenge_detected:
         return "playwright_challenge_detected"
+    if playwright_sampled and fetch_sampled and requests_sampled and playwright_ok and requests_ok and fetch_ok:
+        return "all_success"
     if fetch_sampled and fetch_ok and requests_failed and playwright_failed:
         return "fetch_only_success"
     if fetch_sampled and fetch_ok and requests_failed and (not playwright_sampled or playwright_failed):
@@ -2168,32 +2405,83 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
     if not options.url:
         raise ValueError("单 URL 模式必须提供 --url。")
 
+    provider_config = _provider_config(options)
+    web_config = _parse_config(provider_config)
+    diagnostic_resource_budget = web_config.resource_budgets.diagnostics
+    if options.max_network is not None:
+        diagnostic_resource_budget = DiagnosticResourceBudget(
+            error_chars=diagnostic_resource_budget.error_chars,
+            events=options.max_network,
+        )
+    egress_policy = WebEgressPolicy(
+        allow_private_network=web_config.allow_private_network_url,
+        allow_custom_port=web_config.allow_custom_port_url,
+    )
+    storage_state_input = _resolve_explicit_storage_state_input(
+        options.storage_state_in
+    )
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
         "diagnostic_schema_version": _SCHEMA_VERSION,
         "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
         "generated_at": _utc_now_iso(),
-        "url": options.url,
+        "safe_url": project_safe_url_or_empty(options.url),
     }
-    payload["requests_profile"] = _build_requests_profile(
-        options.url,
-        timeout_seconds=options.request_timeout,
-        allow_private_network_url=options.allow_private_network_url,
+    payload["requests_profile"] = (
+        _skipped_profile(
+            "user_skipped_requests",
+            url=options.url,
+            backend=WebDiagnosticBackend.REQUESTS,
+        )
+        if options.skip_requests
+        else _build_requests_profile(
+            options.url,
+            timeout_seconds=options.request_timeout,
+            egress_policy=egress_policy,
+            transport_policy=web_config.transport_policy,
+            diagnostic_resource_budget=diagnostic_resource_budget,
+        )
     )
     payload["fetch_web_page_profile"] = (
-        _skipped_profile("用户显式传入 --skip-tool-fetch。")
+        _skipped_profile(
+            "user_skipped_tool_fetch",
+            url=options.url,
+            backend=WebDiagnosticBackend.TOOL,
+        )
         if options.skip_tool_fetch
-        else _build_tool_fetch_profile(options.url, options)
+        else _build_tool_fetch_profile(
+            options.url,
+            options,
+            provider_config=provider_config,
+            diagnostic_resource_budget=diagnostic_resource_budget,
+        )
     )
     payload["docling_conversion_invocation_evidence"] = _docling_evidence_json_from_fetch_profile(
         diagnostic_url=options.url,
         fetch_profile=_nested_object(payload, "fetch_web_page_profile"),
     )
-    payload["playwright_profile"] = (
-        _skipped_profile("用户显式传入 --skip-playwright。")
-        if options.skip_playwright
-        else _build_playwright_profile(options.url, options)
-    )
+    if options.skip_playwright or not web_config.browser_enabled:
+        playwright_profile = _skipped_profile(
+            (
+                "user_skipped_playwright"
+                if options.skip_playwright
+                else "browser_disabled"
+            ),
+            url=options.url,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        )
+        playwright_profile["storage_state"] = {
+            "input_used": storage_state_input is not None
+        }
+        payload["playwright_profile"] = playwright_profile
+    else:
+        payload["playwright_profile"] = _build_playwright_profile(
+            options.url,
+            options,
+            egress_policy=egress_policy,
+            storage_state_input=storage_state_input,
+            diagnostic_resource_budget=diagnostic_resource_budget,
+        )
     payload["comparison_bucket"] = _classify_diagnostic_bucket(payload)
     return payload
 
@@ -2404,7 +2692,9 @@ def _entry_json(entry: DiagnosticUrlEntry) -> JsonObject:
         无。
     """
 
-    return cast(JsonObject, asdict(entry))
+    payload = cast(JsonObject, asdict(entry))
+    payload["url"] = project_safe_url_or_empty(entry.url)
+    return payload
 
 
 def _build_batch_child_command(
@@ -2443,17 +2733,15 @@ def _build_batch_child_command(
         str(options.playwright_timeout),
         "--playwright-channel",
         options.playwright_channel,
-        "--max-network",
-        str(options.max_network),
         "--fetch-truncate-chars",
         str(options.fetch_truncate_chars),
     ]
+    if options.max_network is not None:
+        command.extend(["--max-network", str(options.max_network)])
     if options.storage_state_dir:
         command.extend(["--storage-state-dir", options.storage_state_dir])
     if options.storage_state_in:
         command.extend(["--storage-state-in", options.storage_state_in])
-    if options.storage_state_out:
-        command.extend(["--storage-state-out", options.storage_state_out])
     if options.headed:
         command.append("--headed")
     if options.manual_wait_seconds > 0:
@@ -2462,10 +2750,10 @@ def _build_batch_child_command(
         command.append("--pause-before-snapshot")
     if options.skip_playwright:
         command.append("--skip-playwright")
+    if options.skip_requests:
+        command.append("--skip-requests")
     if options.skip_tool_fetch:
         command.append("--skip-tool-fetch")
-    if options.allow_private_network_url:
-        command.append("--allow-private-network-url")
     return command
 
 
@@ -2486,7 +2774,14 @@ def _load_diagnostic_payload(path: Path) -> JsonObject:
     payload = cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
     if not isinstance(payload, Mapping):
         raise ValueError(f"诊断文件不是 JSON 对象: {path}")
-    return {str(key): value for key, value in payload.items()}
+    normalized = {str(key): value for key, value in payload.items()}
+    if normalized.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError(f"诊断文件 schema_version 不是 {_SCHEMA_VERSION}: {path}")
+    if normalized.get("diagnostic_schema_version") != _SCHEMA_VERSION:
+        raise ValueError(f"诊断文件 diagnostic_schema_version 不是 {_SCHEMA_VERSION}: {path}")
+    if normalized.get("diagnostic_schema_revision") != _DIAGNOSTIC_SCHEMA_REVISION:
+        raise ValueError(f"诊断文件 revision 不是 {_DIAGNOSTIC_SCHEMA_REVISION}: {path}")
+    return normalized
 
 
 def _status_code_value(mapping: Mapping[str, JsonValue], key: str) -> JsonValue:
@@ -2577,15 +2872,14 @@ def _observed_failing_path_from_payload(
     failing_paths: list[str] = []
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
     requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
     playwright_profile = _nested_object(payload, "playwright_profile")
 
     fetch_sampled = payload.get("fetch_sampled") is True or _bool_from_mapping(fetch_profile, "sampled")
-    fetch_ok = payload.get("fetch_ok") is True or _bool_from_mapping(fetch_profile, "ok")
+    fetch_ok = payload.get("fetch_ok") is True or fetch_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value
     requests_sampled = payload.get("requests_sampled") is True or _bool_from_mapping(requests_profile, "sampled")
-    requests_ok = payload.get("requests_ok") is True or _bool_from_mapping(requests_result, "ok")
+    requests_ok = payload.get("requests_ok") is True or requests_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value
     playwright_sampled = payload.get("playwright_sampled") is True or _bool_from_mapping(playwright_profile, "sampled")
-    playwright_ok = payload.get("playwright_ok") is True or _bool_from_mapping(playwright_profile, "ok")
+    playwright_ok = payload.get("playwright_ok") is True or playwright_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value
 
     if fetch_sampled and not fetch_ok:
         failing_paths.append(_PATH_FETCH_WEB_PAGE)
@@ -2624,7 +2918,7 @@ def _diagnostic_action_hint_from_payload(
     """
 
     if str(payload.get("status", "") or "") == _OBSERVED_BUCKET_CHILD_PROCESS_ERROR:
-        return "重新运行单 URL 诊断子进程，并检查 stdout/stderr 前缀与诊断脚本参数。"
+        return "重新运行单 URL 诊断子进程，并检查 stdout/stderr length/digest 与诊断脚本参数。"
     if _docling_runtime_initialization_observed(payload):
         return "检查 Docling 运行时依赖、模型初始化与本机设备配置；这是诊断观察到的环境问题。"
     fetch_next_action = str(payload.get("fetch_next_action", "") or "")
@@ -2689,20 +2983,20 @@ def _build_observed_diagnostic_item(row: Mapping[str, JsonValue]) -> JsonObject:
     diagnostic_action_hint = str(row.get("diagnostic_action_hint", "") or "")
     diagnostic_only_reason = str(row.get("diagnostic_only_reason", "") or "")
     evidence_path = str(row.get("evidence_path", "") or row.get("diagnostic_path", "") or "")
-    failure_url = str(row.get("failure_url", "") or "")
+    failure_url = str(row.get("failure_safe_url", "") or "")
     return {
         "input_index": row.get("input_index"),
-        "url": str(row.get("url", "") or ""),
+        "safe_url": str(row.get("safe_url", "") or ""),
         "label": str(row.get("label", "") or ""),
         "observed_bucket": observed_bucket,
         "comparison_bucket": comparison_bucket,
         "observed_failing_path": observed_failing_path,
         "evidence_path": evidence_path,
-        "failure_url": failure_url,
+        "failure_safe_url": failure_url,
         "diagnostic_action_hint": diagnostic_action_hint,
         "diagnostic_only_reason": diagnostic_only_reason,
-        "diagnostic_schema_version": str(row.get("diagnostic_schema_version", "") or _SCHEMA_VERSION),
-        "diagnostic_schema_revision": row.get("diagnostic_schema_revision", _DIAGNOSTIC_SCHEMA_REVISION),
+        "diagnostic_schema_version": str(row.get("diagnostic_schema_version", "")),
+        "diagnostic_schema_revision": row.get("diagnostic_schema_revision"),
     }
 
 
@@ -2768,7 +3062,7 @@ def _diagnostic_action_hints(rows: Sequence[Mapping[str, JsonValue]]) -> list[Js
             continue
         hints.append(
             {
-                "url": str(row.get("url", "") or ""),
+                "safe_url": str(row.get("safe_url", "") or ""),
                 "evidence_path": str(row.get("evidence_path", "") or row.get("diagnostic_path", "") or ""),
                 "diagnostic_action_hint": hint,
             }
@@ -2800,13 +3094,13 @@ def _build_batch_result_row(
 
     playwright_profile = _nested_object(payload, "playwright_profile")
     requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
     docling_evidence = _nested_object(payload, "docling_conversion_invocation_evidence")
     if not docling_evidence:
         docling_evidence = _nested_object(fetch_profile, "docling_conversion_invocation_evidence")
-    navigation = _nested_object(playwright_profile, "navigation")
-    comparison_bucket = str(payload.get("comparison_bucket", "") or _classify_diagnostic_bucket(payload))
+    comparison_bucket = str(payload.get("comparison_bucket", ""))
+    if not comparison_bucket:
+        comparison_bucket = _classify_diagnostic_bucket(payload)
     observed_bucket = _observed_bucket_from_payload(payload=payload, comparison_bucket=comparison_bucket)
     observed_failing_path = _observed_failing_path_from_payload(
         payload=payload,
@@ -2821,10 +3115,10 @@ def _build_batch_result_row(
         payload=payload,
         comparison_bucket=comparison_bucket,
     )
-    failure_url = entry.url if observed_failing_path else ""
+    safe_url = project_safe_url_or_empty(entry.url)
     row: JsonObject = {
         "input_index": index,
-        "url": entry.url,
+        "safe_url": safe_url,
         "label": entry.label,
         "region": entry.region,
         "category": entry.category,
@@ -2833,40 +3127,42 @@ def _build_batch_result_row(
         "diagnostic_path": str(diagnostic_path) if diagnostic_path is not None else None,
         "comparison_bucket": comparison_bucket,
         "playwright_sampled": _bool_from_mapping(playwright_profile, "sampled"),
-        "playwright_ok": _bool_from_mapping(playwright_profile, "ok"),
-        "playwright_status": str(playwright_profile.get("status", "") or ""),
-        "playwright_error": str(playwright_profile.get("error", "") or ""),
-        "playwright_response_status": _status_code_value(navigation, "response_status"),
-        "playwright_final_url": str(navigation.get("final_url", entry.url) or entry.url),
-        "challenge_detected": _bool_from_mapping(playwright_profile, "challenge_detected"),
+        "playwright_ok": playwright_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value,
+        "playwright_status": str(playwright_profile.get("outcome", "") or ""),
+        "playwright_error": str(playwright_profile.get("error_message", "") or ""),
+        "playwright_response_status": _status_code_value(playwright_profile, "http_status"),
+        "playwright_safe_url": str(playwright_profile.get("safe_url", safe_url) or safe_url),
+        "challenge_detected": playwright_profile.get("challenge_decision") == BotChallengeDecision.CONFIRMED.value,
         "challenge_signals": _string_list(playwright_profile.get("challenge_signals")),
         "requests_sampled": _bool_from_mapping(requests_profile, "sampled"),
-        "requests_ok": _bool_from_mapping(requests_result, "ok"),
-        "requests_status": str(requests_result.get("status", "") or requests_profile.get("status", "") or ""),
-        "requests_status_code": _status_code_value(requests_result, "status_code"),
-        "requests_error": str(requests_result.get("error_message", "") or requests_profile.get("error", "") or ""),
+        "requests_ok": requests_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value,
+        "requests_status": str(requests_profile.get("outcome", "") or ""),
+        "requests_status_code": _status_code_value(requests_profile, "http_status"),
+        "requests_error": str(requests_profile.get("error_message", "") or ""),
         "fetch_sampled": _bool_from_mapping(fetch_profile, "sampled"),
-        "fetch_ok": _bool_from_mapping(fetch_profile, "ok"),
-        "fetch_status": str(fetch_profile.get("status", "") or ""),
+        "fetch_ok": fetch_profile.get("outcome") == WebDiagnosticOutcome.COMPLETED.value,
+        "fetch_status": str(fetch_profile.get("outcome", "") or ""),
         "fetch_error_code": str(fetch_profile.get("error_code", "") or ""),
-        "fetch_error": str(fetch_profile.get("error", "") or ""),
+        "fetch_error": str(fetch_profile.get("error_message", "") or ""),
         "fetch_next_action": str(fetch_profile.get("next_action", "") or ""),
-        "fetch_final_url": str(fetch_profile.get("final_url", entry.url) or entry.url),
+        "fetch_safe_url": str(fetch_profile.get("safe_url", safe_url) or safe_url),
         "docling_conversion_invoked": docling_evidence.get("invoked") is True,
         "docling_stream_name": str(docling_evidence.get("stream_name", "") or ""),
         "docling_original_exception_type": str(docling_evidence.get("original_exception_type", "") or ""),
         "docling_runtime_initialization_error": docling_evidence.get("docling_runtime_initialization_error") is True,
         "child_returncode": payload.get("returncode") if str(payload.get("status", "") or "") == "child_process_error" else None,
-        "child_stdout_prefix": str(payload.get("stdout_prefix", "") or ""),
-        "child_stderr_prefix": str(payload.get("stderr_prefix", "") or ""),
+        "child_stdout_length": payload.get("stdout_length", 0),
+        "child_stdout_digest": str(payload.get("stdout_digest", "") or ""),
+        "child_stderr_length": payload.get("stderr_length", 0),
+        "child_stderr_digest": str(payload.get("stderr_digest", "") or ""),
         "observed_bucket": observed_bucket,
         "observed_failing_path": observed_failing_path,
         "evidence_path": str(diagnostic_path) if diagnostic_path is not None else None,
-        "failure_url": failure_url,
+        "failure_safe_url": safe_url if observed_failing_path else "",
         "diagnostic_action_hint": diagnostic_action_hint,
         "diagnostic_only_reason": diagnostic_only_reason,
-        "diagnostic_schema_version": str(payload.get("schema_version", "") or _SCHEMA_VERSION),
-        "diagnostic_schema_revision": payload.get("diagnostic_schema_revision", _DIAGNOSTIC_SCHEMA_REVISION),
+        "diagnostic_schema_version": str(payload.get("schema_version", "")),
+        "diagnostic_schema_revision": payload.get("diagnostic_schema_revision"),
     }
     return row
 
@@ -2889,17 +3185,21 @@ def _child_error_payload(
         无。
     """
 
+    stdout_diagnostic = content_diagnostic_from_text(completed.stdout or "")
+    stderr_diagnostic = content_diagnostic_from_text(completed.stderr or "")
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
         "diagnostic_schema_version": _SCHEMA_VERSION,
         "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
         "generated_at": _utc_now_iso(),
-        "url": entry.url,
+        "safe_url": project_safe_url_or_empty(entry.url),
         "status": "child_process_error",
         "comparison_bucket": "child_process_error",
         "returncode": completed.returncode,
-        "stdout_prefix": _prefix_text(completed.stdout or "", _STDIO_PREFIX_CHARS),
-        "stderr_prefix": _prefix_text(completed.stderr or "", _STDIO_PREFIX_CHARS),
+        "stdout_length": stdout_diagnostic.length,
+        "stdout_digest": stdout_diagnostic.digest,
+        "stderr_length": stderr_diagnostic.length,
+        "stderr_digest": stderr_diagnostic.digest,
         "diagnostic_path": None,
         "message": "单 URL 诊断子进程异常退出；未生成可信诊断 JSON。",
     }
@@ -3081,7 +3381,10 @@ def _run_batch_diagnose(options: CliOptions) -> int:
     interactive_mode = options.headed or options.pause_before_snapshot or options.manual_wait_seconds > 0
     for index, entry in enumerate(entries, start=1):
         diagnostic_path = diagnostics_dir / f"{index:04d}-{_slugify_for_filename(entry.url)}.json"
-        print(f"[diagnose {index}/{len(entries)}] {entry.url}")
+        print(
+            f"[diagnose {index}/{len(entries)}] "
+            f"{project_safe_url_or_empty(entry.url)}"
+        )
         command = _build_batch_child_command(entry=entry, diagnostic_path=diagnostic_path, options=options)
         completed = subprocess.run(
             command,
@@ -3096,17 +3399,23 @@ def _run_batch_diagnose(options: CliOptions) -> int:
         try:
             payload = _load_diagnostic_payload(diagnostic_path)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
+            stdout_diagnostic = content_diagnostic_from_text(completed.stdout or "")
+            stderr_diagnostic = content_diagnostic_from_text(
+                f"{completed.stderr or ''}\n{type(exc).__name__}"
+            )
             error_payload: JsonObject = {
                 "schema_version": _SCHEMA_VERSION,
                 "diagnostic_schema_version": _SCHEMA_VERSION,
                 "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
                 "generated_at": _utc_now_iso(),
-                "url": entry.url,
+                "safe_url": project_safe_url_or_empty(entry.url),
                 "status": "child_process_error",
                 "comparison_bucket": "child_process_error",
                 "returncode": completed.returncode,
-                "stdout_prefix": _prefix_text(completed.stdout or "", _STDIO_PREFIX_CHARS),
-                "stderr_prefix": _prefix_text(f"{completed.stderr or ''}\n{exc}", _STDIO_PREFIX_CHARS),
+                "stdout_length": stdout_diagnostic.length,
+                "stdout_digest": stdout_diagnostic.digest,
+                "stderr_length": stderr_diagnostic.length,
+                "stderr_digest": stderr_diagnostic.digest,
                 "diagnostic_path": None,
                 "message": "单 URL 子进程退出后无法读取有效诊断 JSON。",
             }
@@ -3142,7 +3451,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_batch_diagnose(options)
         return _run_single_diagnose(options)
     except Exception as exc:
-        print(f"[诊断失败] {type(exc).__name__}: {exc}", file=sys.stderr)
+        safe_error = project_error_message(
+            str(exc),
+            max_chars=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET.error_chars,
+        )
+        print(f"[诊断失败] {type(exc).__name__}: {safe_error}", file=sys.stderr)
         return 2
 
 

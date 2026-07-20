@@ -40,10 +40,8 @@ PREPROCESS_TOOL_NAME: Final[str] = "start_fins_preprocess"
 _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_preprocess_start_failed"
 _DEFAULT_SOURCE_KIND: Final[SourceKind] = SourceKind.FILING
-_CANCELLED_MESSAGE: Final[str] = "Fins preprocess start was cancelled."
-_CANCELLED_HINT: Final[str] = (
-    "Continue without this Fins preprocess operation unless the user asks to retry."
-)
+_CANCELLED_MESSAGE: Final[str] = "财报预处理任务启动已停止。"
+_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 
 
 @dataclass(frozen=True)
@@ -101,7 +99,7 @@ class FinsPreprocessToolCallable:
                 tool_name=PREPROCESS_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="预处理任务启动失败，未进入等待状态。",
+                message="预处理任务未能启动。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -109,7 +107,7 @@ class FinsPreprocessToolCallable:
                 tool_name=PREPROCESS_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="预处理任务启动失败，未进入等待状态。",
+                message="预处理任务未能启动。",
                 hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
         return _awaiting_outcome_from_observation_handle(handle)

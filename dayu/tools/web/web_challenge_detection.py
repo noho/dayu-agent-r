@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Collection
 
 import requests
@@ -61,14 +62,59 @@ _CHALLENGE_VENDOR_HEADER_SIGNALS = frozenset(
     }
 )
 _BOT_CHALLENGE_HTTP_STATUS = frozenset({401, 403, 429, 503})
+_STRONG_VENDOR_CONTENT_SIGNALS = frozenset(
+    {
+        "content:cf_challenge_zh",
+        "content:cf_security_verification_zh",
+        "content:cf_connection_check",
+        "content:cf_security_service_zh",
+        "content:captcha-delivery",
+        "content:aliyun_waf",
+        "content:_waf_ticket",
+        "content:_waf_sess",
+        "content:eo_bot",
+        "content:antibot",
+        "content:/u21pn7x6/",
+        "content:cf-please-wait",
+        "content:challenges.cloudflare.com",
+    }
+)
+
+
+class BotChallengeDecision(str, Enum):
+    """挑战页证据强度的封闭判定。"""
+
+    NONE = "none"
+    SUSPECTED = "suspected"
+    CONFIRMED = "confirmed"
+
+
+class BotChallengeEvidenceClass(str, Enum):
+    """挑战页证据来源的封闭分类。"""
+
+    STRONG_VENDOR_CONTENT = "strong_vendor_content"
+    BROAD_CONTENT = "broad_content"
+    VENDOR_GATE_HEADER = "vendor_gate_header"
+    INFRASTRUCTURE_HEADER = "infrastructure_header"
+    COOKIE = "cookie"
+    ERROR_STATUS = "error_status"
+
+
+class ChallengeFallbackAction(str, Enum):
+    """confirmed challenge 的唯一 fallback 动作。"""
+
+    CONTINUE = "continue"
+    TRY_BROWSER = "try_browser"
+    FAIL_BLOCKED = "fail_blocked"
 
 
 @dataclass(frozen=True)
 class BotChallengeDetectionResult:
     """挑战页检测结果。"""
 
-    challenge_detected: bool
+    decision: BotChallengeDecision
     challenge_signals: tuple[str, ...]
+    evidence_classes: tuple[BotChallengeEvidenceClass, ...]
 
 
 def detect_bot_challenge(
@@ -101,20 +147,25 @@ def detect_bot_challenge(
     )
     status_code = response.status_code if response is not None else http_status
     normalized_signals = tuple(sorted(set(signals)))
+    decision = decide_bot_challenge(
+        signals=normalized_signals,
+        http_status=status_code,
+    )
     return BotChallengeDetectionResult(
-        challenge_detected=should_treat_as_bot_challenge(
+        decision=decision,
+        challenge_signals=normalized_signals,
+        evidence_classes=_classify_evidence(
             signals=normalized_signals,
             http_status=status_code,
         ),
-        challenge_signals=normalized_signals,
     )
 
 
-def should_treat_as_bot_challenge(
+def decide_bot_challenge(
     *,
     signals: Collection[str],
     http_status: int | None,
-) -> bool:
+) -> BotChallengeDecision:
     """根据挑战信号强弱与状态码判断是否应视为反爬页。
 
     Args:
@@ -122,7 +173,7 @@ def should_treat_as_bot_challenge(
         http_status: 当前响应状态码。
 
     Returns:
-        `True` 表示应视为 challenge/access gate；否则返回 `False`。
+        ``none``、``suspected`` 或 ``confirmed`` 封闭判定。
 
     Raises:
         无。
@@ -130,26 +181,94 @@ def should_treat_as_bot_challenge(
 
     signal_set = set(signals)
     if not signal_set:
-        return False
+        return BotChallengeDecision.NONE
 
     content_signals = {
         signal
         for signal in signal_set
         if signal.startswith("content:") and signal != "content:empty_near_error"
     }
-    if content_signals:
-        return True
+    if content_signals & _STRONG_VENDOR_CONTENT_SIGNALS:
+        return BotChallengeDecision.CONFIRMED
 
-    # vendor 响应头本身就是强挑战信号；但 vendor cookie 单独出现并不可靠，
-    # 正常页面也可能清理残留 cookie（例如 datadome=0）。
+    broad_content_signals = content_signals - _STRONG_VENDOR_CONTENT_SIGNALS
+    vendor_gate_headers = signal_set & _CHALLENGE_VENDOR_HEADER_SIGNALS
+    cookie_signals = {signal for signal in signal_set if signal.startswith("cookie:")}
+    has_error_status = http_status in _BOT_CHALLENGE_HTTP_STATUS
+    if len(broad_content_signals) >= 2:
+        return BotChallengeDecision.CONFIRMED
+    if broad_content_signals and (vendor_gate_headers or has_error_status):
+        return BotChallengeDecision.CONFIRMED
+    if vendor_gate_headers and (cookie_signals or has_error_status):
+        return BotChallengeDecision.CONFIRMED
+    if cookie_signals and has_error_status:
+        return BotChallengeDecision.CONFIRMED
+    return BotChallengeDecision.SUSPECTED
+
+
+def challenge_fallback_action(
+    *,
+    decision: BotChallengeDecision,
+    browser_available: bool,
+) -> ChallengeFallbackAction:
+    """按 challenge decision 与 browser 可用性决定唯一 fallback 动作。
+
+    Args:
+        decision: challenge detector 的封闭判定。
+        browser_available: 当前调用是否仍可尝试安全 browser profile。
+
+    Returns:
+        继续普通流程、尝试 browser 或稳定 blocked 失败。
+
+    Raises:
+        无。
+    """
+
+    if decision is not BotChallengeDecision.CONFIRMED:
+        return ChallengeFallbackAction.CONTINUE
+    if browser_available:
+        return ChallengeFallbackAction.TRY_BROWSER
+    return ChallengeFallbackAction.FAIL_BLOCKED
+
+
+def _classify_evidence(
+    *,
+    signals: Collection[str],
+    http_status: int | None,
+) -> tuple[BotChallengeEvidenceClass, ...]:
+    """把原始 detector signals 投影为封闭 evidence classes。
+
+    Args:
+        signals: 已去重的 detector signals。
+        http_status: 当前响应状态码。
+
+    Returns:
+        稳定排序、去重后的 evidence classes。
+
+    Raises:
+        无。
+    """
+
+    signal_set = set(signals)
+    evidence: set[BotChallengeEvidenceClass] = set()
+    content_signals = {
+        signal
+        for signal in signal_set
+        if signal.startswith("content:") and signal != "content:empty_near_error"
+    }
+    if content_signals & _STRONG_VENDOR_CONTENT_SIGNALS:
+        evidence.add(BotChallengeEvidenceClass.STRONG_VENDOR_CONTENT)
+    if (content_signals - _STRONG_VENDOR_CONTENT_SIGNALS) or "content:empty_near_error" in signal_set:
+        evidence.add(BotChallengeEvidenceClass.BROAD_CONTENT)
     if signal_set & _CHALLENGE_VENDOR_HEADER_SIGNALS:
-        return True
-
-    non_infra_signals = signal_set - _CHALLENGE_INFRA_SIGNALS
-    if http_status in _BOT_CHALLENGE_HTTP_STATUS and non_infra_signals:
-        return True
-
-    return False
+        evidence.add(BotChallengeEvidenceClass.VENDOR_GATE_HEADER)
+    if signal_set & _CHALLENGE_INFRA_SIGNALS:
+        evidence.add(BotChallengeEvidenceClass.INFRASTRUCTURE_HEADER)
+    if any(signal.startswith("cookie:") for signal in signal_set):
+        evidence.add(BotChallengeEvidenceClass.COOKIE)
+    if signal_set and http_status in _BOT_CHALLENGE_HTTP_STATUS:
+        evidence.add(BotChallengeEvidenceClass.ERROR_STATUS)
+    return tuple(sorted(evidence, key=lambda item: item.value))
 
 
 def _collect_bot_challenge_signals(

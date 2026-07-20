@@ -14,16 +14,16 @@ import pytest
 
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
+import dayu.cli.session_execution as session_execution
 from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.runtime_display import RuntimeDisplayController
-from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
+from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
-    unsupported_execution_option_names,
 )
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -40,6 +40,8 @@ from dayu.host.api import (
     FollowupBehavior,
     FollowupSnapshot,
     Host,
+    HostApiError,
+    HostApiErrorCode,
     HostActivityCounts,
     HostActivityKind,
     HostActivitySeverity,
@@ -62,6 +64,8 @@ from dayu.host.api import (
     SessionSnapshot,
     SessionStatus,
     SubmitFollowupRequest,
+    TerminalResultSummary,
+    is_terminal_run_status,
 )
 from dayu.service.entrypoint_runtime import (
     EntrypointThinking,
@@ -72,8 +76,10 @@ from dayu.service.entrypoint_runtime import (
     EntrypointStartupReconnectResult,
     EntrypointTerminalSource,
 )
+from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
 _MODEL_ID = "deepseek-v4-flash"
+_FINS_DEFAULT_SUBJECT_SLOT = "fins_default_subject"
 _CURRENT_TIME_SLOT = "current_time"
 _CURRENT_TIME_TEXT = (
     "# 当前时间\n"
@@ -87,6 +93,26 @@ _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
     ("--debug-sse-throttle-sec", "1.0"),
 )
 _API_KEY = "test-provider-key"
+
+
+async def _raise_cli_terminal_cursor_error(
+    *,
+    workspace_root: Path,
+    session_id: str,
+    terminal_event_id: str,
+    event_sequence: int,
+) -> None:
+    """模拟 CLI terminal cursor 持久化失败。
+
+    :param workspace_root: workspace 根目录。
+    :param session_id: Host Session id。
+    :param terminal_event_id: 已渲染 terminal event id。
+    :param event_sequence: 已渲染 terminal event sequence。
+    :returns: ``None``。
+    :raises CliTerminalCursorError: 始终抛出，模拟本地 cursor 写入失败。
+    """
+
+    raise CliTerminalCursorError("cursor write failed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +196,7 @@ class _FakeHost:
     _submit_index: int
     _run_status_index: int
     block_cancel_after_record: bool
+    _create_error: HostApiError | None
 
     def __init__(
         self,
@@ -180,6 +207,7 @@ class _FakeHost:
         cancel_status: HostTerminalStatus | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         block_cancel_after_record: bool = False,
+        create_error: HostApiError | None = None,
     ) -> None:
         """初始化 fake Host。
 
@@ -190,6 +218,7 @@ class _FakeHost:
         :param cancel_status: cancel 返回前推入 watcher 的 terminal 状态。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
+        :param create_error: create_session 时抛出的 HostApiError。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -209,6 +238,7 @@ class _FakeHost:
         self._submit_index = 0
         self._run_status_index = 0
         self.block_cancel_after_record = block_cancel_after_record
+        self._create_error = create_error
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 请求。
@@ -235,6 +265,8 @@ class _FakeHost:
 
         self.calls.append("create_session")
         self.create_requests.append(request)
+        if self._create_error is not None:
+            raise self._create_error
         slot = None
         if request.scope is not None and request.slot_key is not None:
             slot = SessionSlotRef(scope=request.scope, slot_key=request.slot_key)
@@ -657,7 +689,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
 
     fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
     captured_requests: list[EntrypointRuntimeRequest] = []
-    real_prepare = interactive_command.prepare_entrypoint_runtime
+    real_prepare = session_execution.prepare_entrypoint_runtime
 
     async def capture_prepare(
         request: EntrypointRuntimeRequest,
@@ -668,8 +700,9 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
         return await real_prepare(request)
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "prepare_entrypoint_runtime",
         capture_prepare,
     )
@@ -702,7 +735,14 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
-    assert tuple(captured_requests[0].context_slot_values) == (_CURRENT_TIME_SLOT,)
+    assert tuple(captured_requests[0].context_slot_values) == (
+        _FINS_DEFAULT_SUBJECT_SLOT,
+        _CURRENT_TIME_SLOT,
+    )
+    assert (
+        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT]
+        == "# 当前分析对象\n你正在分析的是 AAPL。"
+    )
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
     assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
@@ -737,10 +777,13 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
             str(tmp_path),
         )
     )
-    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+    prepared = await session_execution.prepare_interactive_session_execution(
         args,
         command_name="session",
         scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
     assert prepared.runtime.host_assembly.options.wait_poller_policy is not None
     assert prepared.runtime.host_assembly.options.wait_poller_policy.enabled
@@ -756,7 +799,7 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         )
     )
 
-    exit_code = await interactive_command._execute_interactive_on_existing_session(
+    exit_code = await session_execution.execute_interactive_on_session(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
@@ -805,10 +848,13 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
             str(tmp_path),
         )
     )
-    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+    prepared = await session_execution.prepare_interactive_session_execution(
         args,
         command_name="session",
         scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
     fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
 
@@ -861,12 +907,12 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "startup_reconnect_entrypoint_session",
         fake_startup_reconnect,
     )
 
-    exit_code = await interactive_command._execute_interactive_on_existing_session(
+    exit_code = await session_execution.execute_interactive_on_session(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
@@ -885,6 +931,213 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
         "terminal-startup",
         "terminal-run-1",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    (
+        (HostTerminalStatus.FAILED, EXIT_SUCCESS),
+        (HostTerminalStatus.CANCELLED, EXIT_SUCCESS),
+        (HostTerminalStatus.LOST, EXIT_FAILURE),
+    ),
+)
+async def test_interactive_startup_reconnect_advances_terminal_cursor_after_rendering_non_success_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: HostTerminalStatus,
+    expected_exit_code: int,
+) -> None:
+    """startup reconnect 渲染非成功 terminal 后必须推进本地 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param terminal_status: startup 返回的 Host terminal status。
+    :param expected_exit_code: renderer policy 产生的 CLI 退出码。
+    :returns: ``None``。
+    :raises AssertionError: cursor 未推进或退出码被 cursor 逻辑改写时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await session_execution.prepare_interactive_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
+    )
+    fake_host = _FakeHost()
+
+    async def fake_startup_reconnect(
+        host: Host,
+        *,
+        request: EntrypointStartupReconnectRequest,
+    ) -> EntrypointStartupReconnectResult:
+        """返回一条非成功 startup terminal。
+
+        :param host: Host public handle。
+        :param request: startup reconnect 请求。
+        :returns: startup reconnect result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return EntrypointStartupReconnectResult(
+            terminal_results=(
+                _startup_terminal_result(
+                    session_id=request.session_id,
+                    status=terminal_status,
+                ),
+            ),
+            next_terminal_cursor=OutboxTerminalCursor(event_sequence=5),
+            seen_terminal_event_ids=frozenset({"terminal-startup"}),
+        )
+
+    monkeypatch.setattr(
+        session_execution,
+        "startup_reconnect_entrypoint_session",
+        fake_startup_reconnect,
+    )
+
+    exit_code = await session_execution.execute_interactive_on_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        input_reader=_input_reader(()),
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == expected_exit_code
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=5)
+    assert cursor_record.seen_terminal_event_ids == ("terminal-startup",)
+
+
+@pytest.mark.asyncio
+async def test_interactive_startup_cursor_write_failure_propagates_after_terminal_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """startup reconnect 已渲染 terminal 后 cursor 写失败必须传播。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: cursor 异常被吞掉或改写成 renderer 退出码时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        session_execution,
+        "advance_cli_terminal_cursor",
+        _raise_cli_terminal_cursor_error,
+    )
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await session_execution.prepare_interactive_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
+    )
+    fake_host = _FakeHost()
+
+    async def fake_startup_reconnect(
+        host: Host,
+        *,
+        request: EntrypointStartupReconnectRequest,
+    ) -> EntrypointStartupReconnectResult:
+        """返回一条 startup terminal 供 cursor 写失败测试消费。
+
+        :param host: Host public handle。
+        :param request: startup reconnect 请求。
+        :returns: startup reconnect result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return EntrypointStartupReconnectResult(
+            terminal_results=(
+                _startup_terminal_result(
+                    session_id=request.session_id,
+                    status=HostTerminalStatus.LOST,
+                ),
+            ),
+            next_terminal_cursor=OutboxTerminalCursor(event_sequence=5),
+            seen_terminal_event_ids=frozenset({"terminal-startup"}),
+        )
+
+    monkeypatch.setattr(
+        session_execution,
+        "startup_reconnect_entrypoint_session",
+        fake_startup_reconnect,
+    )
+
+    with pytest.raises(CliTerminalCursorError, match="cursor write failed"):
+        await session_execution.execute_interactive_on_session(
+            host=cast(Host, fake_host),
+            prepared=prepared,
+            session_id="session-existing",
+            input_reader=_input_reader(()),
+            sigint_monitor_factory=_NoopSigintMonitor,
+        )
+
+
+def test_interactive_host_api_error_uses_structured_presentation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive 首次 create 阶段 HostApiError 必须结构化展示并返回 failure。"""
+
+    fake_host = _FakeHost(
+        create_error=HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="workspace session root missing",
+            retryable=False,
+        )
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "dayu-cli interactive" in captured.err
+    assert "host_code=not_found" in captured.err
+    assert "host_message=workspace session root missing" in captured.err
+    assert fake_host.calls == ["create_session"]
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug", "--debug-stream"))
@@ -940,7 +1193,7 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
     """输入态第一次空 prompt Ctrl-C 应重绘 prompt，且不得发 submit / cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -954,13 +1207,13 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
         )
     )
 
-    exit_code = await interactive_command._run_interactive_repl(
+    exit_code = await session_execution._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         composer=composer,
         sigint_monitor_factory=_NoopSigintMonitor,
     )
@@ -1004,7 +1257,7 @@ async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pend
     """输入态第一次 Ctrl-C 后提交正常输入，应重置本地退出待确认状态。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1020,13 +1273,13 @@ async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pend
         )
     )
 
-    exit_code = await interactive_command._run_interactive_repl(
+    exit_code = await session_execution._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         composer=composer,
         sigint_monitor_factory=_NoopSigintMonitor,
     )
@@ -1183,7 +1436,7 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
         _input_reader(("第一轮", "第二轮")),
     )
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "new_interactive_run_view",
         lambda show_activity=False: run_view,
     )
@@ -1223,7 +1476,7 @@ def test_interactive_no_detail_omits_activity_and_keeps_final_answer_stdout(
         _input_reader(("第一轮",)),
     )
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "new_interactive_run_view",
         lambda show_activity=False: run_view_factory_calls.append(show_activity),
     )
@@ -1387,13 +1640,131 @@ def test_interactive_lost_is_fatal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    (
+        (HostTerminalStatus.FAILED, EXIT_SUCCESS),
+        (HostTerminalStatus.CANCELLED, EXIT_SUCCESS),
+        (HostTerminalStatus.LOST, EXIT_FAILURE),
+    ),
+)
+async def test_interactive_existing_session_advances_terminal_cursor_after_rendering_non_success_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: HostTerminalStatus,
+    expected_exit_code: int,
+) -> None:
+    """interactive turn 渲染非成功 terminal 后必须推进本地 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param terminal_status: 本轮 Host terminal status。
+    :param expected_exit_code: renderer policy 产生的 CLI 退出码。
+    :returns: ``None``。
+    :raises AssertionError: cursor 未推进或退出码被 cursor 逻辑改写时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await session_execution.prepare_interactive_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
+    )
+    fake_host = _FakeHost(submit_statuses=(terminal_status,))
+
+    exit_code = await session_execution.execute_interactive_on_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        input_reader=_input_reader(("触发非成功终态",)),
+        sigint_monitor_factory=_NoopSigintMonitor,
+        run_startup_reconnect=False,
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == expected_exit_code
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=2)
+    assert cursor_record.seen_terminal_event_ids == ("terminal-run-1",)
+
+
+@pytest.mark.asyncio
+async def test_interactive_turn_cursor_write_failure_propagates_after_terminal_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive turn 已渲染 terminal 后 cursor 写失败必须传播。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: cursor 异常被吞掉或改写成 renderer 退出码时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        session_execution,
+        "advance_cli_terminal_cursor",
+        _raise_cli_terminal_cursor_error,
+    )
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await session_execution.prepare_interactive_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
+    )
+    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.LOST,))
+
+    with pytest.raises(CliTerminalCursorError, match="cursor write failed"):
+        await session_execution.execute_interactive_on_session(
+            host=cast(Host, fake_host),
+            prepared=prepared,
+            session_id="session-existing",
+            input_reader=_input_reader(("触发终态",)),
+            sigint_monitor_factory=_NoopSigintMonitor,
+            run_startup_reconnect=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_interactive_sigint_after_run_id_cancels_host_run(
     tmp_path: Path,
 ) -> None:
     """运行态第一次 SIGINT 应发完整 CancelRunRequest 并返回取消终态。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1405,14 +1776,14 @@ async def test_interactive_sigint_after_run_id_cancels_host_run(
         run_statuses=(RunStatus.RUNNING,),
     )
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_AutoSigintMonitor(),
     )
 
@@ -1433,7 +1804,7 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     """interactive 运行态 Esc 应请求取消当前 accepted Run。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1472,14 +1843,14 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         )
     )
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
         thinking_renderer=thinking_renderer,
@@ -1506,7 +1877,7 @@ async def test_interactive_ctrl_t_switches_run_view_without_cancel(
     """interactive 运行态 Ctrl+T 应切换 run view，且不得触发 Host cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1523,14 +1894,14 @@ async def test_interactive_ctrl_t_switches_run_view_without_cancel(
     )
     key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
         key_monitor=key_monitor,
@@ -1553,7 +1924,7 @@ async def test_interactive_second_sigint_exits_after_cancel_request(
     """运行态第二次 SIGINT 应本地退出 130，且已有 run 必须已发 cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1565,14 +1936,14 @@ async def test_interactive_second_sigint_exits_after_cancel_request(
         block_cancel_after_record=True,
     )
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
     )
 
@@ -1585,10 +1956,15 @@ async def test_interactive_second_sigint_exits_after_cancel_request(
 async def test_interactive_repl_returns_130_on_second_sigint(
     tmp_path: Path,
 ) -> None:
-    """REPL 中第二次 SIGINT 应返回 130。"""
+    """REPL 中第二次 SIGINT 应返回 130，且没有 terminal 时不得推进 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、cancel 请求或 cursor 水位错误时抛出。
+    """
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1600,26 +1976,32 @@ async def test_interactive_repl_returns_130_on_second_sigint(
         block_cancel_after_record=True,
     )
 
-    exit_code = await interactive_command._run_interactive_repl(
+    exit_code = await session_execution._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         input_reader=_input_reader(("请总结收入变化",)),
         sigint_monitor_factory=lambda: _SecondSigintAfterCancelMonitor(fake_host),
     )
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
     assert len(fake_host.cancel_requests) == 1
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-1",
+    )
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=0)
+    assert cursor_record.seen_terminal_event_ids == ()
 
 
-def test_interactive_thinking_flags_are_display_options_not_execution_overrides() -> None:
-    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
+def test_interactive_thinking_flags_are_display_options() -> None:
+    """``--thinking`` / ``--no-thinking`` 保持为明确的展示选项。
 
     :returns: ``None``。
-    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    :raises AssertionError: thinking 展示参数未被正确解析时抛出。
     """
 
     thinking_args = parse_cli_args(("interactive", "--thinking"))
@@ -1627,22 +2009,18 @@ def test_interactive_thinking_flags_are_display_options_not_execution_overrides(
 
     assert thinking_args.thinking is True
     assert no_thinking_args.thinking is False
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(
-        no_thinking_args
-    )
 
 
-def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
-    """debug-stream 是全局日志开关，不是旧 Agent 执行参数。
+def test_interactive_debug_stream_is_global_log_option() -> None:
+    """``--debug-stream`` 保持为全局日志开关。
 
     :returns: ``None``。
-    :raises AssertionError: debug-stream 被错误列为 unsupported option 时抛出。
+    :raises AssertionError: debug-stream 未被正确解析时抛出。
     """
 
     args = parse_cli_args(("interactive", "--debug-stream"))
 
-    assert "--debug-stream" not in unsupported_execution_option_names(args)
+    assert args.debug_stream is True
 
 
 @pytest.mark.parametrize("removed_args", _REMOVED_INTERACTIVE_DEBUG_OPTIONS)
@@ -1666,10 +2044,10 @@ def test_interactive_removed_debug_options_are_argparse_unknown(
     assert removed_args[0] in captured.err
 
 
-def test_interactive_reports_all_unsupported_old_execution_flags(
+def test_interactive_rejects_all_removed_execution_flags_as_unknown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """unsupported 旧参数应统一列入清晰错误。"""
+    """所有已删除旧参数都应由 argparse 清晰拒绝。"""
 
     exit_code = cli_main.main(
         (
@@ -1687,6 +2065,7 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
     for expected in (
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",
@@ -1713,18 +2092,18 @@ async def test_interactive_sigint_monitor_waits_for_notification() -> None:
 async def test_wait_for_run_id_returns_none_when_second_sigint_wins() -> None:
     """run id 尚未 accepted 时第二次 SIGINT 应取消 submit task 并返回本地退出 outcome。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     submit_task = asyncio.create_task(_never_finishes_terminal())
     monitor = _ImmediateSecondSigintMonitor()
 
-    result = await interactive_command._wait_for_run_id_or_local_exit(
+    result = await session_execution._wait_for_run_id_or_local_exit(
         accepted_run=accepted_run,
         submit_task=submit_task,
         sigint_monitor=monitor,
         observed_sigint_count=1,
     )
 
-    assert isinstance(result, interactive_command._LocalExitRequested)
+    assert isinstance(result, session_execution._LocalExitRequested)
     assert submit_task.cancelled()
 
 
@@ -1732,12 +2111,12 @@ async def test_wait_for_run_id_returns_none_when_second_sigint_wins() -> None:
 async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_first() -> None:
     """等待 run id 阶段 submit task 先返回成功终态时不得映射成本地 130。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     terminal = _terminal_result(status=HostTerminalStatus.SUCCEEDED)
     submit_task = asyncio.create_task(_already_terminal(terminal))
     await asyncio.sleep(0)
 
-    result = await interactive_command._wait_for_run_id_or_local_exit(
+    result = await session_execution._wait_for_run_id_or_local_exit(
         accepted_run=accepted_run,
         submit_task=submit_task,
         sigint_monitor=_NeverSigintMonitor(),
@@ -1746,7 +2125,7 @@ async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_fir
 
     assert isinstance(
         result,
-        interactive_command._SubmitCompletedWhileWaitingForRunId,
+        session_execution._SubmitCompletedWhileWaitingForRunId,
     )
     assert result.terminal is terminal
 
@@ -1755,12 +2134,12 @@ async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_fir
 async def test_wait_for_run_id_propagates_submit_failure_when_submit_fails_first() -> None:
     """等待 run id 阶段 submit task 先失败时必须向上透传 Host/API fatal。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     submit_task = asyncio.create_task(_raise_runtime_error_terminal())
     await asyncio.sleep(0)
 
     with pytest.raises(RuntimeError, match="host fatal"):
-        await interactive_command._wait_for_run_id_or_local_exit(
+        await session_execution._wait_for_run_id_or_local_exit(
             accepted_run=accepted_run,
             submit_task=submit_task,
             sigint_monitor=_NeverSigintMonitor(),
@@ -1772,7 +2151,7 @@ async def test_wait_for_run_id_propagates_submit_failure_when_submit_fails_first
 async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> None:
     """第一次 SIGINT 竞争中若 submit 已终态，应直接返回 submit terminal。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     accepted_run.record("run-1")
     submit_task = asyncio.create_task(_already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED)))
     await asyncio.sleep(0)
@@ -1782,9 +2161,9 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         options=CliThinkingRendererOptions(enabled=True),
     )
 
-    result = await interactive_command._cancel_interactive_turn_after_first_sigint(
+    result = await session_execution._cancel_interactive_turn_after_first_sigint(
         host=cast(Host, _FakeHost()),
-        invocation=interactive_command.new_cli_invocation(
+        invocation=session_execution.new_cli_invocation(
             command_name="interactive",
             scenario="interactive",
             display_user="本地 CLI 用户",
@@ -1815,14 +2194,17 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
     :raises Exception: runtime assembly 失败时向上抛出。
     """
 
-    return await interactive_command.prepare_entrypoint_runtime(
+    return await session_execution.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={_CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT},
-            assembly_overrides=interactive_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            context_slot_values={
+                _FINS_DEFAULT_SUBJECT_SLOT: "",
+                _CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT,
+            },
+            assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -1886,7 +2268,7 @@ class _NeverSigintMonitor(CliSigintMonitor):
         return observed_count
 
 
-async def _never_finishes_terminal() -> interactive_command.EntrypointRunTerminalResult:
+async def _never_finishes_terminal() -> EntrypointRunTerminalResult:
     """构造永不完成的 terminal task。
 
     :returns: 正常路径不会返回。
@@ -1898,8 +2280,8 @@ async def _never_finishes_terminal() -> interactive_command.EntrypointRunTermina
 
 
 async def _already_terminal(
-    result: interactive_command.EntrypointRunTerminalResult,
-) -> interactive_command.EntrypointRunTerminalResult:
+    result: EntrypointRunTerminalResult,
+) -> EntrypointRunTerminalResult:
     """返回已完成 terminal result。
 
     :param result: 待返回的 terminal result。
@@ -1910,7 +2292,7 @@ async def _already_terminal(
     return result
 
 
-async def _raise_runtime_error_terminal() -> interactive_command.EntrypointRunTerminalResult:
+async def _raise_runtime_error_terminal() -> EntrypointRunTerminalResult:
     """构造抛出 RuntimeError 的 terminal task。
 
     :returns: 正常路径不会返回。
@@ -1948,12 +2330,19 @@ def _run_snapshot(*, run_id: str, status: RunStatus) -> RunSnapshot:
     :raises Exception: 不主动抛出异常。
     """
 
+    terminal_summary = None
+    if is_terminal_run_status(status):
+        terminal_summary = TerminalResultSummary(
+            status=status,
+            summary_ref=None,
+            summary_digest=None,
+        )
     return RunSnapshot(
         run_id=run_id,
         session_id="session-1",
         status=status,
         current_attempt_id=None,
-        terminal_result_summary=None,
+        terminal_result_summary=terminal_summary,
         event_cursor=HostStreamCursor(event_sequence=0),
         source_run_id=None,
         source_run_relation=None,
@@ -2068,7 +2457,7 @@ def _entrypoint_thinking(
     )
 
 
-def _terminal_result(*, status: HostTerminalStatus) -> interactive_command.EntrypointRunTerminalResult:
+def _terminal_result(*, status: HostTerminalStatus) -> EntrypointRunTerminalResult:
     """构造 interactive terminal result。
 
     :param status: terminal status。
@@ -2076,7 +2465,7 @@ def _terminal_result(*, status: HostTerminalStatus) -> interactive_command.Entry
     :raises Exception: 不主动抛出异常。
     """
 
-    return interactive_command.EntrypointRunTerminalResult(
+    return EntrypointRunTerminalResult(
         source=EntrypointTerminalSource.LIVE_EVENT,
         session_id="session-1",
         run_id="run-1",
@@ -2087,6 +2476,42 @@ def _terminal_result(*, status: HostTerminalStatus) -> interactive_command.Entry
         final_answer=_final_answer(run_id="run-1") if status is HostTerminalStatus.SUCCEEDED else None,
         error_message=_error_message(run_id="run-1", status=status),
         cancel_reason="cancelled for run-1" if status is HostTerminalStatus.CANCELLED else None,
+        watcher_failure_message=None,
+    )
+
+
+def _startup_terminal_result(
+    *,
+    session_id: str,
+    status: HostTerminalStatus,
+) -> EntrypointRunTerminalResult:
+    """构造 startup reconnect terminal result。
+
+    :param session_id: startup reconnect 目标 Session id。
+    :param status: terminal status。
+    :returns: EntrypointRunTerminalResult。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointRunTerminalResult(
+        source=EntrypointTerminalSource.OUTBOX_READ,
+        session_id=session_id,
+        run_id="run-startup",
+        terminal_event_id="terminal-startup",
+        event_sequence=5,
+        terminal_status=status,
+        dedupe_key="terminal-startup",
+        final_answer=(
+            _final_answer(run_id="run-startup")
+            if status is HostTerminalStatus.SUCCEEDED
+            else None
+        ),
+        error_message=_error_message(run_id="run-startup", status=status),
+        cancel_reason=(
+            "cancelled for run-startup"
+            if status is HostTerminalStatus.CANCELLED
+            else None
+        ),
         watcher_failure_message=None,
     )
 

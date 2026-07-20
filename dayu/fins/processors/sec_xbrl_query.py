@@ -8,16 +8,25 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 import pandas as pd
 from edgar.xbrl import XBRL
 
-from dayu.documents.processors.text_utils import (
-    normalize_optional_string as _normalize_optional_string_base,
-    normalize_whitespace as _normalize_whitespace,
+from dayu.documents.processors.text_utils import normalize_whitespace as _normalize_whitespace
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.financial_result_contract import (
+    FinancialPeriod,
+    FinancialScaleOutcome,
+    infer_financial_scale_from_decimals,
 )
-from .financial_base import FinancialStatementResult, XbrlFactsResult
+from dayu.fins.domain.filing_semantics import FiscalPeriod, normalize_fiscal_period
+from dayu.fins.domain.xbrl_result_contract import (
+    XbrlConceptQuerySummary,
+    XbrlQueryExecutionError,
+)
+from dayu.fins.processors.value_normalization import normalize_optional_dataframe_string
 
 _STATEMENT_METHODS = {
     "income": "income_statement",
@@ -40,21 +49,7 @@ _QUERY_STATEMENT_TYPES = {
     "comprehensive_income": "ComprehensiveIncome",
     "comprehensiveincome": "ComprehensiveIncome",
 }
-_STATEMENT_TITLE_BY_TYPE = {
-    "income": "Income Statement",
-    "balance_sheet": "Balance Sheet",
-    "cash_flow": "Cash Flow Statement",
-    "equity": "Statement of Changes in Equity",
-    "comprehensive_income": "Comprehensive Income",
-}
-
-# decimals → scale 映射表（与 read runtime _DECIMALS_SCALE_MAP 保持一致）
-_DECIMALS_SCALE_MAP: dict[int, str] = {
-    -9: "billions",
-    -6: "millions",
-    -3: "thousands",
-    0: "units",
-}
+_XBRL_CONCEPT_IDENTITY_MAX_CHARS = 128
 
 # 用于 units/scale 推断的主营收入概念候选（按 US-GAAP 实务命中优先级排序）。
 # - ``Revenues``：US-GAAP 2018+ 主流命名。
@@ -76,24 +71,6 @@ _KNOWN_CURRENCY_CODES: frozenset[str] = frozenset(
         "CAD", "AUD", "CHF", "BRL", "MXN", "SGD", "ZAR",
     }
 )
-
-
-def _normalize_optional_string(value: Any) -> Optional[str]:
-    """将任意值转为可选字符串，额外处理 pandas NaN/NaT。
-
-    对 ``None``、空字符串、``float('nan')``、``pd.NaT`` 等无意义值统一返回 ``None``。
-
-    Args:
-        value: 任意输入值。
-
-    Returns:
-        标准化字符串；空值返回 ``None``。
-    """
-    if value is None:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    return _normalize_optional_string_base(value)
 
 
 def _infer_xbrl_taxonomy(xbrl: XBRL) -> Optional[str]:
@@ -170,7 +147,10 @@ def _extract_period_columns(columns: Any) -> list[str]:
     return period_columns
 
 
-def _build_statement_rows(statement_df: pd.DataFrame, period_columns: list[str]) -> list[dict[str, Any]]:
+def _build_statement_rows(
+    statement_df: pd.DataFrame,
+    period_columns: list[str],
+) -> list[dict[str, JsonValue]]:
     """构建标准财务行结构。
 
     Args:
@@ -184,11 +164,13 @@ def _build_statement_rows(statement_df: pd.DataFrame, period_columns: list[str])
         RuntimeError: 构建失败时抛出。
     """
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, JsonValue]] = []
     for _, row in statement_df.iterrows():
-        concept = _normalize_optional_string(row.get("concept")) or ""
-        label = _normalize_optional_string(row.get("label")) or concept
-        values = [_to_optional_float(row.get(period)) for period in period_columns]
+        concept = normalize_optional_dataframe_string(row.get("concept")) or ""
+        label = normalize_optional_dataframe_string(row.get("label")) or concept
+        values: list[JsonValue] = []
+        for period in period_columns:
+            values.append(_to_optional_float(row.get(period)))
         if not concept and not label:
             continue
         rows.append(
@@ -201,11 +183,18 @@ def _build_statement_rows(statement_df: pd.DataFrame, period_columns: list[str])
     return rows
 
 
-def _build_period_summary(period_end: str) -> dict[str, Any]:
+def _build_period_summary(
+    period_end: str,
+    *,
+    fiscal_year: int | None = None,
+    fiscal_period: FiscalPeriod | None = None,
+) -> FinancialPeriod:
     """构建期间摘要。
 
     Args:
         period_end: 期末日期（YYYY-MM-DD）。
+        fiscal_year: 来自直接 XBRL/表头证据的财年。
+        fiscal_period: 来自直接 XBRL/表头证据的财期。
 
     Returns:
         期间摘要字典。
@@ -214,96 +203,13 @@ def _build_period_summary(period_end: str) -> dict[str, Any]:
         ValueError: 日期非法时抛出。
     """
 
-    fiscal_year = int(period_end[:4]) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", period_end) else None
-    return {
-        "period_end": period_end,
-        "fiscal_year": fiscal_year,
-        "fiscal_period": "FY" if fiscal_year is not None else None,
-    }
-
-
-def _format_statement_period_label(period_summary: dict[str, Any]) -> str:
-    """将期间摘要格式化为稳定的报表期间标签。
-
-    Args:
-        period_summary: `_build_period_summary` 生成的期间摘要。
-
-    Returns:
-        适合写入 statement locator 的期间标签；优先返回 `FY2025` 这类口径，
-        无法归一时退回原始 `period_end`。
-
-    Raises:
-        无。
-    """
-
-    fiscal_year = period_summary.get("fiscal_year")
-    fiscal_period = _normalize_optional_string(period_summary.get("fiscal_period"))
-    period_end = _normalize_optional_string(period_summary.get("period_end"))
-    if isinstance(fiscal_year, int) and fiscal_period:
-        return f"{fiscal_period}{fiscal_year}"
-    return period_end or ""
-
-
-def _extract_statement_row_labels(rows: list[dict[str, Any]]) -> list[str]:
-    """从结构化报表行中提取去重后的行标签。
-
-    Args:
-        rows: 标准化报表行列表。
-
-    Returns:
-        去重且保序的行标签列表。
-
-    Raises:
-        无。
-    """
-
-    labels: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        label = _normalize_optional_string(row.get("label")) or _normalize_optional_string(row.get("concept")) or ""
-        if not label or label in seen:
-            continue
-        seen.add(label)
-        labels.append(label)
-    return labels
-
-
-def build_statement_locator(
-    *,
-    statement_type: str,
-    periods: list[dict[str, Any]],
-    rows: list[dict[str, Any]],
-    statement_title: Optional[str] = None,
-) -> dict[str, Any]:
-    """构建结构化报表定位信息。
-
-    该定位信息用于：
-    - 让 write 在"证据与出处"中稳定表达 `get_financial_statement` 来源；
-    - 让 confirm/repair 能以 statement + period + row 的粒度复核证据。
-
-    Args:
-        statement_type: 报表类型。
-        periods: 报表期间摘要列表。
-        rows: 报表行列表。
-        statement_title: 可选的人类可读报表标题；为空时按类型映射推断。
-
-    Returns:
-        结构化定位信息字典。
-
-    Raises:
-        无。
-    """
-
-    normalized_statement_type = statement_type.strip().lower()
-    resolved_title = statement_title or _STATEMENT_TITLE_BY_TYPE.get(normalized_statement_type) or statement_type
-    period_labels = [label for label in (_format_statement_period_label(period) for period in periods) if label]
-    row_labels = _extract_statement_row_labels(rows)
-    return {
-        "statement_type": statement_type,
-        "statement_title": resolved_title,
-        "period_labels": period_labels,
-        "row_labels": row_labels,
-    }
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", period_end) is None:
+        raise ValueError("period_end 必须为 YYYY-MM-DD")
+    return FinancialPeriod(
+        period_end=period_end,
+        fiscal_year=fiscal_year,
+        fiscal_period=fiscal_period,
+    )
 
 
 def _to_optional_float(value: Any) -> Optional[float]:
@@ -316,7 +222,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
         浮点数或 `None`。
 
     Raises:
-        ValueError: 转换失败时抛出。
+        无。
     """
 
     if value is None:
@@ -325,7 +231,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return None
     try:
         numeric = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return None
     if pd.isna(numeric):
         return None
@@ -354,9 +260,9 @@ def _normalize_query_statement_type(statement_type: Optional[str]) -> Optional[s
 
 
 def _build_xbrl_value_filter(
-    min_value: Optional[float],
-    max_value: Optional[float],
-) -> Callable[[float], bool] | tuple[float, float] | None:
+    min_value: int | float | None,
+    max_value: int | float | None,
+) -> Callable[[float], bool] | tuple[int | float, int | float] | None:
     """构建 edgartools `FactQuery.by_value` 所需过滤参数。
 
     Args:
@@ -399,8 +305,8 @@ def _build_xbrl_value_filter(
 
 def _apply_xbrl_value_filter(
     query_obj: Any,
-    min_value: Optional[float],
-    max_value: Optional[float],
+    min_value: int | float | None,
+    max_value: int | float | None,
 ) -> Any:
     """兼容不同 edgartools `by_value` 签名应用数值过滤。
 
@@ -437,10 +343,10 @@ def _query_facts_rows(
     statement_type: Optional[str],
     period_end: Optional[str],
     fiscal_year: Optional[int],
-    fiscal_period: Optional[str],
-    min_value: Optional[float],
-    max_value: Optional[float],
-) -> list[dict[str, Any]]:
+    fiscal_period: FiscalPeriod | None,
+    min_value: int | float | None,
+    max_value: int | float | None,
+) -> XbrlConceptQuerySummary:
     """执行 XBRL facts 查询。
 
     Args:
@@ -454,39 +360,51 @@ def _query_facts_rows(
         max_value: 可选最大值。
 
     Returns:
-        facts 原始行列表（仅含数值事实，且按 concept 本地名精确匹配）。
+        包含 rows、尝试 concept、成功 concept 与失败 concept 的执行汇总。
 
     Raises:
-        RuntimeError: 查询失败时抛出。
+        ValueError: concepts 规范化后为空时抛出。
+        XbrlQueryExecutionError: 所有已尝试 concept 均执行失败时抛出。
     """
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, JsonValue]] = []
     seen_keys: set[str] = set()
-    normalized_period_end = _normalize_optional_string(period_end)
-    normalized_fiscal_period = _normalize_optional_string(fiscal_period)
+    attempted_concepts: list[str] = []
+    successful_concepts: list[str] = []
+    failed_concepts: list[str] = []
+    last_failure: Exception | None = None
+    normalized_period_end = normalize_optional_dataframe_string(period_end)
     for concept in concepts:
         target_local_name = _extract_concept_local_name(concept)
         if not target_local_name:
             continue
-        query_obj = xbrl.query().by_concept(concept)
-        if statement_type:
-            query_obj = query_obj.by_statement_type(statement_type)
-        if fiscal_year is not None:
-            query_obj = query_obj.by_fiscal_year(fiscal_year)
-        if normalized_fiscal_period:
-            query_obj = query_obj.by_fiscal_period(normalized_fiscal_period.upper())
-        query_obj = _apply_xbrl_value_filter(
-            query_obj,
-            min_value=min_value,
-            max_value=max_value,
-        )
+        concept_identity = target_local_name[:_XBRL_CONCEPT_IDENTITY_MAX_CHARS]
+        attempted_concepts.append(concept_identity)
         try:
+            query_obj = xbrl.query().by_concept(concept)
+            if statement_type:
+                query_obj = query_obj.by_statement_type(statement_type)
+            if fiscal_year is not None:
+                query_obj = query_obj.by_fiscal_year(fiscal_year)
+            if fiscal_period is not None:
+                query_obj = query_obj.by_fiscal_period(fiscal_period)
+            query_obj = _apply_xbrl_value_filter(
+                query_obj,
+                min_value=min_value,
+                max_value=max_value,
+            )
             result_rows = query_obj.execute()
-        except Exception:
+            if not isinstance(result_rows, list) or any(
+                not isinstance(result_row, Mapping) for result_row in result_rows
+            ):
+                raise TypeError("edgartools FactQuery.execute 返回了非法 rows shape")
+        except Exception as exc:
+            failed_concepts.append(concept_identity)
+            last_failure = exc
             continue
-        for row in result_rows:
-            if not isinstance(row, dict):
-                continue
+        successful_concepts.append(concept_identity)
+        for raw_row in result_rows:
+            row: dict[str, JsonValue] = dict(raw_row)
             row_concept = str(row.get("concept") or "")
             if not _matches_concept_exact_local_name(row_concept, target_local_name):
                 continue
@@ -503,10 +421,22 @@ def _query_facts_rows(
                 continue
             seen_keys.add(dedup_key)
             rows.append(row)
-    return rows
+    if not attempted_concepts:
+        raise ValueError("XBRL concepts 规范化后不能为空")
+    if not successful_concepts:
+        error = XbrlQueryExecutionError(tuple(failed_concepts))
+        if last_failure is not None:
+            raise error from last_failure
+        raise error
+    return XbrlConceptQuerySummary(
+        rows=rows,
+        attempted_concepts=tuple(attempted_concepts),
+        successful_concepts=tuple(successful_concepts),
+        failed_concepts=tuple(failed_concepts),
+    )
 
 
-def _build_fact_dedup_key(row: dict[str, Any]) -> str:
+def _build_fact_dedup_key(row: Mapping[str, JsonValue]) -> str:
     """构建 fact 去重键。
 
     Args:
@@ -528,7 +458,7 @@ def _build_fact_dedup_key(row: dict[str, Any]) -> str:
     return "|".join(parts)
 
 
-def _normalize_fact_row(row: dict[str, Any]) -> dict[str, Any]:
+def _normalize_fact_row(row: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
     """标准化单条 fact 输出。
 
     Args:
@@ -654,7 +584,7 @@ def _is_text_block_concept(concept: str) -> bool:
     return local_name.lower().endswith("textblock")
 
 
-def _extract_numeric_fact_value(row: dict[str, Any]) -> Optional[float]:
+def _extract_numeric_fact_value(row: Mapping[str, JsonValue]) -> Optional[float]:
     """提取 fact 的可用数值。
 
     Args:
@@ -747,7 +677,7 @@ def _infer_currency_from_units(units: Optional[str]) -> Optional[str]:
     return None
 
 
-def _infer_scale_from_xbrl_query(xbrl: XBRL) -> Optional[str]:
+def _infer_scale_from_xbrl_query(xbrl: XBRL) -> FinancialScaleOutcome:
     """从 XBRL Revenue facts 的 decimals 属性推断数值 scale。
 
     依次尝试 ``_REVENUE_CONCEPT_CANDIDATES``，取首条命中 fact 的 ``decimals``
@@ -758,41 +688,84 @@ def _infer_scale_from_xbrl_query(xbrl: XBRL) -> Optional[str]:
         xbrl: XBRL 对象。
 
     Returns:
-        scale 描述字符串或 ``None``。
+        倍率与 probe 是否发生执行失败的强类型结果。
 
     Raises:
         无。
     """
 
+    query_failed = False
+    for concept in _REVENUE_CONCEPT_CANDIDATES:
+        try:
+            rows = xbrl.query().by_concept(concept).execute()
+        except Exception:
+            query_failed = True
+            continue
+        if not isinstance(rows, list):
+            query_failed = True
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                query_failed = True
+                continue
+            raw_decimals = row.get("decimals")
+            scale = infer_financial_scale_from_decimals(raw_decimals)
+            if scale is not None:
+                return FinancialScaleOutcome(scale=scale, query_failed=query_failed)
+    return FinancialScaleOutcome(scale=None, query_failed=query_failed)
+
+
+def _infer_period_semantics_from_xbrl_query(
+    xbrl: XBRL,
+    period_ends: list[str],
+) -> dict[str, tuple[int, FiscalPeriod]]:
+    """从 XBRL fact 的 fiscal 字段读取 statement period 直接证据。
+
+    Args:
+        xbrl: XBRL 对象。
+        period_ends: 报表数据列对应的期末日期。
+
+    Returns:
+        ``period_end -> (fiscal_year, fiscal_period)`` 映射；没有完整直接证据的
+        期间不会出现在结果中。
+
+    Raises:
+        无；辅助 probe 失败由缺失证据触发财务质量降级。
+    """
+
+    requested_periods = set(period_ends)
+    evidence: dict[str, tuple[int, FiscalPeriod]] = {}
     for concept in _REVENUE_CONCEPT_CANDIDATES:
         try:
             rows = xbrl.query().by_concept(concept).execute()
         except Exception:
             continue
+        if not isinstance(rows, list):
+            continue
         for row in rows:
-            if not isinstance(row, dict):
+            if not isinstance(row, Mapping):
                 continue
-            raw_decimals = row.get("decimals")
-            if raw_decimals is None:
+            period_end = row.get("period_end")
+            fiscal_year = row.get("fiscal_year")
+            fiscal_period_raw = row.get("fiscal_period")
+            if (
+                not isinstance(period_end, str)
+                or period_end not in requested_periods
+                or not isinstance(fiscal_year, int)
+                or isinstance(fiscal_year, bool)
+                or fiscal_year <= 0
+                or not isinstance(fiscal_period_raw, str)
+            ):
                 continue
-            # 解析 decimals 值
-            if isinstance(raw_decimals, str):
-                stripped = raw_decimals.strip().upper()
-                if stripped == "INF":
-                    return "units"
-                try:
-                    decimals_int = int(stripped)
-                except ValueError:
-                    continue
-            else:
-                try:
-                    decimals_int = int(raw_decimals)
-                except (TypeError, ValueError):
-                    continue
-            # 查映射表
-            exact = _DECIMALS_SCALE_MAP.get(decimals_int)
-            if exact is not None:
-                return exact
-            if decimals_int > 0:
-                return "units"
-    return None
+            try:
+                fiscal_period = normalize_fiscal_period(
+                    fiscal_period_raw,
+                    field_name="XBRL fact fiscal_period",
+                )
+            except ValueError:
+                continue
+            if fiscal_period is not None:
+                evidence[period_end] = (fiscal_year, fiscal_period)
+        if requested_periods.issubset(evidence):
+            break
+    return evidence

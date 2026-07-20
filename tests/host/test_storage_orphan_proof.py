@@ -186,7 +186,7 @@ def test_descriptor_with_durable_event_reference_keeps_artifact_referenced(
                     run_id="run-1",
                     attempt_id=None,
                     execution_id=None,
-                    event_type="host.payload.accepted",
+                    event_type="USER_INPUT_ACCEPTED",
                     occurred_at=_NOW,
                     actor="host",
                     source="pytest",

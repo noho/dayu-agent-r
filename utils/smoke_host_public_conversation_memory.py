@@ -17,7 +17,7 @@ import os
 import pathlib
 import sys
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import floor
 from typing import Final
 from uuid import uuid4
@@ -609,7 +609,8 @@ def _discover_smoke_service_tools(
         raise ValueError(f"discovered tool bundle already contains non-smoke tool: {_TOOL_NAME}")
 
     smoke_result = _discover_builtin_smoke_tools()
-    return ServiceDiscoveredTools(
+    return replace(
+        discovered,
         tool_bundle=ToolBundle(
             definitions=(
                 *discovered.tool_bundle.definitions,
@@ -632,8 +633,6 @@ def _discover_smoke_service_tools(
                 for report in smoke_result.provider_reports
             ),
         ),
-        effective_provider_configs=discovered.effective_provider_configs,
-        fins_awaiting_runtime=discovered.fins_awaiting_runtime,
     )
 
 

@@ -2,9 +2,7 @@
 
 该模块包含 FinsReadRuntime 所用的非搜索辅助逻辑：
 - 文本标准化（必填/可选/form_type）
-- 推荐文档构建
 - 章节标准化（children / page_range）
-- 财务日期推断（fiscal_year / fiscal_period）
 - 表格数据载荷标准化（records / markdown / raw_text）
 - XBRL 查询与 fact 标准化（concept 归一化 / 去重 / scale 推断）
 """
@@ -15,7 +13,7 @@ import json
 import re
 from collections.abc import Mapping
 from html import unescape
-from typing import Any, NoReturn, Optional, cast
+from typing import Any, NoReturn, Optional, Protocol, cast, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -25,9 +23,19 @@ from dayu.documents.processors.base import (
     SectionSummary,
     TableContent,
 )
-from .result_types import NotSupportedResult
+from dayu.fins.domain.xbrl_result_contract import (
+    XbrlFactsPayload,
+    validate_xbrl_facts_result_payload,
+)
+from dayu.fins.domain.financial_result_contract import infer_financial_scale_from_decimals
+from .result_types import (
+    NotSupportedResult,
+    PublicXbrlQueryResult,
+    project_xbrl_query_result,
+)
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.processors.form_type_utils import normalize_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
+from .error_contract import ErrorCode
 
 # ---------------------------------------------------------------------------
 # 预编译正则
@@ -84,22 +92,6 @@ _DEFAULT_XBRL_CONCEPTS_BY_TAXONOMY: dict[str, tuple[str, ...]] = {
 }
 
 # ---------------------------------------------------------------------------
-# 推荐文档槽位常量
-# ---------------------------------------------------------------------------
-_RECOMMENDED_DOCUMENT_KEYS: tuple[str, ...] = (
-    "latest_document_id",
-    "recommended_for_company_overview_document_id",
-    "latest_annual_report_document_id",
-    "latest_quarterly_report_document_id",
-    "latest_current_report_document_id",
-    "latest_proxy_document_id",
-    "latest_ownership_document_id",
-    "latest_earnings_call_document_id",
-    "latest_earnings_presentation_document_id",
-    "latest_material_document_id",
-)
-
-# ---------------------------------------------------------------------------
 # form_type → document_type 映射
 #
 # document_type 是面向 LLM 的语义字段，屏蔽底层 SEC 表单细节。
@@ -136,31 +128,22 @@ _CN_FORM_TYPE_TO_DOCUMENT_TYPE: dict[str, str] = {
     "Q4": "quarterly_report",
 }
 
-# 缺失 report_date / filing_date 时，按 fiscal_period 做时间顺序回退。
-# 数字越大表示同一年内越“新”。
-_FISCAL_PERIOD_SORT_ORDER: dict[str, int] = {
-    "Q1": 1,
-    "Q2": 2,
-    "H1": 3,
-    "Q3": 4,
-    "Q4": 5,
-    "FY": 6,
-}
-
 # LLM 可传入的合法 document_type 值集合（含预留值）
-_VALID_DOCUMENT_TYPES: frozenset[str] = frozenset({
-    "annual_report",
-    "semi_annual_report",
-    "quarterly_report",
-    "current_report",
-    "proxy",
-    "ownership",
-    "earnings_call",
-    "earnings_presentation",
-    "corporate_governance",
-    "material",
-    "other",
-})
+_VALID_DOCUMENT_TYPES: frozenset[str] = frozenset(
+    {
+        "annual_report",
+        "semi_annual_report",
+        "quarterly_report",
+        "current_report",
+        "proxy",
+        "ownership",
+        "earnings_call",
+        "earnings_presentation",
+        "corporate_governance",
+        "material",
+        "other",
+    }
+)
 
 # material form_type → document_type 精细映射表
 # 未列出的 form_type 回落到通用 "material"
@@ -245,7 +228,7 @@ class FinsReadBusinessError(Exception):
         无。
     """
 
-    def __init__(self, code: str, message: str, *, hint: str = "") -> None:
+    def __init__(self, code: ErrorCode, message: str, *, hint: str = "") -> None:
         """初始化 Fins 业务失败。
 
         Args:
@@ -334,7 +317,7 @@ def raise_fins_cancelled(cancellation_token: CancellationToken, *, message: str)
     del cancellation_token
     raise FinsReadCancelledError(
         message=message,
-        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+        hint="当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。",
     )
 
 
@@ -366,49 +349,7 @@ def _resolve_document_type(form_type: Optional[str], source_kind: str) -> str:
     return _FORM_TYPE_TO_DOCUMENT_TYPE.get(form_type, "other")
 
 
-def build_document_recency_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
-    """构建文档摘要的统一排序键。
-
-    排序目标：
-    1. 优先按显式日期排序（`report_date` > `filing_date`）。
-    2. 日期缺失时，回退到 `fiscal_year + fiscal_period`。
-    3. 若两者都缺失，再回退到 `document_id`，仅用于稳定排序。
-
-    Args:
-        item: 文档摘要字典。
-
-    Returns:
-        可直接用于 ``list.sort(..., reverse=True)`` 的排序键。
-
-    Raises:
-        无。
-    """
-
-    report_date = normalize_optional_text(item.get("report_date")) or ""
-    filing_date = normalize_optional_text(item.get("filing_date")) or ""
-    has_explicit_date = bool(report_date or filing_date)
-
-    fiscal_year = item.get("fiscal_year")
-    normalized_fiscal_year = fiscal_year if isinstance(fiscal_year, int) else -1
-    normalized_fiscal_period = normalize_optional_text(item.get("fiscal_period"))
-    fiscal_period_rank = _FISCAL_PERIOD_SORT_ORDER.get(normalized_fiscal_period or "", 0)
-    has_fiscal_recency = normalized_fiscal_year > 0 or fiscal_period_rank > 0
-    temporal_rank = 2 if has_explicit_date else 1 if has_fiscal_recency else 0
-
-    primary_date = report_date or filing_date
-    secondary_date = filing_date or report_date
-    document_id = normalize_optional_text(item.get("document_id")) or ""
-    return (
-        temporal_rank,
-        primary_date,
-        secondary_date,
-        normalized_fiscal_year,
-        fiscal_period_rank,
-        document_id,
-    )
-
-
-def resolve_document_type_for_source(*, form_type: Any, source_kind: Any) -> str:
+def resolve_document_type_for_source(*, form_type: JsonValue | None, source_kind: JsonValue | None) -> str:
     """根据原始源文档元数据推导稳定 document_type。
 
     该函数统一封装工具链路的 document_type 推导逻辑：
@@ -427,37 +368,26 @@ def resolve_document_type_for_source(*, form_type: Any, source_kind: Any) -> str
     """
 
     normalized_form_type = _normalize_form_type_for_matching(form_type)
-    normalized_source_kind = normalize_optional_text(source_kind) or ""
+    normalized_source_kind = _normalize_json_scalar_text(source_kind) or ""
     return _resolve_document_type(normalized_form_type, normalized_source_kind)
 
 
-def _collect_available_document_types(documents: list[dict[str, Any]]) -> list[str]:
-    """提取文档列表中出现的所有 document_type（去重、排序）。
-
-    对尚未附加 document_type 字段的原始文档（base_documents）也适用，
-    按需从 form_type / source_kind 实时推导。
+def _normalize_json_scalar_text(value: JsonValue | None) -> Optional[str]:
+    """把 JSON 标量值标准化为可选文本。
 
     Args:
-        documents: 文档摘要列表（来自仓储的原始条目）。
+        value: JSON 字段值。
 
     Returns:
-        去重后的 document_type 列表（字母序）。
+        标准化文本；数组或对象等非标量返回 ``None``。
 
     Raises:
-        无。
+        RuntimeError: 标准化失败时抛出。
     """
 
-    doc_types: set[str] = set()
-    for doc in documents:
-        # 若已附加 document_type 字段则直接取；否则实时推导
-        dt = doc.get("document_type")
-        if dt is None:
-            dt = resolve_document_type_for_source(
-                form_type=doc.get("form_type"),
-                source_kind=doc.get("source_kind"),
-            )
-        doc_types.add(dt)
-    return sorted(doc_types)
+    if isinstance(value, list) or isinstance(value, Mapping):
+        return None
+    return normalize_optional_text(value)
 
 
 def _collect_parent_titles(
@@ -510,7 +440,7 @@ def _normalize_form_type_for_matching(value: Any) -> Optional[str]:
     normalized = normalize_optional_text(value)
     if normalized is None:
         return None
-    normalized_form = normalize_form_type(normalized)
+    normalized_form = normalize_sec_form_type_for_matching(normalized)
     normalized_text = normalize_optional_text(normalized_form)
     if normalized_text is None:
         return None
@@ -547,63 +477,6 @@ def _normalize_document_types(document_types: Optional[list[str]]) -> Optional[l
             seen.add(normalized)
             result.append(normalized)
     return result or None
-
-
-def _build_recommended_documents(documents: list[dict[str, Any]]) -> dict[str, Optional[str]]:
-    """构建 `list_documents.recommended_documents` 固定槽位。
-
-    Args:
-        documents: 已按时间倒序的全量文档列表（附带 `document_type`）。
-
-    Returns:
-        推荐文档槽位字典。
-
-    Raises:
-        RuntimeError: 构建失败时抛出。
-    """
-
-    recommendations: dict[str, Optional[str]] = {key: None for key in _RECOMMENDED_DOCUMENT_KEYS}
-    if not documents:
-        return recommendations
-
-    for item in documents:
-        document_id = normalize_optional_text(item.get("document_id"))
-        if document_id is None:
-            continue
-        # document_type 由调用方在过滤循环中已附加
-        doc_type = item.get("document_type") or ""
-
-        if recommendations["latest_document_id"] is None:
-            recommendations["latest_document_id"] = document_id
-        if recommendations["latest_annual_report_document_id"] is None and doc_type == "annual_report":
-            recommendations["latest_annual_report_document_id"] = document_id
-        if recommendations["latest_quarterly_report_document_id"] is None and doc_type in {"quarterly_report", "semi_annual_report"}:
-            recommendations["latest_quarterly_report_document_id"] = document_id
-        if recommendations["latest_current_report_document_id"] is None and doc_type == "current_report":
-            recommendations["latest_current_report_document_id"] = document_id
-        if recommendations["latest_proxy_document_id"] is None and doc_type == "proxy":
-            recommendations["latest_proxy_document_id"] = document_id
-        if recommendations["latest_ownership_document_id"] is None and doc_type == "ownership":
-            recommendations["latest_ownership_document_id"] = document_id
-        if recommendations["latest_earnings_call_document_id"] is None and doc_type == "earnings_call":
-            recommendations["latest_earnings_call_document_id"] = document_id
-        if (
-            recommendations["latest_earnings_presentation_document_id"] is None
-            and doc_type == "earnings_presentation"
-        ):
-            recommendations["latest_earnings_presentation_document_id"] = document_id
-        if recommendations["latest_material_document_id"] is None and doc_type == "material":
-            recommendations["latest_material_document_id"] = document_id
-
-    recommendations["recommended_for_company_overview_document_id"] = (
-        recommendations["latest_annual_report_document_id"]
-        or recommendations["latest_quarterly_report_document_id"]
-        or recommendations["latest_proxy_document_id"]
-        or recommendations["latest_current_report_document_id"]
-        or recommendations["latest_ownership_document_id"]
-        or recommendations["latest_document_id"]
-    )
-    return recommendations
 
 
 def resolve_has_financial_data(
@@ -671,7 +544,7 @@ def build_search_next_section_fields(
     *,
     matches: list[dict[str, Any]],
     queries: Optional[list[str]] = None,
- ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Optional[dict[str, Any]]]]]:
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Optional[dict[str, Any]]]]]:
     """基于搜索命中构建下一步阅读章节字段。
 
     Args:
@@ -745,10 +618,7 @@ def build_search_next_section_fields(
     )
 
     if queries is None:
-        next_section_to_read = (
-            _strip_search_section_internal_fields(ranked_sections[0])
-            if ranked_sections else None
-        )
+        next_section_to_read = _strip_search_section_internal_fields(ranked_sections[0]) if ranked_sections else None
         return next_section_to_read, None
 
     next_section_by_query: dict[str, Optional[dict[str, Any]]] = {}
@@ -795,6 +665,7 @@ def _strip_search_section_internal_fields(section_stat: dict[str, Any]) -> dict[
 # =====================================================================
 # 章节标准化
 # =====================================================================
+
 
 def _normalize_section_children(raw_children: Any) -> list[dict[str, Any]]:
     """标准化 `read_section.children` 字段。
@@ -915,130 +786,6 @@ def _extract_page_range(section: SectionSummary | SectionContent | Mapping[str, 
     return None
 
 
-# =====================================================================
-# 财务日期推断
-# =====================================================================
-
-def _infer_fiscal_period(meta: dict[str, Any]) -> Optional[str]:
-    """推断财期。
-
-    Args:
-        meta: 文档元数据。
-
-    Returns:
-        财期字符串或 `None`。
-
-    Raises:
-        RuntimeError: 推断失败时抛出。
-    """
-
-    raw_period = normalize_optional_text(meta.get("fiscal_period"))
-    if raw_period is not None:
-        return raw_period
-
-    form_type = normalize_optional_text(meta.get("form_type"))
-    if form_type in {"10-K", "20-F"}:
-        return "FY"
-    return None
-
-
-def _resolve_fiscal_year_with_fallback(raw_value: Any, inferred_year: Optional[int]) -> Optional[int]:
-    """解析 fiscal_year，空值时回退到推断值。
-
-    Args:
-        raw_value: 源 meta 中的 fiscal_year 原始值。
-        inferred_year: 由 `report_date` 等信息推断出的 fiscal_year。
-
-    Returns:
-        可用 fiscal_year；当原始值为空或非法时返回 `inferred_year`。
-
-    Raises:
-        RuntimeError: 解析失败时抛出。
-    """
-
-    if isinstance(raw_value, bool):
-        return inferred_year
-    if isinstance(raw_value, int):
-        return raw_value if raw_value > 0 else inferred_year
-    text = normalize_optional_text(raw_value)
-    if text is None:
-        return inferred_year
-    try:
-        parsed = int(text)
-    except ValueError:
-        return inferred_year
-    if parsed <= 0:
-        return inferred_year
-    return parsed
-
-
-def _resolve_fiscal_period_with_fallback(raw_value: Any, inferred_period: Optional[str]) -> Optional[str]:
-    """解析 fiscal_period，空值时回退到推断值。
-
-    Args:
-        raw_value: 源 meta 中的 fiscal_period 原始值。
-        inferred_period: 推断出的 fiscal_period。
-
-    Returns:
-        可用 fiscal_period；原始值为空时返回 `inferred_period`。
-
-    Raises:
-        RuntimeError: 解析失败时抛出。
-    """
-
-    normalized = normalize_optional_text(raw_value)
-    if normalized is not None:
-        return normalized
-    return inferred_period
-
-
-def _infer_fiscal_year(meta: dict[str, Any], fiscal_period: Optional[str]) -> Optional[int]:
-    """推断财年。
-
-    Args:
-        meta: 文档元数据。
-        fiscal_period: 已推断财期。
-
-    Returns:
-        财年或 `None`。
-
-    Raises:
-        RuntimeError: 推断失败时抛出。
-    """
-
-    raw_year = meta.get("fiscal_year")
-    if isinstance(raw_year, int):
-        return raw_year
-
-    del fiscal_period
-    return None
-
-
-def _extract_year(iso_date: str) -> Optional[int]:
-    """从 ISO 日期提取年份。
-
-    Args:
-        iso_date: ISO 日期字符串。
-
-    Returns:
-        年份整数；无法提取时返回 `None`。
-
-    Raises:
-        RuntimeError: 提取失败时抛出。
-    """
-
-    parts = iso_date.split("-")
-    if len(parts) < 2:
-        return None
-    try:
-        year = int(parts[0])
-    except ValueError:
-        return None
-    if year <= 0:
-        return None
-    return year
-
-
 def _to_optional_float(value: Any) -> Optional[float]:
     """将任意值转换为可选浮点数。
 
@@ -1068,6 +815,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
 # =====================================================================
 # 表格标准化
 # =====================================================================
+
 
 def _build_table_data_payload(table_raw: TableContent | Mapping[str, Any]) -> dict[str, Any]:
     """构建 `get_table.data` 的自解释结构。
@@ -1297,7 +1045,32 @@ def _normalize_table_type(raw_table_type: Any) -> Optional[str]:
 # XBRL 辅助
 # =====================================================================
 
-def _resolve_processor_taxonomy(processor: Any) -> Optional[str]:
+
+@runtime_checkable
+class XbrlTaxonomyProcessor(Protocol):
+    """XBRL taxonomy 读取能力协议。
+
+    该协议是 read runtime 判断 processor taxonomy 能力的唯一 typed boundary，
+    避免调用方通过字符串属性名探测能力。
+    """
+
+    def get_xbrl_taxonomy(self) -> Optional[str]:
+        """读取 processor 识别出的 XBRL taxonomy。
+
+        Args:
+            无。
+
+        Returns:
+            原始 taxonomy 名称；无法识别时返回 ``None``。
+
+        Raises:
+            RuntimeError: 底层 XBRL 读取失败时可能抛出。
+        """
+
+        ...
+
+
+def _resolve_processor_taxonomy(processor: object) -> Optional[str]:
     """从处理器中读取 XBRL taxonomy。
 
     Args:
@@ -1310,14 +1083,9 @@ def _resolve_processor_taxonomy(processor: Any) -> Optional[str]:
         RuntimeError: 解析失败时抛出。
     """
 
-    taxonomy_method = getattr(processor, "get_xbrl_taxonomy", None)
-    if callable(taxonomy_method):
-        try:
-            return _normalize_taxonomy_name(taxonomy_method())
-        except Exception:
-            return None
-    raw_taxonomy = getattr(processor, "xbrl_taxonomy", None)
-    return _normalize_taxonomy_name(raw_taxonomy)
+    if not isinstance(processor, XbrlTaxonomyProcessor):
+        return None
+    return _normalize_taxonomy_name(processor.get_xbrl_taxonomy())
 
 
 def _normalize_taxonomy_name(taxonomy: Any) -> Optional[str]:
@@ -1373,73 +1141,54 @@ def _resolve_default_xbrl_concepts(*, form_type: Optional[str], taxonomy: Option
 
 def _normalize_xbrl_query_payload(
     *,
-    payload: Mapping[str, Any] | dict[str, Any],
-    default_concepts: list[str],
-) -> dict[str, Any]:
-    """标准化 `query_xbrl_facts` 的输出载荷。
+    ticker: str,
+    document_id: str,
+    citation: Mapping[str, JsonValue],
+    payload: XbrlFactsPayload,
+) -> PublicXbrlQueryResult:
+    """校验、复制、标准化并投影 XBRL 查询结果。
 
     Args:
+        ticker: 当前 borrowed snapshot 对应的公司代码。
+        document_id: 当前 borrowed snapshot 对应的文档 ID。
+        citation: 当前 borrowed snapshot 产生的来源引用。
         payload: 处理器返回载荷。
-        default_concepts: 本次查询实际使用的概念列表。
 
     Returns:
-        结构稳定、已去重且文本已清洗的载荷。
+        结构稳定、已去重且文本已清洗的唯一公共投影。
 
     Raises:
-        RuntimeError: 标准化失败时抛出。
+        ValueError: producer 载荷违反领域契约时抛出。
     """
 
-    query_params_raw = payload.get("query_params")
-    query_params = dict(query_params_raw) if isinstance(query_params_raw, Mapping) else {}
-    query_params["concepts"] = _normalize_concepts_for_query(query_params.get("concepts"), default_concepts)
+    validated = validate_xbrl_facts_result_payload(payload)
+    query_params = validated.query_params.copy()
+    raw_facts_copy = [dict(raw_fact) for raw_fact in validated.facts]
 
-    facts_raw = payload.get("facts")
-    if not isinstance(facts_raw, list):
-        facts_raw = []
-
-    normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]] = []
-    for index, raw_fact in enumerate(facts_raw):
-        if not isinstance(raw_fact, Mapping):
-            continue
+    normalized_pairs: list[
+        tuple[dict[str, JsonValue], dict[str, JsonValue], int]
+    ] = []
+    for index, raw_fact in enumerate(raw_facts_copy):
         normalized_fact = _normalize_single_fact(raw_fact)
         if normalized_fact is None:
             continue
-        normalized_pairs.append((normalized_fact, dict(raw_fact), index))
+        normalized_pairs.append((normalized_fact, raw_fact, index))
 
     deduped_facts = _deduplicate_xbrl_facts(normalized_pairs)
-    normalized_payload = dict(payload)
-    normalized_payload["query_params"] = query_params
-    normalized_payload["facts"] = deduped_facts
-    normalized_payload["total"] = len(deduped_facts)
-    return normalized_payload
+    return project_xbrl_query_result(
+        ticker=ticker,
+        document_id=document_id,
+        citation=citation,
+        query_params=query_params,
+        returned_facts=deduped_facts,
+        data_quality=validated.data_quality,
+        optional_reason=validated.reason,
+    )
 
 
-def _normalize_concepts_for_query(raw_concepts: Any, default_concepts: list[str]) -> list[str]:
-    """标准化查询概念列表。
-
-    Args:
-        raw_concepts: 原始概念字段。
-        default_concepts: 默认概念列表。
-
-    Returns:
-        标准化后的概念列表（保证非空）。
-
-    Raises:
-        RuntimeError: 标准化失败时抛出。
-    """
-
-    if not isinstance(raw_concepts, list):
-        return list(default_concepts)
-    normalized: list[str] = []
-    for item in raw_concepts:
-        concept = normalize_optional_text(item)
-        if concept is None:
-            continue
-        normalized.append(concept)
-    return normalized or list(default_concepts)
-
-
-def _normalize_single_fact(raw_fact: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+def _normalize_single_fact(
+    raw_fact: Mapping[str, JsonValue],
+) -> Optional[dict[str, JsonValue]]:
     """标准化单条 fact。
 
     Args:
@@ -1479,7 +1228,11 @@ def _normalize_single_fact(raw_fact: Mapping[str, Any]) -> Optional[dict[str, An
     # 解析 decimals 并推断 scale
     raw_decimals = raw_fact.get("decimals")
     decimals = _parse_xbrl_decimals_value(raw_decimals)
-    scale = _infer_scale_from_decimals(decimals) if numeric_value is not None else None
+    scale = (
+        infer_financial_scale_from_decimals(raw_decimals)
+        if numeric_value is not None
+        else None
+    )
 
     return {
         "concept": concept,
@@ -1538,8 +1291,10 @@ def _looks_like_html_text(text: str) -> bool:
 
 
 def _deduplicate_xbrl_facts(
-    normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]]
-) -> list[dict[str, Any]]:
+    normalized_pairs: list[
+        tuple[dict[str, JsonValue], dict[str, JsonValue], int]
+    ],
+) -> list[dict[str, JsonValue]]:
     """按确定性策略去重 XBRL facts。
 
     去重键：`(canonical_concept, period_start, period_end, fiscal_year, dedup_fiscal_period, unit, segment_signature)`。
@@ -1558,7 +1313,7 @@ def _deduplicate_xbrl_facts(
 
     selected: dict[
         tuple[str, str, str, str, str, str, str],
-        tuple[dict[str, Any], int, tuple[int, int, int, int, int]],
+        tuple[dict[str, JsonValue], int, tuple[int, int, int, int, int]],
     ] = {}
     first_seen_index: dict[tuple[str, str, str, str, str, str, str], int] = {}
 
@@ -1704,7 +1459,7 @@ def _parse_xbrl_decimals(raw_decimals: Any) -> int:
         return -100000
 
 
-def _parse_xbrl_decimals_value(raw_decimals: Any) -> Optional[int]:
+def _parse_xbrl_decimals_value(raw_decimals: JsonValue) -> Optional[int]:
     """解析 XBRL decimals 为实际整数值。
 
     与 ``_parse_xbrl_decimals`` 不同，本函数返回原始语义值而非评分值。
@@ -1728,15 +1483,6 @@ def _parse_xbrl_decimals_value(raw_decimals: Any) -> Optional[int]:
         return int(str(raw_decimals).strip())
     except ValueError:
         return None
-
-
-# decimals → scale 映射表
-_DECIMALS_SCALE_MAP: dict[int, str] = {
-    -9: "billions",
-    -6: "millions",
-    -3: "thousands",
-    0: "units",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -1851,46 +1597,10 @@ def _build_search_hint(
             "下一步：直接读取最相关章节。"
         )
     # mixed
-    exact_count = sum(1 for m in matches if m.get("is_exact_phrase"))
     top_ref = _extract_top_section_ref(matches)
-    next_step = (
-        f"下一步：先调用 read_section(ref='{top_ref}')。"
-        if top_ref
-        else "下一步：先读取最相关命中的章节。"
-    )
+    next_step = f"下一步：先调用 read_section(ref='{top_ref}')。" if top_ref else "下一步：先读取最相关命中的章节。"
     return (
         f"目标：先读最相关的精确命中。允许动作：先读取前面的精确命中。"
         f"不允许：先枚举后面的低相关扩展命中。"
         f"{next_step} 只有在你必须枚举全部出现位置时再收窄查询。"
     )
-
-
-def _infer_scale_from_decimals(decimals: Optional[int]) -> Optional[str]:
-    """根据 XBRL decimals 推断数值 scale。
-
-    映射规则：
-    - ``-9`` → ``"billions"``
-    - ``-6`` → ``"millions"``
-    - ``-3`` → ``"thousands"``
-    - ``0`` 或正数 → ``"units"``
-    - ``None`` 或其他负数 → ``None``
-
-    Args:
-        decimals: 已解析的 decimals 值。
-
-    Returns:
-        scale 描述字符串或 ``None``。
-
-    Raises:
-        RuntimeError: 推断失败时抛出。
-    """
-
-    if decimals is None:
-        return None
-    exact = _DECIMALS_SCALE_MAP.get(decimals)
-    if exact is not None:
-        return exact
-    # 正数表示小数位数，即原始单位
-    if decimals > 0:
-        return "units"
-    return None

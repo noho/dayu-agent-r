@@ -8,7 +8,10 @@ endpoint 或外部系统协议，也不让 Engine 选择 adapter。
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
+from functools import partial
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -17,6 +20,7 @@ from uuid import uuid4
 
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import (
+    HOST_WAIT_RESUME_TOKEN_MAX_LENGTH,
     HostCallContext,
     ResolveWaitLostOutcome,
     ResolveWaitOutcome,
@@ -24,6 +28,15 @@ from dayu.host.api import (
     RunSnapshot,
     WaitAdapterKey,
     WaitResolutionSource,
+)
+from dayu.host._wait_observation import (
+    WaitObservationCapacityExceeded,
+    WaitObservationClosed,
+    WaitObservationDiagnosticsSnapshot,
+    WaitObservationFailed,
+    WaitObservationPublished,
+    WaitObservationRunner,
+    WaitObservationTimedOut,
 )
 from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.codec import sha256_digest_json
@@ -42,37 +55,32 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+from dayu.host.wait_boundary import (
+    WaitBoundaryDecisionKind,
+    classify_wait_time_boundary,
+)
+from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
 
 if TYPE_CHECKING:
     from dayu.host.waiting import ToolAwaitingAcceptedAck
 
 _LOGGER = logging.getLogger(__name__)
-_DEFAULT_CLAIM_BATCH_SIZE = 100
-"""单轮 poll 默认最多 claim 的 wait record 数。"""
-
-_POLL_CLAIM_TTL_SECONDS = 60.0
-"""单条 poll claim 默认有效秒数。"""
-
-_POLL_BACKOFF_INITIAL_DELAY_SECONDS = 30.0
-"""poll retry 初始退避秒数。"""
-
-_POLL_NOT_READY_OBSERVE_INTERVAL_SECONDS = 1.0
-"""外部 job 正常运行中时的下一次观察间隔秒数。"""
-
-_POLL_IDLE_INTERVAL_SECONDS = 5.0
-"""没有可 claim wait record 时的空闲轮询间隔秒数。"""
-
-_POLL_BACKOFF_MAX_DELAY_SECONDS = 300.0
-"""poll retry 最大退避秒数。"""
-
-_POLL_BACKOFF_MULTIPLIER = 2.0
-"""poll retry 指数退避倍率。"""
-
 _POLL_ERROR_CODE_ADAPTER_EXCEPTION = "adapter_exception"
 _POLL_ERROR_CODE_MISSING_ADAPTER = "missing_adapter"
 _POLL_ERROR_CODE_RESOLVE_EXCEPTION = "resolve_exception"
 _POLL_ERROR_CODE_ABANDON_EXCEPTION = "abandon_exception"
+_POLL_ERROR_CODE_ABANDON_TIMEOUT = "wait_abandon_timeout"
+_POLL_ERROR_CODE_OBSERVATION_TIMEOUT = "wait_observation_timeout"
+_POLL_ERROR_CODE_OBSERVATION_CAPACITY = "wait_observation_capacity"
 _POLL_ERROR_CODE_SHUTDOWN_SKIPPED = "shutdown_skipped"
+_POLL_ERROR_CODE_INVALID_TIME_BOUNDARY = "invalid_wait_time_boundary"
+_WAIT_POLLER_SELF_CLOSE_MESSAGE = (
+    "wait poller supervisor cannot close from its own thread"
+)
+
+
+class _WaitPollerSelfCloseError(RuntimeError):
+    """supervisor 线程内自关闭的内部控制流异常。"""
 
 
 class WaitExternalJobRefSource(StrEnum):
@@ -191,13 +199,47 @@ WaitPollResult: TypeAlias = WaitPollNotReady | WaitPollReady | WaitPollLost
 """poll adapter 单次观察结果封闭联合。"""
 
 
+class WaitAdapterSnapshotProjectionError(ValueError):
+    """Host wait row 投影为 adapter snapshot 失败。"""
+
+
+@dataclass(frozen=True, slots=True)
+class WaitAdapterSnapshot:
+    """投影给外部 wait adapter 的最小 Host snapshot。
+
+    :param tool_name: 等待所属工具名。
+    :param resume_token: Host durable row 中保存的 opaque resume token。
+    :param created_at: Host durable row 创建时间，已解析为 UTC aware datetime。
+    """
+
+    tool_name: str
+    resume_token: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        """校验 adapter snapshot 基础字段。
+
+        :returns: ``None``。
+        :raises ValueError: 字段为空、类型非法或时间无时区时抛出。
+        """
+
+        if self.tool_name.strip() == "":
+            raise ValueError("tool_name must be non-empty")
+        if self.resume_token.strip() == "":
+            raise ValueError("resume_token must be non-empty")
+        if len(self.resume_token) > HOST_WAIT_RESUME_TOKEN_MAX_LENGTH:
+            raise ValueError("resume_token is too long")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+
+
 class WaitPollAdapter(Protocol):
     """外部等待系统 poll adapter 端口。"""
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """在 Host transaction 外观察外部 job 状态。
 
-        :param wait_record: 当前 wait record 快照。
+        :param snapshot: Host 投影给 adapter 的最小快照。
         :returns: poll 结果。
         :raises Exception: adapter 可在外部系统调用失败时抛出普通异常。
         """
@@ -205,11 +247,11 @@ class WaitPollAdapter(Protocol):
         ...
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """在 wait 已取消时执行 best-effort 外部 job lifecycle 动作。
 
-        :param wait_record: 已取消 wait record 快照。
+        :param snapshot: Host 投影给 adapter 的最小快照。
         :returns: typed lifecycle 结果；applied、unsupported 与 no-op 都是终态诊断。
         :raises Exception: adapter 可在临时外部系统调用失败时抛出普通异常。
         """
@@ -273,6 +315,16 @@ class WaitResolvePort(Protocol):
 
         ...
 
+    def expire_wait(self, request: "ExpireWaitInput") -> "ExpireWaitResult":
+        """按 Host durable deadline 收口过期 wait。
+
+        :param request: expiry owner 输入。
+        :returns: expiry transition 结果。
+        :raises Exception: durable transition 或 wake 失败时透传。
+        """
+
+        ...
+
 
 class WaitPollClock(Protocol):
     """poller 使用的 UTC 时钟端口。"""
@@ -301,10 +353,15 @@ class WaitPollLifecycleGate(Protocol):
 class WaitPollerFactory(Protocol):
     """为 supervisor 创建 wait poller 的端口。"""
 
-    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> "WaitPoller":
+    def create_wait_poller(
+        self,
+        lifecycle_gate: WaitPollLifecycleGate,
+        observation_runner: WaitObservationRunner,
+    ) -> "WaitPoller":
         """创建绑定当前 lifecycle gate 的 wait poller。
 
         :param lifecycle_gate: supervisor close gate。
+        :param observation_runner: supervisor-owned bounded observation runner。
         :returns: wait poller。
         """
 
@@ -351,20 +408,24 @@ class WaitPollerRuntimePolicy:
         ``not_ready`` 后的下一次观察间隔秒数。
     :param idle_poll_interval_seconds: 单轮没有 claim 到任何 wait record 时的
         空闲轮询间隔秒数。
-    :param close_drain_timeout_seconds: close drain 首次诊断超时秒数；
-        ``None`` 表示不做首次超时诊断，直接等待 in-flight poll 收口。
+    :param adapter_call_timeout_seconds: 单次同步 adapter 调用的最大秒数。
+    :param close_drain_timeout_seconds: poller loop 与全部 observation thread
+        共享的单次 close 预算秒数。
+    :param max_outstanding_adapter_calls: live adapter invocation 正数上限。
     """
 
-    enabled: bool = True
-    poll_interval_seconds: float = 1.0
-    claim_ttl_seconds: float = _POLL_CLAIM_TTL_SECONDS
-    claim_batch_size: int = _DEFAULT_CLAIM_BATCH_SIZE
-    backoff_initial_delay_seconds: float = _POLL_BACKOFF_INITIAL_DELAY_SECONDS
-    backoff_multiplier: float = _POLL_BACKOFF_MULTIPLIER
-    backoff_max_delay_seconds: float = _POLL_BACKOFF_MAX_DELAY_SECONDS
-    not_ready_observe_interval_seconds: float = _POLL_NOT_READY_OBSERVE_INTERVAL_SECONDS
-    idle_poll_interval_seconds: float = _POLL_IDLE_INTERVAL_SECONDS
-    close_drain_timeout_seconds: float | None = 5.0
+    enabled: bool
+    poll_interval_seconds: float
+    claim_ttl_seconds: float
+    claim_batch_size: int
+    backoff_initial_delay_seconds: float
+    backoff_multiplier: float
+    backoff_max_delay_seconds: float
+    not_ready_observe_interval_seconds: float
+    idle_poll_interval_seconds: float
+    adapter_call_timeout_seconds: float
+    close_drain_timeout_seconds: float
+    max_outstanding_adapter_calls: int
 
     def __post_init__(self) -> None:
         """校验 runtime policy 字段。
@@ -379,6 +440,10 @@ class WaitPollerRuntimePolicy:
             self.poll_interval_seconds, field_name="poll_interval_seconds"
         )
         _require_positive_float(self.claim_ttl_seconds, field_name="claim_ttl_seconds")
+        if not isinstance(self.claim_batch_size, int) or isinstance(
+            self.claim_batch_size, bool
+        ):
+            raise TypeError("claim_batch_size must be int")
         if self.claim_batch_size <= 0:
             raise ValueError("claim_batch_size must be positive")
         _require_positive_float(
@@ -399,11 +464,20 @@ class WaitPollerRuntimePolicy:
             self.idle_poll_interval_seconds,
             field_name="idle_poll_interval_seconds",
         )
-        if self.close_drain_timeout_seconds is not None:
-            _require_positive_float(
-                self.close_drain_timeout_seconds,
-                field_name="close_drain_timeout_seconds",
-            )
+        _require_positive_float(
+            self.adapter_call_timeout_seconds,
+            field_name="adapter_call_timeout_seconds",
+        )
+        _require_positive_float(
+            self.close_drain_timeout_seconds,
+            field_name="close_drain_timeout_seconds",
+        )
+        if not isinstance(self.max_outstanding_adapter_calls, int) or isinstance(
+            self.max_outstanding_adapter_calls, bool
+        ):
+            raise TypeError("max_outstanding_adapter_calls must be int")
+        if self.max_outstanding_adapter_calls <= 0:
+            raise ValueError("max_outstanding_adapter_calls must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +490,7 @@ class WaitPollOnceResult:
     :param lost: 通过 ``resolve_wait`` 接收 lost 的数。
     :param abandoned: 因 wait 已取消而通知 adapter 放弃的数。
     :param adapter_errors: adapter 调用失败的数。
+    :param boundary_rejections: Host 在调用 adapter 前拒绝过期或非法边界的数。
     :param claim_conflicts: claim / release / abandon CAS 冲突数。
     :param shutdown_skipped: close gate 触发后跳过 resolve / abandon 的数。
     :param next_poll_delay_seconds: 本轮结束时已知下一次 due wait 的等待秒数；
@@ -428,6 +503,7 @@ class WaitPollOnceResult:
     lost: int
     abandoned: int
     adapter_errors: int
+    boundary_rejections: int = 0
     claim_conflicts: int = 0
     shutdown_skipped: int = 0
     next_poll_delay_seconds: float | None = None
@@ -454,13 +530,15 @@ class WaitPollerDiagnosticsSnapshot:
     :param resolved: 累计 resolved 数。
     :param lost: 累计 lost 数。
     :param abandoned: 累计 abandoned 数。
-    :param adapter_errors: 累计 adapter / resolve 错误数。
+    :param adapter_errors: 累计 adapter / resolve / abandon 错误数。
+    :param boundary_rejections: 累计 Host pre-adapter 边界拒绝数。
     :param claim_conflicts: 累计 claim CAS 冲突数。
     :param shutdown_skipped: 累计 close gate 跳过 resolve / abandon 数。
     :param close_drain_timeouts: close drain 首次超时诊断次数。
+    :param round_errors: 可恢复 poll round exception 次数。
     :param fatal_errors: loop-level fatal exception 次数。
-    :param last_error_type: 最近一次 loop-level fatal exception 类型。
-    :param last_error_message: 最近一次 loop-level fatal exception 消息。
+    :param last_error_type: 最近一次 loop-level exception 类型。
+    :param last_error_message: 最近一次 loop-level exception 消息。
     """
 
     status: WaitPollerLoopStatus
@@ -471,9 +549,11 @@ class WaitPollerDiagnosticsSnapshot:
     lost: int
     abandoned: int
     adapter_errors: int
+    boundary_rejections: int
     claim_conflicts: int
     shutdown_skipped: int
     close_drain_timeouts: int
+    round_errors: int
     fatal_errors: int
     last_error_type: str | None
     last_error_message: str | None
@@ -821,9 +901,10 @@ class WaitPoller:
         adapter_registry: WaitPollAdapterRegistry,
         resolver: WaitResolvePort,
         context: HostCallContext,
+        policy: WaitPollerRuntimePolicy,
         clock: WaitPollClock | None = None,
-        policy: WaitPollerRuntimePolicy | None = None,
         lifecycle_gate: WaitPollLifecycleGate | None = None,
+        observation_runner: WaitObservationRunner | None = None,
         owner_id: str | None = None,
     ) -> None:
         """初始化 poller。
@@ -832,9 +913,11 @@ class WaitPoller:
         :param adapter_registry: poll adapter registry。
         :param resolver: resolve_wait 端口。
         :param context: poller 调用上下文。
+        :param policy: 显式 poller runtime policy。
         :param clock: UTC 时钟；缺省使用系统 UTC 时间。
-        :param policy: poller runtime policy；缺省使用默认 policy。
         :param lifecycle_gate: close gate；缺省为永不关闭。
+        :param observation_runner: supervisor-owned bounded observation runner；
+            同步 ``poll_once`` 测试未提供时创建当前 poller 私有 runner。
         :param owner_id: poller owner id；缺省为当前实例生成随机 id。
         :returns: ``None``。
         :raises ValueError: owner id 为空时抛出。
@@ -843,15 +926,24 @@ class WaitPoller:
         resolved_owner_id = owner_id if owner_id is not None else _new_poller_owner_id()
         if resolved_owner_id.strip() == "":
             raise ValueError("owner_id must be non-empty")
-        resolved_policy = policy if policy is not None else WaitPollerRuntimePolicy()
         self._transaction_runner = transaction_runner
         self._adapter_registry = adapter_registry
         self._resolver = resolver
         self._context = context
         self._clock = clock if clock is not None else _SystemUtcClock()
-        self._policy = resolved_policy
+        self._policy = policy
         self._lifecycle_gate = (
             lifecycle_gate if lifecycle_gate is not None else _AlwaysOpenLifecycleGate()
+        )
+        self._observation_runner = (
+            observation_runner
+            if observation_runner is not None
+            else WaitObservationRunner(
+                max_outstanding_adapter_calls=(
+                    policy.max_outstanding_adapter_calls
+                ),
+                thread_name_prefix=f"dayu-wait-observation-{resolved_owner_id}",
+            )
         )
         self._owner_id = resolved_owner_id
 
@@ -886,6 +978,7 @@ class WaitPoller:
         lost = 0
         abandoned = 0
         adapter_errors = 0
+        boundary_rejections = 0
         shutdown_skipped = 0
         next_poll_delay_seconds: float | None = None
         for claimed in claimed_records:
@@ -903,6 +996,13 @@ class WaitPoller:
                 adapter_errors += adapter_error_delta
                 claim_conflicts += conflict_delta
                 shutdown_skipped += shutdown_delta
+                continue
+            boundary_release = self._handle_time_boundary(
+                record, claim_id
+            )
+            if boundary_release is not None:
+                boundary_rejections += 1
+                claim_conflicts += boundary_release
                 continue
             adapter = self._adapter_registry.resolve_adapter(record.adapter_key)
             if adapter is None:
@@ -922,8 +1022,23 @@ class WaitPoller:
                 )
                 continue
             try:
-                poll_result = adapter.poll_wait(record)
-            except Exception as exc:
+                adapter_snapshot = _adapter_snapshot_from_wait_record(record)
+            except WaitAdapterSnapshotProjectionError as exc:
+                adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ADAPTER_ERROR,
+                    error_code=_POLL_ERROR_CODE_ADAPTER_EXCEPTION,
+                    error_message=exc.__class__.__name__,
+                )
+                continue
+            observation = self._observation_runner.observe(
+                partial(adapter.poll_wait, adapter_snapshot),
+                timeout_seconds=self._policy.adapter_call_timeout_seconds,
+            )
+            if isinstance(observation, WaitObservationFailed):
+                exc = observation.error
                 _LOGGER.warning(
                     "wait adapter poll failed; continuing wait_id=%s "
                     "adapter_key=%s error_type=%s",
@@ -940,6 +1055,37 @@ class WaitPoller:
                     error_message=exc.__class__.__name__,
                 )
                 continue
+            if isinstance(observation, WaitObservationCapacityExceeded):
+                adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ADAPTER_ERROR,
+                    error_code=_POLL_ERROR_CODE_OBSERVATION_CAPACITY,
+                    error_message="adapter observation capacity is exhausted",
+                )
+                continue
+            if isinstance(observation, WaitObservationClosed):
+                shutdown_skipped += 1
+                claim_conflicts += self._release_shutdown_skipped(record, claim_id)
+                continue
+            if isinstance(observation, WaitObservationTimedOut):
+                if self._lifecycle_gate.is_closed():
+                    shutdown_skipped += 1
+                    claim_conflicts += self._release_shutdown_skipped(record, claim_id)
+                    continue
+                adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ADAPTER_ERROR,
+                    error_code=_POLL_ERROR_CODE_OBSERVATION_TIMEOUT,
+                    error_message="wait adapter observation exceeded Host time budget",
+                )
+                continue
+            if not isinstance(observation, WaitObservationPublished):
+                raise RuntimeError("wait observation result is invalid")
+            poll_result = observation.value
             poll_result_kind = _poll_result_kind(poll_result)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
@@ -998,6 +1144,7 @@ class WaitPoller:
             lost=lost,
             abandoned=abandoned,
             adapter_errors=adapter_errors,
+            boundary_rejections=boundary_rejections,
             claim_conflicts=claim_conflicts,
             shutdown_skipped=shutdown_skipped,
             next_poll_delay_seconds=self._next_poll_delay_seconds(
@@ -1011,7 +1158,7 @@ class WaitPoller:
                 VERBOSE_LOG_LEVEL,
                 "host.wait_poller.poll_once.done owner_id=%s observed=%s not_ready=%s "
                 "resolved=%s lost=%s abandoned=%s adapter_errors=%s "
-                "claim_conflicts=%s shutdown_skipped=%s",
+                "boundary_rejections=%s claim_conflicts=%s shutdown_skipped=%s",
                 self._owner_id,
                 result.observed,
                 result.not_ready,
@@ -1019,6 +1166,7 @@ class WaitPoller:
                 result.lost,
                 result.abandoned,
                 result.adapter_errors,
+                result.boundary_rejections,
                 result.claim_conflicts,
                 result.shutdown_skipped,
             )
@@ -1115,8 +1263,26 @@ class WaitPoller:
                 0,
             )
         try:
-            lifecycle_result = adapter.abandon_wait(record)
-        except Exception as exc:
+            adapter_snapshot = _adapter_snapshot_from_wait_record(record)
+        except WaitAdapterSnapshotProjectionError as exc:
+            return (
+                0,
+                1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                    error_code=_POLL_ERROR_CODE_ABANDON_EXCEPTION,
+                    error_message=exc.__class__.__name__,
+                ),
+                0,
+            )
+        observation = self._observation_runner.observe(
+            partial(adapter.abandon_wait, adapter_snapshot),
+            timeout_seconds=self._policy.adapter_call_timeout_seconds,
+        )
+        if isinstance(observation, WaitObservationFailed):
+            exc = observation.error
             _LOGGER.warning(
                 "wait adapter abandon failed; continuing wait_id=%s "
                 "adapter_key=%s error_type=%s",
@@ -1136,6 +1302,39 @@ class WaitPoller:
                 ),
                 0,
             )
+        if isinstance(observation, WaitObservationCapacityExceeded):
+            return (
+                0,
+                1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                    error_code=_POLL_ERROR_CODE_OBSERVATION_CAPACITY,
+                    error_message="adapter observation capacity is exhausted",
+                ),
+                0,
+            )
+        if isinstance(observation, WaitObservationClosed):
+            return 0, 0, self._release_shutdown_skipped(record, claim_id), 1
+        if isinstance(observation, WaitObservationTimedOut):
+            if self._lifecycle_gate.is_closed():
+                return 0, 0, self._release_shutdown_skipped(record, claim_id), 1
+            return (
+                0,
+                1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                    error_code=_POLL_ERROR_CODE_ABANDON_TIMEOUT,
+                    error_message="wait adapter abandon exceeded Host time budget",
+                ),
+                0,
+            )
+        if not isinstance(observation, WaitObservationPublished):
+            raise RuntimeError("wait abandon observation result is invalid")
+        lifecycle_result = observation.value
         last_outcome = _last_outcome_for_lifecycle_result(lifecycle_result)
         now = format_utc_timestamp(self._clock.now())
         status = self._transaction_runner.run_write(
@@ -1149,7 +1348,60 @@ class WaitPoller:
         )
         if status is StateMutationStatus.UPDATED:
             return 1, 0, 0, 0
-        return 0, 0, 1, 0
+        return 0, 0, self._release_with_backoff(
+            record,
+            claim_id,
+            outcome=WaitPollLastOutcome.ABANDON_ERROR,
+            error_code=_POLL_ERROR_CODE_ABANDON_EXCEPTION,
+            error_message=status.value,
+        ), 0
+
+    def _handle_time_boundary(
+        self, record: WaitRecordRow, claim_id: str
+    ) -> int | None:
+        """在 provider observation 前处理 expiry 或非法 boundary。
+
+        :param record: 已 claim 的 wait record。
+        :param claim_id: 当前 claim id。
+        :returns: 处理了边界错误时返回 CAS 冲突计数；边界仍 active 时返回
+            ``None``。
+        """
+
+        decision = classify_wait_time_boundary(record, observed_at=self._clock.now())
+        if decision.kind is WaitBoundaryDecisionKind.ACTIVE:
+            return None
+        if decision.kind is WaitBoundaryDecisionKind.EXPIRED:
+            result = self._resolver.expire_wait(
+                ExpireWaitInput(
+                    wait_id=record.wait_id,
+                    observed_at=self._clock.now(),
+                    actor=self._context.actor,
+                    source=WaitResolutionSource.POLL,
+                )
+            )
+            return (
+                0
+                if result.transition.status
+                in (StateMutationStatus.UPDATED, StateMutationStatus.CAS_LOST)
+                else 1
+            )
+        error_code = _POLL_ERROR_CODE_INVALID_TIME_BOUNDARY
+        error_message = decision.boundary_field
+        _LOGGER.warning(
+            "wait poll skipped by Host time boundary; wait_id=%s adapter_key=%s "
+            "boundary_status=%s boundary_field=%s",
+            record.wait_id,
+            record.adapter_key.value,
+            decision.kind.value,
+            decision.boundary_field,
+        )
+        return self._release_with_backoff(
+            record,
+            claim_id,
+            outcome=WaitPollLastOutcome.BOUNDARY_REJECTED,
+            error_code=error_code,
+            error_message=error_message,
+        )
 
     def _resolve_claimed_wait(
         self, record: WaitRecordRow, poll_result: WaitPollReady | WaitPollLost
@@ -1179,9 +1431,19 @@ class WaitPoller:
                 record.adapter_key.value,
                 exc.__class__.__name__,
             )
-            latest = self._transaction_runner.run_read(
-                _ReadWaitRecordOperation(record.wait_id)
-            )
+            try:
+                latest = self._transaction_runner.run_read(
+                    _ReadWaitRecordOperation(record.wait_id)
+                )
+            except Exception as read_exc:
+                _LOGGER.warning(
+                    "wait poll resolve recovery read failed; continuing wait_id=%s "
+                    "adapter_key=%s error_type=%s",
+                    record.wait_id,
+                    record.adapter_key.value,
+                    read_exc.__class__.__name__,
+                )
+                return StateMutationStatus.INVALID_STATE
             if latest is not None and latest.status in (
                 WaitRecordStatus.RESOLVED,
                 WaitRecordStatus.FAILED,
@@ -1298,14 +1560,14 @@ class WaitPollerSupervisor:
         self,
         *,
         poller_factory: WaitPollerFactory,
-        policy: WaitPollerRuntimePolicy | None = None,
+        policy: WaitPollerRuntimePolicy,
         owner_id: str | None = None,
     ) -> None:
         """初始化 supervisor。
 
         :param poller_factory: 创建 poller 的 factory；后台线程必须由 factory
             提供线程内可用的 durable runner。
-        :param policy: runtime policy；缺省使用默认 policy。
+        :param policy: 显式 runtime policy。
         :param owner_id: poller owner id；缺省生成随机 id。
         :returns: ``None``。
         :raises ValueError: owner id 为空时抛出。
@@ -1314,7 +1576,7 @@ class WaitPollerSupervisor:
         resolved_owner_id = owner_id if owner_id is not None else _new_poller_owner_id()
         if resolved_owner_id.strip() == "":
             raise ValueError("owner_id must be non-empty")
-        self._policy = policy if policy is not None else WaitPollerRuntimePolicy()
+        self._policy = policy
         self._owner_id = resolved_owner_id
         self._poller_factory = poller_factory
         self._close_event = threading.Event()
@@ -1323,6 +1585,13 @@ class WaitPollerSupervisor:
         self._thread: threading.Thread | None = None
         self._opened = False
         self._diagnostics = _initial_diagnostics()
+        self._observation_runner = WaitObservationRunner(
+            max_outstanding_adapter_calls=(
+                self._policy.max_outstanding_adapter_calls
+            ),
+            thread_name_prefix=f"dayu-wait-observation-{self._owner_id}",
+            on_drained=self._on_observations_drained,
+        )
 
     def open(self) -> None:
         """启动 background poll loop。
@@ -1360,60 +1629,66 @@ class WaitPollerSupervisor:
         self._wakeup_event.set()
 
     def close(self) -> None:
-        """关闭 supervisor 并等待当前 poll round 收口。
+        """按一个 shared deadline 关闭 poll loop 与 observation threads。
 
         :returns: ``None``。
         """
 
         with self._lock:
             thread = self._thread
+            observations_live = (
+                self._observation_runner.diagnostics_snapshot().live_count
+            )
             if (
                 self._diagnostics.status
                 in (WaitPollerLoopStatus.STOPPED, WaitPollerLoopStatus.FAILED)
                 and (thread is None or not thread.is_alive())
+                and observations_live == 0
             ):
                 self._thread = None
                 self._close_event.set()
                 self._wakeup_event.set()
                 return
-            if thread is None:
-                if self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
-                    self._diagnostics = _diagnostics_with_status(
-                        self._diagnostics, WaitPollerLoopStatus.STOPPED
-                    )
-                self._close_event.set()
-                return
             if thread is threading.current_thread():
-                raise RuntimeError(
-                    "wait poller supervisor cannot close from its own thread"
-                )
+                raise _WaitPollerSelfCloseError(_WAIT_POLLER_SELF_CLOSE_MESSAGE)
             if self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
                 self._diagnostics = _diagnostics_with_status(
                     self._diagnostics, WaitPollerLoopStatus.CLOSING
                 )
             self._close_event.set()
             self._wakeup_event.set()
-        close_drain_timeout_seconds = self._policy.close_drain_timeout_seconds
-        if close_drain_timeout_seconds is None:
-            thread.join()
-        else:
-            thread.join(close_drain_timeout_seconds)
-            if thread.is_alive():
-                _LOGGER.warning(
-                    "wait poller close drain timeout; continuing wait owner_id=%s",
-                    self._owner_id,
+        self._observation_runner.begin_close()
+        deadline = time.monotonic() + self._policy.close_drain_timeout_seconds
+        if thread is not None:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        observations_drained = self._observation_runner.drain_until(deadline)
+        thread_alive = thread is not None and thread.is_alive()
+        if thread_alive or not observations_drained:
+            _LOGGER.warning(
+                "wait poller close drain timeout; detached bounded observations "
+                "owner_id=%s poller_alive=%s observations_live=%s",
+                self._owner_id,
+                thread_alive,
+                self._observation_runner.diagnostics_snapshot().live_count,
+            )
+            with self._lock:
+                self._diagnostics = _diagnostics_with_close_timeout(
+                    self._diagnostics
                 )
-                with self._lock:
-                    self._diagnostics = _diagnostics_with_close_timeout(
-                        self._diagnostics
-                    )
-                thread.join()
         with self._lock:
-            if self._thread is thread:
+            if self._thread is thread and not thread_alive:
                 self._thread = None
-            if self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
+            if (
+                self._diagnostics.status is not WaitPollerLoopStatus.FAILED
+                and not thread_alive
+                and observations_drained
+            ):
                 self._diagnostics = _diagnostics_with_status(
                     self._diagnostics, WaitPollerLoopStatus.STOPPED
+                )
+            elif self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
+                self._diagnostics = _diagnostics_with_status(
+                    self._diagnostics, WaitPollerLoopStatus.CLOSING
                 )
 
     def drain_once_for_test(self) -> WaitPollOnceResult:
@@ -1435,6 +1710,16 @@ class WaitPollerSupervisor:
         with self._lock:
             return self._diagnostics
 
+    def observation_diagnostics_snapshot(
+        self,
+    ) -> WaitObservationDiagnosticsSnapshot:
+        """读取 bounded observation registry diagnostics。
+
+        :returns: observation diagnostics snapshot。
+        """
+
+        return self._observation_runner.diagnostics_snapshot()
+
     def is_closed(self) -> bool:
         """返回 close gate 状态。
 
@@ -1449,34 +1734,54 @@ class WaitPollerSupervisor:
         :returns: ``None``。
         """
 
-        failed = False
-        try:
-            while not self._close_event.is_set():
+        while not self._close_event.is_set():
+            try:
                 result = self._poll_once()
                 self._record_poll_result(result)
                 if self._close_event.is_set():
                     break
                 self._sleep_until_next_poll(result)
-        except Exception as exc:
-            failed = True
-            _LOGGER.exception(
-                "wait poller loop failed owner_id=%s error_type=%s",
-                self._owner_id,
-                exc.__class__.__name__,
-            )
-            with self._lock:
-                self._diagnostics = _diagnostics_with_fatal_error(
-                    self._diagnostics, exc
+            except _WaitPollerSelfCloseError as exc:
+                _LOGGER.exception(
+                    "wait poller loop failed owner_id=%s error_type=%s",
+                    self._owner_id,
+                    exc.__class__.__name__,
                 )
-            self._close_event.set()
-            self._wakeup_event.set()
-        finally:
-            if not failed:
                 with self._lock:
-                    if self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
-                        self._diagnostics = _diagnostics_with_status(
-                            self._diagnostics, WaitPollerLoopStatus.STOPPED
-                        )
+                    self._diagnostics = _diagnostics_with_fatal_error(
+                        self._diagnostics, exc
+                    )
+                self._close_event.set()
+                self._wakeup_event.set()
+                break
+            except Exception as exc:
+                _LOGGER.exception(
+                    "wait poller round failed; retrying owner_id=%s error_type=%s",
+                    self._owner_id,
+                    exc.__class__.__name__,
+                )
+                with self._lock:
+                    self._diagnostics = _diagnostics_with_round_error(
+                        self._diagnostics, exc
+                    )
+                if self._close_event.is_set():
+                    break
+                self._wakeup_event.wait(self._policy.poll_interval_seconds)
+                self._wakeup_event.clear()
+        with self._lock:
+            if (
+                self._diagnostics.status is not WaitPollerLoopStatus.FAILED
+                and self._observation_runner.diagnostics_snapshot().live_count == 0
+            ):
+                self._diagnostics = _diagnostics_with_status(
+                    self._diagnostics, WaitPollerLoopStatus.STOPPED
+                )
+            elif self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
+                self._diagnostics = _diagnostics_with_status(
+                    self._diagnostics, WaitPollerLoopStatus.CLOSING
+                )
+            if self._thread is threading.current_thread():
+                self._thread = None
 
     def _poll_once(self) -> WaitPollOnceResult:
         """构造 poller 并执行单轮 poll。
@@ -1484,8 +1789,28 @@ class WaitPollerSupervisor:
         :returns: 单轮 poll 结果。
         """
 
-        poller = self._poller_factory.create_wait_poller(self)
+        poller = self._poller_factory.create_wait_poller(
+            self, self._observation_runner
+        )
         return poller.poll_once()
+
+    def _on_observations_drained(self) -> None:
+        """最后一个 invalidated observation thread 结束后收口状态。
+
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            thread = self._thread
+            if (
+                self._close_event.is_set()
+                and (thread is None or not thread.is_alive())
+                and self._diagnostics.status is not WaitPollerLoopStatus.FAILED
+            ):
+                self._thread = None
+                self._diagnostics = _diagnostics_with_status(
+                    self._diagnostics, WaitPollerLoopStatus.STOPPED
+                )
 
     def _sleep_until_next_poll(self, result: WaitPollOnceResult) -> None:
         """按单轮结果等待下一次 poll，支持 wakeup 与 close 立即打断。
@@ -1627,6 +1952,7 @@ def _poll_result_has_activity(result: WaitPollOnceResult) -> bool:
         or result.lost > 0
         or result.abandoned > 0
         or result.adapter_errors > 0
+        or result.boundary_rejections > 0
         or result.claim_conflicts > 0
         or result.shutdown_skipped > 0
     )
@@ -1657,11 +1983,14 @@ def _require_positive_float(value: float, *, field_name: str) -> None:
     :param value: 待校验数值。
     :param field_name: 字段名。
     :returns: ``None``。
-    :raises ValueError: 数值小于等于零时抛出。
+    :raises TypeError: 数值类型非法时抛出。
+    :raises ValueError: 数值非 finite 或小于等于零时抛出。
     """
 
-    if value <= 0.0:
-        raise ValueError(f"{field_name} must be positive")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a finite positive number")
+    if not math.isfinite(float(value)) or value <= 0.0:
+        raise ValueError(f"{field_name} must be a finite positive number")
 
 
 def _initial_diagnostics() -> WaitPollerDiagnosticsSnapshot:
@@ -1679,9 +2008,11 @@ def _initial_diagnostics() -> WaitPollerDiagnosticsSnapshot:
         lost=0,
         abandoned=0,
         adapter_errors=0,
+        boundary_rejections=0,
         claim_conflicts=0,
         shutdown_skipped=0,
         close_drain_timeouts=0,
+        round_errors=0,
         fatal_errors=0,
         last_error_type=None,
         last_error_message=None,
@@ -1707,9 +2038,11 @@ def _diagnostics_with_status(
         lost=diagnostics.lost,
         abandoned=diagnostics.abandoned,
         adapter_errors=diagnostics.adapter_errors,
+        boundary_rejections=diagnostics.boundary_rejections,
         claim_conflicts=diagnostics.claim_conflicts,
         shutdown_skipped=diagnostics.shutdown_skipped,
         close_drain_timeouts=diagnostics.close_drain_timeouts,
+        round_errors=diagnostics.round_errors,
         fatal_errors=diagnostics.fatal_errors,
         last_error_type=diagnostics.last_error_type,
         last_error_message=diagnostics.last_error_message,
@@ -1735,9 +2068,13 @@ def _diagnostics_with_poll_result(
         lost=diagnostics.lost + result.lost,
         abandoned=diagnostics.abandoned + result.abandoned,
         adapter_errors=diagnostics.adapter_errors + result.adapter_errors,
+        boundary_rejections=(
+            diagnostics.boundary_rejections + result.boundary_rejections
+        ),
         claim_conflicts=diagnostics.claim_conflicts + result.claim_conflicts,
         shutdown_skipped=diagnostics.shutdown_skipped + result.shutdown_skipped,
         close_drain_timeouts=diagnostics.close_drain_timeouts,
+        round_errors=diagnostics.round_errors,
         fatal_errors=diagnostics.fatal_errors,
         last_error_type=diagnostics.last_error_type,
         last_error_message=diagnostics.last_error_message,
@@ -1762,9 +2099,11 @@ def _diagnostics_with_close_timeout(
         lost=diagnostics.lost,
         abandoned=diagnostics.abandoned,
         adapter_errors=diagnostics.adapter_errors,
+        boundary_rejections=diagnostics.boundary_rejections,
         claim_conflicts=diagnostics.claim_conflicts,
         shutdown_skipped=diagnostics.shutdown_skipped,
         close_drain_timeouts=diagnostics.close_drain_timeouts + 1,
+        round_errors=diagnostics.round_errors,
         fatal_errors=diagnostics.fatal_errors,
         last_error_type=diagnostics.last_error_type,
         last_error_message=diagnostics.last_error_message,
@@ -1790,10 +2129,42 @@ def _diagnostics_with_fatal_error(
         lost=diagnostics.lost,
         abandoned=diagnostics.abandoned,
         adapter_errors=diagnostics.adapter_errors,
+        boundary_rejections=diagnostics.boundary_rejections,
         claim_conflicts=diagnostics.claim_conflicts,
         shutdown_skipped=diagnostics.shutdown_skipped,
         close_drain_timeouts=diagnostics.close_drain_timeouts,
+        round_errors=diagnostics.round_errors,
         fatal_errors=diagnostics.fatal_errors + 1,
+        last_error_type=exc.__class__.__name__,
+        last_error_message=str(exc),
+    )
+
+
+def _diagnostics_with_round_error(
+    diagnostics: WaitPollerDiagnosticsSnapshot, exc: Exception
+) -> WaitPollerDiagnosticsSnapshot:
+    """复制 diagnostics 并记录单轮可恢复异常。
+
+    :param diagnostics: 原 diagnostics。
+    :param exc: 本轮异常。
+    :returns: 保持原 loop 状态并记录异常计数后的 diagnostics。
+    """
+
+    return WaitPollerDiagnosticsSnapshot(
+        status=diagnostics.status,
+        poll_rounds=diagnostics.poll_rounds,
+        observed=diagnostics.observed,
+        not_ready=diagnostics.not_ready,
+        resolved=diagnostics.resolved,
+        lost=diagnostics.lost,
+        abandoned=diagnostics.abandoned,
+        adapter_errors=diagnostics.adapter_errors,
+        boundary_rejections=diagnostics.boundary_rejections,
+        claim_conflicts=diagnostics.claim_conflicts,
+        shutdown_skipped=diagnostics.shutdown_skipped,
+        close_drain_timeouts=diagnostics.close_drain_timeouts,
+        round_errors=diagnostics.round_errors + 1,
+        fatal_errors=diagnostics.fatal_errors,
         last_error_type=exc.__class__.__name__,
         last_error_message=str(exc),
     )
@@ -1806,6 +2177,42 @@ def _new_poll_claim_id() -> str:
     """
 
     return f"poll-claim-{uuid4()}"
+
+
+def _adapter_snapshot_from_wait_record(record: WaitRecordRow) -> WaitAdapterSnapshot:
+    """把 Host durable wait row 投影为 adapter-facing snapshot。
+
+    :param record: Host durable wait row。
+    :returns: adapter-facing 最小 snapshot。
+    :raises WaitAdapterSnapshotProjectionError: resume token 或创建时间非法时抛出。
+    """
+
+    try:
+        _validate_adapter_snapshot_resume_token(record.resume_token)
+        created_at = parse_utc_timestamp(record.created_at)
+        return WaitAdapterSnapshot(
+            tool_name=record.tool_name,
+            resume_token=record.resume_token,
+            created_at=created_at,
+        )
+    except (TypeError, ValueError) as exc:
+        raise WaitAdapterSnapshotProjectionError(
+            "wait record cannot be projected to adapter snapshot"
+        ) from exc
+
+
+def _validate_adapter_snapshot_resume_token(resume_token: str) -> None:
+    """校验 Host wait adapter snapshot 的 resume token 边界。
+
+    :param resume_token: durable wait row 中的 resume token。
+    :returns: ``None``。
+    :raises ValueError: token 为空或超过 Host public 上限时抛出。
+    """
+
+    if resume_token.strip() == "":
+        raise ValueError("resume_token must be non-empty")
+    if len(resume_token) > HOST_WAIT_RESUME_TOKEN_MAX_LENGTH:
+        raise ValueError("resume_token is too long")
 
 
 def _new_poller_owner_id() -> str:
@@ -1822,6 +2229,8 @@ __all__ = [
     "WaitActivationAdapterRegistration",
     "WaitActivationRegistry",
     "WaitActivationRequest",
+    "WaitAdapterSnapshot",
+    "WaitAdapterSnapshotProjectionError",
     "WaitAdapterBinding",
     "WaitAdapterRegistry",
     "WaitExternalJobLifecycleAction",
@@ -1846,4 +2255,5 @@ __all__ = [
     "WaitPollResult",
     "WaitPoller",
     "WaitResolvePort",
+    "WaitResumePolicy",
 ]

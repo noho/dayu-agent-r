@@ -39,21 +39,27 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import pandas as pd
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.text_utils import normalize_whitespace as _normalize_whitespace
 from dayu.documents.processors.table_utils import parse_html_table_dataframe
 
-from .financial_base import FinancialStatementResult
+from dayu.fins.domain.financial_result_contract import (
+    FinancialPeriod,
+    FinancialScale,
+    FinancialStatementResult,
+    determine_financial_statement_quality,
+)
+from dayu.fins.domain.filing_semantics import normalize_fiscal_period
 from .html_financial_statement_common import (
     _normalize_year_token,
     _resolve_period_end_from_fiscal_period,
     build_html_statement_result_from_tables as _build_shared_statement_result_from_tables,
     select_html_statement_tables_by_row_signals as _select_shared_statement_tables_by_row_signals,
 )
-from .sec_xbrl_query import build_statement_locator
 from .sec_form_section_common import _dedupe_markers
 from .sec_report_form_common import _find_table_of_contents_cutoff
 
@@ -971,20 +977,31 @@ def extract_statement_result_from_ocr_pages(
             return None
         return _extract_income_summary_result_from_ocr_pages(page_texts)
 
-    return {
-        "statement_type": statement_type,
-        "periods": periods,
-        "rows": rows,
-        "currency": selected_payload.get("currency"),
-        "units": selected_payload.get("units"),
-        "scale": selected_payload.get("scale"),
-        "data_quality": "extracted",
-        "statement_locator": build_statement_locator(
-            statement_type=statement_type,
-            periods=periods,
-            rows=rows,
-        ),
-    }
+    selected_scale = selected_payload.get("scale")
+    scale = (
+        cast(FinancialScale, selected_scale)
+        if isinstance(selected_scale, str)
+        and selected_scale in {"units", "thousands", "millions", "billions"}
+        else None
+    )
+    quality = determine_financial_statement_quality(
+        rows=rows,
+        periods=periods,
+        scale=scale,
+        complete_quality="extracted",
+    )
+    result = FinancialStatementResult(
+        statement_type=statement_type,
+        periods=periods,
+        rows=rows,
+        currency=selected_payload.get("currency"),
+        units=selected_payload.get("units"),
+        scale=scale,
+        data_quality=quality.data_quality,
+    )
+    if quality.reason is not None:
+        result["reason"] = quality.reason
+    return result
 
 
 def _extract_income_summary_result_from_ocr_pages(
@@ -1016,17 +1033,36 @@ def _extract_income_summary_result_from_ocr_pages(
             continue
         candidate_score = (
             len(parsed_result["rows"]),
-            sum(
-                abs(float(value))
-                for row in parsed_result["rows"]
-                for value in row["values"]
-                if isinstance(value, (int, float))
-            ),
+            _sum_absolute_numeric_row_values(parsed_result["rows"]),
         )
         if candidate_score > best_score:
             best_result = parsed_result
             best_score = candidate_score
     return best_result
+
+
+def _sum_absolute_numeric_row_values(rows: list[dict[str, JsonValue]]) -> float:
+    """汇总财务行中数值的绝对值，用于 OCR 候选稳定排序。
+
+    Args:
+        rows: 标准化财务行。
+
+    Returns:
+        所有有限整型/浮点值的绝对值总和。
+
+    Raises:
+        无。
+    """
+
+    total = 0.0
+    for row in rows:
+        values = row.get("values")
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total += abs(float(value))
+    return total
 
 
 def _parse_income_summary_from_ocr_page(
@@ -1063,6 +1099,9 @@ def _build_income_summary_result_from_title_match(
 ) -> Optional[FinancialStatementResult]:
     """根据 `Profit & Loss` 标题命中构建单期间 income 报表。
 
+    income summary 的 ``units`` 与 ``currency`` 有意同源，均表示该货币报表的
+    报告货币；该假设不适用于非货币计量的 statement type，后者不得复用。
+
     Args:
         normalized_text: 规范化后的 OCR 页文本。
         title_match: `Profit & Loss` 标题匹配对象。
@@ -1088,20 +1127,26 @@ def _build_income_summary_result_from_title_match(
     if len(rows) < 2:
         return None
 
-    return {
-        "statement_type": "income",
-        "periods": [period_summary],
-        "rows": rows,
-        "currency": _extract_income_summary_currency(page_body),
-        "units": None,
-        "scale": None,
-        "data_quality": "extracted",
-        "statement_locator": build_statement_locator(
-            statement_type="income",
-            periods=[period_summary],
-            rows=rows,
-        ),
-    }
+    currency_raw, scale = _extract_ocr_currency_and_scale(page_body[:800])
+    quality = determine_financial_statement_quality(
+        rows=rows,
+        periods=[period_summary],
+        scale=scale,
+        complete_quality="extracted",
+    )
+    currency = _map_ocr_currency_code(currency_raw) or _extract_income_summary_currency(page_body)
+    result = FinancialStatementResult(
+        statement_type="income",
+        periods=[period_summary],
+        rows=rows,
+        currency=currency,
+        units=currency,
+        scale=scale,
+        data_quality=quality.data_quality,
+    )
+    if quality.reason is not None:
+        result["reason"] = quality.reason
+    return result
 
 
 def _extract_income_summary_period(
@@ -1109,7 +1154,7 @@ def _extract_income_summary_period(
     normalized_text: str,
     title_start: int,
     page_body: str,
-) -> Optional[dict[str, Any]]:
+) -> FinancialPeriod | None:
     """提取 `Profit & Loss` 摘要页当前期间。
 
     Args:
@@ -1149,7 +1194,7 @@ def _extract_income_summary_period_from_title_window(
     *,
     normalized_text: str,
     title_start: int,
-) -> Optional[dict[str, Any]]:
+) -> FinancialPeriod | None:
     """从标题附近窗口提取单期间口径。
 
     优先读取 `1Q25 Earnings`、`2Q25`、`H1 2025` 等贴近标题的 token，
@@ -1187,14 +1232,14 @@ def _extract_income_summary_period_from_title_window(
         fiscal_period=fiscal_period,
         anchor_month_day=(12, 31),
     )
-    return {
-        "period_end": period_end,
-        "fiscal_year": fiscal_year,
-        "fiscal_period": fiscal_period,
-    }
+    return FinancialPeriod(
+        period_end=period_end,
+        fiscal_year=fiscal_year,
+        fiscal_period=normalize_fiscal_period(fiscal_period),
+    )
 
 
-def _extract_income_summary_rows(page_body: str) -> list[dict[str, Any]]:
+def _extract_income_summary_rows(page_body: str) -> list[dict[str, JsonValue]]:
     """从 `Profit & Loss` 摘要块中提取行项目和值。
 
     Args:
@@ -1207,7 +1252,7 @@ def _extract_income_summary_rows(page_body: str) -> list[dict[str, Any]]:
         RuntimeError: 提取失败时抛出。
     """
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, JsonValue]] = []
     seen_labels: set[str] = set()
     for label, pattern in _OCR_LINE_ITEM_PATTERNS_BY_STATEMENT["income"]:
         for match in pattern.finditer(page_body):
@@ -1355,7 +1400,7 @@ def _parse_statement_from_ocr_page(
         "periods": periods,
         "rows": rows,
         "currency": _map_ocr_currency_code(currency_raw),
-        "units": _build_ocr_units_label(currency_raw=currency_raw, scale=scale),
+        "units": _map_ocr_currency_code(currency_raw),
         "scale": scale,
     }
 
@@ -1712,7 +1757,7 @@ def _build_ocr_period_summaries(
     period_entries: list[tuple[int, Optional[str]]],
     anchor_month_day: tuple[int, int],
     page_text: str,
-) -> list[dict[str, Any]]:
+) -> list[FinancialPeriod]:
     """构建 OCR 财务报表的期间摘要。
 
     Args:
@@ -1727,12 +1772,8 @@ def _build_ocr_period_summaries(
         RuntimeError: 构建失败时抛出。
     """
 
-    month_value, day_value = anchor_month_day
-    inferred_fiscal_period = _infer_ocr_fiscal_period(
-        page_text=page_text,
-        month_value=month_value,
-    )
-    periods: list[dict[str, Any]] = []
+    inferred_fiscal_period = _extract_ocr_fiscal_period_from_heading(page_text)
+    periods: list[FinancialPeriod] = []
     for fiscal_year, explicit_fiscal_period in period_entries:
         fiscal_period = explicit_fiscal_period or inferred_fiscal_period
         period_end = _resolve_ocr_period_end(
@@ -1741,11 +1782,11 @@ def _build_ocr_period_summaries(
             anchor_month_day=anchor_month_day,
         )
         periods.append(
-            {
-                "period_end": period_end,
-                "fiscal_year": fiscal_year,
-                "fiscal_period": fiscal_period,
-            }
+            FinancialPeriod(
+                period_end=period_end,
+                fiscal_year=fiscal_year,
+                fiscal_period=normalize_fiscal_period(fiscal_period),
+            )
         )
     return periods
 
@@ -1781,56 +1822,29 @@ def _resolve_ocr_period_end(
     return f"{fiscal_year:04d}-{month_value:02d}-{day_value:02d}"
 
 
-def _infer_ocr_fiscal_period(
-    *,
-    page_text: str,
-    month_value: int,
-) -> Optional[str]:
-    """推断 OCR 财报期间口径。
+def _extract_ocr_fiscal_period_from_heading(page_text: str) -> Optional[str]:
+    """仅从 OCR heading 的明示年度口径提取 fiscal period。
+
+    季度、半年度等口径必须由带编号的 ``Q1/H1/FY`` token 产生，不能根据
+    月份或期末日期猜 issuer fiscal calendar。本 helper 只保留无歧义的
+    ``year ended`` -> ``FY`` 直接文本证据。
 
     Args:
-        page_text: 页文本。
-        month_value: 期间月份。
+        page_text: OCR 页文本。
 
     Returns:
-        fiscal period 标识；无法判断时返回 `None`。
+        明示年度口径返回 ``FY``；否则返回 ``None``。
 
     Raises:
-        RuntimeError: 推断失败时抛出。
+        无。
     """
 
-    normalized_text = page_text.lower()
-    if "three months ended" in normalized_text or "quarter ended" in normalized_text:
-        return _month_to_quarter(month_value)
-    if "six months ended" in normalized_text or "half-year" in normalized_text or "half year" in normalized_text:
-        return "H1" if month_value <= 6 else "H2"
-    if "nine months ended" in normalized_text:
-        return "9M"
-    if "year ended" in normalized_text:
-        return "FY"
-    if "as at" in normalized_text and month_value in {3, 6, 9, 12}:
-        return _month_to_quarter(month_value)
-    return "FY" if month_value == 12 else None
+    return "FY" if "year ended" in page_text.lower() else None
 
 
-def _month_to_quarter(month_value: int) -> str:
-    """将月份映射为季度标识。
-
-    Args:
-        month_value: 月份。
-
-    Returns:
-        季度标识。
-
-    Raises:
-        RuntimeError: 映射失败时抛出。
-    """
-
-    quarter = max(1, min(4, (month_value - 1) // 3 + 1))
-    return f"Q{quarter}"
-
-
-def _extract_ocr_currency_and_scale(header_text: str) -> tuple[Optional[str], Optional[str]]:
+def _extract_ocr_currency_and_scale(
+    header_text: str,
+) -> tuple[Optional[str], FinancialScale | None]:
     """从 OCR 页头提取货币与缩放口径。
 
     Args:
@@ -1857,33 +1871,6 @@ def _extract_ocr_currency_and_scale(header_text: str) -> tuple[Optional[str], Op
     else:
         scale = None
     return (currency_raw, scale)
-
-
-def _build_ocr_units_label(
-    *,
-    currency_raw: Optional[str],
-    scale: Optional[str],
-) -> Optional[str]:
-    """构建 OCR 财报 units 文本。
-
-    Args:
-        currency_raw: 原始货币文本。
-        scale: 缩放口径。
-
-    Returns:
-        units 文本；不存在时返回 `None`。
-
-    Raises:
-        RuntimeError: 构建失败时抛出。
-    """
-
-    if currency_raw is None and scale is None:
-        return None
-    if currency_raw is None:
-        return scale
-    if scale is None:
-        return currency_raw
-    return f"{currency_raw} in {scale}"
 
 
 def _map_ocr_currency_code(currency_raw: Optional[str]) -> Optional[str]:

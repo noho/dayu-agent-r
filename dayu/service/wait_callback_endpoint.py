@@ -544,18 +544,12 @@ def _provider_status_ref_from_json(raw: JsonValue) -> WaitProviderStatusRef | No
 
     :param raw: provider status ref JSON 值。
     :returns: Host provider status ref 或 ``None``。
-    :raises TypeError: ref shape 非字符串或对象时抛出。
+    :raises TypeError: ref shape 非对象时抛出。
     :raises ValueError: 字段缺失或 digest 非法时抛出。
     """
 
     if raw is None:
         return None
-    if isinstance(raw, str):
-        return WaitProviderStatusRef(
-            adapter_key=WaitAdapterKey("callback"),
-            status_ref=_validated_optional_string(raw, "provider_status_ref"),
-            status_digest=None,
-        )
     status_ref = _require_json_object(raw, "provider_status_ref")
     return WaitProviderStatusRef(
         adapter_key=WaitAdapterKey(_required_string(status_ref, "adapter_key")),
@@ -754,7 +748,6 @@ def _http_status_code_for_adapter_result(result: WaitCallbackAdapterResult) -> i
     if result.status in {
         WaitCallbackAdapterStatus.LATE_WAIT_CANCELLED,
         WaitCallbackAdapterStatus.LATE_WAIT_LOST,
-        WaitCallbackAdapterStatus.STALE_CALLBACK,
     }:
         return 410
     return 500

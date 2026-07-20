@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.processors.source_text import decode_source_bytes
 
 import datetime as dt
 import re
@@ -164,15 +165,15 @@ def _extract_head_text(payload: bytes, max_lines: int) -> str:
         文本内容（空行已过滤）。
 
     Raises:
-        无。
+        FinsSourceDecodeError: payload 不是合法 UTF-8 时抛出。
     """
 
     from lxml import html as lxml_html
 
-    raw = payload.decode("utf-8", errors="ignore")
+    raw = decode_source_bytes(payload)
     if raw.lstrip().startswith("<"):
         try:
-            tree = lxml_html.fromstring(payload)
+            tree = lxml_html.fromstring(raw)
             text = tree.text_content()
         except Exception:
             text = raw

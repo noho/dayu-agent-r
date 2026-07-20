@@ -4,12 +4,13 @@
 ``Retry-After`` 头（若存在）、本次错误的中性枚举与已尝试次数，产出
 :class:`_RetryDecision`。
 
-策略（与 OLD ``async_openai_runner.py`` 一致）:
+策略:
 
 - 若错误不可重试（见
   :func:`~dayu.engine.runners.openai.error_classifier.is_retriable`）→
   ``should_retry=False``。
-- 若已尝试次数 ``> spec.max_retries`` → ``should_retry=False``。
+- 若本次失败后的已尝试次数已经达到 ``1 + spec.max_retries`` →
+  ``should_retry=False``。
 - 429 (``RATE_LIMIT_EXCEEDED``)：
   - ``Retry-After`` 存在 → 使用 header，但 cap 至 120s；
   - 否则首次 4s、随后指数退避，cap 60s。
@@ -111,7 +112,7 @@ def compute_retry_decision(
         return _RetryDecision(
             should_retry=False, sleep_seconds=0.0, attempt=attempt
         )
-    if attempt > max_retries:
+    if attempt >= max_retries + 1:
         return _RetryDecision(
             should_retry=False, sleep_seconds=0.0, attempt=attempt
         )

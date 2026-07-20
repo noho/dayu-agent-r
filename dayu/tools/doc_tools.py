@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import fnmatch
+import heapq
 import logging
 import re
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,7 +41,9 @@ from dayu.contracts import (
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.documents.processors._doc_processor_factory import create_doc_file_processor
 from dayu.documents.processors.base import DocumentProcessor
-from dayu.documents.processors.search_utils import extract_query_anchored_snippets
+from dayu.documents.processors.local_file_source import LocalFileSource
+from dayu.documents.processors.source import Source
+from dayu.documents.processors.source_snapshot import SourceSnapshot
 from dayu.runtime.tool_call_projection import (
     ToolArgumentValidationFailure,
     ToolBusinessCancelled,
@@ -68,7 +73,7 @@ DOC_TOOL_NAMES: Final[tuple[str, ...]] = (
     READ_FILE_SECTION_TOOL_NAME,
 )
 
-_DOC_CANCELLED_HINT: Final[str] = "当前工具调用已停止；等待新的用户指令或后续调度。"
+_DOC_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and retry."
 _PATH_POLICY_HINT: Final[str] = "Use a path under the provider configured allowed roots."
 
@@ -76,6 +81,8 @@ _READ_FILE_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk", "latin1", "cp125
 _READ_LINES_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk")
 _MARKDOWN_SUFFIXES: Final[frozenset[str]] = frozenset({".md", ".markdown"})
 _DOC_LOOP_CANCELLATION_CHECK_INTERVAL: Final[int] = 1_000
+_DOC_STREAM_CHUNK_BYTES: Final[int] = 64 * 1024
+_DOC_SEARCH_EXCERPT_CHARS: Final[int] = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +108,59 @@ class DocToolLimits:
     search_files_max_results: int = 50
     read_file_max_chars: int = 80_000
     read_file_section_max_chars: int = 50_000
+
+
+@dataclass(frozen=True, slots=True)
+class _DocSourceCancellationCheck:
+    """把 Doc cancellation token 投影为层中立的无参检查器。"""
+
+    cancellation_token: CancellationToken
+
+    def __call__(self) -> None:
+        """观察取消并按 Doc contract 抛出。
+
+        Returns:
+            无。
+
+        Raises:
+            _DocCancelledError: token 已取消时抛出。
+        """
+
+        _raise_if_doc_cancelled(self.cancellation_token)
+
+
+@dataclass(slots=True)
+class _ListedFileCandidate:
+    """目录结果固定堆中的反向排序候选。"""
+
+    sort_key: tuple[str, str, str, str]
+    value: dict[str, JsonValue]
+
+    def __lt__(self, other: _ListedFileCandidate) -> bool:
+        """反向比较，使堆顶保持当前最大路径。
+
+        Args:
+            other: 另一候选。
+
+        Returns:
+            当前路径字典序更大时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        return self.sort_key > other.sort_key
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundedTextRead:
+    """raw read 增量扫描结果。"""
+
+    content: str
+    content_truncated: bool
+    scan_complete: bool
+    total_lines: int | None
+    line_range: tuple[int, int] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,10 +562,18 @@ def build_doc_tool_definitions(
         limits=limits,
     )
     definitions = (
-        _build_list_files_definition(limits, normalized_roots, provider_lock, process_target_factory),
-        _build_get_file_sections_definition(limits, normalized_roots, provider_lock, process_target_factory),
-        _build_search_files_definition(limits, normalized_roots, provider_lock, process_target_factory),
-        _build_read_file_definition(limits, normalized_roots, provider_lock, process_target_factory),
+        _build_list_files_definition(
+            limits, normalized_roots, provider_lock, process_target_factory
+        ),
+        _build_get_file_sections_definition(
+            limits, normalized_roots, provider_lock, process_target_factory
+        ),
+        _build_search_files_definition(
+            limits, normalized_roots, provider_lock, process_target_factory
+        ),
+        _build_read_file_definition(
+            limits, normalized_roots, provider_lock, process_target_factory
+        ),
         _build_read_file_section_definition(
             limits,
             normalized_roots,
@@ -578,7 +646,10 @@ def _build_list_files_definition(
     return _tool_definition(
         name=LIST_FILES_TOOL_NAME,
         description=(
-            "列出配置允许访问目录中的文件。先用它定位文件，再把返回的 files[].path 交给 get_file_sections、read_file 或 read_file_section。"
+            "列出配置允许访问目录中的文件。files 是按稳定顺序返回的首批记录，returned 是返回数，"
+            "total 是完整遍历后的匹配文件总数，scanned_entries 是完整检查的目录项数。"
+            "若 total 大于 returned，表示 limit 限制了本次返回数量；可收紧 pattern 或在参数允许范围内提高 limit。"
+            "定位后把 files[].path 交给 get_file_sections、read_file 或 read_file_section。"
         ),
         parameters=parameters,
         callable_=list_files_callable,
@@ -716,7 +787,11 @@ def _build_search_files_definition(
     return _tool_definition(
         name=SEARCH_FILES_TOOL_NAME,
         description=(
-            "在配置允许访问目录中按关键词查找命中文件。若命中结果带 ref，优先把 matches[].file 和 ref 交给 read_file_section；若 ref 为 null，再把 matches[].file 交给 read_file。"
+            "在配置允许访问目录中按关键词查找。matches 是本次命中，total_matches 等于返回命中数，"
+            "scanned_entries 是已检查目录项数。scan_complete=false 且 truncated_reason=result_limit 表示"
+            "命中数达到 limit，可收紧关键词或在参数允许范围内提高 limit 后重试；完整扫描时"
+            "scan_complete=true 且 truncated_reason 为 null。"
+            "若命中带 ref，把 matches[].file 和 ref 交给 read_file_section；ref 为 null 时用 read_file。"
         ),
         parameters=parameters,
         callable_=search_files_callable,
@@ -784,7 +859,12 @@ def _build_read_file_definition(
 
     return _tool_definition(
         name=READ_FILE_TOOL_NAME,
-        description="按整文件或按行范围读取内容。没有 ref、或文件不支持章节读取时用它。",
+        description=(
+            "按整文件或按行范围读取内容。content 是本次返回文本，returned_chars 是其字符数。"
+            "content_truncated=true 或 scan_complete=false 表示字符预算命中，total_lines 会是 null；"
+            "请用 start_line/end_line 缩小范围继续读取。完整扫描时 scan_complete=true 且 total_lines 为整数；"
+            "请求行范围时 line_range 是两个整数。没有 ref、或文件不支持章节读取时用它。"
+        ),
         parameters=parameters,
         callable_=read_file_callable,
         display_name="读取文件",
@@ -852,7 +932,9 @@ def _build_read_file_section_definition(
     return _tool_definition(
         name=READ_FILE_SECTION_TOOL_NAME,
         description=(
-            f"按章节 ref 读取内容。ref 必须来自 get_file_sections；支持的格式有 {_SUPPORTED_FORMATS_DESCRIPTION}。若文件不支持章节读取或 ref 为 null，改用 read_file。"
+            f"按章节 ref 读取内容。ref 必须来自 get_file_sections；支持的格式有 {_SUPPORTED_FORMATS_DESCRIPTION}。"
+            "returned_chars 是返回 content 的字符数；content_truncated=true 或 scan_complete=false 时，"
+            "改用 read_file 按更小行范围继续读取。若文件不支持章节读取或 ref 为 null，也改用 read_file。"
         ),
         parameters=parameters,
         callable_=read_file_section_callable,
@@ -1015,6 +1097,7 @@ def _execute_doc_business_value(
         raw_value = _route_doc_business(
             tool_name=tool_name,
             arguments=path_projection,
+            allowed_roots=allowed_roots,
             limits=limits,
             cancellation_token=cancellation_token,
         )
@@ -1059,6 +1142,7 @@ def _route_doc_business(
     *,
     tool_name: str,
     arguments: Mapping[str, JsonValue],
+    allowed_roots: tuple[Path, ...],
     limits: DocToolLimits,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
@@ -1067,6 +1151,7 @@ def _route_doc_business(
     Args:
         tool_name: 工具名。
         arguments: 已通过 schema 与路径白名单校验的参数。
+        allowed_roots: 已重新解析的允许访问根路径。
         limits: Doc 工具限制配置。
         cancellation_token: 当前执行边界使用的取消观察 token。
 
@@ -1103,6 +1188,7 @@ def _route_doc_business(
             include_types=_optional_string_list(arguments, "include_types"),
             limit=_required_int(arguments, "limit"),
             max_results=limits.search_files_max_results,
+            allowed_roots=allowed_roots,
             cancellation_token=cancellation_token,
         )
     if tool_name == READ_FILE_TOOL_NAME:
@@ -1110,12 +1196,14 @@ def _route_doc_business(
             file_path=_required_string(arguments, "file_path"),
             start_line=_optional_int(arguments, "start_line"),
             end_line=_optional_int(arguments, "end_line"),
+            max_chars=limits.read_file_max_chars,
             cancellation_token=cancellation_token,
         )
     if tool_name == READ_FILE_SECTION_TOOL_NAME:
         return _read_file_section_business(
             file_path=_required_string(arguments, "file_path"),
             ref=_required_string(arguments, "ref"),
+            max_chars=limits.read_file_section_max_chars,
             cancellation_token=cancellation_token,
         )
     raise ValueError(f"unsupported doc tool: {tool_name}")
@@ -1325,6 +1413,62 @@ def _is_supported_doc_file_path(tool_name: str, candidate: Path) -> bool:
         return False
 
 
+def _directory_entry_sort_key(entry: Path) -> tuple[str, str]:
+    """构造目录 entry 的确定性名称排序键。
+
+    Args:
+        entry: 待排序的目录 entry。
+
+    Returns:
+        先按名称 ``casefold``、再按原名排序的二元组。
+
+    Raises:
+        无。
+    """
+
+    return (entry.name.casefold(), entry.name)
+
+
+def _iter_directory_entries(
+    directory: Path,
+    *,
+    recursive: bool,
+    cancellation_token: CancellationToken,
+) -> Iterator[Path]:
+    """按确定性 depth-first 顺序产出目录 entry。
+
+    Args:
+        directory: 当前待枚举目录。
+        recursive: 是否递归普通子目录。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Yields:
+        每层按名称 ``casefold`` 与原名稳定排序的目录 entry；目录 symlink
+        本身会产出但不会递归其目标，file symlink 也会作为 entry 产出。
+
+    Raises:
+        OSError: 目录枚举失败时透出。
+        _DocCancelledError: 枚举或产出 entry 时观察到 Host 取消后抛出。
+    """
+
+    entries: list[Path] = []
+    _raise_if_doc_cancelled(cancellation_token)
+    for entry in directory.iterdir():
+        _raise_if_doc_cancelled(cancellation_token)
+        entries.append(entry)
+    entries.sort(key=_directory_entry_sort_key)
+
+    for entry in entries:
+        _raise_if_doc_cancelled(cancellation_token)
+        yield entry
+        if recursive and not entry.is_symlink() and entry.is_dir():
+            yield from _iter_directory_entries(
+                entry,
+                recursive=True,
+                cancellation_token=cancellation_token,
+            )
+
+
 def _list_files_business(
     *,
     directory: str,
@@ -1357,36 +1501,57 @@ def _list_files_business(
     if not dir_path.is_dir():
         raise _DocFileAccessError(directory, "", "路径不是目录")
 
-    files: list[JsonValue] = []
+    files_heap: list[_ListedFileCandidate] = []
+    matched_files = 0
+    scanned_entries = 0
     _raise_if_doc_cancelled(cancellation_token)
-    all_files = dir_path.rglob(pattern if pattern else "*") if recursive else dir_path.glob(pattern if pattern else "*")
-    for file_path in all_files:
-        _raise_if_doc_cancelled(cancellation_token)
+    for file_path in _iter_directory_entries(
+        dir_path,
+        recursive=recursive,
+        cancellation_token=cancellation_token,
+    ):
+        scanned_entries += 1
         if not file_path.is_file():
             continue
+        if pattern is not None and not fnmatch.fnmatch(file_path.name, pattern):
+            continue
         try:
-            stat = file_path.stat()
-            files.append(
-                {
-                    "name": file_path.name,
-                    "path": str(file_path.relative_to(dir_path)),
-                    "size": stat.st_size,
-                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                }
+            file_stat = file_path.stat()
+            relative_path = str(file_path.relative_to(dir_path))
+            record: dict[str, JsonValue] = {
+                "name": file_path.name,
+                "path": relative_path,
+                "size": file_stat.st_size,
+                "modified": datetime.fromtimestamp(file_stat.st_mtime).isoformat(),
+            }
+            matched_files += 1
+            candidate = _ListedFileCandidate(
+                sort_key=(
+                    *_directory_entry_sort_key(file_path),
+                    relative_path.casefold(),
+                    relative_path,
+                ),
+                value=record,
             )
+            if len(files_heap) < actual_limit:
+                heapq.heappush(files_heap, candidate)
+            elif actual_limit > 0 and candidate.sort_key < files_heap[0].sort_key:
+                heapq.heapreplace(files_heap, candidate)
         except OSError as error:
             Log.warn(f"无法读取文件信息: {file_path} - {error}", module=MODULE)
             continue
 
-    files.sort(key=_sort_record_by_name)
-    total = len(files)
-    filtered_files = files[:actual_limit] if actual_limit < total else files
+    filtered_files: list[JsonValue] = [
+        candidate.value
+        for candidate in sorted(files_heap, key=lambda item: item.sort_key)
+    ]
     _raise_if_doc_cancelled(cancellation_token)
     return {
         "directory": str(dir_path),
         "files": filtered_files,
-        "total": total,
+        "total": matched_files,
         "returned": len(filtered_files),
+        "scanned_entries": scanned_entries,
     }
 
 
@@ -1415,31 +1580,34 @@ def _get_file_sections_business(
     actual_limit = min(limit, max_sections)
     path = Path(file_path)
     _raise_if_doc_cancelled(cancellation_token)
-    processor = _try_create_processor(path)
-    if processor is not None:
-        return _sections_via_processor(processor, path, actual_limit, cancellation_token)
+    with _source_snapshot(path, cancellation_token) as snapshot:
+        processor = _try_create_processor(snapshot, path)
+        if processor is not None:
+            return _sections_via_processor(
+                processor, snapshot, path, actual_limit, cancellation_token
+            )
 
-    _raise_if_doc_cancelled(cancellation_token)
-    lines = _read_file_lines(path)
-    if lines is None:
-        return _fallback_single_section(file_path, path, cancellation_token)
-
-    total_lines = len(lines)
-    if path.suffix.lower() in _MARKDOWN_SUFFIXES:
         _raise_if_doc_cancelled(cancellation_token)
-        sections = _extract_markdown_sections(lines, cancellation_token)
-        if sections:
-            filtered_sections: list[JsonValue] = list(sections[:actual_limit])
-            markdown_payload: dict[str, JsonValue] = {
-                "file_path": str(path),
-                "sections": filtered_sections,
-                "total_sections": len(sections),
-                "returned": len(filtered_sections),
-                "total_lines": total_lines,
-            }
-            return markdown_payload
+        lines = _read_source_lines(snapshot, cancellation_token)
+        if lines is None:
+            return _fallback_single_section(path, 0)
 
-    return _fallback_single_section(file_path, path, cancellation_token, total_lines)
+        total_lines = len(lines)
+        if path.suffix.lower() in _MARKDOWN_SUFFIXES:
+            _raise_if_doc_cancelled(cancellation_token)
+            sections = _extract_markdown_sections(lines, cancellation_token)
+            if sections:
+                filtered_sections: list[JsonValue] = list(sections[:actual_limit])
+                markdown_payload: dict[str, JsonValue] = {
+                    "file_path": str(path),
+                    "sections": filtered_sections,
+                    "total_sections": len(sections),
+                    "returned": len(filtered_sections),
+                    "total_lines": total_lines,
+                }
+                return markdown_payload
+
+        return _fallback_single_section(path, total_lines)
 
 
 def _search_files_business(
@@ -1449,6 +1617,7 @@ def _search_files_business(
     include_types: list[str] | None,
     limit: int,
     max_results: int,
+    allowed_roots: tuple[Path, ...],
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """在目录中搜索包含关键词的文件。
@@ -1459,6 +1628,7 @@ def _search_files_business(
         include_types: 可选文件扩展名过滤。
         limit: 最大返回数量。
         max_results: 配置硬上限。
+        allowed_roots: 已重新解析的允许访问根路径。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1475,34 +1645,54 @@ def _search_files_business(
         raise _DocFileAccessError(directory, "", "路径不是目录")
 
     matches: list[JsonValue] = []
+    scanned_entries = 0
+    scan_complete = True
+    truncated_reason: str | None = None
     _raise_if_doc_cancelled(cancellation_token)
-    for file_path in dir_path.rglob("*"):
-        _raise_if_doc_cancelled(cancellation_token)
+    for file_path in _iter_directory_entries(
+        dir_path,
+        recursive=True,
+        cancellation_token=cancellation_token,
+    ):
+        scanned_entries += 1
         if not file_path.is_file():
             continue
-        if include_types and file_path.suffix.lstrip(".") not in include_types:
+        resolved_file = _resolve_search_files_candidate(
+            file_path=file_path,
+            allowed_roots=allowed_roots,
+        )
+        if resolved_file is None:
+            continue
+        if include_types and resolved_file.suffix.lstrip(".") not in include_types:
             continue
 
         relative_path = str(file_path.relative_to(dir_path))
-        processor = _try_create_processor(file_path)
-        if processor is not None:
-            _raise_if_doc_cancelled(cancellation_token)
-            matches.extend(_search_via_processor(processor, relative_path, query, cancellation_token))
-            if len(matches) >= actual_limit:
-                break
-            continue
-
-        _raise_if_doc_cancelled(cancellation_token)
-        matches.extend(
-            _search_via_line_scan(
-                file_path,
-                relative_path,
-                query,
-                actual_limit - len(matches),
-                cancellation_token,
-            )
-        )
+        with _source_snapshot(resolved_file, cancellation_token) as snapshot:
+            processor = _try_create_processor(snapshot, resolved_file)
+            processor_matches = None
+            if processor is not None:
+                processor_matches = _search_via_processor(
+                    processor,
+                    relative_path,
+                    query,
+                    actual_limit - len(matches),
+                    cancellation_token,
+                )
+            if processor_matches is not None:
+                matches.extend(processor_matches)
+            else:
+                matches.extend(
+                    _search_via_line_scan(
+                        snapshot,
+                        relative_path,
+                        query,
+                        actual_limit - len(matches),
+                        cancellation_token,
+                    )
+                )
         if len(matches) >= actual_limit:
+            scan_complete = False
+            truncated_reason = "result_limit"
             break
 
     matches = matches[:actual_limit]
@@ -1512,7 +1702,37 @@ def _search_files_business(
         "directory": str(dir_path),
         "matches": matches,
         "total_matches": len(matches),
+        "scanned_entries": scanned_entries,
+        "scan_complete": scan_complete,
+        "truncated_reason": truncated_reason,
     }
+
+
+def _resolve_search_files_candidate(
+    *, file_path: Path, allowed_roots: tuple[Path, ...]
+) -> Path | None:
+    """解析 search_files 候选文件并重新校验真实路径 containment。
+
+    Args:
+        file_path: ``rglob`` 得到的候选路径。
+        allowed_roots: 允许访问根路径。
+
+    Returns:
+        真实路径仍在允许根内时返回解析后的路径；否则返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    try:
+        resolved_file = file_path.resolve(strict=True)
+    except OSError:
+        return None
+    if not any(_is_relative_to(resolved_file, root) for root in allowed_roots):
+        return None
+    if not resolved_file.is_file():
+        return None
+    return resolved_file
 
 
 def _read_file_business(
@@ -1520,6 +1740,7 @@ def _read_file_business(
     file_path: str,
     start_line: int | None,
     end_line: int | None,
+    max_chars: int,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """读取文件内容。
@@ -1528,6 +1749,7 @@ def _read_file_business(
         file_path: 已校验并归一化的文件路径。
         start_line: 起始行号。
         end_line: 结束行号。
+        max_chars: 最大返回字符数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1539,50 +1761,38 @@ def _read_file_business(
         _DocCancelledError: 观察到 Host 取消时抛出。
     """
 
-    path = Path(file_path)
-    lines: list[str] | None = None
-    for encoding in _READ_FILE_ENCODINGS:
-        try:
-            _raise_if_doc_cancelled(cancellation_token)
-            with open(path, "r", encoding=encoding) as file:
-                lines = file.readlines()
-            _raise_if_doc_cancelled(cancellation_token)
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
-
-    if lines is None:
-        raise _DocFileAccessError(
-            str(path.parent),
-            path.name,
-            f"无法读取文件，尝试过的编码: {list(_READ_FILE_ENCODINGS)}",
-        )
-
-    total_lines = len(lines)
-    _raise_if_doc_cancelled(cancellation_token)
     actual_start_line = 1 if start_line is None else start_line
-    actual_end_line = total_lines if end_line is None else end_line
-
     if actual_start_line < 1:
         raise _DocToolArgumentError(READ_FILE_TOOL_NAME, "start_line", actual_start_line, "必须 >= 1")
-    if actual_end_line < actual_start_line:
+    if end_line is not None and end_line < actual_start_line:
         raise _DocToolArgumentError(
             READ_FILE_TOOL_NAME,
             "end_line",
-            actual_end_line,
+            end_line,
             f"必须 >= 起始行号 {actual_start_line}",
         )
 
-    start_idx = actual_start_line - 1
-    end_idx = min(actual_end_line, total_lines)
-    selected_lines = lines[start_idx:end_idx]
+    path = Path(file_path)
+    with _source_snapshot(path, cancellation_token) as snapshot:
+        scanned = _read_bounded_text(
+            snapshot=snapshot,
+            encodings=_READ_FILE_ENCODINGS,
+            max_chars=max_chars,
+            start_line=actual_start_line,
+            end_line=end_line,
+            cancellation_token=cancellation_token,
+        )
     result: dict[str, JsonValue] = {
         "file_path": str(path),
-        "content": "".join(selected_lines),
-        "total_lines": total_lines,
+        "content": scanned.content,
+        "returned_chars": len(scanned.content),
+        "content_truncated": scanned.content_truncated,
+        "scan_complete": scanned.scan_complete,
+        "total_lines": scanned.total_lines,
     }
-    if actual_start_line != 1 or actual_end_line != total_lines:
-        result["line_range"] = [actual_start_line, end_idx]
+    if start_line is not None or end_line is not None:
+        assert scanned.line_range is not None
+        result["line_range"] = list(scanned.line_range)
     return result
 
 
@@ -1590,6 +1800,7 @@ def _read_file_section_business(
     *,
     file_path: str,
     ref: str,
+    max_chars: int,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """按 section ref 读取文件章节内容。
@@ -1597,6 +1808,7 @@ def _read_file_section_business(
     Args:
         file_path: 已校验并归一化的文件路径。
         ref: 章节 ref。
+        max_chars: 最大返回字符数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1609,35 +1821,41 @@ def _read_file_section_business(
 
     path = Path(file_path)
     _raise_if_doc_cancelled(cancellation_token)
-    processor = _try_create_processor(path)
-    if processor is None:
-        raise _DocToolArgumentError(
-            READ_FILE_SECTION_TOOL_NAME,
-            "file_path",
-            file_path,
-            f"该文件格式不支持 read_file_section。支持的格式: {_SUPPORTED_FORMATS_DESCRIPTION}。请使用 read_file 工具按行读取。",
-        )
+    with _source_snapshot(path, cancellation_token) as snapshot:
+        processor = _try_create_processor(snapshot, path)
+        if processor is None:
+            raise _DocToolArgumentError(
+                READ_FILE_SECTION_TOOL_NAME,
+                "file_path",
+                file_path,
+                f"该文件格式不支持 read_file_section。支持的格式: {_SUPPORTED_FORMATS_DESCRIPTION}。请使用 read_file 工具按行读取。",
+            )
 
-    try:
+        try:
+            _raise_if_doc_cancelled(cancellation_token)
+            section_content = processor.read_section(ref)
+        except KeyError:
+            raise _DocToolArgumentError(
+                READ_FILE_SECTION_TOOL_NAME,
+                "ref",
+                ref,
+                "章节 ref 不存在，请通过 get_file_sections 获取有效的 ref",
+            ) from None
+
         _raise_if_doc_cancelled(cancellation_token)
-        section_content = processor.read_section(ref)
-    except KeyError:
-        raise _DocToolArgumentError(
-            READ_FILE_SECTION_TOOL_NAME,
-            "ref",
-            ref,
-            "章节 ref 不存在，请通过 get_file_sections 获取有效的 ref",
-        ) from None
-
-    _raise_if_doc_cancelled(cancellation_token)
-    children = _get_section_children(processor, ref, cancellation_token)
-    content = section_content.get("content", "")
-    table_refs: list[JsonValue] = list(section_content.get("tables", []))
+        children = _get_section_children(processor, ref, cancellation_token)
+        full_content = section_content.get("content", "")
+        content_truncated = len(full_content) > max_chars
+        content = full_content[:max_chars]
+        table_refs: list[JsonValue] = list(section_content.get("tables", []))
     section_payload: dict[str, JsonValue] = {
         "file_path": str(path),
         "ref": ref,
         "title": section_content.get("title"),
         "content": content,
+        "returned_chars": len(content),
+        "content_truncated": content_truncated,
+        "scan_complete": not content_truncated,
         "tables": table_refs,
         "children": children,
         "content_word_count": len(content.split()),
@@ -1645,11 +1863,36 @@ def _read_file_section_business(
     return section_payload
 
 
-def _try_create_processor(path: Path) -> DocumentProcessor | None:
+def _source_snapshot(
+    path: Path,
+    cancellation_token: CancellationToken,
+) -> SourceSnapshot:
+    """构造由当前 Doc 调用拥有的完整本地 Source 快照。
+
+    Args:
+        path: 已通过路径 authority 校验的文件路径。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Returns:
+        尚未进入上下文的完整 Source 快照。
+
+    Raises:
+        无。
+    """
+
+    source = LocalFileSource(path=path, uri=str(path))
+    return SourceSnapshot(
+        source,
+        _DocSourceCancellationCheck(cancellation_token),
+    )
+
+
+def _try_create_processor(source: Source, path: Path) -> DocumentProcessor | None:
     """安全地尝试创建处理器。
 
     Args:
-        path: 文件绝对路径。
+        source: 已完成 EOF 快照的 Source。
+        path: 仅用于诊断的原文件路径。
 
     Returns:
         ``DocumentProcessor`` 实例或 ``None``。
@@ -1659,7 +1902,7 @@ def _try_create_processor(path: Path) -> DocumentProcessor | None:
     """
 
     try:
-        return create_doc_file_processor(path)
+        return create_doc_file_processor(source)
     except Exception as exc:
         Log.warn(f"创建处理器失败，降级处理: {path} - {exc}", module=MODULE)
         return None
@@ -1667,6 +1910,7 @@ def _try_create_processor(path: Path) -> DocumentProcessor | None:
 
 def _sections_via_processor(
     processor: DocumentProcessor,
+    source: Source,
     path: Path,
     limit: int,
     cancellation_token: CancellationToken,
@@ -1675,6 +1919,7 @@ def _sections_via_processor(
 
     Args:
         processor: 文档处理器。
+        source: 已完成 EOF 快照的 Source。
         path: 文件路径。
         limit: 最大返回数。
         cancellation_token: Host 注入的取消观察令牌。
@@ -1688,7 +1933,7 @@ def _sections_via_processor(
 
     raw_sections = processor.list_sections()
     _raise_if_doc_cancelled(cancellation_token)
-    total_lines = _count_file_lines(path, cancellation_token)
+    total_lines = _count_source_lines(source, cancellation_token)
     section_table_map: dict[str, list[str]] = {}
     try:
         for table in processor.list_tables():
@@ -1725,53 +1970,50 @@ def _sections_via_processor(
     }
 
 
-def _count_file_lines(path: Path, cancellation_token: CancellationToken) -> int:
-    """计算文件总行数。
+def _count_source_lines(source: Source, cancellation_token: CancellationToken) -> int:
+    """增量计算完整快照 Source 的总行数。
 
     Args:
-        path: 文件路径。
+        source: 已完成 EOF 快照的 Source。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
-        文件行数；读取失败时返回 0。
+        文件行数；UTF-8 解码失败时返回 0。
 
     Raises:
         _DocCancelledError: 观察到 Host 取消时抛出。
     """
 
     try:
-        with open(path, "r", encoding="utf-8") as file:
-            total_lines = 0
-            for total_lines, _line in enumerate(file, start=1):
-                _raise_if_doc_cancelled_at_interval(cancellation_token, total_lines)
-            _raise_if_doc_cancelled(cancellation_token)
-            return total_lines
+        decoded = _decode_snapshot_text(source, ("utf-8",), cancellation_token)
+        if decoded is None:
+            return 0
+        return len(decoded.splitlines())
     except (UnicodeDecodeError, OSError):
         return 0
 
 
-def _read_file_lines(path: Path) -> list[str] | None:
-    """读取文件全部行，尝试多编码。
+def _read_source_lines(
+    source: Source,
+    cancellation_token: CancellationToken,
+) -> list[str] | None:
+    """读取完整快照 Source 的全部行，尝试多编码。
 
     Args:
-        path: 文件路径。
+        source: 已完成 EOF 快照的 Source。
+        cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
         行列表；无法解码或读取失败时返回 ``None``。
 
     Raises:
-        无。
+        _DocCancelledError: 观察到 Host 取消时抛出。
     """
 
-    for encoding in _READ_LINES_ENCODINGS:
-        try:
-            with open(path, "r", encoding=encoding) as file:
-                return file.readlines()
-        except UnicodeDecodeError:
-            continue
-        except OSError:
-            return None
-    return None
+    decoded = _decode_snapshot_text(source, _READ_LINES_ENCODINGS, cancellation_token)
+    if decoded is None:
+        return None
+    return decoded.splitlines(keepends=True)
 
 
 def _extract_markdown_sections(
@@ -1837,28 +2079,22 @@ def _extract_markdown_sections(
 
 
 def _fallback_single_section(
-    file_path: str,
     path: Path,
-    cancellation_token: CancellationToken,
-    total_lines: int | None = None,
+    total_lines: int,
 ) -> JsonValue:
     """返回覆盖整个文件的 fallback 单章节。
 
     Args:
-        file_path: 文件路径字符串。
         path: 文件路径对象。
-        cancellation_token: Host 注入的取消观察令牌。
         total_lines: 已知总行数。
 
     Returns:
         单章节 JSON 对象。
 
     Raises:
-        _DocCancelledError: 观察到 Host 取消时抛出。
+        无。
     """
 
-    del file_path
-    actual_total_lines = _count_file_lines(path, cancellation_token) if total_lines is None else total_lines
     section: dict[str, JsonValue] = {
         "ref": None,
         "title": path.name,
@@ -1866,8 +2102,8 @@ def _fallback_single_section(
         "parent_ref": None,
         "table_refs": [],
         "table_count": 0,
-        "line_range": [1, actual_total_lines] if actual_total_lines > 0 else None,
-        "line_count": actual_total_lines,
+        "line_range": [1, total_lines] if total_lines > 0 else None,
+        "line_count": total_lines,
         "preview": f"整个文件（{path.name}）",
     }
     return {
@@ -1875,7 +2111,7 @@ def _fallback_single_section(
         "sections": [section],
         "total_sections": 1,
         "returned": 1,
-        "total_lines": actual_total_lines,
+        "total_lines": total_lines,
     }
 
 
@@ -1883,18 +2119,21 @@ def _search_via_processor(
     processor: DocumentProcessor,
     relative_path: str,
     query: str,
+    remaining: int,
     cancellation_token: CancellationToken,
-) -> list[JsonValue]:
+) -> list[JsonValue] | None:
     """通过处理器搜索文件内容。
 
     Args:
         processor: 文档处理器。
         relative_path: 文件相对路径。
         query: 搜索关键词。
+        remaining: 当前调用仍可返回的最大匹配数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
-        标准化匹配列表。
+        标准化匹配列表；处理器搜索失败时返回 ``None``，由同一完整快照
+        Source 上的 raw scanner 接管。
 
     Raises:
         _DocCancelledError: 观察到 Host 取消时抛出。
@@ -1907,7 +2146,7 @@ def _search_via_processor(
         raise
     except Exception as exc:
         Log.warn(f"处理器搜索失败: {relative_path} - {exc}", module=MODULE)
-        return []
+        return None
 
     matches: list[JsonValue] = []
     for hit in hits:
@@ -1921,11 +2160,13 @@ def _search_via_processor(
                 "matched_line_content": None,
             }
         )
+        if len(matches) >= remaining:
+            break
     return matches
 
 
 def _search_via_line_scan(
-    file_path: Path,
+    source: Source,
     relative_path: str,
     query: str,
     remaining: int,
@@ -1934,7 +2175,7 @@ def _search_via_line_scan(
     """通过行扫描搜索文件内容。
 
     Args:
-        file_path: 文件绝对路径。
+        source: 已完成 EOF 快照的 Source。
         relative_path: 文件相对路径。
         query: 搜索关键词。
         remaining: 剩余可返回匹配数。
@@ -1947,40 +2188,337 @@ def _search_via_line_scan(
         _DocCancelledError: 观察到 Host 取消时抛出。
     """
 
-    query_lower = query.lower()
-    matches: list[dict[str, JsonValue]] = []
-    try:
-        _raise_if_doc_cancelled(cancellation_token)
-        with open(file_path, "r", encoding="utf-8") as file:
-            content = file.read()
-    except (UnicodeDecodeError, OSError):
-        return []
-
-    snippets = extract_query_anchored_snippets(content, query)
-    if not snippets:
-        return []
-
-    lines = content.split("\n")
-    snippet_idx = 0
-    for line_num, line in enumerate(lines, start=1):
-        _raise_if_doc_cancelled_at_interval(cancellation_token, line_num)
-        if query_lower not in line.lower():
+    for encoding in _READ_FILE_ENCODINGS:
+        try:
+            return _search_source_with_encoding(
+                source,
+                relative_path,
+                query,
+                remaining,
+                encoding,
+                cancellation_token,
+            )
+        except (UnicodeDecodeError, LookupError):
+            _raise_if_doc_cancelled(cancellation_token)
             continue
-        snippet_text = snippets[snippet_idx] if snippet_idx < len(snippets) else line.strip()[:150]
-        matches.append(
-            {
-                "file": relative_path,
-                "line_number": line_num,
-                "ref": None,
-                "section_title": None,
-                "snippet": snippet_text,
-                "matched_line_content": line.strip(),
-            }
-        )
-        snippet_idx += 1
-        if len(matches) >= remaining:
-            break
+        except OSError:
+            return []
+    return []
+
+
+def _read_bounded_text(
+    *,
+    snapshot: Source,
+    encodings: tuple[str, ...],
+    max_chars: int,
+    start_line: int,
+    end_line: int | None,
+    cancellation_token: CancellationToken,
+) -> _BoundedTextRead:
+    """用增量 decoder 与行扫描器读取完整快照 Source。
+
+    Args:
+        snapshot: 已完成 EOF 快照的 Source。
+        encodings: 按顺序尝试的文本编码。
+        max_chars: 允许返回的最大字符数。
+        start_line: 从 1 开始的起始行。
+        end_line: 可选结束行。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Returns:
+        自足表达截断与扫描完整性的结果。
+
+    Raises:
+        _DocFileAccessError: 所有编码均无法解码时抛出。
+        _DocCancelledError: 观察到 Host 取消时抛出。
+        OSError: Source 读取失败时抛出。
+    """
+
+    for encoding in encodings:
+        try:
+            return _read_source_with_encoding(
+                snapshot,
+                encoding,
+                max_chars,
+                start_line,
+                end_line,
+                cancellation_token,
+            )
+        except (UnicodeDecodeError, LookupError):
+            _raise_if_doc_cancelled(cancellation_token)
+            continue
+    raise _DocFileAccessError(
+        "",
+        snapshot.uri,
+        f"无法读取文件，尝试过的编码: {list(encodings)}",
+    )
+
+
+def _read_source_with_encoding(
+    source: Source,
+    encoding: str,
+    max_chars: int,
+    start_line: int,
+    end_line: int | None,
+    cancellation_token: CancellationToken,
+) -> _BoundedTextRead:
+    """使用单一编码增量扫描 Source 并执行字符预算。
+
+    Args:
+        source: 已完成 EOF 快照的 Source。
+        encoding: 当前文本编码。
+        max_chars: 允许返回的最大字符数。
+        start_line: 从 1 开始的起始行。
+        end_line: 可选结束行。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Returns:
+        当前编码下的扫描结果。
+
+    Raises:
+        UnicodeDecodeError: 当前编码无法解码时抛出。
+        LookupError: 编码名称不存在时抛出。
+        OSError: Source 读取失败时抛出。
+        _DocCancelledError: 观察到 Host 取消时抛出。
+    """
+
+    returned_parts: list[str] = []
+    returned_chars = 0
+    current_line = 1
+    saw_text = False
+    last_character_was_newline = False
+
+    for decoded in _iter_decoded_chunks(source, encoding, cancellation_token):
+        cursor = 0
+        while cursor < len(decoded):
+            newline_index = decoded.find("\n", cursor)
+            segment_end = len(decoded) if newline_index < 0 else newline_index + 1
+            segment = decoded[cursor:segment_end]
+            saw_text = True
+            selected = current_line >= start_line and (
+                end_line is None or current_line <= end_line
+            )
+            if selected:
+                remaining_with_probe = max_chars + 1 - returned_chars
+                if remaining_with_probe > 0:
+                    returned_parts.append(segment[:remaining_with_probe])
+                    returned_chars += min(len(segment), remaining_with_probe)
+                if returned_chars > max_chars:
+                    content = "".join(returned_parts)[:max_chars]
+                    return _BoundedTextRead(
+                        content=content,
+                        content_truncated=True,
+                        scan_complete=False,
+                        total_lines=None,
+                        line_range=(start_line, current_line),
+                    )
+            if newline_index >= 0:
+                current_line += 1
+                last_character_was_newline = True
+            else:
+                last_character_was_newline = False
+            cursor = segment_end
+        _raise_if_doc_cancelled(cancellation_token)
+
+    total_lines = (
+        0
+        if not saw_text
+        else current_line - 1
+        if last_character_was_newline
+        else current_line
+    )
+    actual_end_line = min(end_line if end_line is not None else total_lines, total_lines)
+    if start_line > total_lines:
+        actual_end_line = start_line - 1
+    return _BoundedTextRead(
+        content="".join(returned_parts),
+        content_truncated=False,
+        scan_complete=True,
+        total_lines=total_lines,
+        line_range=(start_line, actual_end_line),
+    )
+
+
+def _decode_snapshot_text(
+    source: Source,
+    encodings: tuple[str, ...],
+    cancellation_token: CancellationToken,
+) -> str | None:
+    """完整解码已复制到 EOF 的 Source 快照。
+
+    Args:
+        source: 已完成 EOF 快照的 Source。
+        encodings: 按顺序尝试的文本编码。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Returns:
+        解码文本；所有编码失败时返回 ``None``。
+
+    Raises:
+        OSError: Source 读取失败时抛出。
+        _DocCancelledError: 观察到 Host 取消时抛出。
+    """
+
+    for encoding in encodings:
+        try:
+            parts = list(_iter_decoded_chunks(source, encoding, cancellation_token))
+            return "".join(parts)
+        except (UnicodeDecodeError, LookupError):
+            _raise_if_doc_cancelled(cancellation_token)
+            continue
+    return None
+
+
+def _iter_decoded_chunks(
+    source: Source,
+    encoding: str,
+    cancellation_token: CancellationToken,
+) -> Iterator[str]:
+    """从 Source 产出增量解码文本块。
+
+    Args:
+        source: 已完成 EOF 快照的 Source。
+        encoding: 文本编码。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Yields:
+        非空解码文本块。
+
+    Raises:
+        UnicodeDecodeError: 当前编码无法解码时抛出。
+        LookupError: 编码名称不存在时抛出。
+        OSError: Source 读取失败时抛出。
+        _DocCancelledError: 观察到 Host 取消时抛出。
+    """
+
+    decoder_type = codecs.getincrementaldecoder(encoding)
+    decoder = decoder_type(errors="strict")
+    with source.open() as stream:
+        while True:
+            _raise_if_doc_cancelled(cancellation_token)
+            chunk = stream.read(_DOC_STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            decoded = decoder.decode(chunk, final=False)
+            if decoded:
+                yield decoded
+        final_text = decoder.decode(b"", final=True)
+        if final_text:
+            yield final_text
+    _raise_if_doc_cancelled(cancellation_token)
+
+
+def _search_source_with_encoding(
+    source: Source,
+    relative_path: str,
+    query: str,
+    remaining: int,
+    encoding: str,
+    cancellation_token: CancellationToken,
+) -> list[dict[str, JsonValue]]:
+    """使用单一编码增量搜索完整快照 Source。
+
+    Args:
+        source: 已完成 EOF 快照的 Source。
+        relative_path: 文件相对路径。
+        query: 搜索关键词。
+        remaining: 剩余可返回匹配数。
+        encoding: 当前文本编码。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Returns:
+        至多 ``remaining`` 个有界匹配投影。
+
+    Raises:
+        UnicodeDecodeError: 当前编码无法解码时抛出。
+        LookupError: 编码名称不存在时抛出。
+        OSError: Source 读取失败时抛出。
+        _DocCancelledError: 观察到 Host 取消时抛出。
+    """
+
+    if remaining <= 0 or not query:
+        return []
+    query_lower = query.lower()
+    tail = ""
+    line_number = 1
+    matches: list[dict[str, JsonValue]] = []
+    for decoded in _iter_decoded_chunks(source, encoding, cancellation_token):
+        fragments = decoded.split("\n")
+        for index, fragment in enumerate(fragments):
+            tail, new_matches = _search_line_fragment(
+                relative_path=relative_path,
+                line_number=line_number,
+                tail=tail,
+                fragment=fragment,
+                query_lower=query_lower,
+                remaining=remaining - len(matches),
+            )
+            matches.extend(new_matches)
+            if len(matches) >= remaining:
+                return matches
+            if index < len(fragments) - 1:
+                line_number += 1
+                tail = ""
+        _raise_if_doc_cancelled(cancellation_token)
     return matches
+
+
+def _search_line_fragment(
+    *,
+    relative_path: str,
+    line_number: int,
+    tail: str,
+    fragment: str,
+    query_lower: str,
+    remaining: int,
+) -> tuple[str, list[dict[str, JsonValue]]]:
+    """在单行流式片段中查找新增匹配并保留有界尾窗。
+
+    Args:
+        relative_path: 文件相对路径。
+        line_number: 当前行号。
+        tail: 前一片段保留的有界尾窗。
+        fragment: 当前新增文本片段。
+        query_lower: 已小写的搜索关键词。
+        remaining: 当前片段最多可返回的匹配数。
+
+    Returns:
+        新尾窗与新增匹配列表。
+
+    Raises:
+        无。
+    """
+
+    combined = tail + fragment
+    lowered = combined.lower()
+    previous_length = len(tail)
+    query_length = len(query_lower)
+    matches: list[dict[str, JsonValue]] = []
+    search_from = 0
+    while remaining > len(matches):
+        match_index = lowered.find(query_lower, search_from)
+        if match_index < 0:
+            break
+        match_end = match_index + query_length
+        if match_end > previous_length:
+            excerpt_start = max(0, match_index - _DOC_SEARCH_EXCERPT_CHARS // 2)
+            excerpt = combined[
+                excerpt_start : excerpt_start + _DOC_SEARCH_EXCERPT_CHARS
+            ].strip()
+            matches.append(
+                {
+                    "file": relative_path,
+                    "line_number": line_number,
+                    "ref": None,
+                    "section_title": None,
+                    "snippet": excerpt,
+                    "matched_line_content": excerpt,
+                }
+            )
+        search_from = match_index + max(1, query_length)
+
+    tail_chars = max(query_length - 1, _DOC_SEARCH_EXCERPT_CHARS // 2)
+    return combined[-tail_chars:], matches
 
 
 def _raise_if_doc_cancelled_at_interval(
@@ -2092,7 +2630,7 @@ def _doc_cancelled() -> ToolBusinessCancelled:
         无。
     """
 
-    return ToolBusinessCancelled(message="文档工具调用已被宿主取消。", hint=_DOC_CANCELLED_HINT)
+    return ToolBusinessCancelled(message="文档工具调用已停止。", hint=_DOC_CANCELLED_HINT)
 
 
 def _cancelled_outcome(

@@ -18,6 +18,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import EnsureSessionRequest, HostMetadataEntry, RunStatus
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
@@ -371,7 +372,7 @@ def _seed_running_dispatching_run(
                 source="pytest",
                 idempotency_key="request-recovery-dispatch",
                 execution_target="local-default",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

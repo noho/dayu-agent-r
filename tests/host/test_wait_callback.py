@@ -35,6 +35,11 @@ from dayu.host.command import (
 )
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
+from dayu.host.durable.state import (
+    WaitRecordRow,
+    WaitRecordStatus,
+    read_wait_record_by_id,
+)
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.wait_callback import (
     CallbackWaitResolvePort,
@@ -366,10 +371,10 @@ def test_pre_existing_lost_wait_maps_to_late_lost(tmp_path: Path) -> None:
         host.close()
 
 
-def test_stale_callback_with_deadline_returns_stale_without_event_append(
+def test_expired_callback_is_rejected_by_resolve_owner(
     tmp_path: Path,
 ) -> None:
-    """deadline 已过的 callback 返回 stale 且不追加 EventLog。"""
+    """deadline 已过的 callback 由 resolve owner 拒绝并记录 late diagnostic。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -379,14 +384,20 @@ def test_stale_callback_with_deadline_returns_stale_without_event_append(
             seeded.wait_id,
             datetime(2026, 5, 16, 1, 5, 5, tzinfo=UTC),
         )
-        before_events = _events(host._transaction_runner())
-
         result = _real_adapter(host).resolve_callback(
             _envelope(seeded.wait_id, "stale-callback")
         )
 
-        assert result.status is WaitCallbackAdapterStatus.STALE_CALLBACK
-        assert _events(host._transaction_runner()) == before_events
+        wait_record = host._transaction_runner().run_read(
+            lambda transaction: _read_wait_row(transaction, seeded.wait_id)
+        )
+        late_events = _events_by_type(
+            _events(host._transaction_runner()), "WAIT_LATE_RESULT_REJECTED"
+        )
+        assert result.status is WaitCallbackAdapterStatus.INVALID_WAIT_STATE
+        assert wait_record is not None
+        assert wait_record.status is WaitRecordStatus.FAILED
+        assert len(late_events) == 1
     finally:
         host.close()
 
@@ -407,29 +418,30 @@ def test_wait_without_deadline_or_expires_is_not_stale(tmp_path: Path) -> None:
         host.close()
 
 
-def test_invalid_stored_deadline_maps_to_invalid_wait_state_without_resolver_call() -> None:
-    """非法持久化 deadline 边界返回 INVALID_WAIT_STATE 且不调用 resolver。"""
+def test_invalid_stored_deadline_is_failed_closed_by_resolve_owner(
+    tmp_path: Path,
+) -> None:
+    """非法持久化 deadline 由 resolve owner fail closed，不由 callback 预解析。"""
 
-    resolver = _FailIfCalledResolver()
-    adapter = DefaultWaitCallbackAdapter(
-        authenticator=_AcceptingAuthenticator(),
-        state_reader=_FakeStateReader(
-            WaitCallbackStoredWaitState(
-                status=WaitCallbackStoredWaitStatus.WAITING,
-                deadline_at="2026-05-16T01:05:05.000000+00:00",
-                expires_at=None,
-            )
-        ),
-        resolver=resolver,
-    )
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_wait_deadline_text(host, seeded.wait_id, "not-a-timestamp")
+        before_events = _events(host._transaction_runner())
 
-    result = adapter.resolve_callback(
-        _envelope("wait-invalid-deadline", "invalid-deadline")
-    )
+        result = _real_adapter(host).resolve_callback(
+            _envelope(seeded.wait_id, "invalid-deadline")
+        )
 
-    assert result.status is WaitCallbackAdapterStatus.INVALID_WAIT_STATE
-    assert result.diagnostic_code == "invalid_wait_time_boundary"
-    assert resolver.calls == 0
+        wait_record = host._transaction_runner().run_read(
+            lambda transaction: _read_wait_row(transaction, seeded.wait_id)
+        )
+        assert result.status is WaitCallbackAdapterStatus.INVALID_WAIT_STATE
+        assert wait_record is not None
+        assert wait_record.status is WaitRecordStatus.WAITING
+        assert _events(host._transaction_runner()) == before_events
+    finally:
+        host.close()
 
 
 def test_digest_mismatch_returns_without_resolver_call() -> None:
@@ -583,8 +595,24 @@ def _set_wait_deadline(
     :returns: ``None``。
     """
 
+    _set_wait_deadline_text(host, wait_id, format_utc_timestamp(deadline))
+
+
+def _set_wait_deadline_text(
+    host: HostCommandHandle,
+    wait_id: str,
+    deadline_text: str,
+) -> None:
+    """更新测试 wait record deadline 原始文本。
+
+    :param host: Host command handle。
+    :param wait_id: wait id。
+    :param deadline_text: deadline 原始文本。
+    :returns: ``None``。
+    """
+
     def _operation(transaction: HostTransaction) -> None:
-        """执行 deadline 更新。
+        """执行 deadline 文本更新。
 
         :param transaction: Host transaction。
         :returns: ``None``。
@@ -592,7 +620,20 @@ def _set_wait_deadline(
 
         transaction.execute(
             f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET deadline_at = ? WHERE wait_id = ?",
-            (format_utc_timestamp(deadline), wait_id),
+            (deadline_text, wait_id),
         )
 
     host._transaction_runner().run_write(_operation)
+
+
+def _read_wait_row(
+    transaction: HostTransaction, wait_id: str
+) -> WaitRecordRow | None:
+    """读取 wait record row。
+
+    :param transaction: 当前 Host transaction。
+    :param wait_id: wait id。
+    :returns: wait record；不存在时为 ``None``。
+    """
+
+    return read_wait_record_by_id(transaction, wait_id)

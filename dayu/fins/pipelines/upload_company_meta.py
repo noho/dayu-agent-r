@@ -1,7 +1,7 @@
 """上传场景公司元数据写入助手。
 
-本模块聚合 upload 相关的 company meta 写入逻辑，保持 OLD create/update
-场景的公司元数据解析与已存在 meta 优先规则。
+本模块聚合 upload 相关的 company meta 写入逻辑，以 upload resolver
+版本作为既有元数据 freshness 真源。
 """
 
 from __future__ import annotations
@@ -9,9 +9,9 @@ from __future__ import annotations
 from typing import Final
 
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
-from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id
+from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id, try_normalize_ticker
 
 UPLOAD_ACTIONS_REQUIRING_COMPANY_META: Final[frozenset[str]] = frozenset({"create", "update"})
 RESOLVER_VERSION: Final[str] = "market_resolver_v1.0.0"
@@ -26,6 +26,7 @@ def upsert_company_meta_for_upload(
     company_id: str | None,
     company_name: str | None,
     ticker_aliases: list[str] | None = None,
+    batch: BatchToken,
 ) -> None:
     """在上传链路中按规则写入公司级元数据。
 
@@ -36,6 +37,7 @@ def upsert_company_meta_for_upload(
         company_id: 兼容既有调用方的可选字段；上传链路不会把它作为身份真源。
         company_name: 公司名称。
         ticker_aliases: 可选 ticker alias 列表。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         无。
@@ -50,7 +52,10 @@ def upsert_company_meta_for_upload(
         return
 
     existing_meta = _load_existing_company_meta(repository=repository, ticker=ticker)
-    if existing_meta is not None:
+    if existing_meta is not None and _existing_company_meta_is_fresh(
+        existing_meta=existing_meta,
+        resolver_version=RESOLVER_VERSION,
+    ):
         _warn_ignored_company_meta_args(
             ticker=existing_meta.ticker,
             company_id=company_id,
@@ -77,7 +82,8 @@ def upsert_company_meta_for_upload(
             resolver_version=RESOLVER_VERSION,
             updated_at=now_iso8601(),
             ticker_aliases=normalized_ticker_aliases,
-        )
+        ),
+        batch=batch,
     )
 
 
@@ -154,22 +160,46 @@ def _normalize_ticker_aliases(
         ticker_aliases: 原始 alias 列表。
 
     Returns:
-        去重后的大写 ticker 列表，且首项始终为规范 ticker。
+        去重后的 canonical ticker 列表，且首项始终为规范 ticker。
+
+    Raises:
+        ValueError: canonical ticker 或任一非空 alias 无法识别时抛出。
+    """
+
+    canonical_profile = try_normalize_ticker(canonical_ticker)
+    if canonical_profile is None:
+        raise ValueError(f"无法识别 canonical ticker: {canonical_ticker!r}")
+    normalized_canonical = canonical_profile.canonical
+    normalized_aliases: list[str] = []
+    for raw_alias in [normalized_canonical, *(ticker_aliases or [])]:
+        alias_text = raw_alias.strip()
+        if not alias_text:
+            continue
+        alias_profile = try_normalize_ticker(alias_text)
+        if alias_profile is None:
+            raise ValueError(f"无法识别 ticker alias: {raw_alias!r}")
+        normalized_alias = alias_profile.canonical
+        if normalized_alias in normalized_aliases:
+            continue
+        normalized_aliases.append(normalized_alias)
+    return normalized_aliases
+
+
+def _existing_company_meta_is_fresh(*, existing_meta: CompanyMeta, resolver_version: str) -> bool:
+    """判断既有 upload company meta 是否由当前 resolver 语义产生。
+
+    Args:
+        existing_meta: 仓储中已存在的公司元数据。
+        resolver_version: 当前 upload company identity resolver 版本。
+
+    Returns:
+        当既有元数据的 resolver 版本与当前版本一致时返回 ``True``。
 
     Raises:
         无。
     """
 
-    normalized_canonical = str(canonical_ticker).strip().upper()
-    normalized_aliases: list[str] = []
-    for raw_alias in [normalized_canonical, *(ticker_aliases or [])]:
-        normalized_alias = str(raw_alias).strip().upper()
-        if not normalized_alias:
-            continue
-        if normalized_alias in normalized_aliases:
-            continue
-        normalized_aliases.append(normalized_alias)
-    return normalized_aliases
+    return existing_meta.resolver_version == resolver_version
 
 
 def _warn_ignored_company_meta_args(

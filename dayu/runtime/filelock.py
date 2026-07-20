@@ -13,7 +13,9 @@ from pathlib import Path
 from types import TracebackType
 from typing import Final
 
-from filelock import FileLock, Timeout
+from filelock import BaseFileLock, FileLock, Timeout
+
+from dayu.runtime.numeric import is_non_negative_finite_number
 
 _THIRD_PARTY_DEFAULT_TIMEOUT_SECONDS: Final[float] = -1.0
 _LOGGER = logging.getLogger(__name__)
@@ -72,9 +74,9 @@ class RuntimeFileLockToken:
 
     lock_path: Path
     _release_completed: bool
-    _third_party_lock: FileLock = field(repr=False, compare=False)
+    _third_party_lock: BaseFileLock = field(repr=False, compare=False)
 
-    def __init__(self, *, lock_path: Path, third_party_lock: FileLock) -> None:
+    def __init__(self, *, lock_path: Path, third_party_lock: BaseFileLock) -> None:
         """初始化文件锁 token。
 
         :param lock_path: 已获取的 lock file 路径。
@@ -127,7 +129,7 @@ class RuntimeFileLock:
     __slots__ = ("_context_token", "_third_party_lock", "options")
 
     options: RuntimeFileLockOptions
-    _third_party_lock: FileLock
+    _third_party_lock: BaseFileLock
     _context_token: RuntimeFileLockToken | None
 
     def __init__(self, options: RuntimeFileLockOptions) -> None:
@@ -250,7 +252,7 @@ def _effective_timeout_seconds(
     :param timeout_seconds: 本次 acquire timeout。
     :param default_timeout_seconds: wrapper 默认 timeout。
     :returns: 第三方 FileLock timeout；``-1`` 表示使用其默认无限等待语义。
-    :raises RuntimeFileLockError: timeout 为负数时抛出。
+    :raises RuntimeFileLockError: timeout 为负数、NaN 或无穷时抛出。
     """
 
     selected = timeout_seconds if timeout_seconds is not None else default_timeout_seconds
@@ -318,8 +320,8 @@ def _validate_timeout_seconds(timeout_seconds: float | None) -> None:
     :raises RuntimeFileLockError: timeout 为负数时抛出。
     """
 
-    if timeout_seconds is not None and timeout_seconds < 0:
-        raise RuntimeFileLockError("runtime file lock timeout_seconds 不能为负数")
+    if timeout_seconds is not None and not is_non_negative_finite_number(timeout_seconds):
+        raise RuntimeFileLockError("runtime file lock timeout_seconds 必须为有限非负数")
 
 
 __all__ = [

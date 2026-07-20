@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
-import pandas as pd
 from edgar.documents import HTMLParser, ParserConfig
 from edgar.documents.exceptions import DocumentTooLargeError
 from edgar.xbrl import XBRL
@@ -30,11 +30,14 @@ from dayu.documents.processors.base import (
     TableSummary,
     build_table_content,
 )
-from .financial_base import (
-    FinancialMeta,
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.financial_result_contract import (
     FinancialStatementResult,
-    XbrlFactsResult,
+    determine_financial_statement_quality,
 )
+from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult, XbrlQueryParams
+from .financial_base import FinancialMeta
 from dayu.documents.processors.text_utils import (
     append_missing_table_placeholders as _append_missing_placeholders,
     infer_suffix_from_uri as _infer_suffix_from_uri,
@@ -44,7 +47,7 @@ from dayu.documents.processors.source import Source
 from dayu.documents.processors.perf_utils import ProcessorStageProfiler, is_processor_profile_enabled
 from dayu.fins.xbrl_file_discovery import discover_xbrl_files
 from dayu.fins._log import Log
-from dayu.fins.processors.form_type_utils import normalize_form_type as _normalize_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_processor_sec_form
 
 # --- 子模块导入 ---
 from dayu.fins.processors.sec_xbrl_query import (
@@ -53,13 +56,13 @@ from dayu.fins.processors.sec_xbrl_query import (
     _build_statement_rows,
     _extract_period_columns,
     _infer_currency_from_units,
+    _infer_period_semantics_from_xbrl_query,
     _infer_scale_from_xbrl_query,
     _infer_units_from_xbrl_query,
     _infer_xbrl_taxonomy,
     _normalize_fact_row,
     _normalize_query_statement_type,
     _query_facts_rows,
-    build_statement_locator,
 )
 from dayu.fins.processors.sec_section_build import (
     _SectionBlock,
@@ -78,6 +81,7 @@ from dayu.fins.processors.sec_table_extraction import (
     _safe_statement_dataframe,
     _should_prioritize_records_output,
 )
+from dayu.fins.processors.source_text import read_source_path_text
 
 
 # --- 本模块独用常量 ---
@@ -138,7 +142,7 @@ class SecProcessor:
         """
 
         self._source = source
-        self._form_type = _normalize_form_type(form_type)
+        self._form_type = _parse_processor_sec_form(form_type)
         self._media_type = media_type or source.media_type
         self._profiler = ProcessorStageProfiler(
             component=self.__class__.__name__,
@@ -266,7 +270,7 @@ class SecProcessor:
             OSError: 文件访问失败时可能抛出。
         """
 
-        normalized_form = _normalize_form_type(form_type)
+        normalized_form = _parse_processor_sec_form(form_type)
         if normalized_form is None:
             return False
         # 设计约束：6-K 统一路由到 BSProcessor，避免 edgartools 分段结果
@@ -572,7 +576,7 @@ class SecProcessor:
     def get_financial_statement(
         self,
         statement_type: str,
-        financials: Optional[dict[str, Any]] = None,
+        financials: Mapping[str, JsonValue] | None = None,
         *,
         meta: Optional[FinancialMeta] = None,
     ) -> FinancialStatementResult:
@@ -603,9 +607,9 @@ class SecProcessor:
             "units": None,
             "scale": None,
             "data_quality": "partial",
+            "reason": "unsupported_statement_type",
         }
         if method_name is None:
-            base_result["reason"] = "unsupported_statement_type"
             return base_result
 
         xbrl = self._get_xbrl()
@@ -616,7 +620,7 @@ class SecProcessor:
         statements = getattr(xbrl, "statements", None)
         method = getattr(statements, method_name, None)
         if not callable(method):
-            base_result["reason"] = "statement_method_missing"
+            base_result["reason"] = "statement_not_found"
             return base_result
 
         statement_obj = method()
@@ -626,30 +630,46 @@ class SecProcessor:
 
         statement_df = _safe_statement_dataframe(statement_obj)
         if statement_df is None or statement_df.empty:
-            base_result["reason"] = "statement_empty"
+            base_result["reason"] = "statement_not_found"
             return base_result
 
         period_columns = _extract_period_columns(statement_df.columns)
         rows = _build_statement_rows(statement_df, period_columns)
-        periods = [_build_period_summary(period) for period in period_columns]
+        period_evidence = _infer_period_semantics_from_xbrl_query(xbrl, period_columns)
+        periods = [
+            _build_period_summary(
+                period,
+                fiscal_year=(period_evidence[period][0] if period in period_evidence else None),
+                fiscal_period=(period_evidence[period][1] if period in period_evidence else None),
+            )
+            for period in period_columns
+        ]
         units = _infer_units_from_xbrl_query(xbrl)
         currency = _infer_currency_from_units(units)
-        scale = _infer_scale_from_xbrl_query(xbrl)
+        scale_outcome = _infer_scale_from_xbrl_query(xbrl)
+        scale = None if scale_outcome.query_failed else scale_outcome.scale
+        if not rows:
+            base_result["reason"] = "statement_not_found"
+            return base_result
+        quality = determine_financial_statement_quality(
+            rows=rows,
+            periods=periods,
+            scale=scale,
+            complete_quality="xbrl",
+        )
 
-        return {
-            "statement_type": statement_type,
-            "periods": periods,
-            "rows": rows,
-            "currency": currency,
-            "units": units,
-            "scale": scale,
-            "data_quality": "xbrl" if rows else "partial",
-            "statement_locator": build_statement_locator(
-                statement_type=statement_type,
-                periods=periods,
-                rows=rows,
-            ),
-        }
+        result = FinancialStatementResult(
+            statement_type=statement_type,
+            periods=periods,
+            rows=rows,
+            currency=currency,
+            units=units,
+            scale=scale,
+            data_quality=quality.data_quality,
+        )
+        if quality.reason is not None:
+            result["reason"] = quality.reason
+        return result
 
     def query_xbrl_facts(
         self,
@@ -657,9 +677,9 @@ class SecProcessor:
         statement_type: Optional[str] = None,
         period_end: Optional[str] = None,
         fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        min_value: Optional[float] = None,
-        max_value: Optional[float] = None,
+        fiscal_period: FiscalPeriod | None = None,
+        min_value: int | float | None = None,
+        max_value: int | float | None = None,
     ) -> XbrlFactsResult:
         """查询 XBRL facts。
 
@@ -681,35 +701,32 @@ class SecProcessor:
 
         normalized_concepts = [str(item).strip() for item in concepts if str(item).strip()]
         normalized_statement_type = _normalize_query_statement_type(statement_type)
-        query_params = {
-            "concepts": normalized_concepts,
-            "statement_type": normalized_statement_type or statement_type,
-            "filters_applied": {
-                "period_end": period_end,
-                "fiscal_year": fiscal_year,
-                "fiscal_period": fiscal_period,
-                "min_value": min_value,
-                "max_value": max_value,
-            },
-        }
         if not normalized_concepts:
-            return {
-                "query_params": query_params,
-                "facts": [],
-                "total": 0,
-            }
+            raise ValueError("XBRL concepts 不能为空")
+        query_params = XbrlQueryParams(concepts=list(normalized_concepts))
+        if normalized_statement_type is not None:
+            query_params["statement_type"] = normalized_statement_type
+        if period_end is not None:
+            query_params["period_end"] = period_end
+        if fiscal_year is not None:
+            query_params["fiscal_year"] = fiscal_year
+        if fiscal_period is not None:
+            query_params["fiscal_period"] = fiscal_period
+        if min_value is not None:
+            query_params["min_value"] = min_value
+        if max_value is not None:
+            query_params["max_value"] = max_value
 
         xbrl = self._get_xbrl()
         if xbrl is None:
             return {
                 "query_params": query_params,
                 "facts": [],
-                "total": 0,
                 "data_quality": "partial",
                 "reason": "xbrl_not_available",
             }
 
-        rows = _query_facts_rows(
+        summary = _query_facts_rows(
             xbrl=xbrl,
             concepts=normalized_concepts,
             statement_type=normalized_statement_type,
@@ -719,12 +736,16 @@ class SecProcessor:
             min_value=min_value,
             max_value=max_value,
         )
-        facts = [_normalize_fact_row(row) for row in rows]
-        return {
-            "query_params": query_params,
-            "facts": facts,
-            "total": len(facts),
-        }
+        facts = [_normalize_fact_row(row) for row in summary.rows]
+        is_partial = bool(summary.failed_concepts)
+        result = XbrlFactsResult(
+            query_params=query_params,
+            facts=facts,
+            data_quality="partial" if is_partial else "xbrl",
+        )
+        if is_partial:
+            result["reason"] = "query_partially_failed"
+        return result
 
     def _get_xbrl(self) -> Optional[XBRL]:
         """延迟加载并缓存 XBRL 对象。
@@ -852,7 +873,7 @@ def _load_text(source_path: Path) -> str:
         文本内容。
 
     Raises:
-        OSError: 读取失败时抛出。
+        FinsSourceDecodeError: 读取失败或内容不是合法 UTF-8 时抛出。
     """
 
-    return source_path.read_text(encoding="utf-8", errors="ignore")
+    return read_source_path_text(source_path)

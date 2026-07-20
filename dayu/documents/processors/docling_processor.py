@@ -11,9 +11,10 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Final, Optional, Protocol, TypeVar, cast, overload
 
 import pandas as pd
+from docling_core.types.doc.document import TextItem
 
 if TYPE_CHECKING:
     from docling_core.types.doc.document import DoclingDocument, NodeItem, TableItem
@@ -47,8 +48,15 @@ from .perf_utils import ProcessorStageProfiler, is_processor_profile_enabled
 
 _LOW_INFO_TOKENS = {"", "-", "--", "—", "n/a", "na", "none", "nil"}
 _SECTION_CONTENT_CACHE_MAX_ENTRIES = 256
+_DOCLING_DOCUMENT_ROOT_REF: Final[str] = "#"
 
 _CellValueT = TypeVar("_CellValueT")
+
+
+class _DoclingLabelValue(Protocol):
+    """Docling label enum 的值协议。"""
+
+    value: str
 
 
 @dataclass
@@ -158,9 +166,7 @@ class DoclingProcessor:
         self._section_by_ref = {section.ref: section for section in self._sections}
         self._table_by_ref = {table.table_ref: table for table in self._tables}
         self._table_ref_by_internal_ref = {
-            table.internal_ref: table.table_ref
-            for table in self._tables
-            if table.internal_ref
+            table.internal_ref: table.table_ref for table in self._tables if table.internal_ref
         }
         self._section_content_cache: OrderedDict[str, tuple[tuple[str, ...], str]] = OrderedDict()
         self._full_text_cache: Optional[str] = None
@@ -398,11 +404,7 @@ class DoclingProcessor:
         if within_ref is not None and within_ref not in self._section_by_ref:
             return []
 
-        target_sections = (
-            [self._section_by_ref[within_ref]]
-            if within_ref is not None
-            else self._sections
-        )
+        target_sections = [self._section_by_ref[within_ref]] if within_ref is not None else self._sections
         hits_raw: list[SearchHit] = []
         section_content_map: dict[str, str] = {}
         with self._profiler.stage("search"):
@@ -462,7 +464,7 @@ class DoclingProcessor:
         if cached_entry is not None and cached_entry[0] == cache_key_refs:
             self._section_content_cache.move_to_end(section.ref, last=True)
             return cached_entry[1]
-        section_items = self._linear_items[section.start_index:section.end_index]
+        section_items = self._linear_items[section.start_index : section.end_index]
         rendered = _render_section_content(
             section_items=section_items,
             table_ref_by_internal_ref=self._table_ref_by_internal_ref,
@@ -625,7 +627,7 @@ def _build_tables(
         row_count, col_count = _resolve_table_dimensions(table_item, document)
         headers = _extract_table_headers(table_item, document)
         context_before = _extract_table_context_before(table_item, linear_items)
-        caption = _extract_table_caption(table_item)
+        caption = _extract_table_caption(table_item, document)
         table_type = _classify_table_type(
             row_count=row_count,
             col_count=col_count,
@@ -666,9 +668,7 @@ def _build_sections(linear_items: list[_LinearItem], table_internal_ref_map: dic
     """
 
     header_indices = [
-        item.index
-        for item in linear_items
-        if item.item_type == "text" and item.label == "section_header"
+        item.index for item in linear_items if item.item_type == "text" and item.label == "section_header"
     ]
 
     if not linear_items:
@@ -850,10 +850,7 @@ def _render_records_table(
     records = table_df.to_dict(orient="records")
     normalized_records: list[dict[str, Any]] = []
     for row in records:
-        normalized_row = {
-            str(key): _normalize_cell_value(value)
-            for key, value in row.items()
-        }
+        normalized_row = {str(key): _normalize_cell_value(value) for key, value in row.items()}
         normalized_records.append(normalized_row)
     return {
         "columns": columns,
@@ -1055,7 +1052,7 @@ def _extract_page_no(item: NodeItem) -> Optional[int]:
     return None
 
 
-def _normalize_label(raw_label: object) -> Optional[str]:
+def _normalize_label(raw_label: str | _DoclingLabelValue | None) -> Optional[str]:
     """标准化 item 标签。
 
     Args:
@@ -1070,8 +1067,8 @@ def _normalize_label(raw_label: object) -> Optional[str]:
 
     if raw_label is None:
         return None
-    if hasattr(raw_label, "value"):
-        raw_label = getattr(raw_label, "value")
+    if not isinstance(raw_label, str):
+        raw_label = raw_label.value
     normalized = _normalize_optional_string(raw_label)
     if normalized is None:
         return None
@@ -1174,24 +1171,40 @@ def _extract_table_headers(
     return _deduplicate_headers(normalized_columns[:10])
 
 
-def _extract_table_caption(table_item: TableItem) -> Optional[str]:
+def _extract_table_caption(
+    table_item: TableItem,
+    document: DoclingDocument,
+) -> Optional[str]:
     """提取表格标题。
 
     Args:
         table_item: 表格对象。
+        document: 与表格对象同源的 Docling 文档。
 
     Returns:
         标题字符串；不存在时返回 `None`。
 
     Raises:
-        RuntimeError: 提取失败时抛出。
+        无。
     """
 
-    caption_obj = getattr(table_item, "caption", None)
-    if caption_obj is None:
-        return None
-    caption_text = getattr(caption_obj, "text", caption_obj)
-    return _normalize_optional_string(caption_text)
+    captions: list[str] = []
+    seen: set[str] = set()
+    for caption_ref in table_item.captions:
+        if caption_ref.cref == _DOCLING_DOCUMENT_ROOT_REF:
+            continue
+        try:
+            resolved = caption_ref.resolve(document)
+        except (AttributeError, IndexError):
+            continue
+        if not isinstance(resolved, TextItem):
+            continue
+        caption = _normalize_whitespace(resolved.text)
+        if not caption or caption in seen:
+            continue
+        seen.add(caption)
+        captions.append(caption)
+    return " ".join(captions) or None
 
 
 def _extract_table_context_before(
@@ -1449,12 +1462,8 @@ def _build_page_section_preview(
         RuntimeError: 构建失败时抛出。
     """
 
-    scoped_items = linear_items[section.start_index:section.end_index]
-    page_items = [
-        item
-        for item in scoped_items
-        if isinstance(item.page_no, int) and item.page_no == page_no
-    ]
+    scoped_items = linear_items[section.start_index : section.end_index]
+    page_items = [item for item in scoped_items if isinstance(item.page_no, int) and item.page_no == page_no]
     if not page_items:
         return ""
     rendered = _render_section_content(
@@ -1593,8 +1602,6 @@ def _safe_table_dataframe(
     return None
 
 
-
-
 def _classify_table_type(
     *,
     row_count: int,
@@ -1627,23 +1634,19 @@ def _classify_table_type(
 
 
 @overload
-def _normalize_cell_value(value: None) -> None:
-    ...
+def _normalize_cell_value(value: None) -> None: ...
 
 
 @overload
-def _normalize_cell_value(value: str) -> str | None:
-    ...
+def _normalize_cell_value(value: str) -> str | None: ...
 
 
 @overload
-def _normalize_cell_value(value: float) -> float | None:
-    ...
+def _normalize_cell_value(value: float) -> float | None: ...
 
 
 @overload
-def _normalize_cell_value(value: _CellValueT) -> _CellValueT | None:
-    ...
+def _normalize_cell_value(value: _CellValueT) -> _CellValueT | None: ...
 
 
 def _normalize_cell_value(value: _CellValueT | str | float | None) -> _CellValueT | str | float | None:
@@ -1788,8 +1791,7 @@ def _looks_like_docling_payload(payload: Any) -> bool:
     if "body" not in payload:
         return False
     has_core_array = any(
-        key in payload and isinstance(payload.get(key), list)
-        for key in ("texts", "tables", "pictures", "groups")
+        key in payload and isinstance(payload.get(key), list) for key in ("texts", "tables", "pictures", "groups")
     )
     has_pages = isinstance(payload.get("pages"), (dict, list))
     return has_core_array and has_pages

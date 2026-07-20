@@ -31,6 +31,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEvent,
     RunnerEventType,
+    RunnerProviderDiagnosticData,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.runner import (
@@ -40,9 +41,9 @@ from dayu.engine.runners.openai.runner import (
     _is_sse_response,
 )
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeResponseSpec,
     FakeSession,
 )
@@ -99,7 +100,7 @@ def _install_session(
 def _agent_request(
     *,
     spec: RunnerSpec,
-    token: FakeCancellationToken,
+    token: ControllableCancellationToken,
     stream: bool,
 ) -> AgentRunRequest:
     """构造 OpenAI Runner 到 Agent 的集成测试请求。
@@ -128,6 +129,8 @@ def _agent_request(
             continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),
@@ -157,7 +160,7 @@ async def _collect_agent_events(
     *,
     runner: AsyncOpenAIRunner,
     spec: RunnerSpec,
-    token: FakeCancellationToken,
+    token: ControllableCancellationToken,
     stream: bool,
 ) -> list[EngineEvent]:
     """通过 Agent 执行 OpenAI Runner 并收集 EngineEvent。
@@ -220,7 +223,7 @@ async def test_supports_streaming_false_downgrades_payload_to_non_stream() -> No
 
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=False, supports_stream_usage=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -340,7 +343,7 @@ async def test_sse_success_provider_request_id_reaches_agent_iteration_completed
     """SSE 正常成功响应的 request id 会传到 Agent iteration_completed。"""
 
     spec = make_spec(supports_streaming=True)
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     runner = AsyncOpenAIRunner(spec=spec, cancellation_token=token)
     session = FakeSession()
     session.enqueue_response(
@@ -378,7 +381,7 @@ async def test_stream_true_json_content_type_uses_non_stream_parser() -> None:
 
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -420,7 +423,7 @@ async def test_stream_true_missing_content_type_falls_back_to_sse(
     )
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -439,14 +442,79 @@ async def test_stream_true_missing_content_type_falls_back_to_sse(
     events = await _collect(runner)
 
     assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_DIAGNOSTIC,
         RunnerEventType.RUNNER_CONTENT_DELTA,
         RunnerEventType.RUNNER_CONTENT_COMPLETED,
         RunnerEventType.RUNNER_DONE,
     ]
-    assert isinstance(events[1].data, RunnerContentCompletedData)
-    assert events[1].data.content == "hi"
+    diagnostic = events[0].data
+    assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "runner.http.missing_content_type"
+    assert diagnostic.provider_request_id == "req_missing_content_type"
+    assert diagnostic.raw_payload == {
+        "stream_requested": True,
+        "fallback_parse_mode": "sse_fallback",
+    }
+    assert isinstance(events[2].data, RunnerContentCompletedData)
+    assert events[2].data.content == "hi"
+    assert isinstance(events[3].data, RunnerDoneData)
+    assert events[3].data.provider_request_id == "req_missing_content_type"
+    assert "runner.http.missing_content_type" in caplog.text
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_non_stream_missing_content_type_keeps_json_parse_with_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """stream=False 且缺 Content-Type 时仍按 JSON 解析并产出诊断。"""
+
+    caplog.set_level(
+        "WARNING", logger="dayu.engine.runners.openai.runner"
+    )
+    runner = AsyncOpenAIRunner(
+        spec=make_spec(supports_streaming=True),
+        cancellation_token=ControllableCancellationToken(),
+    )
+    session = FakeSession()
+    session.enqueue_response(
+        FakeResponseSpec(
+            status=200,
+            headers={"x-request-id": "req_missing_json_content_type"},
+            body_chunks=[
+                b'{"choices":[{"message":{"role":"assistant",'
+                b'"content":"json"},"finish_reason":"stop"}]}'
+            ],
+        )
+    )
+    _install_session(runner, session)
+
+    events: list[RunnerEvent] = []
+    async for event in runner.call(
+        messages=[UserMessage(role=AgentMessageRole.USER, content="hi")],
+        options=make_options(stream=False),
+        tools=[],
+    ):
+        events.append(event)
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_DIAGNOSTIC,
+        RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    diagnostic = events[0].data
+    assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "runner.http.missing_content_type"
+    assert diagnostic.provider_request_id == "req_missing_json_content_type"
+    assert diagnostic.raw_payload == {
+        "stream_requested": False,
+        "fallback_parse_mode": "json_fallback",
+    }
+    completed = events[1].data
+    assert isinstance(completed, RunnerContentCompletedData)
+    assert completed.content == "json"
     assert isinstance(events[2].data, RunnerDoneData)
-    assert events[2].data.provider_request_id == "req_missing_content_type"
+    assert events[2].data.provider_request_id == "req_missing_json_content_type"
     assert "runner.http.missing_content_type" in caplog.text
     await runner.close()
 
@@ -456,7 +524,7 @@ async def test_non_stream_success_provider_request_id_reaches_agent_iteration_co
     """非流式正常成功响应的 request id 会传到 Agent iteration_completed。"""
 
     spec = make_spec(supports_streaming=True)
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     runner = AsyncOpenAIRunner(spec=spec, cancellation_token=token)
     session = FakeSession()
     session.enqueue_response(

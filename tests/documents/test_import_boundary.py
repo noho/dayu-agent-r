@@ -92,7 +92,17 @@ def test_documents_import_boundary_scan_covers_docling_runtime() -> None:
 
 
 def test_documents_import_boundary_scan_covers_processors() -> None:
-    """documents import 边界扫描必须覆盖 processors 子包。"""
+    """验证 documents import 边界扫描覆盖当前 processors 子包文件。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 当前 processor 文件遗漏或已删除文件仍存在时抛出。
+    """
 
     scanned_relpaths = {
         file_path.relative_to(_documents_root()).as_posix()
@@ -101,4 +111,6 @@ def test_documents_import_boundary_scan_covers_processors() -> None:
     assert "processors/markdown_processor.py" in scanned_relpaths
     assert "processors/bs_processor.py" in scanned_relpaths
     assert "processors/docling_processor.py" in scanned_relpaths
-
+    assert "processors/source_snapshot.py" in scanned_relpaths
+    removed_snapshot_path = "processors/" + "bounded" + "_source.py"
+    assert removed_snapshot_path not in scanned_relpaths

@@ -46,6 +46,13 @@ from dayu.host.api import (
     SessionSnapshot,
 )
 from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
+from dayu.host._terminal_answer import (
+    required_assistant_final_answer_continuity_text,
+)
+from dayu.host.accepted_result_projection import (
+    AcceptedToolResultStatus,
+    project_accepted_tool_result,
+)
 from dayu.host.command import HostCommandHandle
 from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
@@ -65,11 +72,7 @@ from dayu.host.durable.outbox import (
     read_outbox_terminal_items_after as _read_outbox_terminal_items_after,
     read_outbox_terminal_projection_state as _read_outbox_terminal_projection_state,
 )
-from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
-from dayu.host.durable.schema import (
-    TABLE_EVENT_LOG,
-    TABLE_SQLITE_PAYLOADS,
-)
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import (
     SessionWithSlotRows,
     read_all_sessions_with_slots,
@@ -80,6 +83,10 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.lifecycle_events import (
+    HostRunEventType,
+    parse_host_run_event_type,
+)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.outbox import (
     OUTBOX_TERMINAL_CONSUMER_ID,
@@ -87,10 +94,6 @@ from dayu.host.outbox import (
 )
 
 _SESSION_WATCH_BATCH_LIMIT = 64
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
@@ -105,15 +108,16 @@ _EVENT_TYPE_CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 _EVENT_TYPE_CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
 _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+_EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_REASONING_DELTA = "REASONING_DELTA"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_FINISH_REASON = "finish_reason"
 _PAYLOAD_FIELD_FILTERED = "filtered"
 _PAYLOAD_FIELD_DEGRADED = "degraded"
 _PAYLOAD_FIELD_MESSAGE = "message"
+_PAYLOAD_FIELD_DIAGNOSTIC_CODE = "diagnostic_code"
+_PAYLOAD_FIELD_DIAGNOSTIC_SOURCE = "diagnostic_source"
 _PAYLOAD_FIELD_REASON = "reason"
 _PAYLOAD_FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
 _PAYLOAD_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
@@ -825,7 +829,7 @@ def _final_answer_from_outbox_json(value: str | None) -> HostFinalAnswerView | N
     :param value: durable outbox final answer JSON 文本；无 final answer 时为
         ``None``。
     :returns: public final answer view 或 ``None``。
-    :raises HostDurableError: JSON 非法或字段类型非法时抛出。
+    :raises HostDurableError: JSON 非法或字段类型/语义非法时抛出。
     """
 
     if value is None:
@@ -843,12 +847,20 @@ def _final_answer_from_outbox_json(value: str | None) -> HostFinalAnswerView | N
     terminal_status = parsed.get(_PAYLOAD_FIELD_TERMINAL_STATUS)
     if not isinstance(content, str):
         raise HostDurableError("outbox final answer content is invalid")
+    if content.strip() == "":
+        raise HostDurableError(
+            "Outbox final answer field content must be non-empty text"
+        )
     if not isinstance(filtered, bool):
         raise HostDurableError("outbox final answer filtered is invalid")
     if not isinstance(degraded, bool):
         raise HostDurableError("outbox final answer degraded is invalid")
     if finish_reason is not None and not isinstance(finish_reason, str):
         raise HostDurableError("outbox final answer finish_reason is invalid")
+    if finish_reason is not None and finish_reason.strip() == "":
+        raise HostDurableError(
+            "Outbox final answer field finish_reason must be non-empty text"
+        )
     if terminal_status != HostTerminalStatus.SUCCEEDED.value:
         raise HostDurableError("outbox final answer terminal_status is invalid")
     return HostFinalAnswerView(
@@ -869,13 +881,14 @@ def _host_event_from_row(transaction: HostTransaction, row: EventLogRow) -> Host
     :raises HostDurableError: terminal payload 损坏时抛出。
     """
 
-    if row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+    run_event_type = parse_host_run_event_type(row.event_type)
+    if run_event_type is HostRunEventType.RUN_SUCCEEDED:
         return _succeeded_host_event(transaction, row)
-    if row.event_type == _EVENT_TYPE_RUN_FAILED:
+    if run_event_type is HostRunEventType.RUN_FAILED:
         return _failed_host_event(row)
-    if row.event_type == _EVENT_TYPE_RUN_CANCELLED:
+    if run_event_type is HostRunEventType.RUN_CANCELLED:
         return _cancelled_host_event(row)
-    if row.event_type == _EVENT_TYPE_RUN_LOST:
+    if run_event_type is HostRunEventType.RUN_LOST:
         return _lost_host_event(row)
     return HostEvent(
         event_id=row.event_id,
@@ -905,40 +918,23 @@ def _succeeded_host_event(transaction: HostTransaction, row: EventLogRow) -> Hos
     """
 
     payload = _payload_object(row)
-    summary_ref = _required_payload_text(
-        payload,
-        field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF,
-        row=row,
-    )
-    summary_digest = _required_payload_text(
-        payload,
-        field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST,
-        row=row,
-    )
-    terminal_payload = _terminal_payload_object(
-        transaction,
-        payload_ref=summary_ref,
-        payload_digest=summary_digest,
-        row=row,
-    )
     final_answer = HostFinalAnswerView(
-        content=_required_payload_text(
-            terminal_payload,
-            field_name=_PAYLOAD_FIELD_CONTENT,
-            row=row,
+        content=required_assistant_final_answer_continuity_text(
+            transaction,
+            payload,
         ),
         filtered=_required_payload_bool(
-            terminal_payload,
+            payload,
             field_name=_PAYLOAD_FIELD_FILTERED,
             row=row,
         ),
         degraded=_required_payload_bool(
-            terminal_payload,
+            payload,
             field_name=_PAYLOAD_FIELD_DEGRADED,
             row=row,
         ),
         finish_reason=_optional_payload_text(
-            terminal_payload,
+            payload,
             field_name=_PAYLOAD_FIELD_FINISH_REASON,
             row=row,
         ),
@@ -1099,6 +1095,8 @@ def _activity_from_row(
         return _context_compaction_activity(row)
     if row.event_type == _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR:
         return _provider_protocol_error_activity(row)
+    if row.event_type == _EVENT_TYPE_PROVIDER_DIAGNOSTIC:
+        return _provider_diagnostic_activity(row)
     return None
 
 
@@ -1136,16 +1134,16 @@ def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
     elif row.event_type == _EVENT_TYPE_RUN_RECOVERING:
         status = HostActivityStatus.IN_PROGRESS
         title = "运行恢复中"
-    elif row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+    elif row.event_type == HostRunEventType.RUN_SUCCEEDED.value:
         status = HostActivityStatus.COMPLETED
         title = "运行已完成"
-    elif row.event_type == _EVENT_TYPE_RUN_FAILED:
+    elif row.event_type == HostRunEventType.RUN_FAILED.value:
         status = HostActivityStatus.FAILED
         title = "运行失败"
-    elif row.event_type == _EVENT_TYPE_RUN_CANCELLED:
+    elif row.event_type == HostRunEventType.RUN_CANCELLED.value:
         status = HostActivityStatus.CANCELLED
         title = "运行已取消"
-    elif row.event_type == _EVENT_TYPE_RUN_LOST:
+    elif row.event_type == HostRunEventType.RUN_LOST.value:
         status = HostActivityStatus.FAILED
         title = "运行已丢失"
     else:
@@ -1218,6 +1216,50 @@ def _tool_result_accepted_activity(
     :raises: 无主动抛出。
     """
 
+    if row.event_class is EventClass.CANONICAL_FACT:
+        return _canonical_tool_result_accepted_activity(transaction, row)
+    if row.event_class is not EventClass.PREVIEW:
+        return None
+    return _preview_tool_result_accepted_activity(transaction, row)
+
+
+def _canonical_tool_result_accepted_activity(
+    transaction: HostTransaction, row: EventLogRow
+) -> HostActivityView | None:
+    """投影 canonical ``TOOL_RESULT_ACCEPTED`` activity。
+
+    :param transaction: 当前 Host transaction。
+    :param row: canonical accepted result row。
+    :returns: 工具结果 activity；缺工具名时返回 ``None``。
+    """
+
+    projection = project_accepted_tool_result(transaction, row)
+    if projection.tool_name is None:
+        return None
+    display_name = _tool_display_name(transaction, row, projection.tool_name)
+    status, severity = _accepted_result_activity_state(projection.status)
+    return HostActivityView(
+        kind=HostActivityKind.TOOL_RESULT,
+        status=status,
+        title=f"工具返回：{display_name}",
+        summary=f"结果状态：{projection.status.value}",
+        severity=severity,
+        tool_name=projection.tool_name,
+        tool_display_name=display_name,
+        counts=None,
+    )
+
+
+def _preview_tool_result_accepted_activity(
+    transaction: HostTransaction, row: EventLogRow
+) -> HostActivityView | None:
+    """投影 preview ``TOOL_RESULT_ACCEPTED`` activity。
+
+    :param transaction: 当前 Host transaction。
+    :param row: preview accepted result row。
+    :returns: 工具结果 activity；payload 缺关键字段时返回 ``None``。
+    """
+
     payload = _activity_payload(transaction, row)
     if payload is None:
         return None
@@ -1237,6 +1279,22 @@ def _tool_result_accepted_activity(
         tool_display_name=display_name,
         counts=None,
     )
+
+
+def _accepted_result_activity_state(
+    status: AcceptedToolResultStatus,
+) -> tuple[HostActivityStatus, HostActivitySeverity]:
+    """把 accepted-result projection status 映射为 activity 状态。
+
+    :param status: accepted result projection status。
+    :returns: activity status 与 severity。
+    """
+
+    if status is AcceptedToolResultStatus.COMPLETED:
+        return HostActivityStatus.COMPLETED, HostActivitySeverity.INFO
+    if status is AcceptedToolResultStatus.CANCELLED:
+        return HostActivityStatus.CANCELLED, HostActivitySeverity.WARNING
+    return HostActivityStatus.FAILED, HostActivitySeverity.ERROR
 
 
 def _tool_calls_batch_done_activity(row: EventLogRow) -> HostActivityView | None:
@@ -1352,10 +1410,10 @@ def _context_compaction_activity(row: EventLogRow) -> HostActivityView | None:
 
 
 def _provider_protocol_error_activity(row: EventLogRow) -> HostActivityView | None:
-    """投影 provider protocol diagnostic activity。
+    """投影 provider fatal protocol error activity。
 
     :param row: PROVIDER_PROTOCOL_ERROR EventLog row。
-    :returns: provider diagnostic activity。
+    :returns: provider protocol error activity。
     :raises: 无主动抛出。
     """
 
@@ -1373,9 +1431,37 @@ def _provider_protocol_error_activity(row: EventLogRow) -> HostActivityView | No
     message = _bounded_summary(_payload_text(payload, _PAYLOAD_FIELD_MESSAGE))
     summary = _join_summary_parts(error_code, message)
     return HostActivityView(
-        kind=HostActivityKind.PROVIDER_DIAGNOSTIC,
+        kind=HostActivityKind.PROVIDER_PROTOCOL_ERROR,
         status=HostActivityStatus.FAILED,
         title="模型协议诊断",
+        summary=summary,
+        severity=HostActivitySeverity.WARNING,
+        tool_name=None,
+        tool_display_name=None,
+        counts=None,
+    )
+
+
+def _provider_diagnostic_activity(row: EventLogRow) -> HostActivityView | None:
+    """投影 provider 非致命诊断 activity。
+
+    :param row: PROVIDER_DIAGNOSTIC EventLog row。
+    :returns: provider diagnostic activity。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    payload = _activity_payload_without_descriptor(row)
+    diagnostic_code = _payload_text(payload, _PAYLOAD_FIELD_DIAGNOSTIC_CODE)
+    message = _bounded_summary(_payload_text(payload, _PAYLOAD_FIELD_MESSAGE))
+    source = _payload_text(payload, _PAYLOAD_FIELD_DIAGNOSTIC_SOURCE)
+    summary = _join_summary_parts(
+        _join_summary_parts(diagnostic_code, source),
+        message,
+    )
+    return HostActivityView(
+        kind=HostActivityKind.PROVIDER_DIAGNOSTIC,
+        status=HostActivityStatus.INFO,
+        title="模型非致命诊断",
         summary=summary,
         severity=HostActivitySeverity.WARNING,
         tool_name=None,
@@ -1539,73 +1625,6 @@ def _join_summary_parts(first: str | None, second: str | None) -> str | None:
     if len(parts) == 0:
         return None
     return _bounded_summary("；".join(parts))
-
-
-def _terminal_payload_object(
-    transaction: HostTransaction,
-    *,
-    payload_ref: str,
-    payload_digest: str,
-    row: EventLogRow,
-) -> Mapping[str, JsonValue]:
-    """读取 terminal artifact descriptor 并返回顶层 payload object。
-
-    :param transaction: 当前 Host transaction。
-    :param payload_ref: terminal payload ref。
-    :param payload_digest: terminal payload digest。
-    :param row: 关联 terminal EventLog row，用于错误上下文。
-    :returns: terminal payload JSON object。
-    :raises HostDurableError: descriptor、digest 或 payload 字段非法时抛出。
-    """
-
-    return _sqlite_payload_object(
-        transaction,
-        payload_ref=payload_ref,
-        payload_digest=payload_digest,
-        row=row,
-    )
-
-
-def _sqlite_payload_object(
-    transaction: HostTransaction,
-    *,
-    payload_ref: str,
-    payload_digest: str,
-    row: EventLogRow,
-) -> Mapping[str, JsonValue]:
-    """读取 SQLite payload descriptor 对应的 JSON object。
-
-    :param transaction: 当前 Host transaction。
-    :param payload_ref: payload descriptor 引用。
-    :param payload_digest: 期望 payload digest。
-    :param row: 关联 EventLog row，用于错误上下文。
-    :returns: payload JSON object。
-    :raises HostDurableError: descriptor 缺失、类型非法或 JSON 不是 object 时抛出。
-    """
-
-    descriptor = read_payload_descriptor(transaction, payload_ref)
-    if descriptor is None:
-        raise HostDurableError("terminal payload descriptor is missing")
-    if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
-        raise HostDurableError("terminal payload must be sqlite payload")
-    if descriptor.payload_digest != payload_digest:
-        raise HostDurableError("terminal payload digest mismatch")
-    if descriptor.sqlite_payload_id is None:
-        raise HostDurableError("terminal summary sqlite payload id is missing")
-    payload_row = transaction.fetchone(
-        f"""
-        SELECT payload_json
-        FROM {TABLE_SQLITE_PAYLOADS}
-        WHERE payload_id = ?
-        """,
-        (descriptor.sqlite_payload_id,),
-    )
-    if payload_row is None:
-        raise HostDurableError("terminal summary sqlite payload row is missing")
-    payload_json = payload_row.get("payload_json")
-    if not isinstance(payload_json, str):
-        raise HostDurableError("terminal summary sqlite payload JSON is invalid")
-    return _json_object(payload_json, row=row)
 
 
 def _payload_object(row: EventLogRow) -> Mapping[str, JsonValue]:

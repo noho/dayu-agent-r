@@ -6,18 +6,32 @@ from dayu.contracts.json_value import JsonValue
 
 import datetime as dt
 import time
-from typing import Callable, Optional, Protocol, cast
+from typing import Callable, Final, Optional, Protocol, cast
 
-from dayu.fins.domain.document_models import CompanyMeta, FilingUpdateRequest, SourceHandle, now_iso8601
+from dayu.fins.domain.document_models import (
+    CompanyMeta,
+    FinsIngestMethod,
+    FilingUpdateRequest,
+    SourceHandle,
+    now_iso8601,
+)
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.storage import SourceDocumentRepositoryProtocol
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
+from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    ProcessedDocumentRepositoryProtocol,
+    SourceDocumentRepositoryProtocol,
+)
 
 from .sec_download_state import _normalize_rebuild_file_entries, _resolve_rebuild_source_fingerprint
 from .sec_fiscal_fields import (
     _coerce_optional_int,
-    _normalize_form_for_fiscal,
     _normalize_optional_period,
     _resolve_download_fiscal_fields,
+)
+
+_ROLLBACK_FAILURE_NOTE_PREFIX: Final[str] = (
+    "rollback_batch failed; recovery evidence retained"
 )
 
 
@@ -25,8 +39,20 @@ class SecRebuildWorkflowHost(Protocol):
     """重建工作流所需的最小宿主边界。"""
 
     @property
+    def _batching_repository(self) -> BatchingRepositoryProtocol:
+        """返回 batch lifecycle 唯一仓储。"""
+
+        ...
+
+    @property
     def _source_repository(self) -> SourceDocumentRepositoryProtocol:
         """返回 source 仓储。"""
+
+        ...
+
+    @property
+    def _processed_repository(self) -> ProcessedDocumentRepositoryProtocol:
+        """返回 processed 仓储。"""
 
         ...
 
@@ -73,7 +99,7 @@ def _should_preserve_previous_rebuild_fiscal_fields(form_type: str) -> bool:
         无。
     """
 
-    normalized_form = _normalize_form_for_fiscal(form_type)
+    normalized_form = normalize_sec_form_type_for_matching(form_type)
     return normalized_form not in {"6-K", "6-K/A"}
 
 
@@ -89,10 +115,30 @@ def rebuild_download_artifacts(
     expand_form_aliases: Callable[[list[str]], list[str]],
     split_form_input: Callable[[str], list[str]],
     parse_date: Callable[[str, bool], dt.date],
-    normalize_form: Callable[[str], str],
-    overwrite_rebuilt_meta: Callable[[SourceDocumentRepositoryProtocol, str, str, str, list[dict[str, JsonValue]], dict[str, JsonValue]], None],
+    parse_sec_form: Callable[[str], str],
 ) -> dict[str, JsonValue]:
-    """基于本地已下载 filings 重建 meta/manifest。"""
+    """基于本地已下载 filings 重建 meta/manifest。
+
+    Args:
+        host: 重建工作流宿主边界。
+        ticker: 股票代码。
+        form_type: 可选 SEC form 过滤条件。
+        start_date: 可选起始 filing date。
+        end_date: 可选结束 filing date。
+        overwrite: 是否覆盖既有 meta。
+        pipeline_download_version: 当前 SEC 下载版本。
+        expand_form_aliases: SEC form 筛选别名展开函数。
+        split_form_input: form 输入拆分函数。
+        parse_date: 日期解析函数。
+        parse_sec_form: SEC form 解析函数。
+
+    Returns:
+        下载重建结果 payload。
+
+    Raises:
+        ValueError: 输入过滤条件非法时抛出。
+        RuntimeError: 仓储或写入函数异常时原样抛出。
+    """
 
     target_forms, start_bound, end_bound = build_rebuild_filter_spec(
         form_type=form_type,
@@ -118,25 +164,26 @@ def rebuild_download_artifacts(
         )
         if previous_meta is None:
             continue
-        if str(previous_meta.get("ingest_method", "")).strip().lower() != "download":
+        if FinsIngestMethod.from_storage_value(str(previous_meta["ingest_method"])) is not FinsIngestMethod.DOWNLOAD:
             continue
         if not passes_rebuild_filters(
             meta=previous_meta,
             target_forms=target_forms,
             start_bound=start_bound,
             end_bound=end_bound,
-            normalize_form=normalize_form,
+            parse_sec_form=parse_sec_form,
             parse_date=parse_date,
         ):
             continue
         filing_result = rebuild_single_local_filing(
+            batching_repository=host._batching_repository,
             source_repository=host._source_repository,
+            processed_repository=host._processed_repository,
             ticker=ticker,
             document_id=document_id,
             previous_meta=previous_meta,
             company_meta=company_meta,
             pipeline_download_version=pipeline_download_version,
-            overwrite_rebuilt_meta=overwrite_rebuilt_meta,
         )
         filing_results.append(filing_result)
         host._log_filing_download_result(ticker=ticker, filing_result=filing_result)
@@ -197,17 +244,32 @@ def passes_rebuild_filters(
     target_forms: Optional[set[str]],
     start_bound: Optional[dt.date],
     end_bound: Optional[dt.date],
-    normalize_form: Callable[[str], str],
+    parse_sec_form: Callable[[str], str],
     parse_date: Callable[[str, bool], dt.date],
 ) -> bool:
-    """判断本地 meta 是否满足重建过滤条件。"""
+    """判断本地 meta 是否满足重建过滤条件。
+
+    Args:
+        meta: 本地 source meta。
+        target_forms: 目标 SEC form 集合；为空表示不过滤 form。
+        start_bound: filing date 起始边界。
+        end_bound: filing date 结束边界。
+        parse_sec_form: SEC form 解析函数。
+        parse_date: 日期解析函数。
+
+    Returns:
+        满足过滤条件返回 `True`，否则返回 `False`。
+
+    Raises:
+        无；解析失败按不匹配处理。
+    """
 
     if target_forms is not None:
         raw_form_type = str(meta.get("form_type", "")).strip()
         if not raw_form_type:
             return False
         try:
-            normalized_form = normalize_form(raw_form_type)
+            normalized_form = parse_sec_form(raw_form_type)
         except ValueError:
             return False
         if normalized_form not in target_forms:
@@ -230,15 +292,34 @@ def passes_rebuild_filters(
 
 def rebuild_single_local_filing(
     *,
+    batching_repository: BatchingRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
+    processed_repository: ProcessedDocumentRepositoryProtocol,
     ticker: str,
     document_id: str,
     previous_meta: dict[str, JsonValue],
     company_meta: Optional[CompanyMeta],
     pipeline_download_version: str,
-    overwrite_rebuilt_meta: Callable[[SourceDocumentRepositoryProtocol, str, str, str, list[dict[str, JsonValue]], dict[str, JsonValue]], None],
 ) -> dict[str, JsonValue]:
-    """重建单个本地 filing 的 meta/manifest。"""
+    """重建单个本地 filing 的 meta/manifest。
+
+    Args:
+        batching_repository: batch lifecycle 唯一仓储。
+        source_repository: source 仓储。
+        processed_repository: processed 仓储。
+        ticker: 股票代码。
+        document_id: 文档 ID。
+        previous_meta: 当前完成态 source meta。
+        company_meta: 可选公司元数据。
+        pipeline_download_version: 当前下载版本。
+
+    Returns:
+        单文档重建结果。
+
+    Raises:
+        OSError: batch lifecycle 失败时抛出。
+        ValueError: batch capability 非法时抛出。
+    """
 
     raw_internal_document_id = str(previous_meta.get("internal_document_id", "")).strip()
     internal_document_id = (
@@ -309,7 +390,7 @@ def rebuild_single_local_filing(
         "document_id": document_id,
         "internal_document_id": internal_document_id,
         "accession_number": accession_number,
-        "ingest_method": "download",
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "company_id": company_id,
         "form_type": form_type,
@@ -319,7 +400,7 @@ def rebuild_single_local_filing(
         "report_date": report_date,
         "filing_date": filing_date,
         "first_ingested_at": first_ingested_at,
-        "ingest_complete": bool(previous_meta.get("ingest_complete", True)),
+        "ingest_complete": True,
         "is_deleted": bool(previous_meta.get("is_deleted", False)),
         "deleted_at": previous_meta.get("deleted_at"),
         "document_version": document_version,
@@ -338,6 +419,13 @@ def rebuild_single_local_filing(
         has_xbrl = None
     meta_payload["has_xbrl"] = has_xbrl
     try:
+        processed_repository.get_processed_meta(ticker, document_id)
+    except FileNotFoundError:
+        has_processed_document = False
+    else:
+        has_processed_document = True
+    batch = batching_repository.begin_batch(ticker)
+    try:
         source_repository.update_source_document(
             FilingUpdateRequest(
                 ticker=ticker,
@@ -349,16 +437,25 @@ def rebuild_single_local_filing(
                 meta=meta_payload,
             ),
             source_kind=SourceKind.FILING,
+            batch=batch,
         )
-        overwrite_rebuilt_meta(
-            source_repository,
-            ticker,
-            document_id,
-            primary_document,
-            file_entries,
-            meta_payload,
-        )
-    except Exception as exc:
+        if has_processed_document:
+            processed_repository.mark_processed_reprocess_required(
+                ticker,
+                document_id,
+                True,
+                batch=batch,
+            )
+    except BaseException as operation_error:
+        try:
+            batching_repository.rollback_batch(batch)
+        except BaseException as rollback_error:
+            operation_error.add_note(
+                f"{_ROLLBACK_FAILURE_NOTE_PREFIX}: {rollback_error}"
+            )
+            raise operation_error from rollback_error
+        if not isinstance(operation_error, Exception):
+            raise
         return {
             "document_id": document_id,
             "internal_document_id": internal_document_id,
@@ -366,11 +463,12 @@ def rebuild_single_local_filing(
             "form_type": form_type,
             "filing_date": filing_date,
             "report_date": report_date,
-            "error": str(exc),
+            "error": str(operation_error),
             "reason_code": "rebuild_write_failed",
-            "reason_message": str(exc),
+            "reason_message": str(operation_error),
             "rebuild": True,
         }
+    batching_repository.commit_batch(batch)
 
     return {
         "document_id": document_id,
@@ -385,32 +483,10 @@ def rebuild_single_local_filing(
     }
 
 
-def overwrite_rebuilt_meta(
-    repository: SourceDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    primary_document: str,
-    file_entries: list[dict[str, JsonValue]],
-    canonical_meta: dict[str, JsonValue],
-) -> None:
-    """通过 repository 精确覆盖重建后的 source meta。"""
-
-    payload = dict(canonical_meta)
-    payload["primary_document"] = primary_document
-    payload["files"] = cast(JsonValue, file_entries)
-    repository.replace_source_meta(
-        ticker=ticker,
-        document_id=document_id,
-        source_kind=SourceKind.FILING,
-        meta=payload,
-    )
-
-
 __all__ = [
     "_should_preserve_previous_rebuild_fiscal_fields",
     "SecRebuildWorkflowHost",
     "build_rebuild_filter_spec",
-    "overwrite_rebuilt_meta",
     "passes_rebuild_filters",
     "rebuild_download_artifacts",
     "rebuild_single_local_filing",

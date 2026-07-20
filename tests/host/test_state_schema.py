@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import sqlite3
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
 
-from dayu.host.api import AttemptStatus, RunStatus, SessionStatus
+from dayu.host.api import (
+    TERMINAL_RUN_STATUSES as PUBLIC_TERMINAL_RUN_STATUSES,
+    AttemptStatus,
+    RunStatus,
+    SessionStatus,
+)
+from dayu.host.durable import state as state_module
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable._row_rules import (
+    TERMINAL_ATTEMPT_STATUS_VALUES,
+    TERMINAL_RUN_STATUS_VALUES,
+)
 from dayu.host.durable.errors import HostDurableError, HostRowDecodeError, HostUniqueConstraintError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -26,33 +37,52 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.state import (
     DispatchRecordStatus,
+    NON_TERMINAL_RUN_STATUSES,
+    RunMutationResult,
     RunStartReason,
+    START_BLOCKING_RUN_STATUSES,
+    StateMutationStatus,
+    TERMINAL_ATTEMPT_STATUSES,
+    TERMINAL_RUN_STATUSES,
     WorkerKind,
     attempt_row_from_host_row,
+    decode_run_started_payload,
     deserialize_dispatch_record_status,
     deserialize_run_status,
     deserialize_run_start_reason,
     deserialize_worker_kind,
     dispatch_record_row_from_host_row,
+    is_terminal_attempt_status,
+    is_terminal_run_status,
+    promote_queued_run_row,
+    read_active_run_for_session,
     read_cancelling_runs,
+    read_non_terminal_runs,
+    read_non_terminal_runs_for_session,
+    read_run_by_id,
+    read_session_by_id,
+    resume_waiting_run_row,
+    run_status_in_clause,
     run_row_from_host_row,
     serialize_attempt_status,
     serialize_dispatch_record_status,
     serialize_run_status,
     serialize_run_start_reason,
     serialize_session_status,
+    serialized_run_status_values,
     serialize_worker_kind,
+    session_snapshot_from_rows,
     session_row_from_host_row,
+    start_recovering_run_row,
+    start_unstarted_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.queue_policy import RunQueuePolicy
 
 _TIMESTAMP = "2026-05-14T00:00:00Z"
 _EVENT_DIGEST = "0" * 64
-_TERMINAL_RUN_STATUSES = (
-    RunStatus.SUCCEEDED,
-    RunStatus.FAILED,
-    RunStatus.CANCELLED,
-    RunStatus.LOST,
+_TERMINAL_RUN_STATUSES = tuple(
+    status for status in RunStatus if status in PUBLIC_TERMINAL_RUN_STATUSES
 )
 _STARTED_RUN_STATUSES = (
     RunStatus.RUNNING,
@@ -60,6 +90,15 @@ _STARTED_RUN_STATUSES = (
     RunStatus.CANCELLING,
     RunStatus.RECOVERING,
 )
+
+
+class _StartTransitionKind(StrEnum):
+    """测试覆盖的四类 start transition。"""
+
+    PROMOTE_QUEUED = "promote_queued"
+    START_UNSTARTED = "start_unstarted"
+    RESUME_WAITING = "resume_waiting"
+    START_RECOVERING = "start_recovering"
 
 
 def _options(
@@ -79,6 +118,190 @@ def _options(
         payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
         sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=busy_timeout_seconds),
     )
+
+
+def _apply_start_transition(
+    transaction: HostTransaction,
+    *,
+    transition_kind: _StartTransitionKind,
+    session_id: str,
+    run_id: str,
+    source_status: RunStatus,
+    source_attempt_id: str,
+    next_attempt_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+) -> RunMutationResult:
+    """按指定类别执行一次底层 start transition。
+
+    :param transaction: Host transaction。
+    :param transition_kind: transition 类别。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param source_status: 目标 Run 的源状态。
+    :param source_attempt_id: resume / recovery 的旧 Attempt id。
+    :param next_attempt_id: 新 Attempt id。
+    :param started_event_id: 新 ``RUN_STARTED`` event id。
+    :param started_event_sequence: 新 ``RUN_STARTED`` event sequence。
+    :returns: 底层 Run mutation 结果。
+    :raises AssertionError: ``transition_kind`` 不属于受测封闭集合时抛出。
+    """
+
+    if transition_kind is _StartTransitionKind.PROMOTE_QUEUED:
+        return promote_queued_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            current_attempt_id=next_attempt_id,
+            updated_at=_TIMESTAMP,
+        )
+    if transition_kind is _StartTransitionKind.START_UNSTARTED:
+        return start_unstarted_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            expected_status=source_status,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            current_attempt_id=next_attempt_id,
+            updated_at=_TIMESTAMP,
+        )
+    if transition_kind is _StartTransitionKind.RESUME_WAITING:
+        return resume_waiting_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            suspended_attempt_id=source_attempt_id,
+            resumed_attempt_id=next_attempt_id,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            updated_at=_TIMESTAMP,
+        )
+    if transition_kind is _StartTransitionKind.START_RECOVERING:
+        return start_recovering_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            source_attempt_id=source_attempt_id,
+            recovered_attempt_id=next_attempt_id,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            updated_at=_TIMESTAMP,
+        )
+    raise AssertionError(f"unknown transition: {transition_kind}")
+
+
+def test_terminal_run_statuses_derive_from_row_rules() -> None:
+    """Run 终态集合与 durable row rules 使用同一个文本真源。"""
+
+    expected = frozenset(RunStatus(value) for value in TERMINAL_RUN_STATUS_VALUES)
+
+    assert TERMINAL_RUN_STATUSES == expected
+
+
+def test_terminal_attempt_statuses_derive_from_row_rules() -> None:
+    """Attempt 终态集合与 durable row rules 使用同一个文本真源。"""
+
+    expected = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
+
+    assert TERMINAL_ATTEMPT_STATUSES == expected
+
+
+def test_is_terminal_run_status_covers_all_members() -> None:
+    """is_terminal_run_status predicate 显式覆盖所有 RunStatus 成员。"""
+
+    expected = frozenset(RunStatus(value) for value in TERMINAL_RUN_STATUS_VALUES)
+
+    for status in RunStatus:
+        assert is_terminal_run_status(status) is (status in expected)
+
+
+def test_is_terminal_attempt_status_covers_all_members() -> None:
+    """is_terminal_attempt_status predicate 显式覆盖所有 AttemptStatus 成员。"""
+
+    expected = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
+
+    for status in AttemptStatus:
+        assert is_terminal_attempt_status(status) is (status in expected)
+
+
+def test_non_terminal_run_statuses_derive_from_terminal_owner_set() -> None:
+    """Run 非终态集合由 RunStatus 全集减终态集合派生。"""
+
+    assert NON_TERMINAL_RUN_STATUSES == frozenset(
+        status for status in RunStatus if status not in TERMINAL_RUN_STATUSES
+    )
+
+
+def test_start_blocking_run_statuses_are_explicit_current_assumption() -> None:
+    """start-blocking 当前假设为除 QUEUED 外所有非终态 Run status。
+
+    新增非终态 ``RunStatus`` 时，本测试必须失败，迫使开发者显式审查该状态是否
+    应阻塞同一 Session 启动新 Run。
+    """
+
+    assert START_BLOCKING_RUN_STATUSES == frozenset(
+        (
+            RunStatus.ACCEPTED,
+            RunStatus.RUNNING,
+            RunStatus.WAITING,
+            RunStatus.CANCELLING,
+            RunStatus.RECOVERING,
+        )
+    )
+    assert START_BLOCKING_RUN_STATUSES == (
+        NON_TERMINAL_RUN_STATUSES - frozenset((RunStatus.QUEUED,))
+    )
+
+
+def test_serialized_run_status_values_use_owner_serialization() -> None:
+    """Run status value projection 统一走 durable state serialization helper。"""
+
+    assert serialized_run_status_values(
+        (
+            RunStatus.LOST,
+            RunStatus.SUCCEEDED,
+        )
+    ) == (
+        serialize_run_status(RunStatus.LOST),
+        serialize_run_status(RunStatus.SUCCEEDED),
+    )
+    assert serialized_run_status_values(TERMINAL_RUN_STATUSES) == (
+        serialize_run_status(RunStatus.SUCCEEDED),
+        serialize_run_status(RunStatus.FAILED),
+        serialize_run_status(RunStatus.CANCELLED),
+        serialize_run_status(RunStatus.LOST),
+    )
+    assert serialized_run_status_values(
+        frozenset(
+            (
+                RunStatus.LOST,
+                RunStatus.SUCCEEDED,
+            )
+        )
+    ) == (
+        serialize_run_status(RunStatus.SUCCEEDED),
+        serialize_run_status(RunStatus.LOST),
+    )
+
+
+def test_run_status_in_clause_rejects_empty_statuses() -> None:
+    """Run status SQL helper 对空集合 fail-fast，避免生成不明确谓词。"""
+
+    with pytest.raises(HostDurableError, match="must not be empty"):
+        run_status_in_clause(())
+
+
+def test_run_status_in_clause_placeholder_count_matches_params() -> None:
+    """Run status SQL helper 生成的占位符数量与参数数量一致。"""
+
+    clause, params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
+
+    assert clause == "IN (?, ?, ?, ?, ?)"
+    assert clause.count("?") == len(params)
+    assert params == serialized_run_status_values(START_BLOCKING_RUN_STATUSES)
 
 
 def test_active_run_partial_unique_index_shape(tmp_path: Path) -> None:
@@ -132,6 +355,354 @@ def test_run_status_sequence_index_supports_status_ordered_scan(tmp_path: Path) 
             connection.close()
 
 
+def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> None:
+    """SQL status helper 生成的 IN clause 与 durable read helper 查询等价。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def seed(transaction: HostTransaction) -> None:
+            """写入覆盖 start-blocking、queued 与 terminal 的 Run rows。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-sql-1")
+            _insert_session_tx(transaction, session_id="session-sql-2")
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-accepted",
+                session_id="session-sql-1",
+                status=RunStatus.ACCEPTED,
+                client_request_id="request-sql-accepted",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-queued",
+                session_id="session-sql-1",
+                status=RunStatus.QUEUED,
+                client_request_id="request-sql-queued",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-succeeded",
+                session_id="session-sql-1",
+                status=RunStatus.SUCCEEDED,
+                client_request_id="request-sql-succeeded",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-running",
+                session_id="session-sql-2",
+                status=RunStatus.RUNNING,
+                client_request_id="request-sql-running",
+            )
+
+        def verify(
+            transaction: HostTransaction,
+        ) -> tuple[str | None, tuple[str, ...], tuple[str, ...], bool, bool, bool]:
+            """比较 durable read helper 与 helper SQL 的结果。
+
+            :param transaction: Host transaction。
+            :returns: active id、session/all 非终态 id 与三条 planner 输出是否存在。
+            """
+
+            active_clause, active_params = run_status_in_clause(
+                START_BLOCKING_RUN_STATUSES
+            )
+            non_terminal_clause, non_terminal_params = run_status_in_clause(
+                NON_TERMINAL_RUN_STATUSES
+            )
+            active_plan = transaction.fetchall(
+                f"""
+                EXPLAIN QUERY PLAN
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {active_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                LIMIT 1
+                """,
+                ("session-sql-1", *active_params),
+            )
+            session_plan = transaction.fetchall(
+                f"""
+                EXPLAIN QUERY PLAN
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                ("session-sql-1", *non_terminal_params),
+            )
+            all_plan = transaction.fetchall(
+                f"""
+                EXPLAIN QUERY PLAN
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                non_terminal_params,
+            )
+            active_equivalent = transaction.fetchone(
+                f"""
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {active_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                LIMIT 1
+                """,
+                ("session-sql-1", *active_params),
+            )
+            session_equivalent = transaction.fetchall(
+                f"""
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                ("session-sql-1", *non_terminal_params),
+            )
+            all_equivalent = transaction.fetchall(
+                f"""
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                non_terminal_params,
+            )
+            active = read_active_run_for_session(transaction, "session-sql-1")
+            session_runs = read_non_terminal_runs_for_session(
+                transaction, "session-sql-1"
+            )
+            all_runs = read_non_terminal_runs(transaction)
+            active_id = active.run_id if active is not None else None
+            equivalent_active_id = (
+                _required_row_text(active_equivalent, column="run_id")
+                if active_equivalent is not None
+                else None
+            )
+            assert active_id == equivalent_active_id
+            assert tuple(row.run_id for row in session_runs) == tuple(
+                _required_row_text(row, column="run_id") for row in session_equivalent
+            )
+            assert tuple(row.run_id for row in all_runs) == tuple(
+                _required_row_text(row, column="run_id") for row in all_equivalent
+            )
+            return (
+                active_id,
+                tuple(row.run_id for row in session_runs),
+                tuple(row.run_id for row in all_runs),
+                len(active_plan) > 0,
+                len(session_plan) > 0,
+                len(all_plan) > 0,
+            )
+
+        store.transaction_runner.run_write(seed)
+        assert store.transaction_runner.run_read(verify) == (
+            "run-sql-accepted",
+            ("run-sql-accepted", "run-sql-queued"),
+            ("run-sql-accepted", "run-sql-queued", "run-sql-running"),
+            True,
+            True,
+            True,
+        )
+
+
+def test_session_snapshot_active_run_matches_owner_derived_public_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session snapshot 与公开 active read 动态消费同一个 owner status set。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest 属性替换夹具，用于精确替换 owner set。
+    :returns: ``None``。
+    :raises AssertionError: snapshot 与公开 read 不同源或 owner material 未生效时抛出。
+    """
+
+    owner_statuses = frozenset((RunStatus.QUEUED,))
+    monkeypatch.setattr(
+        state_module,
+        "START_BLOCKING_RUN_STATUSES",
+        owner_statuses,
+    )
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def seed(transaction: HostTransaction) -> None:
+            """写入只会被替换后 owner set 选中的 queued Run。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: 测试事实无法写入 durable store 时抛出。
+            """
+
+            _insert_session_tx(transaction, session_id="session-owner-read")
+            _insert_run_tx(
+                transaction,
+                run_id="run-owner-read-queued",
+                session_id="session-owner-read",
+                status=RunStatus.QUEUED,
+                client_request_id="request-owner-read-queued",
+            )
+
+        def verify(transaction: HostTransaction) -> tuple[str | None, str | None]:
+            """比较 public durable read 与 SessionSnapshot 投影结果。
+
+            :param transaction: Host transaction。
+            :returns: public read 与 snapshot 的 active Run id。
+            :raises AssertionError: Session row 缺失时抛出。
+            """
+
+            session = read_session_by_id(transaction, "session-owner-read")
+            assert session is not None
+            active = read_active_run_for_session(transaction, "session-owner-read")
+            snapshot = session_snapshot_from_rows(transaction, session, None)
+            return (
+                active.run_id if active is not None else None,
+                snapshot.active_run_id,
+            )
+
+        store.transaction_runner.run_write(seed)
+        assert serialized_run_status_values(owner_statuses) == (
+            serialize_run_status(RunStatus.QUEUED),
+        )
+        assert store.transaction_runner.run_read(verify) == (
+            "run-owner-read-queued",
+            "run-owner-read-queued",
+        )
+
+
+@pytest.mark.parametrize(
+    ("transition_kind", "target_status"),
+    (
+        (_StartTransitionKind.PROMOTE_QUEUED, RunStatus.QUEUED),
+        (_StartTransitionKind.START_UNSTARTED, RunStatus.ACCEPTED),
+        (_StartTransitionKind.RESUME_WAITING, RunStatus.WAITING),
+        (_StartTransitionKind.START_RECOVERING, RunStatus.RECOVERING),
+    ),
+)
+def test_start_transition_guards_derive_blocking_material_from_owner_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition_kind: _StartTransitionKind,
+    target_status: RunStatus,
+) -> None:
+    """四条 start transition guard 从 owner set 派生阻塞参数并保持 happy path。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest 属性替换夹具，用于精确替换 owner set。
+    :param transition_kind: 本次验证的 transition 类别。
+    :param target_status: transition 目标 Run 的源状态。
+    :returns: ``None``。
+    :raises AssertionError: guard 未阻塞 owner status 或无冲突路径未成功时抛出。
+    """
+
+    owner_statuses = frozenset((RunStatus.QUEUED,))
+    monkeypatch.setattr(
+        state_module,
+        "START_BLOCKING_RUN_STATUSES",
+        owner_statuses,
+    )
+    session_id = f"session-owner-guard-{transition_kind.value}"
+    target_run_id = f"run-owner-guard-{transition_kind.value}"
+    blocker_run_id = f"run-owner-blocker-{transition_kind.value}"
+    started_event_id = f"event-owner-started-{transition_kind.value}"
+    source_attempt_id = f"attempt-owner-source-{transition_kind.value}"
+    next_attempt_id = f"attempt-owner-next-{transition_kind.value}"
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[StateMutationStatus, StateMutationStatus, RunStatus | None]:
+            """先验证 owner blocker 触发 CAS_LOST，再删除 blocker 验证成功路径。
+
+            :param transaction: Host transaction。
+            :returns: 阻塞结果、无冲突结果与最终 Run 状态。
+            :raises AssertionError: transition 名称未知或 mutation row 缺失时抛出。
+            """
+
+            _insert_session_tx(transaction, session_id=session_id)
+            _insert_run_tx(
+                transaction,
+                run_id=target_run_id,
+                session_id=session_id,
+                status=target_status,
+                client_request_id=f"request-owner-target-{transition_kind.value}",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id=blocker_run_id,
+                session_id=session_id,
+                status=RunStatus.QUEUED,
+                client_request_id=f"request-owner-blocker-{transition_kind.value}",
+            )
+            if target_status in (RunStatus.WAITING, RunStatus.RECOVERING):
+                transaction.execute(
+                    f"UPDATE {TABLE_HOST_RUNS} SET current_attempt_id = ? WHERE run_id = ?",
+                    (source_attempt_id, target_run_id),
+                )
+            started_event_sequence = _insert_event_tx(
+                transaction,
+                event_id=started_event_id,
+                session_id=session_id,
+                run_id=target_run_id,
+            )
+
+            blocked_result = _apply_start_transition(
+                transaction,
+                transition_kind=transition_kind,
+                session_id=session_id,
+                run_id=target_run_id,
+                source_status=target_status,
+                source_attempt_id=source_attempt_id,
+                next_attempt_id=next_attempt_id,
+                started_event_id=started_event_id,
+                started_event_sequence=started_event_sequence,
+            )
+
+            transaction.execute(
+                f"DELETE FROM {TABLE_HOST_RUNS} WHERE run_id = ?",
+                (blocker_run_id,),
+            )
+
+            updated_result = _apply_start_transition(
+                transaction,
+                transition_kind=transition_kind,
+                session_id=session_id,
+                run_id=target_run_id,
+                source_status=target_status,
+                source_attempt_id=source_attempt_id,
+                next_attempt_id=next_attempt_id,
+                started_event_id=started_event_id,
+                started_event_sequence=started_event_sequence,
+            )
+
+            final_row = read_run_by_id(transaction, target_run_id)
+            return (
+                blocked_result.status,
+                updated_result.status,
+                final_row.status if final_row is not None else None,
+            )
+
+        assert serialized_run_status_values(owner_statuses) == (
+            serialize_run_status(RunStatus.QUEUED),
+        )
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST,
+            StateMutationStatus.UPDATED,
+            RunStatus.RUNNING,
+        )
+
+
 def test_run_start_reason_resume_codec_round_trips() -> None:
     """RunStartReason 增加 resume 且 codec 保持封闭 enum。"""
 
@@ -144,6 +715,31 @@ def test_run_start_reason_resume_codec_round_trips() -> None:
         "RESUME": "resume",
         "STEER": "steer",
     }
+
+
+def test_run_started_payload_decoder_uses_run_start_reason_codec() -> None:
+    """RUN_STARTED payload decoder 复用 RunStartReason 闭集 codec。"""
+
+    payload = decode_run_started_payload(
+        {"start_reason": serialize_run_start_reason(RunStartReason.RESUME)}
+    )
+
+    assert payload.start_reason is RunStartReason.RESUME
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {},
+        {"start_reason": ""},
+        {"start_reason": "unknown"},
+    ),
+)
+def test_run_started_payload_decoder_fails_closed(payload: dict[str, str]) -> None:
+    """RUN_STARTED payload 缺失或未知 start_reason 必须 fail closed。"""
+
+    with pytest.raises(HostDurableError, match="RunStartReason|start_reason"):
+        decode_run_started_payload(payload)
 
 
 def test_queue_fifo_index_shape(tmp_path: Path) -> None:
@@ -245,6 +841,34 @@ def test_active_runs_for_different_sessions_succeed(tmp_path: Path) -> None:
             return _required_row_int(row, column="count")
 
         assert store.transaction_runner.run_write(operation) == 2
+
+
+def test_run_row_queue_policy_decodes_to_owner_type(tmp_path: Path) -> None:
+    """RunRow.queue_policy 从 SQLite 文本解码为 Host queue policy owner 类型。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> RunQueuePolicy:
+            """写入 Run 后读取 typed queue policy。
+
+            :param transaction: Host transaction。
+            :returns: 解码后的 queue policy。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-typed-policy",
+                session_id="session-1",
+                status=RunStatus.ACCEPTED,
+                client_request_id="request-typed-policy",
+            )
+            row = read_run_by_id(transaction, "run-typed-policy")
+            assert row is not None
+            return row.queue_policy
+
+        assert store.transaction_runner.run_write(operation) is RunQueuePolicy.QUEUE
 
 
 @pytest.mark.parametrize("status", _STARTED_RUN_STATUSES)
@@ -388,6 +1012,46 @@ def test_run_terminal_shape_check_rejects_non_terminal_ref(
             transaction.execute(
                 f"UPDATE {TABLE_HOST_RUNS} SET terminal_at = ? WHERE run_id = ?",
                 (_TIMESTAMP, "run-active"),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+@pytest.mark.parametrize("status", (RunStatus.CANCELLING, RunStatus.CANCELLED))
+def test_cancel_acceptance_status_requires_cancel_request_event_id(
+    tmp_path: Path,
+    status: RunStatus,
+) -> None:
+    """Run DDL CHECK 拒绝 cancelling / cancelled 缺 typed cancel link。
+
+    :param tmp_path: pytest 临时目录。
+    :param status: 待验证的 accepted cancel 状态。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法 Run 后清空 cancel_request_event_id 以触发 DDL CHECK。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-cancel-link")
+            _insert_run_tx(
+                transaction,
+                run_id=f"run-{status.value}",
+                session_id="session-cancel-link",
+                status=status,
+                client_request_id=f"request-{status.value}",
+            )
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_RUNS} SET cancel_request_event_id = NULL WHERE run_id = ?",
+                (f"run-{status.value}",),
             )
 
         with pytest.raises(HostDurableError, match="CHECK constraint"):
@@ -1117,6 +1781,7 @@ def _run_host_row(
                 "started_event_sequence",
                 "terminal_event_id",
                 "terminal_event_sequence",
+                "cancel_request_event_id",
                 "current_attempt_id",
                 "source_run_id",
                 "source_run_relation",
@@ -1144,6 +1809,7 @@ def _run_host_row(
                 None,
                 None,
                 None,
+                None,
                 "local-default",
                 "queue",
                 _TIMESTAMP,
@@ -1166,6 +1832,7 @@ def _run_host_row(
             "started_event_sequence",
             "terminal_event_id",
             "terminal_event_sequence",
+            "cancel_request_event_id",
             "current_attempt_id",
             "source_run_id",
             "source_run_relation",
@@ -1189,6 +1856,7 @@ def _run_host_row(
             3,
             terminal_event_id,
             terminal_event_sequence,
+            None,
             None,
             None,
             None,
@@ -1253,6 +1921,7 @@ def _insert_event_tx(
     *,
     event_id: str,
     session_id: str,
+    event_type: str = "USER_INPUT_ACCEPTED",
     run_id: str | None = None,
     attempt_id: str | None = None,
     execution_id: str | None = None,
@@ -1262,6 +1931,7 @@ def _insert_event_tx(
     :param transaction: Host transaction。
     :param event_id: EventLog event id。
     :param session_id: 事件所属 Session。
+    :param event_type: EventLog event type。
     :param run_id: 事件所属 Run。
     :param attempt_id: 事件所属 Attempt。
     :param execution_id: execution id。
@@ -1300,7 +1970,7 @@ def _insert_event_tx(
             run_id,
             attempt_id,
             execution_id,
-            "TEST_EVENT",
+            event_type,
             _TIMESTAMP,
             None,
             None,
@@ -1511,6 +2181,7 @@ def _insert_run_tx(
     started_sequence: int | None = None
     terminal_event_id: str | None = None
     terminal_sequence: int | None = None
+    cancel_request_event_id: str | None = None
     terminal_at: str | None = None
     if status == RunStatus.QUEUED:
         queued_event_id = f"event-queued-{run_id}"
@@ -1537,6 +2208,15 @@ def _insert_run_tx(
             run_id=run_id,
         )
         terminal_at = _TIMESTAMP
+    if status in (RunStatus.CANCELLING, RunStatus.CANCELLED):
+        cancel_request_event_id = f"event-cancel-requested-{run_id}"
+        _insert_event_tx(
+            transaction,
+            event_id=cancel_request_event_id,
+            session_id=session_id,
+            event_type="CANCEL_REQUESTED",
+            run_id=run_id,
+        )
     transaction.execute(
         f"""
         INSERT INTO {TABLE_HOST_RUNS} (
@@ -1554,6 +2234,7 @@ def _insert_run_tx(
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1562,7 +2243,7 @@ def _insert_run_tx(
           created_at,
           updated_at,
           terminal_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -1579,6 +2260,7 @@ def _insert_run_tx(
             started_sequence,
             terminal_event_id,
             terminal_sequence,
+            cancel_request_event_id,
             None,
             None,
             None,

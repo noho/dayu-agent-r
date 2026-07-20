@@ -45,9 +45,12 @@ dependencies = [
     "fastapi>=0.115.0",
     "edgartools>=5.30.0",
     # 当前项目正式支持的 Docling 基线直接收敛到 2.90+，避免继续承诺
-    # 已不打算维护的更低版本区间。
+    # 已不打算维护的更低版本区间。Docling 的模型栈统一停留在
+    # transformers 4.x：5.x 要求 torch>=2.4，而受支持的 macOS x64
+    # Python 3.11 环境只能使用 torch 2.2.x。
     "docling>=2.90.0,<3.0.0",
     "docling-core>=2.74.0,<3.0.0",
+    "transformers>=4.57.6,<5.0.0",
     # pandas 下界需与 docling / docling-core 当前依赖树保持一致，
     # 上界维持在当前 3.x 生态窗口内，避免把 4.x 误声明为支持范围。
     "pandas>=2.1.4,<4.0.0",
@@ -67,11 +70,6 @@ browser = [
     "playwright>=1.40.0",
     # 当前代码直接从包根导入 `Stealth`，该符号在 1.x 包根未稳定导出。
     "playwright-stealth>=2.0.3",
-]
-# Web UI（streamlit）能力，仅在启用 `dayu-web` 入口时安装。
-# 上界锁在当前 1.x 生态窗口，避免把未来 2.x 误声明为支持范围。
-web = [
-    "streamlit>=1.49.0,<2.0.0",
 ]
 # 测试与静态检查工具链。
 test = [
@@ -96,9 +94,6 @@ Issues = "https://github.com/noho/dayu-agent/issues"
 
 [project.scripts]
 dayu-cli = "dayu.cli.main:main"
-dayu-web = "dayu.web.__main__:main"
-dayu-wechat = "dayu.wechat.main:main"
-dayu-render = "dayu.render.render:main"
 
 
 [tool.setuptools.packages.find]
@@ -124,15 +119,6 @@ exclude = [
 "dayu.assets" = [
     "*.md",
 ]
-"dayu.render" = [
-    "*.css",
-    "*.html",
-    "*.lua",
-    "*.docx",
-    "*.xlsx",
-    "*.mmd",
-]
-
 [tool.pytest.ini_options]
 minversion = "7.4"
 addopts = "-m 'not stress'"

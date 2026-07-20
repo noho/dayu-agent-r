@@ -169,7 +169,7 @@ def _event_log_row(
         run_id=run_id,
         attempt_id=None,
         execution_id=None,
-        event_type="TYPE_A",
+        event_type="USER_INPUT_ACCEPTED",
         occurred_at="2026-05-16T00:00:00.000000Z",
         actor=None,
         source=None,
@@ -622,18 +622,18 @@ def test_stream_run_events_exposes_event_class_for_preview_rows(
             EventLogStore().append_event(
                 transaction,
                 EventLogAppendRequest(
-                    event_id="event-preview-content-delta",
+                    event_id="event-preview-reasoning-delta",
                     event_class=EventClass.PREVIEW,
                     session_id=session_id,
                     run_id=target.run_id,
                     attempt_id=None,
                     execution_id=None,
-                    event_type="CONTENT_DELTA",
+                    event_type="REASONING_DELTA",
                     occurred_at=datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC),
                     actor="engine",
                     source="pytest",
                     client_request_id=None,
-                    idempotency_key="preview-content-delta",
+                    idempotency_key="preview-reasoning-delta",
                     policy_decision=None,
                     reason=None,
                     payload_json={"text": "delta"},
@@ -655,7 +655,7 @@ def test_stream_run_events_exposes_event_class_for_preview_rows(
         assert HostEventClass.CANONICAL_FACT in event_classes
         assert HostEventClass.PREVIEW in event_classes
         assert stream.events[-1].event_class is HostEventClass.PREVIEW
-        assert stream.events[-1].event_type == "CONTENT_DELTA"
+        assert stream.events[-1].event_type == "REASONING_DELTA"
     finally:
         host.close()
 

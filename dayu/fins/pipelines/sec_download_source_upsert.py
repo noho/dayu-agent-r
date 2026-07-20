@@ -7,9 +7,16 @@ from dayu.contracts.json_value import JsonValue
 from collections.abc import Callable
 from typing import Optional, Protocol
 
-from dayu.fins.domain.document_models import FilingCreateRequest, FilingUpdateRequest, now_iso8601
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    FinsIngestMethod,
+    FinsSourceProvider,
+    FilingCreateRequest,
+    FilingUpdateRequest,
+    now_iso8601,
+)
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.storage import SourceDocumentRepositoryProtocol
+from dayu.fins.storage import ProcessedDocumentRepositoryProtocol, SourceDocumentRepositoryProtocol
 
 
 class DownloadedFilingRecord(Protocol):
@@ -72,9 +79,10 @@ def upsert_downloaded_filing_source_document(
     inferred_fiscal_year: Optional[int],
     inferred_fiscal_period: Optional[str],
     source_repository: SourceDocumentRepositoryProtocol,
+    processed_repository: ProcessedDocumentRepositoryProtocol,
+    batch: BatchToken,
     resolve_document_version: Callable[[Optional[dict[str, JsonValue]], str], str],
     safe_get_processed_meta: Callable[[str, str], Optional[dict[str, JsonValue]]],
-    mark_processed_reprocess_required: Callable[[str, str], None],
 ) -> None:
     """写入下载成功后的 filing source document，并按规则标记重处理。
 
@@ -93,9 +101,10 @@ def upsert_downloaded_filing_source_document(
         inferred_fiscal_year: 推断出的 fiscal year。
         inferred_fiscal_period: 推断出的 fiscal period。
         source_repository: source 仓储。
+        processed_repository: processed 仓储。
+        batch: caller 显式传入的 batch capability。
         resolve_document_version: 文档版本计算函数。
         safe_get_processed_meta: 安全读取 processed meta 的函数。
-        mark_processed_reprocess_required: 标记 processed 需重处理的函数。
 
     Returns:
         无。
@@ -131,9 +140,17 @@ def upsert_downloaded_filing_source_document(
         previous_meta=previous_meta,
     )
     if previous_meta is None:
-        source_repository.create_source_document(upsert_request, source_kind=SourceKind.FILING)
+        source_repository.create_source_document(
+            upsert_request,
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
     else:
-        source_repository.update_source_document(upsert_request, source_kind=SourceKind.FILING)
+        source_repository.update_source_document(
+            upsert_request,
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
 
     if _should_mark_processed_reprocess_required(
         ticker=ticker,
@@ -142,7 +159,12 @@ def upsert_downloaded_filing_source_document(
         source_fingerprint=source_fingerprint,
         safe_get_processed_meta=safe_get_processed_meta,
     ):
-        mark_processed_reprocess_required(ticker, document_id)
+        processed_repository.mark_processed_reprocess_required(
+            ticker,
+            document_id,
+            True,
+            batch=batch,
+        )
 
 
 def _build_downloaded_filing_meta_payload(
@@ -198,7 +220,8 @@ def _build_downloaded_filing_meta_payload(
         "document_id": document_id,
         "internal_document_id": internal_document_id,
         "accession_number": filing.accession_number,
-        "ingest_method": "download",
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+        "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
         "ticker": ticker,
         "company_id": cik,
         "form_type": filing.form_type,

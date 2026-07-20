@@ -1346,7 +1346,7 @@ async def test_same_attempt_concurrent_owner_cancellation_hands_off_to_waiter() 
 
     assert tool.call_count == 2
     assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
-    assert owner_outcome.records[0].outcome.result.hint == "tool_runtime_cancelled"
+    assert owner_outcome.records[0].outcome.result.hint is None
     assert isinstance(waiter_outcome.records[0].outcome, ToolCompletedOutcome)
     assert waiter_outcome.records[0].outcome.result.value == {
         "accepted": "replacement"

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from filelock import FileLock
+from filelock import BaseFileLock
 
 import dayu.runtime.filelock as filelock_module
 from dayu.runtime.filelock import (
@@ -173,7 +173,7 @@ def test_context_manager_release_failure_clears_context_token(
     lock = file_lock(lock_path)
     lock._context_token = RuntimeFileLockToken(
         lock_path=lock_path,
-        third_party_lock=cast(FileLock, third_party_lock),
+        third_party_lock=cast(BaseFileLock, third_party_lock),
     )
 
     with pytest.raises(RuntimeFileLockError, match="释放 runtime file lock 失败"):
@@ -225,7 +225,7 @@ def test_release_success_before_marker_failure_remains_idempotent(
     )
     token = RuntimeFileLockToken(
         lock_path=lock_path,
-        third_party_lock=cast(FileLock, third_party_lock),
+        third_party_lock=cast(BaseFileLock, third_party_lock),
     )
 
     token.release()
@@ -244,7 +244,7 @@ def test_release_failure_does_not_complete_and_allows_retry(
     third_party_lock = _FailingThirdPartyLock()
     token = RuntimeFileLockToken(
         lock_path=lock_path,
-        third_party_lock=cast(FileLock, third_party_lock),
+        third_party_lock=cast(BaseFileLock, third_party_lock),
     )
 
     with pytest.raises(RuntimeFileLockError, match="释放 runtime file lock 失败"):
@@ -267,6 +267,34 @@ def test_non_blocking_timeout_is_wrapped(tmp_path: Path) -> None:
             second_lock.acquire(timeout_seconds=0)
     finally:
         first_token.release()
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (-0.1, float("nan"), float("inf"), float("-inf")),
+)
+def test_filelock_rejects_invalid_timeout_at_options_and_acquire_boundaries(
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> None:
+    """默认与单次 acquire timeout 都必须是有限非负数。
+
+    :param tmp_path: pytest 临时目录。
+    :param timeout_seconds: 负数或非有限 timeout。
+    :returns: ``None``。
+    :raises AssertionError: 非法 timeout 到达第三方 filelock 时抛出。
+    """
+
+    lock_path = _lock_path(tmp_path)
+    with pytest.raises(RuntimeFileLockError, match="有限非负数"):
+        RuntimeFileLockOptions(
+            lock_path=lock_path,
+            timeout_seconds=timeout_seconds,
+        )
+
+    lock = file_lock(lock_path)
+    with pytest.raises(RuntimeFileLockError, match="有限非负数"):
+        lock.acquire(timeout_seconds=timeout_seconds)
 
 
 def test_public_api_shape_and_non_goals_are_explicit(tmp_path: Path) -> None:

@@ -67,6 +67,11 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.contracts.tool_source import ToolBundleSourceRef
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_inline_size_bytes,
+    accepted_tool_outcome_json,
+)
 from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
 from dayu.host.durable.codec import (
     canonical_json_dumps,
@@ -89,7 +94,9 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.payload import read_payload_descriptor
@@ -97,15 +104,6 @@ from dayu.host.durable.payload import (
     PayloadStore,
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
-)
-from dayu.host.durable.schema import (
-    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
-    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
-    TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
-    TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
-    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
-    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
-    TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -143,6 +141,11 @@ from dayu.host.tool_trace_signals import (
     TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS as _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS,
     bound_trace_signal_text,
 )
+from dayu.host.tool_call_request import (
+    AcceptedToolCallRequestAtomInput,
+    ToolCallRequestEventOrigin,
+    build_tool_call_requested_event_request,
+)
 from dayu.runtime.cancellation import (
     WaitCancelled,
     WaitCompleted,
@@ -174,7 +177,6 @@ from dayu.host.tool_duplicate_governance import (
     DuplicateGovernanceRequest,
     DuplicateGovernanceScope,
     InMemoryAttemptDuplicateGovernance,
-    duplicate_governance_key as _duplicate_key,
 )
 from dayu.host.tool_runtime_schema_projection import (
     business_bundle_digest as _business_bundle_digest,
@@ -215,12 +217,11 @@ _UNSUPPORTED_EXECUTOR_ERROR = "tool_runtime_not_connected"
 _UNSUPPORTED_EXECUTOR_MESSAGE = (
     "ToolRuntime executor is not connected in Phase 6 S1"
 )
-_TOOL_FACT_ACCEPT_SCOPE_KIND = "tool_fact_accept"
-_TOOL_FACT_ACCEPT_RESULT_KIND = "tool_fact_accept_ack"
+_TOOL_FACT_ACCEPT_SCOPE_KIND = IdempotencyScopeKind.TOOL_FACT_ACCEPT
+_TOOL_FACT_ACCEPT_RESULT_KIND = IdempotencyResultKind.TOOL_FACT_ACCEPT_ACK
 _EVENT_ID_TOOL_CALL_REQUESTED_PREFIX = "event-tool-call-requested-"
 _EVENT_ID_TOOL_CALL_GOVERNED_PREFIX = "event-tool-call-governed-"
 _EVENT_ID_TOOL_RESULT_ACCEPTED_PREFIX = "event-tool-result-accepted-"
-_EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
@@ -229,12 +230,6 @@ _PAYLOAD_FIELD_TOOL_TIMING = "tool_timing"
 _PAYLOAD_FIELD_FAILURE_METADATA = "failure_metadata"
 _TOOL_RESULT_PAYLOAD_REF_PREFIX = "payload-tool-result"
 _TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-result"
-_TOOL_CALL_ARGUMENTS_PAYLOAD_REF_PREFIX = "payload-tool-call-arguments"
-_TOOL_CALL_ARGUMENTS_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-call-arguments"
-_TOOL_CALL_SEMANTIC_QUERY_PAYLOAD_REF_PREFIX = "payload-tool-call-semantic-query"
-_TOOL_CALL_SEMANTIC_QUERY_SQLITE_PAYLOAD_ID_PREFIX = (
-    "sqlite-payload-tool-call-semantic-query"
-)
 _TOOL_ACCEPT_EVENT_ACTOR = "host.tool_runtime"
 _TOOL_ACCEPT_EVENT_SOURCE = "host.tool_runtime.accept"
 _MIN_ACCEPT_RETRY_ATTEMPTS = 1
@@ -242,7 +237,6 @@ _MIN_ACCEPT_BACKOFF_SECONDS = 0.0
 _DEFAULT_ACCEPT_RETRY_ATTEMPTS = 2
 _DEFAULT_ACCEPT_BACKOFF_SECONDS = 0.0
 _TOOL_RESULT_SIZE_LOG_THRESHOLD_BYTES = 65536
-_TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
 _TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
 _TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR = "tool_accept_timeout"
@@ -271,9 +265,6 @@ _TOOL_RUNTIME_DUPLICATE_AWAITING_MARKER_FAILURE_REASON = (
     "duplicate_awaiting_marker_failed"
 )
 _TOOL_RUNTIME_WAIT_ACTIVATION_FAILURE_REASON = "wait_activation_failed"
-_TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY = "diagnostic_refs"
-_TOOL_RUNTIME_HINT_SECTION_SEPARATOR = ";"
-_TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR = ","
 _TOOL_RUNTIME_DUPLICATE_REUSE_REASON = "duplicate_reuse"
 _TOOL_RUNTIME_DUPLICATE_HINT_REASON = "duplicate_hint"
 _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
@@ -287,7 +278,10 @@ _ONE_MILLISECOND = timedelta(milliseconds=1)
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
     "side-effect or paid tool requires a tool idempotency key"
 )
-_FETCH_MORE_DESCRIPTION = "Fetch more content from a truncated tool result."
+_FETCH_MORE_DESCRIPTION = (
+    "仅用于继续读取上一条被截断的工具结果；必须使用该结果给出的 "
+    "cursor 与 scope_token，不能用于发起新的业务查询。"
+)
 _FETCH_MORE_CURSOR_FIELD = "cursor"
 _FETCH_MORE_SCOPE_TOKEN_FIELD = "scope_token"
 _FETCH_MORE_LIMIT_FIELD = "limit"
@@ -295,14 +289,6 @@ _TRUNCATED_VALUE_FIELD = "value"
 _TRUNCATED_META_FIELD = "fetch_more"
 _TRUNCATED_APPLIED_FIELD = "truncated"
 _TRUNCATION_ERROR_CODE = "truncation_error"
-_TRUNCATION_UNSUPPORTED_REASON = "unsupported_truncation_target"
-_TRUNCATION_CURSOR_MISSING_REASON = "missing_cursor"
-_TRUNCATION_SCOPE_MISMATCH_REASON = "scope_mismatch"
-_TRUNCATION_TOKEN_MISMATCH_REASON = "scope_token_mismatch"
-_TRUNCATION_CURSOR_EXPIRED_REASON = "cursor_expired"
-_TRUNCATION_CURSOR_USED_REASON = "cursor_already_used"
-_TRUNCATION_REMAINDER_DIGEST_REASON = "remainder_digest_mismatch"
-_TRUNCATION_INVALID_REQUEST_REASON = "invalid_fetch_more_request"
 _DEFAULT_TRUNCATION_TTL_SECONDS = 600
 _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT = 4096
 _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT = 200
@@ -2047,7 +2033,6 @@ class TruncationManager:
             self._cursors.pop(cursor.cursor_id, None)
             return TruncationAppliedOutcome(
                 outcome=_truncation_failure(
-                    _TRUNCATION_UNSUPPORTED_REASON,
                     "tool result target cannot be replaced safely",
                 ),
                 cursor_hint=None,
@@ -2089,7 +2074,6 @@ class TruncationManager:
         if cursor is None:
             self._cleanup_expired_cursors(datetime.now(UTC))
             return _truncation_failure(
-                _TRUNCATION_CURSOR_MISSING_REASON,
                 "truncation cursor is missing or no longer available",
             )
         validation_failure = self._validate_cursor(cursor, request, context)
@@ -2102,7 +2086,6 @@ class TruncationManager:
         if fetched is None:
             self._cleanup_expired_cursors(datetime.now(UTC))
             return _truncation_failure(
-                _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
         fetched_outcome = ToolCompletedOutcome(
@@ -2198,27 +2181,22 @@ class TruncationManager:
             or context.run_id != self._run_id
         ):
             return _truncation_failure(
-                _TRUNCATION_SCOPE_MISMATCH_REASON,
                 "truncation cursor does not belong to this run scope",
             )
         if cursor.scope_token_digest != _scope_token_digest(request.scope_token):
             return _truncation_failure(
-                _TRUNCATION_TOKEN_MISMATCH_REASON,
                 "truncation scope token does not match cursor",
             )
         if datetime.now(UTC) > cursor.expires_at:
             return _truncation_failure(
-                _TRUNCATION_CURSOR_EXPIRED_REASON,
                 "truncation cursor expired",
             )
         if cursor.single_use and cursor.used_at is not None:
             return _truncation_failure(
-                _TRUNCATION_CURSOR_USED_REASON,
                 "truncation cursor has already been used",
             )
         if not _remainder_digest_matches(cursor.remaining_ref):
             return _truncation_failure(
-                _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
         return None
@@ -2258,7 +2236,6 @@ class FetchMoreToolCallable:
 
         if self._manager is None:
             return _truncation_failure(
-                _TRUNCATION_CURSOR_MISSING_REASON,
                 "truncation manager is not enabled for this run",
             )
         request = _fetch_more_request_from_call(call)
@@ -2474,12 +2451,15 @@ class DefaultHostToolFactAcceptPort:
             )
 
         event_plan = _tool_accept_event_plan(candidate)
+        occurred_at = datetime.now(UTC)
         requested = self._event_log_store.append_event(
             transaction,
-            _tool_call_requested_event_request(
+            build_tool_call_requested_event_request(
                 transaction,
-                candidate,
-                event_plan.requested_id,
+                atom=_tool_call_request_atom(candidate),
+                event_id=event_plan.requested_id,
+                occurred_at=occurred_at,
+                origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
             ),
         ).row
         governed = _append_tool_call_governed_if_needed(
@@ -3603,7 +3583,7 @@ class ToolRuntimeExecutor:
         )
 
     def _awaiting_configuration_failure(self) -> ToolFailedOutcome:
-        """构造 awaiting adapter 未配置的受治理错误。
+        """构造后台任务启动能力未配置的受治理错误。
 
         :returns: 工具失败 outcome。
         """
@@ -3618,12 +3598,12 @@ class ToolRuntimeExecutor:
             ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
                 reason_code=_TOOL_RUNTIME_AWAITING_BINDING_REASON,
-                message="awaiting adapter binding is not configured",
+                message="该工具当前无法启动后台任务；请改用已可用的工具或稍后重试。",
             )
         )
 
     def _awaiting_external_job_failure(self) -> ToolFailedOutcome:
-        """构造 poll awaiting 缺少外部 job 引用的受治理错误。
+        """构造后台任务缺少可跟踪任务引用的受治理错误。
 
         :returns: 工具失败 outcome。
         """
@@ -3631,14 +3611,14 @@ class ToolRuntimeExecutor:
         self._diagnostic_emitter.emit(
             ToolTraceDiagnosticRecord(
                 reason_code=_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON,
-                message="poll awaiting binding did not produce external job ref",
+                message="awaiting binding did not produce external job ref",
             )
         )
         return _governed_failure_outcome(
             ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
                 reason_code=_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON,
-                message="poll awaiting requires a durable external job ref",
+                message="该工具后台任务未返回可跟踪的任务引用；请稍后重试或联系系统维护者。",
             )
         )
 
@@ -3734,14 +3714,25 @@ class ToolRuntimeExecutor:
             or duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
         ):
             return False
-        await self._duplicate_governance.record_accepted(
-            duplicate_request,
-            DuplicateAcceptedEntry(
-                accepted_event_refs=accepted_ack.accepted_event_refs,
-                accepted_outcome=accepted_outcome,
-                result_digest=accepted_ack.result_digest,
-            ),
-        )
+        try:
+            await self._duplicate_governance.record_accepted(
+                duplicate_request,
+                DuplicateAcceptedEntry(
+                    accepted_event_refs=accepted_ack.accepted_event_refs,
+                    accepted_outcome=accepted_outcome,
+                    result_digest=accepted_ack.result_digest,
+                ),
+            )
+        except Exception:
+            self._diagnostic_emitter.emit(
+                ToolTraceDiagnosticRecord(
+                    reason_code="duplicate_accepted_index_failed",
+                    message=(
+                        "工具结果已完成持久化接受；重复调用索引更新失败，"
+                        "后续治理必须以已持久化事实为准。"
+                    ),
+                )
+            )
         return True
 
     async def _record_duplicate_awaiting_accepted(
@@ -4107,22 +4098,6 @@ class _ToolResultPayloadPlan:
     payload_ref: HostPayloadRef | None
 
 
-@dataclass(frozen=True, slots=True)
-class _ToolCallRequestPayloadPlan:
-    """``TOOL_CALL_REQUESTED`` 的 accepted 参数与可读 query 写入计划。
-
-    :param payload: 写入 EventLog 的 bounded canonical payload。
-    :param arguments_payload_ref: 大参数 payload descriptor 引用；inline 时为
-        ``None``。
-    :param semantic_query_payload_ref: 长 semantic query payload descriptor
-        引用；缺失或 inline 时为 ``None``。
-    """
-
-    payload: Mapping[str, JsonValue]
-    arguments_payload_ref: HostPayloadRef | None
-    semantic_query_payload_ref: HostPayloadRef | None
-
-
 def _log_tool_fact_accept_result(
     candidate: ToolFactAcceptCandidate, result: ToolFactAcceptResult
 ) -> None:
@@ -4314,207 +4289,33 @@ def _tool_accept_event_plan(candidate: ToolFactAcceptCandidate) -> _ToolAcceptEv
     )
 
 
-def _tool_call_requested_event_request(
-    transaction: HostTransaction,
+def _tool_call_request_atom(
     candidate: ToolFactAcceptCandidate,
-    event_id: str,
-) -> EventLogAppendRequest:
-    """构造 ``TOOL_CALL_REQUESTED`` append request。
+) -> AcceptedToolCallRequestAtomInput:
+    """把普通工具 accepted candidate 显式映射为共享 request atom。
 
-    :param transaction: 当前 Host transaction。
     :param candidate: 工具事实候选。
-    :param event_id: 稳定事件 id。
-    :returns: EventLog append request。
+    :returns: 与 candidate 同源的 canonical request atom 输入。
+    :raises HostPayloadReferenceError: 写 accepted fact 时缺少 accepted arguments
+        时抛出。
     """
 
-    payload_plan = _tool_call_request_payload_plan(
-        transaction=transaction,
-        candidate=candidate,
-        requested_event_id=event_id,
-    )
-    return _tool_event_request(
-        candidate,
-        event_id=event_id,
-        event_type=_EVENT_TYPE_TOOL_CALL_REQUESTED,
-        policy_decision=None,
-        reason=None,
-        payload=payload_plan.payload,
-    )
-
-
-def _tool_call_request_payload_plan(
-    *,
-    transaction: HostTransaction,
-    candidate: ToolFactAcceptCandidate,
-    requested_event_id: str,
-) -> _ToolCallRequestPayloadPlan:
-    """为 ``TOOL_CALL_REQUESTED`` 准备 accepted request atom payload。
-
-    :param transaction: 当前 Host transaction。
-    :param candidate: 工具事实候选。
-    :param requested_event_id: 即将写入的 ``TOOL_CALL_REQUESTED`` event id。
-    :returns: EventLog bounded payload 与可选 payload descriptor 引用。
-    """
-
-    accepted_arguments = _required_accepted_arguments(candidate.call)
-    arguments_json = _accepted_arguments_json(accepted_arguments)
-    arguments_payload_digest = _accepted_arguments_digest(
-        accepted_arguments
-    )
-    if arguments_payload_digest != candidate.call.normalized_arguments_digest:
-        raise HostPayloadReferenceError(
-            "tool call accepted arguments digest mismatch"
-        )
-    arguments_size_bytes = _payload_size_bytes(arguments_json)
-    arguments_ref: HostPayloadRef | None = None
-    arguments_inline_json: JsonValue = None
-    arguments_storage_kind = TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON
-    if arguments_size_bytes <= transaction.payload_inline_threshold_bytes:
-        arguments_inline_json = arguments_json
-    else:
-        descriptor = PayloadStore().write_sqlite_payload(
-            transaction,
-            SQLitePayloadWriteRequest(
-                payload_ref=_tool_call_arguments_payload_ref(requested_event_id),
-                payload_id=_tool_call_arguments_sqlite_payload_id(
-                    requested_event_id
-                ),
-                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
-                payload_json=arguments_json,
-                media_type="application/json",
-                metadata={
-                    "descriptor_kind": TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
-                    "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
-                    "event_id": requested_event_id,
-                    "tool_name": candidate.call.tool_name,
-                    "tool_call_id": candidate.call.tool_call_id,
-                },
-                expected_digest=arguments_payload_digest,
-            ),
-        )
-        arguments_ref = HostPayloadRef(
-            payload_ref=descriptor.payload_ref,
-            payload_digest=descriptor.payload_digest,
-        )
-        arguments_storage_kind = TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR
-
-    semantic_query_plan = _semantic_query_payload_plan(
-        transaction=transaction,
-        candidate=candidate,
-        requested_event_id=requested_event_id,
-    )
-    payload: dict[str, JsonValue] = {
-        "session_id": candidate.identity.session_id,
-        "run_id": candidate.identity.run_id,
-        "attempt_id": candidate.identity.attempt_id,
-        "execution_id": candidate.identity.execution_id,
-        "iteration_id": candidate.call.iteration_id,
-        "tool_call_id": candidate.call.tool_call_id,
-        "tool_name": candidate.call.tool_name,
-        "tool_schema_digest": candidate.call.tool_schema_digest,
-        "tool_identity_digest": candidate.call.tool_identity_digest,
-        "normalized_arguments_digest": candidate.call.normalized_arguments_digest,
-        "arguments_json_size_bytes": arguments_size_bytes,
-        "arguments_storage_kind": arguments_storage_kind,
-        "arguments_inline_json": arguments_inline_json,
-        "arguments_payload_ref": (
-            arguments_ref.payload_ref if arguments_ref is not None else None
-        ),
-        "arguments_payload_digest": arguments_payload_digest,
-        "tool_fact_kind": candidate.tool_fact_kind.value,
-        "accept_idempotency_key": candidate.idempotency.accept_idempotency_key,
-        "semantic_input_digest": candidate.idempotency.semantic_input_digest,
-        "semantic_query_storage_kind": semantic_query_plan.storage_kind,
-        "semantic_query_text": semantic_query_plan.inline_text,
-        "semantic_query_payload_ref": (
-            semantic_query_plan.payload_ref.payload_ref
-            if semantic_query_plan.payload_ref is not None
-            else None
-        ),
-        "semantic_query_digest": semantic_query_plan.digest,
-    }
-    return _ToolCallRequestPayloadPlan(
-        payload=payload,
-        arguments_payload_ref=arguments_ref,
-        semantic_query_payload_ref=semantic_query_plan.payload_ref,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _SemanticQueryPayloadPlan:
-    """semantic query 的冷热 payload 写入计划。
-
-    :param storage_kind: semantic query 存储形态。
-    :param inline_text: inline 文本；缺失或 descriptor 时为 ``None``。
-    :param payload_ref: descriptor 引用；缺失或 inline 时为 ``None``。
-    :param digest: query 文本 digest；缺失时为 ``None``。
-    """
-
-    storage_kind: str
-    inline_text: str | None
-    payload_ref: HostPayloadRef | None
-    digest: str | None
-
-
-def _semantic_query_payload_plan(
-    *,
-    transaction: HostTransaction,
-    candidate: ToolFactAcceptCandidate,
-    requested_event_id: str,
-) -> _SemanticQueryPayloadPlan:
-    """为可选 semantic query 准备冷热 payload。
-
-    :param transaction: 当前 Host transaction。
-    :param candidate: 工具事实候选。
-    :param requested_event_id: 即将写入的 ``TOOL_CALL_REQUESTED`` event id。
-    :returns: semantic query payload 计划。
-    """
-
-    query_text = candidate.call.semantic_query_text
-    if query_text is None:
-        return _SemanticQueryPayloadPlan(
-            storage_kind=TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
-            inline_text=None,
-            payload_ref=None,
-            digest=None,
-        )
-    query_json = _semantic_query_json(query_text)
-    query_digest = _semantic_query_digest(query_text)
-    if _payload_size_bytes(query_json) <= transaction.payload_inline_threshold_bytes:
-        return _SemanticQueryPayloadPlan(
-            storage_kind=TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
-            inline_text=query_text,
-            payload_ref=None,
-            digest=query_digest,
-        )
-    descriptor = PayloadStore().write_sqlite_payload(
-        transaction,
-        SQLitePayloadWriteRequest(
-            payload_ref=_tool_call_semantic_query_payload_ref(requested_event_id),
-            payload_id=_tool_call_semantic_query_sqlite_payload_id(
-                requested_event_id
-            ),
-            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
-            payload_json=query_json,
-            media_type="text/plain; charset=utf-8",
-            metadata={
-                "descriptor_kind": TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
-                "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
-                "event_id": requested_event_id,
-                "tool_name": candidate.call.tool_name,
-                "tool_call_id": candidate.call.tool_call_id,
-            },
-            expected_digest=query_digest,
-        ),
-    )
-    return _SemanticQueryPayloadPlan(
-        storage_kind=TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
-        inline_text=None,
-        payload_ref=HostPayloadRef(
-            payload_ref=descriptor.payload_ref,
-            payload_digest=descriptor.payload_digest,
-        ),
-        digest=descriptor.payload_digest,
+    return AcceptedToolCallRequestAtomInput(
+        session_id=candidate.identity.session_id,
+        run_id=candidate.identity.run_id,
+        attempt_id=candidate.identity.attempt_id,
+        execution_id=candidate.identity.execution_id,
+        iteration_id=candidate.call.iteration_id,
+        tool_call_id=candidate.call.tool_call_id,
+        tool_name=candidate.call.tool_name,
+        tool_schema_digest=candidate.call.tool_schema_digest,
+        tool_identity_digest=candidate.call.tool_identity_digest,
+        accepted_arguments=_required_accepted_arguments(candidate.call),
+        normalized_arguments_digest=candidate.call.normalized_arguments_digest,
+        tool_fact_kind=candidate.tool_fact_kind.value,
+        accept_idempotency_key=candidate.idempotency.accept_idempotency_key,
+        semantic_input_digest=candidate.idempotency.semantic_input_digest,
+        semantic_query_text=candidate.call.semantic_query_text,
     )
 
 
@@ -4858,66 +4659,6 @@ def _tool_result_sqlite_payload_id(result_event_id: str) -> str:
     """
 
     return f"{_TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX}-{result_event_id}"
-
-
-def _tool_call_arguments_payload_ref(requested_event_id: str) -> str:
-    """派生工具调用 accepted arguments payload ref。
-
-    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
-    :returns: 稳定 payload descriptor ref。
-    """
-
-    return f"{_TOOL_CALL_ARGUMENTS_PAYLOAD_REF_PREFIX}-{requested_event_id}"
-
-
-def _tool_call_arguments_sqlite_payload_id(requested_event_id: str) -> str:
-    """派生工具调用 accepted arguments SQLite payload id。
-
-    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
-    :returns: 稳定 SQLite payload id。
-    """
-
-    return f"{_TOOL_CALL_ARGUMENTS_SQLITE_PAYLOAD_ID_PREFIX}-{requested_event_id}"
-
-
-def _tool_call_semantic_query_payload_ref(requested_event_id: str) -> str:
-    """派生工具调用 semantic query payload ref。
-
-    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
-    :returns: 稳定 payload descriptor ref。
-    """
-
-    return f"{_TOOL_CALL_SEMANTIC_QUERY_PAYLOAD_REF_PREFIX}-{requested_event_id}"
-
-
-def _tool_call_semantic_query_sqlite_payload_id(requested_event_id: str) -> str:
-    """派生工具调用 semantic query SQLite payload id。
-
-    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
-    :returns: 稳定 SQLite payload id。
-    """
-
-    return f"{_TOOL_CALL_SEMANTIC_QUERY_SQLITE_PAYLOAD_ID_PREFIX}-{requested_event_id}"
-
-
-def _semantic_query_json(query_text: str) -> Mapping[str, JsonValue]:
-    """构造 semantic query descriptor 的 canonical JSON preimage。
-
-    :param query_text: 业务可读 semantic query 文本。
-    :returns: canonical JSON object。
-    """
-
-    return {"semantic_query_text": query_text}
-
-
-def _semantic_query_digest(query_text: str) -> str:
-    """计算 semantic query 文本 digest。
-
-    :param query_text: 业务可读 semantic query 文本。
-    :returns: Host canonical sha256 digest。
-    """
-
-    return sha256_digest_json(_semantic_query_json(query_text))
 
 
 def _accepted_evidence_envelope(
@@ -5968,9 +5709,28 @@ def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinit
     """
 
     properties: dict[str, JsonValue] = {
-        _FETCH_MORE_CURSOR_FIELD: {"type": "string"},
-        _FETCH_MORE_SCOPE_TOKEN_FIELD: {"type": "string"},
-        _FETCH_MORE_LIMIT_FIELD: {"type": "integer", "minimum": 1},
+        _FETCH_MORE_CURSOR_FIELD: {
+            "type": "string",
+            "description": (
+                "上一条截断结果给出的 cursor 引用标签。必须原样使用；"
+                "它只用于定位待续读内容，不是业务事实或推理依据。"
+            ),
+        },
+        _FETCH_MORE_SCOPE_TOKEN_FIELD: {
+            "type": "string",
+            "description": (
+                "上一条截断结果给出的 scope_token 引用标签。必须原样使用；"
+                "它只用于校验本次续读范围，不是业务事实或推理依据。"
+            ),
+        },
+        _FETCH_MORE_LIMIT_FIELD: {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "可选的本次补读单位数，必须是正整数；"
+                "省略时由系统使用当前续读上限。"
+            ),
+        },
     }
     schema = ToolSchema(
         type="function",
@@ -6013,14 +5773,12 @@ def _fetch_more_request_from_call(
     limit_value = call.arguments.get(_FETCH_MORE_LIMIT_FIELD)
     if not isinstance(cursor, str) or not isinstance(scope_token, str):
         return _truncation_failure(
-            _TRUNCATION_INVALID_REQUEST_REASON,
             "fetch_more requires cursor and scope_token string arguments",
         )
     limit: int | None = None
     if limit_value is not None:
         if isinstance(limit_value, bool) or not isinstance(limit_value, int):
             return _truncation_failure(
-                _TRUNCATION_INVALID_REQUEST_REASON,
                 "fetch_more limit must be a positive integer",
             )
         limit = limit_value
@@ -6031,7 +5789,7 @@ def _fetch_more_request_from_call(
             limit=limit,
         )
     except ValueError as exc:
-        return _truncation_failure(_TRUNCATION_INVALID_REQUEST_REASON, str(exc))
+        return _truncation_failure(str(exc))
 
 
 def _tool_truncation_strategy(
@@ -7014,6 +6772,10 @@ def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
     :returns: Host canonical sha256 digest。
     """
 
+    if isinstance(
+        outcome, ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+    ):
+        return accepted_tool_outcome_digest(outcome)
     return sha256_digest_json(_tool_outcome_json(outcome))
 
 
@@ -7025,6 +6787,10 @@ def _tool_outcome_inline_size_bytes(outcome: ToolExecutionOutcome) -> int:
     :raises TypeError: 收到不支持的工具 outcome 时抛出。
     """
 
+    if isinstance(
+        outcome, ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+    ):
+        return accepted_tool_outcome_inline_size_bytes(outcome)
     return len(canonical_json_dumps(_tool_outcome_json(outcome)).encode("utf-8"))
 
 
@@ -7270,34 +7036,10 @@ def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
     :raises TypeError: 收到 awaiting outcome 时抛出。
     """
 
-    if isinstance(outcome, ToolCompletedOutcome):
-        return {
-            "kind": "completed",
-            "result": {
-                "ok": outcome.result.ok,
-                "value": outcome.result.value,
-                "meta": _tool_result_meta_json(outcome.result.meta),
-            },
-        }
-    if isinstance(outcome, ToolFailedOutcome):
-        return {
-            "kind": "failed",
-            "result": {
-                "ok": outcome.result.ok,
-                "error": outcome.result.error,
-                "message": outcome.result.message,
-                "hint": outcome.result.hint,
-                "meta": _tool_result_meta_json(outcome.result.meta),
-            },
-        }
-    if isinstance(outcome, ToolCancelledOutcome):
-        return {
-            "kind": "cancelled",
-            "reason": outcome.reason,
-            "message": outcome.message,
-            "hint": outcome.hint,
-            "meta": _tool_result_meta_json(outcome.meta),
-        }
+    if isinstance(
+        outcome, ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+    ):
+        return accepted_tool_outcome_json(outcome)
     if isinstance(outcome, ToolAwaitingOutcome):
         return {
             "kind": "awaiting",
@@ -7320,22 +7062,6 @@ def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
             ),
         }
     raise TypeError("unsupported tool outcome")
-
-
-def _tool_result_meta_json(meta: ToolResultMeta | None) -> JsonValue:
-    """把工具结果 meta 投影为 JSON。
-
-    :param meta: 工具结果 meta。
-    :returns: JSON 值。
-    """
-
-    if meta is None:
-        return None
-    return {
-        "tool_name": meta.tool_name,
-        "started_at": meta.started_at.isoformat(),
-        "finished_at": meta.finished_at.isoformat(),
-    }
 
 
 def _duplicate_decision_json(decision: DuplicateDecision) -> JsonValue:
@@ -7411,7 +7137,7 @@ def _runtime_cancelled_policy_decision(reason: str | None) -> ToolPolicyDecision
     :returns: governed error 决策。
     """
 
-    message = "tool execution cancelled before completion"
+    message = "工具调用在完成前已停止"
     if reason is not None:
         message = f"{message}: {reason}"
     return ToolPolicyDecision(
@@ -7462,10 +7188,9 @@ def _tool_interrupt_result_from_process(
     )
 
 
-def _truncation_failure(reason_code: str, message: str) -> ToolFailedOutcome:
+def _truncation_failure(message: str) -> ToolFailedOutcome:
     """构造截断 / 补读失败工具 outcome。
 
-    :param reason_code: 截断错误原因码。
     :param message: 人类可读错误。
     :returns: 普通 ``ToolFailedOutcome``。
     """
@@ -7473,7 +7198,7 @@ def _truncation_failure(reason_code: str, message: str) -> ToolFailedOutcome:
     return _tool_failed_outcome(
         error=_TRUNCATION_ERROR_CODE,
         message=message,
-        hint=reason_code,
+        hint=None,
     )
 
 
@@ -7484,31 +7209,26 @@ def _governed_failure_outcome(
 
     :param policy_decision: 工具治理决策。
     :returns: governed ``ToolFailedOutcome``。
+    :raises ValueError: 决策字段非法，或 ``ALLOW`` / ``REUSE``
+        误入治理失败投影时抛出。
     """
 
+    _validate_policy_decision_fields(policy_decision)
+    if policy_decision.kind in (
+        ToolPolicyDecisionKind.ALLOW,
+        ToolPolicyDecisionKind.REUSE,
+    ):
+        raise ValueError(
+            f"{policy_decision.kind.value} policy decision cannot produce "
+            "governed failure"
+        )
+    message = policy_decision.message
+    if message is None:
+        raise ValueError("governed failure requires policy decision message")
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_POLICY_BLOCKED_ERROR,
-        message=policy_decision.message or _TOOL_RUNTIME_GOVERNED_ERROR,
-        hint=policy_decision.reason_code,
-    )
-
-
-def _hint_with_diagnostic_refs(
-    *, base_hint: str, diagnostic_refs: tuple[str, ...]
-) -> str:
-    """把诊断引用合并进失败结果的稳定提示字段。
-
-    :param base_hint: 原始失败提示。
-    :param diagnostic_refs: 需要暴露给最终 outcome 的诊断引用。
-    :returns: 合并诊断引用后的提示；无诊断引用时返回原始提示。
-    """
-
-    if len(diagnostic_refs) == 0:
-        return base_hint
-    refs_value = _TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR.join(diagnostic_refs)
-    return (
-        f"{base_hint}{_TOOL_RUNTIME_HINT_SECTION_SEPARATOR}"
-        f"{_TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY}={refs_value}"
+        message=message,
+        hint=None,
     )
 
 
@@ -7525,12 +7245,15 @@ def _accept_failure_outcome(
         return _tool_failed_outcome(
             error=_TOOL_RUNTIME_ACCEPT_REJECTED_ERROR,
             message=result.message,
-            hint=f"{_TOOL_RUNTIME_ACCEPT_REJECTED_REASON}:{result.reason_code.value}",
+            hint=None,
         )
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR,
-        message="tool fact accept ack timed out",
-        hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+        message=_accept_timeout_message(
+            "tool fact accept ack timed out",
+            result.last_error_code,
+        ),
+        hint=None,
     )
 
 
@@ -7547,19 +7270,29 @@ def _awaiting_accept_failure_outcome(
         return _tool_failed_outcome(
             error=_TOOL_RUNTIME_AWAITING_ACCEPT_REJECTED_ERROR,
             message=result.message,
-            hint=(
-                f"{_TOOL_RUNTIME_ACCEPT_REJECTED_REASON}:"
-                f"{result.reason_code.value}"
-            ),
+            hint=None,
         )
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR,
-        message="tool awaiting accept ack timed out",
-        hint=_hint_with_diagnostic_refs(
-            base_hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
-            diagnostic_refs=result.diagnostic_refs,
+        message=_accept_timeout_message(
+            "tool awaiting accept ack timed out",
+            result.last_error_code,
         ),
+        hint=None,
     )
+
+
+def _accept_timeout_message(message: str, last_error_code: str | None) -> str:
+    """构造保留最后 accept 错误码的失败说明。
+
+    :param message: 基础失败说明。
+    :param last_error_code: accept owner 记录的最后错误码；无则为 ``None``。
+    :returns: 保留必要错误码后的说明。
+    """
+
+    if last_error_code is None:
+        return message
+    return f"{message} (last_error_code={last_error_code})"
 
 
 __all__ = [

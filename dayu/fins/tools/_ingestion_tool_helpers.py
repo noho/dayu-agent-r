@@ -18,7 +18,6 @@ from dayu.fins.ingestion.observation_handle import (
     observation_handle_id_to_resume_token,
 )
 
-
 def _awaiting_outcome_from_observation_handle(
     handle: FinsObservationHandle,
 ) -> ToolAwaitingOutcome:

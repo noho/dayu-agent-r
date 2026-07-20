@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import pty
-import termios
 from collections.abc import Callable
 from contextlib import suppress
 from typing import TextIO, cast
 
 import pytest
+
+if os.name == "posix":
+    import pty
+    import termios
 
 import dayu.cli.run_keys as run_keys
 from dayu.cli.run_keys import (
@@ -36,6 +38,19 @@ class _FailingThread:
         raise RuntimeError("thread start failed")
 
 
+class _ReportedTty(io.StringIO):
+    """报告为 TTY 的平台能力测试输入。"""
+
+    def isatty(self) -> bool:
+        """声明该输入是 TTY。
+
+        :returns: 恒为 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+
 def test_running_key_action_from_bytes_maps_supported_controls() -> None:
     """Ctrl+T 与 Esc 应映射为运行态控制动作。"""
 
@@ -52,6 +67,26 @@ def test_new_running_key_monitor_uses_noop_for_non_tty() -> None:
     assert isinstance(monitor, NoopRunningKeyMonitor)
 
 
+def test_new_running_key_monitor_uses_noop_for_non_posix_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 POSIX 即使输入报告为 TTY 也必须使用 no-op owner boundary。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 非 POSIX 仍创建 POSIX monitor 时抛出。
+    """
+
+    monkeypatch.setattr(run_keys, "_POSIX_TERMINAL_CONTROL_AVAILABLE", False)
+
+    monitor = new_running_key_monitor(stdin=_ReportedTty())
+
+    assert isinstance(monitor, NoopRunningKeyMonitor)
+    direct_monitor = TtyRunningKeyMonitor(stdin=_ReportedTty())
+    direct_monitor.start()
+    direct_monitor.close()
+
+
 @pytest.mark.asyncio
 async def test_noop_running_key_monitor_wait_is_cancellable() -> None:
     """no-op monitor 的等待应只由调用方取消。"""
@@ -65,6 +100,7 @@ async def test_noop_running_key_monitor_wait_is_cancellable() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX PTY contract")
 async def test_tty_running_key_monitor_reads_action_and_restores_terminal() -> None:
     """TTY monitor 应读取控制键，并在 close 时恢复终端属性。"""
 
@@ -105,6 +141,7 @@ async def test_tty_running_key_monitor_close_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX PTY contract")
 async def test_tty_running_key_monitor_restores_terminal_when_thread_start_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

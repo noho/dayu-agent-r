@@ -35,8 +35,10 @@ from dayu.host.durable.payload import (
     write_sqlite_payload,
 )
 from dayu.host.durable.schema import (
+    PayloadDescriptorKind,
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
+    payload_descriptor_metadata,
 )
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.payload_resolution import event_payload_object
@@ -77,7 +79,7 @@ def _event_request(payload_ref: str, payload_digest: str) -> EventLogAppendReque
         run_id="run-1",
         attempt_id="attempt-1",
         execution_id="execution-1",
-        event_type="host.payload.accepted",
+        event_type="USER_INPUT_ACCEPTED",
         occurred_at=datetime(2026, 5, 14, 1, 2, 3, 123456, tzinfo=UTC),
         actor="host",
         source="payload-test",
@@ -179,6 +181,63 @@ def test_canonical_json_payload_writes_payload_and_descriptor(
             1,
             1,
         )
+
+
+def test_descriptor_metadata_helper_rejects_descriptor_kind_override() -> None:
+    """descriptor metadata helper 不允许调用方覆盖 owner 写入的 kind。"""
+
+    with pytest.raises(
+        HostDurableError, match="must not override descriptor_kind"
+    ):
+        payload_descriptor_metadata(
+            PayloadDescriptorKind.TOOL_CALL_ARGUMENTS_JSON,
+            {"descriptor_kind": "other"},
+        )
+
+
+def test_payload_descriptor_rejects_unknown_descriptor_kind_before_write(
+    tmp_path: Path,
+) -> None:
+    """payload 写入边界拒绝未知 descriptor kind 且不落 durable row。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """尝试写入未知 descriptor kind。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-json",
+                    payload_id="sqlite-json",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={"ok": True},
+                    metadata={"descriptor_kind": "unknown_descriptor_kind"},
+                ),
+            )
+
+        with pytest.raises(
+            HostDurableError, match="payload descriptor kind is invalid"
+        ):
+            store.transaction_runner.run_write(operation)
+
+        def count_operation(transaction: HostTransaction) -> tuple[int, int]:
+            """统计 payload 与 descriptor rows。
+
+            :param transaction: Host transaction。
+            :returns: payload row 数与 descriptor row 数。
+            """
+
+            return (
+                _count_rows(transaction, TABLE_SQLITE_PAYLOADS),
+                _count_rows(transaction, TABLE_PAYLOAD_DESCRIPTORS),
+            )
+
+        assert store.transaction_runner.run_read(count_operation) == (0, 0)
 
 
 def test_bytes_payload_writes_bytes_descriptor_and_digest(
@@ -360,7 +419,7 @@ def test_event_payload_object_raises_when_descriptor_missing(
             )
 
         with pytest.raises(
-            HostDurableError, match="USER_INPUT_ACCEPTED payload descriptor is missing"
+            HostDurableError, match="JSON payload descriptor is missing"
         ):
             store.transaction_runner.run_read(operation)
 
@@ -415,7 +474,7 @@ def test_event_payload_object_raises_when_sqlite_payload_row_missing(
 
         with pytest.raises(
             HostDurableError,
-            match="USER_INPUT_ACCEPTED sqlite payload row is missing",
+            match="JSON sqlite payload row is missing",
         ):
             store.transaction_runner.run_read(read_missing_payload)
 

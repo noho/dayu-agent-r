@@ -26,6 +26,7 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.contracts.tool_await import ToolAwaitSnapshot
+from dayu.engine.contracts.error_codes import serialize_engine_error_code
 from dayu.engine.contracts.engine_events import (
     ContentCompleteData,
     ContentDeltaData,
@@ -35,6 +36,7 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
     IterationCompletedData,
     IterationStartedData,
+    ProviderDiagnosticData,
     ProviderProtocolErrorData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
@@ -52,6 +54,17 @@ from dayu.engine.contracts.engine_events import (
     UsageReportedData,
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallHotDiagnostic,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    parse_runner_call_hot_payload,
+    parse_runner_call_manifest,
+    runner_call_hot_diagnostic_from_json,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host.admission import (
     AdmissionWakeupPort,
     NoopAdmissionWakeupPort,
@@ -158,18 +171,18 @@ from dayu.host.durable.run_transition import (
     active_cancel_closeout_in_transaction,
     close_attempt_for_context_recovery_in_transaction,
     fail_recovering_run_in_transaction,
+    read_cancel_requested_event_from_run_link,
     start_recovery_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
-    _cancel_request_event_id_from_cancelling,
 )
 from dayu.host.durable.schema import (
-    RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+    PayloadDescriptorKind,
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-    RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
     RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
     RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
+    payload_descriptor_metadata,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -179,6 +192,8 @@ from dayu.host.durable.state import (
     WaitRecordRow,
     WaitRecordStatus,
     WorkerKind,
+    is_terminal_attempt_status,
+    is_terminal_run_status,
     read_active_wait_records_for_run,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
@@ -192,6 +207,10 @@ from dayu.host._event_payload import (
     required_payload_text as _required_payload_text,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 from dayu.host.memory import (
     MemoryProjectionPolicy,
     default_memory_projection_policy,
@@ -222,18 +241,16 @@ _EVENT_ACTOR = "host.engine_ingest"
 _EVENT_ID_PREFIX = "event-engine-"
 _PAYLOAD_REF_PREFIX = "payload-engine-terminal"
 _PAYLOAD_ID_PREFIX = "sqlite-payload-engine-terminal"
+_HOST_LIFECYCLE_EVENT_SOURCE = "host.worker_lifecycle"
+_HOST_LIFECYCLE_EVENT_ACTOR = "host.worker_lifecycle"
+_HOST_LIFECYCLE_EVENT_ID_PREFIX = "event-host-lifecycle-"
+_HOST_LIFECYCLE_PAYLOAD_REF_PREFIX = "payload-host-lifecycle-terminal"
+_HOST_LIFECYCLE_PAYLOAD_ID_PREFIX = "sqlite-payload-host-lifecycle-terminal"
 _EVENT_TYPE_ENGINE_EVENT_REJECTED = "ENGINE_EVENT_REJECTED"
 _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC = "ENGINE_EVENT_DIAGNOSTIC"
+_EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC = "HOST_LIFECYCLE_DIAGNOSTIC"
+_EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
-_EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_ATTEMPT_FAILED = "ATTEMPT_FAILED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
@@ -247,16 +264,21 @@ _REASON_UNSUPPORTED_RECOVERY_POLICY = "unsupported_recovery_policy"
 _REASON_UNSUPPORTED_WAITING_PATH = "unsupported_waiting_path"
 _REASON_STREAM_ENDED_WITHOUT_TERMINAL = "stream_ended_without_terminal"
 _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
-_REASON_EMPTY_FINAL_ANSWER = "empty_final_answer"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
+_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED = (
+    "terminal_closeout_precondition_failed"
+)
 _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL = "late_terminal_after_active_cancel"
+_REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL = (
+    "host_lifecycle_after_active_cancel"
+)
 _REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
 _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
     "waiting_event_without_host_accepted_refs"
 )
 _REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = (
-    "run_cancelled_invalid_active_cancel_payload"
+    "run_cancelled_invalid_active_cancel_link"
 )
 _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
@@ -297,7 +319,7 @@ _RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION = "tool_result_continuation"
 _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
 _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE = "tool_results_available"
 _RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT = (
-    "runner_call_projection_artifact"
+    "artifact_ref"
 )
 _RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION = "tool_continuation_input"
 _ORDINARY_RUNNER_CALL_KINDS = frozenset(
@@ -315,6 +337,17 @@ class EngineIngestStatus(StrEnum):
     ACCEPTED = "accepted"
     DUPLICATE = "duplicate"
     REJECTED = "rejected"
+
+
+class _HostLifecycleSource(StrEnum):
+    """Host worker lifecycle closeout 的强类型来源。"""
+
+    WORKER_CLEAN_EOF = "worker_clean_eof"
+    WORKER_LOST = "worker_lost"
+
+
+class _TerminalCloseoutRollback(Exception):
+    """terminal closeout 未更新 durable state 时触发整笔事务回滚。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,8 +453,8 @@ class _RunnerCallIterationResolution:
 
 
 @dataclass(frozen=True, slots=True)
-class _TerminalPlan:
-    """terminal closeout 事件规划。"""
+class _TerminalFactPlan:
+    """两类 terminal 来源共享的 canonical fact 规划。"""
 
     attempt_event_type: str
     run_event_type: str
@@ -429,6 +462,13 @@ class _TerminalPlan:
     run_status: RunStatus
     reason: str
     terminal_payload: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class _EngineTerminalPlan:
+    """Engine-origin terminal closeout 规划。"""
+
+    terminal: _TerminalFactPlan
     finish_reason: str | None
     filtered: bool | None
     degraded: bool | None
@@ -438,10 +478,54 @@ class _TerminalPlan:
     client_correlation_id: str | None
     recoverable: bool | None
     unsupported_later_owner: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _HostLifecycleTerminalPlan:
+    """Host worker lifecycle terminal closeout 规划。"""
+
+    terminal: _TerminalFactPlan
+    error_code: str | None
+    message: str | None
+    recoverable: bool | None
     worker_lifecycle_signal: str | None
     stream_error_code: str | None
     last_observed_worker_event_index: int | None
     last_accepted_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _HostLifecycleCloseoutCandidate:
+    """进入 Host lifecycle closeout 的强类型 candidate。
+
+    :param envelope: Host-owned worker identity envelope。
+    :param observed_at: Host 观察到 lifecycle signal 的 UTC aware 时间。
+    :param worker_event_index: 单个 execution 内 Host 分配的 lifecycle 序号。
+    :param plan: Host terminal closeout 规划。
+    :param lifecycle_source: worker lifecycle signal 的强类型来源。
+    """
+
+    envelope: LocalEngineEnvelope
+    observed_at: datetime
+    worker_event_index: int
+    plan: _HostLifecycleTerminalPlan
+    lifecycle_source: _HostLifecycleSource
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedHostLifecycleCloseoutCandidate:
+    """已通过 durable identity 校验的 Host lifecycle candidate 上下文。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :param run: 当前 durable Run row。
+    :param attempt: 当前 durable Attempt row。
+    :param dispatch_record: 当前 durable dispatch record row。
+    """
+
+    candidate: _HostLifecycleCloseoutCandidate
+    run: RunRow
+    attempt: AttemptRow
+    dispatch_record: DispatchRecordRow
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,10 +818,10 @@ class EngineEventIngestor:
                     candidate=candidate,
                     reason=_REASON_STALE_EXECUTION_ID,
                 )
-            duplicate = self._duplicate_terminal_result(transaction, context)
+            duplicate = self._duplicate_engine_terminal_result(transaction, context)
             if duplicate is not None:
                 return duplicate
-            late = _late_rejection_reason(context)
+            late = _late_engine_event_rejection_reason(context)
             if late is not None:
                 return self._append_rejected_diagnostic(
                     transaction,
@@ -746,7 +830,10 @@ class EngineEventIngestor:
                 )
             return self._ingest_validated(transaction, context)
 
-        return self._transaction_runner.run_write(_operation)
+        try:
+            return self._transaction_runner.run_write(_operation)
+        except _TerminalCloseoutRollback:
+            return _terminal_closeout_precondition_failed_result()
 
     def _finish_ingest(
         self,
@@ -789,14 +876,15 @@ class EngineEventIngestor:
         )
         return promoted
 
-    def _duplicate_terminal_result(
+    def _duplicate_engine_terminal_result(
         self, transaction: HostTransaction, context: _ValidatedCandidate
     ) -> EngineIngestResult | None:
-        """识别 terminal candidate 的完整重复写入。
+        """识别 Engine-origin terminal candidate 的完整重复写入。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
         :returns: duplicate 结果；不是完整重复时返回 ``None``。
+        :raises HostDurableError: EventLog 读取失败时抛出。
         """
 
         event_ids = _duplicate_terminal_event_ids(context.candidate)
@@ -817,6 +905,31 @@ class EngineEventIngestor:
                 reason="duplicate_candidate",
                 stop_worker_stream=True,
             )
+        return EngineIngestResult(
+            status=EngineIngestStatus.DUPLICATE,
+            events=existing,
+            terminal_closeout=True,
+            promotion_triggered=False,
+            reason="duplicate_candidate",
+        )
+
+    def _duplicate_host_lifecycle_terminal_result(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedHostLifecycleCloseoutCandidate,
+    ) -> EngineIngestResult | None:
+        """识别 Host lifecycle terminal candidate 的完整重复写入。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验的 Host lifecycle candidate 上下文。
+        :returns: duplicate 结果；不是完整重复时返回 ``None``。
+        :raises HostDurableError: EventLog 读取失败时抛出。
+        """
+
+        event_ids = _host_lifecycle_terminal_event_ids(context.candidate)
+        existing = _existing_rows(self._event_log_store, transaction, event_ids)
+        if len(existing) != len(event_ids):
+            return None
         return EngineIngestResult(
             status=EngineIngestStatus.DUPLICATE,
             events=existing,
@@ -848,6 +961,7 @@ class EngineEventIngestor:
             envelope,
             observed_at=observed_at,
             event_index=last_observed_worker_event_index + 1,
+            lifecycle_source=_HostLifecycleSource.WORKER_CLEAN_EOF,
             plan=_failed_lifecycle_plan(
                 reason=_REASON_STREAM_ENDED_WITHOUT_TERMINAL,
                 last_observed_worker_event_index=last_observed_worker_event_index,
@@ -885,6 +999,7 @@ class EngineEventIngestor:
             envelope,
             observed_at=observed_at,
             event_index=last_observed_worker_event_index + 1,
+            lifecycle_source=_HostLifecycleSource.WORKER_LOST,
             plan=_lost_lifecycle_plan(
                 worker_lifecycle_signal=worker_lifecycle_signal,
                 stream_error_code=stream_error_code,
@@ -922,6 +1037,7 @@ class EngineEventIngestor:
         if event.type == EngineEventType.RUN_FAILED and isinstance(
             event.data, RunFailedData
         ):
+            error_code = serialize_engine_error_code(event.data.error_code)
             if event.data.recoverable:
                 diagnostic = self._append_diagnostic_event(
                     transaction,
@@ -931,7 +1047,7 @@ class EngineEventIngestor:
                     payload={
                         "attempt_id": context.attempt.attempt_id,
                         "execution_id": context.attempt.execution_id,
-                        "error_code": event.data.error_code,
+                        "error_code": error_code,
                         "message": event.data.message,
                         "provider_request_id": event.data.provider_request_id,
                         "client_correlation_id": event.data.client_correlation_id,
@@ -994,6 +1110,13 @@ class EngineEventIngestor:
         if _is_preview_event(event):
             row = self._append_preview_event(transaction, context)
             return _single_event_result(row)
+        if event.type == EngineEventType.PROVIDER_DIAGNOSTIC and isinstance(
+            event.data, ProviderDiagnosticData
+        ):
+            row = self._append_provider_diagnostic(
+                transaction, context, event.data
+            )
+            return _single_event_result(row)
         if event.type == EngineEventType.PROVIDER_PROTOCOL_ERROR and isinstance(
             event.data, ProviderProtocolErrorData
         ):
@@ -1041,11 +1164,49 @@ class EngineEventIngestor:
             dispatch_record=dispatch_record,
         )
 
+    def _validate_host_lifecycle_context(
+        self,
+        transaction: HostTransaction,
+        candidate: _HostLifecycleCloseoutCandidate,
+    ) -> _ValidatedHostLifecycleCloseoutCandidate | None:
+        """校验 Host lifecycle candidate 与 durable identity 是否同源。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: 待校验的 Host lifecycle candidate。
+        :returns: 校验通过的强类型上下文；identity 不匹配时返回 ``None``。
+        :raises HostDurableError: durable row 解码失败时抛出。
+        """
+
+        envelope = candidate.envelope
+        run = read_run_by_id(transaction, envelope.run_id)
+        attempt = read_attempt_by_id(transaction, envelope.attempt_id)
+        dispatch_record = read_dispatch_record_by_attempt_id(
+            transaction, envelope.attempt_id
+        )
+        if run is None or attempt is None or dispatch_record is None:
+            return None
+        if (
+            run.session_id != envelope.session_id
+            or run.run_id != envelope.run_id
+            or run.current_attempt_id != envelope.attempt_id
+            or attempt.run_id != envelope.run_id
+            or attempt.execution_id != envelope.execution_id
+            or dispatch_record.dispatch_record_id != envelope.dispatch_record_id
+            or dispatch_record.execution_id != envelope.execution_id
+        ):
+            return None
+        return _ValidatedHostLifecycleCloseoutCandidate(
+            candidate=candidate,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+
     def _close_terminal(
         self,
         transaction: HostTransaction,
         context: _ValidatedCandidate,
-        plan: _TerminalPlan,
+        plan: _EngineTerminalPlan,
         *,
         sub_index_offset: int = 0,
     ) -> EngineIngestResult:
@@ -1056,19 +1217,22 @@ class EngineEventIngestor:
         :param plan: terminal closeout 规划。
         :param sub_index_offset: 多事件映射时的 sub-index 偏移。
         :returns: ingest 结果。
+        :raises _TerminalCloseoutRollback: terminal mutation 未更新时抛出以回滚事务。
+        :raises HostDurableError: payload、EventLog 或状态写入失败时抛出。
         """
 
         candidate = context.candidate
+        terminal = plan.terminal
         attempt_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            plan.attempt_event_type,
+            terminal.attempt_event_type,
             sub_index_offset,
         )
         run_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            plan.run_event_type,
+            terminal.run_event_type,
             sub_index_offset + 1,
         )
         existing = _existing_rows(
@@ -1082,13 +1246,13 @@ class EngineEventIngestor:
                 events=existing,
                 terminal_closeout=True,
                 promotion_triggered=False,
-                reason=plan.reason,
+                reason=terminal.reason,
             )
         descriptor = self._write_terminal_payload(
             transaction,
             candidate=candidate,
             event_id=attempt_event_id,
-            payload=plan.terminal_payload,
+            payload=terminal.terminal_payload,
         )
         result = terminal_closeout_in_transaction(
             transaction,
@@ -1098,12 +1262,12 @@ class EngineEventIngestor:
                 attempt_id=context.attempt.attempt_id,
                 attempt_terminal_event_id=attempt_event_id,
                 run_terminal_event_id=run_event_id,
-                attempt_terminal_status=plan.attempt_status,
-                run_terminal_status=plan.run_status,
+                attempt_terminal_status=terminal.attempt_status,
+                run_terminal_status=terminal.run_status,
                 occurred_at=candidate.observed_at,
                 actor=_EVENT_ACTOR,
                 source=_EVENT_SOURCE,
-                reason=plan.reason,
+                reason=terminal.reason,
                 terminal_summary_ref=descriptor.payload_ref,
                 terminal_summary_digest=descriptor.payload_digest,
                 engine_event_ref=_engine_event_ref(candidate),
@@ -1116,21 +1280,15 @@ class EngineEventIngestor:
                 client_correlation_id=plan.client_correlation_id,
                 recoverable=plan.recoverable,
                 unsupported_later_owner=plan.unsupported_later_owner,
-                worker_lifecycle_signal=plan.worker_lifecycle_signal,
-                stream_error_code=plan.stream_error_code,
-                last_observed_worker_event_index=(
-                    plan.last_observed_worker_event_index
-                ),
-                last_accepted_event_id=plan.last_accepted_event_id,
+                worker_lifecycle_signal=None,
+                stream_error_code=None,
+                last_observed_worker_event_index=None,
+                last_accepted_event_id=None,
             ),
         )
         if result.status != StateMutationStatus.UPDATED:
-            return EngineIngestResult(
-                status=EngineIngestStatus.REJECTED,
-                events=(),
-                terminal_closeout=True,
-                promotion_triggered=False,
-                reason="terminal_closeout_precondition_failed",
+            raise _TerminalCloseoutRollback(
+                f"Engine terminal closeout returned {result.status.value}"
             )
         rows = _existing_rows(
             self._event_log_store,
@@ -1142,7 +1300,96 @@ class EngineEventIngestor:
             events=rows,
             terminal_closeout=True,
             promotion_triggered=False,
-            reason=plan.reason,
+            reason=terminal.reason,
+        )
+
+    def _close_host_lifecycle_terminal(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedHostLifecycleCloseoutCandidate,
+    ) -> EngineIngestResult:
+        """按 Host lifecycle plan 写入 Attempt / Run terminal facts。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验的 Host lifecycle candidate 上下文。
+        :returns: lifecycle closeout 结果。
+        :raises _TerminalCloseoutRollback: terminal mutation 未更新时抛出以回滚事务。
+        :raises HostDurableError: payload 或 terminal transaction 写入失败时抛出。
+        """
+
+        candidate = context.candidate
+        plan = candidate.plan
+        terminal = plan.terminal
+        attempt_event_id, run_event_id = _host_lifecycle_terminal_event_ids(
+            candidate
+        )
+        existing = _existing_rows(
+            self._event_log_store,
+            transaction,
+            (attempt_event_id, run_event_id),
+        )
+        if len(existing) == 2:
+            return EngineIngestResult(
+                status=EngineIngestStatus.DUPLICATE,
+                events=existing,
+                terminal_closeout=True,
+                promotion_triggered=False,
+                reason=terminal.reason,
+            )
+        descriptor = self._write_host_lifecycle_terminal_payload(
+            transaction,
+            candidate=candidate,
+            event_id=attempt_event_id,
+        )
+        result = terminal_closeout_in_transaction(
+            transaction,
+            self._event_log_store,
+            TerminalCloseoutInput(
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                attempt_terminal_event_id=attempt_event_id,
+                run_terminal_event_id=run_event_id,
+                attempt_terminal_status=terminal.attempt_status,
+                run_terminal_status=terminal.run_status,
+                occurred_at=candidate.observed_at,
+                actor=_HOST_LIFECYCLE_EVENT_ACTOR,
+                source=_HOST_LIFECYCLE_EVENT_SOURCE,
+                reason=terminal.reason,
+                terminal_summary_ref=descriptor.payload_ref,
+                terminal_summary_digest=descriptor.payload_digest,
+                engine_event_ref=None,
+                finish_reason=None,
+                filtered=None,
+                degraded=None,
+                error_code=plan.error_code,
+                message=plan.message,
+                provider_request_id=None,
+                client_correlation_id=None,
+                recoverable=plan.recoverable,
+                unsupported_later_owner=None,
+                worker_lifecycle_signal=plan.worker_lifecycle_signal,
+                stream_error_code=plan.stream_error_code,
+                last_observed_worker_event_index=(
+                    plan.last_observed_worker_event_index
+                ),
+                last_accepted_event_id=plan.last_accepted_event_id,
+            ),
+        )
+        if result.status != StateMutationStatus.UPDATED:
+            raise _TerminalCloseoutRollback(
+                f"Host lifecycle terminal closeout returned {result.status.value}"
+            )
+        rows = _existing_rows(
+            self._event_log_store,
+            transaction,
+            (attempt_event_id, run_event_id),
+        )
+        return EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=rows,
+            terminal_closeout=True,
+            promotion_triggered=False,
+            reason=terminal.reason,
         )
 
     def _close_active_cancel(
@@ -1163,13 +1410,13 @@ class EngineEventIngestor:
         attempt_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_ATTEMPT_CANCELLED,
+            _closeout_attempt_event_type(AttemptStatus.CANCELLED),
             0,
         )
         run_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_RUN_CANCELLED,
+            _run_terminal_event_type(RunStatus.CANCELLED),
             1,
         )
         existing = _existing_rows(
@@ -1185,19 +1432,12 @@ class EngineEventIngestor:
                 promotion_triggered=False,
                 reason=data.reason,
             )
-        cancelling = self._event_log_store.read_latest_run_event_by_type(
+        cancel_requested = read_cancel_requested_event_from_run_link(
             transaction,
-            run_id=context.run.run_id,
-            event_type=_EVENT_TYPE_RUN_CANCELLING,
+            self._event_log_store,
+            context.run,
         )
-        if cancelling is None:
-            return self._append_rejected_diagnostic(
-                transaction,
-                candidate=candidate,
-                reason="run_cancelled_without_active_cancel",
-            )
-        cancel_request_event_id = _cancel_request_event_id_from_cancelling(cancelling)
-        if cancel_request_event_id is None:
+        if cancel_requested is None:
             return self._append_rejected_diagnostic(
                 transaction,
                 candidate=candidate,
@@ -1215,9 +1455,9 @@ class EngineEventIngestor:
                 actor=_EVENT_ACTOR,
                 source=_EVENT_SOURCE,
                 reason=data.reason,
-                cancel_request_event_id=cancel_request_event_id,
+                cancel_request_event_id=cancel_requested.event_id,
                 engine_event_ref=_engine_event_ref(candidate),
-                requested_at=format_utc_timestamp(data.requested_at),
+                requested_at=cancel_requested.occurred_at,
                 accepted_at=format_utc_timestamp(data.accepted_at),
                 finished_at=format_utc_timestamp(data.finished_at),
             ),
@@ -1465,7 +1705,7 @@ class EngineEventIngestor:
         attempt_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_ATTEMPT_FAILED,
+            _closeout_attempt_event_type(AttemptStatus.FAILED),
             sub_index_offset,
         )
         recovering_event_id = _event_id(
@@ -1713,7 +1953,7 @@ class EngineEventIngestor:
                 )
             if (
                 latest.run.status is not RunStatus.RECOVERING
-                or latest.attempt.terminal_event_id is None
+                or not is_terminal_attempt_status(latest.attempt.status)
             ):
                 return pending.result_prefix
             attempt_rows: list[EventLogRow] = []
@@ -2278,7 +2518,7 @@ class EngineEventIngestor:
         run_failed_event_id = _event_id(
             context.candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_RUN_FAILED,
+            _run_terminal_event_type(RunStatus.FAILED),
             4,
         )
         result = fail_recovering_run_in_transaction(
@@ -2435,16 +2675,29 @@ class EngineEventIngestor:
         *,
         observed_at: datetime,
         event_index: int,
-        plan: _TerminalPlan,
+        lifecycle_source: _HostLifecycleSource,
+        plan: _HostLifecycleTerminalPlan,
     ) -> EngineIngestResult:
         """按 worker lifecycle signal 执行 terminal closeout。
 
         :param envelope: Host-owned identity envelope。
         :param observed_at: Host 观察时间。
-        :param event_index: 合成 worker event index。
+        :param event_index: Host worker lifecycle event index。
+        :param lifecycle_source: Host worker lifecycle 来源。
         :param plan: terminal closeout 规划。
         :returns: closeout 结果。
+        :raises ValueError: candidate identity、时间或 event index 非法时抛出。
+        :raises HostDurableError: durable identity、EventLog 或 closeout 写入失败时抛出。
         """
+
+        candidate = _HostLifecycleCloseoutCandidate(
+            envelope=envelope,
+            observed_at=observed_at,
+            worker_event_index=event_index,
+            plan=plan,
+            lifecycle_source=lifecycle_source,
+        )
+        _validate_host_lifecycle_candidate_shape(candidate)
 
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -2456,49 +2709,35 @@ class EngineEventIngestor:
             envelope.attempt_id,
             envelope.execution_id,
             event_index,
-            plan.reason,
-        )
-        event = EngineEvent(
-            occurred_at=observed_at,
-            session_id=envelope.session_id,
-            run_id=envelope.run_id,
-            type=EngineEventType.RUN_FAILED,
-            data=RunFailedData(
-                error_code=plan.reason,
-                message=plan.reason,
-                provider_request_id=None,
-                recoverable=False,
-            ),
-            metadata=None,
-        )
-        candidate = EngineEventCandidate(
-            envelope=envelope,
-            worker_event_index=event_index,
-            engine_event=event,
-            observed_at=observed_at,
+            plan.terminal.reason,
         )
 
         def _operation(transaction: HostTransaction) -> EngineIngestResult:
-            context = self._validate_durable_context(transaction, candidate)
+            context = self._validate_host_lifecycle_context(transaction, candidate)
             if context is None:
-                return self._append_rejected_diagnostic(
+                return self._append_stale_host_lifecycle_diagnostic(
                     transaction,
                     candidate=candidate,
                     reason=_REASON_STALE_EXECUTION_ID,
                 )
-            duplicate = self._duplicate_terminal_result(transaction, context)
+            duplicate = self._duplicate_host_lifecycle_terminal_result(
+                transaction, context
+            )
             if duplicate is not None:
                 return duplicate
-            late = _late_rejection_reason(context)
+            late = _late_host_lifecycle_rejection_reason(context)
             if late is not None:
-                return self._append_rejected_diagnostic(
+                return self._append_host_lifecycle_diagnostic(
                     transaction,
-                    candidate=candidate,
+                    context=context,
                     reason=late,
                 )
-            return self._close_terminal(transaction, context, plan)
+            return self._close_host_lifecycle_terminal(transaction, context)
 
-        result = self._transaction_runner.run_write(_operation)
+        try:
+            result = self._transaction_runner.run_write(_operation)
+        except _TerminalCloseoutRollback:
+            result = _terminal_closeout_precondition_failed_result()
         promoted = self._with_terminal_promotion_retry(
             result,
             session_id=envelope.session_id,
@@ -2875,7 +3114,7 @@ class EngineEventIngestor:
                     "prompt_tokens": data.prompt_tokens,
                     "completion_tokens": data.completion_tokens,
                     "total_tokens": data.total_tokens,
-                    "provider_request_id": None,
+                    "provider_request_id": data.provider_request_id,
                     "policy_ref": diagnostic.policy_ref,
                     "estimator_digest": diagnostic.estimator_digest,
                     "estimated_input_tokens": diagnostic.estimated_input_tokens,
@@ -2931,7 +3170,7 @@ class EngineEventIngestor:
                 prompt_tokens=data.prompt_tokens,
                 completion_tokens=data.completion_tokens,
                 total_tokens=data.total_tokens,
-                provider_request_id=None,
+                provider_request_id=data.provider_request_id,
                 estimator_digest=estimator_digest,
                 policy_ref=policy_ref,
                 observed_at=context.candidate.observed_at,
@@ -3048,7 +3287,7 @@ class EngineEventIngestor:
             "attempt_id": context.attempt.attempt_id,
             "execution_id": context.attempt.execution_id,
             "iteration_id": data.iteration_id,
-            "error_code": data.error_code,
+            "error_code": serialize_engine_error_code(data.error_code),
             "message": data.message,
             "provider_request_id": data.provider_request_id,
             "client_correlation_id": data.client_correlation_id,
@@ -3077,7 +3316,69 @@ class EngineEventIngestor:
                 event_class=EventClass.DIAGNOSTIC,
                 event_type=_EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
                 payload=payload,
-                reason={"reason": data.error_code},
+                reason={"reason": serialize_engine_error_code(data.error_code)},
+            ),
+        ).row
+
+    def _append_provider_diagnostic(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedCandidate,
+        data: ProviderDiagnosticData,
+    ) -> EventLogRow:
+        """追加 provider 非致命诊断事件。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param data: provider diagnostic data。
+        :returns: EventLog row。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        payload_descriptor = self._write_raw_payload(
+            transaction,
+            context=context,
+            raw_payload=data.raw_payload,
+        )
+        payload_ref = (
+            payload_descriptor.payload_ref
+            if payload_descriptor is not None
+            else None
+        )
+        payload_digest = (
+            payload_descriptor.payload_digest
+            if payload_descriptor is not None
+            else None
+        )
+        candidate = context.candidate
+        payload: dict[str, JsonValue] = {
+            "attempt_id": context.attempt.attempt_id,
+            "execution_id": context.attempt.execution_id,
+            "iteration_id": data.iteration_id,
+            "diagnostic_code": data.diagnostic_code,
+            "severity": data.severity.value,
+            "message": data.message,
+            "provider_request_id": data.provider_request_id,
+            "client_correlation_id": data.client_correlation_id,
+            "diagnostic_source": data.diagnostic_source.value,
+            "payload_ref": payload_ref,
+            "payload_digest": payload_digest,
+            "partial_tool_call_count": len(data.partial_tool_calls),
+        }
+        return self._event_log_store.append_event(
+            transaction,
+            _event_request(
+                candidate=candidate,
+                event_id=_event_id(
+                    candidate,
+                    EventClass.DIAGNOSTIC,
+                    _EVENT_TYPE_PROVIDER_DIAGNOSTIC,
+                    0,
+                ),
+                event_class=EventClass.DIAGNOSTIC,
+                event_type=_EVENT_TYPE_PROVIDER_DIAGNOSTIC,
+                payload=payload,
+                reason={"reason": data.diagnostic_code},
             ),
         ).row
 
@@ -3191,6 +3492,127 @@ class EngineEventIngestor:
             stop_worker_stream=stop_worker_stream,
         )
 
+    def _append_stale_host_lifecycle_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: _HostLifecycleCloseoutCandidate,
+        reason: str,
+    ) -> EngineIngestResult:
+        """为 durable identity 不匹配的 Host lifecycle signal 追加诊断。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: Host lifecycle closeout candidate。
+        :param reason: 拒绝原因。
+        :returns: rejected 或 duplicate lifecycle 诊断结果。
+        :raises HostDurableError: EventLog 读写失败时抛出。
+        """
+
+        payload: dict[str, JsonValue] = {
+            "attempt_id": candidate.envelope.attempt_id,
+            "execution_id": candidate.envelope.execution_id,
+            "dispatch_record_id": candidate.envelope.dispatch_record_id,
+            "worker_event_index": candidate.worker_event_index,
+            "lifecycle_source": candidate.lifecycle_source.value,
+            "lifecycle_reason": candidate.plan.terminal.reason,
+            "host_lifecycle_ref": _host_lifecycle_ref(candidate),
+            "reason": reason,
+        }
+        return self._append_host_lifecycle_diagnostic_candidate(
+            transaction,
+            candidate=candidate,
+            reason=reason,
+            payload=payload,
+        )
+
+    def _append_host_lifecycle_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        context: _ValidatedHostLifecycleCloseoutCandidate,
+        reason: str,
+    ) -> EngineIngestResult:
+        """为已校验但不允许 closeout 的 Host lifecycle signal 追加诊断。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验的 Host lifecycle candidate 上下文。
+        :param reason: 拒绝原因。
+        :returns: rejected 或 duplicate lifecycle 诊断结果。
+        :raises HostDurableError: EventLog 读写失败时抛出。
+        """
+
+        candidate = context.candidate
+        payload: dict[str, JsonValue] = {
+            "attempt_id": context.attempt.attempt_id,
+            "execution_id": context.attempt.execution_id,
+            "dispatch_record_id": context.dispatch_record.dispatch_record_id,
+            "worker_event_index": candidate.worker_event_index,
+            "lifecycle_source": candidate.lifecycle_source.value,
+            "lifecycle_reason": candidate.plan.terminal.reason,
+            "host_lifecycle_ref": _host_lifecycle_ref(candidate),
+            "run_status": context.run.status.value,
+            "attempt_status": context.attempt.status.value,
+            "reason": reason,
+        }
+        return self._append_host_lifecycle_diagnostic_candidate(
+            transaction,
+            candidate=candidate,
+            reason=reason,
+            payload=payload,
+        )
+
+    def _append_host_lifecycle_diagnostic_candidate(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: _HostLifecycleCloseoutCandidate,
+        reason: str,
+        payload: Mapping[str, JsonValue],
+    ) -> EngineIngestResult:
+        """按 Host lifecycle identity 幂等追加诊断事件。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: Host lifecycle closeout candidate。
+        :param reason: 诊断原因。
+        :param payload: Host lifecycle 诊断 payload。
+        :returns: rejected 或 duplicate lifecycle 诊断结果。
+        :raises HostDurableError: EventLog 读写失败时抛出。
+        """
+
+        event_id = _host_lifecycle_event_id(
+            candidate,
+            EventClass.DIAGNOSTIC,
+            _EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC,
+            0,
+        )
+        existing = _existing_rows(self._event_log_store, transaction, (event_id,))
+        if len(existing) == 1:
+            return EngineIngestResult(
+                status=EngineIngestStatus.DUPLICATE,
+                events=existing,
+                terminal_closeout=False,
+                promotion_triggered=False,
+                reason=reason,
+            )
+        row = self._event_log_store.append_event(
+            transaction,
+            _host_lifecycle_event_request(
+                candidate=candidate,
+                event_id=event_id,
+                event_class=EventClass.DIAGNOSTIC,
+                event_type=_EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC,
+                payload=payload,
+                reason={"reason": reason},
+            ),
+        ).row
+        return EngineIngestResult(
+            status=EngineIngestStatus.REJECTED,
+            events=(row,),
+            terminal_closeout=False,
+            promotion_triggered=False,
+            reason=reason,
+        )
+
     def _write_terminal_payload(
         self,
         transaction: HostTransaction,
@@ -3228,6 +3650,53 @@ class EngineEventIngestor:
                 metadata={
                     "kind": "engine_terminal_payload",
                     "engine_event_type": candidate.engine_event.type.value,
+                },
+                expected_digest=None,
+            ),
+        )
+
+    def _write_host_lifecycle_terminal_payload(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: _HostLifecycleCloseoutCandidate,
+        event_id: str,
+    ) -> PayloadDescriptor:
+        """写入 Host lifecycle terminal payload descriptor。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: Host lifecycle closeout candidate。
+        :param event_id: Host lifecycle Attempt terminal event id。
+        :returns: payload descriptor。
+        :raises HostDurableError: durable payload 写入失败时抛出。
+        """
+
+        payload_json: dict[str, JsonValue] = dict(
+            candidate.plan.terminal.terminal_payload
+        )
+        payload_json.update(
+            {
+                "attempt_id": candidate.envelope.attempt_id,
+                "execution_id": candidate.envelope.execution_id,
+                "worker_event_index": candidate.worker_event_index,
+                "lifecycle_source": candidate.lifecycle_source.value,
+                "host_lifecycle_ref": _host_lifecycle_ref(candidate),
+            }
+        )
+        return self._payload_store.write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=(
+                    f"{_HOST_LIFECYCLE_PAYLOAD_REF_PREFIX}-{event_id}"
+                ),
+                payload_id=f"{_HOST_LIFECYCLE_PAYLOAD_ID_PREFIX}-{event_id}",
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=payload_json,
+                payload_bytes=None,
+                media_type="application/json",
+                metadata={
+                    "kind": "host_lifecycle_terminal_payload",
+                    "lifecycle_source": candidate.lifecycle_source.value,
                 },
                 expected_digest=None,
             ),
@@ -3292,6 +3761,31 @@ def _validate_candidate_shape(candidate: EngineEventCandidate) -> None:
         raise ValueError("EngineEvent.occurred_at must be timezone-aware")
 
 
+def _validate_host_lifecycle_candidate_shape(
+    candidate: _HostLifecycleCloseoutCandidate,
+) -> None:
+    """校验 Host lifecycle candidate 的必填事实。
+
+    :param candidate: 待校验的 Host lifecycle closeout candidate。
+    :returns: ``None``。
+    :raises ValueError: event index、时间或 identity 字段非法时抛出。
+    """
+
+    if candidate.worker_event_index <= 0:
+        raise ValueError("worker_event_index must be positive")
+    _validate_observed_at(candidate.observed_at)
+    envelope = candidate.envelope
+    required_identity = (
+        envelope.session_id,
+        envelope.run_id,
+        envelope.attempt_id,
+        envelope.execution_id,
+        envelope.dispatch_record_id,
+    )
+    if any(value.strip() == "" for value in required_identity):
+        raise ValueError("Host lifecycle envelope identity must be non-empty")
+
+
 def _engine_ingest_log_level(engine_event_type: EngineEventType) -> int:
     """根据 Engine event 类型选择 ingest 诊断日志级别。
 
@@ -3317,11 +3811,14 @@ def _validate_observed_at(observed_at: datetime) -> None:
         raise ValueError("observed_at must be timezone.utc aware")
 
 
-def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
-    """判断 candidate 是否为 terminal 后迟到事件。
+def _late_engine_event_rejection_reason(
+    context: _ValidatedCandidate,
+) -> str | None:
+    """判断 Engine-origin candidate 是否为迟到事件。
 
     :param context: 已校验上下文。
     :returns: 拒绝原因；可接受时为 ``None``。
+    :raises: 无主动抛出。
     """
 
     if (
@@ -3331,9 +3828,8 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
         and context.attempt.status is AttemptStatus.SUSPENDED
     ):
         return None
-    if (
-        context.run.terminal_event_id is not None
-        or context.attempt.terminal_event_id is not None
+    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(
+        context.attempt.status
     ):
         return _REASON_TERMINAL_ALREADY_CLOSED
     if (
@@ -3343,6 +3839,41 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
     ):
         return _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL
     return None
+
+
+def _late_host_lifecycle_rejection_reason(
+    context: _ValidatedHostLifecycleCloseoutCandidate,
+) -> str | None:
+    """判断 Host lifecycle candidate 是否已迟到或被 active cancel 抢先。
+
+    :param context: 已校验的 Host lifecycle candidate 上下文。
+    :returns: 拒绝原因；允许 closeout 时返回 ``None``。
+    :raises: 无主动抛出。
+    """
+
+    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(
+        context.attempt.status
+    ):
+        return _REASON_TERMINAL_ALREADY_CLOSED
+    if context.run.status is RunStatus.CANCELLING:
+        return _REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL
+    return None
+
+
+def _terminal_closeout_precondition_failed_result() -> EngineIngestResult:
+    """构造 terminal transaction 回滚后的稳定 rejected 结果。
+
+    :returns: 不携带未提交事件、且不触发 promotion 的 rejected 结果。
+    :raises: 无主动抛出。
+    """
+
+    return EngineIngestResult(
+        status=EngineIngestStatus.REJECTED,
+        events=(),
+        terminal_closeout=True,
+        promotion_triggered=False,
+        reason=_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED,
+    )
 
 
 def _validate_waiting_confirmation(
@@ -3813,6 +4344,87 @@ def _event_id(
     return f"{_EVENT_ID_PREFIX}{digest}"
 
 
+def _host_lifecycle_event_id(
+    candidate: _HostLifecycleCloseoutCandidate,
+    event_class: EventClass,
+    event_type: str,
+    sub_index: int,
+) -> str:
+    """按 Host lifecycle identity material 派生稳定 event id。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :param event_class: Host EventLog class。
+    :param event_type: Host lifecycle event type。
+    :param sub_index: 单个 lifecycle signal 映射多事件时的下标。
+    :returns: ``event-host-lifecycle-`` 命名空间下的稳定 event id。
+    :raises ValueError: identity material 含非法 JSON 数值时抛出。
+    :raises TypeError: identity material 含不可序列化值时抛出。
+    """
+
+    envelope = candidate.envelope
+    digest = sha256_digest_json(
+        {
+            "identity_kind": "host-lifecycle-terminal",
+            "session_id": envelope.session_id,
+            "run_id": envelope.run_id,
+            "attempt_id": envelope.attempt_id,
+            "execution_id": envelope.execution_id,
+            "worker_event_index": candidate.worker_event_index,
+            "event_class": event_class.value,
+            "event_type": event_type,
+            "sub_index": sub_index,
+            "lifecycle_source": candidate.lifecycle_source.value,
+            "reason": candidate.plan.terminal.reason,
+        }
+    ).removeprefix("sha256:")
+    return f"{_HOST_LIFECYCLE_EVENT_ID_PREFIX}{digest}"
+
+
+def _host_lifecycle_terminal_event_ids(
+    candidate: _HostLifecycleCloseoutCandidate,
+) -> tuple[str, str]:
+    """计算 Host lifecycle Attempt / Run terminal event ids。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :returns: Attempt 与 Run terminal event id 二元组。
+    :raises ValueError: identity material 含非法 JSON 数值时抛出。
+    :raises TypeError: identity material 含不可序列化值时抛出。
+    """
+
+    return (
+        _host_lifecycle_event_id(
+            candidate,
+            EventClass.CANONICAL_FACT,
+            candidate.plan.terminal.attempt_event_type,
+            0,
+        ),
+        _host_lifecycle_event_id(
+            candidate,
+            EventClass.CANONICAL_FACT,
+            candidate.plan.terminal.run_event_type,
+            1,
+        ),
+    )
+
+
+def _host_lifecycle_ref(candidate: _HostLifecycleCloseoutCandidate) -> str:
+    """构造 Host lifecycle 治理来源标签。
+
+    该标签只表达 worker lifecycle 来源，不是 Engine event ref、业务事实或
+    EventLog identity。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :returns: Host lifecycle 来源标签。
+    :raises: 无主动抛出。
+    """
+
+    return (
+        f"host-lifecycle:{candidate.envelope.execution_id}:"
+        f"{candidate.worker_event_index}:{candidate.lifecycle_source.value}:"
+        f"{candidate.plan.terminal.reason}"
+    )
+
+
 def _frozen_reactive_material_blocks(
     *,
     context: _ValidatedCandidate,
@@ -3956,6 +4568,48 @@ def _event_request(
         occurred_at=candidate.observed_at,
         actor=_EVENT_ACTOR,
         source=_EVENT_SOURCE,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=reason,
+        payload_json=payload,
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _host_lifecycle_event_request(
+    *,
+    candidate: _HostLifecycleCloseoutCandidate,
+    event_id: str,
+    event_class: EventClass,
+    event_type: str,
+    payload: Mapping[str, JsonValue],
+    reason: JsonValue,
+) -> EventLogAppendRequest:
+    """构造 Host lifecycle EventLog append request。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :param event_id: Host lifecycle event id。
+    :param event_class: Host EventLog class。
+    :param event_type: Host lifecycle event type。
+    :param payload: inline payload JSON。
+    :param reason: reason JSON。
+    :returns: EventLog append request。
+    :raises: 无主动抛出。
+    """
+
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=event_class,
+        session_id=candidate.envelope.session_id,
+        run_id=candidate.envelope.run_id,
+        attempt_id=candidate.envelope.attempt_id,
+        execution_id=candidate.envelope.execution_id,
+        event_type=event_type,
+        occurred_at=candidate.observed_at,
+        actor=_HOST_LIFECYCLE_EVENT_ACTOR,
+        source=_HOST_LIFECYCLE_EVENT_SOURCE,
         client_request_id=None,
         idempotency_key=None,
         policy_decision=None,
@@ -4121,7 +4775,7 @@ def _invalid_usage_observation_digest(
             "prompt_tokens": data.prompt_tokens,
             "completion_tokens": data.completion_tokens,
             "total_tokens": data.total_tokens,
-            "provider_request_id": None,
+            "provider_request_id": data.provider_request_id,
             "observed_at": context.candidate.observed_at.isoformat(),
         },
         "diagnostic": {
@@ -4148,6 +4802,28 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _closeout_attempt_event_type(status: AttemptStatus) -> str:
+    """把 closeout-supported Attempt terminal status 投影为 EventLog type。
+
+    :param status: Attempt terminal status。
+    :returns: 对应 EventLog event_type 文本。
+    :raises ValueError: 状态不属于 Run / Attempt 联合 closeout 支持子集时抛出。
+    """
+
+    return closeout_attempt_terminal_event_type_for_status(status).value
+
+
+def _run_terminal_event_type(status: RunStatus) -> str:
+    """把 Run terminal status 投影为 EventLog type。
+
+    :param status: Run terminal status。
+    :returns: 对应 EventLog event_type 文本。
+    :raises ValueError: 状态不是 Run terminal status 时抛出。
+    """
+
+    return run_terminal_event_type_for_status(status).value
+
+
 def _duplicate_terminal_event_ids(
     candidate: EngineEventCandidate,
 ) -> tuple[str, ...]:
@@ -4163,34 +4839,19 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_SUCCEEDED,
+                _closeout_attempt_event_type(AttemptStatus.SUCCEEDED),
                 0,
             ),
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_SUCCEEDED,
+                _run_terminal_event_type(RunStatus.SUCCEEDED),
                 1,
             ),
         )
     if event.type == EngineEventType.RUN_FAILED and isinstance(
         event.data, RunFailedData
     ):
-        if event.data.error_code == _REASON_WORKER_LOST_BEFORE_TERMINAL:
-            return (
-                _event_id(
-                    candidate,
-                    EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_ATTEMPT_LOST,
-                    0,
-                ),
-                _event_id(
-                    candidate,
-                    EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_RUN_LOST,
-                    1,
-                ),
-            )
         if event.data.recoverable:
             return (
                 _event_id(
@@ -4202,13 +4863,13 @@ def _duplicate_terminal_event_ids(
                 _event_id(
                     candidate,
                     EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_ATTEMPT_FAILED,
+                    _closeout_attempt_event_type(AttemptStatus.FAILED),
                     1,
                 ),
                 _event_id(
                     candidate,
                     EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_RUN_FAILED,
+                    _run_terminal_event_type(RunStatus.FAILED),
                     2,
                 ),
             )
@@ -4216,13 +4877,13 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_FAILED,
+                _closeout_attempt_event_type(AttemptStatus.FAILED),
                 0,
             ),
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_FAILED,
+                _run_terminal_event_type(RunStatus.FAILED),
                 1,
             ),
         )
@@ -4231,13 +4892,13 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_CANCELLED,
+                _closeout_attempt_event_type(AttemptStatus.CANCELLED),
                 0,
             ),
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_CANCELLED,
+                _run_terminal_event_type(RunStatus.CANCELLED),
                 1,
             ),
         )
@@ -4252,7 +4913,7 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_FAILED,
+                _closeout_attempt_event_type(AttemptStatus.FAILED),
                 1,
             ),
             _event_id(
@@ -4272,16 +4933,9 @@ def _engine_event_ref(candidate: EngineEventCandidate) -> str:
     :returns: EngineEvent 引用文本。
     """
 
-    event_type = candidate.engine_event.type.value
-    if (
-        candidate.engine_event.type == EngineEventType.RUN_FAILED
-        and isinstance(candidate.engine_event.data, RunFailedData)
-        and candidate.engine_event.data.error_code == _REASON_WORKER_LOST_BEFORE_TERMINAL
-    ):
-        event_type = _REASON_WORKER_LOST_BEFORE_TERMINAL
     return (
         f"engine:{candidate.envelope.execution_id}:"
-        f"{candidate.worker_event_index}:{event_type}"
+        f"{candidate.worker_event_index}:{candidate.engine_event.type.value}"
     )
 
 
@@ -4311,38 +4965,30 @@ def _host_event_type(event_type: EngineEventType) -> str:
     return event_type.value.upper()
 
 
-def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
+def _final_answer_plan(data: FinalAnswerData) -> _EngineTerminalPlan:
     """构造 final_answer terminal plan。
 
     :param data: final_answer data。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    if data.content.strip() == "":
-        return _failed_plan(
-            reason=_REASON_EMPTY_FINAL_ANSWER,
-            error_code=_REASON_EMPTY_FINAL_ANSWER,
-            message=(
-                "Engine final_answer contained no displayable content; "
-                f"finish_reason={data.finish_reason.value}"
+    return _EngineTerminalPlan(
+        terminal=_TerminalFactPlan(
+            attempt_event_type=_closeout_attempt_event_type(
+                AttemptStatus.SUCCEEDED
             ),
-            provider_request_id=None,
-            client_correlation_id=None,
-            recoverable=False,
-            unsupported_later_owner=None,
-        )
-    return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_SUCCEEDED,
-        run_event_type=_EVENT_TYPE_RUN_SUCCEEDED,
-        attempt_status=AttemptStatus.SUCCEEDED,
-        run_status=RunStatus.SUCCEEDED,
-        reason=_REASON_FINAL_ANSWER,
-        terminal_payload={
-            "content": data.content,
-            "finish_reason": data.finish_reason.value,
-            "filtered": data.filtered,
-            "degraded": data.degraded,
-        },
+            run_event_type=_run_terminal_event_type(RunStatus.SUCCEEDED),
+            attempt_status=AttemptStatus.SUCCEEDED,
+            run_status=RunStatus.SUCCEEDED,
+            reason=_REASON_FINAL_ANSWER,
+            terminal_payload={
+                "content": data.content,
+                "finish_reason": data.finish_reason.value,
+                "filtered": data.filtered,
+                "degraded": data.degraded,
+            },
+        ),
         finish_reason=data.finish_reason.value,
         filtered=data.filtered,
         degraded=data.degraded,
@@ -4352,58 +4998,52 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
         client_correlation_id=None,
         recoverable=None,
         unsupported_later_owner=None,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=None,
-        last_accepted_event_id=None,
     )
 
 
-def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
+def _run_failed_plan(data: RunFailedData) -> _EngineTerminalPlan:
     """构造 run_failed terminal plan。
 
     :param data: run_failed data。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
+    error_code = serialize_engine_error_code(data.error_code)
     unsupported_owner = _OWNER_PHASE10 if data.recoverable else None
     reason = (
-        _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else data.error_code
+        _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else error_code
     )
-    return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_FAILED,
-        run_event_type=_EVENT_TYPE_RUN_FAILED,
-        attempt_status=AttemptStatus.FAILED,
-        run_status=RunStatus.FAILED,
+    terminal = _failed_terminal_fact_plan(
         reason=reason,
-        terminal_payload={
-            "error_code": data.error_code,
-            "message": data.message,
-            "provider_request_id": data.provider_request_id,
-            "client_correlation_id": data.client_correlation_id,
-            "recoverable": data.recoverable,
-        },
+        error_code=error_code,
+        message=data.message,
+        provider_request_id=data.provider_request_id,
+        client_correlation_id=data.client_correlation_id,
+        recoverable=data.recoverable,
+    )
+    return _EngineTerminalPlan(
+        terminal=terminal,
         finish_reason=None,
         filtered=None,
         degraded=None,
-        error_code=data.error_code,
+        error_code=error_code,
         message=data.message,
         provider_request_id=data.provider_request_id,
         client_correlation_id=data.client_correlation_id,
         recoverable=data.recoverable,
         unsupported_later_owner=unsupported_owner,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=None,
-        last_accepted_event_id=None,
     )
 
 
-def _unsupported_recovery_plan(provider_request_id: str | None) -> _TerminalPlan:
+def _unsupported_recovery_plan(
+    provider_request_id: str | None,
+) -> _EngineTerminalPlan:
     """构造 unsupported recovery terminal plan。
 
     :param provider_request_id: provider request id；无时为 ``None``。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
     return _failed_plan(
@@ -4417,10 +5057,11 @@ def _unsupported_recovery_plan(provider_request_id: str | None) -> _TerminalPlan
     )
 
 
-def _unsupported_waiting_plan() -> _TerminalPlan:
+def _unsupported_waiting_plan() -> _EngineTerminalPlan:
     """构造 unsupported waiting terminal plan。
 
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
     return _failed_plan(
@@ -4436,24 +5077,33 @@ def _unsupported_waiting_plan() -> _TerminalPlan:
 
 def _failed_lifecycle_plan(
     *, reason: str, last_observed_worker_event_index: int
-) -> _TerminalPlan:
+) -> _HostLifecycleTerminalPlan:
     """构造 worker lifecycle failed closeout plan。
 
     :param reason: closeout reason。
     :param last_observed_worker_event_index: 最后观察到的 worker event index。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    plan = _failed_plan(
+    terminal = _failed_terminal_fact_plan(
         reason=reason,
         error_code=reason,
         message=reason,
         provider_request_id=None,
         client_correlation_id=None,
         recoverable=False,
-        unsupported_later_owner=None,
     )
-    return _replace_lifecycle_index(plan, last_observed_worker_event_index)
+    return _HostLifecycleTerminalPlan(
+        terminal=terminal,
+        error_code=reason,
+        message=reason,
+        recoverable=False,
+        worker_lifecycle_signal=None,
+        stream_error_code=None,
+        last_observed_worker_event_index=last_observed_worker_event_index,
+        last_accepted_event_id=None,
+    )
 
 
 def _lost_lifecycle_plan(
@@ -4462,7 +5112,7 @@ def _lost_lifecycle_plan(
     stream_error_code: str | None,
     last_observed_worker_event_index: int,
     last_accepted_event_id: str | None,
-) -> _TerminalPlan:
+) -> _HostLifecycleTerminalPlan:
     """构造 worker lost closeout plan。
 
     :param worker_lifecycle_signal: worker lifecycle signal。
@@ -4470,28 +5120,25 @@ def _lost_lifecycle_plan(
     :param last_observed_worker_event_index: 最后观察到的 worker event index。
     :param last_accepted_event_id: 最后已接受 EventLog id；无时为 ``None``。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_LOST,
-        run_event_type=_EVENT_TYPE_RUN_LOST,
-        attempt_status=AttemptStatus.LOST,
-        run_status=RunStatus.LOST,
-        reason=_REASON_WORKER_LOST_BEFORE_TERMINAL,
-        terminal_payload={
-            "reason": _REASON_WORKER_LOST_BEFORE_TERMINAL,
-            "worker_lifecycle_signal": worker_lifecycle_signal,
-            "stream_error_code": stream_error_code,
-        },
-        finish_reason=None,
-        filtered=None,
-        degraded=None,
+    return _HostLifecycleTerminalPlan(
+        terminal=_TerminalFactPlan(
+            attempt_event_type=_closeout_attempt_event_type(AttemptStatus.LOST),
+            run_event_type=_run_terminal_event_type(RunStatus.LOST),
+            attempt_status=AttemptStatus.LOST,
+            run_status=RunStatus.LOST,
+            reason=_REASON_WORKER_LOST_BEFORE_TERMINAL,
+            terminal_payload={
+                "reason": _REASON_WORKER_LOST_BEFORE_TERMINAL,
+                "worker_lifecycle_signal": worker_lifecycle_signal,
+                "stream_error_code": stream_error_code,
+            },
+        ),
         error_code=None,
         message=None,
-        provider_request_id=None,
-        client_correlation_id=None,
         recoverable=None,
-        unsupported_later_owner=None,
         worker_lifecycle_signal=worker_lifecycle_signal,
         stream_error_code=stream_error_code,
         last_observed_worker_event_index=last_observed_worker_event_index,
@@ -4508,7 +5155,7 @@ def _failed_plan(
     client_correlation_id: str | None,
     recoverable: bool,
     unsupported_later_owner: str | None,
-) -> _TerminalPlan:
+) -> _EngineTerminalPlan:
     """构造 failed terminal plan。
 
     :param reason: terminal reason。
@@ -4519,11 +5166,54 @@ def _failed_plan(
     :param recoverable: 是否可恢复。
     :param unsupported_later_owner: unsupported later owner。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_FAILED,
-        run_event_type=_EVENT_TYPE_RUN_FAILED,
+    return _EngineTerminalPlan(
+        terminal=_failed_terminal_fact_plan(
+            reason=reason,
+            error_code=error_code,
+            message=message,
+            provider_request_id=provider_request_id,
+            client_correlation_id=client_correlation_id,
+            recoverable=recoverable,
+        ),
+        finish_reason=None,
+        filtered=None,
+        degraded=None,
+        error_code=error_code,
+        message=message,
+        provider_request_id=provider_request_id,
+        client_correlation_id=client_correlation_id,
+        recoverable=recoverable,
+        unsupported_later_owner=unsupported_later_owner,
+    )
+
+
+def _failed_terminal_fact_plan(
+    *,
+    reason: str,
+    error_code: str,
+    message: str,
+    provider_request_id: str | None,
+    client_correlation_id: str | None,
+    recoverable: bool,
+) -> _TerminalFactPlan:
+    """构造 Engine failure 与 clean EOF 共用的 FAILED canonical facts。
+
+    :param reason: terminal reason。
+    :param error_code: error code。
+    :param message: error message。
+    :param provider_request_id: provider request id；无时为 ``None``。
+    :param client_correlation_id: 客户端关联 id；无时为 ``None``。
+    :param recoverable: failure 是否可恢复。
+    :returns: 由 lifecycle owner helper 派生 event type 的 terminal fact plan。
+    :raises: 无主动抛出。
+    """
+
+    return _TerminalFactPlan(
+        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.FAILED),
+        run_event_type=_run_terminal_event_type(RunStatus.FAILED),
         attempt_status=AttemptStatus.FAILED,
         run_status=RunStatus.FAILED,
         reason=reason,
@@ -4534,52 +5224,6 @@ def _failed_plan(
             "client_correlation_id": client_correlation_id,
             "recoverable": recoverable,
         },
-        finish_reason=None,
-        filtered=None,
-        degraded=None,
-        error_code=error_code,
-        message=message,
-        provider_request_id=provider_request_id,
-        client_correlation_id=client_correlation_id,
-        recoverable=recoverable,
-        unsupported_later_owner=unsupported_later_owner,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=None,
-        last_accepted_event_id=None,
-    )
-
-
-def _replace_lifecycle_index(
-    plan: _TerminalPlan, last_observed_worker_event_index: int
-) -> _TerminalPlan:
-    """复制 failed plan 并写入 lifecycle index。
-
-    :param plan: 原 failed plan。
-    :param last_observed_worker_event_index: 最后观察到的 worker event index。
-    :returns: 新 terminal plan。
-    """
-
-    return _TerminalPlan(
-        attempt_event_type=plan.attempt_event_type,
-        run_event_type=plan.run_event_type,
-        attempt_status=plan.attempt_status,
-        run_status=plan.run_status,
-        reason=plan.reason,
-        terminal_payload=plan.terminal_payload,
-        finish_reason=plan.finish_reason,
-        filtered=plan.filtered,
-        degraded=plan.degraded,
-        error_code=plan.error_code,
-        message=plan.message,
-        provider_request_id=plan.provider_request_id,
-        client_correlation_id=plan.client_correlation_id,
-        recoverable=plan.recoverable,
-        unsupported_later_owner=plan.unsupported_later_owner,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=last_observed_worker_event_index,
-        last_accepted_event_id=None,
     )
 
 
@@ -4657,7 +5301,6 @@ def _preview_payload(
         common["iteration_id"] = data.iteration_id
         common["has_content"] = data.content is not None
         common["has_reasoning_content"] = data.reasoning_content is not None
-        common["finish_reason"] = data.finish_reason.value
     elif isinstance(data, ReasoningDeltaData):
         common["iteration_id"] = data.iteration_id
         common["delta"] = data.delta
@@ -4902,12 +5545,14 @@ def _limited_runner_call_manifest_body(
             consumer_boundary=_EVENT_SOURCE,
         )
     )
+    projector_metadata_id = _limited_runner_call_projector_metadata_id(data)
     message_entries = (
         tuple(
             _observed_runner_call_message_entry(
                 context,
                 message,
                 projection_descriptor=projection_descriptor,
+                projector_metadata_id=projector_metadata_id,
             )
             for message in data.input_projection
         )
@@ -4995,12 +5640,14 @@ def _observed_runner_call_message_entry(
     message: RunnerInputMessageProjection,
     *,
     projection_descriptor: PayloadDescriptor,
+    projector_metadata_id: str,
 ) -> Mapping[str, JsonValue]:
     """构造 Engine observed manifest message entry。
 
     :param context: 已校验 candidate 上下文。
     :param message: Engine observed message projection。
     :param projection_descriptor: runner-call projection descriptor。
+    :param projector_metadata_id: 本次 Engine observed projector metadata id。
     :returns: manifest message entry JSON object。
     """
 
@@ -5012,7 +5659,7 @@ def _observed_runner_call_message_entry(
         "source_refs": list(_limited_runner_call_source_refs(context)),
         "projection_artifact_ref": projection_descriptor.payload_ref,
         "projection_artifact_digest": projection_descriptor.payload_digest,
-        "projector_metadata_id": f"projector:{message.index}:{message.role}",
+        "projector_metadata_id": projector_metadata_id,
         "provider_tool_calls_digest": (
             sha256_digest_json(
                 {
@@ -5106,21 +5753,38 @@ def _limited_runner_call_projector_metadata(
 
     projector_id = "engine_observed_runner_input_signal"
     projector_schema_version = "engine_observed_runner_input_signal.v1"
-    metadata_id = f"projector:{data.iteration_index}:engine-observed"
-    return {
-        "projector_metadata_id": metadata_id,
-        "projector_id": projector_id,
-        "projector_schema_version": projector_schema_version,
-        "projector_digest": sha256_digest_json(
-            {
-                "projector_id": projector_id,
-                "projector_schema_version": projector_schema_version,
-                "source_refs": list(_limited_runner_call_source_refs(context)),
-            }
-        ),
-        "purpose": _RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION,
-        "source_contract_refs": list(_limited_runner_call_source_refs(context)),
-    }
+    metadata_id = _limited_runner_call_projector_metadata_id(data)
+    source_contract_refs = _limited_runner_call_source_refs(context)
+    projector_digest = sha256_digest_json(
+        {
+            "projector_id": projector_id,
+            "projector_schema_version": projector_schema_version,
+            "source_refs": list(source_contract_refs),
+        }
+    )
+    return runner_call_projector_metadata_descriptor(
+        RunnerCallProjectorMetadata(
+            projector_metadata_id=metadata_id,
+            projector_id=projector_id,
+            projector_schema_version=projector_schema_version,
+            projector_digest=projector_digest,
+            purpose=_RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION,
+            source_contract_refs=source_contract_refs,
+        )
+    )
+
+
+def _limited_runner_call_projector_metadata_id(
+    data: IterationStartedData,
+) -> str:
+    """返回 Engine continuation messages 共用的 metadata id。
+
+    :param data: Engine iteration started data。
+    :returns: 可由 manifest ``projector_metadata`` 唯一解析的 id。
+    :raises: 无。
+    """
+
+    return f"projector:{data.iteration_index}:engine-observed"
 
 
 def _runner_call_kind_for_iteration(data: IterationStartedData) -> str:
@@ -5180,11 +5844,13 @@ def _write_runner_call_manifest_payload(
             payload_format=SQLitePayloadFormat.CANONICAL_JSON,
             payload_json=manifest,
             media_type=RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST,
+                {
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=manifest_digest,
         ),
     )
@@ -5216,12 +5882,14 @@ def _write_runner_call_projection_payload(
             sqlite_payload_id=_runner_call_projection_sqlite_payload_id(event_id),
             payload_json=projection,
             media_type=RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
-                "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_INPUT_PROJECTION,
+                {
+                    "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=projection_digest,
         ),
     )
@@ -5286,44 +5954,49 @@ def _runner_call_manifest_hot_payload(
     :returns: canonical event hot payload。
     """
 
-    return {
-        "session_id": _manifest_text(manifest, "session_id"),
-        "host_run_id": _manifest_text(manifest, "host_run_id"),
-        "attempt_id": _manifest_optional_text(manifest, "attempt_id"),
-        "execution_id": _manifest_optional_text(manifest, "execution_id"),
-        "runner_call_index": _manifest_int(manifest, "runner_call_index"),
-        "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
-        "runner_call_trigger_reason": _manifest_text(
-            manifest, "runner_call_trigger_reason"
+    validation_status = _manifest_validation_status(manifest)
+    return runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=_manifest_text(manifest, "session_id"),
+            host_run_id=_manifest_text(manifest, "host_run_id"),
+            attempt_id=_manifest_optional_text(manifest, "attempt_id"),
+            execution_id=_manifest_optional_text(manifest, "execution_id"),
+            runner_call_index=_manifest_int(manifest, "runner_call_index"),
+            runner_call_kind=_manifest_text(manifest, "runner_call_kind"),
+            runner_call_trigger_reason=_manifest_text(
+                manifest, "runner_call_trigger_reason"
+            ),
+            iteration_id=_manifest_optional_text(manifest, "iteration_id"),
+            iteration_index=_manifest_optional_int(manifest, "iteration_index"),
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=_manifest_text(manifest, "schema_version"),
+            validation_status=validation_status,
+            message_count=_manifest_int(manifest, "message_count"),
+            role_sequence_digest=_manifest_text(
+                manifest, "role_sequence_digest"
+            ),
+            input_projection_digest=_manifest_text(
+                manifest, "input_projection_digest"
+            ),
+            runner_call_projection_artifact_ref=_manifest_optional_text(
+                manifest, "runner_call_projection_artifact_ref"
+            ),
+            runner_call_projection_artifact_digest=_manifest_optional_text(
+                manifest, "runner_call_projection_artifact_digest"
+            ),
+            runner_call_projection_artifact_size_bytes=_manifest_optional_int(
+                manifest, "runner_call_projection_artifact_size_bytes"
+            ),
+            diagnostic=_manifest_hot_diagnostic(manifest),
         ),
-        "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
-        "iteration_index": manifest.get("iteration_index"),
-        "manifest_payload_ref": manifest_payload_ref,
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": _manifest_text(manifest, "schema_version"),
-        "validation_status": _manifest_validation_status(manifest),
-        "message_count": _manifest_int(manifest, "message_count"),
-        "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
-        "input_projection_digest": _manifest_text(
-            manifest, "input_projection_digest"
-        ),
-        "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
-        "runner_call_projection_artifact_ref": _manifest_optional_text(
-            manifest, "runner_call_projection_artifact_ref"
-        ),
-        "runner_call_projection_artifact_digest": _manifest_optional_text(
-            manifest, "runner_call_projection_artifact_digest"
-        ),
-        "runner_call_projection_artifact_size_bytes": _manifest_optional_int(
-            manifest, "runner_call_projection_artifact_size_bytes"
-        ),
-        "diagnostic": _manifest_hot_diagnostic(manifest),
-    }
+        manifest=manifest,
+    )
 
 
 def _manifest_hot_diagnostic(
     manifest: Mapping[str, JsonValue]
-) -> Mapping[str, JsonValue]:
+) -> RunnerCallHotDiagnostic:
     """构造 runner-call manifest hot payload diagnostic。
 
     :param manifest: manifest body。
@@ -5333,19 +6006,13 @@ def _manifest_hot_diagnostic(
     """
 
     if _manifest_validation_status(manifest) != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
-        return _manifest_diagnostic(manifest)
+        return runner_call_hot_diagnostic_from_json(_manifest_diagnostic(manifest))
     message_count = _manifest_int(manifest, "message_count")
     role_sequence_digest = _manifest_text(manifest, "role_sequence_digest")
-    return _runner_call_manifest_diagnostic(
+    return complete_runner_call_hot_diagnostic(
         status=_RUNNER_CALL_MANIFEST_STATUS_COMPLETE,
-        reason=None,
-        missing_atom_kind=None,
-        missing_ref_kind=None,
-        missing_ref=None,
-        observed_count=message_count,
-        expected_count=message_count,
-        observed_digest=role_sequence_digest,
-        expected_digest=role_sequence_digest,
+        message_count=message_count,
+        role_sequence_digest=role_sequence_digest,
         consumer_boundary=_EVENT_SOURCE,
     )
 
@@ -5434,39 +6101,6 @@ def _next_runner_call_index(transaction: HostTransaction, run_id: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise HostDurableError("runner-call manifest count is invalid")
     return value
-
-
-def _projector_metadata_summary(
-    manifest: Mapping[str, JsonValue]
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """从 manifest body 复制 projector metadata summary。
-
-    :param manifest: manifest body。
-    :returns: projector metadata summary。
-    :raises HostDurableError: projector metadata 字段非法时抛出。
-    """
-
-    value = manifest.get("projector_metadata")
-    if not isinstance(value, list):
-        raise HostDurableError("runner-call manifest projector_metadata is invalid")
-    summary: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("runner-call projector metadata must be object")
-        summary.append(
-            {
-                "projector_metadata_id": _manifest_text(
-                    item, "projector_metadata_id"
-                ),
-                "projector_id": _manifest_text(item, "projector_id"),
-                "projector_schema_version": _manifest_text(
-                    item, "projector_schema_version"
-                ),
-                "projector_digest": _manifest_text(item, "projector_digest"),
-                "purpose": _manifest_text(item, "purpose"),
-            }
-        )
-    return tuple(summary)
 
 
 def _find_runner_call_iteration_link_event(
@@ -5630,26 +6264,25 @@ def _is_unlinked_prepared_ordinary_manifest(
     :raises HostDurableError: payload 字段非法时抛出。
     """
 
-    hot_payload = _payload_object(event)
-    if _optional_payload_text(hot_payload, field_name="validation_status") != (
-        _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
-    ):
+    hot_payload = parse_runner_call_hot_payload(_payload_object(event))
+    if hot_payload.validation_status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
         return False
-    if _optional_payload_text(hot_payload, field_name="iteration_id") is not None:
+    if hot_payload.iteration_id is not None:
         return False
-    if hot_payload.get("iteration_index") is not None:
+    if hot_payload.iteration_index is not None:
         return False
-    runner_call_kind = _optional_payload_text(
-        hot_payload, field_name="runner_call_kind"
-    )
-    if runner_call_kind not in _ORDINARY_RUNNER_CALL_KINDS:
+    if hot_payload.runner_call_kind not in _ORDINARY_RUNNER_CALL_KINDS:
         return False
-    manifest = event_payload_object(
+    manifest_payload = event_payload_object(
         transaction,
         event,
         payload_label="runner-call manifest",
     )
-    if manifest.get("compactor_identity") is not None:
+    manifest = parse_runner_call_manifest(
+        manifest_payload,
+        hot_payload=hot_payload,
+    )
+    if manifest.compactor_identity is not None:
         return False
     return True
 
@@ -5737,13 +6370,11 @@ def _runner_call_iteration_link_payload(
     :raises HostDurableError: manifest hot payload 字段非法时抛出。
     """
 
-    manifest_payload = _payload_object(manifest_event)
-    expected_count = _optional_payload_int(
-        manifest_payload, field_name="message_count"
+    manifest_payload = parse_runner_call_hot_payload(
+        _payload_object(manifest_event)
     )
-    expected_digest = _optional_payload_text(
-        manifest_payload, field_name="role_sequence_digest"
-    )
+    expected_count = manifest_payload.message_count
+    expected_digest = manifest_payload.role_sequence_digest
     status = _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
     reason: str | None = None
     if expected_count != data.message_count:
@@ -5767,26 +6398,18 @@ def _runner_call_iteration_link_payload(
             consumer_boundary=_EVENT_SOURCE,
         )
     return {
-        "session_id": _manifest_text(manifest_payload, "session_id"),
-        "host_run_id": _manifest_text(manifest_payload, "host_run_id"),
-        "attempt_id": _manifest_optional_text(manifest_payload, "attempt_id"),
-        "execution_id": _manifest_optional_text(manifest_payload, "execution_id"),
+        "session_id": manifest_payload.session_id,
+        "host_run_id": manifest_payload.host_run_id,
+        "attempt_id": manifest_payload.attempt_id,
+        "execution_id": manifest_payload.execution_id,
         "manifest_event_id": manifest_event.event_id,
-        "manifest_payload_ref": _manifest_text(
-            manifest_payload, "manifest_payload_ref"
-        ),
-        "manifest_digest": _manifest_text(manifest_payload, "manifest_digest"),
-        "manifest_schema_version": _manifest_text(
-            manifest_payload, "manifest_schema_version"
-        ),
-        "runner_call_index": _manifest_int(
-            manifest_payload, "runner_call_index"
-        ),
-        "runner_call_kind": _manifest_text(
-            manifest_payload, "runner_call_kind"
-        ),
-        "runner_call_trigger_reason": _manifest_text(
-            manifest_payload, "runner_call_trigger_reason"
+        "manifest_payload_ref": manifest_payload.manifest_payload_ref,
+        "manifest_digest": manifest_payload.manifest_digest,
+        "manifest_schema_version": manifest_payload.manifest_schema_version,
+        "runner_call_index": manifest_payload.runner_call_index,
+        "runner_call_kind": manifest_payload.runner_call_kind,
+        "runner_call_trigger_reason": (
+            manifest_payload.runner_call_trigger_reason
         ),
         "iteration_id": data.iteration_id,
         "iteration_index": data.iteration_index,
@@ -5875,9 +6498,9 @@ def _resolution_from_limited_manifest_event(
     :raises HostDurableError: manifest hot payload 字段非法时抛出。
     """
 
-    payload = _payload_object(event)
-    diagnostic = _runner_call_payload_diagnostic(
-        payload,
+    hot_payload = parse_runner_call_hot_payload(_payload_object(event))
+    diagnostic = _runner_call_diagnostic_projection(
+        hot_payload.diagnostic,
         consumer_boundary="engine_ingest_preview",
     )
     status = _manifest_text(diagnostic, "status")
@@ -5886,8 +6509,8 @@ def _resolution_from_limited_manifest_event(
         reason=_manifest_optional_text(diagnostic, "reason"),
         link_event_id=None,
         manifest_event_id=event.event_id,
-        manifest_payload_ref=_manifest_text(payload, "manifest_payload_ref"),
-        manifest_digest=_manifest_text(payload, "manifest_digest"),
+        manifest_payload_ref=hot_payload.manifest_payload_ref,
+        manifest_digest=hot_payload.manifest_digest,
         expected_count=_manifest_optional_int(diagnostic, "expected_count"),
         expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
         observed_count=data.message_count,
@@ -5988,44 +6611,39 @@ def _runner_call_payload_diagnostic(
     :param payload: canonical hot payload。
     :param consumer_boundary: 当前消费边界。
     :returns: diagnostic summary。
-    :raises HostDurableError: 非 complete signal 缺少 typed diagnostic 时抛出。
+    :raises HostDurableError: hot payload 或 diagnostic contract 非法时抛出。
     """
 
-    status = _optional_payload_text(payload, field_name="validation_status")
-    diagnostic = payload.get("diagnostic")
-    if status == _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
-        return _runner_call_manifest_diagnostic(
-            status=_RUNNER_CALL_MANIFEST_STATUS_COMPLETE,
-            reason=None,
-            missing_atom_kind=None,
-            missing_ref_kind=None,
-            missing_ref=None,
-            observed_count=_optional_payload_int(
-                payload, field_name="message_count"
-            ),
-            expected_count=_optional_payload_int(
-                payload, field_name="message_count"
-            ),
-            observed_digest=_optional_payload_text(
-                payload, field_name="role_sequence_digest"
-            ),
-            expected_digest=_optional_payload_text(
-                payload, field_name="role_sequence_digest"
-            ),
-            consumer_boundary=consumer_boundary,
-        )
-    if not isinstance(diagnostic, Mapping):
-        raise HostDurableError("runner-call manifest diagnostic must be object")
+    hot_payload = parse_runner_call_hot_payload(payload)
+    return _runner_call_diagnostic_projection(
+        hot_payload.diagnostic,
+        consumer_boundary=consumer_boundary,
+    )
+
+
+def _runner_call_diagnostic_projection(
+    diagnostic: RunnerCallHotDiagnostic,
+    *,
+    consumer_boundary: str,
+) -> Mapping[str, JsonValue]:
+    """把 shared owner diagnostic 投影到 Engine ingest consumer boundary。
+
+    :param diagnostic: shared hot owner 已校验的 diagnostic。
+    :param consumer_boundary: 当前 Engine ingest 消费边界。
+    :returns: 只改写 consumer boundary 的 diagnostic JSON object。
+    :raises HostDurableError: consumer boundary 非法时由 projection builder 抛出。
+    """
+
     return _runner_call_manifest_diagnostic(
-        status=_manifest_text(diagnostic, "status"),
-        reason=_manifest_optional_text(diagnostic, "reason"),
-        missing_atom_kind=_manifest_optional_text(diagnostic, "missing_atom_kind"),
-        missing_ref_kind=_manifest_optional_text(diagnostic, "missing_ref_kind"),
-        missing_ref=_manifest_optional_text(diagnostic, "missing_ref"),
-        observed_count=_manifest_optional_int(diagnostic, "observed_count"),
-        expected_count=_manifest_optional_int(diagnostic, "expected_count"),
-        observed_digest=_manifest_optional_text(diagnostic, "observed_digest"),
-        expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
+        status=diagnostic.status,
+        reason=diagnostic.reason,
+        missing_atom_kind=diagnostic.missing_atom_kind,
+        missing_ref_kind=diagnostic.missing_ref_kind,
+        missing_ref=diagnostic.missing_ref,
+        observed_count=diagnostic.observed_count,
+        expected_count=diagnostic.expected_count,
+        observed_digest=diagnostic.observed_digest,
+        expected_digest=diagnostic.expected_digest,
         consumer_boundary=consumer_boundary,
     )
 
@@ -6286,7 +6904,7 @@ def _provider_protocol_failure_metadata(
         "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
         "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
         "failure_kind": _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
-        "provider_error_code": data.error_code,
+        "provider_error_code": serialize_engine_error_code(data.error_code),
         "diagnostic_refs": list(diagnostic_refs),
     }
 

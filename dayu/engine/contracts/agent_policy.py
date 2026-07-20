@@ -9,30 +9,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from enum import StrEnum
+from dayu.contracts.agent_policy import AgentFallbackMode
 
 
-class AgentFallbackMode(StrEnum):
-    """Agent 降级收口模式。
-
-    成员：
-
-    - ``FORCE_ANSWER``：禁用工具再调用一次 Runner，要求模型基于已有上下文
-      给出最终回答。
-    - ``RAISE_ERROR``：直接收口为 ``run_failed``。
-    """
-
-    FORCE_ANSWER = "force_answer"
-    RAISE_ERROR = "raise_error"
-
-
-_DEFAULT_FALLBACK_PROMPT: str = (
-    "请基于目前已经获得的上下文直接给出最终回答，不要再调用工具。"
-)
-_DEFAULT_CONTINUATION_PROMPT: str = (
-    "Your previous response was truncated (finish_reason=length). "
-    "Continue from where you left off without repeating content already produced."
-)
 _DEFAULT_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES: int = 2
 
 
@@ -58,9 +37,9 @@ class AgentPolicy:
     continuation_max_attempts: int
     allow_tool_calls: bool
     tool_execution_timeout_seconds: float
+    fallback_prompt: str
+    continuation_prompt: str
     fallback_mode: AgentFallbackMode = AgentFallbackMode.FORCE_ANSWER
-    fallback_prompt: str = _DEFAULT_FALLBACK_PROMPT
-    continuation_prompt: str = _DEFAULT_CONTINUATION_PROMPT
     max_consecutive_failed_tool_batches: int = (
         _DEFAULT_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES
     )
@@ -68,11 +47,15 @@ class AgentPolicy:
     def __post_init__(self) -> None:
         """校验 Agent 策略边界。
 
+        :returns: ``None``。
+        :raises TypeError: ``fallback_mode`` 不是 AgentFallbackMode 时抛出。
         :raises ValueError: ``max_iterations`` 小于 1、timeout 非正数、
             continuation 次数小于 0、continuation prompt 为空、
             fallback prompt 为空或连续失败工具批次阈值小于 1 时抛出。
         """
 
+        if not isinstance(self.fallback_mode, AgentFallbackMode):
+            raise TypeError("AgentPolicy.fallback_mode must be AgentFallbackMode")
         if self.max_iterations < 1:
             raise ValueError("AgentPolicy.max_iterations must be >= 1")
         if (

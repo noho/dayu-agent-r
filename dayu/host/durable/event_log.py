@@ -39,7 +39,9 @@ from dayu.host.durable.errors import (
 )
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import RunStartReason, decode_run_started_payload
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.lifecycle_events import parse_host_event_type
 
 _MIN_READ_LIMIT = 1
 _MIN_EVENT_CURSOR = 0
@@ -857,9 +859,9 @@ def count_recovery_dispatches_for_run(
     """统计某个 Run 已提交的 recovery dispatch 次数。
 
     该 helper 只读取 EventLog canonical facts，按 ``run_id`` 和
-    ``RUN_STARTED`` 精确过滤，并只计入 inline payload 中
-    ``start_reason == "recovery"`` 的事件；不读取 projection/read-model，也不做
-    diagnostic 文本匹配。
+    ``RUN_STARTED`` 精确过滤，通过 typed ``RUN_STARTED`` payload decoder
+    读取 ``RunStartReason``，并只计入 ``RunStartReason.RECOVERY`` 的事件；
+    不读取 projection/read-model，也不做 diagnostic 文本匹配。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param run_id: 目标 Run id。
@@ -867,16 +869,29 @@ def count_recovery_dispatches_for_run(
     :raises HostDurableError: 输入非法或 payload 无法验证时抛出。
     """
 
-    return count_committed_events_by_run_and_type(
-        transaction,
-        run_id=run_id,
-        event_type="RUN_STARTED",
-        payload_filter=EventPayloadTextEqualsFilter(
-            field_name="start_reason",
-            expected_value="recovery",
-            allowed_values=("initial", "queue_promotion", "resume", "steer", "recovery"),
-        ),
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          event_id,
+          event_sequence,
+          payload_json
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_type = ?
+          AND event_class = ?
+        ORDER BY event_sequence ASC
+        """,
+        (run_id, "RUN_STARTED", EventClass.CANONICAL_FACT.value),
     )
+    count = 0
+    for row in rows:
+        payload = _payload_mapping_from_text(
+            _require_text(row.get("payload_json"), field_name="payload_json")
+        )
+        started_payload = decode_run_started_payload(payload)
+        if started_payload.start_reason is RunStartReason.RECOVERY:
+            count += 1
+    return count
 
 
 @dataclass(frozen=True, slots=True)
@@ -1125,6 +1140,8 @@ def _validate_append_request(request: EventLogAppendRequest) -> None:
         raise HostDurableError("EventLog event_class is invalid")
     _require_non_empty_text(request.session_id, field_name="session_id")
     _require_non_empty_text(request.event_type, field_name="event_type")
+    if parse_host_event_type(request.event_type) is None:
+        raise HostDurableError("EventLog event_type is unknown")
     _require_optional_non_empty_text(request.run_id, field_name="run_id")
     _require_optional_non_empty_text(request.attempt_id, field_name="attempt_id")
     _require_optional_non_empty_text(request.execution_id, field_name="execution_id")
@@ -1245,6 +1262,9 @@ def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
         event_class = EventClass(event_class_text)
     except ValueError as exc:
         raise HostDurableError("EventLog row has invalid event_class") from exc
+    event_type = _require_text(row.get("event_type"), field_name="event_type")
+    if parse_host_event_type(event_type) is None:
+        raise HostDurableError("EventLog row has invalid event_type")
     return EventLogRow(
         event_sequence=_require_int(
             row.get("event_sequence"), field_name="event_sequence"
@@ -1258,7 +1278,7 @@ def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
         run_id=_optional_text(row.get("run_id"), field_name="run_id"),
         attempt_id=_optional_text(row.get("attempt_id"), field_name="attempt_id"),
         execution_id=_optional_text(row.get("execution_id"), field_name="execution_id"),
-        event_type=_require_text(row.get("event_type"), field_name="event_type"),
+        event_type=event_type,
         occurred_at=_require_text(row.get("occurred_at"), field_name="occurred_at"),
         actor=_optional_text(row.get("actor"), field_name="actor"),
         source=_optional_text(row.get("source"), field_name="source"),

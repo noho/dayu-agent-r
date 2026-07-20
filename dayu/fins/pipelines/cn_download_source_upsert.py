@@ -13,10 +13,12 @@ from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
+    BatchToken,
+    FinsIngestMethod,
+    FinsSourceProvider,
     FileObjectMeta,
     FilingCreateRequest,
     FilingUpdateRequest,
-    SourceHandle,
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -33,7 +35,6 @@ from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_i
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
-_INGEST_METHOD_DOWNLOAD = "download"
 _FISCAL_YEAR_SOURCE = "title_or_category_inferred"
 _REPORT_DATE_SOURCE = "period_inferred"
 
@@ -120,73 +121,6 @@ def build_content_fingerprint(*, pdf_bytes: bytes, docling_json_bytes: bytes) ->
     return hashlib.sha256(f"{pdf_sha}|{docling_sha}".encode("utf-8")).hexdigest()
 
 
-def update_cn_staging_source_document(
-    *,
-    source_repository: SourceDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    internal_document_id: str,
-    form_type: str,
-    primary_document: str,
-    file_entries: list[JsonObject],
-    candidate: CnReportCandidate,
-    profile: CnCompanyProfile,
-    pdf_sha256: str | None,
-    remote_fingerprint: str,
-    previous_meta_exists: bool,
-) -> None:
-    """写入 CN/HK 下载中间态 source meta。
-
-    参数:
-        source_repository: source 文档仓储。
-        ticker: ticker。
-        document_id: 文档 ID。
-        internal_document_id: 内部文档 ID。
-        form_type: form type。
-        primary_document: 当前主文件名。
-        file_entries: 已落盘文件条目。
-        candidate: 远端候选。
-        profile: 公司基础元数据。
-        pdf_sha256: PDF SHA-256；PDF 未落盘时为 ``None``。
-        remote_fingerprint: 远端 fingerprint。
-        previous_meta_exists: source document 是否已经存在。
-
-    返回:
-        无。
-
-    异常:
-        OSError: 仓储写入失败时抛出。
-    """
-
-    meta = _build_base_meta(
-        ticker=ticker,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-        form_type=form_type,
-        candidate=candidate,
-        profile=profile,
-        ingest_complete=False,
-    )
-    meta["download_version"] = CN_PIPELINE_DOWNLOAD_VERSION
-    meta["remote_fingerprint"] = remote_fingerprint
-    meta["staging_remote_fingerprint"] = remote_fingerprint
-    meta["staging_pdf_sha256"] = pdf_sha256
-    request = _build_upsert_request(
-        ticker=ticker,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-        form_type=form_type,
-        primary_document=primary_document,
-        file_entries=file_entries,
-        meta=meta,
-        previous_meta_exists=previous_meta_exists,
-    )
-    if previous_meta_exists:
-        source_repository.update_source_document(request, source_kind=SourceKind.FILING)
-    else:
-        source_repository.create_source_document(request, source_kind=SourceKind.FILING)
-
-
 def commit_cn_filing_source_document(
     *,
     source_repository: SourceDocumentRepositoryProtocol,
@@ -204,8 +138,14 @@ def commit_cn_filing_source_document(
     source_fingerprint: str,
     previous_completed_meta: JsonObject | None,
     source_meta_exists: bool,
+    batch: BatchToken,
 ) -> None:
-    """提交 CN/HK filing source document 完成态。
+    """在 caller-owned 活动 batch 内暂存 CN/HK filing 完成态与 marker。
+
+    本 helper 不是事务 commit owner：它不调用 ``begin_batch``、
+    ``commit_batch`` 或 ``rollback_batch``。调用方必须先持有与 ``ticker``
+    对应的 active token，并把本 helper 与相关 reset、ack、blob 写入放在同一
+    同步 batch 段内，最后由 caller 唯一一次调用 ``commit_batch``。
 
     参数:
         source_repository: source 文档仓储。
@@ -225,6 +165,7 @@ def commit_cn_filing_source_document(
             ``None``。中间态 staging meta 不应传入此字段。
         source_meta_exists: 当前 source meta 是否已经存在；仅用于选择
             create/update，不参与版本计算。
+        batch: caller 显式传入的 batch capability。
 
     返回:
         无。
@@ -232,6 +173,7 @@ def commit_cn_filing_source_document(
     异常:
         OSError: 仓储写入失败时抛出。
         ValueError: ``primary_document`` 未指向 Docling JSON 时抛出。
+        RuntimeError: 当前执行 owner 未持有 ``ticker`` 的活动 batch 时抛出。
     """
 
     if not primary_document.endswith("_docling.json"):
@@ -243,15 +185,12 @@ def commit_cn_filing_source_document(
         form_type=form_type,
         candidate=candidate,
         profile=profile,
-        ingest_complete=True,
         previous_completed_meta=previous_completed_meta,
     )
     meta["download_version"] = CN_PIPELINE_DOWNLOAD_VERSION
     meta["remote_fingerprint"] = remote_fingerprint
     meta["source_fingerprint"] = source_fingerprint
     meta["pdf_sha256"] = pdf_sha256
-    meta["staging_remote_fingerprint"] = None
-    meta["staging_pdf_sha256"] = None
     meta["document_version"] = _resolve_document_version(previous_completed_meta, source_fingerprint)
     request = _build_upsert_request(
         ticker=ticker,
@@ -264,9 +203,17 @@ def commit_cn_filing_source_document(
         previous_meta_exists=source_meta_exists,
     )
     if source_meta_exists:
-        source_repository.update_source_document(request, source_kind=SourceKind.FILING)
+        source_repository.update_source_document(
+            request,
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
     else:
-        source_repository.create_source_document(request, source_kind=SourceKind.FILING)
+        source_repository.create_source_document(
+            request,
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
     if _should_mark_processed_reprocess_required(
         processed_repository=processed_repository,
         ticker=ticker,
@@ -274,7 +221,12 @@ def commit_cn_filing_source_document(
         previous_meta=previous_completed_meta,
         source_fingerprint=source_fingerprint,
     ):
-        processed_repository.mark_processed_reprocess_required(ticker, document_id, True)
+        processed_repository.mark_processed_reprocess_required(
+            ticker,
+            document_id,
+            True,
+            batch=batch,
+        )
 
 
 def _build_base_meta(
@@ -285,7 +237,6 @@ def _build_base_meta(
     form_type: str,
     candidate: CnReportCandidate,
     profile: CnCompanyProfile,
-    ingest_complete: bool,
     previous_completed_meta: JsonObject | None = None,
 ) -> JsonObject:
     """构建 CN/HK source meta 公共字段。"""
@@ -295,7 +246,7 @@ def _build_base_meta(
     return {
         "document_id": document_id,
         "internal_document_id": internal_document_id,
-        "ingest_method": _INGEST_METHOD_DOWNLOAD,
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "company_id": company_id,
         "provider_company_id": profile.company_id,
@@ -309,10 +260,10 @@ def _build_base_meta(
         "report_date": None,
         "filing_date": candidate.filing_date,
         "first_ingested_at": _preserve_text_meta(previous_completed_meta, "first_ingested_at", now),
-        "ingest_complete": ingest_complete,
+        "ingest_complete": True,
         "is_deleted": False,
         "deleted_at": None,
-        "source_provider": candidate.provider,
+        "source_provider": FinsSourceProvider.from_storage_value(candidate.provider).to_storage_value(),
         "source_id": candidate.source_id,
         "source_url": candidate.source_url,
         "source_language": candidate.language,
@@ -415,5 +366,4 @@ __all__ = [
     "build_content_fingerprint",
     "build_remote_fingerprint",
     "commit_cn_filing_source_document",
-    "update_cn_staging_source_document",
 ]

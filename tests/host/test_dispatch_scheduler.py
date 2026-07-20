@@ -18,6 +18,7 @@ import dayu.host.engine_ingest as host_engine_ingest
 from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
@@ -29,6 +30,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, SystemMessage, UserMessage
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -45,11 +47,15 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
 )
 from dayu.host.admission import PendingDispatchRecord
+from dayu.host._execution_health import HostExecutionHealthState
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
     CancelMode,
     EnsureSessionRequest,
+    HostApiError,
+    HostApiErrorCode,
+    HostUnavailableDetail,
     HostLocalExecutionOptions,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
@@ -68,7 +74,6 @@ from dayu.host.compaction import (
     ContextCompactor,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -87,7 +92,11 @@ from dayu.host.compact_pipeline import (
     CompactPipelineSourceSnapshot,
     build_fallback_decision_input,
 )
-from dayu.host.compaction_operation import CompactorProposalRunInput
+from dayu.host.compaction_operation import (
+    CompactorProposalManifestReference,
+    CompactorProposalRunInput,
+    DurableCompactorProposalManifestRecorder,
+)
 from dayu.host.context_budget import (
     BudgetEstimateInput,
     BudgetTextFragment,
@@ -1929,58 +1938,192 @@ class _FailingDrainLoopScheduler(HostDispatchScheduler):
         raise RuntimeError("drain failure")
 
 
-class _RetryExhaustedDrainLoopScheduler(HostDispatchScheduler):
-    """测试用 drain_once 持久化重试耗尽 scheduler。"""
+class _RetryOnceDrainLoopScheduler(HostDispatchScheduler):
+    """测试用首次 retry exhausted、随后成功 reconcile 的 scheduler。"""
 
-    async def drain_once(self) -> DispatchDrainResult:
-        """模拟 drain_once 遇到持久化重试耗尽。
+    _drain_call_count: int
+    _retry_seen: asyncio.Event
+    _reconciled: asyncio.Event
+    _reconcile_hold: asyncio.Event
 
-        :returns: 不会返回。
-        :raises HostTransactionRetryExhaustedError: 始终抛出测试异常。
+    def configure_retry_probe(
+        self,
+        *,
+        retry_seen: asyncio.Event,
+        reconciled: asyncio.Event,
+    ) -> None:
+        """配置 deterministic retry 观测事件。
+
+        :param retry_seen: 首次 retry exhausted 时置位。
+        :param reconciled: 下一次 drain 成功时置位。
+        :returns: ``None``。
         """
 
-        raise HostTransactionRetryExhaustedError("drain retry exhausted", attempts=3)
+        self._drain_call_count = 0
+        self._retry_seen = retry_seen
+        self._reconciled = reconciled
+        self._reconcile_hold = asyncio.Event()
+
+    async def drain_once(self) -> DispatchDrainResult:
+        """首次抛 retry exhausted，下一轮记录 reconcile 成功。
+
+        :returns: retry 后的空 drain 结果。
+        :raises HostTransactionRetryExhaustedError: 首次调用固定抛出。
+        """
+
+        self._drain_call_count += 1
+        if self._drain_call_count == 1:
+            self._retry_seen.set()
+            raise HostTransactionRetryExhaustedError(
+                "drain retry exhausted",
+                attempts=3,
+            )
+        self._reconciled.set()
+        await self._reconcile_hold.wait()
+        return DispatchDrainResult(
+            processed=0,
+            dispatched=0,
+            skipped=0,
+            timed_out=0,
+        )
 
 
-class _TransientFailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
-    """测试用 active cancel watchdog 单次 tick 失败 scheduler。"""
+class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
+    """记录 Event clear/set 与 tick 次数的 watchdog scheduler。"""
 
     _tick_count: int
+    _first_tick_seen: asyncio.Event
     _second_tick_seen: asyncio.Event
+    _wake_during_first_tick: bool
+    _event_states_before_tick: list[bool]
+    _event_state_after_nested_wake: bool | None
 
-    def configure_transient_watchdog_failure(
-        self, second_tick_seen: asyncio.Event
+    def configure_level_trigger_probe(
+        self,
+        *,
+        first_tick_seen: asyncio.Event,
+        second_tick_seen: asyncio.Event,
+        wake_during_first_tick: bool,
     ) -> None:
-        """配置 transient tick failure 测试观测点。
+        """配置 deterministic level-triggered 观测点。
 
-        :param second_tick_seen: 第二次 tick 执行时置位的事件。
+        :param first_tick_seen: 第一轮 tick 观测事件。
+        :param second_tick_seen: 第二轮 tick 观测事件。
+        :param wake_during_first_tick: 是否在第一轮 tick barrier 内再次 wake。
         :returns: ``None``。
         """
 
         self._tick_count = 0
+        self._first_tick_seen = first_tick_seen
         self._second_tick_seen = second_tick_seen
+        self._wake_during_first_tick = wake_during_first_tick
+        self._event_states_before_tick = []
+        self._event_state_after_nested_wake = None
 
     def tick_active_cancel_watchdog(
         self, now: datetime
     ) -> host_dispatch.ActiveCancelWatchdogTickResult:
-        """模拟第一次 tick 抛普通异常，第二次 tick 成功。
+        """记录 tick 前 event 已 clear，并可在第一轮内注入第二次 wake。
 
         :param now: watchdog tick 的当前时间。
         :returns: 空扫描 tick 结果。
-        :raises RuntimeError: 第一次 tick 固定抛出测试异常。
+        :raises Exception: 不主动抛出异常。
         """
 
         _ = now
         self._tick_count += 1
+        self._event_states_before_tick.append(
+            self._active_cancel_watchdog_event.is_set()
+        )
         if self._tick_count == 1:
-            raise RuntimeError("active cancel watchdog transient failure")
-        self._second_tick_seen.set()
+            self._first_tick_seen.set()
+            if self._wake_during_first_tick:
+                self.wake_active_cancel_watchdog()
+                self._event_state_after_nested_wake = (
+                    self._active_cancel_watchdog_event.is_set()
+                )
+        elif self._tick_count == 2:
+            self._second_tick_seen.set()
         return host_dispatch.ActiveCancelWatchdogTickResult(
             scanned=0,
             eligible=0,
             closed=0,
             ignored=0,
         )
+
+
+class _FailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
+    """测试用 active cancel watchdog fatal tick scheduler。"""
+
+    def tick_active_cancel_watchdog(
+        self, now: datetime
+    ) -> host_dispatch.ActiveCancelWatchdogTickResult:
+        """固定抛出 watchdog unexpected failure。
+
+        :param now: watchdog tick 的当前时间。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        _ = now
+        raise RuntimeError("active cancel watchdog private failure")
+
+
+async def _open_watchdog_probe_scheduler(
+    tmp_path: Path,
+    store: HostDurableStore,
+    scheduler_type: type[HostDispatchScheduler],
+    *,
+    suffix: str,
+) -> HostDispatchScheduler:
+    """打开不受 periodic timeout 干扰的 watchdog probe scheduler。
+
+    :param tmp_path: pytest 临时目录。
+    :param store: scheduler durable store。
+    :param scheduler_type: 待实例化 scheduler 类型。
+    :param suffix: lane/handle 隔离后缀。
+    :returns: 已构造但仅按显式 wake 启动 watchdog 的 scheduler。
+    :raises Exception: lane controller 打开失败时透传。
+    """
+
+    lane_db_path = tmp_path / f"lane-active-cancel-{suffix}.sqlite3"
+    lane_controller = await LaneController.open(
+        [
+            LaneConfig(
+                name=_LANE_NAME,
+                capacity=1,
+                default_timeout_seconds=0.1,
+                claim_ttl_seconds=1.0,
+                heartbeat_interval_seconds=0.1,
+            )
+        ],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+    )
+    return scheduler_type(
+        transaction_runner=store.transaction_runner,
+        event_log_store=EventLogStore(),
+        local_execution=HostLocalExecutionOptions(
+            lane_db_path=lane_db_path,
+            lane_name=_LANE_NAME,
+            lane_capacity=1,
+            lane_default_timeout_seconds=0.1,
+            lane_claim_ttl_seconds=1.0,
+            lane_heartbeat_interval_seconds=0.1,
+            worker_startup_timeout_seconds=1.0,
+            dispatch_poll_interval_seconds=60.0,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=False,
+            ),
+            agent_policy=_agent_policy(False),
+            worker_factory=_FakeWorkerFactory(),
+        ),
+        lane_controller=lane_controller,
+        host_handle_id=f"host-active-cancel-{suffix}",
+    )
 
 
 class _CloseWorkerLostFailingIngestor:
@@ -2587,11 +2730,16 @@ async def test_persistent_memory_lag_repair_failure_closes_starting_run(
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_logs_unexpected_exception(
+async def test_drain_loop_unexpected_exception_reports_fatal(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop 未预期异常后必须记录诊断并保持可关闭。"""
+    """drain loop 未预期异常退出并向 shared health 报告 fatal。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
 
     caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -2628,9 +2776,16 @@ async def test_drain_loop_logs_unexpected_exception(
             host_handle_id="host-drain-loop-log",
         )
         try:
-            scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
-            await asyncio.sleep(0.03)
-            assert scheduler._drain_task.done() is False
+            scheduler._drain_task = scheduler._start_critical_task(
+                scheduler._drain_loop,
+                component="dispatch",
+            )
+            await asyncio.wait_for(
+                asyncio.shield(scheduler._drain_task),
+                timeout=0.5,
+            )
+            assert scheduler._drain_task.done() is True
+            assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
         finally:
             await scheduler.close()
 
@@ -2638,13 +2793,18 @@ async def test_drain_loop_logs_unexpected_exception(
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
+async def test_drain_loop_retries_durable_retry_exhausted_without_self_close(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop 持久化重试耗尽时必须 fail-close 并可继续 close 清理。"""
+    """drain retry exhausted 按 poll interval 重试且不关闭或取消 worker。
 
-    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
         lane_controller = await LaneController.open(
             [
@@ -2667,7 +2827,7 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
             handle=_FakeHandle(),
             cancellation_token=active_token,
         )
-        scheduler = _RetryExhaustedDrainLoopScheduler(
+        scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
@@ -2688,98 +2848,159 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
             host_handle_id="host-drain-loop-retry-exhausted",
             active_registry=registry,
         )
-        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
-        await asyncio.sleep(0.03)
-        assert scheduler._drain_task.done() is True
-        assert active_token.is_cancelled() is True
-        assert (
-            active_token.cancel_reason()
-            == "drain_loop_durable_retry_exhausted"
+        retry_seen = asyncio.Event()
+        reconciled = asyncio.Event()
+        scheduler.configure_retry_probe(
+            retry_seen=retry_seen,
+            reconciled=reconciled,
         )
-        with pytest.raises(RuntimeError, match="closed"):
-            scheduler.wake_dispatch(
-                PendingDispatchRecord(
-                    dispatch_record_id="dispatch-closed",
-                    run_id="run-closed",
-                    attempt_id="attempt-closed",
-                    execution_id="execution-closed",
-                    execution_target="target-dispatch",
-                    worker_kind=WorkerKind.LOCAL,
-                )
+        scheduler._drain_task = scheduler._start_critical_task(
+            scheduler._drain_loop,
+            component="dispatch",
+        )
+        await asyncio.wait_for(retry_seen.wait(), timeout=0.5)
+        await asyncio.wait_for(reconciled.wait(), timeout=0.5)
+        assert scheduler._drain_task.done() is False
+        assert scheduler._closed is False
+        assert active_token.is_cancelled() is False
+        scheduler.wake_dispatch(
+            PendingDispatchRecord(
+                dispatch_record_id="dispatch-open",
+                run_id="run-open",
+                attempt_id="attempt-open",
+                execution_id="execution-open",
+                execution_target="target-dispatch",
+                worker_kind=WorkerKind.LOCAL,
             )
+        )
         await scheduler.close()
 
     assert any("dispatch drain loop durable retry exhausted" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_active_cancel_watchdog_loop_continues_after_transient_tick_failure(
+async def test_active_cancel_watchdog_wake_during_tick_drives_second_tick(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """active cancel watchdog 单次 tick 普通异常后必须继续下一轮扫描。"""
+    """tick barrier 内第二次 wake 在 clear 后保持 set 并驱动第二轮。"""
 
-    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
-        lane_controller = await LaneController.open(
-            [
-                LaneConfig(
-                    name=_LANE_NAME,
-                    capacity=1,
-                    default_timeout_seconds=0.1,
-                    claim_ttl_seconds=1.0,
-                    heartbeat_interval_seconds=0.1,
-                )
-            ],
-            coordinator=SQLiteLaneCoordinatorConfig(
-                db_path=tmp_path / "lane-active-cancel-watchdog.sqlite3"
+        scheduler = cast(
+            _LevelTriggeredActiveCancelWatchdogScheduler,
+            await _open_watchdog_probe_scheduler(
+                tmp_path,
+                store,
+                _LevelTriggeredActiveCancelWatchdogScheduler,
+                suffix="second-wake",
             ),
         )
-        scheduler = _TransientFailingActiveCancelWatchdogScheduler(
-            transaction_runner=store.transaction_runner,
-            event_log_store=EventLogStore(),
-            local_execution=HostLocalExecutionOptions(
-                lane_db_path=tmp_path / "lane-active-cancel-watchdog.sqlite3",
-                lane_name=_LANE_NAME,
-                lane_capacity=1,
-                lane_default_timeout_seconds=0.1,
-                lane_claim_ttl_seconds=1.0,
-                lane_heartbeat_interval_seconds=0.1,
-                worker_startup_timeout_seconds=1.0,
-                dispatch_poll_interval_seconds=0.01,
-                runner_spec=_runner_spec(),
-                runner_options=RunnerCallOptions(
-                    temperature=None,
-                    max_tokens=None,
-                    top_p=None,
-                    stream=False,
-                ),
-                agent_policy=_agent_policy(False),
-                worker_factory=_FakeWorkerFactory(),
-            ),
-            lane_controller=lane_controller,
-            host_handle_id="host-active-cancel-watchdog-transient",
-        )
+        first_tick_seen = asyncio.Event()
         second_tick_seen = asyncio.Event()
-        scheduler.configure_transient_watchdog_failure(second_tick_seen)
+        scheduler.configure_level_trigger_probe(
+            first_tick_seen=first_tick_seen,
+            second_tick_seen=second_tick_seen,
+            wake_during_first_tick=True,
+        )
         try:
             scheduler.wake_active_cancel_watchdog()
             await asyncio.wait_for(second_tick_seen.wait(), timeout=0.5)
-            assert scheduler._active_cancel_watchdog_task is not None
-            assert scheduler._active_cancel_watchdog_task.done() is False
+
+            assert first_tick_seen.is_set()
+            assert scheduler._tick_count == 2
+            assert scheduler._event_states_before_tick == [False, False]
+            assert scheduler._event_state_after_nested_wake is True
+            assert scheduler._health_gate.state is HostExecutionHealthState.READY
         finally:
             await scheduler.close()
 
-    assert "dispatch.active_cancel_watchdog.tick_failed" in caplog.text
-    assert "error_type=RuntimeError" in caplog.text
+        assert scheduler._health_gate.state is HostExecutionHealthState.READY
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
+async def test_active_cancel_watchdog_concurrent_wakes_coalesce_to_level_signal(
+    tmp_path: Path,
+) -> None:
+    """多个并发 wake 可合并为一次 level signal，不制造额外 tick。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = cast(
+            _LevelTriggeredActiveCancelWatchdogScheduler,
+            await _open_watchdog_probe_scheduler(
+                tmp_path,
+                store,
+                _LevelTriggeredActiveCancelWatchdogScheduler,
+                suffix="coalesced-wakes",
+            ),
+        )
+        first_tick_seen = asyncio.Event()
+        second_tick_seen = asyncio.Event()
+        scheduler.configure_level_trigger_probe(
+            first_tick_seen=first_tick_seen,
+            second_tick_seen=second_tick_seen,
+            wake_during_first_tick=False,
+        )
+        try:
+            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog()
+            await asyncio.wait_for(first_tick_seen.wait(), timeout=0.5)
+
+            assert scheduler._tick_count == 1
+            assert scheduler._event_states_before_tick == [False]
+            assert scheduler._active_cancel_watchdog_event.is_set() is False
+            assert second_tick_seen.is_set() is False
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_watchdog_unexpected_failure_reports_typed_fatal(
+    tmp_path: Path,
+) -> None:
+    """watchdog 普通异常必须由 S3 critical supervisor 提交 typed fatal。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = cast(
+            _FailingActiveCancelWatchdogScheduler,
+            await _open_watchdog_probe_scheduler(
+                tmp_path,
+                store,
+                _FailingActiveCancelWatchdogScheduler,
+                suffix="fatal",
+            ),
+        )
+        try:
+            scheduler.wake_active_cancel_watchdog()
+            task = scheduler._active_cancel_watchdog_task
+            assert task is not None
+            await task
+
+            assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
+            with pytest.raises(HostApiError) as exc_info:
+                scheduler.wake_active_cancel_watchdog()
+            assert exc_info.value.code is HostApiErrorCode.UNAVAILABLE
+            assert isinstance(exc_info.value.detail, HostUnavailableDetail)
+            assert exc_info.value.detail.component == "active_cancel_watchdog"
+            assert (
+                exc_info.value.detail.reason_code
+                == "critical_task_unexpected_exit"
+            )
+            assert "private failure" not in str(exc_info.value.detail)
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_loop_retry_exhausted_preserves_pending_durable_truth(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop retry exhausted 关闭前尽力收口队列剩余 dispatch。"""
+    """drain retry exhausted 不把 pending durable work 改写成 terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
 
     caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -2796,7 +3017,7 @@ async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
             ],
             coordinator=SQLiteLaneCoordinatorConfig(db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3"),
         )
-        scheduler = _RetryExhaustedDrainLoopScheduler(
+        scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
@@ -2817,18 +3038,27 @@ async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
             host_handle_id="host-drain-loop-queue-closeout",
         )
         scheduler._queue.put_nowait(_pending_dispatch(seeded))
-        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
-        await asyncio.sleep(0.03)
+        retry_seen = asyncio.Event()
+        reconciled = asyncio.Event()
+        scheduler.configure_retry_probe(
+            retry_seen=retry_seen,
+            reconciled=reconciled,
+        )
+        scheduler._drain_task = scheduler._start_critical_task(
+            scheduler._drain_loop,
+            component="dispatch",
+        )
+        await asyncio.wait_for(retry_seen.wait(), timeout=0.5)
+        await asyncio.wait_for(reconciled.wait(), timeout=0.5)
         await scheduler.close()
 
         run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
-        assert scheduler._queue.qsize() == 0
-        assert run.status is RunStatus.FAILED
-        assert attempt.status is AttemptStatus.FAILED
-        assert dispatch_record.status is DispatchRecordStatus.CANCELLED
+        assert scheduler._queue.qsize() == 1
+        assert run.status is RunStatus.RUNNING
+        assert attempt.status is AttemptStatus.STARTING
+        assert dispatch_record.status is DispatchRecordStatus.PENDING
 
-    assert "dispatch.drain_loop.queue_closeout" in caplog.text
-    assert "closeout_count=1" in caplog.text
+    assert "dispatch.drain_loop.queue_closeout" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3244,6 +3474,57 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
             assert attempt.status == AttemptStatus.FAILED
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
             assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_startup_timeout")
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_durable_retry_exhausted_requeues_current_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """首次 durable 写 retry exhausted 时当前 dispatch record 不会丢失。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+
+        def _raise_retry_exhausted(
+            record: PendingDispatchRecord,
+        ) -> DispatchRecordRow | None:
+            """模拟首次 durable waiting-for-lane 写入 retry exhausted。
+
+            :param record: pending dispatch record。
+            :returns: 不会返回。
+            :raises HostTransactionRetryExhaustedError: 始终抛出。
+            """
+
+            del record
+            raise HostTransactionRetryExhaustedError(
+                "waiting_for_lane busy",
+                attempts=3,
+            )
+
+        monkeypatch.setattr(
+            scheduler,
+            "_mark_waiting_for_lane",
+            _raise_retry_exhausted,
+        )
+        try:
+            scheduler._queue.put_nowait(_pending_dispatch(seeded))
+
+            with pytest.raises(HostTransactionRetryExhaustedError):
+                await scheduler.drain_once()
+
+            assert scheduler._queue.qsize() == 1
+            queued = scheduler._queue.get_nowait()
+            assert queued.dispatch_record_id == seeded.dispatch_record_id
+            assert queued.attempt_id == seeded.attempt_id
         finally:
             await scheduler.close()
 
@@ -3786,8 +4067,10 @@ async def test_scheduler_close_with_non_empty_dispatch_queue_does_not_drain_or_w
             store.transaction_runner,
             after_cursor=event_log_cursor,
         )
-        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+        with pytest.raises(HostApiError) as wake_error:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
+        assert wake_error.value.code is HostApiErrorCode.UNAVAILABLE
+        assert wake_error.value.retryable is True
         with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
             await scheduler.drain_once()
 
@@ -4095,7 +4378,7 @@ async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_e
                 run_id=request.run_id,
                 type=EngineEventType.RUN_FAILED,
                 data=RunFailedData(
-                    error_code="late",
+                    error_code=adapter_error_code("late"),
                     message="late event must not be consumed",
                     provider_request_id=None,
                     recoverable=False,
@@ -4696,6 +4979,48 @@ async def test_wake_queue_promotion_logs_promotion_task_exception(
 
 
 @pytest.mark.asyncio
+async def test_wake_queue_promotion_requeues_after_transient_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """promotion transient exception 后同一 session wakeup 会被重投。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+        attempts = 0
+        recovered = asyncio.Event()
+
+        async def _flaky_promotion(session_id: str) -> None:
+            """第一次失败，第二次记录恢复。
+
+            :param session_id: promotion session id。
+            :returns: ``None``。
+            :raises RuntimeError: 第一次调用时模拟 transient failure。
+            """
+
+            nonlocal attempts
+            assert session_id == "session-promotion-retry"
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("promotion transient")
+            recovered.set()
+
+        monkeypatch.setattr(scheduler, "run_queue_promotion", _flaky_promotion)
+        try:
+            scheduler.wake_queue_promotion("session-promotion-retry")
+            await asyncio.wait_for(recovered.wait(), timeout=1)
+
+            assert attempts == 2
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_close_cancels_tracked_promotion_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4750,10 +5075,75 @@ async def test_scheduler_wake_methods_fail_after_close_and_close_is_idempotent(
         await scheduler.close()
         await scheduler.close()
 
-        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+        with pytest.raises(HostApiError) as dispatch_error:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
-        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+        assert dispatch_error.value.code is HostApiErrorCode.UNAVAILABLE
+        with pytest.raises(HostApiError) as promotion_error:
             scheduler.wake_queue_promotion(seeded.session_id)
+        assert promotion_error.value.code is HostApiErrorCode.UNAVAILABLE
+        with pytest.raises(HostApiError) as watchdog_error:
+            scheduler.wake_active_cancel_watchdog()
+        assert watchdog_error.value.code is HostApiErrorCode.UNAVAILABLE
+        assert scheduler._promotion_queue.qsize() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", ("heartbeat", "dispatch", "promotion"))
+async def test_critical_task_exception_reports_typed_fatal_to_shared_health(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    """critical task 非预期异常只向 shared health 提交稳定 typed fatal。
+
+    :param tmp_path: pytest 临时目录。
+    :param component: 预期写入 typed detail 的 critical component。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+        )
+
+        async def fail_critical_task() -> None:
+            """抛出不会进入 public detail 的固定测试异常。
+
+            :returns: 不会返回。
+            :raises RuntimeError: 始终抛出。
+            """
+
+            raise RuntimeError("private provider diagnostic must not leak")
+
+        try:
+            await scheduler._supervise_critical_task(
+                fail_critical_task,
+                component=component,
+            )
+            assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
+            with pytest.raises(HostApiError) as exc_info:
+                scheduler.wake_dispatch(
+                    PendingDispatchRecord(
+                        dispatch_record_id="dispatch-fatal",
+                        run_id="run-fatal",
+                        attempt_id="attempt-fatal",
+                        execution_id="execution-fatal",
+                        execution_target="target-fatal",
+                        worker_kind=WorkerKind.LOCAL,
+                    )
+                )
+            assert exc_info.value.code is HostApiErrorCode.UNAVAILABLE
+            assert exc_info.value.retryable is True
+            assert isinstance(exc_info.value.detail, HostUnavailableDetail)
+            assert exc_info.value.detail.component == component
+            assert (
+                exc_info.value.detail.reason_code
+                == "critical_task_unexpected_exit"
+            )
+            assert "private provider diagnostic" not in str(exc_info.value.detail)
+        finally:
+            await scheduler.close()
 
 
 @pytest.mark.asyncio
@@ -4791,6 +5181,83 @@ async def test_proactive_compaction_calls_llm_outside_write_transaction(
                     )
                 )
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_rechecks_durable_state_after_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """manifest commit 后 Run 失效时，durable token 阻止 provider 调用。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-stale-after-manifest",
+            display_text=_soft_threshold_prompt(),
+        )
+        compactor = _PreparedManifestProactiveCompactor()
+        original_record = (
+            DurableCompactorProposalManifestRecorder.record_compactor_proposal_manifest
+        )
+
+        def record_then_fail_run(
+            recorder: DurableCompactorProposalManifestRecorder,
+            *,
+            request: CompactionRequest,
+            prepared_input: CompactorProposalRunInput,
+            compaction_operation_id: str,
+            compaction_attempt_number: int,
+        ) -> CompactorProposalManifestReference:
+            """提交真实 manifest 后在独立事务中让 Run 失效。
+
+            :param recorder: durable manifest recorder。
+            :param request: frozen compaction request。
+            :param prepared_input: 已准备的 provider input。
+            :param compaction_operation_id: compaction operation id。
+            :param compaction_attempt_number: attempt 序号。
+            :returns: 已提交的 manifest reference。
+            """
+
+            reference = original_record(
+                recorder,
+                request=request,
+                prepared_input=prepared_input,
+                compaction_operation_id=compaction_operation_id,
+                compaction_attempt_number=compaction_attempt_number,
+            )
+            _fail_unstarted_for_stale_test(store.transaction_runner, request)
+            return reference
+
+        monkeypatch.setattr(
+            DurableCompactorProposalManifestRecorder,
+            "record_compactor_proposal_manifest",
+            record_then_fail_run,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.FAILED
+            assert _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            ) == 1
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
         finally:
             await scheduler.close()
 
@@ -5034,8 +5501,7 @@ async def test_proactive_compaction_recovery_tier2_degrades_previous_view(
             assert tuple(
                 block.text for block in tier2_request.material_pack.previous_compacted_view
             ) == (
-                "fact=claim_text=previous evidence fact must stay exact; "
-                "evidence_refs=E1; evidence_kind=accepted_evidence_material",
+                "previous evidence fact must stay exact",
             )
         finally:
             await scheduler.close()
@@ -5794,6 +6260,7 @@ async def test_reactive_compact_request_uses_latest_previous_view(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=reactive_compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             reactive_scheduler.wake_dispatch(_pending_dispatch(reactive_seed))
@@ -6540,6 +7007,8 @@ def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
         continuation_max_attempts=0,
         allow_tool_calls=allow_tool_calls,
         tool_execution_timeout_seconds=1.0,
+        fallback_prompt="test fallback prompt",
+        continuation_prompt="test continuation prompt",
     )
 
 
@@ -6587,7 +7056,7 @@ def _seed_current_run(store: HostDurableStore, *, session_id: str | None = None)
                 source="pytest",
                 idempotency_key="idem-dispatch",
                 execution_target="target-dispatch",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
@@ -6647,7 +7116,7 @@ def _seed_accepted_run(
                 source="pytest",
                 idempotency_key=f"idem-run-{run_id}",
                 execution_target="target-dispatch",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 call_context_digest=_CALL_CONTEXT_DIGEST,
             ),
         )
@@ -7194,7 +7663,6 @@ def _previous_compacted_candidate() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="previous evidence fact must stay exact",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
         ),
         answer_anchors=(

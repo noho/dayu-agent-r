@@ -23,6 +23,8 @@ from dayu.documents.docling_runtime import (
 )
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import (
+    BatchToken,
+    FinsSourceProvider,
     FileObjectMeta,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
@@ -109,6 +111,42 @@ class _PendingFileAsset:
     source: str
 
 
+@dataclass(frozen=True)
+class _PreparedDeleteMutation:
+    """已完成业务校验、等待短事务发布的删除动作。"""
+
+    ticker: str
+    source_kind: SourceKind
+    document_id: str
+    internal_document_id: str
+
+
+@dataclass(frozen=True)
+class _PreparedAssetMutation:
+    """已完成文件读取与 Docling 转换、等待短事务发布的上传动作。"""
+
+    ticker: str
+    source_kind: SourceKind
+    action: str
+    document_id: str
+    internal_document_id: str
+    form_type: str
+    overwrite: bool
+    pending_assets: tuple[_PendingFileAsset, ...]
+    conversion_events: tuple[UploadFileEventPayload, ...]
+    previous_meta: JsonObject | None
+    meta: JsonObject
+    source_fingerprint: str
+    document_version: str
+    cancellation_checker: UploadCancellationChecker | None
+
+
+PreparedDoclingUpload: TypeAlias = (
+    UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
+)
+"""Docling 转换完成后交给 top-level publication owner 的 typed plan。"""
+
+
 class DoclingUploadService:
     """Docling 上传服务。"""
 
@@ -143,7 +181,7 @@ class DoclingUploadService:
         self._blob_repository = blob_repository
         self._convert_with_docling = convert_with_docling or _convert_bytes_with_docling
 
-    def execute_upload(
+    def prepare_upload(
         self,
         *,
         ticker: str,
@@ -156,8 +194,8 @@ class DoclingUploadService:
         overwrite: bool,
         meta: Mapping[str, JsonValue],
         cancellation_checker: UploadCancellationChecker | None = None,
-    ) -> UploadOperationResult:
-        """执行上传操作。
+    ) -> PreparedDoclingUpload:
+        """完成读取与 Docling 转换，生成待发布计划。
 
         Args:
             ticker: 股票代码。
@@ -172,7 +210,7 @@ class DoclingUploadService:
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
-            上传结果对象。
+            无需写入时返回最终结果；否则返回等待 caller 短事务发布的 typed plan。
 
         Raises:
             ValueError: 参数非法时抛出。
@@ -196,21 +234,11 @@ class DoclingUploadService:
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
 
         if normalized_action == "delete":
-            self._delete_source_document(
+            return _PreparedDeleteMutation(
                 ticker=normalized_ticker,
                 source_kind=source_kind,
                 document_id=document_id,
-            )
-            return UploadOperationResult(
-                status="deleted",
-                document_id=document_id,
                 internal_document_id=internal_document_id,
-                file_events=[],
-                payload={
-                    "document_id": document_id,
-                    "internal_document_id": internal_document_id,
-                    "deleted": True,
-                },
             )
 
         validated_files = _validate_source_files(files)
@@ -247,20 +275,178 @@ class DoclingUploadService:
         )
         if _is_cancelled(cancellation_checker):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+        current_version = _resolve_document_version(previous_meta, source_fingerprint)
+        staging_meta = self._build_upsert_meta(
+            previous_meta=previous_meta,
+            source_fingerprint=source_fingerprint,
+            document_version=current_version,
+            base_meta=meta,
+        )
+        return _PreparedAssetMutation(
+            ticker=normalized_ticker,
+            source_kind=source_kind,
+            action=normalized_action,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            overwrite=overwrite,
+            pending_assets=tuple(pending_assets),
+            conversion_events=tuple(conversion_events),
+            previous_meta=previous_meta,
+            meta=staging_meta,
+            source_fingerprint=source_fingerprint,
+            document_version=current_version,
+            cancellation_checker=cancellation_checker,
+        )
+
+    def publish_prepared_upload(
+        self,
+        prepared: PreparedDoclingUpload,
+        *,
+        batch: BatchToken,
+    ) -> UploadOperationResult:
+        """在 caller-owned 短事务内发布已准备的 Docling 计划。
+
+        Args:
+            prepared: ``prepare_upload`` 返回的 typed plan。
+            batch: caller 显式传入的 batch capability。
+
+        Returns:
+            上传操作结果；取消结果要求 caller rollback，其他写入结果可 commit。
+
+        Raises:
+            OSError: 仓储写入失败时抛出。
+            ValueError: batch 或计划字段非法时抛出。
+            RuntimeError: 完整 source 无法构造时抛出。
+        """
+
+        if isinstance(prepared, UploadOperationResult):
+            return prepared
+        if isinstance(prepared, _PreparedDeleteMutation):
+            self._delete_source_document(
+                ticker=prepared.ticker,
+                source_kind=prepared.source_kind,
+                document_id=prepared.document_id,
+                batch=batch,
+            )
+            return UploadOperationResult(
+                status="deleted",
+                document_id=prepared.document_id,
+                internal_document_id=prepared.internal_document_id,
+                file_events=[],
+                payload={
+                    "document_id": prepared.document_id,
+                    "internal_document_id": prepared.internal_document_id,
+                    "deleted": True,
+                },
+            )
+        result = self._store_upload_assets(
+            ticker=prepared.ticker,
+            source_kind=prepared.source_kind,
+            action=prepared.action,
+            document_id=prepared.document_id,
+            internal_document_id=prepared.internal_document_id,
+            form_type=prepared.form_type,
+            overwrite=prepared.overwrite,
+            pending_assets=list(prepared.pending_assets),
+            conversion_events=list(prepared.conversion_events),
+            previous_meta=prepared.previous_meta,
+            meta=prepared.meta,
+            source_fingerprint=prepared.source_fingerprint,
+            document_version=prepared.document_version,
+            cancellation_checker=prepared.cancellation_checker,
+            batch=batch,
+        )
+        if result.status == "uploaded":
+            Log.verbose(
+                (
+                    f"Docling 转换与源文档落盘完成: ticker={prepared.ticker} "
+                    f"document_id={prepared.document_id} "
+                    f"files={result.payload.get('uploaded_files')}"
+                ),
+                module=self.MODULE,
+            )
+        return result
+
+    def _store_upload_assets(
+        self,
+        *,
+        ticker: str,
+        source_kind: SourceKind,
+        action: str,
+        document_id: str,
+        internal_document_id: str,
+        form_type: str,
+        overwrite: bool,
+        pending_assets: list[_PendingFileAsset],
+        conversion_events: list[UploadFileEventPayload],
+        previous_meta: JsonObject | None,
+        meta: JsonObject,
+        source_fingerprint: str,
+        document_version: str,
+        cancellation_checker: UploadCancellationChecker | None,
+        batch: BatchToken,
+    ) -> UploadOperationResult:
+        """在 storage owner 边界写入上传文件和最终 source meta。
+
+        Args:
+            ticker: 已规范化股票代码。
+            source_kind: 文档来源类型。
+            action: 已解析上传动作。
+            document_id: 文档 ID。
+            internal_document_id: 内部文档 ID。
+            form_type: 表单类型。
+            overwrite: 是否开启覆盖。
+            pending_assets: 已完成转换、等待落盘的文件资产。
+            conversion_events: 转换阶段产生的文件事件。
+            previous_meta: 旧 source meta。
+            meta: 本次写入的 source meta。
+            source_fingerprint: 本次上传源指纹。
+            document_version: 本次文档版本。
+            cancellation_checker: 可选协作式取消检查器。
+            batch: caller 显式传入的 batch capability。
+
+        Returns:
+            上传操作结果。
+
+        Raises:
+            RuntimeError: 未生成主 Docling 文件时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        replace_existing = overwrite and previous_meta is not None and action in {"create", "update"}
+        upsert_mode = _resolve_upsert_mode(
+            action=action,
+            previous_meta=previous_meta,
+            overwrite=overwrite,
+        )
+        if replace_existing:
+            self._source_repository.reset_source_document(
+                ticker=ticker,
+                document_id=document_id,
+                source_kind=source_kind,
+                batch=batch,
+            )
+            upsert_mode = "create"
+
         stored_entries: list[JsonObject] = []
         file_events: list[UploadFileEventPayload] = list(conversion_events)
         handle = SourceHandle(
-            ticker=normalized_ticker,
+            ticker=ticker,
             document_id=document_id,
             source_kind=source_kind.value,
         )
         for asset in pending_assets:
             if _is_cancelled(cancellation_checker):
-                return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+                return _build_cancelled_result(
+                    document_id=document_id,
+                    internal_document_id=internal_document_id,
+                )
             file_meta = self._blob_repository.store_file(
                 handle=handle,
                 filename=asset.name,
                 data=BytesIO(asset.data),
+                batch=batch,
                 content_type=asset.content_type,
             )
             stored_entries.append(_build_stored_file_entry(asset=asset, file_meta=file_meta))
@@ -279,36 +465,28 @@ class DoclingUploadService:
         primary_document = _pick_primary_docling_file(stored_entries)
         if primary_document is None:
             raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
-        current_version = _resolve_document_version(previous_meta, source_fingerprint)
-        merged_meta = self._build_upsert_meta(
-            previous_meta=previous_meta,
-            source_fingerprint=source_fingerprint,
-            document_version=current_version,
-            base_meta=meta,
-        )
-        upsert_mode = _resolve_upsert_mode(
-            action=normalized_action,
-            previous_meta=previous_meta,
-            overwrite=overwrite,
-        )
+        if _is_cancelled(cancellation_checker):
+            return _build_cancelled_result(
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+            )
         self._upsert_source_document(
             upsert_mode=upsert_mode,
             source_kind=source_kind,
-            ticker=normalized_ticker,
+            ticker=ticker,
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type=form_type,
             primary_document=primary_document,
             file_entries=stored_entries,
-            meta=merged_meta,
+            meta=meta,
+            batch=batch,
         )
-        Log.verbose(
-            (
-                f"Docling 转换与源文档落盘完成: ticker={normalized_ticker} "
-                f"document_id={document_id} mode={upsert_mode} files={len(stored_entries)}"
-            ),
-            module=self.MODULE,
-        )
+        if _is_cancelled(cancellation_checker):
+            return _build_cancelled_result(
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+            )
         return UploadOperationResult(
             status="uploaded",
             document_id=document_id,
@@ -320,7 +498,7 @@ class DoclingUploadService:
                 "primary_document": primary_document,
                 "uploaded_files": len(stored_entries),
                 "source_fingerprint": source_fingerprint,
-                "document_version": current_version,
+                "document_version": document_version,
             },
         )
 
@@ -392,6 +570,7 @@ class DoclingUploadService:
         ticker: str,
         source_kind: SourceKind,
         document_id: str,
+        batch: BatchToken,
     ) -> None:
         """删除源文档。
 
@@ -399,6 +578,7 @@ class DoclingUploadService:
             ticker: 股票代码。
             source_kind: 文档来源类型。
             document_id: 文档 ID。
+            batch: caller 显式传入的 batch capability。
 
         Returns:
             无。
@@ -413,7 +593,8 @@ class DoclingUploadService:
                 ticker=ticker,
                 document_id=document_id,
                 source_kind=source_kind.value,
-            )
+            ),
+            batch=batch,
         )
 
     def _build_original_assets(self, files: list[Path]) -> list[_PendingFileAsset]:
@@ -536,6 +717,7 @@ class DoclingUploadService:
         merged["document_version"] = document_version
         merged["source_fingerprint"] = source_fingerprint
         merged["ingest_complete"] = True
+        merged["source_provider"] = FinsSourceProvider.USER_UPLOAD.to_storage_value()
         merged["is_deleted"] = False
         merged["deleted_at"] = None
         return merged
@@ -552,6 +734,7 @@ class DoclingUploadService:
         primary_document: str,
         file_entries: list[JsonObject],
         meta: JsonObject,
+        batch: BatchToken,
     ) -> None:
         """执行仓储 upsert。
 
@@ -565,6 +748,7 @@ class DoclingUploadService:
             primary_document: 主文件名。
             file_entries: 文件条目列表。
             meta: 元数据字典。
+            batch: caller 显式传入的 batch capability。
 
         Returns:
             无。
@@ -586,11 +770,13 @@ class DoclingUploadService:
             self._source_repository.create_source_document(
                 request,
                 source_kind=source_kind,
+                batch=batch,
             )
             return
         self._source_repository.update_source_document(
             request,
             source_kind=source_kind,
+            batch=batch,
         )
 
 
@@ -695,8 +881,6 @@ def _can_skip_upload(
     """
 
     if overwrite or previous_meta is None:
-        return False
-    if not bool(previous_meta.get("ingest_complete", False)):
         return False
     previous_fingerprint = _text_meta(previous_meta, "source_fingerprint")
     return bool(previous_fingerprint) and previous_fingerprint == source_fingerprint
@@ -948,47 +1132,6 @@ def resolve_upload_action(
     if previous_meta is None:
         return "create"
     return "update"
-
-
-def reset_upload_target_for_overwrite(
-    *,
-    source_repository: SourceDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    source_kind: SourceKind,
-    action: str,
-    overwrite: bool,
-    previous_meta: Mapping[str, JsonValue] | None,
-) -> None:
-    """在覆盖模式下重置当前上传目标。
-
-    Args:
-        source_repository: 源文档仓储实现。
-        ticker: 股票代码。
-        document_id: 文档 ID。
-        source_kind: 来源类型。
-        action: 已解析的最终动作。
-        overwrite: 是否开启覆盖模式。
-        previous_meta: 当前目标的既有 meta。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 仓储重置失败时抛出。
-    """
-
-    if not overwrite:
-        return
-    if previous_meta is None:
-        return
-    if action not in {"create", "update"}:
-        return
-    source_repository.reset_source_document(
-        ticker=ticker,
-        document_id=document_id,
-        source_kind=source_kind,
-    )
 
 
 def build_cn_filing_ids(
@@ -1248,7 +1391,6 @@ __all__ = [
     "build_sec_filing_ids",
     "derive_report_kind",
     "normalize_cn_fiscal_period",
-    "reset_upload_target_for_overwrite",
     "resolve_upload_action",
     "validate_material_upload_ids",
 ]

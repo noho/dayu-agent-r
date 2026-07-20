@@ -6,12 +6,12 @@
 fallback，不是失败诊断、取消原因、lost 诊断、compact session_summary、
 answer anchor 或 evidence-backed fact 来源。
 
-consumer 边界固定如下：compaction material 使用本 strict continuity resolver 并允许
-digest-checked artifact fallback；Conversation Memory selected recent window 直接消费
-inline ``final_answer`` 且保持 lenient；durable projection / run-input adapter 可以先把
-descriptor-backed terminal artifact ``content`` hydrate 成 transient ``final_answer``，
-再交给 memory consumer。本模块不负责文本截断，长度治理属于调用方的展示、存储或上下文
-预算边界。
+consumer 边界固定如下：HostEvent 与 Outbox 使用 required strict contract；compaction
+material 使用 optional strict contract 并允许 digest-checked artifact fallback；durable
+projection / RunInputBuilder 把 resolver 输出作为 projection-internal typed continuity
+material 传给 memory consumer，不修改 EventLog payload mapping；直接 Conversation Memory
+consumer 在缺少 typed material 时只消费 inline ``final_answer`` 并保持 lenient、
+descriptor-blind。本模块不负责文本截断，长度治理属于调用方的展示、存储或上下文预算边界。
 """
 
 from __future__ import annotations
@@ -52,35 +52,107 @@ def assistant_final_answer_continuity_text(
     :param transaction: 当前 Host durable transaction。
     :param run_payload: ``RUN_SUCCEEDED`` payload。
     :param text_policy: 文本字段读取策略。
-    :returns: final answer continuity 文本；缺失时返回 ``None``。
-    :raises HostDurableError: strict 策略下允许字段类型非法，或 terminal
-        artifact descriptor 损坏时抛出。
+    optional contract 允许完整缺失 answer source、descriptor ``content`` 缺失或空白时
+    返回 ``None``。descriptor pair、descriptor、digest、SQLite row 与 JSON 结构始终
+    strict fail closed；lenient 策略只影响 inline ``final_answer`` 字段。
+
+    :returns: final answer continuity 文本；允许省略的内容缺失时返回 ``None``。
+    :raises HostDurableError: strict inline 字段类型非法、descriptor pair 损坏，或
+        terminal artifact 完整性 / ``content`` 类型非法时抛出。
+    """
+
+    final_answer, _missing_error = _resolve_assistant_final_answer_continuity_text(
+        transaction,
+        run_payload,
+        inline_text_policy=text_policy,
+    )
+    return final_answer
+
+
+def required_assistant_final_answer_continuity_text(
+    transaction: HostTransaction,
+    run_payload: Mapping[str, JsonValue],
+) -> str:
+    """读取成功 public terminal 必需的 assistant final answer 文本。
+
+    本 contract 与 optional resolver 共用同一个 source-selection core，并固定使用
+    strict inline policy。inline answer 与 descriptor source 都缺失，或 descriptor
+    ``content`` 缺失 / 空白时均抛出可诊断的 durable error，保证成功 HostEvent 与
+    Outbox materialization 不产生 nullable final answer。
+
+    :param transaction: 当前 Host durable transaction。
+    :param run_payload: ``RUN_SUCCEEDED`` payload。
+    :returns: 非空 final answer continuity 文本。
+    :raises HostDurableError: 没有合法 answer source，或 descriptor / content 非法时抛出。
+    """
+
+    final_answer, missing_error = _resolve_assistant_final_answer_continuity_text(
+        transaction,
+        run_payload,
+        inline_text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+    )
+    if final_answer is None:
+        if missing_error is None:
+            raise HostDurableError("assistant final answer resolution is invalid")
+        raise HostDurableError(missing_error)
+    return final_answer
+
+
+def _resolve_assistant_final_answer_continuity_text(
+    transaction: HostTransaction,
+    run_payload: Mapping[str, JsonValue],
+    *,
+    inline_text_policy: PayloadTextReadPolicy,
+) -> tuple[str | None, str | None]:
+    """统一选择 inline 或 descriptor-backed final answer source。
+
+    返回值第二项只在没有文本 candidate 时携带 required contract 应使用的稳定诊断；
+    descriptor 结构或内容类型损坏直接抛错，不降级为缺失。
+
+    :param transaction: 当前 Host durable transaction。
+    :param run_payload: ``RUN_SUCCEEDED`` payload。
+    :param inline_text_policy: inline ``final_answer`` 字段读取策略。
+    :returns: ``(answer_text, missing_error)``；有文本时错误为 ``None``。
+    :raises HostDurableError: descriptor pair、artifact 完整性或 content 类型非法时抛出。
     """
 
     final_answer = assistant_final_answer_text_from_run_payload(
         run_payload,
-        text_policy=text_policy,
+        text_policy=inline_text_policy,
     )
     if final_answer is not None:
-        return final_answer
+        return final_answer, None
     terminal_payload_ref = _optional_descriptor_text(
         run_payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF
     )
     terminal_payload_digest = _optional_descriptor_text(
         run_payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST
     )
+    if terminal_payload_ref is None and terminal_payload_digest is None:
+        return (
+            None,
+            "assistant final answer inline answer and descriptor pair are missing",
+        )
     if terminal_payload_ref is None or terminal_payload_digest is None:
-        return None
+        raise HostDurableError(
+            "terminal_summary_ref and terminal_summary_digest must pair"
+        )
     terminal_payload = sqlite_payload_object(
         transaction,
         payload_ref=terminal_payload_ref,
         payload_digest=terminal_payload_digest,
         payload_label="terminal payload",
     )
-    return terminal_payload_content_text_from_payload(
+    content = terminal_payload_content_text_from_payload(
         terminal_payload,
-        text_policy=text_policy,
+        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
+    if content is not None:
+        return content, None
+    raw_content = terminal_payload.get("content")
+    if raw_content is None:
+        return None, "terminal payload content is missing"
+    return None, "terminal payload content is blank"
 
 
 def _optional_descriptor_text(
@@ -109,4 +181,5 @@ def _optional_descriptor_text(
 
 __all__ = [
     "assistant_final_answer_continuity_text",
+    "required_assistant_final_answer_continuity_text",
 ]

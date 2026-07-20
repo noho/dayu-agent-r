@@ -20,6 +20,12 @@ class SourceType(str, Enum):
     SEC_EDGAR = "SEC_EDGAR"
     """SEC EDGAR 下载的美股 filing。"""
 
+    CNINFO = "CNINFO"
+    """巨潮资讯下载的 A 股 filing。"""
+
+    HKEXNEWS = "HKEXNEWS"
+    """港交所披露易下载的港股 filing。"""
+
     UPLOADED = "UPLOADED"
     """用户上传的 filing（港A股等）。"""
 
@@ -89,6 +95,7 @@ class Citation:
         form_type: 表单类型（如 "10-K"），非 filing 时为 None。
         filing_date: 申报日期（ISO 格式），非 filing 时为 None。
         accession_no: SEC accession number，仅美股 filing 有值。
+        source_provider: 源文档提供方，完成态 source 文档通常非空。
         document_id: 文档唯一标识。
         ticker: 股票代码。
         fiscal_year: 财年。
@@ -103,6 +110,7 @@ class Citation:
     form_type: Optional[str] = None
     filing_date: Optional[str] = None
     accession_no: Optional[str] = None
+    source_provider: Optional[str] = None
     fiscal_year: Optional[int] = None
     fiscal_period: Optional[str] = None
     item: Optional[str] = None
@@ -133,6 +141,7 @@ class Citation:
             form_type=self.form_type,
             filing_date=self.filing_date,
             accession_no=self.accession_no,
+            source_provider=self.source_provider,
             fiscal_year=self.fiscal_year,
             fiscal_period=self.fiscal_period,
             item=item or self.item,

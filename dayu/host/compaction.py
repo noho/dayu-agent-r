@@ -77,15 +77,7 @@ class TraceReadableKindVNext(StrEnum):
 
     USER_INPUT = "user_input"
     ASSISTANT_FINAL_ANSWER = "assistant_final_answer"
-    USER_VISIBLE_RUN_STATE = "user_visible_run_state"
-
-
-class FactEvidenceKindVNext(StrEnum):
-    """vNext evidence-backed fact candidate 的证据类型。"""
-
-    TOOL_RESULT = "tool_result"
-    TOOL_SOURCE_TEXT = "tool_source_text"
-    ACCEPTED_EVIDENCE_MATERIAL = "accepted_evidence_material"
+    USER_VISIBLE_PROGRESS = "user_visible_progress"
 
 
 class ForwardIntentTypeVNext(StrEnum):
@@ -1182,20 +1174,17 @@ class EvidenceBackedFactCandidateVNext:
 
     :param claim_text: fact claim 文本。
     :param evidence_labels: 支撑事实的 evidence labels。
-    :param evidence_kind: 证据类型。
     :param source_labels: 可选辅助 source labels。
     """
 
     claim_text: str
     evidence_labels: tuple[PromptLocalMaterialLabel, ...]
-    evidence_kind: FactEvidenceKindVNext
     source_labels: tuple[PromptLocalMaterialLabel, ...] = field(default_factory=_empty_string_tuple)
 
     def __post_init__(self) -> None:
         """校验 vNext evidence-backed fact candidate。
 
         :returns: ``None``。
-        :raises TypeError: enum 类型非法时抛出。
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
@@ -1204,8 +1193,6 @@ class EvidenceBackedFactCandidateVNext:
             self.evidence_labels,
             field_name="EvidenceBackedFactCandidateVNext.evidence_labels",
         )
-        if not isinstance(self.evidence_kind, FactEvidenceKindVNext):
-            raise TypeError("EvidenceBackedFactCandidateVNext.evidence_kind is invalid")
         _require_unique_string_tuple(
             self.source_labels,
             field_name="EvidenceBackedFactCandidateVNext.source_labels",
@@ -1220,7 +1207,6 @@ class EvidenceBackedFactCandidateVNext:
         return {
             "claim_text": self.claim_text,
             "evidence_labels": _string_list_json(self.evidence_labels),
-            "evidence_kind": self.evidence_kind.value,
             "source_labels": _string_list_json(self.source_labels),
         }
 
@@ -1622,6 +1608,7 @@ class CompactMaterialPack:
     """Compactor LLM-facing material pack 与内部 provenance map。
 
     :param previous_compacted_view: previous compacted view blocks。
+    :param previous_compacted_readable_view: 与 previous blocks 同源的 typed previous view。
     :param trace_material: trace material blocks。
     :param evidence_material: evidence material blocks。
     :param answer_material: answer material blocks。
@@ -1630,6 +1617,7 @@ class CompactMaterialPack:
     """
 
     previous_compacted_view: tuple[CompactMaterialBlock, ...]
+    previous_compacted_readable_view: CompactReadableViewVNext | None
     trace_material: tuple[CompactMaterialBlock, ...]
     evidence_material: tuple[CompactEvidenceBlock, ...]
     answer_material: tuple[CompactMaterialBlock, ...]
@@ -1648,6 +1636,10 @@ class CompactMaterialPack:
             self.previous_compacted_view,
             field_name="CompactMaterialPack.previous_compacted_view",
             section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+        )
+        _require_previous_compacted_view_pair(
+            self.previous_compacted_view,
+            self.previous_compacted_readable_view,
         )
         _require_material_block_tuple(
             self.trace_material,
@@ -1742,6 +1734,11 @@ class CompactMaterialPack:
 
         return {
             "previous_compacted_view": _material_block_list_json(self.previous_compacted_view),
+            "previous_compacted_readable_view": (
+                None
+                if self.previous_compacted_readable_view is None
+                else self.previous_compacted_readable_view.to_json()
+            ),
             "trace_material": _material_block_list_json(self.trace_material),
             "evidence_material": _evidence_block_list_json(self.evidence_material),
             "answer_material": _material_block_list_json(self.answer_material),
@@ -2136,6 +2133,176 @@ def _require_one_section_per_canonical_content(pack: CompactMaterialPack) -> Non
             continue
         if existing_section is not entry.section:
             raise ValueError("material pack canonical content appears in two sections")
+
+
+_PREVIOUS_VIEW_ALLOWED_KINDS = frozenset(
+    (
+        CompactMaterialBlockKind.SESSION_SUMMARY,
+        CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+        CompactMaterialBlockKind.ANSWER_ANCHOR,
+        CompactMaterialBlockKind.FORWARD_INTENT,
+        CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+    )
+)
+_ANCHOR_CHILD_TEXT_PREFIX = "- "
+_ANCHOR_CHILD_ORDINAL_SEPARATOR = ". "
+
+
+def previous_answer_anchor_block_text(anchor: ReadableAnswerAnchorVNext) -> str:
+    """返回 previous answer anchor block 的业务可读文本。
+
+    :param anchor: typed previous answer anchor。
+    :returns: 与 typed anchor 同源的 block 文本。
+    """
+
+    if not isinstance(anchor, ReadableAnswerAnchorVNext):
+        raise TypeError("anchor must be ReadableAnswerAnchorVNext")
+    lines = [anchor.anchor_title]
+    for item in anchor.anchor_items:
+        ordinal_prefix = (
+            ""
+            if item.ordinal is None
+            else f"{item.ordinal}{_ANCHOR_CHILD_ORDINAL_SEPARATOR}"
+        )
+        lines.append(f"{_ANCHOR_CHILD_TEXT_PREFIX}{ordinal_prefix}{item.display_text}")
+    return "\n".join(lines)
+
+
+def validate_previous_compacted_view_pair(
+    blocks: tuple[CompactMaterialBlock, ...],
+    readable_view: CompactReadableViewVNext | None,
+) -> None:
+    """校验 previous compacted blocks 与 typed readable view 的 exact pair。
+
+    :param blocks: previous compacted material blocks。
+    :param readable_view: 同源 typed readable view。
+    :returns: ``None``。
+    :raises TypeError: block 或 readable view 类型非法时抛出。
+    :raises ValueError: pair invariant 不成立时抛出。
+    """
+
+    _require_material_block_tuple(
+        blocks,
+        field_name="previous_compacted_view",
+        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+    )
+    _require_previous_compacted_view_pair(blocks, readable_view)
+
+
+def _require_previous_compacted_view_pair(
+    blocks: tuple[CompactMaterialBlock, ...],
+    readable_view: CompactReadableViewVNext | None,
+) -> None:
+    """校验 previous compacted blocks 与 typed readable view 的 exact pair。
+
+    :param blocks: previous compacted material blocks。
+    :param readable_view: 同源 typed readable view。
+    :returns: ``None``。
+    :raises TypeError: readable view 类型非法时抛出。
+    :raises ValueError: presence、kind、label、数量或文本不一致时抛出。
+    """
+
+    if len(blocks) == 0:
+        if readable_view is not None:
+            raise ValueError("previous compacted readable view must be None without blocks")
+        return
+    if readable_view is None:
+        raise ValueError("previous compacted readable view is required with blocks")
+    if not isinstance(readable_view, CompactReadableViewVNext):
+        raise TypeError("previous compacted readable view must be CompactReadableViewVNext")
+    _require_previous_block_kind_and_label_set(blocks)
+    summary_blocks = _previous_blocks_by_kind(
+        blocks,
+        CompactMaterialBlockKind.SESSION_SUMMARY,
+    )
+    if len(summary_blocks) > 1:
+        raise ValueError("previous compacted view may contain one session summary")
+    if readable_view.session_summary is None:
+        if len(summary_blocks) != 0:
+            raise ValueError("previous session summary block mismatch")
+    elif len(summary_blocks) != 1 or summary_blocks[0].text != readable_view.session_summary:
+        raise ValueError("previous session summary block mismatch")
+    _require_previous_item_blocks(
+        _previous_blocks_by_kind(blocks, CompactMaterialBlockKind.EVIDENCE_BACKED_FACT),
+        tuple((item.source_label, item.claim_text) for item in readable_view.evidence_backed_facts),
+        section_name="evidence_backed_facts",
+    )
+    _require_previous_item_blocks(
+        _previous_blocks_by_kind(blocks, CompactMaterialBlockKind.ANSWER_ANCHOR),
+        tuple(
+            (item.source_label, previous_answer_anchor_block_text(item))
+            for item in readable_view.answer_anchors
+        ),
+        section_name="answer_anchors",
+    )
+    _require_previous_item_blocks(
+        _previous_blocks_by_kind(blocks, CompactMaterialBlockKind.FORWARD_INTENT),
+        tuple((item.source_label, item.text) for item in readable_view.forward_intents),
+        section_name="forward_intents",
+    )
+    _require_previous_item_blocks(
+        _previous_blocks_by_kind(blocks, CompactMaterialBlockKind.REFERENCE_CONTINUITY),
+        tuple((item.source_label, item.text) for item in readable_view.reference_continuity_items),
+        section_name="reference_continuity_items",
+    )
+
+
+def _require_previous_block_kind_and_label_set(
+    blocks: tuple[CompactMaterialBlock, ...],
+) -> None:
+    """校验 previous blocks 的 kind 与 label 集合。
+
+    :param blocks: previous compacted material blocks。
+    :returns: ``None``。
+    :raises ValueError: kind 非法或 label 重复时抛出。
+    """
+
+    labels: set[PromptLocalMaterialLabel] = set()
+    for block in blocks:
+        if block.kind not in _PREVIOUS_VIEW_ALLOWED_KINDS:
+            raise ValueError("previous compacted view block kind is invalid")
+        if block.block_label in labels:
+            raise ValueError("previous compacted view block labels must be unique")
+        labels.add(block.block_label)
+
+
+def _previous_blocks_by_kind(
+    blocks: tuple[CompactMaterialBlock, ...],
+    kind: CompactMaterialBlockKind,
+) -> tuple[CompactMaterialBlock, ...]:
+    """按 kind 返回 previous blocks。
+
+    :param blocks: previous compacted material blocks。
+    :param kind: 目标 block kind。
+    :returns: 同 kind block tuple。
+    """
+
+    return tuple(block for block in blocks if block.kind is kind)
+
+
+def _require_previous_item_blocks(
+    blocks: tuple[CompactMaterialBlock, ...],
+    expected_items: tuple[tuple[PromptLocalMaterialLabel, str], ...],
+    *,
+    section_name: str,
+) -> None:
+    """校验 previous section 的 label 与文本逐项一致。
+
+    :param blocks: 同 kind previous blocks。
+    :param expected_items: typed view 中同 section 的 label / text tuple。
+    :param section_name: 错误消息中的 section 名称。
+    :returns: ``None``。
+    :raises ValueError: 数量、label 或文本不一致时抛出。
+    """
+
+    if len(blocks) != len(expected_items):
+        raise ValueError(f"previous {section_name} block count mismatch")
+    for block, expected in zip(blocks, expected_items, strict=True):
+        label, text = expected
+        if block.block_label != label:
+            raise ValueError(f"previous {section_name} block label mismatch")
+        if block.text != text:
+            raise ValueError(f"previous {section_name} block text mismatch")
 
 
 def _require_opaque_ref_tuple(value: tuple[OpaqueEvidenceRef, ...], *, field_name: str) -> None:
@@ -2800,7 +2967,6 @@ __all__ = [
     "CurrentInputAnchorVNext",
     "EvidenceBackedFactCandidateVNext",
     "EvidenceReadableItemVNext",
-    "FactEvidenceKindVNext",
     "ForwardIntentCandidateVNext",
     "ForwardIntentStatusVNext",
     "ForwardIntentTypeVNext",
@@ -2818,4 +2984,6 @@ __all__ = [
     "TraceReadableItemVNext",
     "TraceReadableKindVNext",
     "conversation_compact_label_looks_stale_vnext",
+    "previous_answer_anchor_block_text",
+    "validate_previous_compacted_view_pair",
 ]

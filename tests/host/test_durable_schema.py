@@ -11,6 +11,8 @@ import pytest
 import dayu.host.durable.schema as durable_schema
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostSchemaMismatchError
+from dayu.host.lifecycle_events import all_host_event_type_values
+from dayu.host.queue_policy import run_queue_policy_values
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -73,6 +75,7 @@ from dayu.host.durable.schema import (
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
     bootstrap_host_durable_store,
+    payload_descriptor_kind_values,
 )
 
 _CREATE_INDEX_NAME_PATTERN = re.compile(
@@ -328,7 +331,7 @@ def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> No
           'digest',
           'canonical_fact',
           'session-1',
-          'TYPE_A',
+          'USER_INPUT_ACCEPTED',
           '2026-05-16T00:00:00.000000Z',
           '{{}}',
           '2026-05-16T00:00:00.000000Z'
@@ -831,10 +834,83 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
     )
 
 
-def test_host_schema_version_is_query_index_version() -> None:
-    """当前 committed Host schema version 是 watchdog cancelling query fresh schema 20。"""
+def test_host_schema_version_is_queue_policy_check_version() -> None:
+    """当前 committed Host schema version 是 queue policy CHECK schema 23。"""
 
-    assert HOST_SCHEMA_VERSION == 20
+    assert HOST_SCHEMA_VERSION == 23
+
+
+def test_host_runs_queue_policy_check_uses_owner_values(tmp_path: Path) -> None:
+    """fresh host_runs schema 使用 queue policy owner 三值 CHECK。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            table_sql = _schema_sql(
+                connection,
+                _SQLITE_OBJECT_TYPE_TABLE,
+                TABLE_HOST_RUNS,
+            )
+            assert "queue_policy IN" in table_sql
+            for policy_value in run_queue_policy_values():
+                assert f"'{policy_value}'" in table_sql
+
+            connection.execute("PRAGMA foreign_keys=OFF")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"""
+                    INSERT INTO {TABLE_HOST_RUNS} (
+                      run_id,
+                      session_id,
+                      status,
+                      client_request_id,
+                      input_event_id,
+                      input_event_sequence,
+                      accepted_event_id,
+                      accepted_event_sequence,
+                      queued_event_id,
+                      queued_event_sequence,
+                      started_event_id,
+                      started_event_sequence,
+                      terminal_event_id,
+                      terminal_event_sequence,
+                      cancel_request_event_id,
+                      current_attempt_id,
+                      source_run_id,
+                      source_run_relation,
+                      execution_target,
+                      queue_policy,
+                      created_at,
+                      updated_at,
+                      terminal_at
+                    ) VALUES (
+                      'run-invalid-policy',
+                      'session-1',
+                      'accepted',
+                      'request-1',
+                      'event-input',
+                      1,
+                      'event-accepted',
+                      2,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      'local-default',
+                      'invalid_policy',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z',
+                      NULL
+                    )
+                    """)
+        finally:
+            connection.close()
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
@@ -844,6 +920,15 @@ def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
     assert (
         TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND
         == "tool_call_semantic_query_text"
+    )
+    assert payload_descriptor_kind_values() == (
+        "tool_call_arguments_json",
+        "tool_call_semantic_query_text",
+        "runner_call_input_manifest",
+        "runner_call_input_projection",
+        "selected_tool_schema_snapshot",
+        "compactor_input_projection",
+        "compaction_rejected_attempt_diagnostic",
     )
 
 
@@ -1021,7 +1106,11 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
                 (TABLE_EVENT_LOG,),
             ).fetchone()
             assert create_sql_row is not None
-            assert "AUTOINCREMENT" in str(create_sql_row[0]).upper()
+            event_log_sql = str(create_sql_row[0])
+            assert "AUTOINCREMENT" in event_log_sql.upper()
+            assert "event_type TEXT NOT NULL CHECK" in event_log_sql
+            for event_type in all_host_event_type_values():
+                assert f"'{event_type}'" in event_log_sql
 
             event_indexes = connection.execute(f"PRAGMA index_list({TABLE_EVENT_LOG})").fetchall()
             assert any(int(row[2]) == 1 for row in event_indexes)
@@ -1034,9 +1123,50 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
                 "scope_id",
                 "idempotency_key",
             )
+            idempotency_sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (TABLE_IDEMPOTENCY_RECORDS,),
+            ).fetchone()
+            assert idempotency_sql_row is not None
+            idempotency_sql = str(idempotency_sql_row[0])
+            assert "scope_kind TEXT NOT NULL CHECK" not in idempotency_sql
+            assert "result_kind TEXT NOT NULL CHECK" not in idempotency_sql
             assert _primary_key_columns(connection, TABLE_PAYLOAD_DESCRIPTORS) == ("payload_ref",)
             assert _primary_key_columns(connection, TABLE_SQLITE_PAYLOADS) == ("payload_id",)
             assert _primary_key_columns(connection, TABLE_HOST_INSTANCES) == ("host_instance_id",)
+        finally:
+            connection.close()
+
+
+def test_event_log_schema_rejects_unknown_event_type(tmp_path: Path) -> None:
+    """EventLog fresh-schema DDL CHECK 拒绝未知 event type。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"""
+                    INSERT INTO {TABLE_EVENT_LOG} (
+                      event_id,
+                      event_body_digest,
+                      event_class,
+                      session_id,
+                      event_type,
+                      occurred_at,
+                      payload_json,
+                      appended_at
+                    ) VALUES (
+                      'event-invalid-type',
+                      'digest',
+                      'canonical_fact',
+                      'session-1',
+                      'INVALID_TEST_EVENT_TYPE',
+                      '2026-05-16T00:00:00.000000Z',
+                      '{{}}',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """)
         finally:
             connection.close()
 
@@ -1068,7 +1198,7 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
                       'digest',
                       'canonical_fact',
                       'session-1',
-                      'TYPE_A',
+                      'USER_INPUT_ACCEPTED',
                       '2026-05-16T00:00:00.000000Z',
                       '{{}}',
                       'payload-ref-1',
@@ -1092,7 +1222,7 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
                       'digest',
                       'canonical_fact',
                       'session-1',
-                      'TYPE_A',
+                      'USER_INPUT_ACCEPTED',
                       '2026-05-16T00:00:00.000000Z',
                       '{{}}',
                       'sha256:0000000000000000000000000000000000000000000000000000000000000000',

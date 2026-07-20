@@ -15,6 +15,7 @@ from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
@@ -417,6 +418,8 @@ def _request() -> AgentRunRequest:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),
@@ -453,7 +456,7 @@ def _engine_event() -> EngineEvent:
         run_id="run-local",
         type=EngineEventType.RUN_FAILED,
         data=RunFailedData(
-            error_code="fake",
+            error_code=adapter_error_code("fake"),
             message="fake",
             provider_request_id=None,
             recoverable=False,

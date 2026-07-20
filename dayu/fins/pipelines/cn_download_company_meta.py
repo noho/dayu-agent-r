@@ -7,7 +7,7 @@ downloader 具体实现、不写 source 文档、不参与 docling 转换。
 
 from __future__ import annotations
 
-from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
 from dayu.fins.pipelines.cn_download_models import CnCompanyProfile
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
 from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id
@@ -21,6 +21,7 @@ def upsert_company_meta_for_cn_download(
     profile: CnCompanyProfile,
     normalized_ticker: str,
     ticker_aliases: list[str] | None,
+    batch: BatchToken,
 ) -> CompanyMeta:
     """写入 CN/HK 下载链路的公司级元数据。
 
@@ -29,6 +30,7 @@ def upsert_company_meta_for_cn_download(
         profile: downloader 解析得到的公司基础信息。
         normalized_ticker: 已归一化 ticker。
         ticker_aliases: CLI / Service 透传的 ticker alias 列表。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         已写入的 ``CompanyMeta``。
@@ -59,7 +61,7 @@ def upsert_company_meta_for_cn_download(
         updated_at=now_iso8601(),
         ticker_aliases=aliases,
     )
-    repository.upsert_company_meta(meta)
+    repository.upsert_company_meta(meta, batch=batch)
     return meta
 
 

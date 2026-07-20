@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import cast
 
 import pytest
 
 import dayu.host.compaction_operation as compaction_operation
 import dayu.host.dispatch as dispatch
 from dayu.contracts.cancellation import CancellationToken
-from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
@@ -35,16 +32,14 @@ from dayu.host.compact_material import (
     initial_segment_selection,
 )
 from dayu.host.compaction import (
-    CompactMaterialBlock,
     CompactMaterialBlockKind,
-    CompactMaterialSection,
+    CompactCandidateDiagnosticVNext,
     CompactSegmentTrigger,
     CompactQualityCheckResultVNext,
     CompactQualityIssueVNext,
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
-    PromptLocalProvenanceEntry,
 )
 from dayu.host.compaction_operation import run_compaction_operation
 from dayu.host.compaction_operation import (
@@ -54,17 +49,8 @@ from dayu.host.compaction_operation import (
 from dayu.host.context_events import build_context_compaction_attempt_rejected_payload
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.artifact import LocalArtifactStore
-from dayu.host.durable.options import (
-    HostDurableStoreOptions,
-    HostSQLiteStoragePolicy,
-    PayloadStoragePolicy,
-)
-from dayu.host.durable.payload import PayloadStore
-from dayu.host.durable.transaction import HostTransaction
-from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
-from tests.host.fake_cancellation import StubCancellationToken
+from dayu.host.durable.codec import sha256_digest_json
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -177,7 +163,7 @@ class _EmptyMessageFailingCompactor(FakeContextCompactor):
 class _CancelAfterFailureCompactor(FakeContextCompactor):
     """首次失败后请求取消的 compactor。"""
 
-    def __init__(self, token: StubCancellationToken) -> None:
+    def __init__(self, token: ControllableCancellationToken) -> None:
         """初始化可控 token 与调用计数。
 
         :param token: 测试用可控 cancellation token。
@@ -275,6 +261,39 @@ class _HardThresholdOnceCompactor(FakeContextCompactor):
                 ),
             )
         return candidate
+
+
+class _DiagnosticsOnlyLargeCompactor(FakeContextCompactor):
+    """返回业务文本很小但 diagnostic 很大的 candidate。"""
+
+    def __init__(self) -> None:
+        """初始化 fake compactor。
+
+        :returns: ``None``。
+        """
+
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
+        """返回只在 diagnostics 中携带大文本的 candidate。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: compaction candidate。
+        """
+
+        candidate = await self._fake.compact(request, cancellation_token)
+        return replace(
+            candidate,
+            diagnostics=(
+                CompactCandidateDiagnosticVNext(
+                    code="large_diagnostic",
+                    text="diagnostic text " * 200,
+                ),
+            ),
+        )
 
 
 class _RecordingCompactor(FakeContextCompactor):
@@ -554,7 +573,7 @@ class _PreparedManifestCompactor(FakeContextCompactor):
 class _PreparedCancelledCompactor(_PreparedManifestCompactor):
     """prepared proposal run 阶段请求取消并抛出 CancelledError。"""
 
-    def __init__(self, events: list[str], token: StubCancellationToken) -> None:
+    def __init__(self, events: list[str], token: ControllableCancellationToken) -> None:
         """初始化 compactor。
 
         :param events: 共享顺序记录列表。
@@ -621,10 +640,12 @@ def _proposal_agent_request(
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 
@@ -659,7 +680,7 @@ async def test_run_compaction_operation_retries_async_proposal_failure() -> None
         request=_request(),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -682,7 +703,7 @@ async def test_run_compaction_operation_records_prepared_proposal_manifest_befor
         request=_request(),
         compactor=_PreparedManifestCompactor(events),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-prepared-accepted",
         proposal_manifest_recorder=recorder,
     )
@@ -705,7 +726,7 @@ def test_compactor_proposal_manifest_uses_initial_trigger_for_first_attempt() ->
     compactor = _PreparedManifestCompactor([])
     prepared_input = compactor.prepare_compactor_proposal_run_input(
         request,
-        StubCancellationToken(),
+        ControllableCancellationToken(),
         compaction_operation_id="operation-trigger",
         compaction_attempt_number=1,
     )
@@ -734,6 +755,27 @@ def test_compactor_proposal_manifest_uses_initial_trigger_for_first_attempt() ->
     assert retry_manifest["runner_call_trigger_reason"] == (
         "context_compaction_retry_attempt"
     )
+    for manifest in (first_manifest, retry_manifest):
+        metadata = manifest["projector_metadata"]
+        assert isinstance(metadata, list)
+        assert len(metadata) == 2
+        for item in metadata:
+            assert isinstance(item, Mapping)
+            assert frozenset(item) == frozenset(
+                {
+                    "projector_metadata_id",
+                    "projector_id",
+                    "projector_schema_version",
+                    "projector_digest",
+                    "purpose",
+                    "source_contract_refs",
+                }
+            )
+            assert "metadata_id" not in item
+            assert item["projector_schema_version"] == "compactor_projector.v1"
+            source_contract_refs = item["source_contract_refs"]
+            assert isinstance(source_contract_refs, list)
+            assert len(source_contract_refs) > 0
 
 
 @pytest.mark.asyncio
@@ -747,7 +789,7 @@ async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest
         request=_request(),
         compactor=_PreparedManifestCompactor(events, fail_run=True),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-prepared-failed",
         proposal_manifest_recorder=recorder,
     )
@@ -767,7 +809,7 @@ async def test_run_compaction_operation_cancelled_proposal_keeps_manifest_ref() 
     """proposal 已写 manifest 后被 Host 取消时仍返回 rejected attempt。"""
 
     events: list[str] = []
-    token = StubCancellationToken()
+    token = ControllableCancellationToken()
     recorder = _RecordingProposalManifestRecorder(events)
 
     result = await run_compaction_operation(
@@ -838,7 +880,7 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
         request=_request(),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -886,7 +928,7 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
         request=_request(),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -905,11 +947,11 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
 
 
 @pytest.mark.asyncio
-async def test_run_compaction_operation_accepts_reactive_budget_estimate_overflow() -> None:
-    """reactive compact 不用 compact 后估算值阻断 recovery dispatch。
+async def test_run_compaction_operation_retries_reactive_hard_threshold_after_compact() -> None:
+    """reactive compact 后仍越过 hard threshold 时由 operation owner 重试。
 
     :returns: ``None``。
-    :raises AssertionError: reactive path 仍按估算 hard threshold reject 时抛出。
+    :raises AssertionError: reactive path 未在 operation 内执行预算验收时抛出。
     """
 
     compactor = _HardThresholdOnceCompactor()
@@ -917,14 +959,45 @@ async def test_run_compaction_operation_accepts_reactive_budget_estimate_overflo
         request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
+    )
+
+    assert compactor.calls == 2
+    assert result.accepted_candidate is not None
+    assert result.quality_result is not None
+    assert len(result.rejected_attempts) == 1
+    assert (
+        result.rejected_attempts[0].failure_category
+        is compaction_operation.CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
+    )
+    assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_fails_closed_for_reactive_over_budget_output() -> None:
+    """reactive compact 超 hard threshold 且无 repair budget 时 fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: reactive over-budget output 被接受或未 fail closed 时抛出。
+    """
+
+    compactor = _HardThresholdOnceCompactor()
+    result = await run_compaction_operation(
+        request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
+        compactor=compactor,
+        max_attempts=1,
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 1
-    assert result.accepted_candidate is not None
-    assert result.quality_result is not None
-    assert len(result.rejected_attempts) == 0
-    assert result.failure_reason is None
+    assert result.accepted_candidate is None
+    assert len(result.rejected_attempts) == 1
+    assert (
+        result.rejected_attempts[0].failure_category
+        is compaction_operation.CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
+    )
+    assert result.rejected_attempts[0].repairable is False
+    assert result.failure_reason == "hard_threshold_after_compact"
 
 
 @pytest.mark.asyncio
@@ -935,7 +1008,7 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
         request=_request(),
         compactor=_AlwaysFailingCompactor(),
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert result.accepted_candidate is None
@@ -964,7 +1037,7 @@ async def test_run_compaction_operation_logs_terminal_reject_as_warning(
             request=_request(),
             compactor=_AlwaysFailingCompactor(),
             max_attempts=1,
-            cancellation_token=StubCancellationToken(),
+            cancellation_token=ControllableCancellationToken(),
         )
 
     assert result.failure_reason is not None
@@ -979,111 +1052,35 @@ async def test_run_compaction_operation_logs_terminal_reject_as_warning(
 
 
 @pytest.mark.asyncio
-async def test_rejected_attempt_diagnostic_captures_invalid_previous_reference(
-    tmp_path: Path,
-) -> None:
-    """previous_compacted_view parse 失败时生成可持久化 diagnostic artifact。
+async def test_run_compaction_operation_budget_excludes_candidate_diagnostics() -> None:
+    """compact 后预算只统计 accepted business texts，不统计 diagnostics。
 
-    :param tmp_path: pytest 临时目录。
     :returns: ``None``。
-    :raises AssertionError: diagnostic 缺失或 raw material 泄漏到 EventLog payload。
+    :raises AssertionError: diagnostics 被误计入 budget 或 candidate 未被接受时抛出。
     """
 
-    raw_text = "reference_continuity=previous_fact text=offending raw continuity"
-    request = _request_with_previous_reference_continuity(raw_text)
+    request = _request()
     result = await run_compaction_operation(
         request=request,
-        compactor=FakeContextCompactor(),
+        compactor=_DiagnosticsOnlyLargeCompactor(),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
-        compaction_operation_id="operation-invalid-reference",
+        cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-diagnostics-budget",
     )
 
-    assert result.accepted_candidate is None
-    assert result.failure_reason == "proposal_failed"
-    assert len(result.rejected_attempts) == 1
-    rejected = result.rejected_attempts[0]
-    assert rejected.proposal_manifest_ref is None
-    assert rejected.proposal_manifest_digest is None
-    diagnostic = rejected.diagnostic
-    assert diagnostic is not None
-    assert diagnostic.failure_stage == "previous_compacted_view_parse"
-    assert diagnostic.parser_or_validator == "previous_reference_continuity"
-    assert diagnostic.exception_class == "ValueError"
-    assert diagnostic.exception_message == "previous reference continuity text is invalid"
-    assert diagnostic.offending_block is not None
-    assert diagnostic.offending_block.kind == "reference_continuity"
-    assert diagnostic.offending_block.block_label == "P-REF"
-    assert diagnostic.offending_block.text_length == len(raw_text)
-
-    reference, artifact_json, metadata_json = _write_and_read_rejected_diagnostic(
-        tmp_path,
-        diagnostic=diagnostic,
-        operation_id="operation-invalid-reference",
-        attempt_number=rejected.attempt_number,
-    )
-    payload = dict(
-        build_context_compaction_attempt_rejected_payload(
-            operation_id="operation-invalid-reference",
-            attempt_number=rejected.attempt_number,
-            failure_category=rejected.failure_category.value,
-            repairable=rejected.repairable,
-            runner_attempt_summary_refs=rejected.runner_attempt_summary_refs,
-            diagnostic_refs=rejected.diagnostic_refs,
-            next_policy_decision=rejected.next_policy_decision.value,
-            budget_after_attempted_compact=rejected.budget_after_attempted_compact,
-            proposal_manifest_ref=rejected.proposal_manifest_ref,
-            proposal_manifest_digest=rejected.proposal_manifest_digest,
-            diagnostic_artifact_ref=reference.payload_ref,
-            diagnostic_artifact_digest=reference.payload_digest,
-            failure_stage=diagnostic.failure_stage,
-            diagnostic_suffix=diagnostic.diagnostic_suffix,
-            parser_or_validator=diagnostic.parser_or_validator,
-            exception_class=diagnostic.exception_class,
-            exception_message=diagnostic.exception_message,
-            offending_block_section=diagnostic.offending_block.section,
-            offending_block_kind=diagnostic.offending_block.kind,
-            offending_block_label=diagnostic.offending_block.block_label,
-            offending_block_ordinal=diagnostic.offending_block.block_ordinal,
-            offending_block_text_digest=diagnostic.offending_block.text_digest,
-            offending_block_text_length=diagnostic.offending_block.text_length,
-            material_pack_digest=diagnostic.material_pack_digest,
-        )
-    )
-
-    assert payload["proposal_manifest_ref"] is None
-    assert payload["diagnostic_artifact_ref"] == reference.payload_ref
-    assert payload["diagnostic_artifact_digest"] == reference.payload_digest
-    assert payload["failure_stage"] == "previous_compacted_view_parse"
-    assert payload["offending_block_kind"] == "reference_continuity"
-    assert raw_text not in canonical_json_dumps(payload)
-    assert metadata_json["descriptor_kind"] == (
-        "compaction_rejected_attempt_diagnostic"
-    )
-    assert metadata_json["event_type"] == "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
-    assert metadata_json["compaction_operation_id"] == "operation-invalid-reference"
-    assert metadata_json["compaction_attempt_number"] == rejected.attempt_number
-    assert metadata_json["failure_stage"] == "previous_compacted_view_parse"
-    assert metadata_json["parser_or_validator"] == "previous_reference_continuity"
-    assert metadata_json["contains_raw_material"] is True
-    assert metadata_json["confidential"] is True
-    assert artifact_json["proposal_manifest_ref"] is None
-    assert artifact_json["failure_stage"] == "previous_compacted_view_parse"
-    assert artifact_json["parser_or_validator"] == "previous_reference_continuity"
-    offending = artifact_json["offending_block"]
-    assert isinstance(offending, dict)
-    assert offending["raw_text"] == raw_text
-    assert offending["kind"] == "reference_continuity"
-    previous_view = artifact_json["previous_compacted_view"]
-    assert isinstance(previous_view, list)
-    assert previous_view == [request.material_pack.previous_compacted_view[0].to_json()]
+    assert result.accepted_candidate is not None
+    assert len(result.accepted_candidate.diagnostics) == 1
+    assert result.budget_after_attempted_compact is not None
+    assert result.budget_after_attempted_compact < request.budget_before_compact.hard_threshold_tokens
+    assert result.rejected_attempts == ()
+    assert result.failure_reason is None
 
 
 @pytest.mark.asyncio
 async def test_run_compaction_operation_stops_before_retry_when_cancelled() -> None:
     """首次失败后 token 被取消时，不发起第二次 compactor 调用。"""
 
-    token = StubCancellationToken()
+    token = ControllableCancellationToken()
     compactor = _CancelAfterFailureCompactor(token)
 
     result = await run_compaction_operation(
@@ -1123,7 +1120,7 @@ async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> N
         request=_request(),
         compactor=_SensitiveFailingCompactor(),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1180,7 +1177,7 @@ async def test_run_compaction_operation_redacts_each_value_bearing_secret_patter
         request=_request(),
         compactor=_SensitiveFailingCompactor(message),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1201,7 +1198,7 @@ async def test_run_compaction_operation_keeps_plain_token_expired_context() -> N
         request=_request(),
         compactor=_SensitiveFailingCompactor("provider failed: JWT token has expired"),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1221,7 +1218,7 @@ async def test_exception_diagnostic_suffix_uses_exception_type_for_empty_message
         request=_request(),
         compactor=_EmptyMessageFailingCompactor(),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1240,7 +1237,7 @@ async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> 
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1261,7 +1258,7 @@ async def test_reactive_multi_pass_uses_last_whole_vnext_fact_tuple() -> None:
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1284,7 +1281,7 @@ async def test_reactive_multi_pass_uses_last_whole_vnext_candidate() -> None:
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1338,7 +1335,7 @@ async def test_vnext_quality_reject_records_rejected_attempt(
         request=request,
         compactor=_RecordingCompactor(),
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert result.accepted_candidate is not None
@@ -1366,7 +1363,7 @@ async def test_reactive_multi_pass_intermediate_failure_commits_single_failed_ev
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1388,7 +1385,7 @@ async def test_reactive_passes_share_operation_attempt_budget() -> None:
         request=request,
         compactor=compactor,
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1437,131 +1434,6 @@ def _request(
     )
 
 
-def _request_with_previous_reference_continuity(raw_text: str) -> CompactionRequest:
-    """构造包含坏 reference continuity previous view 的 compaction request。
-
-    :param raw_text: previous compacted view 中的 raw block text。
-    :returns: compaction request。
-    """
-
-    base = _request()
-    content_digest = sha256_digest_json({"text": raw_text})
-    previous_block = CompactMaterialBlock(
-        block_label="P-REF",
-        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-        kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
-        text=raw_text,
-        size_units=len(raw_text),
-        source_labels=(),
-        canonical_source_refs=("event-previous-reference",),
-        content_digest=content_digest,
-    )
-    provenance_map = {
-        **base.material_pack.provenance_map,
-        "P-REF": PromptLocalProvenanceEntry(
-            label="P-REF",
-            section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
-            canonical_source_refs=("event-previous-reference",),
-            source_event_refs=("event-previous-reference",),
-            content_digest=content_digest,
-            accepted_evidence_id=None,
-            tool_result_event_ref=None,
-            tool_call_event_ref=None,
-            payload_refs=(),
-            artifact_refs=(),
-            source_locator_refs=(),
-        ),
-    }
-    material_pack = replace(
-        base.material_pack,
-        previous_compacted_view=(previous_block,),
-        provenance_map=provenance_map,
-    )
-    return replace(
-        base,
-        material_pack=material_pack,
-        segment_selection=initial_segment_selection(
-            trigger_source=CompactSegmentTrigger.PROACTIVE,
-            input_cursor=base.segment_selection.input_cursor,
-            material_pack=material_pack,
-        ),
-    )
-
-
-def _write_and_read_rejected_diagnostic(
-    tmp_path: Path,
-    *,
-    diagnostic: compaction_operation.CompactionRejectedAttemptDiagnostic,
-    operation_id: str,
-    attempt_number: int,
-) -> tuple[
-    compaction_operation.CompactionRejectedAttemptDiagnosticReference,
-    dict[str, JsonValue],
-    dict[str, JsonValue],
-]:
-    """写入并读回 rejected attempt diagnostic artifact 与 descriptor metadata。
-
-    :param tmp_path: pytest 临时目录。
-    :param diagnostic: 内存态 diagnostic。
-    :param operation_id: compaction operation id。
-    :param attempt_number: compaction attempt number。
-    :returns: diagnostic reference、artifact JSON、metadata JSON。
-    """
-
-    options = _options(tmp_path)
-    with open_host_durable_store(options) as store:
-
-        def operation(
-            transaction: HostTransaction,
-        ) -> tuple[
-            compaction_operation.CompactionRejectedAttemptDiagnosticReference,
-            str,
-            str,
-        ]:
-            """写入 artifact descriptor 并读回 descriptor JSON 文本。
-
-            :param transaction: Host transaction。
-            :returns: diagnostic reference、artifact relative path、metadata JSON 文本。
-            """
-
-            reference = (
-                compaction_operation.write_compaction_rejected_attempt_diagnostic_artifact(
-                    transaction=transaction,
-                    artifact_store=LocalArtifactStore(
-                        options.payload_policy.artifact_root
-                    ),
-                    payload_store=PayloadStore(),
-                    diagnostic=diagnostic,
-                    compaction_operation_id=operation_id,
-                    compaction_attempt_number=attempt_number,
-                )
-            )
-            descriptor = PayloadStore().read_payload_descriptor(
-                transaction,
-                reference.payload_ref,
-            )
-            assert descriptor is not None
-            assert descriptor.payload_digest == reference.payload_digest
-            assert descriptor.artifact_relative_path == reference.artifact_relative_path
-            return reference, reference.artifact_relative_path, descriptor.metadata_json
-
-        reference, relative_path, metadata_text = store.transaction_runner.run_write(
-            operation
-        )
-
-        artifact_path = options.payload_policy.artifact_root / relative_path
-        artifact_json = cast(
-            dict[str, JsonValue],
-            json.loads(artifact_path.read_text(encoding="utf-8")),
-        )
-        metadata_json = cast(dict[str, JsonValue], json.loads(metadata_text))
-        assert reference.payload_digest == sha256_digest_json(artifact_json)
-        return reference, artifact_json, metadata_json
-
-    raise AssertionError("durable store context did not return diagnostic artifact")
-
-
 def _material_pack():
     """构造 compaction operation 测试 material pack。
 
@@ -1590,25 +1462,5 @@ def _material_pack():
                 readable_source_text="accepted tool evidence",
                 payload_refs=("payload:operation",),
             ),
-        ),
-    )
-
-
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
-    """构造测试用 Host durable store options。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: Host durable store options。
-    """
-
-    return HostDurableStoreOptions(
-        db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
-        sqlite_policy=HostSQLiteStoragePolicy(
-            busy_timeout_seconds=0.25,
-            write_busy_retry_count=3,
-            write_retry_initial_delay_seconds=0.001,
-            write_retry_backoff_multiplier=1.2,
-            write_retry_max_delay_seconds=0.01,
         ),
     )

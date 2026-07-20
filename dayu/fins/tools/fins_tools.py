@@ -32,6 +32,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.fins._log import Log
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.runtime.tool_call_projection import (
@@ -47,6 +48,10 @@ from .read_runtime_helpers import (
     FinsReadArgumentError,
     FinsReadBusinessError,
     FinsReadCancelledError,
+)
+from .result_types import (
+    financial_statement_result_description,
+    xbrl_query_result_description,
 )
 
 MODULE: Final[str] = "FINS.FINS_TOOLS"
@@ -77,9 +82,38 @@ FINS_READ_TOOL_NAMES: Final[tuple[str, ...]] = (
 _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and retry."
 _FILE_NOT_FOUND_HINT: Final[str] = "Verify the ticker, document_id, ref, or table_ref and retry."
 _UNEXPECTED_FAILURE_HINT: Final[str] = "Inspect provider diagnostics or retry with narrower arguments."
-_FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；等待新的用户指令或后续调度。"
+_FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
+_PROCESS_RUNTIME_CLOSE_FOLLOW_UP_ACTION: Final[str] = "runtime.close.follow_up"
 
 _BusinessCall = Callable[[CancellationToken], JsonValue]
+
+
+def _follow_up_process_runtime_close(runtime: DefaultFinsRuntime) -> None:
+    """在首次关闭失败后再消费一次公共幂等 cleanup authority。
+
+    Args:
+        runtime: process target 本次创建的默认 Fins runtime。
+
+    Returns:
+        无。
+
+    Raises:
+        无；二次失败只记录 path-free 结构化诊断。
+    """
+
+    try:
+        runtime.close()
+    except Exception as close_error:
+        errno_value = (
+            str(close_error.errno)
+            if isinstance(close_error, OSError) and close_error.errno is not None
+            else "none"
+        )
+        Log.warning(
+            f"action={_PROCESS_RUNTIME_CLOSE_FOLLOW_UP_ACTION} "
+            f"type={type(close_error).__name__} errno={errno_value}",
+            module=MODULE,
+        )
 
 
 def build_fins_read_tool_definitions(
@@ -264,6 +298,9 @@ class _FinsReadProcessTarget:
             index_in_iteration=0,
             provider_state=None,
         )
+        runtime: DefaultFinsRuntime | None = None
+        outcome: JsonValue
+        primary_failed = False
         try:
             runtime = DefaultFinsRuntime.create(workspace_root=Path(self.workspace_root_locator))
             read_runtime = runtime.get_read_runtime(processor_cache_max_entries=self.limits.processor_cache_max_entries)
@@ -275,15 +312,30 @@ class _FinsReadProcessTarget:
                 limits=self.limits,
                 cancellation_token=_FinsProcessCancellationToken(),
             )
+            outcome = process_tool_completed_envelope(value)
         except _FinsReadBusinessFailure as failure:
-            return _process_failed_envelope(failure)
+            primary_failed = True
+            outcome = _process_failed_envelope(failure)
         except Exception:
-            return process_tool_failed_envelope(
+            primary_failed = True
+            outcome = process_tool_failed_envelope(
                 error_type="execution_error",
                 message=f"Tool {self.tool_name!r} execution failed.",
                 hint=_UNEXPECTED_FAILURE_HINT,
             )
-        return process_tool_completed_envelope(value)
+        finally:
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception:
+                    if not primary_failed:
+                        outcome = process_tool_failed_envelope(
+                            error_type="execution_error",
+                            message=f"Tool {self.tool_name!r} execution failed.",
+                            hint=_UNEXPECTED_FAILURE_HINT,
+                        )
+                    _follow_up_process_runtime_close(runtime)
+        return outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,7 +902,7 @@ def _build_get_financial_statement_definition(
 
     @tool(
         name=GET_FINANCIAL_STATEMENT_TOOL_NAME,
-        description="读取标准财务报表。",
+        description=financial_statement_result_description(),
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,
@@ -920,7 +972,7 @@ def _build_query_xbrl_facts_definition(
 
     @tool(
         name=QUERY_XBRL_FACTS_TOOL_NAME,
-        description="查询结构化 XBRL 数值 facts。",
+        description=xbrl_query_result_description(),
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,
@@ -1032,7 +1084,7 @@ async def _invoke_fins_read_business(
         except FinsReadBusinessError as exc:
             return failed_outcome(
                 tool_name=tool_name,
-                error=exc.code,
+                error=exc.code.value,
                 message=exc.message,
                 hint=exc.hint,
                 started_at=started_at,
@@ -1127,7 +1179,7 @@ def _execute_fins_read_business_value(
             _INVALID_ARGUMENT_HINT,
         ) from exc
     except FinsReadBusinessError as exc:
-        raise _FinsReadBusinessFailure(exc.code, exc.message, exc.hint) from exc
+        raise _FinsReadBusinessFailure(exc.code.value, exc.message, exc.hint) from exc
     except FileNotFoundError as exc:
         raise _FinsReadBusinessFailure(
             "file_not_found",
@@ -1409,10 +1461,7 @@ def _list_documents_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {
-                "type": "string",
-                "description": "直接传最自然的写法即可，不要手工穷举变体。",
-            },
+            "ticker": _ticker_parameter_schema(),
             "document_types": {
                 "type": "array",
                 "items": {
@@ -1464,8 +1513,8 @@ def _ticker_document_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
         },
         required=("ticker", "document_id"),
         additional_properties=False,
@@ -1488,8 +1537,8 @@ def _read_section_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "ref": {
                 "type": "string",
                 "description": "章节ref。只能来自于 `get_document_sections` 的 `sections[].ref`，`search_document` 的 `next_section_to_read.section.ref`，或 `search_document` 的 `next_section_by_query[*].section.ref`。仅在当前 `document_id` 内有效；切换 `document_id` 后必须重新对新文档 grounding，禁止复用其他 `document_id` 的 `ref`。",
@@ -1516,8 +1565,8 @@ def _search_document_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "query": {
                 "type": "string",
                 "description": "单个搜索词。只搜一个概念时使用；避免裸数字、裸百分比或过于宽泛的词。",
@@ -1559,8 +1608,8 @@ def _list_tables_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "financial_only": {
                 "type": "boolean",
                 "description": "只在你明确只看财务报表类表格时设为 true；否则保持默认 false。",
@@ -1592,8 +1641,8 @@ def _get_table_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "table_ref": {
                 "type": "string",
                 "description": "表格ref。只能来自于`list_tables` 的 `tables[].table_ref` 或 `read_section` 正文里的 `[[t_XXXX]]`。仅在当前 `document_id` 内有效；切换 `document_id` 后必须重新对新文档 grounding，禁止复用其他 `document_id` 的 `table_ref`。",
@@ -1620,8 +1669,8 @@ def _get_page_content_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "page_no": {"type": "integer", "description": "页码，从 1 开始。", "minimum": 1},
         },
         required=("ticker", "document_id", "page_no"),
@@ -1645,8 +1694,8 @@ def _get_financial_statement_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "statement_type": {
                 "type": "string",
                 "description": "报表类型。通常先看 income、balance_sheet、cash_flow；只有明确需要时再看 equity 或 comprehensive_income。",
@@ -1671,11 +1720,14 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
         Exception: schema 构造失败时透出。
     """
 
+    fiscal_period_values: list[JsonValue] = [
+        fiscal_period for fiscal_period in sorted(FISCAL_PERIODS)
+    ]
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "concepts": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1688,13 +1740,62 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
             },
             "period_end": {"type": "string", "description": "可选期末日期过滤，格式 YYYY-MM-DD。"},
             "fiscal_year": {"type": "integer", "description": "可选财年过滤。只在你已明确年份时填写。"},
-            "fiscal_period": {"type": "string", "description": "可选财期过滤，例如 FY、Q1、Q2。"},
+            "fiscal_period": {
+                "type": "string",
+                "description": "可选财期过滤。只在已明确 FY、H1 或季度归属时填写。",
+                "enum": fiscal_period_values,
+            },
             "min_value": {"type": "number", "description": "可选最小值过滤。只在你明确要排除过小数值时填写。"},
             "max_value": {"type": "number", "description": "可选最大值过滤。只在你明确要排除过大数值时填写。"},
         },
         required=("ticker", "document_id"),
         additional_properties=False,
     )
+
+
+def _ticker_parameter_schema() -> dict[str, JsonValue]:
+    """构造 Fins read 工具共用的 ticker 参数 schema。
+
+    Args:
+        无。
+
+    Returns:
+        包含自足业务语义的 ticker 参数 schema。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "type": "string",
+        "description": (
+            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；"
+            "不要传公司名称，也不要手工穷举代码变体。"
+        ),
+    }
+
+
+def _document_id_parameter_schema() -> dict[str, JsonValue]:
+    """构造 Fins read 工具共用的 document_id 参数 schema。
+
+    Args:
+        无。
+
+    Returns:
+        包含来源约束的 document_id 参数 schema。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "type": "string",
+        "description": (
+            "文档 ID。只能使用同一 ticker 的 "
+            "list_documents.documents[].document_id；切换 ticker 后必须重新调用 "
+            "list_documents 选择，禁止猜测或复用其他 ticker 的 document_id。"
+        ),
+    }
 
 
 def _text_truncate(max_chars: int, target_field: str) -> ToolTruncateSpec:

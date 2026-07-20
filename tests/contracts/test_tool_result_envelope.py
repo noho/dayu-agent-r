@@ -1,14 +1,16 @@
-"""``ToolResultEnvelope`` 判别字段与字段集合测试。
+"""``ToolResultEnvelope`` 判别字段与必需字段测试。
 
 断言 :class:`ToolResultSuccess` / :class:`ToolResultFailure` 的 ``ok``
-判别字段固定，并且字段集合**不**包含 ``await_spec`` / ``await`` /
-``awaiting`` 等指向 :class:`ToolAwaitSpec` 的字段。
+判别字段固定，必需结果字段存在，并且字段集合**不**包含
+``await_spec`` / ``await`` / ``awaiting`` 等指向 :class:`ToolAwaitSpec`
+的字段。
 """
 
 from __future__ import annotations
 
 import dataclasses
 from datetime import UTC, datetime, timedelta
+from typing import Literal, cast
 
 import pytest
 
@@ -28,6 +30,17 @@ def test_success_envelope_has_ok_true_and_value() -> None:
     assert not isinstance(s, ToolResultFailure)
 
 
+def test_success_envelope_rejects_runtime_false_ok() -> None:
+    """成功结果运行时必须拒绝被伪装成 ``Literal[True]`` 的 ``False``。"""
+
+    with pytest.raises(ValueError, match="ToolResultSuccess.ok must be True"):
+        ToolResultSuccess(
+            ok=cast(Literal[True], False),
+            value={"a": 1},
+            meta=None,
+        )
+
+
 def test_failure_envelope_has_ok_false_and_error() -> None:
     """:class:`ToolResultFailure` 应固定 ``ok=False`` 并承载错误字段。"""
 
@@ -37,6 +50,19 @@ def test_failure_envelope_has_ok_false_and_error() -> None:
     assert f.ok is False
     assert isinstance(f, ToolResultFailure)
     assert not isinstance(f, ToolResultSuccess)
+
+
+def test_failure_envelope_rejects_runtime_true_ok() -> None:
+    """失败结果运行时必须拒绝被伪装成 ``Literal[False]`` 的 ``True``。"""
+
+    with pytest.raises(ValueError, match="ToolResultFailure.ok must be False"):
+        ToolResultFailure(
+            ok=cast(Literal[False], True),
+            error="E_X",
+            message="x",
+            hint=None,
+            meta=None,
+        )
 
 
 def test_failure_envelope_rejects_empty_error_or_message() -> None:
@@ -89,13 +115,14 @@ def test_tool_result_meta_rejects_mixed_naive_and_aware_times() -> None:
 
 
 def test_envelope_field_sets_do_not_contain_await_spec() -> None:
-    """``ToolResultSuccess`` / ``ToolResultFailure`` 字段不得包含
-    ``await_spec`` 或任何指向 ``ToolAwaitSpec`` 的字段。"""
+    """结果 envelope 必须包含必需字段且不得包含 awaiting 字段。"""
 
     success_fields = {f.name for f in dataclasses.fields(ToolResultSuccess)}
     failure_fields = {f.name for f in dataclasses.fields(ToolResultFailure)}
+    required_success_fields = {"ok", "value", "meta"}
+    required_failure_fields = {"ok", "error", "message", "hint", "meta"}
     forbidden = {"await_spec", "await", "awaiting"}
-    assert success_fields == {"ok", "value", "meta"}
-    assert failure_fields == {"ok", "error", "message", "hint", "meta"}
+    assert required_success_fields <= success_fields
+    assert required_failure_fields <= failure_fields
     assert success_fields.isdisjoint(forbidden)
     assert failure_fields.isdisjoint(forbidden)

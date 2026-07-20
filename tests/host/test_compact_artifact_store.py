@@ -42,7 +42,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 _POLICY_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -276,7 +276,7 @@ async def _candidate_bundle() -> tuple[
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    candidate = await FakeContextCompactor().compact(request, ControllableCancellationToken())
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )

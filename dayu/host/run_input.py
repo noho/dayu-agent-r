@@ -41,6 +41,13 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host._event_payload import (
     payload_object as _payload_object,
 )
@@ -50,6 +57,7 @@ from dayu.host._event_payload import (
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_REQUESTED
 from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
@@ -100,38 +108,39 @@ from dayu.host.durable.payload import (
     SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.schema import (
+    PayloadDescriptorKind,
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
-    RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-    RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
     RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
     RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
-    SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND,
     SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE,
     SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
+    payload_descriptor_metadata,
 )
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordStatus,
     RunRow,
+    RunStartReason,
+    decode_run_started_payload,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
-from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
-from dayu.host.evidence import accepted_evidence_envelope_from_payload
+from dayu.host.accepted_result_projection import (
+    AcceptedToolResultProjection,
+    project_accepted_tool_result,
+)
+from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.payload_resolution import (
     event_payload_object,
-    event_payload_object_for_result_ref,
-    tool_call_request_atoms,
 )
 from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
-    assistant_final_answer_text_from_run_payload,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -147,9 +156,7 @@ from dayu.host.memory import (
     SelectedRecentWindowItem,
     SelectedRecentWindowRole,
     build_inline_delta_repair_diagnostic,
-    build_memory_budget_diagnostic,
     digest_memory_projection_policy,
-    estimate_memory_size_units,
     memory_snapshot_with_cursor_and_diagnostics,
     project_conversation_memory_event,
 )
@@ -159,48 +166,21 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
-_EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
-_PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_TOOL_CALL_ID = "tool_call_id"
 _PAYLOAD_FIELD_TOOL_NAME = "tool_name"
-_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
-_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
-_PAYLOAD_FIELD_WAIT_CREATED_EVENT_REF = "wait_created_event_ref"
 _PAYLOAD_FIELD_ARGUMENTS = "arguments"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
 _PAYLOAD_FIELD_TRIGGER_SOURCE = "trigger_source"
-_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
-_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
-_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
-_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
-_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
-_PAYLOAD_FIELD_TEXT = "text"
-_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
-_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
-_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
-_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
-_PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
-_PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
-_PAYLOAD_FIELD_ORDINAL = "ordinal"
-_PAYLOAD_FIELD_INTENT_TYPE = "intent_type"
-_PAYLOAD_FIELD_STATUS = "status"
-_PAYLOAD_FIELD_REASON = "reason"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
-_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
-_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _SYSTEM_ENVELOPE_SEPARATOR = "\n\n"
 _SYSTEM_ENVELOPE_HEADER_PREFIX = "## "
@@ -212,7 +192,6 @@ _SYSTEM_SECTION_PRIOR_ANSWER_ANCHORS = "Prior Answer Anchors"
 _SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT = "Open Follow-up Context"
 _SYSTEM_SECTION_REFERENCE_CONTINUITY = "Reference Continuity"
 _SYSTEM_SECTION_RECENT_EVIDENCE = "Recent Evidence"
-_SYSTEM_SECTION_RESUME_GUIDANCE = "Resume Guidance"
 _SYSTEM_ENVELOPE_SECTION_ORDER = (
     _SYSTEM_SECTION_TASK_INSTRUCTIONS,
     _SYSTEM_SECTION_EXECUTION_GUIDANCE,
@@ -222,23 +201,10 @@ _SYSTEM_ENVELOPE_SECTION_ORDER = (
     _SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT,
     _SYSTEM_SECTION_REFERENCE_CONTINUITY,
     _SYSTEM_SECTION_RECENT_EVIDENCE,
-    _SYSTEM_SECTION_RESUME_GUIDANCE,
 )
 _EXECUTION_GUIDANCE_PREFIX = "Execution guidance:"
-_ACCEPTED_COMPACTED_VIEW_PREFIX = "Accepted compacted conversation view:"
 _RECENT_EVIDENCE_PREFIX = "Recent evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
-_RESUME_GUIDANCE_PREFIX = "恢复上下文："
-_EVIDENCE_SOURCE_PART_SEPARATOR = ", "
-_INTERNAL_EVIDENCE_SOURCE_PREFIXES = (
-    "tool_call_event:",
-    "tool_result_event:",
-    "event:",
-    "eventlog:",
-    "payload:",
-    "artifact:",
-    "digest:",
-)
 _MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
 _MEMORY_EVIDENCE_FACT_HEADER = "Evidence / Fact Memory:"
 _MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
@@ -353,6 +319,7 @@ class MemorySnapshotView:
     :param diagnostics: memory provider 产生或透传的 diagnostics。
     :param represented_evidence_refs: 已被 stable evidence-backed fact 表示的
         accepted evidence refs。
+    :param latest_compaction_event_ref: memory snapshot 已覆盖的最新 compact event id。
     :param selected_recent_source_refs: 已渲染 selected recent window 的内部来源
         refs，仅用于 provider 内部去重，不进入 LLM-facing messages。
     :param selected_recent_content_digests: 已渲染 selected recent window 的文本
@@ -364,6 +331,7 @@ class MemorySnapshotView:
     policy_digest: str | None
     diagnostics: tuple[MemoryDiagnostic, ...]
     represented_evidence_refs: tuple[str, ...] = ()
+    latest_compaction_event_ref: str | None = None
     selected_recent_source_refs: tuple[str, ...] = ()
     selected_recent_content_digests: tuple[str, ...] = ()
 
@@ -434,14 +402,14 @@ class _RenderedMemoryMessages:
 class CompactArtifactView:
     """Compact artifact provider 输出。
 
-    :param messages: compact artifact messages；Phase 5 noop 为空。
+    :param compaction_event_ref: latest accepted compact event id。
     :param compact_artifact_ref: compact artifact ref；Phase 5 noop 为 ``None``。
     :param compact_artifact_digest: compact artifact digest；Phase 5 noop 为 ``None``。
     :param represented_evidence_refs: 已被 accepted compact artifact 表示的
         canonical evidence refs。
     """
 
-    messages: tuple[AgentMessage, ...]
+    compaction_event_ref: str | None
     compact_artifact_ref: str | None
     compact_artifact_digest: str | None
     represented_evidence_refs: tuple[str, ...] = ()
@@ -1314,7 +1282,7 @@ class NoopCompactArtifactProvider:
 
         del snapshot, current_facts
         return CompactArtifactView(
-            messages=(),
+            compaction_event_ref=None,
             compact_artifact_ref=None,
             compact_artifact_digest=None,
         )
@@ -1614,32 +1582,23 @@ class DurableCompactArtifactProvider:
         row = _latest_compacted_event_before_attempt(transaction, current_facts)
         if row is None:
             return CompactArtifactView(
-                messages=(),
+                compaction_event_ref=None,
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             )
         payload = _payload_object(row)
-        artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
-        artifact_digest = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST)
-        message_content = _compact_artifact_message_content(
-            compacted_event=row,
-            payload=payload,
-        )
-        messages: tuple[SystemMessage, ...] = (
-            ()
-            if message_content is None
-            else (
-                SystemMessage(
-                    role=AgentMessageRole.SYSTEM,
-                    content=message_content,
-                ),
-            )
-        )
+        try:
+            semantic_payload = parse_context_compacted_semantic_payload(payload)
+        except (TypeError, ValueError) as exc:
+            raise HostDurableError("compact semantic payload is invalid") from exc
         return CompactArtifactView(
-            messages=messages,
-            compact_artifact_ref=artifact_ref,
-            compact_artifact_digest=artifact_digest,
-            represented_evidence_refs=_accepted_evidence_mapping_refs(payload),
+            compaction_event_ref=row.event_id,
+            compact_artifact_ref=semantic_payload.compact_artifact_ref,
+            compact_artifact_digest=_required_text_field(
+                payload,
+                _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST,
+            ),
+            represented_evidence_refs=semantic_payload.accepted_evidence_mapping_refs,
         )
 
 
@@ -1920,6 +1879,11 @@ class RunInputBuilder:
         continuity = self._session_continuity_provider.load_session_continuity(attempt_snapshot, current_facts)
         memory = self._memory_snapshot_provider.load_memory_snapshot(attempt_snapshot, current_facts)
         compact = self._compact_artifact_provider.load_compact_artifact(attempt_snapshot, current_facts)
+        _require_compact_memory_event_ref_consistency(
+            memory=memory,
+            compact=compact,
+            current_facts=current_facts,
+        )
         fallback = self._context_fallback_provider.load_context_fallback(
             run_id=current_facts.run.run_id,
             run_started_event_sequence=(current_facts.run_started_event.event_sequence),
@@ -1944,7 +1908,6 @@ class RunInputBuilder:
             )
             bounded_context_messages = (
                 *memory.messages,
-                *compact.messages,
                 *protected_recent_raw_tail.messages,
                 *continuity.messages,
             )
@@ -1961,7 +1924,6 @@ class RunInputBuilder:
                 else build_run_input_material_blocks(
                     current_facts=current_facts,
                     memory=memory,
-                    compact=compact,
                     continuity=continuity,
                     accepted_tool_evidence=evidence,
                 )
@@ -2040,7 +2002,6 @@ class RunInputBuilder:
         return build_run_input_material_blocks(
             current_facts=current_facts,
             memory=memory,
-            compact=compact,
             continuity=continuity,
             accepted_tool_evidence=evidence,
         )
@@ -2271,6 +2232,7 @@ def _memory_snapshot_view(
         policy_digest=snapshot.policy_digest,
         diagnostics=snapshot.diagnostics + rendered.diagnostics,
         represented_evidence_refs=_memory_represented_evidence_refs(snapshot),
+        latest_compaction_event_ref=snapshot.latest_compaction_event_ref,
         selected_recent_source_refs=_memory_selected_recent_source_refs(
             snapshot.trace_memory.selected_recent_window,
             render_scope,
@@ -2353,7 +2315,7 @@ def _memory_evidence_fact_message(
         return None
     lines = [_MEMORY_EVIDENCE_FACT_HEADER]
     for index, fact in enumerate(facts, start=1):
-        lines.append(f"Source F{index}: " f"claim_text={fact.claim_text}; " f"evidence_kind={fact.evidence_kind.value}")
+        lines.append(f"Source F{index}: " f"claim_text={fact.claim_text}")
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
         content="\n".join(lines),
@@ -2396,7 +2358,11 @@ def _memory_forward_intent_message(
         return None
     lines = [_MEMORY_FORWARD_INTENT_HEADER]
     for intent in intents:
-        lines.append("forward_intent=" f"type={intent.intent_type}; status={intent.status}; text={intent.text}")
+        lines.append(
+            "forward_intent="
+            f"type={intent.intent_type.value}; "
+            f"status={intent.status.value}; text={intent.text}"
+        )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -2413,7 +2379,9 @@ def _memory_reference_continuity_message(
         return None
     lines = [_MEMORY_REFERENCE_CONTINUITY_HEADER]
     for item in items:
-        lines.append(f"reference_continuity=reason={item.reason}; text={item.text}")
+        lines.append(
+            f"reference_continuity=reason={item.reason.value}; text={item.text}"
+        )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -2496,7 +2464,6 @@ def build_run_input_material_blocks(
     *,
     current_facts: CurrentRunFacts,
     memory: MemorySnapshotView,
-    compact: CompactArtifactView,
     continuity: SessionContinuityView,
     accepted_tool_evidence: tuple[RunInputMaterialBlock, ...] = (),
 ) -> tuple[RunInputMaterialBlock, ...]:
@@ -2504,7 +2471,6 @@ def build_run_input_material_blocks(
 
     :param current_facts: 当前 Run durable facts。
     :param memory: memory snapshot provider view。
-    :param compact: compact artifact provider view。
     :param continuity: session continuity provider view。
     :param accepted_tool_evidence: 当前 Attempt 前可用于 compact 的 accepted
         tool evidence material blocks。
@@ -2523,20 +2489,6 @@ def build_run_input_material_blocks(
                 canonical_source_refs=(_memory_material_source_ref(memory),),
                 event_sequence=None,
                 event_sub_index=index,
-            )
-        )
-    compact_source_ref = _compact_material_source_ref(compact)
-    for index, message in enumerate(compact.messages):
-        blocks.append(
-            run_input_material_block(
-                block_id=f"compact:{index}",
-                section=CompactMaterialSection.TRACE_MATERIAL,
-                kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=_run_input_message_content(message),
-                canonical_source_refs=(compact_source_ref,),
-                event_sequence=None,
-                event_sub_index=index,
-                already_represented=True,
             )
         )
     for index, message in enumerate(continuity.messages):
@@ -2631,12 +2583,6 @@ def _system_envelope_section_and_body(content: str) -> tuple[str, str]:
             prefix=_MEMORY_SESSION_SUMMARY_HEADER,
             section=_SYSTEM_SECTION_CONVERSATION_SUMMARY,
         )
-    if content.startswith(_ACCEPTED_COMPACTED_VIEW_PREFIX):
-        return _stripped_prefixed_system_body(
-            content,
-            prefix=_ACCEPTED_COMPACTED_VIEW_PREFIX,
-            section=_SYSTEM_SECTION_CONVERSATION_SUMMARY,
-        )
     if content.startswith(_MEMORY_EVIDENCE_FACT_HEADER):
         return _stripped_prefixed_system_body(
             content,
@@ -2672,12 +2618,6 @@ def _system_envelope_section_and_body(content: str) -> tuple[str, str]:
             content,
             prefix=_ACCEPTED_TOOL_EVIDENCE_PREFIX,
             section=_SYSTEM_SECTION_RECENT_EVIDENCE,
-        )
-    if content.startswith(_RESUME_GUIDANCE_PREFIX):
-        return _stripped_prefixed_system_body(
-            content,
-            prefix=_RESUME_GUIDANCE_PREFIX,
-            section=_SYSTEM_SECTION_RESUME_GUIDANCE,
         )
     return (_SYSTEM_SECTION_TASK_INSTRUCTIONS, content)
 
@@ -2969,6 +2909,7 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
 
     :param block: selected fallback material block。
     :returns: Agent message。
+    :raises HostDurableError: accepted evidence 缺 typed LLM material 时抛出。
     """
 
     if block.kind is CompactMaterialBlockKind.USER_INPUT:
@@ -2981,9 +2922,16 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
             tool_calls=(),
         )
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        if block.accepted_tool_evidence is None:
+            raise HostDurableError(
+                "accepted tool evidence LLM material is missing"
+            )
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
-            content=_accepted_tool_evidence_content(block),
+            content=(
+                f"{_ACCEPTED_TOOL_EVIDENCE_PREFIX}\n"
+                f"{render_accepted_tool_evidence_for_llm(block.accepted_tool_evidence)}"
+            ),
         )
     if block.kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
         return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
@@ -3003,59 +2951,6 @@ def _recent_evidence_content(text: str) -> str:
     """
 
     return f"{_RECENT_EVIDENCE_PREFIX}\n{text}"
-
-
-def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
-    """把 accepted tool evidence block 改写为业务可读 material。
-
-    :param block: accepted tool evidence material block。
-    :returns: 不含内部 ref / digest 的 evidence 文本。
-    :raises HostDurableError: 可读工具名缺失时抛出。
-    """
-
-    if block.readable_tool_name is None:
-        raise HostDurableError("accepted tool evidence requires readable tool name")
-    query_text = (
-        "The original tool query is not available in readable form."
-        if block.readable_query_text is None
-        else block.readable_query_text
-    )
-    lines = [
-        _ACCEPTED_TOOL_EVIDENCE_PREFIX,
-        f"tool_name={block.readable_tool_name}",
-        f"query={query_text}",
-    ]
-    source_text = _llm_facing_evidence_source_text(block.readable_source_text)
-    if source_text is not None:
-        lines.append(f"source={source_text}")
-    lines.append(f"result={block.text}")
-    return "\n".join(lines)
-
-
-def _llm_facing_evidence_source_text(source_text: str | None) -> str | None:
-    """过滤 accepted evidence source note 中的内部 provenance。
-
-    :param source_text: compact material provider 给出的 source note。
-    :returns: 仅含业务可读 source locator 的文本；无可读项时返回 ``None``。
-    """
-
-    if source_text is None:
-        return None
-    parts = tuple(part.strip() for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR) if part.strip() != "")
-    visible_parts = tuple(part for part in parts if not _is_internal_evidence_source_part(part))
-    if len(visible_parts) == 0:
-        return None
-    return _EVIDENCE_SOURCE_PART_SEPARATOR.join(visible_parts)
-
-
-def _is_internal_evidence_source_part(source_part: str) -> bool:
-    """判断 source note 片段是否属于内部 provenance。
-
-    :param source_part: source note 片段。
-    :returns: 内部 provenance 返回 ``True``。
-    """
-
-    return any(source_part.startswith(prefix) for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -3157,18 +3052,39 @@ def _memory_represented_evidence_refs(
     return tuple(dict.fromkeys(refs))
 
 
-def _compact_material_source_ref(compact: CompactArtifactView) -> str:
-    """返回 compact artifact material canonical source ref。
+def _require_compact_memory_event_ref_consistency(
+    *,
+    memory: MemorySnapshotView,
+    compact: CompactArtifactView,
+    current_facts: CurrentRunFacts,
+) -> None:
+    """校验 compact artifact 与 memory snapshot 的 latest compact event id 一致。
 
-    :param compact: compact artifact view。
-    :returns: source ref。
+    :param memory: memory provider view。
+    :param compact: compact artifact provider view。
+    :param current_facts: 当前 Run facts。
+    :returns: ``None``。
+    :raises MemoryProjectionRepairRequired: memory 需要 catch-up / rebuild 时抛出。
+    :raises HostDurableError: repair request 所需 metadata 缺失时抛出。
     """
 
-    if compact.compact_artifact_ref is not None:
-        return f"compact:{compact.compact_artifact_ref}"
-    if compact.compact_artifact_digest is not None:
-        return f"compact:{compact.compact_artifact_digest}"
-    return "compact:no-artifact"
+    compact_ref = compact.compaction_event_ref
+    memory_ref = memory.latest_compaction_event_ref
+    if compact_ref is None and memory_ref is None:
+        return
+    if compact_ref is not None and memory_ref == compact_ref:
+        return
+    if memory.policy_digest is None:
+        raise HostDurableError("memory policy digest is required for compaction repair")
+    raise MemoryProjectionRepairRequired(
+        MemoryRepairRequest(
+            session_id=current_facts.run.session_id,
+            reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+            required_event_sequence=_required_memory_event_sequence(current_facts),
+            observed_cursor=None,
+            policy_digest=memory.policy_digest,
+        )
+    )
 
 
 def _represented_evidence_refs(memory: MemorySnapshotView, compact: CompactArtifactView) -> tuple[str, ...]:
@@ -3212,9 +3128,26 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
     :param row: EventLog row。
     :returns: memory projection event。
     :raises HostDurableError: payload 不是 JSON object 时抛出。
+    :raises ValueError: persisted compact semantic payload 非法时抛出。
     """
 
-    payload = _payload_with_assistant_final_answer(transaction, row)
+    payload = _memory_projection_payload(transaction, row)
+    accepted_tool_projection = (
+        project_accepted_tool_result(
+            transaction,
+            row,
+            resolved_payload=payload,
+        )
+        if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED
+        else None
+    )
+    if (
+        accepted_tool_projection is not None
+        and accepted_tool_projection.llm_material is None
+    ):
+        raise HostDurableError(
+            "TOOL_RESULT_ACCEPTED typed LLM material is missing"
+        )
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
@@ -3228,11 +3161,29 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
         payload=payload,
+        compacted_semantics=(
+            parse_context_compacted_semantic_payload(payload)
+            if row.event_type == CONTEXT_COMPACTED
+            else None
+        ),
+        assistant_final_answer_text=_assistant_final_answer_text(
+            transaction,
+            row,
+            payload,
+        ),
+        accepted_tool_evidence=(
+            None
+            if accepted_tool_projection is None
+            else accepted_tool_projection.llm_material
+        ),
     )
 
 
-def _payload_with_assistant_final_answer(transaction: HostTransaction, row: EventLogRow) -> Mapping[str, JsonValue]:
-    """必要时把 memory projection 需要的 transient payload 补齐。
+def _memory_projection_payload(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> Mapping[str, JsonValue]:
+    """读取 memory inline repair 使用的 payload。
 
     :param transaction: Host transaction。
     :param row: EventLog row。
@@ -3241,68 +3192,37 @@ def _payload_with_assistant_final_answer(transaction: HostTransaction, row: Even
     """
 
     payload = _payload_object(row)
-    if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
-        return _tool_result_memory_payload(transaction, row, payload)
-    if row.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
-        return payload
-    if (
-        assistant_final_answer_text_from_run_payload(
-            payload,
-            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
-        )
-        is not None
-    ):
-        return payload
-    final_answer = assistant_final_answer_continuity_text(
-        transaction,
-        payload,
-        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
-    )
-    if final_answer is None:
-        return payload
-    merged: dict[str, JsonValue] = dict(payload)
-    merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
-    return merged
+    del transaction
+    return payload
 
 
-def _tool_result_memory_payload(
+def _assistant_final_answer_text(
     transaction: HostTransaction,
     row: EventLogRow,
     payload: Mapping[str, JsonValue],
-) -> Mapping[str, JsonValue]:
-    """读取 memory inline repair 使用的完整 accepted tool result payload。
+) -> str | None:
+    """读取 RUN_SUCCEEDED 的 typed assistant final-answer continuity 文本。
 
     :param transaction: Host transaction。
-    :param row: ``TOOL_RESULT_ACCEPTED`` EventLog row。
-    :param payload: inline hot payload。
-    :returns: digest-checked 工具结果 payload。
-    :raises HostDurableError: envelope 或 payload descriptor 损坏时抛出。
+    :param row: EventLog row。
+    :param payload: 已解析 canonical payload。
+    :returns: LLM-facing assistant answer 文本；非成功终态或缺失时返回 ``None``。
+    :raises HostDurableError: terminal artifact descriptor 损坏时抛出。
     """
 
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            payload,
-            producer_event_ref=row.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope is None:
-        return payload
-    return event_payload_object_for_result_ref(
+    if row.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
+        return None
+    return assistant_final_answer_continuity_text(
         transaction,
-        row,
-        expected_payload_ref=envelope.result_ref.payload_ref,
-        expected_payload_digest=envelope.result_ref.payload_digest,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+        payload,
+        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
 
 
 def _latest_compacted_event_before_attempt(
     transaction: HostTransaction, current_facts: CompactPipelineCurrentRunFacts
 ) -> EventLogRow | None:
-    """读取当前 Attempt start cursor 前最新 ``CONTEXT_COMPACTED``。
+    """读取当前 Session 在 Attempt start cursor 前最新 ``CONTEXT_COMPACTED``。
 
     :param transaction: Host durable transaction。
     :param current_facts: 当前 Run facts。
@@ -3314,7 +3234,6 @@ def _latest_compacted_event_before_attempt(
         SELECT event_id
         FROM {TABLE_EVENT_LOG}
         WHERE session_id = ?
-          AND run_id = ?
           AND event_type = ?
           AND event_class = ?
           AND event_sequence < ?
@@ -3323,7 +3242,6 @@ def _latest_compacted_event_before_attempt(
         """,
         (
             current_facts.run.session_id,
-            current_facts.run.run_id,
             CONTEXT_COMPACTED,
             EventClass.CANONICAL_FACT.value,
             current_facts.attempt.started_event_sequence,
@@ -3341,7 +3259,7 @@ def _latest_compacted_event_before_attempt(
 def _validate_loaded_compact_view_matches_event(
     *, compact: CompactPipelineCompactArtifactView, compacted_event: EventLogRow
 ) -> None:
-    """校验 compact provider view 来自同一个 current-run compact event。
+    """校验 compact provider view 来自同一个 session latest compact event。
 
     :param compact: compact provider view。
     :param compacted_event: current Run / current Attempt 前的 compacted event。
@@ -3400,294 +3318,6 @@ def _text_content_digest(text: str) -> str:
     return sha256_digest_json({"text": text})
 
 
-def _compact_artifact_message_content(
-    *,
-    compacted_event: EventLogRow,
-    payload: Mapping[str, JsonValue],
-) -> str | None:
-    """构造 compact artifact SystemMessage 内容。
-
-    :param compacted_event: ``CONTEXT_COMPACTED`` event row。
-    :param payload: compacted payload。
-    :returns: message 内容；没有可渲染语义项时返回 ``None``。
-    """
-
-    del compacted_event
-    semantic_lines = _vnext_compact_candidate_semantic_lines(payload)
-    if len(semantic_lines) == 0:
-        return None
-    lines = [
-        _ACCEPTED_COMPACTED_VIEW_PREFIX,
-        *semantic_lines,
-    ]
-    return "\n".join(lines)
-
-
-def _accepted_evidence_mapping_refs(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """读取 vNext compact payload 中已接受 evidence mapping refs。
-
-    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
-    :returns: accepted evidence mapping refs。
-    :raises HostDurableError: 字段缺失或包含非文本元素时抛出。
-    """
-
-    return _required_text_list_field(payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
-
-
-def _vnext_compact_candidate_semantic_lines(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """从 vNext accepted candidate 渲染完整语义条目。
-
-    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
-    :returns: LLM-facing semantic lines。
-    :raises HostDurableError: accepted candidate 结构损坏时抛出。
-    """
-
-    candidate = _required_mapping_field(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
-    _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
-    facts = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
-    anchors = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
-    intents = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    references = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS)
-    lines: list[str] = []
-    session_summary = _optional_session_summary_text(candidate)
-    if session_summary is not None:
-        lines.append(f"session_summary={session_summary}")
-    lines.extend(_accepted_compact_fact_lines(facts))
-    lines.extend(_accepted_compact_answer_anchor_lines(anchors))
-    lines.extend(_accepted_compact_forward_intent_lines(intents))
-    lines.extend(_accepted_compact_reference_lines(references))
-    return tuple(lines)
-
-
-def _accepted_compact_fact_lines(
-    facts: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact fact 语义条目。
-
-    :param facts: fact JSON objects。
-    :returns: LLM-facing fact lines。
-    :raises HostDurableError: fact 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, fact in enumerate(facts, start=1):
-        parts = [f"fact {index}: claim_text={_required_text_field(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}"]
-        evidence_kind = _optional_semantic_text_field(
-            fact,
-            _PAYLOAD_FIELD_EVIDENCE_KIND,
-        )
-        if evidence_kind is not None:
-            parts.append(f"evidence_kind={evidence_kind}")
-        evidence_labels = _optional_text_list_field(
-            fact,
-            _PAYLOAD_FIELD_EVIDENCE_LABELS,
-        )
-        if len(evidence_labels) > 0:
-            parts.append(f"evidence_labels={', '.join(evidence_labels)}")
-        source_labels = _optional_text_list_field(fact, _PAYLOAD_FIELD_SOURCE_LABELS)
-        if len(source_labels) > 0:
-            parts.append(f"source_labels={', '.join(source_labels)}")
-        lines.append("; ".join(parts))
-    return tuple(lines)
-
-
-def _accepted_compact_answer_anchor_lines(
-    anchors: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact answer anchor 语义条目。
-
-    :param anchors: answer anchor JSON objects。
-    :returns: LLM-facing answer anchor lines。
-    :raises HostDurableError: anchor 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, anchor in enumerate(anchors, start=1):
-        title = _required_text_field(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)
-        item_text = _accepted_compact_anchor_item_text(anchor)
-        line = f"answer_anchor {index}: title={title}"
-        if item_text != "":
-            line = f"{line}; items={item_text}"
-        lines.append(line)
-    return tuple(lines)
-
-
-def _accepted_compact_anchor_item_text(anchor: Mapping[str, JsonValue]) -> str:
-    """渲染 answer anchor 子项文本。
-
-    :param anchor: answer anchor JSON object。
-    :returns: 子项文本；没有子项时返回空字符串。
-    :raises HostDurableError: 子项结构损坏时抛出。
-    """
-
-    value = anchor.get(_PAYLOAD_FIELD_ANCHOR_ITEMS)
-    if value is None:
-        return ""
-    if not isinstance(value, list):
-        raise HostDurableError("answer_anchor.anchor_items must be list")
-    items: list[str] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("answer_anchor.anchor_items item must be object")
-        display_text = _required_text_field(item, _PAYLOAD_FIELD_DISPLAY_TEXT)
-        ordinal = item.get(_PAYLOAD_FIELD_ORDINAL)
-        if ordinal is None:
-            items.append(display_text)
-        elif isinstance(ordinal, int):
-            items.append(f"{ordinal}. {display_text}")
-        else:
-            raise HostDurableError("answer_anchor.anchor_items ordinal must be int")
-    return "; ".join(items)
-
-
-def _accepted_compact_forward_intent_lines(
-    intents: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact forward intent 语义条目。
-
-    :param intents: forward intent JSON objects。
-    :returns: LLM-facing forward intent lines。
-    :raises HostDurableError: intent 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, intent in enumerate(intents, start=1):
-        lines.append(
-            "forward_intent "
-            f"{index}: type={_required_text_field(intent, _PAYLOAD_FIELD_INTENT_TYPE)}; "
-            f"status={_required_text_field(intent, _PAYLOAD_FIELD_STATUS)}; "
-            f"text={_required_text_field(intent, _PAYLOAD_FIELD_TEXT)}"
-        )
-    return tuple(lines)
-
-
-def _accepted_compact_reference_lines(
-    references: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact reference continuity 语义条目。
-
-    :param references: reference continuity JSON objects。
-    :returns: LLM-facing reference continuity lines。
-    :raises HostDurableError: reference 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, reference in enumerate(references, start=1):
-        parts = [f"reference_continuity {index}: text={_required_text_field(reference, _PAYLOAD_FIELD_TEXT)}"]
-        reason = _optional_semantic_text_field(reference, _PAYLOAD_FIELD_REASON)
-        if reason is not None:
-            parts.append(f"reason={reason}")
-        source_labels = _optional_text_list_field(
-            reference,
-            _PAYLOAD_FIELD_SOURCE_LABELS,
-        )
-        if len(source_labels) > 0:
-            parts.append(f"source_labels={', '.join(source_labels)}")
-        lines.append("; ".join(parts))
-    return tuple(lines)
-
-
-def _optional_session_summary_text(
-    candidate: Mapping[str, JsonValue],
-) -> str | None:
-    """读取 vNext accepted candidate 的可选 session summary 文本。
-
-    :param candidate: ``accepted_candidate`` JSON object。
-    :returns: summary text；无 summary 时返回 ``None``。
-    :raises HostDurableError: summary 字段存在但结构损坏时抛出。
-    """
-
-    value = candidate.get(_PAYLOAD_FIELD_SESSION_SUMMARY)
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise HostDurableError("accepted_candidate.session_summary must be object")
-    return _required_text_field(value, _PAYLOAD_FIELD_SUMMARY_TEXT)
-
-
-def _required_mapping_field(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
-    """读取必填 JSON object 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: JSON object。
-    :raises HostDurableError: 字段缺失或非 object 时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, Mapping):
-        raise HostDurableError(f"payload field {field_name} must be object")
-    return value
-
-
-def _required_mapping_list_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """读取必填 JSON object list 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: JSON object tuple。
-    :raises HostDurableError: 字段缺失、非 list 或元素非 object 时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    items: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError(f"payload field {field_name} item must be object")
-        items.append(item)
-    return tuple(items)
-
-
-def _required_text_list_field(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
-    """读取必填文本 list 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: 文本 tuple。
-    :raises HostDurableError: 字段缺失、非 list 或元素非文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    result: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or item.strip() == "":
-            raise HostDurableError(f"payload field {field_name} item must be text")
-        result.append(item)
-    return tuple(result)
-
-
-def _optional_text_list_field(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
-    """读取可选文本 list 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: 文本 tuple；字段不存在时返回空 tuple。
-    :raises HostDurableError: 字段存在但非 list 或元素非文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    result: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or item.strip() == "":
-            raise HostDurableError(f"payload field {field_name} item must be text")
-        result.append(item)
-    return tuple(result)
-
-
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:
     """读取必填文本字段。
 
@@ -3701,23 +3331,6 @@ def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> s
     if not isinstance(value, str) or value.strip() == "":
         raise HostDurableError(f"payload field {field_name} must be text")
     return value
-
-
-def _optional_semantic_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
-    """读取 accepted compact semantic renderer 的可选文本字段。
-
-    字段不存在时表示该 semantic item 不提供该属性；字段一旦存在，必须是
-    非空文本，避免把损坏 compact payload 静默渲染为缺省语义。
-
-    :param payload: payload 映射。
-    :param field_name: 字段名。
-    :returns: 文本或 ``None``。
-    :raises HostDurableError: 字段存在但不是非空文本时抛出。
-    """
-
-    if field_name not in payload:
-        return None
-    return _required_text_field(payload, field_name)
 
 
 def _optional_mapping_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
@@ -3854,8 +3467,8 @@ def _resume_wait_messages_from_current_start(
     """
 
     start_payload = _payload_object(current_facts.run_started_event)
-    start_reason = _optional_payload_text(start_payload, field_name=_PAYLOAD_FIELD_START_REASON)
-    if start_reason != "resume":
+    started_payload = decode_run_started_payload(start_payload)
+    if started_payload.start_reason is not RunStartReason.RESUME:
         return ()
     tool_result_event_id = _event_id_from_payload_ref(start_payload, field_name=_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF)
     tool_result_event = read_event_by_id(transaction, tool_result_event_id)
@@ -3866,13 +3479,10 @@ def _resume_wait_messages_from_current_start(
         expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
     payload = _payload_object(tool_result_event)
+    projection = project_accepted_tool_result(transaction, tool_result_event)
     accepted_arguments = _resume_wait_accepted_arguments(
-        transaction,
-        tool_result_payload=payload,
-        tool_result_event=tool_result_event,
+        projection=projection,
     )
-    if accepted_arguments is None:
-        return (_resume_wait_fallback_message(payload),)
     tool_call_id = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_CALL_ID)
     tool_name = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)
     return (
@@ -3898,102 +3508,24 @@ def _resume_wait_messages_from_current_start(
     )
 
 
-def _resume_wait_fallback_message(payload: Mapping[str, JsonValue]) -> SystemMessage:
-    """构造缺少工具参数时的 resume system guidance。
-
-    :param payload: ``TOOL_RESULT_ACCEPTED`` payload。
-    :returns: 自解释 resume guidance system message。
-    """
-
-    result_text = _resume_wait_tool_message_content(payload)
-    content = "\n".join(
-        (
-            _RESUME_GUIDANCE_PREFIX,
-            "上一轮被等待中断的外部工具步骤已经完成。",
-            f"完成的工具：{_required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)}",
-            f"完成状态：{_required_payload_text(payload, field_name='resolution_kind')}",
-            f"工具结果：{result_text}",
-            ("这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了" "同一次请求再次启动相同下载、上传或处理。"),
-        )
-    )
-    return SystemMessage(role=AgentMessageRole.SYSTEM, content=content)
-
-
 def _resume_wait_accepted_arguments(
-    transaction: HostTransaction,
     *,
-    tool_result_payload: Mapping[str, JsonValue],
-    tool_result_event: EventLogRow,
-) -> Mapping[str, JsonValue] | None:
-    """读取 resume 等待工具调用的 LLM-safe request atom 参数。
+    projection: AcceptedToolResultProjection,
+) -> Mapping[str, JsonValue]:
+    """读取 resume 等待工具调用的 exact canonical request atom 参数。
 
-    :param transaction: Host durable transaction。
-    :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
-    :param tool_result_event: ``TOOL_RESULT_ACCEPTED`` event row。
-    :returns: LLM-safe replay 工具参数；缺少 accepted evidence envelope 或 request
-        atom 时返回 ``None``。
-    :raises HostDurableError: envelope、request atom 或 digest 结构损坏时抛出。
+    :param projection: accepted result 共享投影。
+    :returns: Host 已接受的精确工具参数。
+    :raises HostDurableError: canonical request arguments 缺失或结构非法时抛出。
     """
 
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            tool_result_payload,
-            producer_event_ref=tool_result_event.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("resume wait accepted evidence envelope is invalid") from exc
-    if envelope is None:
-        return None
-    request_event_ref = envelope.tool_query.tool_call_requested_event_ref
-    if request_event_ref is None:
-        return None
-    request_event = read_event_by_id(transaction, request_event_ref)
-    if request_event is None:
-        return None
-    if not _resume_wait_request_event_matches_result(
-        request_event=request_event,
-        result_event=tool_result_event,
-    ):
-        raise HostDurableError("resume wait request atom event type mismatch")
-    atoms = tool_call_request_atoms(transaction, request_event)
-    if (
-        atoms.tool_call_id != envelope.tool_call_id
-        or atoms.tool_name != envelope.tool_name
-        or atoms.normalized_arguments_digest
-        != envelope.tool_query.normalized_arguments_digest
-    ):
-        raise HostDurableError("resume wait request atom identity mismatch")
-    value = atoms.arguments_json.get(_PAYLOAD_FIELD_ARGUMENTS)
+    if projection.request_arguments_json is None:
+        raise HostDurableError("resume wait request arguments are missing")
+    value = projection.request_arguments_json.get(_PAYLOAD_FIELD_ARGUMENTS)
     if not isinstance(value, Mapping):
         raise HostDurableError("resume wait request arguments must be object")
     accepted_arguments = dict(value)
     return accepted_arguments
-
-
-def _resume_wait_request_event_matches_result(
-    *, request_event: EventLogRow, result_event: EventLogRow
-) -> bool:
-    """校验 resume request atom 与 wait result 属于同一工具调用上下文。
-
-    :param request_event: ``TOOL_CALL_REQUESTED`` row。
-    :param result_event: ``TOOL_RESULT_ACCEPTED`` row。
-    :returns: 身份上下文相容时返回 ``True``。
-    """
-
-    if (
-        request_event.event_class is not EventClass.CANONICAL_FACT
-        or request_event.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
-        or request_event.session_id != result_event.session_id
-        or request_event.run_id != result_event.run_id
-        or request_event.attempt_id != result_event.attempt_id
-    ):
-        return False
-    return (
-        request_event.execution_id == result_event.execution_id
-        or result_event.execution_id is None
-    )
 
 
 def _resume_wait_tool_message_content(
@@ -4006,22 +3538,37 @@ def _resume_wait_tool_message_content(
     :raises HostDurableError: result 结构缺失或非法时抛出。
     """
 
-    result = tool_result_payload.get("result")
+    result = tool_result_payload.get("raw_tool_outcome")
     if not isinstance(result, Mapping):
-        raise HostDurableError("resume wait result must be object")
+        raise HostDurableError("resume wait raw_tool_outcome must be object")
     kind = _required_payload_text(result, field_name="kind")
-    body = result.get("result")
-    if not isinstance(body, Mapping):
-        raise HostDurableError("resume wait result body must be object")
     if kind == "completed":
+        body = _required_resume_tool_result_body(result)
         projected = _resume_wait_completed_tool_content(body)
     elif kind == "failed":
+        body = _required_resume_tool_result_body(result)
         projected = _resume_wait_failed_tool_content(body)
     elif kind == "cancelled":
-        projected = _resume_wait_cancelled_tool_content(body)
+        projected = _resume_wait_cancelled_tool_content(result)
     else:
         raise HostDurableError("resume wait result kind is not resumable")
     return json.dumps(projected, ensure_ascii=False, sort_keys=True)
+
+
+def _required_resume_tool_result_body(
+    raw_tool_outcome: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """读取 canonical completed / failed outcome 的 result body。
+
+    :param raw_tool_outcome: accepted tool outcome canonical atom。
+    :returns: ``result`` 字段中的 JSON object。
+    :raises HostDurableError: ``result`` 缺失或非 object 时抛出。
+    """
+
+    body = raw_tool_outcome.get("result")
+    if not isinstance(body, Mapping):
+        raise HostDurableError("resume wait raw_tool_outcome.result must be object")
+    return body
 
 
 def _resume_wait_completed_tool_content(
@@ -4096,24 +3643,6 @@ def _event_id_from_payload_ref(payload: Mapping[str, JsonValue], *, field_name: 
     if not isinstance(event_id, str) or event_id.strip() == "":
         raise HostDurableError(f"payload field {field_name}.event_id is invalid")
     return event_id
-
-
-def _optional_event_id_from_payload_ref(payload: Mapping[str, JsonValue], *, field_name: str) -> str | None:
-    """从可选 payload event ref 中读取 event_id。
-
-    resume wait 的旧事实可能没有 wait 创建事件引用；该缺失只表示无法安全重建
-    assistant tool call，应由调用方降级到 fallback guidance。字段一旦存在则必须
-    是结构合法的 event ref，避免掩盖 schema 编码错误。
-
-    :param payload: payload 映射。
-    :param field_name: event ref 字段名。
-    :returns: event_id；字段缺失时返回 ``None``。
-    :raises HostDurableError: 字段存在但结构非法时抛出。
-    """
-
-    if field_name not in payload or payload.get(field_name) is None:
-        return None
-    return _event_id_from_payload_ref(payload, field_name=field_name)
 
 
 def _validate_tool_mode_snapshot(
@@ -4415,12 +3944,14 @@ def _write_runner_call_projection_payload(
             sqlite_payload_id=_runner_call_projection_sqlite_payload_id(event_id),
             payload_json=projection,
             media_type=RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
-                "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_INPUT_PROJECTION,
+                {
+                    "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=projection_digest,
         ),
     )
@@ -4461,12 +3992,14 @@ def _write_selected_tool_schema_snapshot_payload(
             payload_format=SQLitePayloadFormat.CANONICAL_JSON,
             payload_json=snapshot,
             media_type=SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND,
-                "schema_version": SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.SELECTED_TOOL_SCHEMA_SNAPSHOT,
+                {
+                    "schema_version": SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=snapshot_digest,
         ),
     )
@@ -4607,11 +4140,13 @@ def _write_runner_call_manifest_payload(
             payload_format=SQLitePayloadFormat.CANONICAL_JSON,
             payload_json=manifest,
             media_type=RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST,
+                {
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=manifest_digest,
         ),
     )
@@ -4632,55 +4167,48 @@ def _runner_call_manifest_hot_payload(
     :raises HostDurableError: manifest identity 字段类型非法时抛出。
     """
 
-    return {
-        "session_id": _manifest_text(manifest, "session_id"),
-        "host_run_id": _manifest_text(manifest, "host_run_id"),
-        "attempt_id": _manifest_optional_text(manifest, "attempt_id"),
-        "execution_id": _manifest_optional_text(manifest, "execution_id"),
-        "runner_call_index": _manifest_int(manifest, "runner_call_index"),
-        "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
-        "runner_call_trigger_reason": _manifest_text(manifest, "runner_call_trigger_reason"),
-        "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
-        "iteration_index": manifest.get("iteration_index"),
-        "manifest_payload_ref": manifest_payload_ref,
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": _manifest_text(manifest, "schema_version"),
-        "validation_status": _RUNNER_CALL_VALIDATION_COMPLETE,
-        "message_count": _manifest_int(manifest, "message_count"),
-        "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
-        "input_projection_digest": _manifest_text(manifest, "input_projection_digest"),
-        "runner_call_projection_artifact_ref": _manifest_text(manifest, "runner_call_projection_artifact_ref"),
-        "runner_call_projection_artifact_digest": _manifest_text(manifest, "runner_call_projection_artifact_digest"),
-        "runner_call_projection_artifact_size_bytes": _manifest_int(
-            manifest, "runner_call_projection_artifact_size_bytes"
-        ),
-        "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
-        "diagnostic": _complete_runner_call_hot_diagnostic(manifest),
-    }
-
-
-def _complete_runner_call_hot_diagnostic(manifest: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-    """构造 complete runner-call hot payload diagnostic。
-
-    :param manifest: manifest body。
-    :returns: 自描述的 complete diagnostic object。
-    :raises HostDurableError: manifest 字段类型非法时抛出。
-    """
-
     message_count = _manifest_int(manifest, "message_count")
     role_sequence_digest = _manifest_text(manifest, "role_sequence_digest")
-    return {
-        "status": _RUNNER_CALL_VALIDATION_COMPLETE,
-        "reason": None,
-        "missing_atom_kind": None,
-        "missing_ref_kind": None,
-        "missing_ref": None,
-        "observed_count": message_count,
-        "expected_count": message_count,
-        "observed_digest": role_sequence_digest,
-        "expected_digest": role_sequence_digest,
-        "consumer_boundary": _RUNNER_CALL_EVENT_SOURCE,
-    }
+    return runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=_manifest_text(manifest, "session_id"),
+            host_run_id=_manifest_text(manifest, "host_run_id"),
+            attempt_id=_manifest_optional_text(manifest, "attempt_id"),
+            execution_id=_manifest_optional_text(manifest, "execution_id"),
+            runner_call_index=_manifest_int(manifest, "runner_call_index"),
+            runner_call_kind=_manifest_text(manifest, "runner_call_kind"),
+            runner_call_trigger_reason=_manifest_text(
+                manifest, "runner_call_trigger_reason"
+            ),
+            iteration_id=_manifest_optional_text(manifest, "iteration_id"),
+            iteration_index=None,
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=_manifest_text(manifest, "schema_version"),
+            validation_status=_RUNNER_CALL_VALIDATION_COMPLETE,
+            message_count=message_count,
+            role_sequence_digest=role_sequence_digest,
+            input_projection_digest=_manifest_text(
+                manifest, "input_projection_digest"
+            ),
+            runner_call_projection_artifact_ref=_manifest_text(
+                manifest, "runner_call_projection_artifact_ref"
+            ),
+            runner_call_projection_artifact_digest=_manifest_text(
+                manifest, "runner_call_projection_artifact_digest"
+            ),
+            runner_call_projection_artifact_size_bytes=_manifest_int(
+                manifest, "runner_call_projection_artifact_size_bytes"
+            ),
+            diagnostic=complete_runner_call_hot_diagnostic(
+                status=_RUNNER_CALL_VALIDATION_COMPLETE,
+                message_count=message_count,
+                role_sequence_digest=role_sequence_digest,
+                consumer_boundary=_RUNNER_CALL_EVENT_SOURCE,
+            ),
+        ),
+        manifest=manifest,
+    )
 
 
 def _runner_call_manifest_payload_ref(event_id: str) -> str:
@@ -4833,48 +4361,24 @@ def _projector_metadata(
     :returns: projector metadata JSON object。
     """
 
-    return {
-        "projector_metadata_id": metadata_id,
-        "projector_id": projector_id,
-        "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
-        "projector_digest": sha256_digest_json(
-            {
-                "projector_id": projector_id,
-                "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
-                "purpose": purpose,
-                "source_contract_refs": list(source_contract_refs),
-            }
-        ),
-        "purpose": purpose,
-        "source_contract_refs": list(source_contract_refs),
-    }
-
-
-def _projector_metadata_summary(manifest: Mapping[str, JsonValue]) -> tuple[Mapping[str, JsonValue], ...]:
-    """从 manifest body 复制 Tool Trace 可缓存的 projector metadata summary。
-
-    :param manifest: manifest body。
-    :returns: projector metadata summary 元组。
-    :raises HostDurableError: manifest projector metadata 结构非法时抛出。
-    """
-
-    value = manifest.get("projector_metadata")
-    if not isinstance(value, list):
-        raise HostDurableError("runner-call manifest projector_metadata is invalid")
-    summaries: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("runner-call projector metadata must be object")
-        summaries.append(
-            {
-                "projector_metadata_id": _manifest_text(item, "projector_metadata_id"),
-                "projector_id": _manifest_text(item, "projector_id"),
-                "projector_schema_version": _manifest_text(item, "projector_schema_version"),
-                "projector_digest": _manifest_text(item, "projector_digest"),
-                "purpose": _manifest_text(item, "purpose"),
-            }
+    projector_digest = sha256_digest_json(
+        {
+            "projector_id": projector_id,
+            "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
+            "purpose": purpose,
+            "source_contract_refs": list(source_contract_refs),
+        }
+    )
+    return runner_call_projector_metadata_descriptor(
+        RunnerCallProjectorMetadata(
+            projector_metadata_id=metadata_id,
+            projector_id=projector_id,
+            projector_schema_version=_PROJECTOR_SCHEMA_VERSION,
+            projector_digest=projector_digest,
+            purpose=purpose,
+            source_contract_refs=source_contract_refs,
         )
-    return tuple(summaries)
+    )
 
 
 def _projector_metadata_id_for_message(
@@ -5191,13 +4695,16 @@ def _runner_call_kind_and_trigger(
     """
 
     start_payload = _payload_object(record_input.current_facts.run_started_event)
-    start_reason = start_payload.get(_PAYLOAD_FIELD_START_REASON)
-    if start_reason == "recovery" or record_input.fallback is not None:
+    started_payload = decode_run_started_payload(start_payload)
+    if (
+        started_payload.start_reason is RunStartReason.RECOVERY
+        or record_input.fallback is not None
+    ):
         return (
             _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
             _RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED,
         )
-    if start_reason == "resume":
+    if started_payload.start_reason is RunStartReason.RESUME:
         return (
             _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
             _RUNNER_CALL_TRIGGER_HOST_RESUME,

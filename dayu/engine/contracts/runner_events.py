@@ -8,11 +8,17 @@ Qwen 等具体协议归一为本事件流，**不**执行工具、**不**拆分�
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TypeAlias
 
+from dayu.engine.contracts.error_codes import (
+    RunnerSpecificErrorCode,
+    validate_runner_specific_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.contracts.json_value import JsonValue
@@ -28,6 +34,7 @@ class RunnerEventType(StrEnum):
     RUNNER_TOOL_CALLS_COMPLETED = "runner_tool_calls_completed"
     RUNNER_CONTENT_COMPLETED = "runner_content_completed"
     RUNNER_USAGE_RECORDED = "runner_usage_recorded"
+    PROVIDER_DIAGNOSTIC = "provider_diagnostic"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     RUNNER_HTTP_ERROR = "runner_http_error"
     RUNNER_DONE = "runner_done"
@@ -62,6 +69,48 @@ class RunnerHTTPErrorCode(StrEnum):
     TIMEOUT = "timeout"
     CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
     UNKNOWN_HTTP_STATUS = "unknown_http_status"
+
+
+class RunnerDiagnosticSeverity(StrEnum):
+    """Runner 非致命诊断严重级别闭集。"""
+
+    INFO = "info"
+    WARNING = "warning"
+
+
+class RunnerDiagnosticSource(StrEnum):
+    """Runner 非致命诊断来源闭集。"""
+
+    HTTP_ADAPTER = "http_adapter"
+    SSE_PARSER = "sse_parser"
+    NON_STREAM_PARSER = "non_stream_parser"
+    TOOL_CALL_AGGREGATOR = "tool_call_aggregator"
+    CONTEXT_OVERFLOW_CLASSIFIER = "context_overflow_classifier"
+
+
+class ContextOverflowDetectionKind(StrEnum):
+    """provider context overflow 检测来源闭集。"""
+
+    STRUCTURED_CODE = "structured_code"
+    MESSAGE_MARKER_FALLBACK = "message_marker_fallback"
+    NOT_OVERFLOW = "not_overflow"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextOverflowDetection:
+    """provider context overflow 检测结果。
+
+    :param kind: 检测来源分类。只有 ``STRUCTURED_CODE`` 可作为业务真源；
+        ``MESSAGE_MARKER_FALLBACK`` 只提供诊断 provenance。
+    :param diagnostic_code: 需要对外持久化诊断时使用的诊断码。
+    :param message: 需要对外持久化诊断时使用的人类可读摘要。
+    :param raw_payload: 有界诊断载荷；无诊断或无结构化载荷时为 ``None``。
+    """
+
+    kind: ContextOverflowDetectionKind
+    diagnostic_code: str | None = None
+    message: str | None = None
+    raw_payload: JsonValue | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,12 +171,10 @@ class RunnerContentCompletedData:
 
     :param content: 完整正文；为 ``None`` 表示无正文。
     :param reasoning_content: 完整推理链文本；为 ``None`` 表示无推理链。
-    :param finish_reason: 完成原因。
     """
 
     content: str | None
     reasoning_content: str | None
-    finish_reason: FinishReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,11 +184,13 @@ class RunnerUsageRecordedData:
     :param prompt_tokens: 输入 token 数。
     :param completion_tokens: 输出 token 数。
     :param total_tokens: 总 token 数。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示未提供。
     """
 
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    provider_request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +207,49 @@ class RunnerProtocolErrorData:
         摘要；不包含 raw argument payload。
     """
 
-    error_code: str
+    error_code: RunnerSpecificErrorCode
     message: str
     provider_request_id: str | None
     raw_payload: JsonValue | None
     partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+
+    def __post_init__(self) -> None:
+        """校验 provider 协议错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是专有错误码 wrapper 时抛出。
+        """
+
+        validate_runner_specific_error_code(
+            self.error_code,
+            field_name="RunnerProtocolErrorData.error_code",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerProviderDiagnosticData:
+    """provider 非致命诊断事件 data。
+
+    :param diagnostic_code: 中性诊断码。
+    :param severity: 诊断严重级别闭集。
+    :param message: 人类可读诊断摘要。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示未提供。
+    :param raw_payload: 有界诊断载荷；为 ``None`` 表示无。不承诺保留
+        provider 原始报错载荷。
+    :param partial_tool_calls: 诊断发生时已解析但未完成的 tool call 有界
+        摘要；不包含 raw argument payload。
+    :param diagnostic_source: 产生诊断的 Runner 内部来源闭集。
+    """
+
+    diagnostic_code: str
+    severity: RunnerDiagnosticSeverity
+    message: str
+    provider_request_id: str | None
+    raw_payload: JsonValue | None
+    partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+    diagnostic_source: RunnerDiagnosticSource = (
+        RunnerDiagnosticSource.HTTP_ADAPTER
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +266,8 @@ class RunnerHTTPErrorData:
         载荷。
     :param attempt: 触发本错误事件时已经尝试的次数（首次为 1）。
     :param retried: 是否已经发生过至少一次重试。
+    :param context_overflow_detection: HTTP 错误被识别为 context overflow 时
+        的检测 provenance；非 context overflow 时为 ``None``。
 
     本事件**不**与 :class:`RunnerProtocolErrorData` 相互替代：解析层错误
     走协议错误事件，传输层错误走本事件；两者均以
@@ -192,6 +281,7 @@ class RunnerHTTPErrorData:
     raw_payload: JsonValue | None
     attempt: int
     retried: bool
+    context_overflow_detection: ContextOverflowDetection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,11 +304,67 @@ RunnerEventData: TypeAlias = (
     | RunnerToolCallsCompletedData
     | RunnerContentCompletedData
     | RunnerUsageRecordedData
+    | RunnerProviderDiagnosticData
     | RunnerProtocolErrorData
     | RunnerHTTPErrorData
     | RunnerDoneData
 )
 """Runner 事件 data 封闭联合。"""
+
+RUNNER_EVENT_TYPE_TO_DATA: Mapping[RunnerEventType, type[RunnerEventData]] = (
+    MappingProxyType(
+        {
+            RunnerEventType.RUNNER_CONTENT_DELTA: RunnerContentDeltaData,
+            RunnerEventType.RUNNER_REASONING_DELTA: RunnerReasoningDeltaData,
+            RunnerEventType.RUNNER_TOOL_CALL_DELTA: RunnerToolCallDeltaData,
+            RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED: RunnerToolCallsCompletedData,
+            RunnerEventType.RUNNER_CONTENT_COMPLETED: RunnerContentCompletedData,
+            RunnerEventType.RUNNER_USAGE_RECORDED: RunnerUsageRecordedData,
+            RunnerEventType.PROVIDER_DIAGNOSTIC: RunnerProviderDiagnosticData,
+            RunnerEventType.PROVIDER_PROTOCOL_ERROR: RunnerProtocolErrorData,
+            RunnerEventType.RUNNER_HTTP_ERROR: RunnerHTTPErrorData,
+            RunnerEventType.RUNNER_DONE: RunnerDoneData,
+        }
+    )
+)
+"""RunnerEvent type/data 配对真源。"""
+
+
+def runner_event_type_for_data(data: RunnerEventData) -> RunnerEventType:
+    """根据 RunnerEvent data 类型返回对应事件类型。
+
+    :param data: RunnerEvent data 联合成员。
+    :returns: 与 data 类型唯一对应的 RunnerEventType。
+    :raises TypeError: ``data`` 不是 RunnerEventData 闭集成员时抛出。
+    """
+
+    for event_type, data_type in RUNNER_EVENT_TYPE_TO_DATA.items():
+        if isinstance(data, data_type):
+            return event_type
+    raise TypeError("RunnerEvent.data has unsupported type")
+
+
+def validate_runner_event_pairing(
+    event_type: RunnerEventType, data: RunnerEventData
+) -> None:
+    """校验 RunnerEvent type/data 判别关系。
+
+    :param event_type: RunnerEventType。
+    :param data: RunnerEvent data 联合成员。
+    :returns: ``None``。
+    :raises TypeError: ``event_type`` 不是 RunnerEventType，或 ``data`` 不是
+        RunnerEventData 闭集成员时抛出。
+    :raises ValueError: type 与 data 类型不匹配时抛出。
+    """
+
+    if not isinstance(event_type, RunnerEventType):
+        raise TypeError("RunnerEvent.type must be RunnerEventType")
+    actual_type = runner_event_type_for_data(data)
+    if actual_type is not event_type:
+        raise ValueError(
+            "RunnerEvent.type/data mismatch: "
+            f"type={event_type.value} data_type={type(data).__name__}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,10 +383,24 @@ class RunnerEvent:
     data: RunnerEventData
     occurred_at: datetime
 
+    def __post_init__(self) -> None:
+        """校验 RunnerEvent 公共判别契约。
+
+        :returns: ``None``。
+        :raises TypeError: ``type`` 或 ``data`` 类型非法时抛出。
+        :raises ValueError: ``type`` 与 ``data`` 不匹配时抛出。
+        """
+
+        validate_runner_event_pairing(self.type, self.data)
+
 
 __all__ = [
     "RunnerEventType",
     "RunnerHTTPErrorCode",
+    "RunnerDiagnosticSeverity",
+    "RunnerDiagnosticSource",
+    "ContextOverflowDetectionKind",
+    "ContextOverflowDetection",
     "PartialToolCallSummary",
     "RunnerContentDeltaData",
     "RunnerReasoningDeltaData",
@@ -248,9 +408,13 @@ __all__ = [
     "RunnerToolCallsCompletedData",
     "RunnerContentCompletedData",
     "RunnerUsageRecordedData",
+    "RunnerProviderDiagnosticData",
     "RunnerProtocolErrorData",
     "RunnerHTTPErrorData",
     "RunnerDoneData",
     "RunnerEventData",
+    "RUNNER_EVENT_TYPE_TO_DATA",
     "RunnerEvent",
+    "runner_event_type_for_data",
+    "validate_runner_event_pairing",
 ]

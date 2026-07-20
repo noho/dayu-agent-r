@@ -10,16 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shlex
-import signal
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from types import FrameType
-from typing import Final, cast
+from typing import Final, NoReturn, cast
 
 import dayu.runtime.log as runtime_log
+from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import (
     COMMAND_DOWNLOAD,
     COMMAND_PROCESS,
@@ -42,25 +42,31 @@ from dayu.cli.output import (
     render_fins_direct_event,
     render_fins_direct_local_exit_after_cancel,
 )
+from dayu.cli.upload_script import (
+    current_upload_script_platform,
+    publish_upload_script,
+    render_upload_script,
+)
 from dayu.fins.direct_events import (
-    FINS_RESULT_EXIT_CANCELLED,
-    FINS_RESULT_EXIT_FAILURE,
-    FinsErrorKind,
+    FinsDirectStreamProtocolError,
     FinsEvent,
     FinsEventDetail,
-    FinsEventType,
-    FinsOperationKind,
-    FinsResultStatus,
     FinsResultSummary,
 )
+from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.resolver import FmpCompanyInfoResolver
+from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.upload_batch import (
     FINS_UPLOAD_FILE_SUFFIXES,
     BatchUploadAction,
+    UploadBatchFilingEntry,
+    UploadBatchMaterialEntry,
     UploadBatchPlanEmptyError,
-    UploadBatchPlanEntry,
     UploadBatchPlanRequest,
     UploadBatchPlanUsageError,
+    UploadBatchSkippedEntry,
     generate_upload_batch_plan,
 )
 from dayu.service.fins_direct import (
@@ -70,22 +76,17 @@ from dayu.service.fins_direct import (
 
 _BASE_OPTION: Final[str] = "--base"
 _TICKER_OPTION: Final[str] = "--ticker"
-_INFER_OPTION: Final[str] = "--infer"
-_CI_OPTION: Final[str] = "--ci"
-_UNSUPPORTED_OPTION_TEMPLATE: Final[str] = "unsupported option {option}: {reason}"
-_UNSUPPORTED_INFER_REASON: Final[str] = "当前没有 approved Fins alias inference boundary"
-_UNSUPPORTED_CI_REASON: Final[str] = "当前没有 public CI snapshot contract"
-_MULTIPLE_MATERIAL_FORMS_MESSAGE: Final[str] = (
-    "当前 Fins upload_material request 只支持单个 --forms 值"
+_MULTIPLE_MATERIAL_FORMS_MESSAGE: Final[str] = "当前 Fins upload_material request 只支持单个 --forms 值"
+_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE: Final[str] = (
+    "upload_filings_from 的 --material-forms 最多接受一个值"
 )
+_FMP_API_KEY_ENV: Final[str] = "FMP_API_KEY"
 _EMPTY_TICKER_MESSAGE: Final[str] = "--ticker must not be empty"
 _EMPTY_DOCUMENT_ID_MESSAGE: Final[str] = "--document-id must not contain empty item"
 _EMPTY_FORM_MESSAGE: Final[str] = "--forms must not contain empty item"
 _MISSING_UPLOAD_FILE_TEMPLATE: Final[str] = "upload file does not exist: {path}"
 _UPLOAD_PATH_NOT_FILE_TEMPLATE: Final[str] = "upload path is not a file: {path}"
-_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = (
-    "upload file suffix is not allowed: {path}"
-)
+_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = "upload file suffix is not allowed: {path}"
 _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
@@ -95,6 +96,16 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 class CliFinsUsageError(ValueError):
     """Fins direct CLI 用法错误。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _CliDirectLocalExit:
+    """CLI 本地 direct command 退出状态。
+
+    :param exit_code: 当前 CLI command 应返回的进程退出码。
+    """
+
+    exit_code: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,86 +181,8 @@ class _CliFinsCancellationToken:
         return self._requested_at
 
 
-class _FinsSigintMonitor:
-    """Fins direct operation 运行阶段的 SIGINT 观察器。"""
-
-    count: int
-    _event: asyncio.Event
-    _loop: asyncio.AbstractEventLoop | None
-    _installed: bool
-
-    def __init__(self) -> None:
-        """初始化 SIGINT monitor。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.count = 0
-        self._event = asyncio.Event()
-        self._loop = None
-        self._installed = False
-
-    def install(self) -> None:
-        """在当前事件循环安装 SIGINT handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常；不支持 signal handler 的平台保留
-            默认 KeyboardInterrupt 行为。
-        """
-
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGINT, self.notify)
-        except (NotImplementedError, RuntimeError):
-            self._installed = False
-            self._loop = None
-            return
-        self._installed = True
-        self._loop = loop
-
-    def close(self) -> None:
-        """移除当前 monitor 安装的 SIGINT handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        if self._installed and self._loop is not None:
-            self._loop.remove_signal_handler(signal.SIGINT)
-        self._installed = False
-        self._loop = None
-
-    def notify(self, _signal_number: int | None = None, _frame: FrameType | None = None) -> None:
-        """记录一次 SIGINT。
-
-        :param _signal_number: ``signal.signal`` 风格 handler 兼容参数。
-        :param _frame: ``signal.signal`` 风格 handler 兼容参数。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.count += 1
-        self._event.set()
-
-    async def wait_next(self, observed_count: int) -> int:
-        """等待下一次 SIGINT。
-
-        :param observed_count: 调用方已经观察到的 SIGINT 计数。
-        :returns: 新的 SIGINT 计数。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
-        """
-
-        while self.count <= observed_count:
-            await self._event.wait()
-            self._event.clear()
-        return self.count
-
-
 FinsDirectServiceFactory = Callable[[Path], FinsDirectCommandService]
-FINS_DIRECT_SERVICE_FACTORY: FinsDirectServiceFactory = (
-    FinsDirectCommandService.from_workspace_root
-)
+FINS_DIRECT_SERVICE_FACTORY: FinsDirectServiceFactory = FinsDirectCommandService.from_workspace_root
 
 
 def run_fins_direct_command(args: ParsedCliArgs) -> int:
@@ -274,6 +207,9 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except FinsDirectUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
+    except FinsDirectStreamProtocolError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
     except Exception as exc:
@@ -287,7 +223,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     :param args: argparse 已解析的 Fins direct 命令参数。
     :returns: CLI 退出码。
     :raises CliFinsUsageError: 用户输入参数非法或命令未支持时抛出。
-    :raises Exception: Service 或 runtime 执行失败时向上抛出。
+    :raises BaseException: stream 消费或确定性关闭失败时保持原异常向上抛出。
     """
 
     runtime_log.log_verbose(
@@ -297,7 +233,6 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     )
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
         return _run_upload_filings_from(args)
-    _raise_for_unsupported_flags(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
@@ -306,103 +241,179 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         service=service,
         cancellation_token=cancellation_token,
     )
-    runtime_log.log_verbose(
-        _LOGGER,
-        "Fins direct stream opened; command=%s",
-        args.command_name,
-    )
-    terminal = await _wait_for_terminal_handling_sigint(
-        events=stream,
-        cancellation_token=cancellation_token,
-        sigint_monitor=_FinsSigintMonitor(),
-        command_name=args.command_name,
-    )
+    try:
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct stream opened; command=%s",
+            args.command_name,
+        )
+        terminal = await _wait_for_terminal_handling_sigint(
+            events=stream,
+            cancellation_token=cancellation_token,
+            sigint_monitor=CliSigintMonitor(),
+            command_name=args.command_name,
+        )
+    except BaseException as primary_error:
+        await _raise_primary_after_fins_stream_close(
+            stream=stream,
+            primary_error=primary_error,
+        )
+    await stream.aclose()
     return terminal.exit_code
 
 
+async def _raise_primary_after_fins_stream_close(
+    *,
+    stream: ValidatedFinsEventStream,
+    primary_error: BaseException,
+) -> NoReturn:
+    """确定性关闭 CLI 创建的 stream，并保持既存 primary 异常身份。
+
+    :param stream: 当前 CLI 创建并拥有的 Fins direct stream。
+    :param primary_error: stream 消费或下游处理已经产生的主异常。
+    :returns: 不返回。
+    :raises BaseException: 始终重抛同一 primary；关闭失败时将其挂为显式 cause。
+    """
+
+    try:
+        await stream.aclose()
+    except BaseException as close_error:
+        raise primary_error from close_error
+    raise primary_error
+
+
 def _run_upload_filings_from(args: ParsedCliArgs) -> int:
-    """执行 ``upload_filings_from`` 本地计划生成。
+    """生成并安全发布 ``upload_filings_from`` 可执行脚本。
 
     :param args: argparse 已解析的 upload_filings_from 参数。
     :returns: CLI 退出码。
-    :raises CliFinsUsageError: ticker 或 source dir 参数非法时抛出。
+    :raises CliFinsUsageError: ticker、source、material form 或 FMP 输入非法时抛出。
     :raises UploadBatchPlanUsageError: Fins batch helper 判断输入非法时抛出。
     :raises UploadBatchPlanEmptyError: 源目录无可识别文件时抛出。
-    :raises OSError: 输出文件写入失败时由底层抛出。
+    :raises RuntimeError: FMP 结果与用户 canonical ticker 冲突时抛出。
+    :raises OSError: 脚本发布失败时由底层抛出。
     """
 
-    ticker = _parse_ticker_csv(args.ticker)
     if args.source_dir is None or args.source_dir.strip() == "":
         raise CliFinsUsageError("--from must not be empty")
+    ticker = _parse_ticker_csv(args.ticker)
+    explicit_company_name = _optional_stripped_text(args.company_name)
+    aliases = ticker.aliases
+    company_name = explicit_company_name
+    if args.infer:
+        api_key = os.environ.get(_FMP_API_KEY_ENV)
+        if api_key is None or api_key.strip() == "":
+            raise CliFinsUsageError("--infer requires non-empty FMP_API_KEY")
+        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(
+            ticker.canonical
+        )
+        if resolved_info.canonical_ticker != ticker.canonical:
+            raise RuntimeError(
+                "FMP resolved canonical ticker does not match the requested ticker"
+            )
+        aliases = _merge_ticker_aliases(
+            canonical=ticker.canonical,
+            explicit_aliases=ticker.aliases,
+            resolved_aliases=resolved_info.ticker_aliases,
+        )
+        if company_name is None:
+            company_name = resolved_info.company_name
+    material_form = _single_batch_material_form(args.material_forms)
+    workspace_root = _resolve_workspace_root(args.workspace_root)
+    source_dir = Path(args.source_dir)
     plan = generate_upload_batch_plan(
         UploadBatchPlanRequest(
             ticker=ticker.canonical,
-            source_dir=Path(args.source_dir),
+            aliases=aliases,
+            source_dir=source_dir,
             action=cast(BatchUploadAction, args.action),
             recursive=args.recursive,
             fiscal_year=args.fiscal_year,
-            fiscal_period=_optional_stripped_text(args.fiscal_period),
+            fiscal_period=cast(
+                FiscalPeriod | None,
+                _optional_stripped_text(args.fiscal_period),
+            ),
             amended=args.amended,
             filing_date=_optional_stripped_text(args.filing_date),
             report_date=_optional_stripped_text(args.report_date),
-            company_name=_optional_stripped_text(args.company_name),
-            material_forms=_normalized_text_tuple(
-                args.material_forms,
-                field_name="--material-forms",
-            ),
+            company_name=company_name,
+            overwrite=args.overwrite,
+            material_form=material_form,
         )
     )
-    script = _render_upload_batch_script(plan.entries)
-    if args.output is None:
-        print(script, end="")
-        return EXIT_SUCCESS
-    output_path = Path(args.output).expanduser().resolve(strict=False)
-    output_path.write_text(script, encoding="utf-8")
+    commands = tuple(
+        _upload_batch_command_argv(entry, workspace_root=workspace_root)
+        for entry in (*plan.recognized_entries, *plan.material_entries)
+    )
+    platform = current_upload_script_platform()
+    content = render_upload_script(
+        commands,
+        regeneration_argv=_upload_batch_regeneration_argv(
+            args=args,
+            ticker=ticker,
+            source_dir=source_dir,
+            explicit_company_name=explicit_company_name,
+            material_form=material_form,
+        ),
+        platform=platform,
+    )
+    script_path = publish_upload_script(
+        workspace_root=workspace_root,
+        output=Path(args.output) if args.output is not None else None,
+        canonical_ticker=ticker.canonical,
+        platform=platform,
+        content=content,
+    )
+    _render_upload_batch_summary(
+        script_path=script_path,
+        recognized_count=len(plan.recognized_entries),
+        material_count=len(plan.material_entries),
+        skipped_entries=plan.skipped_entries,
+    )
     return EXIT_SUCCESS
 
 
-def _render_upload_batch_script(entries: tuple[UploadBatchPlanEntry, ...]) -> str:
-    """把结构化上传计划渲染为 ``dayu-cli`` 命令脚本。
+def _upload_batch_command_argv(
+    entry: UploadBatchFilingEntry | UploadBatchMaterialEntry,
+    *,
+    workspace_root: Path,
+) -> tuple[str, ...]:
+    """把单条 Fins typed entry 机械投影为 current CLI argv。
 
-    :param entries: Fins batch helper 返回的结构化计划条目。
-    :returns: shell 可执行的命令脚本文本。
+    :param entry: Fins owner 产生的 filing 或 material entry。
+    :param workspace_root: 每条 direct upload 使用的 workspace root。
+    :returns: 不经过 shell quoting 的 argv 元组。
     :raises Exception: 不主动抛出异常。
     """
 
-    lines = tuple(_render_upload_batch_command(entry) for entry in entries)
-    return "\n".join(lines) + "\n"
-
-
-def _render_upload_batch_command(entry: UploadBatchPlanEntry) -> str:
-    """渲染单条上传命令。
-
-    :param entry: 结构化上传计划条目。
-    :returns: shell quoted 命令行。
-    :raises Exception: 不主动抛出异常。
-    """
-
+    command_name = (
+        COMMAND_UPLOAD_FILING
+        if isinstance(entry, UploadBatchFilingEntry)
+        else COMMAND_UPLOAD_MATERIAL
+    )
     parts = [
-        "dayu-cli",
-        entry.command_name,
+        "python",
+        "-m",
+        "dayu.cli",
+        command_name,
+        _BASE_OPTION,
+        str(workspace_root),
         "--ticker",
-        entry.ticker,
-        "--action",
-        entry.action,
+        ",".join((entry.ticker, *entry.aliases)),
     ]
-    if entry.command_name == COMMAND_UPLOAD_MATERIAL:
-        if entry.form_type is not None:
-            parts.extend(("--forms", entry.form_type))
-        if entry.material_name is not None:
-            parts.extend(("--material-name", entry.material_name))
-    parts.append("--files")
-    parts.extend(str(path) for path in entry.files)
+    if entry.action != "auto":
+        parts.extend(("--action", entry.action))
+    if isinstance(entry, UploadBatchMaterialEntry):
+        parts.extend(("--forms", entry.form_type))
+        parts.extend(("--material-name", entry.material_name))
+    parts.extend(("--files", str(entry.file)))
     _append_optional_entry_metadata(parts, entry)
-    return shlex.join(parts)
+    return tuple(parts)
 
 
 def _append_optional_entry_metadata(
     parts: list[str],
-    entry: UploadBatchPlanEntry,
+    entry: UploadBatchFilingEntry | UploadBatchMaterialEntry,
 ) -> None:
     """向命令参数列表追加可选 metadata flags。
 
@@ -424,6 +435,94 @@ def _append_optional_entry_metadata(
         parts.extend(("--report-date", entry.report_date))
     if entry.company_name is not None:
         parts.extend(("--company-name", entry.company_name))
+    if entry.overwrite:
+        parts.append("--overwrite")
+
+
+def _upload_batch_regeneration_argv(
+    *,
+    args: ParsedCliArgs,
+    ticker: CliTickerInput,
+    source_dir: Path,
+    explicit_company_name: str | None,
+    material_form: str | None,
+) -> tuple[str, ...]:
+    """从用户显式生成参数构造无 secret 的再生成 argv。
+
+    :param args: argparse 解析结果。
+    :param ticker: 已规范化的用户 ticker CSV。
+    :param source_dir: 用户 source directory。
+    :param explicit_company_name: 用户显式 company name，不含 FMP 推断值。
+    :param material_form: 已规范化单一 material form 候选。
+    :returns: 可安全写入注释的 argv。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts = [
+        "python",
+        "-m",
+        "dayu.cli",
+        COMMAND_UPLOAD_FILINGS_FROM,
+        _BASE_OPTION,
+        args.workspace_root,
+        "--ticker",
+        ",".join((ticker.canonical, *ticker.aliases)),
+        "--from",
+        str(source_dir),
+    ]
+    if args.action != "auto":
+        parts.extend(("--action", args.action))
+    if args.output is not None:
+        parts.extend(("--output", args.output))
+    if args.recursive:
+        parts.append("--recursive")
+    if args.fiscal_year is not None:
+        parts.extend(("--fiscal-year", str(args.fiscal_year)))
+    fiscal_period = _optional_stripped_text(args.fiscal_period)
+    if fiscal_period is not None:
+        parts.extend(("--fiscal-period", fiscal_period))
+    if args.amended:
+        parts.append("--amended")
+    if args.filing_date is not None:
+        parts.extend(("--filing-date", args.filing_date))
+    if args.report_date is not None:
+        parts.extend(("--report-date", args.report_date))
+    if explicit_company_name is not None:
+        parts.extend(("--company-name", explicit_company_name))
+    if material_form is not None:
+        parts.extend(("--material-forms", material_form))
+    if args.infer:
+        parts.append("--infer")
+    if args.overwrite:
+        parts.append("--overwrite")
+    return tuple(parts)
+
+
+def _render_upload_batch_summary(
+    *,
+    script_path: Path,
+    recognized_count: int,
+    material_count: int,
+    skipped_entries: tuple[UploadBatchSkippedEntry, ...],
+) -> None:
+    """输出用户可读的脚本生成摘要。
+
+    :param script_path: 已发布脚本绝对路径。
+    :param recognized_count: filing 数量。
+    :param material_count: material 数量。
+    :param skipped_entries: Fins owner 跳过事实。
+    :returns: ``None``。
+    :raises OSError: stdout 写入失败时由 ``print`` 透传。
+    """
+
+    print(f"Generated upload script: {script_path}")
+    print(f"Recognized filings: {recognized_count}")
+    print(f"Material files: {material_count}")
+    print(f"Skipped files: {len(skipped_entries)}")
+    for skipped in skipped_entries:
+        print(
+            f"Skipped [{skipped.reason_code}] {skipped.path}: {skipped.reason}"
+        )
 
 
 def _open_direct_stream(
@@ -431,13 +530,13 @@ def _open_direct_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """按命令名打开 direct event stream。
 
     :param args: argparse 已解析的 Fins direct 命令参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: 命令或用户输入非法时抛出。
     :raises Exception: Service 打开 stream 失败时向上抛出。
     """
@@ -472,19 +571,18 @@ def _open_direct_stream(
         )
     raise CliFinsUsageError(f"unsupported fins direct command: {args.command_name}")
 
-
 def _download_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """打开 download direct stream。
 
     :param args: argparse 已解析的 download 参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker 或 forms 输入非法时抛出。
     """
 
@@ -505,13 +603,13 @@ def _upload_filing_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """打开 upload_filing direct stream。
 
     :param args: argparse 已解析的 upload_filing 参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker 或文件路径非法时抛出。
     """
 
@@ -537,13 +635,13 @@ def _upload_material_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """打开 upload_material direct stream。
 
     :param args: argparse 已解析的 upload_material 参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker、forms 或文件路径非法时抛出。
     """
 
@@ -574,13 +672,13 @@ def _process_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """打开 process direct stream。
 
     :param args: argparse 已解析的 process 参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker 或 document id 输入非法时抛出。
     """
 
@@ -599,13 +697,13 @@ def _process_filing_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """打开 process_filing direct stream。
 
     :param args: argparse 已解析的 process_filing 参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker 或 document id 输入非法时抛出。
     """
 
@@ -624,13 +722,13 @@ def _process_material_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
-) -> AsyncIterator[FinsEvent]:
+) -> ValidatedFinsEventStream:
     """打开 process_material direct stream。
 
     :param args: argparse 已解析的 process_material 参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins direct 事件异步迭代器。
+    :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker 或 document id 输入非法时抛出。
     """
 
@@ -646,19 +744,19 @@ def _process_material_stream(
 
 async def _wait_for_terminal_handling_sigint(
     *,
-    events: AsyncIterator[FinsEvent],
+    events: ValidatedFinsEventStream,
     cancellation_token: _CliFinsCancellationToken,
-    sigint_monitor: _FinsSigintMonitor,
+    sigint_monitor: CliSigintMonitor,
     command_name: str,
-) -> FinsResultSummary:
+) -> FinsResultSummary | _CliDirectLocalExit:
     """等待 direct stream 终态并处理运行中 SIGINT。
 
     :param events: Fins direct event stream。
     :param cancellation_token: 当前 operation 的取消 token。
     :param sigint_monitor: SIGINT 观察器。
     :param command_name: 用户可见命令名，用于诊断。
-    :returns: direct stream 终态摘要。
-    :raises Exception: stream 消费失败时向上抛出。
+    :returns: direct stream 终态摘要，或 CLI 本地退出状态。
+    :raises BaseException: stream 消费或 consumer task 清理失败时保持原异常向上抛出。
     """
 
     sigint_monitor.install()
@@ -685,29 +783,71 @@ async def _wait_for_terminal_handling_sigint(
                 cancellation_token.request_cancel("keyboard_interrupt")
                 event_task.cancel()
                 render_fins_direct_cancel_requested()
+                close_error: BaseException | None = None
                 try:
                     terminal_result = await event_task
-                except asyncio.CancelledError:
-                    pass
+                except asyncio.CancelledError as cancellation_error:
+                    close_error = cancellation_error.__cause__
                 else:
                     return terminal_result
+                if close_error is not None:
+                    # 离开 child cancellation handler 后再传播 cleanup error，
+                    # 避免 Python 把 child cancellation 写入其隐式 context。
+                    raise close_error
                 render_fins_direct_local_exit_after_cancel()
-                return _cancelled_result_summary()
+                return _CliDirectLocalExit(exit_code=EXIT_KEYBOARD_INTERRUPT)
+    except BaseException as primary_error:
+        cleanup_error = await _cancel_and_drain_fins_event_task(
+            event_task,
+            primary_error=primary_error,
+        )
+        if cleanup_error is not None:
+            raise primary_error from cleanup_error
+        raise primary_error
     finally:
         sigint_monitor.close()
         sigint_task.cancel()
-        if not event_task.done():
-            event_task.cancel()
+
+
+async def _cancel_and_drain_fins_event_task(
+    event_task: asyncio.Task[FinsResultSummary],
+    *,
+    primary_error: BaseException,
+) -> BaseException | None:
+    """取消并等待仍在运行的 CLI event consumer task。
+
+    :param event_task: 当前 direct stream consumer task。
+    :param primary_error: 当前 owner 已捕获且必须保持身份的主异常。
+    :returns: task 取消期间发生的显式 cleanup cause；正常取消或已结束时返回 ``None``。
+    :raises Exception: 不主动抛出异常；task cleanup error 作为返回值交给 owner 裁决。
+    """
+
+    if not event_task.done():
+        event_task.cancel()
+    try:
+        await event_task
+    except asyncio.CancelledError as cancellation_error:
+        if cancellation_error is primary_error:
+            return None
+        cleanup_error = cancellation_error.__cause__
+        if cleanup_error is primary_error:
+            return None
+        return cleanup_error
+    except BaseException as cleanup_error:
+        if cleanup_error is primary_error:
+            return None
+        return cleanup_error
+    return None
 
 
 async def _consume_fins_direct_events(
-    events: AsyncIterator[FinsEvent],
+    events: ValidatedFinsEventStream,
 ) -> FinsResultSummary:
     """消费 Service event stream 并输出 Fins direct 事件。
 
     :param events: Fins direct event stream。
-    :returns: event stream 产出的 terminal result summary。
-    :raises RuntimeError: event stream 结束但没有 terminal result 时抛出。
+    :returns: clean exhaustion 后由 Fins owner 提供的 terminal result summary。
+    :raises FinsDirectStreamProtocolError: Fins owner 判定 terminal 协议非法时抛出。
     :raises Exception: Service stream 或输出失败时向上抛出。
     """
 
@@ -722,13 +862,7 @@ async def _consume_fins_direct_events(
                 event.result.status.value,
                 event.result.exit_code,
             )
-            return event.result
-    missing_result = _missing_result_event()
-    render_fins_direct_event(missing_result)
-    result = missing_result.result
-    if result is None:
-        raise RuntimeError("missing-result event did not contain result")
-    return result
+    return events.terminal_result
 
 
 def _log_fins_direct_event_received(event: FinsEvent) -> None:
@@ -862,10 +996,7 @@ def _append_result_details_diagnostic_parts(
     for detail in details:
         if len(rendered) >= _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS:
             break
-        rendered.append(
-            f"{_bounded_diagnostic_text(detail.label)}="
-            f"{_quoted_diagnostic_text(detail.value)}"
-        )
+        rendered.append(f"{_bounded_diagnostic_text(detail.label)}=" f"{_quoted_diagnostic_text(detail.value)}")
     if rendered:
         parts.append(f"details={','.join(rendered)}")
 
@@ -891,77 +1022,10 @@ def _bounded_diagnostic_text(value: str) -> str:
 
     if len(value) <= _FINS_DIAGNOSTIC_TEXT_MAX_CHARS:
         return value
-    return value[
-        : _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)
-    ] + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
-
-
-def _missing_result_event() -> FinsEvent:
-    """构造 direct stream 无 RESULT 时的 failure event。
-
-    :returns: failure RESULT 事件。
-    :raises ValueError: 构造出的事件违反 direct contract 时抛出。
-    """
-
-    return FinsEvent(
-        event_type=FinsEventType.RESULT,
-        operation_kind=FinsOperationKind.PREPROCESS,
-        message="Fins direct stream ended without result",
-        emitted_at=datetime.now(timezone.utc),
-        ticker=None,
-        filing_kind=None,
-        document_label=None,
-        progress=None,
-        result=FinsResultSummary(
-            status=FinsResultStatus.FAILURE,
-            exit_code=FINS_RESULT_EXIT_FAILURE,
-            title="Fins direct operation failed",
-            details=(),
-            error_kind=FinsErrorKind.EXECUTION,
-            error_message="Fins direct stream ended without result",
-        ),
+    return (
+        value[: _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)]
+        + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
     )
-
-
-def _cancelled_result_summary() -> FinsResultSummary:
-    """构造 CLI 本地取消终态摘要。
-
-    :returns: cancelled result summary。
-    :raises ValueError: 构造出的摘要违反 direct contract 时抛出。
-    """
-
-    return FinsResultSummary(
-        status=FinsResultStatus.CANCELLED,
-        exit_code=FINS_RESULT_EXIT_CANCELLED,
-        title="Fins direct operation cancelled",
-        details=(FinsEventDetail(label="reason", value="keyboard_interrupt"),),
-        error_kind=FinsErrorKind.CANCELLED,
-        error_message="cancelled",
-    )
-
-
-def _raise_for_unsupported_flags(args: ParsedCliArgs) -> None:
-    """对当前无 approved boundary 的旧 flag fail fast。
-
-    :param args: argparse 已解析的 Fins direct 命令参数。
-    :returns: ``None``。
-    :raises CliFinsUsageError: 发现 unsupported flag 时抛出。
-    """
-
-    if args.infer:
-        raise CliFinsUsageError(
-            _UNSUPPORTED_OPTION_TEMPLATE.format(
-                option=_INFER_OPTION,
-                reason=_UNSUPPORTED_INFER_REASON,
-            )
-        )
-    if args.ci:
-        raise CliFinsUsageError(
-            _UNSUPPORTED_OPTION_TEMPLATE.format(
-                option=_CI_OPTION,
-                reason=_UNSUPPORTED_CI_REASON,
-            )
-        )
 
 
 def _resolve_workspace_root(raw_value: str) -> Path:
@@ -982,17 +1046,55 @@ def _parse_ticker_csv(raw_value: str | None) -> CliTickerInput:
 
     :param raw_value: ``--ticker`` 原始值。
     :returns: CLI ticker 输入。
-    :raises CliFinsUsageError: ticker 缺失或 canonical 为空时抛出。
+    :raises CliFinsUsageError: ticker 缺失、空项或任一 token 无法规范化时抛出。
     """
 
     if raw_value is None:
         raise CliFinsUsageError(_EMPTY_TICKER_MESSAGE)
     parts = tuple(part.strip() for part in raw_value.split(","))
-    canonical = parts[0] if parts else ""
-    if canonical == "":
+    if not parts or any(part == "" for part in parts):
         raise CliFinsUsageError(_EMPTY_TICKER_MESSAGE)
-    aliases = tuple(part for part in parts[1:] if part != "")
+    try:
+        canonical = normalize_ticker(parts[0]).canonical
+        normalized_aliases = tuple(
+            normalize_ticker(alias).canonical for alias in parts[1:]
+        )
+    except ValueError as exc:
+        raise CliFinsUsageError(str(exc)) from exc
+    aliases = _merge_ticker_aliases(
+        canonical=canonical,
+        explicit_aliases=normalized_aliases,
+        resolved_aliases=(),
+    )
     return CliTickerInput(canonical=canonical, aliases=aliases)
+
+
+def _merge_ticker_aliases(
+    *,
+    canonical: str,
+    explicit_aliases: tuple[str, ...],
+    resolved_aliases: tuple[str, ...],
+) -> tuple[str, ...]:
+    """按显式优先顺序合并已由各自 owner 规范化的 ticker aliases。
+
+    :param canonical: 用户 canonical ticker。
+    :param explicit_aliases: CLI strict normalizer 产生的显式 aliases。
+    :param resolved_aliases: FMP resolver public contract 产生的 aliases。
+    :returns: 排除 canonical 后的稳定去重 aliases。
+    :raises RuntimeError: resolver 返回空 alias 时抛出。
+    """
+
+    aliases: list[str] = []
+    seen = {canonical}
+    for raw_alias in (*explicit_aliases, *resolved_aliases):
+        alias = raw_alias.strip()
+        if alias == "":
+            raise RuntimeError("FMP resolver returned an empty ticker alias")
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return tuple(aliases)
 
 
 def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
@@ -1009,17 +1111,11 @@ def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
     for raw_file in raw_files:
         path = Path(raw_file).expanduser().resolve(strict=False)
         if not path.exists():
-            raise CliFinsUsageError(
-                _MISSING_UPLOAD_FILE_TEMPLATE.format(path=path)
-            )
+            raise CliFinsUsageError(_MISSING_UPLOAD_FILE_TEMPLATE.format(path=path))
         if not path.is_file():
-            raise CliFinsUsageError(
-                _UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path)
-            )
+            raise CliFinsUsageError(_UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path))
         if path.suffix.lower() not in FINS_UPLOAD_FILE_SUFFIXES:
-            raise CliFinsUsageError(
-                _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE.format(path=path)
-            )
+            raise CliFinsUsageError(_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE.format(path=path))
         paths.append(path)
     return tuple(paths)
 
@@ -1065,6 +1161,24 @@ def _single_optional_form(values: list[str] | None) -> str | None:
     if not normalized:
         return None
     return normalized[0]
+
+
+def _single_batch_material_form(
+    values: list[str] | None,
+) -> str | None:
+    """读取 batch 可选单一 material form override。
+
+    :param values: ``--material-forms`` 输入。
+    :returns: 规范化的单一 material form 候选；未传入时返回 ``None``。
+    :raises CliFinsUsageError: 传入多个 form 时抛出。
+    """
+
+    normalized = _normalized_text_tuple(values, field_name="--material-forms")
+    if len(normalized) > 1:
+        raise CliFinsUsageError(_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE)
+    if not normalized:
+        return None
+    return normalized[0].upper()
 
 
 def _document_ids_from_arg(raw_value: str | list[str] | None) -> tuple[str, ...]:

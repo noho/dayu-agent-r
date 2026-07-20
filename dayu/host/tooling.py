@@ -9,10 +9,12 @@ tool snapshot。
 from __future__ import annotations
 
 import math
+from collections.abc import Hashable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
+from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_declaration import ToolBundle
 from dayu.contracts.tool_source import ToolBundleSourceRef
 from dayu.host.tool_duplicate_governance import DuplicateGovernancePolicy
@@ -23,6 +25,67 @@ if TYPE_CHECKING:
         WaitAdapterRegistry,
         WaitPollAdapterRegistry,
     )
+else:
+
+    class WaitAdapterBindingRuntimeView(Protocol):
+        """等待 binding 的运行时结构视图。"""
+
+
+    class WaitPollAdapterRuntimeView(Protocol):
+        """poll adapter 的运行时结构视图。"""
+
+
+    class WaitActivationAdapterRuntimeView(Protocol):
+        """activation adapter 的运行时结构视图。"""
+
+
+    @runtime_checkable
+    class WaitAdapterRegistry(Protocol):
+        """Host tooling 接收的等待 adapter registry 运行时契约。"""
+
+        def resolve_binding(
+            self, *, tool_name: str, await_kind: ToolAwaitKind
+        ) -> WaitAdapterBindingRuntimeView | None:
+            """解析工具等待 binding。
+
+            :param tool_name: 工具名。
+            :param await_kind: 等待类型。
+            :returns: 匹配 binding；未配置时为 ``None``。
+            """
+
+            ...
+
+
+    @runtime_checkable
+    class WaitPollAdapterRegistry(Protocol):
+        """Host tooling 接收的 wait poll adapter registry 运行时契约。"""
+
+        def resolve_adapter(
+            self, adapter_key: Hashable
+        ) -> WaitPollAdapterRuntimeView | None:
+            """按 adapter key 解析 poll adapter。
+
+            :param adapter_key: wait record 上持久化的 adapter key。
+            :returns: adapter；未注册时为 ``None``。
+            """
+
+            ...
+
+
+    @runtime_checkable
+    class WaitActivationRegistry(Protocol):
+        """Host tooling 接收的 accepted wait activation registry 运行时契约。"""
+
+        def resolve_adapter(
+            self, adapter_key: Hashable
+        ) -> WaitActivationAdapterRuntimeView | None:
+            """按 adapter key 解析 activation adapter。
+
+            :param adapter_key: wait binding 使用的 adapter key。
+            :returns: adapter；未注册时为 ``None``。
+            """
+
+            ...
 
 
 _DEFAULT_PROCESS_CAPSULE_TERMINATE_GRACE_SECONDS: Final[float] = 0.2
@@ -191,6 +254,26 @@ class HostToolingOptions:
             raise ValueError(
                 "HostToolingOptions.process_capsule_interrupt_policy must be "
                 "ProcessCapsuleInterruptPolicy"
+            )
+        if self.wait_adapter_registry is not None and not isinstance(
+            self.wait_adapter_registry, WaitAdapterRegistry
+        ):
+            raise TypeError(
+                "HostToolingOptions.wait_adapter_registry must be WaitAdapterRegistry"
+            )
+        if self.wait_activation_registry is not None and not isinstance(
+            self.wait_activation_registry, WaitActivationRegistry
+        ):
+            raise TypeError(
+                "HostToolingOptions.wait_activation_registry must be "
+                "WaitActivationRegistry"
+            )
+        if self.wait_poll_adapter_registry is not None and not isinstance(
+            self.wait_poll_adapter_registry, WaitPollAdapterRegistry
+        ):
+            raise TypeError(
+                "HostToolingOptions.wait_poll_adapter_registry must be "
+                "WaitPollAdapterRegistry"
             )
         reserved_names = frozenset(
             tool_name.value for tool_name in self.framework_tool_policy.reserved_framework_tool_names

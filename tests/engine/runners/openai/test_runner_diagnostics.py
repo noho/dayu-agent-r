@@ -23,9 +23,9 @@ from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeContent,
     FakeResponse,
     FakeResponseSpec,
@@ -264,7 +264,7 @@ async def test_attempt_start_diagnostic_logged(
         )
     )
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -320,7 +320,7 @@ async def test_response_log_includes_client_correlation_id(
                 ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
             )
         ),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -404,7 +404,8 @@ async def test_cancelled_diagnostic_logged(
 ) -> None:
     """token 已取消时应输出 runner.cancelled 诊断日志。"""
 
-    token = FakeCancellationToken(cancelled=True, reason="test-cancel")
+    token = ControllableCancellationToken()
+    token.request_cancel("test-cancel")
     session = FakeSession()
     session.enqueue_response(
         FakeResponseSpec(
@@ -502,7 +503,7 @@ async def test_terminal_error_logged_at_warning_level(
     )
     runner = AsyncOpenAIRunner(
         spec=make_spec(max_retries=0),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -543,7 +544,7 @@ async def test_runner_logs_use_dayu_namespace_only(
         )
     )
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -599,7 +600,7 @@ async def _collect_stream_diagnostic_events(
             stream_idle_timeout_seconds=0.5,
             stream_idle_heartbeat_seconds=0.02,
         ),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     runner_with_client = cast(_RunnerWithDelayedSessionClient, runner)
     runner_with_client._http_client = _DelayedSessionClient(session)

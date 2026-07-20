@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,12 +23,25 @@ from dayu.host import (
     get_run,
     resolve_wait,
 )
-from dayu.host.command import HostCommandHandle, create_host_command_handle
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.api import HostCommandHandleOptions
+from dayu.host.command import (
+    HostCommandHandle,
+    create_host_command_handle,
+    expire_wait,
+)
+from dayu.host.durable.codec import (
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostTransaction,
+    HostTransactionOperation,
+)
 from dayu.host.wait_adapter import (
+    WaitAdapterSnapshot,
     WaitExternalJobLifecycleAction,
     WaitExternalJobLifecycleApplied,
     WaitExternalJobLifecycleNoop,
@@ -42,8 +56,10 @@ from dayu.host.wait_adapter import (
     WaitPollReady,
     WaitPollResult,
     WaitPoller,
+    WaitPollerRuntimePolicy,
     WaitResolvePort,
 )
+from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from tests.host.test_resolve_wait_command import (
     _context,
@@ -89,6 +105,15 @@ class _PublicCommandResolver:
 
         return resolve_wait(self._host, wait_id, request)
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """执行 common expiry owner。
+
+        :param request: expiry 输入。
+        :returns: expiry transition。
+        """
+
+        return expire_wait(self._host, request)
+
 
 class _FailingResolveResolver:
     """测试用始终抛出 resolve_wait 异常的 resolver。"""
@@ -115,6 +140,17 @@ class _FailingResolveResolver:
         self.idempotency_keys.append(request.idempotency_key)
         raise RuntimeError("resolve wait failed")
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """模拟 expiry resolver 失败。
+
+        :param request: expiry 输入。
+        :returns: 永不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        self.calls.append(request.wait_id)
+        raise RuntimeError("expire wait failed")
+
 
 class _NoResolveResolver:
     """测试用禁止调用 resolve_wait 的 resolver。"""
@@ -139,6 +175,17 @@ class _NoResolveResolver:
         del request
         self.calls.append(wait_id)
         raise AssertionError(f"unexpected resolve_wait for {wait_id}")
+
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """禁止 expiry 调用。
+
+        :param request: expiry 输入。
+        :returns: 永不返回。
+        :raises AssertionError: 任何调用都表示测试路径错误。
+        """
+
+        self.calls.append(request.wait_id)
+        raise AssertionError(f"unexpected expire_wait for {request.wait_id}")
 
 
 class _RecordingPublicCommandResolver:
@@ -165,6 +212,15 @@ class _RecordingPublicCommandResolver:
         self.idempotency_keys.append(request.idempotency_key)
         return resolve_wait(self._host, wait_id, request)
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """执行 common expiry owner。
+
+        :param request: expiry 输入。
+        :returns: expiry transition。
+        """
+
+        return expire_wait(self._host, request)
+
 
 class _SequenceAdapter:
     """按预置序列返回 poll 结果的 adapter。"""
@@ -181,33 +237,72 @@ class _SequenceAdapter:
         self.abandoned: list[str] = []
         self.lifecycle_results: list[WaitExternalJobLifecycleResult] = []
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """返回下一项 poll 结果。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: poll 结果。
         """
 
+        del snapshot
         result = self._results[self.poll_count]
         self.poll_count += 1
         return result
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
-        """记录被放弃 wait id。
+        """记录被放弃 wait 的 resume token。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: applied lifecycle result。
         """
 
-        self.abandoned.append(wait_record.wait_id)
+        self.abandoned.append(snapshot.resume_token)
         lifecycle_result = WaitExternalJobLifecycleApplied(
             action=WaitExternalJobLifecycleAction.ABANDON,
             message="test_abandoned",
         )
         self.lifecycle_results.append(lifecycle_result)
         return lifecycle_result
+
+
+class _SnapshotRecordingAdapter:
+    """记录 Host 投影给 adapter 的 snapshot。"""
+
+    def __init__(self) -> None:
+        """初始化记录容器。
+
+        :returns: ``None``。
+        """
+
+        self.polled_snapshots: list[WaitAdapterSnapshot] = []
+        self.abandoned_snapshots: list[WaitAdapterSnapshot] = []
+
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
+        """记录 poll snapshot 并返回 not-ready。
+
+        :param snapshot: adapter snapshot。
+        :returns: not-ready poll 结果。
+        """
+
+        self.polled_snapshots.append(snapshot)
+        return WaitPollNotReady()
+
+    def abandon_wait(
+        self, snapshot: WaitAdapterSnapshot
+    ) -> WaitExternalJobLifecycleResult:
+        """记录 abandon snapshot 并返回 applied。
+
+        :param snapshot: adapter snapshot。
+        :returns: applied lifecycle result。
+        """
+
+        self.abandoned_snapshots.append(snapshot)
+        return WaitExternalJobLifecycleApplied(
+            action=WaitExternalJobLifecycleAction.ABANDON,
+            message="test_abandoned",
+        )
 
 
 class _AbandonValueErrorThenNotReadyAdapter:
@@ -222,28 +317,65 @@ class _AbandonValueErrorThenNotReadyAdapter:
         self.abandoned: list[str] = []
         self.polled: list[str] = []
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """记录 poll wait 并返回 not-ready。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: not-ready poll 结果。
         """
 
-        self.polled.append(wait_record.wait_id)
+        self.polled.append(snapshot.resume_token)
         return WaitPollNotReady()
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """记录 abandon wait 并抛出普通异常。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: 不返回；始终抛出 ``ValueError``。
         :raises ValueError: 始终抛出，用于验证普通异常隔离。
         """
 
-        self.abandoned.append(wait_record.wait_id)
+        self.abandoned.append(snapshot.resume_token)
         raise ValueError("adapter abandon failed")
+
+
+class _FailingPollAdapter:
+    """poll_wait 始终抛出异常的测试 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。
+
+        :returns: ``None``。
+        """
+
+        self.polled: list[str] = []
+        self.abandoned: list[str] = []
+
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
+        """记录 poll wait 并抛出异常。
+
+        :param snapshot: adapter snapshot。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        self.polled.append(snapshot.resume_token)
+        raise RuntimeError("provider transient failure")
+
+    def abandon_wait(
+        self, snapshot: WaitAdapterSnapshot
+    ) -> WaitExternalJobLifecycleResult:
+        """记录异常的 abandon 调用。
+
+        :param snapshot: adapter snapshot。
+        :returns: 不返回。
+        :raises AssertionError: 本测试 adapter 不应进入 abandon path。
+        """
+
+        self.abandoned.append(snapshot.resume_token)
+        raise AssertionError(f"unexpected abandon {snapshot.resume_token}")
 
 
 class _StaticLifecycleAdapter:
@@ -259,26 +391,26 @@ class _StaticLifecycleAdapter:
         self._lifecycle_result = lifecycle_result
         self.abandoned: list[str] = []
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """本 adapter 不应处理 waiting poll。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: 永不返回。
         :raises AssertionError: 被错误调用时抛出。
         """
 
-        raise AssertionError(f"unexpected poll for {wait_record.wait_id}")
+        raise AssertionError(f"unexpected poll for {snapshot.resume_token}")
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """记录 abandon wait 并返回固定 lifecycle result。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: 固定 lifecycle result。
         """
 
-        self.abandoned.append(wait_record.wait_id)
+        self.abandoned.append(snapshot.resume_token)
         return self._lifecycle_result
 
 
@@ -287,17 +419,20 @@ class _AbandonClaimStealingAdapter:
 
     def __init__(
         self,
-        transaction_runner: HostTransactionRunner,
+        options: HostCommandHandleOptions,
+        wait_id: str,
         lifecycle_result: WaitExternalJobLifecycleResult | None = None,
     ) -> None:
         """初始化 adapter。
 
-        :param transaction_runner: Host transaction runner。
+        :param options: observation thread 内创建独立 durable handle 的选项。
+        :param wait_id: 本测试要篡改的 Host wait id。
         :param lifecycle_result: adapter 返回的 lifecycle result。
         :returns: ``None``。
         """
 
-        self._transaction_runner = transaction_runner
+        self._options = options
+        self._wait_id = wait_id
         self._lifecycle_result = (
             lifecycle_result
             if lifecycle_result is not None
@@ -308,26 +443,26 @@ class _AbandonClaimStealingAdapter:
         )
         self.abandoned: list[str] = []
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """本 adapter 不应处理 waiting poll。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: 永不返回。
         :raises AssertionError: 被错误调用时抛出。
         """
 
-        raise AssertionError(f"unexpected poll for {wait_record.wait_id}")
+        raise AssertionError(f"unexpected poll for {snapshot.resume_token}")
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """篡改当前 row claim，模拟另一路 poller 先写入。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: 预置 lifecycle result。
         """
 
-        self.abandoned.append(wait_record.wait_id)
+        self.abandoned.append(snapshot.resume_token)
 
         def operation(transaction: HostTransaction) -> None:
             """替换 wait row claim。
@@ -350,12 +485,79 @@ class _AbandonClaimStealingAdapter:
                     "poller-stolen",
                     "2026-05-16T02:00:00.000000Z",
                     "2026-05-16T02:05:00.000000Z",
-                    wait_record.wait_id,
+                    self._wait_id,
                 ),
             )
 
-        self._transaction_runner.run_write(operation)
+        thread_host = create_host_command_handle(self._options)
+        try:
+            thread_host._transaction_runner().run_write(operation)
+        finally:
+            thread_host.close()
         return self._lifecycle_result
+
+
+class _AbandonAlreadyMarkedAdapter:
+    """abandon 调用中保留当前 claim 但制造 abandoned marker CAS 冲突。"""
+
+    def __init__(self, options: HostCommandHandleOptions, wait_id: str) -> None:
+        """初始化 adapter。
+
+        :param options: observation thread 内创建独立 durable handle 的选项。
+        :param wait_id: 本测试要篡改的 Host wait id。
+        :returns: ``None``。
+        """
+
+        self._options = options
+        self._wait_id = wait_id
+        self.abandoned: list[str] = []
+
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
+        """本 adapter 不应处理 waiting poll。
+
+        :param snapshot: adapter snapshot。
+        :returns: 永不返回。
+        :raises AssertionError: 被错误调用时抛出。
+        """
+
+        raise AssertionError(f"unexpected poll for {snapshot.resume_token}")
+
+    def abandon_wait(
+        self, snapshot: WaitAdapterSnapshot
+    ) -> WaitExternalJobLifecycleResult:
+        """写入 abandoned marker 并保留当前 claim。
+
+        :param snapshot: adapter snapshot。
+        :returns: applied lifecycle result。
+        """
+
+        self.abandoned.append(snapshot.resume_token)
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入 abandoned marker。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_abandoned_at = ?
+                WHERE wait_id = ?
+                """,
+                ("2026-05-16T02:00:01.000000Z", self._wait_id),
+            )
+
+        thread_host = create_host_command_handle(self._options)
+        try:
+            thread_host._transaction_runner().run_write(operation)
+        finally:
+            thread_host.close()
+        return WaitExternalJobLifecycleApplied(
+            action=WaitExternalJobLifecycleAction.ABANDON,
+            message="test_abandoned",
+        )
 
 
 class _MutableLifecycleGate:
@@ -391,26 +593,26 @@ class _CloseGateDuringAbandonAdapter:
         self._lifecycle_gate = lifecycle_gate
         self.abandoned: list[str] = []
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """本 adapter 不应处理 waiting poll。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: 永不返回。
         :raises AssertionError: 被错误调用时抛出。
         """
 
-        raise AssertionError(f"unexpected poll for {wait_record.wait_id}")
+        raise AssertionError(f"unexpected poll for {snapshot.resume_token}")
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """记录 abandon 成功并关闭 lifecycle gate。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: applied lifecycle result。
         """
 
-        self.abandoned.append(wait_record.wait_id)
+        self.abandoned.append(snapshot.resume_token)
         self._lifecycle_gate.closed = True
         return WaitExternalJobLifecycleApplied(
             action=WaitExternalJobLifecycleAction.ABANDON,
@@ -515,6 +717,122 @@ def test_poll_adapter_not_ready_leaves_wait_active(
         host.close()
 
 
+def test_poll_adapter_receives_minimal_host_snapshot(tmp_path: Path) -> None:
+    """poll adapter 只能收到 Host 投影的三字段 snapshot。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SnapshotRecordingAdapter()
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        snapshot = adapter.polled_snapshots[0]
+        assert result.not_ready == 1
+        assert tuple(field.name for field in fields(WaitAdapterSnapshot)) == (
+            "tool_name",
+            "resume_token",
+            "created_at",
+        )
+        assert snapshot.tool_name == wait_record.tool_name
+        assert snapshot.resume_token == wait_record.resume_token
+        assert snapshot.created_at == parse_utc_timestamp(wait_record.created_at)
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("resume_token", ("", "x" * 2049))
+def test_wait_adapter_snapshot_rejects_empty_or_too_long_resume_token(
+    resume_token: str,
+) -> None:
+    """adapter snapshot public contract 拒绝空 token 与超长 token。"""
+
+    with pytest.raises(ValueError):
+        WaitAdapterSnapshot(
+            tool_name="long_tool",
+            resume_token=resume_token,
+            created_at=_POLL_NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("resume_token", "   "),
+        ("created_at", "not-a-timestamp"),
+    ),
+)
+def test_poll_adapter_snapshot_projection_failure_releases_with_backoff(
+    tmp_path: Path,
+    field_name: str,
+    field_value: str,
+) -> None:
+    """非法 Host durable snapshot 字段必须在 adapter 调用前 fail closed。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_wait_field_text(host, seeded.wait_id, field_name, field_value)
+        adapter = _SnapshotRecordingAdapter()
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert result.adapter_errors == 1
+        assert result.not_ready == 0
+        assert adapter.polled_snapshots == []
+        assert wait_record.poll_last_outcome is WaitPollLastOutcome.ADAPTER_ERROR
+        assert wait_record.poll_last_error_code == "adapter_exception"
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("resume_token", "   "),
+        ("created_at", "not-a-timestamp"),
+    ),
+)
+def test_abandon_adapter_snapshot_projection_failure_releases_with_backoff(
+    tmp_path: Path,
+    field_name: str,
+    field_value: str,
+) -> None:
+    """cancelled wait 的非法 snapshot 字段不得进入 abandon adapter。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-invalid-snapshot"),
+                client_request_id="poll-cancel-invalid-snapshot",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        _set_wait_field_text(host, seeded.wait_id, field_name, field_value)
+        adapter = _SnapshotRecordingAdapter()
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert result.adapter_errors == 1
+        assert result.abandoned == 0
+        assert adapter.abandoned_snapshots == []
+        assert wait_record.poll_last_outcome is WaitPollLastOutcome.ABANDON_ERROR
+        assert wait_record.poll_last_error_code == "abandon_exception"
+    finally:
+        host.close()
+
+
 def test_poll_adapter_empty_round_does_not_log_poll_summary(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -528,6 +846,7 @@ def test_poll_adapter_empty_round_does_not_log_poll_summary(
             resolver=_NoResolveResolver(),
             context=_context("poller"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.wait_adapter"):
@@ -567,7 +886,8 @@ def test_poll_adapter_lost_result_closes_run(
                 ),
             )
         )
-        poller = _poller(host, adapter, seeded.wait_id)
+        resolver = _RecordingPublicCommandResolver(host)
+        poller = _poller_with_resolver(host, adapter, seeded.wait_id, resolver)
 
         result = poller.poll_once()
 
@@ -576,6 +896,9 @@ def test_poll_adapter_lost_result_closes_run(
         assert result.resolved == 0
         assert result.lost == 1
         assert adapter.poll_count == 1
+        assert len(resolver.idempotency_keys) == 1
+        assert wait_record.resolve_idempotency_key == resolver.idempotency_keys[0]
+        assert wait_record.poll_last_error_code is None
         assert wait_record.status is WaitRecordStatus.LOST
         assert snapshot.status is RunStatus.LOST
     finally:
@@ -611,7 +934,7 @@ def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
         assert second.abandoned == 0
         assert second.observed == 0
         assert adapter.poll_count == 0
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
         assert len(adapter.lifecycle_results) == 1
         assert isinstance(
             adapter.lifecycle_results[0], WaitExternalJobLifecycleApplied
@@ -659,7 +982,7 @@ def test_cancelled_poll_wait_unsupported_marks_terminal_without_resolve(
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert result.abandoned == 1
         assert second.observed == 0
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
         assert resolver.calls == []
         assert wait_record.status is WaitRecordStatus.CANCELLED
         assert wait_record.poll_abandoned_at is not None
@@ -700,7 +1023,7 @@ def test_cancelled_poll_wait_noop_marks_terminal_without_resolve(
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert result.abandoned == 1
         assert second.observed == 0
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
         assert resolver.calls == []
         assert wait_record.status is WaitRecordStatus.CANCELLED
         assert wait_record.poll_abandoned_at is not None
@@ -744,7 +1067,7 @@ def test_cancelled_abandon_success_marks_abandoned_when_close_gate_closes(
         assert result.shutdown_skipped == 0
         assert result.claim_conflicts == 0
         assert second.observed == 0
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
         assert wait_record.poll_abandoned_at is not None
         assert wait_record.poll_last_outcome is WaitPollLastOutcome.ABANDONED
         assert wait_record.poll_claim_id is None
@@ -767,6 +1090,7 @@ def test_missing_poll_adapter_registration_logs_warning(
             resolver=_PublicCommandResolver(host),
             context=_context("poller-missing-adapter"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -811,6 +1135,7 @@ def test_cancelled_poll_wait_missing_adapter_stays_retryable(
             resolver=_NoResolveResolver(),
             context=_context("poller-cancelled-missing-adapter"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -864,8 +1189,8 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
         assert result.adapter_errors == 1
         assert result.not_ready == 1
         assert result.abandoned == 0
-        assert adapter.abandoned == [seeded.wait_id]
-        assert adapter.polled == [followup_wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
+        assert adapter.polled == [_resume_token(host, followup_wait_id)]
         assert "wait adapter abandon failed; continuing" in caplog.text
     finally:
         host.close()
@@ -907,6 +1232,7 @@ def test_resolve_wait_exception_isolated_per_wait_record(
             resolver=resolver,
             context=_context("poller-resolve-failure"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -921,6 +1247,80 @@ def test_resolve_wait_exception_isolated_per_wait_record(
         assert resolver.calls == [seeded.wait_id]
         assert "wait poll resolve failed; continuing" in caplog.text
         assert seeded.wait_id in caplog.text
+    finally:
+        host.close()
+
+
+def test_resolve_wait_exception_readback_failure_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """resolve_wait 失败后的 read-back 再失败也不能冒泡到 supervisor。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter(
+            (
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(
+                            ok=True, value={"ready": True}, meta=None
+                        ),
+                        payload_ref=None,
+                    )
+                ),
+            )
+        )
+        resolver = _FailingResolveResolver()
+        runner = host._transaction_runner()
+        adapter_key = _read_wait(runner, seeded.wait_id).adapter_key
+        original_run_read = runner.run_read
+
+        def _failing_recovery_read(
+            operation: HostTransactionOperation[WaitRecordRow | None],
+        ) -> WaitRecordRow | None:
+            """只让 resolve error recovery 的 wait record 读回失败。
+
+            :param operation: transaction read operation。
+            :returns: 正常 read operation 的返回值。
+            :raises RuntimeError: 读回 wait record 时抛出。
+            """
+
+            if operation.__class__.__name__ == "_ReadWaitRecordOperation":
+                raise RuntimeError("readback failed")
+            return original_run_read(operation)
+
+        monkeypatch.setattr(runner, "run_read", _failing_recovery_read)
+        poller = WaitPoller(
+            transaction_runner=runner,
+            adapter_registry=WaitPollAdapterRegistry(
+                (
+                    WaitPollAdapterRegistration(
+                        adapter_key=adapter_key,
+                        adapter=adapter,
+                    ),
+                )
+            ),
+            resolver=resolver,
+            context=_context("poller-resolve-readback-failure"),
+            clock=_FixedClock(),
+            policy=_wait_poller_policy(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
+
+        monkeypatch.setattr(runner, "run_read", original_run_read)
+        wait_record = _read_wait(runner, seeded.wait_id)
+        assert result.observed == 1
+        assert result.adapter_errors == 1
+        assert result.resolved == 0
+        assert wait_record.status is WaitRecordStatus.WAITING
+        assert wait_record.poll_claim_id is None
+        assert wait_record.poll_last_outcome is WaitPollLastOutcome.RESOLVE_ERROR
+        assert "wait poll resolve recovery read failed; continuing" in caplog.text
     finally:
         host.close()
 
@@ -954,7 +1354,7 @@ def test_failed_cancelled_wait_abandon_is_retried_next_poll(
         assert first.adapter_errors == 1
         assert second.adapter_errors == 0
         assert second.observed == 0
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
     finally:
         host.close()
 
@@ -1046,6 +1446,7 @@ def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
             resolver=failing_resolver,
             context=_context("poller-resolve-failure"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         failed = failing_poller.poll_once()
@@ -1065,6 +1466,7 @@ def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
             resolver=recording_resolver,
             context=_context("poller-resolve-retry"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
         retried = retry_poller.poll_once()
 
@@ -1074,6 +1476,99 @@ def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
         assert wait_after_failure.poll_last_outcome is WaitPollLastOutcome.RESOLVE_ERROR
         assert retried.resolved == 1
         assert failing_resolver.idempotency_keys == recording_resolver.idempotency_keys
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    (
+        _SequenceAdapter(
+            (
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(
+                            ok=True, value={"ready": True}, meta=None
+                        ),
+                        payload_ref=None,
+                    )
+                ),
+            )
+        ),
+        _SequenceAdapter((WaitPollNotReady(),)),
+        _FailingPollAdapter(),
+    ),
+)
+def test_expired_poll_wait_is_released_before_provider_observation(
+    tmp_path: Path,
+    adapter: WaitPollAdapter,
+) -> None:
+    """expired wait 由 Host poll owner 拦截，ready/pending/error 不分裂终态。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_wait_deadline(
+            host,
+            seeded.wait_id,
+            datetime(2026, 5, 16, 1, 59, 59, tzinfo=UTC),
+        )
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+
+        assert result.observed == 1
+        assert result.adapter_errors == 0
+        assert result.boundary_rejections == 1
+        assert result.resolved == 0
+        assert result.lost == 0
+        assert result.not_ready == 0
+        assert wait_record.status is WaitRecordStatus.FAILED
+        assert wait_record.poll_claim_id is None
+        assert wait_record.poll_last_outcome is None
+        assert wait_record.poll_last_error_code is None
+        assert get_run(host, seeded.run_id).status is RunStatus.FAILED
+        if isinstance(adapter, _SequenceAdapter):
+            assert adapter.poll_count == 0
+        if isinstance(adapter, _FailingPollAdapter):
+            assert adapter.polled == []
+    finally:
+        host.close()
+
+
+def test_invalid_poll_deadline_fails_closed_without_business_lost(
+    tmp_path: Path,
+) -> None:
+    """非法 poll deadline fail closed，不调用 provider，也不写业务 LOST。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_wait_deadline_text(host, seeded.wait_id, "not-a-timestamp")
+        adapter = _SequenceAdapter(
+            (
+                WaitPollLost(
+                    ResolveWaitLostOutcome(
+                        reason_code="provider_lost",
+                        message="provider lost",
+                        provider_status_ref=None,
+                    )
+                ),
+            )
+        )
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+
+        assert result.adapter_errors == 0
+        assert result.boundary_rejections == 1
+        assert result.lost == 0
+        assert adapter.poll_count == 0
+        assert wait_record.status is WaitRecordStatus.WAITING
+        assert wait_record.poll_last_outcome is WaitPollLastOutcome.BOUNDARY_REJECTED
+        assert wait_record.poll_last_error_code == "invalid_wait_time_boundary"
     finally:
         host.close()
 
@@ -1096,7 +1591,7 @@ def test_abandon_cas_conflict_leaves_cancelled_wait_retryable(
                 mode=CancelMode.GRACEFUL,
             ),
         )
-        adapter = _AbandonClaimStealingAdapter(host._transaction_runner())
+        adapter = _AbandonClaimStealingAdapter(_options(tmp_path), seeded.wait_id)
         poller = _poller(host, adapter, seeded.wait_id)
 
         result = poller.poll_once()
@@ -1104,9 +1599,43 @@ def test_abandon_cas_conflict_leaves_cancelled_wait_retryable(
 
         assert result.abandoned == 0
         assert result.claim_conflicts == 1
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
         assert wait_record.poll_abandoned_at is None
         assert wait_record.poll_claim_id == "claim-stolen"
+    finally:
+        host.close()
+
+
+def test_abandon_cas_lost_releases_current_claim(
+    tmp_path: Path,
+) -> None:
+    """abandon marker CAS_LOST 时释放当前 claim，避免等待 claim TTL。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-abandon-release"),
+                client_request_id="poll-cancel-abandon-release",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        adapter = _AbandonAlreadyMarkedAdapter(_options(tmp_path), seeded.wait_id)
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+
+        assert result.abandoned == 0
+        assert result.claim_conflicts == 0
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
+        assert wait_record.poll_abandoned_at is not None
+        assert wait_record.poll_claim_id is None
+        assert wait_record.poll_last_outcome is WaitPollLastOutcome.ABANDON_ERROR
     finally:
         host.close()
 
@@ -1149,7 +1678,8 @@ def test_terminal_abandon_cas_conflict_leaves_cancelled_wait_retryable(
             ),
         )
         adapter = _AbandonClaimStealingAdapter(
-            host._transaction_runner(),
+            _options(tmp_path),
+            seeded.wait_id,
             lifecycle_result=lifecycle_result,
         )
         poller = _poller(host, adapter, seeded.wait_id)
@@ -1159,7 +1689,7 @@ def test_terminal_abandon_cas_conflict_leaves_cancelled_wait_retryable(
 
         assert result.abandoned == 0
         assert result.claim_conflicts == 1
-        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.abandoned == [_resume_token(host, seeded.wait_id)]
         assert wait_record.poll_abandoned_at is None
         assert wait_record.poll_last_outcome is None
         assert wait_record.poll_claim_id == "claim-stolen"
@@ -1198,8 +1728,20 @@ def _poller(
         resolver=_PublicCommandResolver(host),
         context=_context("poller"),
         clock=_FixedClock(),
+        policy=_wait_poller_policy(),
         lifecycle_gate=lifecycle_gate,
     )
+
+
+def _resume_token(host: HostCommandHandle, wait_id: str) -> str:
+    """读取 wait record 的 adapter-facing resume token。
+
+    :param host: Host command handle。
+    :param wait_id: wait record id。
+    :returns: resume token。
+    """
+
+    return _read_wait(host._transaction_runner(), wait_id).resume_token
 
 
 def _poller_with_resolver(
@@ -1232,7 +1774,108 @@ def _poller_with_resolver(
         resolver=resolver,
         context=_context("poller"),
         clock=_FixedClock(),
+        policy=_wait_poller_policy(),
     )
+
+
+def _wait_poller_policy() -> WaitPollerRuntimePolicy:
+    """构造字段完整的测试 wait poller policy。
+
+    :returns: 显式包含十二个部署字段的 policy。
+    """
+
+    return WaitPollerRuntimePolicy(
+        enabled=True,
+        poll_interval_seconds=1.0,
+        claim_ttl_seconds=60.0,
+        claim_batch_size=100,
+        backoff_initial_delay_seconds=30.0,
+        backoff_multiplier=2.0,
+        backoff_max_delay_seconds=300.0,
+        not_ready_observe_interval_seconds=1.0,
+        idle_poll_interval_seconds=5.0,
+        adapter_call_timeout_seconds=30.0,
+        close_drain_timeout_seconds=5.0,
+        max_outstanding_adapter_calls=8,
+    )
+
+
+def _set_wait_deadline(
+    host: HostCommandHandle,
+    wait_id: str,
+    deadline: datetime,
+) -> None:
+    """更新测试 wait record deadline。
+
+    :param host: Host command handle。
+    :param wait_id: wait id。
+    :param deadline: deadline UTC datetime。
+    :returns: ``None``。
+    """
+
+    _set_wait_deadline_text(host, wait_id, format_utc_timestamp(deadline))
+
+
+def _set_wait_deadline_text(
+    host: HostCommandHandle,
+    wait_id: str,
+    deadline_text: str,
+) -> None:
+    """更新测试 wait record deadline 原始文本。
+
+    :param host: Host command handle。
+    :param wait_id: wait id。
+    :param deadline_text: deadline 原始文本。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """执行 deadline 文本更新。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET deadline_at = ? WHERE wait_id = ?",
+            (deadline_text, wait_id),
+        )
+
+    host._transaction_runner().run_write(_operation)
+
+
+def _set_wait_field_text(
+    host: HostCommandHandle,
+    wait_id: str,
+    field_name: str,
+    field_value: str,
+) -> None:
+    """更新测试 wait record 的允许文本字段。
+
+    :param host: Host command handle。
+    :param wait_id: wait id。
+    :param field_name: 允许更新的字段名。
+    :param field_value: 字段原始文本。
+    :returns: ``None``。
+    :raises ValueError: 字段不在允许列表中时抛出。
+    """
+
+    if field_name not in {"resume_token", "created_at"}:
+        raise ValueError("unsupported wait text field")
+
+    def _operation(transaction: HostTransaction) -> None:
+        """执行 wait record 字段文本更新。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET {field_name} = ? WHERE wait_id = ?",
+            (field_value, wait_id),
+        )
+
+    host._transaction_runner().run_write(_operation)
 
 
 def _insert_followup_wait_record(

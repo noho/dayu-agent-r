@@ -7,15 +7,15 @@ import inspect
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_spec
-from tests.engine.runners.openai._fakes import FakeCancellationToken
 
 
 def test_runner_isinstance_async_runner_protocol() -> None:
     """``AsyncOpenAIRunner`` 应通过 ``AsyncRunner`` 协议运行时检查。"""
 
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     assert isinstance(runner, AsyncRunner)
 
@@ -47,11 +47,11 @@ def test_is_supports_tool_calling_returns_spec_value() -> None:
 
     runner_true = AsyncOpenAIRunner(
         spec=make_spec(supports_tool_calling=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     runner_false = AsyncOpenAIRunner(
         spec=make_spec(supports_tool_calling=False),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     assert runner_true.is_supports_tool_calling() is True
     assert runner_false.is_supports_tool_calling() is False

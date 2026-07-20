@@ -16,8 +16,8 @@ import dayu.engine.runners.openai.runner as openai_runner
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 from dayu.runtime.cancellation import WaitCancelled
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
-from tests.engine.runners.openai._fakes import FakeCancellationToken
 
 
 class _TrackedResponse:
@@ -299,7 +299,7 @@ async def test_cancel_after_response_acquired_releases_once(
     :raises AssertionError: 回归断言失败时由 pytest 抛出。
     """
 
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     context = _AcquireResponseContext()
     runner = AsyncOpenAIRunner(spec=make_spec(), cancellation_token=token)
     runner._http_client._session = _RaceSession(context)  # type: ignore[attr-defined]
@@ -329,7 +329,7 @@ async def test_outer_task_cancel_after_response_acquired_propagates_and_releases
 
     context = _CancelOuterAfterAcquireContext()
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner_task = asyncio.create_task(
         runner._enter_response_context_or_cancel(context.__aenter__())
@@ -357,7 +357,7 @@ async def test_cancel_before_response_acquired_does_not_release(
 
     context = _NeverAcquireResponseContext()
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = _RaceSession(context)  # type: ignore[attr-defined]
 

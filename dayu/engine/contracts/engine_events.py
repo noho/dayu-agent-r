@@ -15,11 +15,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TypeAlias
 
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    validate_engine_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
+from dayu.engine.contracts.runner_events import (
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AwaitingToolExecutionRecord,
@@ -49,6 +58,7 @@ class EngineEventType(StrEnum):
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION_REQUESTED = "context_compaction_requested"
     USAGE_REPORTED = "usage_reported"
+    PROVIDER_DIAGNOSTIC = "provider_diagnostic"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     ITERATION_COMPLETED = "iteration_completed"
     FINAL_ANSWER = "final_answer"
@@ -143,13 +153,11 @@ class ContentCompleteData:
     :param iteration_id: 当前迭代 id。
     :param content: 完整正文；为 ``None`` 表示无正文。
     :param reasoning_content: 完整推理链文本；为 ``None`` 表示无推理链。
-    :param finish_reason: 完成原因。
     """
 
     iteration_id: str
     content: str | None
     reasoning_content: str | None
-    finish_reason: FinishReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,9 +282,7 @@ class ToolCallsBatchDoneData:
             or self.failed_count < 0
             or self.cancelled_count < 0
         ):
-            raise ValueError(
-                "ToolCallsBatchDoneData counts must be non-negative"
-            )
+            raise ValueError("ToolCallsBatchDoneData counts must be non-negative")
         total = self.completed_count + self.failed_count + self.cancelled_count
         if total != len(self.tool_call_ids):
             raise ValueError(
@@ -327,12 +333,14 @@ class UsageReportedData:
     :param prompt_tokens: 提示 token 数。
     :param completion_tokens: 完成 token 数。
     :param total_tokens: 总 token 数。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示未提供。
     """
 
     iteration_id: str
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    provider_request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,11 +361,53 @@ class ProviderProtocolErrorData:
     """
 
     iteration_id: str
-    error_code: str
+    error_code: EngineErrorCode
     message: str
     provider_request_id: str | None
     raw_payload: JsonValue | None
     partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+    client_correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验 provider protocol error 的错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是 Engine 错误码联合成员时抛出。
+        """
+
+        validate_engine_error_code(
+            self.error_code,
+            field_name="ProviderProtocolErrorData.error_code",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDiagnosticData:
+    """provider 非致命诊断提升事件 data。
+
+    :param iteration_id: 当前迭代 id。
+    :param diagnostic_code: 中性诊断码。
+    :param severity: 诊断严重级别闭集。
+    :param message: 人类可读诊断摘要。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示
+        未提供。
+    :param raw_payload: 有界诊断载荷；为 ``None`` 表示无。不承诺保留
+        provider 原始报错载荷。
+    :param partial_tool_calls: provider stream 诊断发生时已解析但未完成的
+        tool call 有界摘要；不包含 raw argument payload。
+    :param diagnostic_source: 产生诊断的 Runner 内部来源闭集。
+    :param client_correlation_id: 触发诊断的逻辑 Runner 调用客户端关联 id；
+        非 Runner 调用触发时为 ``None``。
+    """
+
+    iteration_id: str
+    diagnostic_code: str
+    severity: RunnerDiagnosticSeverity
+    message: str
+    provider_request_id: str | None
+    raw_payload: JsonValue | None
+    partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+    diagnostic_source: RunnerDiagnosticSource = RunnerDiagnosticSource.HTTP_ADAPTER
     client_correlation_id: str | None = None
 
 
@@ -419,9 +469,7 @@ class RunSuspendedData:
         """
 
         if not self.awaiting_records:
-            raise ValueError(
-                "RunSuspendedData.awaiting_records must be non-empty"
-            )
+            raise ValueError("RunSuspendedData.awaiting_records must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,11 +502,23 @@ class RunFailedData:
     :param recoverable: 是否可恢复。
     """
 
-    error_code: str
+    error_code: EngineErrorCode
     message: str
     provider_request_id: str | None
     recoverable: bool
     client_correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验 run_failed 的错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是 Engine 错误码联合成员时抛出。
+        """
+
+        validate_engine_error_code(
+            self.error_code,
+            field_name="RunFailedData.error_code",
+        )
 
 
 EngineEventData: TypeAlias = (
@@ -474,6 +534,7 @@ EngineEventData: TypeAlias = (
     | ToolAwaitingData
     | ContextCompactionRequestedData
     | UsageReportedData
+    | ProviderDiagnosticData
     | ProviderProtocolErrorData
     | IterationCompletedData
     | FinalAnswerData
@@ -482,6 +543,72 @@ EngineEventData: TypeAlias = (
     | RunFailedData
 )
 """Engine 事件 data 封闭联合。"""
+
+ENGINE_EVENT_TYPE_TO_DATA: Mapping[EngineEventType, type[EngineEventData]] = (
+    MappingProxyType(
+        {
+            EngineEventType.ITERATION_STARTED: IterationStartedData,
+            EngineEventType.CONTENT_DELTA: ContentDeltaData,
+            EngineEventType.REASONING_DELTA: ReasoningDeltaData,
+            EngineEventType.CONTENT_COMPLETED: ContentCompleteData,
+            EngineEventType.TOOL_CALL_DELTA: ToolCallDeltaData,
+            EngineEventType.TOOL_CALLS_BATCH_READY: ToolCallsBatchReadyData,
+            EngineEventType.TOOL_CALL_REQUESTED: ToolCallRequestedData,
+            EngineEventType.TOOL_RESULT_ACCEPTED: ToolResultAcceptedData,
+            EngineEventType.TOOL_CALLS_BATCH_DONE: ToolCallsBatchDoneData,
+            EngineEventType.TOOL_AWAITING: ToolAwaitingData,
+            EngineEventType.CONTEXT_COMPACTION_REQUESTED: (
+                ContextCompactionRequestedData
+            ),
+            EngineEventType.USAGE_REPORTED: UsageReportedData,
+            EngineEventType.PROVIDER_DIAGNOSTIC: ProviderDiagnosticData,
+            EngineEventType.PROVIDER_PROTOCOL_ERROR: ProviderProtocolErrorData,
+            EngineEventType.ITERATION_COMPLETED: IterationCompletedData,
+            EngineEventType.FINAL_ANSWER: FinalAnswerData,
+            EngineEventType.RUN_SUSPENDED: RunSuspendedData,
+            EngineEventType.RUN_CANCELLED: RunCancelledData,
+            EngineEventType.RUN_FAILED: RunFailedData,
+        }
+    )
+)
+"""EngineEvent type/data 配对真源。"""
+
+
+def engine_event_type_for_data(data: EngineEventData) -> EngineEventType:
+    """根据 EngineEvent data 类型返回对应事件类型。
+
+    :param data: EngineEvent data 联合成员。
+    :returns: 与 data 类型唯一对应的 EngineEventType。
+    :raises TypeError: ``data`` 不是 EngineEventData 闭集成员时抛出。
+    """
+
+    for event_type, data_type in ENGINE_EVENT_TYPE_TO_DATA.items():
+        if isinstance(data, data_type):
+            return event_type
+    raise TypeError("EngineEvent.data has unsupported type")
+
+
+def validate_engine_event_pairing(
+    event_type: EngineEventType, data: EngineEventData
+) -> None:
+    """校验 EngineEvent type/data 判别关系。
+
+    :param event_type: EngineEventType。
+    :param data: EngineEvent data 联合成员。
+    :returns: ``None``。
+    :raises TypeError: ``event_type`` 不是 EngineEventType，或 ``data`` 不是
+        EngineEventData 闭集成员时抛出。
+    :raises ValueError: type 与 data 类型不匹配时抛出。
+    """
+
+    if not isinstance(event_type, EngineEventType):
+        raise TypeError("EngineEvent.type must be EngineEventType")
+    actual_type = engine_event_type_for_data(data)
+    if actual_type is not event_type:
+        raise ValueError(
+            "EngineEvent.type/data mismatch: "
+            f"type={event_type.value} data_type={type(data).__name__}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +631,16 @@ class EngineEvent:
     type: EngineEventType
     data: EngineEventData
     metadata: Mapping[str, JsonValue] | None
+
+    def __post_init__(self) -> None:
+        """校验 EngineEvent 公共判别契约。
+
+        :returns: ``None``。
+        :raises TypeError: ``type`` 或 ``data`` 类型非法时抛出。
+        :raises ValueError: ``type`` 与 ``data`` 不匹配时抛出。
+        """
+
+        validate_engine_event_pairing(self.type, self.data)
 
 
 TERMINAL_ENGINE_EVENT_TYPES: frozenset[EngineEventType] = frozenset(
@@ -550,6 +687,7 @@ __all__ = [
     "ToolAwaitingData",
     "ContextCompactionRequestedData",
     "UsageReportedData",
+    "ProviderDiagnosticData",
     "ProviderProtocolErrorData",
     "PartialToolCallSummary",
     "IterationCompletedData",
@@ -558,7 +696,10 @@ __all__ = [
     "RunCancelledData",
     "RunFailedData",
     "EngineEventData",
+    "ENGINE_EVENT_TYPE_TO_DATA",
     "EngineEvent",
+    "engine_event_type_for_data",
+    "validate_engine_event_pairing",
     "TERMINAL_ENGINE_EVENT_TYPES",
     "runner_role_sequence_digest",
 ]

@@ -11,15 +11,16 @@ from pathlib import Path
 from typing import Protocol, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import SecDownloader
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
+    UploadOperationResult,
     UploadCancellationChecker,
     build_material_ids,
     build_sec_filing_ids,
     derive_report_kind,
-    reset_upload_target_for_overwrite,
     resolve_upload_action,
     validate_material_upload_ids,
 )
@@ -30,7 +31,11 @@ from dayu.fins.pipelines.upload_progress_helpers import (
     map_upload_file_event_to_filing_event_type as _map_upload_file_event_to_filing_event_type,
     map_upload_file_event_to_material_event_type as _map_upload_file_event_to_material_event_type,
 )
-from dayu.fins.storage import CompanyMetaRepositoryProtocol, SourceDocumentRepositoryProtocol
+from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    CompanyMetaRepositoryProtocol,
+    SourceDocumentRepositoryProtocol,
+)
 from dayu.fins.ticker_normalization import normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -38,6 +43,12 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 
 class SecUploadWorkflowHost(Protocol):
     """SEC upload 工作流所需的最小宿主边界。"""
+
+    @property
+    def _batching_repository(self) -> BatchingRepositoryProtocol:
+        """返回 batch lifecycle 唯一仓储。"""
+
+        ...
 
     @property
     def _downloader(self) -> SecDownloader:
@@ -189,24 +200,22 @@ async def run_upload_filing_stream(
         },
     )
     try:
-        upsert_company_meta_for_upload(
-            repository=host._company_repository,
-            ticker=normalized_ticker,
-            action=normalized_action,
-            company_id=company_id,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-        )
-        reset_upload_target_for_overwrite(
-            source_repository=host._source_repository,
-            ticker=normalized_ticker,
-            document_id=document_id,
-            source_kind=SourceKind.FILING,
-            action=normalized_action,
-            overwrite=overwrite,
-            previous_meta=previous_meta,
-        )
-        upload_result = host._upload_service.execute_upload(
+        company_batch = host._batching_repository.begin_batch(normalized_ticker)
+        try:
+            upsert_company_meta_for_upload(
+                repository=host._company_repository,
+                ticker=normalized_ticker,
+                action=normalized_action,
+                company_id=company_id,
+                company_name=company_name,
+                ticker_aliases=ticker_aliases,
+                batch=company_batch,
+            )
+        except BaseException:
+            host._batching_repository.rollback_batch(company_batch)
+            raise
+        host._batching_repository.commit_batch(company_batch)
+        prepared_upload = host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.FILING,
             action=normalized_action,
@@ -218,7 +227,7 @@ async def run_upload_filing_stream(
             cancellation_checker=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
-                "ingest_method": "upload",
+                "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "fiscal_year": fiscal_year,
                 "fiscal_period": normalized_period,
                 "report_kind": derive_report_kind(normalized_period),
@@ -227,6 +236,22 @@ async def run_upload_filing_stream(
                 "amended": amended,
             },
         )
+        if isinstance(prepared_upload, UploadOperationResult):
+            upload_result = prepared_upload
+        else:
+            document_batch = host._batching_repository.begin_batch(normalized_ticker)
+            try:
+                upload_result = host._upload_service.publish_prepared_upload(
+                    prepared_upload,
+                    batch=document_batch,
+                )
+            except BaseException:
+                host._batching_repository.rollback_batch(document_batch)
+                raise
+            if upload_result.status == "cancelled":
+                host._batching_repository.rollback_batch(document_batch)
+            else:
+                host._batching_repository.commit_batch(document_batch)
         for file_event in upload_result.file_events:
             yield UploadFilingEvent(
                 event_type=_map_upload_file_event_to_filing_event_type(file_event),
@@ -385,24 +410,22 @@ async def run_upload_material_stream(
         },
     )
     try:
-        upsert_company_meta_for_upload(
-            repository=host._company_repository,
-            ticker=normalized_ticker,
-            action=normalized_action,
-            company_id=company_id,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-        )
-        reset_upload_target_for_overwrite(
-            source_repository=host._source_repository,
-            ticker=normalized_ticker,
-            document_id=resolved_document_id,
-            source_kind=SourceKind.MATERIAL,
-            action=normalized_action,
-            overwrite=overwrite,
-            previous_meta=previous_meta,
-        )
-        upload_result = host._upload_service.execute_upload(
+        company_batch = host._batching_repository.begin_batch(normalized_ticker)
+        try:
+            upsert_company_meta_for_upload(
+                repository=host._company_repository,
+                ticker=normalized_ticker,
+                action=normalized_action,
+                company_id=company_id,
+                company_name=company_name,
+                ticker_aliases=ticker_aliases,
+                batch=company_batch,
+            )
+        except BaseException:
+            host._batching_repository.rollback_batch(company_batch)
+            raise
+        host._batching_repository.commit_batch(company_batch)
+        prepared_upload = host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.MATERIAL,
             action=normalized_action,
@@ -414,7 +437,7 @@ async def run_upload_material_stream(
             cancellation_checker=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
-                "ingest_method": "upload",
+                "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "material_name": material_name,
                 "fiscal_year": fiscal_year,
                 "fiscal_period": normalized_fiscal_period,
@@ -422,6 +445,22 @@ async def run_upload_material_stream(
                 "report_date": report_date,
             },
         )
+        if isinstance(prepared_upload, UploadOperationResult):
+            upload_result = prepared_upload
+        else:
+            document_batch = host._batching_repository.begin_batch(normalized_ticker)
+            try:
+                upload_result = host._upload_service.publish_prepared_upload(
+                    prepared_upload,
+                    batch=document_batch,
+                )
+            except BaseException:
+                host._batching_repository.rollback_batch(document_batch)
+                raise
+            if upload_result.status == "cancelled":
+                host._batching_repository.rollback_batch(document_batch)
+            else:
+                host._batching_repository.commit_batch(document_batch)
         for file_event in upload_result.file_events:
             yield UploadMaterialEvent(
                 event_type=_map_upload_file_event_to_material_event_type(file_event),

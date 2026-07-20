@@ -60,8 +60,8 @@ EXCLUDED_COMMAND_NAMES: tuple[str, ...] = (
     "cancel",
     "conv",
 )
-FILING_ACTION_CHOICES: tuple[str, ...] = ("create", "update", "delete")
-BATCH_UPLOAD_ACTION_CHOICES: tuple[str, ...] = ("create", "update")
+FILING_ACTION_CHOICES: tuple[str, ...] = ("auto", "create", "update", "delete")
+BATCH_UPLOAD_ACTION_CHOICES: tuple[str, ...] = ("auto", "create", "update")
 
 
 class CommandSubparserRegistry(Protocol):
@@ -139,26 +139,18 @@ class ParsedCliArgs(argparse.Namespace):
     label: str | None
     model_name: str | None
     thinking: bool
-    web_provider: str | None
     temperature: float | None
     tool_timeout_seconds: float | None
-    enable_tool_trace: bool
-    tool_trace_dir: str | None
     max_iterations: int | None
     fallback_mode: str | None
     fallback_prompt: str | None
     max_consecutive_failed_tool_batches: int | None
-    max_duplicate_tool_calls: int | None
-    duplicate_tool_hint_prompt: str | None
-    doc_limits_json: str | None
-    fins_limits_json: str | None
     forms: list[str] | None
     start: str | None
     end: str | None
     reset: bool
     overwrite: bool
     rebuild: bool
-    infer: bool
     action: str
     files: list[str] | None
     fiscal_year: int | None
@@ -170,11 +162,11 @@ class ParsedCliArgs(argparse.Namespace):
     material_name: str | None
     document_id: str | list[str] | None
     internal_document_id: str | None
-    ci: bool
     source_dir: str | None
     output: str | None
     recursive: bool
     material_forms: list[str] | None
+    infer: bool
     session_action: str | None
     session_id: str | None
     kind: str | None
@@ -251,27 +243,19 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.label = None
     namespace.model_name = None
     namespace.thinking = True
-    namespace.web_provider = None
     namespace.temperature = None
     namespace.tool_timeout_seconds = None
-    namespace.enable_tool_trace = False
-    namespace.tool_trace_dir = None
     namespace.max_iterations = None
     namespace.fallback_mode = None
     namespace.fallback_prompt = None
     namespace.max_consecutive_failed_tool_batches = None
-    namespace.max_duplicate_tool_calls = None
-    namespace.duplicate_tool_hint_prompt = None
-    namespace.doc_limits_json = None
-    namespace.fins_limits_json = None
     namespace.forms = None
     namespace.start = None
     namespace.end = None
     namespace.reset = False
     namespace.overwrite = False
     namespace.rebuild = False
-    namespace.infer = False
-    namespace.action = "create"
+    namespace.action = "auto"
     namespace.files = None
     namespace.fiscal_year = None
     namespace.fiscal_period = None
@@ -282,11 +266,11 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.material_name = None
     namespace.document_id = None
     namespace.internal_document_id = None
-    namespace.ci = False
     namespace.source_dir = None
     namespace.output = None
     namespace.recursive = False
     namespace.material_forms = None
+    namespace.infer = False
     namespace.session_action = None
     namespace.session_id = None
     namespace.kind = None
@@ -329,7 +313,7 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         "--log-file",
         dest="log_file",
         default=argparse.SUPPRESS,
-        help="把诊断日志追加写入指定文件；未提供时写入系统临时目录 dayu-cli-*.log。",
+        help="把诊断日志追加写入指定文件；未提供时日志仅保留到本次进程结束。",
     )
     parser.add_argument(
         "--debug",
@@ -345,8 +329,7 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         dest="debug_stream",
         default=argparse.SUPPRESS,
         help=(
-            "启用普通 DEBUG 以及高频 stream delta、SSE、逐 delta ingest "
-            "诊断；不要与互相矛盾的日志等级参数组合使用。"
+            "启用普通 DEBUG 以及高频 stream delta、SSE、逐 delta ingest " "诊断；不要与互相矛盾的日志等级参数组合使用。"
         ),
     )
     parser.add_argument(
@@ -421,8 +404,16 @@ def _register_init_command(
         command_name=COMMAND_INIT,
         help_text="初始化当前工作区配置骨架。",
     )
-    parser.add_argument("--reset", action="store_true", help="重置已有工作区配置。")
-    parser.add_argument("--overwrite", action="store_true", help="覆盖已有配置文件。")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="确认后重建 .dayu 与 config 两个受管根，并优先于 --overwrite。",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="从当前 package 默认值重建 config，但保留 .dayu 与其它 workspace 路径。",
+    )
 
 
 def _register_prompt_command(
@@ -640,7 +631,7 @@ def _add_session_selector_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
-    """为 Agent 类命令追加旧 CLI 用户可见执行参数。
+    """为 Agent 类命令追加当前可执行的用户参数。
 
     :param parser: 目标命令解析器。
     :returns: ``None``。
@@ -663,19 +654,12 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
         help="不在终端显示运行态思考展示。",
     )
-    parser.add_argument("--web-provider", help="Web 工具 provider 覆盖标识。")
     parser.add_argument("--temperature", type=float, help="本轮模型采样温度覆盖值。")
     parser.add_argument(
         "--tool-timeout-seconds",
         type=float,
         help="本轮工具执行超时秒数覆盖值。",
     )
-    parser.add_argument(
-        "--enable-tool-trace",
-        action="store_true",
-        help="保留的工具追踪开关。",
-    )
-    parser.add_argument("--tool-trace-dir", help="保留的工具追踪输出目录。")
     parser.add_argument("--max-iterations", type=int, help="本轮最大推理迭代次数。")
     parser.add_argument("--fallback-mode", help="本轮 fallback 策略。")
     parser.add_argument("--fallback-prompt", help="本轮 fallback 提示文本。")
@@ -684,17 +668,6 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="连续失败工具批次上限。",
     )
-    parser.add_argument(
-        "--max-duplicate-tool-calls",
-        type=int,
-        help="保留的重复工具调用治理上限。",
-    )
-    parser.add_argument(
-        "--duplicate-tool-hint-prompt",
-        help="保留的重复工具调用提示文本。",
-    )
-    parser.add_argument("--doc-limits-json", help="保留的文档工具限制 JSON。")
-    parser.add_argument("--fins-limits-json", help="保留的财报工具限制 JSON。")
 
 
 def _add_detail_display_arguments(parser: argparse.ArgumentParser) -> None:
@@ -759,7 +732,6 @@ def _register_download_command(
     parser.add_argument("--end", help="最晚 filing 日期。")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有原始文档。")
     parser.add_argument("--rebuild", action="store_true", help="重建已处理结果。")
-    parser.add_argument("--infer", action="store_true", help="保留的主体别名推断开关。")
 
 
 def _register_upload_filing_command(
@@ -784,7 +756,6 @@ def _register_upload_filing_command(
     _add_upload_action_argument(parser, choices=FILING_ACTION_CHOICES)
     parser.add_argument("--files", nargs="+", help="待上传文件路径。")
     _add_filing_metadata_arguments(parser)
-    parser.add_argument("--infer", action="store_true", help="保留的元数据推断开关。")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有文档。")
 
 
@@ -814,7 +785,6 @@ def _register_upload_material_command(
     parser.add_argument("--document-id", help="已有文档标识。")
     parser.add_argument("--internal-document-id", help="内部文档标识。")
     _add_filing_metadata_arguments(parser)
-    parser.add_argument("--infer", action="store_true", help="保留的元数据推断开关。")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有文档。")
 
 
@@ -834,15 +804,30 @@ def _register_upload_filings_from_command(
         subparsers,
         global_parent,
         command_name=COMMAND_UPLOAD_FILINGS_FROM,
-        help_text="从目录生成批量上传计划。",
+        help_text="从目录生成可执行的批量上传脚本。",
     )
     _add_required_ticker_argument(parser)
     parser.add_argument("--from", dest="source_dir", required=True, help="待扫描目录。")
     _add_upload_action_argument(parser, choices=BATCH_UPLOAD_ACTION_CHOICES)
-    parser.add_argument("--output", help="输出计划文件路径。")
+    parser.add_argument(
+        "--output",
+        help="脚本输出文件或既有目录；未提供时写入 --base 工作区根目录。",
+    )
     parser.add_argument("--recursive", action="store_true", help="递归扫描目录。")
     _add_filing_metadata_arguments(parser)
     parser.add_argument("--material-forms", nargs="+", help="补充材料关联报表类型。")
+    parser.add_argument(
+        "--infer",
+        action="store_true",
+        default=False,
+        help="使用 FMP 公司信息补全公司名称与 ticker aliases（需要 FMP_API_KEY）。",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="允许每条生成的上传命令覆盖已有存储文档；不控制脚本文件替换。",
+    )
 
 
 def _register_process_command(
@@ -870,7 +855,6 @@ def _register_process_command(
         help="指定待处理文档，可重复传入或使用逗号分隔。",
     )
     parser.add_argument("--overwrite", action="store_true", help="重建已处理结果。")
-    parser.add_argument("--ci", action="store_true", help="保留的 CI 快照开关。")
 
 
 def _register_process_filing_command(
@@ -894,7 +878,6 @@ def _register_process_filing_command(
     _add_required_ticker_argument(parser)
     parser.add_argument("--document-id", required=True, help="待处理 filing 文档标识。")
     parser.add_argument("--overwrite", action="store_true", help="重建已处理结果。")
-    parser.add_argument("--ci", action="store_true", help="保留的 CI 快照开关。")
 
 
 def _register_process_material_command(
@@ -918,7 +901,6 @@ def _register_process_material_command(
     _add_required_ticker_argument(parser)
     parser.add_argument("--document-id", required=True, help="待处理材料文档标识。")
     parser.add_argument("--overwrite", action="store_true", help="重建已处理结果。")
-    parser.add_argument("--ci", action="store_true", help="保留的 CI 快照开关。")
 
 
 def _add_required_ticker_argument(parser: argparse.ArgumentParser) -> None:
@@ -932,9 +914,7 @@ def _add_required_ticker_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ticker", required=True, help="公司代码或财报主体。")
 
 
-def _add_upload_action_argument(
-    parser: argparse.ArgumentParser, *, choices: tuple[str, ...]
-) -> None:
+def _add_upload_action_argument(parser: argparse.ArgumentParser, *, choices: tuple[str, ...]) -> None:
     """追加上传类命令的 ``--action`` 参数。
 
     :param parser: 目标命令解析器。
@@ -946,7 +926,7 @@ def _add_upload_action_argument(
     parser.add_argument(
         "--action",
         choices=choices,
-        default="create",
+        default="auto",
         help="上传动作。",
     )
 

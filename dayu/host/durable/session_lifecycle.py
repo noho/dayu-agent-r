@@ -43,7 +43,9 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.state import (
@@ -62,11 +64,11 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 
 _EVENT_TYPE_SESSION_CREATED = "SESSION_CREATED"
 _EVENT_TYPE_SESSION_CLOSED = "SESSION_CLOSED"
-_OPERATION_ENSURE_SESSION = "ensure_session"
-_OPERATION_CREATE_SESSION = "create_session"
-_OPERATION_CLOSE_SESSION = "close_session"
+_OPERATION_ENSURE_SESSION = IdempotencyScopeKind.ENSURE_SESSION
+_OPERATION_CREATE_SESSION = IdempotencyScopeKind.CREATE_SESSION
+_OPERATION_CLOSE_SESSION = IdempotencyScopeKind.CLOSE_SESSION
 _IDEMPOTENCY_SCOPE_ID_HOST = "host"
-_IDEMPOTENCY_RESULT_KIND_SESSION = "session"
+_IDEMPOTENCY_RESULT_KIND_SESSION = IdempotencyResultKind.SESSION
 _EVENT_SOURCE = "host.session_lifecycle"
 _EVENT_ID_PREFIX = "event"
 _SESSION_ID_PREFIX = "session"
@@ -743,7 +745,10 @@ def _create_bound_slot(
 
 
 def _idempotency_scope(
-    *, operation: str, scope_id: str, idempotency_key: str
+    *,
+    operation: IdempotencyScopeKind,
+    scope_id: str,
+    idempotency_key: str,
 ) -> IdempotencyScope:
     """构造 lifecycle 幂等 scope。
 

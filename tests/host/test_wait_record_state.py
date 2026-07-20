@@ -17,6 +17,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.state import (
     AttemptRow,
     ExternalJobRef,
@@ -136,11 +137,12 @@ def _seed_run(transaction: HostTransaction, *, run_id: str = "run-1") -> None:
             started_event_sequence=started_sequence,
             terminal_event_id=None,
             terminal_event_sequence=None,
+            cancel_request_event_id=None,
             current_attempt_id=None,
             source_run_id=None,
             source_run_relation=None,
             execution_target="local-default",
-            queue_policy="queue",
+            queue_policy=RunQueuePolicy.QUEUE,
             created_at=_TIMESTAMP,
             updated_at=_TIMESTAMP,
             terminal_at=None,
@@ -224,7 +226,7 @@ def _insert_event(
             run_id,
             attempt_id,
             execution_id,
-            "TEST_EVENT",
+            "USER_INPUT_ACCEPTED",
             _TIMESTAMP,
             None,
             None,
@@ -413,8 +415,16 @@ def test_wait_record_status_and_policy_codecs_are_closed() -> None:
 
 
 def test_wait_poll_terminal_outcome_codecs_roundtrip_new_values() -> None:
-    """新增 cancelled lifecycle terminal outcome 使用 StrEnum value roundtrip。"""
+    """新增 Host wait poll outcome 使用 StrEnum value roundtrip。"""
 
+    assert (
+        serialize_wait_poll_last_outcome(WaitPollLastOutcome.BOUNDARY_REJECTED)
+        == "boundary_rejected"
+    )
+    assert (
+        deserialize_wait_poll_last_outcome("boundary_rejected")
+        is WaitPollLastOutcome.BOUNDARY_REJECTED
+    )
     assert (
         serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDON_UNSUPPORTED)
         == "abandon_unsupported"
@@ -1049,6 +1059,75 @@ def test_cancelled_poll_abandoned_row_is_not_eligible(tmp_path: Path) -> None:
             return result.status
 
         assert store.transaction_runner.run_write(operation) is StateMutationStatus.NOT_FOUND
+
+
+def test_cancelled_poll_timeout_release_preserves_claimability_after_due(
+    tmp_path: Path,
+) -> None:
+    """cancelled wait timeout release 后保持非终态并可在到期时再次 claim。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[WaitRecordRow, WaitRecordRow]:
+            """claim、release cancelled wait，再在 due 时重新 claim。
+
+            :param transaction: Host transaction。
+            :returns: release 后与重新 claim 后的 wait row。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(
+                transaction,
+                _wait_row(transaction, status=WaitRecordStatus.CANCELLED),
+            )
+            claimed = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-timeout",
+                owner_id="poller-timeout",
+                now=_TIMESTAMP,
+                claim_expires_at=_LATER_TIMESTAMP,
+            )
+            assert claimed.status is StateMutationStatus.UPDATED
+            released = release_wait_record_poll_claim(
+                transaction,
+                wait_id="wait-1",
+                claim_id="claim-timeout",
+                next_observe_at=_LATER_TIMESTAMP,
+                backoff_attempt=1,
+                last_outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                last_error_code="wait_abandon_timeout",
+                last_error_message="wait adapter abandon exceeded Host time budget",
+                updated_at=_TIMESTAMP,
+            )
+            assert released.status is StateMutationStatus.UPDATED
+            assert released.row is not None
+            retry = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-retry",
+                owner_id="poller-retry",
+                now=_LATER_TIMESTAMP,
+                claim_expires_at=_FUTURE_TIMESTAMP,
+            )
+            assert retry.status is StateMutationStatus.UPDATED
+            assert retry.row is not None
+            return released.row, retry.row
+
+        released_row, retry_row = store.transaction_runner.run_write(operation)
+        assert released_row.status is WaitRecordStatus.CANCELLED
+        assert released_row.poll_claim_id is None
+        assert released_row.poll_claim_owner_id is None
+        assert released_row.poll_claimed_at is None
+        assert released_row.poll_claim_expires_at is None
+        assert released_row.poll_next_observe_at == _LATER_TIMESTAMP
+        assert released_row.poll_backoff_attempt == 1
+        assert released_row.poll_last_outcome is WaitPollLastOutcome.ABANDON_ERROR
+        assert released_row.poll_last_error_code == "wait_abandon_timeout"
+        assert released_row.poll_abandoned_at is None
+        assert retry_row.poll_claim_id == "claim-retry"
+        assert retry_row.poll_claim_owner_id == "poller-retry"
+        assert retry_row.poll_backoff_attempt == 1
+        assert retry_row.poll_abandoned_at is None
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import cast
 
 import pytest
 
@@ -29,18 +30,29 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
     EngineRunOutcomeSuspended,
 )
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    EngineRunErrorCode,
+    RunnerSpecificErrorCode,
+    RunnerSpecificErrorSource,
+    adapter_error_code,
+    runner_protocol_error_code,
+    serialize_engine_error_code,
+)
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
     IterationCompletedData,
+    ProviderDiagnosticData,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
     TERMINAL_ENGINE_EVENT_TYPES,
     ToolCallDeltaData,
+    UsageReportedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -50,6 +62,8 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
+    ContextOverflowDetection,
+    ContextOverflowDetectionKind,
     RunnerContentCompletedData,
     RunnerContentDeltaData,
     RunnerDoneData,
@@ -59,13 +73,20 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
-from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
     ToolAwaitSnapshot,
@@ -81,9 +102,45 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _CONTINUATION_MAX_ATTEMPTS: int = 3
+
+
+def _assert_engine_run_error_code(
+    actual: EngineErrorCode, expected: EngineRunErrorCode
+) -> None:
+    """断言 Engine-owned 失败码保持枚举身份并可序列化。
+
+    :param actual: 被测失败码。
+    :param expected: 期望的 Engine-owned 失败码枚举成员。
+    :returns: 无返回值。
+    :raises AssertionError: 失败码身份或序列化文本不符合预期时抛出。
+    """
+
+    assert actual is expected
+    assert serialize_engine_error_code(actual) == expected.value
+
+
+def _assert_runner_specific_error_code(
+    actual: EngineErrorCode,
+    *,
+    expected_value: str,
+    expected_source: RunnerSpecificErrorSource,
+) -> None:
+    """断言 provider / runner 专有失败码保持 wrapper 类型与来源。
+
+    :param actual: 被测失败码。
+    :param expected_value: 期望的序列化文本。
+    :param expected_source: 期望的失败码来源闭集成员。
+    :returns: 无返回值。
+    :raises AssertionError: 失败码类型、来源或序列化文本不符合预期时抛出。
+    """
+
+    assert isinstance(actual, RunnerSpecificErrorCode)
+    assert actual.source is expected_source
+    assert serialize_engine_error_code(actual) == expected_value
 
 
 def _utc_now() -> datetime:
@@ -94,54 +151,6 @@ def _utc_now() -> datetime:
     """
 
     return datetime.now(tz=timezone.utc)
-
-
-@dataclass(slots=True)
-class _Token:
-    """测试用 cancellation token。"""
-
-    cancelled: bool = False
-    reason: str | None = None
-    requested: datetime | None = None
-
-    def is_cancelled(self) -> bool:
-        """返回是否已取消。
-
-        :returns: 已取消返回 ``True``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.cancelled
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 取消原因或 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.reason
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 请求时间或 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.requested
-
-    def trigger(self, reason: str = "test_cancelled") -> None:
-        """触发取消。
-
-        :param reason: 取消原因。
-        :returns: 无返回值。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.cancelled = True
-        self.reason = reason
-        self.requested = _utc_now()
 
 
 class _NoopToolExecutor:
@@ -181,8 +190,10 @@ class _ScriptedRunner:
 
     events: tuple[RunnerEvent, ...]
     token_to_cancel_after_event_index: int | None = None
-    token: _Token | None = None
+    token: ControllableCancellationToken | None = None
     raise_on_call: bool = False
+    cancel_before_raise: bool = False
+    raise_after_event_index: int | None = None
     raise_on_close: bool = False
     raise_cancelled_on_close: bool = False
     block_after_first_event: bool = False
@@ -251,6 +262,8 @@ class _ScriptedRunner:
         """
 
         if self.raise_on_call:
+            if self.cancel_before_raise and self.token is not None:
+                self.token.request_cancel("runner_exception_race")
             raise RuntimeError("runner exploded")
         for index, event in enumerate(self.events):
             yield event
@@ -259,9 +272,81 @@ class _ScriptedRunner:
                 and self.token is not None
                 and index == self.token_to_cancel_after_event_index
             ):
-                self.token.trigger()
+                self.token.request_cancel()
+            if self.raise_after_event_index == index:
+                raise RuntimeError("runner exploded after event")
             if index == 0 and self.block_after_first_event:
                 await self.release_event.wait()
+
+
+class _MalformedPairingRunner:
+    """测试用 malformed RunnerEvent 生产者。"""
+
+    close_count: int
+
+    def __init__(self) -> None:
+        """初始化测试 Runner。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count = 0
+
+    def call(
+        self,
+        messages: Sequence[AgentMessage],
+        options: RunnerCallOptions,
+        tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
+    ) -> AsyncIterator[RunnerEvent]:
+        """返回会在迭代时构造非法 RunnerEvent 的事件流。
+
+        :param messages: Agent 消息。
+        :param options: Runner 调用选项。
+        :param tools: 暴露给模型的工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
+        :returns: RunnerEvent 异步流。
+        :raises ValueError: 迭代时由 RunnerEvent 构造边界抛出。
+        """
+
+        del messages, options, tools, request_identity
+        return self._iter_events()
+
+    def is_supports_tool_calling(self) -> bool:
+        """声明支持工具调用。
+
+        :returns: ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    async def close(self) -> None:
+        """记录 close 调用。
+
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+    async def _iter_events(self) -> AsyncIterator[RunnerEvent]:
+        """迭代时构造 type/data 矛盾 RunnerEvent。
+
+        :returns: 理论上不会成功产出的 RunnerEvent 流。
+        :raises ValueError: RunnerEvent 公共契约拒绝 malformed pairing。
+        """
+
+        yield RunnerEvent(
+            type=RunnerEventType.RUNNER_CONTENT_DELTA,
+            data=RunnerDoneData(
+                finish_reason=FinishReason.STOP,
+                provider_request_id=None,
+            ),
+            occurred_at=_utc_now(),
+        )
 
 
 class _PublicEntryDefaultRunner:
@@ -377,7 +462,7 @@ def _event(event_type: RunnerEventType, data: RunnerEventData) -> RunnerEvent:
 
 def _request(
     *,
-    token: _Token | None = None,
+    token: ControllableCancellationToken | None = None,
     max_iterations: int = 1,
     tool_schemas: tuple[ToolSchema, ...] = (),
 ) -> AgentRunRequest:
@@ -390,13 +475,11 @@ def _request(
     :raises Exception: 不主动抛出异常。
     """
 
-    actual_token = token or _Token()
+    actual_token = token or ControllableCancellationToken()
     return AgentRunRequest(
         run_id="run_phase2",
         session_id="session_phase2",
-        messages=(
-            UserMessage(role=AgentMessageRole.USER, content="hello"),
-        ),
+        messages=(UserMessage(role=AgentMessageRole.USER, content="hello"),),
         disable_tools=True,
         runner_spec=RunnerSpec(
             provider="openai",
@@ -423,6 +506,8 @@ def _request(
             continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=tool_schemas,
         tool_executor=_NoopToolExecutor(),
@@ -442,6 +527,35 @@ async def _collect(agent: _AsyncAgent) -> list[EngineEvent]:
 
     events: list[EngineEvent] = []
     async for event in agent.run_messages():
+        events.append(event)
+    return events
+
+
+async def _collect_with_cancel_after_iteration_completed(
+    *,
+    agent: _AsyncAgent,
+    token: ControllableCancellationToken,
+    completed_ordinal: int = 1,
+) -> list[EngineEvent]:
+    """在指定 RunnerDone commit 对外可见后请求取消并继续消费。
+
+    :param agent: 被测私有 Agent。
+    :param token: Agent 使用的可控取消 token。
+    :param completed_ordinal: 触发取消的 ``ITERATION_COMPLETED`` 序号。
+    :returns: 完整 EngineEvent 列表。
+    :raises StopAsyncIteration: stream 未产出目标 completed event 时抛出。
+    """
+
+    stream = agent.run_messages()
+    events: list[EngineEvent] = []
+    completed_count = 0
+    while completed_count < completed_ordinal:
+        event = await anext(stream)
+        events.append(event)
+        if event.type is EngineEventType.ITERATION_COMPLETED:
+            completed_count += 1
+    token.request_cancel("post_runner_done")
+    async for event in stream:
         events.append(event)
     return events
 
@@ -494,6 +608,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
                     prompt_tokens=1,
                     completion_tokens=2,
                     total_tokens=3,
+                    provider_request_id="req-usage",
                 ),
             ),
             _event(
@@ -501,12 +616,13 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
                 RunnerContentCompletedData(
                     content="你好",
                     reasoning_content="想",
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         )
     )
@@ -539,9 +655,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert request_identity.runner_call_index == 1
     assert request_identity.client_correlation_id.startswith("dayu-")
     iteration_completed = [
-        event
-        for event in events
-        if event.type is EngineEventType.ITERATION_COMPLETED
+        event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]
     assert len(iteration_completed) == 1
     assert isinstance(iteration_completed[0].data, IterationCompletedData)
@@ -549,14 +663,78 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
         iteration_completed[0].data.client_correlation_id
         == request_identity.client_correlation_id
     )
+    usage_reported = [
+        event for event in events if event.type is EngineEventType.USAGE_REPORTED
+    ]
+    assert len(usage_reported) == 1
+    assert isinstance(usage_reported[0].data, UsageReportedData)
+    assert usage_reported[0].data.provider_request_id == "req-usage"
     _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
-async def test_finish_reason_mismatch_logs_warning(
+async def test_whitespace_only_final_answer_fails_closed() -> None:
+    """Engine 拥有 final answer 有效性，纯空白回答必须失败收口。
+
+    :returns: ``None``。
+    :raises AssertionError: 纯空白回答被解释成成功 final 时抛出。
+    """
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content=" \n\t ",
+                    reasoning_content=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req_blank",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code is EngineRunErrorCode.RUNNER_EMPTY_FINAL_CONTENT
+    assert terminal.data.provider_request_id == "req_blank"
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_malformed_runner_event_pairing_fails_closed() -> None:
+    """custom Runner malformed event 不得被 Agent 解释成成功 final。
+
+    :returns: ``None``。
+    :raises AssertionError: malformed RunnerEvent 被解释成成功 final 时抛出。
+    """
+
+    runner = _MalformedPairingRunner()
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code is EngineRunErrorCode.RUNNER_EXCEPTION
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_runner_done_finish_reason_is_authority(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """finish_reason 不一致时必须记录 warning 且保留更早完成原因。"""
+    """RunnerDoneData.finish_reason 是唯一迭代完成原因真源。"""
 
     runner = _ScriptedRunner(
         events=(
@@ -565,7 +743,6 @@ async def test_finish_reason_mismatch_logs_warning(
                 RunnerContentCompletedData(
                     content="partial",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -581,17 +758,16 @@ async def test_finish_reason_mismatch_logs_warning(
 
     events = await _collect(_AsyncAgent(request=_request(), runner=runner))
 
-    assert any(
+    assert not any(
         "engine.agent.finish_reason_mismatch" in record.getMessage()
         for record in caplog.records
     )
     iteration_completed = [
-        event for event in events
-        if event.type is EngineEventType.ITERATION_COMPLETED
+        event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]
     assert len(iteration_completed) == 1
     assert isinstance(iteration_completed[0].data, IterationCompletedData)
-    assert iteration_completed[0].data.finish_reason is FinishReason.STOP
+    assert iteration_completed[0].data.finish_reason is FinishReason.LENGTH
 
 
 @pytest.mark.asyncio
@@ -612,7 +788,6 @@ async def test_async_agent_uses_injected_runner_without_default_runner(
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -656,12 +831,13 @@ async def test_phase2_passes_empty_tools_even_when_request_has_schema() -> None:
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         )
     )
@@ -685,7 +861,7 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
             _event(
                 RunnerEventType.PROVIDER_PROTOCOL_ERROR,
                 RunnerProtocolErrorData(
-                    error_code="bad_sse",
+                    error_code=runner_protocol_error_code("bad_sse"),
                     message="bad stream",
                     provider_request_id="req_1",
                     raw_payload={"type": "bad"},
@@ -706,10 +882,67 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
-    assert terminal.data.error_code == "bad_sse"
+    _assert_runner_specific_error_code(
+        terminal.data.error_code,
+        expected_value="bad_sse",
+        expected_source=RunnerSpecificErrorSource.RUNNER_PROTOCOL,
+    )
     assert isinstance(events[-2].data, IterationCompletedData)
     assert events[-2].data.provider_request_id == "req_1"
     assert terminal.data.provider_request_id == "req_1"
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_provider_diagnostic_does_not_create_failure_candidate() -> None:
+    """Runner 非致命诊断提升为 Engine diagnostic，不影响成功终态。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.PROVIDER_DIAGNOSTIC,
+                RunnerProviderDiagnosticData(
+                    diagnostic_code="usage_field_malformed",
+                    severity=RunnerDiagnosticSeverity.WARNING,
+                    message="usage ignored",
+                    provider_request_id="req_diag",
+                    raw_payload={"prompt_tokens_type": "str"},
+                    diagnostic_source=RunnerDiagnosticSource.SSE_PARSER,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="ok",
+                    reasoning_content=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req_diag",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.PROVIDER_DIAGNOSTIC,
+        EngineEventType.CONTENT_COMPLETED,
+        EngineEventType.ITERATION_COMPLETED,
+        EngineEventType.FINAL_ANSWER,
+    ]
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, ProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "usage_field_malformed"
+    assert diagnostic.severity is RunnerDiagnosticSeverity.WARNING
+    assert diagnostic.diagnostic_source is RunnerDiagnosticSource.SSE_PARSER
+    assert diagnostic.provider_request_id == "req_diag"
+    assert events[-1].type is EngineEventType.FINAL_ANSWER
     _assert_single_terminal_at_end(events)
 
 
@@ -748,7 +981,11 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
         EngineEventType.RUN_FAILED,
     ]
     assert isinstance(events[-1].data, RunFailedData)
-    assert events[-1].data.error_code == "rate_limit_exceeded"
+    _assert_runner_specific_error_code(
+        events[-1].data.error_code,
+        expected_value="rate_limit_exceeded",
+        expected_source=RunnerSpecificErrorSource.ADAPTER,
+    )
     assert isinstance(events[-2].data, IterationCompletedData)
     assert events[-2].data.provider_request_id == "req_http"
     assert events[-1].data.provider_request_id == "req_http"
@@ -797,9 +1034,118 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     assert events[-2].data.provider_request_id == "req_context"
     terminal = events[-1]
     assert isinstance(terminal.data, RunFailedData)
-    assert terminal.data.error_code == "context_compaction_required"
+    _assert_engine_run_error_code(
+        terminal.data.error_code,
+        EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
+    )
     assert terminal.data.provider_request_id == "req_context"
     assert terminal.data.recoverable
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_without_detection_emits_only_compaction_request() -> (
+    None
+):
+    """typed context overflow 无检测来源时不生成 provider diagnostic。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                    http_status=400,
+                    message="maximum context length is 128000 tokens",
+                    provider_request_id="req_context_no_detection",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                    context_overflow_detection=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_context_no_detection",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        EngineEventType.ITERATION_COMPLETED,
+        EngineEventType.RUN_FAILED,
+    ]
+    assert EngineEventType.PROVIDER_DIAGNOSTIC not in {event.type for event in events}
+    compact_event = events[1]
+    assert isinstance(compact_event.data, ContextCompactionRequestedData)
+    assert compact_event.data.provider_request_id == "req_context_no_detection"
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_marker_fallback_emits_nonfatal_diagnostic() -> None:
+    """message marker fallback provenance 进入 diagnostic，不替代压缩事实。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                    http_status=400,
+                    message="context length exceeded",
+                    provider_request_id="req_context_marker",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                    context_overflow_detection=ContextOverflowDetection(
+                        kind=(ContextOverflowDetectionKind.MESSAGE_MARKER_FALLBACK),
+                        diagnostic_code=("context_overflow_message_marker_fallback"),
+                        message="marker fallback detected context overflow",
+                        raw_payload={"detection_kind": "message_marker_fallback"},
+                    ),
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_context_marker",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.PROVIDER_DIAGNOSTIC,
+        EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        EngineEventType.ITERATION_COMPLETED,
+        EngineEventType.RUN_FAILED,
+    ]
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, ProviderDiagnosticData)
+    assert diagnostic.diagnostic_source is (
+        RunnerDiagnosticSource.CONTEXT_OVERFLOW_CLASSIFIER
+    )
+    assert diagnostic.diagnostic_code == ("context_overflow_message_marker_fallback")
+    compact = events[2].data
+    assert isinstance(compact, ContextCompactionRequestedData)
+    assert compact.provider_request_id == "req_context_marker"
+    terminal = events[-1].data
+    assert isinstance(terminal, RunFailedData)
+    _assert_engine_run_error_code(
+        terminal.error_code,
+        EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
+    )
+    assert terminal.recoverable
 
 
 @pytest.mark.asyncio
@@ -810,7 +1156,9 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
         events=(
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR, provider_request_id=None
+                ),
             ),
         )
     )
@@ -819,7 +1167,10 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
-    assert terminal.data.error_code == "runner_error_done_without_detail"
+    _assert_engine_run_error_code(
+        terminal.data.error_code,
+        EngineRunErrorCode.RUNNER_ERROR_DONE_WITHOUT_DETAIL,
+    )
     assert terminal.data.provider_request_id is None
 
 
@@ -832,16 +1183,147 @@ async def test_runner_exception_maps_to_run_failed_and_closes() -> None:
 
     assert _final_event(events).type is EngineEventType.RUN_FAILED
     assert isinstance(events[-1].data, RunFailedData)
-    assert events[-1].data.error_code == "runner_exception"
+    _assert_engine_run_error_code(
+        events[-1].data.error_code,
+        EngineRunErrorCode.RUNNER_EXCEPTION,
+    )
     assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_exception_preserves_first_failure_candidate() -> None:
+    """runner 异常不覆盖先到的 protocol、HTTP 或 context 候选。"""
+
+    protocol_code = runner_protocol_error_code("first_protocol_failure")
+    cases: tuple[tuple[RunnerEvent, EngineErrorCode, str, bool], ...] = (
+        (
+            _event(
+                RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+                RunnerProtocolErrorData(
+                    error_code=protocol_code,
+                    message="first protocol failure",
+                    provider_request_id="req_first_protocol",
+                    raw_payload=None,
+                ),
+            ),
+            protocol_code,
+            "req_first_protocol",
+            False,
+        ),
+        (
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.SERVER_ERROR,
+                    http_status=503,
+                    message="first http failure",
+                    provider_request_id="req_first_http",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                ),
+            ),
+            adapter_error_code("server_error"),
+            "req_first_http",
+            False,
+        ),
+        (
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                    http_status=400,
+                    message="first context failure",
+                    provider_request_id="req_first_context",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                ),
+            ),
+            EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
+            "req_first_context",
+            True,
+        ),
+    )
+
+    for event, expected_code, expected_request_id, recoverable in cases:
+        runner = _ScriptedRunner(
+            events=(event,),
+            raise_after_event_index=0,
+        )
+
+        events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+        terminal = _final_event(events)
+        assert terminal.type is EngineEventType.RUN_FAILED
+        assert isinstance(terminal.data, RunFailedData)
+        assert terminal.data.error_code == expected_code
+        assert terminal.data.provider_request_id == expected_request_id
+        assert terminal.data.recoverable is recoverable
+        assert runner.close_count == 1
+        _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_runner_exception_and_cancel_without_done_prefers_cancel() -> None:
+    """没有 RunnerDone 时，异常与取消竞态仍由 pre-done 取消抢占。"""
+
+    token = ControllableCancellationToken()
+    runner = _ScriptedRunner(
+        events=(),
+        token=token,
+        raise_on_call=True,
+        cancel_before_raise=True,
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(token=token), runner=runner))
+
+    assert _final_event(events).type is EngineEventType.RUN_CANCELLED
+    assert EngineEventType.RUN_FAILED not in {event.type for event in events}
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_runner_done_with_invalid_finish_reason_fails_closed() -> None:
+    """非法或缺失 finish_reason 不得建立 RunnerDone commit。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=cast(FinishReason, None),
+                    provider_request_id="req_invalid_finish",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert EngineEventType.ITERATION_COMPLETED not in {event.type for event in events}
+    assert EngineEventType.FINAL_ANSWER not in {event.type for event in events}
+    assert EngineEventType.TOOL_CALLS_BATCH_READY not in {
+        event.type for event in events
+    }
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    _assert_engine_run_error_code(
+        terminal.data.error_code,
+        EngineRunErrorCode.RUNNER_ABNORMAL_STOP,
+    )
+    assert terminal.data.message == ("runner done has invalid or missing finish reason")
+    assert terminal.data.provider_request_id == "req_invalid_finish"
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
 
 
 def test_exception_diagnostic_message_marks_truncation() -> None:
     """异常诊断消息被截断时必须显式携带截断标记。"""
 
-    message = agent_module._exception_diagnostic_message(
-        RuntimeError("x" * 500)
-    )
+    message = agent_module._exception_diagnostic_message(RuntimeError("x" * 500))
 
     assert message.startswith("RuntimeError: ")
     assert message.endswith("... [truncated]")
@@ -874,9 +1356,7 @@ def test_exception_diagnostic_message_preserves_normal_token_and_header_words(
 ) -> None:
     """异常诊断保留不含 secret 值的 token/header 普通诊断词。"""
 
-    message = agent_module._exception_diagnostic_message(
-        RuntimeError(raw_message)
-    )
+    message = agent_module._exception_diagnostic_message(RuntimeError(raw_message))
 
     assert message == f"RuntimeError: {raw_message}"
 
@@ -900,9 +1380,7 @@ def test_exception_diagnostic_message_redacts_sensitive_value_patterns(
 ) -> None:
     """异常诊断只要包含疑似 secret 明文值就整条脱敏。"""
 
-    message = agent_module._exception_diagnostic_message(
-        RuntimeError(raw_message)
-    )
+    message = agent_module._exception_diagnostic_message(RuntimeError(raw_message))
 
     assert message == "RuntimeError: exception message redacted"
     assert "sk-secret-value" not in message
@@ -925,9 +1403,7 @@ def test_exception_diagnostic_message_redacts_semicolon_value_start(
     :raises Exception: 不主动抛出异常。
     """
 
-    message = agent_module._exception_diagnostic_message(
-        RuntimeError(raw_message)
-    )
+    message = agent_module._exception_diagnostic_message(RuntimeError(raw_message))
 
     assert message == "RuntimeError: exception message redacted"
 
@@ -953,9 +1429,7 @@ def test_exception_diagnostic_message_preserves_closing_punctuation_start(
     :raises Exception: 不主动抛出异常。
     """
 
-    message = agent_module._exception_diagnostic_message(
-        RuntimeError(raw_message)
-    )
+    message = agent_module._exception_diagnostic_message(RuntimeError(raw_message))
 
     assert message == f"RuntimeError: {raw_message}"
 
@@ -969,10 +1443,7 @@ def test_safe_log_message_redacts_blank_or_whitespace(raw_message: str) -> None:
     :raises Exception: 不主动抛出异常。
     """
 
-    assert (
-        agent_module._safe_log_message(raw_message)
-        == "exception message redacted"
-    )
+    assert agent_module._safe_log_message(raw_message) == "exception message redacted"
 
 
 @pytest.mark.parametrize(
@@ -1039,12 +1510,10 @@ def test_safe_log_message_preserves_false_positive_guards(
 async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
     """入口已取消时不调用 Runner，但先 close 再产出 run_cancelled。"""
 
-    token = _Token()
-    token.trigger()
+    token = ControllableCancellationToken()
+    token.request_cancel()
     runner = _ScriptedRunner(events=())
-    events = await _collect(
-        _AsyncAgent(request=_request(token=token), runner=runner)
-    )
+    events = await _collect(_AsyncAgent(request=_request(token=token), runner=runner))
 
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_CANCELLED
@@ -1060,7 +1529,7 @@ async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
 async def test_runner_cancelled_naturally_without_done_maps_cancelled() -> None:
     """Runner 因取消自然结束且无 done 时由 Agent 收口 run_cancelled。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1071,9 +1540,7 @@ async def test_runner_cancelled_naturally_without_done_maps_cancelled() -> None:
         token_to_cancel_after_event_index=0,
         token=token,
     )
-    events = await _collect(
-        _AsyncAgent(request=_request(token=token), runner=runner)
-    )
+    events = await _collect(_AsyncAgent(request=_request(token=token), runner=runner))
 
     assert _final_event(events).type is EngineEventType.RUN_CANCELLED
     assert EngineEventType.FINAL_ANSWER not in {event.type for event in events}
@@ -1083,7 +1550,7 @@ async def test_runner_cancelled_naturally_without_done_maps_cancelled() -> None:
 async def test_cancel_before_final_answer_wins_over_final() -> None:
     """final_answer 前取消优先于最终回答。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1091,20 +1558,19 @@ async def test_cancel_before_final_answer_wins_over_final() -> None:
                 RunnerContentCompletedData(
                     content="should not final",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         ),
         token_to_cancel_after_event_index=0,
         token=token,
     )
-    events = await _collect(
-        _AsyncAgent(request=_request(token=token), runner=runner)
-    )
+    events = await _collect(_AsyncAgent(request=_request(token=token), runner=runner))
 
     assert _final_event(events).type is EngineEventType.RUN_CANCELLED
     assert EngineEventType.FINAL_ANSWER not in {event.type for event in events}
@@ -1114,13 +1580,13 @@ async def test_cancel_before_final_answer_wins_over_final() -> None:
 async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
     """provider error 与取消同时出现时取消优先于 failure terminal。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
                 RunnerEventType.PROVIDER_PROTOCOL_ERROR,
                 RunnerProtocolErrorData(
-                    error_code="bad",
+                    error_code=runner_protocol_error_code("bad"),
                     message="bad",
                     provider_request_id=None,
                     raw_payload=None,
@@ -1128,15 +1594,15 @@ async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR, provider_request_id=None
+                ),
             ),
         ),
         token_to_cancel_after_event_index=0,
         token=token,
     )
-    events = await _collect(
-        _AsyncAgent(request=_request(token=token), runner=runner)
-    )
+    events = await _collect(_AsyncAgent(request=_request(token=token), runner=runner))
 
     assert _final_event(events).type is EngineEventType.RUN_CANCELLED
 
@@ -1145,7 +1611,7 @@ async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
 async def test_http_error_and_cancel_same_run_cancel_wins() -> None:
     """HTTP error 后若取消同时到达，取消优先于 failure terminal。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1162,17 +1628,143 @@ async def test_http_error_and_cancel_same_run_cancel_wins() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR, provider_request_id=None
+                ),
             ),
         ),
         token_to_cancel_after_event_index=0,
         token=token,
     )
-    events = await _collect(
-        _AsyncAgent(request=_request(token=token), runner=runner)
-    )
+    events = await _collect(_AsyncAgent(request=_request(token=token), runner=runner))
 
     assert _final_event(events).type is EngineEventType.RUN_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_post_done_cancel_does_not_override_ordinary_final() -> None:
+    """普通回答的 RunnerDone commit 拒绝其后到达的取消覆盖。"""
+
+    token = ControllableCancellationToken()
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="committed answer",
+                    reasoning_content=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req_post_done_final",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect_with_cancel_after_iteration_completed(
+        agent=_AsyncAgent(request=_request(token=token), runner=runner),
+        token=token,
+    )
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.FINAL_ANSWER
+    assert isinstance(terminal.data, FinalAnswerData)
+    assert terminal.data.content == "committed answer"
+    assert EngineEventType.RUN_CANCELLED not in {event.type for event in events}
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_post_done_cancel_does_not_override_protocol_error_failure() -> None:
+    """协议错误的 RunnerDone commit 保留首个错误事实。"""
+
+    token = ControllableCancellationToken()
+    error_code = runner_protocol_error_code("bad_post_done_protocol")
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+                RunnerProtocolErrorData(
+                    error_code=error_code,
+                    message="bad committed stream",
+                    provider_request_id="req_post_done_protocol",
+                    raw_payload=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_post_done_protocol",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect_with_cancel_after_iteration_completed(
+        agent=_AsyncAgent(request=_request(token=token), runner=runner),
+        token=token,
+    )
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code == error_code
+    assert terminal.data.provider_request_id == "req_post_done_protocol"
+    assert terminal.data.recoverable is False
+    assert EngineEventType.RUN_CANCELLED not in {event.type for event in events}
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_post_done_cancel_does_not_override_http_error_failure() -> None:
+    """HTTP 错误的 RunnerDone commit 保留 adapter 错误事实。"""
+
+    token = ControllableCancellationToken()
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.SERVER_ERROR,
+                    http_status=503,
+                    message="provider unavailable",
+                    provider_request_id="req_post_done_http",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_post_done_http",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect_with_cancel_after_iteration_completed(
+        agent=_AsyncAgent(request=_request(token=token), runner=runner),
+        token=token,
+    )
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code == adapter_error_code("server_error")
+    assert terminal.data.provider_request_id == "req_post_done_http"
+    assert terminal.data.recoverable is False
+    assert EngineEventType.RUN_CANCELLED not in {event.type for event in events}
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
@@ -1186,12 +1778,13 @@ async def test_close_error_does_not_override_terminal() -> None:
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         ),
         raise_on_close=True,
@@ -1227,12 +1820,13 @@ async def test_close_cancelled_error_releases_run_slot() -> None:
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         ),
         raise_cancelled_on_close=True,
@@ -1286,7 +1880,10 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
         events = await _collect(_AsyncAgent(request=_request(), runner=runner))
         assert _final_event(events).type is EngineEventType.RUN_FAILED
         assert isinstance(events[-1].data, RunFailedData)
-        assert events[-1].data.error_code == "runner_abnormal_stop"
+        _assert_engine_run_error_code(
+            events[-1].data.error_code,
+            EngineRunErrorCode.RUNNER_ABNORMAL_STOP,
+        )
         assert EngineEventType.TOOL_CALL_REQUESTED not in {
             event.type for event in events
         }
@@ -1302,13 +1899,9 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
     # fail-closed 路径下 executor 未被调用，TOOL_CALLS_BATCH_READY 不应出现。
     assert ready_events == []
 
-    delta_events = await _collect(
-        _AsyncAgent(request=_request(), runner=delta_runner)
-    )
+    delta_events = await _collect(_AsyncAgent(request=_request(), runner=delta_runner))
     tool_delta_events = [
-        event
-        for event in delta_events
-        if event.type is EngineEventType.TOOL_CALL_DELTA
+        event for event in delta_events if event.type is EngineEventType.TOOL_CALL_DELTA
     ]
     assert len(tool_delta_events) == 1
     assert isinstance(tool_delta_events[0].data, ToolCallDeltaData)
@@ -1327,12 +1920,13 @@ async def test_length_and_content_filter_final_boundaries() -> None:
                     RunnerContentCompletedData(
                         content="partial",
                         reasoning_content=None,
-                        finish_reason=finish_reason,
                     ),
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=finish_reason, provider_request_id=None),
+                    RunnerDoneData(
+                        finish_reason=finish_reason, provider_request_id=None
+                    ),
                 ),
             )
         )
@@ -1358,9 +1952,7 @@ async def test_content_filter_final_logs_bounded_provider_message(
     :raises AssertionError: 诊断日志缺少过滤原因或回答预览时抛出。
     """
 
-    provider_message = (
-        "The request was rejected because it was considered high risk"
-    )
+    provider_message = "The request was rejected because it was considered high risk"
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1368,7 +1960,6 @@ async def test_content_filter_final_logs_bounded_provider_message(
                 RunnerContentCompletedData(
                     content=provider_message,
                     reasoning_content=None,
-                    finish_reason=FinishReason.CONTENT_FILTER,
                 ),
             ),
             _event(
@@ -1416,7 +2007,10 @@ async def test_abnormal_stop_and_max_iterations_fail() -> None:
         )
     )
     assert isinstance(abnormal[-1].data, RunFailedData)
-    assert abnormal[-1].data.error_code == "runner_abnormal_stop"
+    _assert_engine_run_error_code(
+        abnormal[-1].data.error_code,
+        EngineRunErrorCode.RUNNER_ABNORMAL_STOP,
+    )
 
     exceeded = await _collect(
         _AsyncAgent(
@@ -1434,6 +2028,8 @@ async def test_abnormal_stop_and_max_iterations_fail() -> None:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         )
 
 
@@ -1449,7 +2045,9 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         ),
         block_after_first_event=True,
@@ -1490,7 +2088,9 @@ async def test_outer_asyncio_cancelled_error_propagates_and_closes() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP, provider_request_id=None
+                ),
             ),
         ),
         block_after_first_event=True,
@@ -1533,12 +2133,13 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
                     RunnerContentCompletedData(
                         content="ok",
                         reasoning_content=None,
-                        finish_reason=FinishReason.STOP,
                     ),
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+                    RunnerDoneData(
+                        finish_reason=FinishReason.STOP, provider_request_id=None
+                    ),
                 ),
             )
         ),
@@ -1546,13 +2147,16 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
             events=(
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
+                    RunnerDoneData(
+                        finish_reason=FinishReason.ERROR, provider_request_id=None
+                    ),
                 ),
             )
         ),
         _ScriptedRunner(events=()),
     ]
-    token = _Token(cancelled=True, reason="stop", requested=_utc_now())
+    token = ControllableCancellationToken()
+    token.request_cancel("stop")
     requests = [request, request, _request(token=token)]
 
     for runner, current_request, expected_type in zip(
@@ -1626,7 +2230,7 @@ async def test_run_agent_and_wait_preserves_provider_request_id(
             run_id=request.run_id,
             type=EngineEventType.RUN_FAILED,
             data=RunFailedData(
-                error_code="provider_http_error",
+                error_code=adapter_error_code("provider_http_error"),
                 message="provider failed",
                 provider_request_id=expected_provider_request_id,
                 client_correlation_id=expected_client_correlation_id,
@@ -1641,7 +2245,11 @@ async def test_run_agent_and_wait_preserves_provider_request_id(
     assert isinstance(result, EngineRunOutcomeFailed)
     assert result.provider_request_id == expected_provider_request_id
     assert result.client_correlation_id == expected_client_correlation_id
-    assert result.error_code == "provider_http_error"
+    _assert_runner_specific_error_code(
+        result.error_code,
+        expected_value="provider_http_error",
+        expected_source=RunnerSpecificErrorSource.ADAPTER,
+    )
 
 
 @pytest.mark.asyncio
@@ -1717,11 +2325,10 @@ async def test_run_agent_and_wait_maps_suspended(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_and_wait_logs_unknown_terminal_shape(
+async def test_engine_event_rejects_unknown_terminal_shape_before_aggregation(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """terminal type 与 data 不匹配时必须记录 warning。"""
+    """非法 terminal pairing 在 EngineEvent owner 处失败。"""
 
     async def fake_messages(
         request: AgentRunRequest,
@@ -1730,7 +2337,7 @@ async def test_run_agent_and_wait_logs_unknown_terminal_shape(
 
         :param request: Agent run 请求。
         :returns: EngineEvent 异步流。
-        :raises Exception: 不主动抛出异常。
+        :raises ValueError: EngineEvent 构造边界拒绝错误 pairing。
         """
 
         yield EngineEvent(
@@ -1739,7 +2346,7 @@ async def test_run_agent_and_wait_logs_unknown_terminal_shape(
             run_id=request.run_id,
             type=EngineEventType.FINAL_ANSWER,
             data=RunFailedData(
-                error_code="bad_terminal_shape",
+                error_code=EngineRunErrorCode.MISSING_TERMINAL,
                 message="bad terminal shape",
                 provider_request_id=None,
                 recoverable=False,
@@ -1747,16 +2354,10 @@ async def test_run_agent_and_wait_logs_unknown_terminal_shape(
             metadata=None,
         )
 
-    caplog.set_level(logging.WARNING, logger="dayu.engine.agent")
     monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
 
-    result = await agent_module.run_agent_and_wait(_request())
-
-    assert isinstance(result, EngineRunOutcomeFailed)
-    assert any(
-        "engine.agent.unknown_terminal_shape" in record.getMessage()
-        for record in caplog.records
-    )
+    with pytest.raises(ValueError, match="type/data mismatch"):
+        await agent_module.run_agent_and_wait(_request())
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

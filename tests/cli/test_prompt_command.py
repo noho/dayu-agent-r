@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
+import getpass
 import io
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -10,16 +12,18 @@ from datetime import UTC, datetime
 from types import TracebackType
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
+import dayu.cli.commands.init as init_command
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
+import dayu.cli.session_execution as session_execution
 import dayu.service.scene_context as scene_context
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
-    unsupported_execution_option_names,
 )
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -36,6 +40,8 @@ from dayu.host.api import (
     FollowupBehavior,
     FollowupSnapshot,
     Host,
+    HostApiError,
+    HostApiErrorCode,
     HostActivityCounts,
     HostActivityKind,
     HostActivitySeverity,
@@ -60,16 +66,19 @@ from dayu.host.api import (
     SessionSnapshot,
     SessionStatus,
     SubmitFollowupRequest,
+    TerminalResultSummary,
+    is_terminal_run_status,
 )
 from dayu.service.entrypoint_runtime import EntrypointRuntimeRequest
 from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
+from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.output import render_prompt_terminal_result
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.runtime_display import RuntimeDisplayController
-from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
+from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
-from dayu.service.entrypoint_runtime import EntrypointThinking
+from dayu.service.entrypoint_runtime import EntrypointRunTerminalResult, EntrypointThinking
 from dayu.fins.resolver import FmpCompanyInfo
 
 _REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
@@ -90,6 +99,50 @@ _PROMPT_CURRENT_TIME_TEXT = (
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+
+
+class _TtySecretInput(io.StringIO):
+    """只允许 capability 检查、禁止 init secret owner 逐行读取的 TTY fake。"""
+
+    def isatty(self) -> bool:
+        """声明 caller-owned stdin 具有 TTY 能力。
+
+        :returns: 始终返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    def readline(self, size: int = -1, /) -> str:
+        """拒绝 TTY secret owner 误入 redirected stdin 路径。
+
+        :param size: 兼容文本流协议的最大读取长度；测试不消费。
+        :returns: 本方法不返回。
+        :raises AssertionError: 任何调用都表示 TTY capability 分流漂移。
+        """
+
+        del size
+        raise AssertionError("TTY secret input must not call stdin.readline")
+
+
+async def _raise_cli_terminal_cursor_error(
+    *,
+    workspace_root: Path,
+    session_id: str,
+    terminal_event_id: str,
+    event_sequence: int,
+) -> None:
+    """模拟 CLI terminal cursor 持久化失败。
+
+    :param workspace_root: workspace 根目录。
+    :param session_id: Host Session id。
+    :param terminal_event_id: 已渲染 terminal event id。
+    :param event_sequence: 已渲染 terminal event sequence。
+    :returns: ``None``。
+    :raises CliTerminalCursorError: 始终抛出，模拟本地 cursor 写入失败。
+    """
+
+    raise CliTerminalCursorError("cursor write failed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +274,7 @@ class _FakeHost:
     _run_statuses: tuple[RunStatus, ...]
     _run_status_index: int
     block_cancel_after_record: bool
+    _create_error: HostApiError | None
 
     def __init__(
         self,
@@ -232,6 +286,7 @@ class _FakeHost:
         outbox_item: OutboxTerminalItem | None = None,
         cancel_terminal: HostEvent | None = None,
         block_cancel_after_record: bool = False,
+        create_error: HostApiError | None = None,
     ) -> None:
         """初始化 fake Host。
 
@@ -243,6 +298,7 @@ class _FakeHost:
         :param outbox_item: outbox fallback 返回的 terminal item。
         :param cancel_terminal: cancel 返回前推入的 terminal event。
         :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
+        :param create_error: create_session 时抛出的 HostApiError。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -262,6 +318,7 @@ class _FakeHost:
         self._run_statuses = run_statuses
         self._run_status_index = 0
         self.block_cancel_after_record = block_cancel_after_record
+        self._create_error = create_error
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 请求。
@@ -288,6 +345,8 @@ class _FakeHost:
 
         self.calls.append("create_session")
         self.create_requests.append(request)
+        if self._create_error is not None:
+            raise self._create_error
         slot = None
         if request.scope is not None and request.slot_key is not None:
             slot = SessionSlotRef(scope=request.scope, slot_key=request.slot_key)
@@ -747,7 +806,7 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
         submit_events=(_activity_event(),),
     )
     captured_requests: list[EntrypointRuntimeRequest] = []
-    real_prepare = prompt_command.prepare_entrypoint_runtime
+    real_prepare = session_execution.prepare_entrypoint_runtime
 
     async def capture_prepare(
         request: EntrypointRuntimeRequest,
@@ -759,7 +818,7 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.delenv("FMP_API_KEY", raising=False)
-    monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
+    monkeypatch.setattr(session_execution, "prepare_entrypoint_runtime", capture_prepare)
     monkeypatch.setattr(
         prompt_command,
         "open_host",
@@ -820,7 +879,7 @@ def test_prompt_command_ticker_uses_fmp_company_name_when_resolved(
 
     fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
     captured_requests: list[EntrypointRuntimeRequest] = []
-    real_prepare = prompt_command.prepare_entrypoint_runtime
+    real_prepare = session_execution.prepare_entrypoint_runtime
 
     async def capture_prepare(
         request: EntrypointRuntimeRequest,
@@ -834,7 +893,7 @@ def test_prompt_command_ticker_uses_fmp_company_name_when_resolved(
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
     monkeypatch.setattr(scene_context, "FmpCompanyInfoResolver", _FakePromptFmpResolver)
-    monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
+    monkeypatch.setattr(session_execution, "prepare_entrypoint_runtime", capture_prepare)
     monkeypatch.setattr(
         prompt_command,
         "open_host",
@@ -878,18 +937,24 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
             "请继续分析",
         )
     )
-    prepared = await prompt_command._prepare_prompt_existing_session_execution(
+    prepared = await session_execution.prepare_prompt_session_execution(
         args,
         command_name="session",
         scenario="prompt",
         user_prompt="请继续分析",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
     )
     fake_host = _FakeHost(
         submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
         submit_events=(_activity_event(),),
     )
 
-    exit_code = await prompt_command._execute_prompt_on_existing_session(
+    exit_code = await session_execution.execute_prompt_on_session(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
@@ -910,6 +975,164 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
     )
     assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=2)
     assert cursor_record.seen_terminal_event_ids == ("terminal-run-1-2",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    (
+        (HostTerminalStatus.FAILED, EXIT_FAILURE),
+        (HostTerminalStatus.CANCELLED, EXIT_KEYBOARD_INTERRUPT),
+        (HostTerminalStatus.LOST, EXIT_FAILURE),
+    ),
+)
+async def test_prompt_existing_session_advances_terminal_cursor_after_rendering_non_success_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: HostTerminalStatus,
+    expected_exit_code: int,
+) -> None:
+    """prompt 已渲染非成功 terminal 后必须推进本地 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param terminal_status: 本轮 Host terminal status。
+    :param expected_exit_code: renderer policy 产生的 CLI 退出码。
+    :returns: ``None``。
+    :raises AssertionError: cursor 未推进或退出码被 cursor 逻辑改写时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请继续分析",
+        )
+    )
+    prepared = await session_execution.prepare_prompt_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请继续分析",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
+    )
+    fake_host = _FakeHost(submit_terminal=_terminal_event(status=terminal_status))
+
+    exit_code = await session_execution.execute_prompt_on_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        sigint_monitor=_NoopSigintMonitor(),
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == expected_exit_code
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=2)
+    assert cursor_record.seen_terminal_event_ids == ("terminal-run-1-2",)
+
+
+@pytest.mark.asyncio
+async def test_prompt_cursor_write_failure_propagates_after_terminal_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt 已渲染 terminal 后 cursor 写失败必须作为本地投递错误传播。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: cursor 异常被吞掉或改写成 renderer 退出码时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        session_execution,
+        "advance_cli_terminal_cursor",
+        _raise_cli_terminal_cursor_error,
+    )
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请继续分析",
+        )
+    )
+    prepared = await session_execution.prepare_prompt_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请继续分析",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
+    )
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.FAILED),
+    )
+
+    with pytest.raises(CliTerminalCursorError, match="cursor write failed"):
+        await session_execution.execute_prompt_on_session(
+            host=cast(Host, fake_host),
+            prepared=prepared,
+            session_id="session-existing",
+            sigint_monitor=_NoopSigintMonitor(),
+        )
+
+
+def test_prompt_host_api_error_uses_structured_presentation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt 首次 create 阶段 HostApiError 必须结构化展示并返回 failure。"""
+
+    fake_host = _FakeHost(
+        submit_terminal=None,
+        create_error=HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="workspace session root missing",
+            retryable=False,
+        ),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("prompt", "--base", str(tmp_path), "hello"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "dayu-cli prompt" in captured.err
+    assert "host_code=not_found" in captured.err
+    assert "host_message=workspace session root missing" in captured.err
+    assert fake_host.calls == ["create_session"]
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug", "--debug-stream"))
@@ -969,7 +1192,7 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
     workspace_root = tmp_path
     fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
     captured_requests: list[EntrypointRuntimeRequest] = []
-    real_prepare = prompt_command.prepare_entrypoint_runtime
+    real_prepare = session_execution.prepare_entrypoint_runtime
 
     async def capture_prepare(
         request: EntrypointRuntimeRequest,
@@ -980,7 +1203,7 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
         return await real_prepare(request)
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
+    monkeypatch.setattr(session_execution, "prepare_entrypoint_runtime", capture_prepare)
     monkeypatch.setattr(
         prompt_command,
         "open_host",
@@ -1013,11 +1236,22 @@ def test_prompt_command_uses_init_generated_workspace_config(
     """
 
     workspace_root = tmp_path / "workspace"
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        Mock(side_effect=("14", "", "", "")),
+    )
+    monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
+    monkeypatch.setattr(
+        getpass,
+        "getpass",
+        Mock(side_effect=("", "", "", "", "")),
+    )
     assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
     capsys.readouterr()
     fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
     captured_results: list[EntrypointRuntimeResult] = []
-    real_prepare = prompt_command.prepare_entrypoint_runtime
+    real_prepare = session_execution.prepare_entrypoint_runtime
 
     async def capture_prepare(
         request: EntrypointRuntimeRequest,
@@ -1034,7 +1268,7 @@ def test_prompt_command_uses_init_generated_workspace_config(
         return result
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
+    monkeypatch.setattr(session_execution, "prepare_entrypoint_runtime", capture_prepare)
     monkeypatch.setattr(
         prompt_command,
         "open_host",
@@ -1262,7 +1496,7 @@ async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_fi
     """TTY prompt 应在 activity 前闭合 thinking，并在 final 前清理运行态展示。"""
 
     runtime = await _prepare_prompt_runtime(tmp_path)
-    invocation = prompt_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="prompt",
         scenario="prompt",
         display_user="本地 CLI 用户",
@@ -1310,13 +1544,13 @@ async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_fi
         ),
     )
 
-    terminal = await prompt_command._submit_prompt_turn_handling_sigint(
+    terminal = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         activity_renderer=activity_renderer,
         thinking_renderer=thinking_renderer,
@@ -1349,7 +1583,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
     """Run accepted 后 SIGINT 应构造完整 CancelRunRequest 并复用幂等 id。"""
 
     workspace_root = tmp_path
-    runtime = await prompt_command.prepare_entrypoint_runtime(
+    runtime = await session_execution.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
@@ -1359,11 +1593,11 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
-            assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
+                assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
-    invocation = prompt_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="prompt",
         scenario="prompt",
         display_user="本地 CLI 用户",
@@ -1375,13 +1609,13 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
         cancel_terminal=_terminal_event(status=HostTerminalStatus.CANCELLED),
     )
 
-    result = await prompt_command._submit_prompt_turn_handling_sigint(
+    result = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_AutoSigintMonitor(),
     )
 
@@ -1401,7 +1635,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
 async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
     """prompt 本地取消 helper 应先收尾再关闭 thinking renderer。"""
 
-    accepted_run = prompt_command._AcceptedRunState()
+    accepted_run = session_execution._PromptAcceptedRunState()
     submit_task = asyncio.create_task(_never_finishes_prompt_terminal())
     stderr = io.StringIO()
     thinking_renderer = CliThinkingRenderer(
@@ -1418,9 +1652,9 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
         submit_terminal=None,
     )
 
-    result = await prompt_command._cancel_prompt_turn_after_local_request(
+    result = await session_execution._cancel_prompt_turn_after_local_request(
         host=cast(Host, fake_host),
-        invocation=prompt_command.new_cli_invocation(
+        invocation=session_execution.new_cli_invocation(
             command_name="prompt",
             scenario="prompt",
             display_user="本地 CLI 用户",
@@ -1450,7 +1684,7 @@ async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
     """运行态 Ctrl+T 应切换 activity 可见性，且不发 Host cancel。"""
 
     runtime = await _prepare_prompt_runtime(tmp_path)
-    invocation = prompt_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="prompt",
         scenario="prompt",
         display_user="本地 CLI 用户",
@@ -1466,13 +1700,13 @@ async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
         options=CliActivityRendererOptions(visible=True, enabled=False),
     )
 
-    result = await prompt_command._submit_prompt_turn_handling_sigint(
+    result = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         activity_renderer=renderer,
         key_monitor=key_monitor,
@@ -1493,7 +1727,7 @@ async def test_prompt_esc_requests_cancel_after_run_id(
     """运行态 Esc 应请求取消当前 accepted Run。"""
 
     runtime = await _prepare_prompt_runtime(tmp_path)
-    invocation = prompt_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="prompt",
         scenario="prompt",
         display_user="本地 CLI 用户",
@@ -1533,13 +1767,13 @@ async def test_prompt_esc_requests_cancel_after_run_id(
         )
     )
 
-    result = await prompt_command._submit_prompt_turn_handling_sigint(
+    result = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         activity_renderer=renderer,
         thinking_renderer=thinking_renderer,
@@ -1563,7 +1797,7 @@ async def test_prompt_second_sigint_exits_after_cancel_request(
     """prompt 运行态第二次 Ctrl+C 应在 cancel terminal 前本地退出。"""
 
     runtime = await _prepare_prompt_runtime(tmp_path)
-    invocation = prompt_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="prompt",
         scenario="prompt",
         display_user="本地 CLI 用户",
@@ -1599,13 +1833,13 @@ async def test_prompt_second_sigint_exits_after_cancel_request(
         )
     )
 
-    result = await prompt_command._submit_prompt_turn_handling_sigint(
+    result = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
         activity_renderer=renderer,
         thinking_renderer=thinking_renderer,
@@ -1625,7 +1859,7 @@ async def test_prompt_cancel_terminal_wins_over_second_sigint(
     """prompt cancel terminal 与第二次 Ctrl+C 竞争时应返回 terminal。"""
 
     runtime = await _prepare_prompt_runtime(tmp_path)
-    invocation = prompt_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="prompt",
         scenario="prompt",
         display_user="本地 CLI 用户",
@@ -1637,13 +1871,13 @@ async def test_prompt_cancel_terminal_wins_over_second_sigint(
         cancel_terminal=_terminal_event(status=HostTerminalStatus.CANCELLED),
     )
 
-    result = await prompt_command._submit_prompt_turn_handling_sigint(
+    result = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
     )
 
@@ -1660,26 +1894,26 @@ async def test_prompt_cancel_terminal_wins_over_second_sigint(
         (("--doc-limits-json", "{}"), "--doc-limits-json"),
     ),
 )
-def test_prompt_command_rejects_unsupported_old_execution_flags(
+def test_prompt_command_rejects_removed_execution_flags_as_unknown(
     unsupported_args: tuple[str, ...],
     expected_fragment: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """旧执行参数缺少 typed public contract 时应 fail fast。"""
+    """没有 public contract 的旧执行参数必须从 parser surface 删除。"""
 
     exit_code = cli_main.main(("prompt", *unsupported_args, "请总结收入变化"))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
-    assert "unsupported option" in captured.err
+    assert "unrecognized arguments" in captured.err
     assert expected_fragment in captured.err
 
 
-def test_prompt_thinking_flags_are_display_options_not_execution_overrides() -> None:
-    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
+def test_prompt_thinking_flags_are_display_options() -> None:
+    """``--thinking`` / ``--no-thinking`` 保持为明确的展示选项。
 
     :returns: ``None``。
-    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    :raises AssertionError: thinking 展示参数未被正确解析时抛出。
     """
 
     thinking_args = parse_cli_args(("prompt", "hello", "--thinking"))
@@ -1687,20 +1921,18 @@ def test_prompt_thinking_flags_are_display_options_not_execution_overrides() -> 
 
     assert thinking_args.thinking is True
     assert no_thinking_args.thinking is False
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(no_thinking_args)
 
 
-def test_prompt_debug_stream_is_not_unsupported_execution_option() -> None:
-    """debug-stream 是全局日志开关，不是旧 Agent 执行参数。
+def test_prompt_debug_stream_is_global_log_option() -> None:
+    """``--debug-stream`` 保持为全局日志开关。
 
     :returns: ``None``。
-    :raises AssertionError: debug-stream 被错误列为 unsupported option 时抛出。
+    :raises AssertionError: debug-stream 未被正确解析时抛出。
     """
 
     args = parse_cli_args(("prompt", "--debug-stream", "请总结收入变化"))
 
-    assert "--debug-stream" not in unsupported_execution_option_names(args)
+    assert args.debug_stream is True
 
 
 @pytest.mark.parametrize("removed_args", _REMOVED_PROMPT_DEBUG_OPTIONS)
@@ -1724,10 +1956,10 @@ def test_prompt_removed_debug_options_are_argparse_unknown(
     assert removed_args[0] in captured.err
 
 
-def test_prompt_command_reports_all_unsupported_old_execution_flags(
+def test_prompt_command_rejects_all_removed_execution_flags_as_unknown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """unsupported 旧参数应统一列入清晰错误。"""
+    """所有已删除旧参数都应由 argparse 清晰拒绝。"""
 
     exit_code = cli_main.main(
         (
@@ -1746,6 +1978,7 @@ def test_prompt_command_reports_all_unsupported_old_execution_flags(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
     for expected in (
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",
@@ -1853,7 +2086,7 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
 ) -> None:
     """Run accepted 前 SIGINT 应只本地退出，不发 Host cancel。"""
 
-    runtime = await prompt_command.prepare_entrypoint_runtime(
+    runtime = await session_execution.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
@@ -1863,16 +2096,16 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
-            assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
+                assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
     fake_host = _BlockingSubmitHost(submit_terminal=None)
 
-    result = await prompt_command._submit_prompt_turn_handling_sigint(
+    result = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
-        invocation=prompt_command.new_cli_invocation(
+        invocation=session_execution.new_cli_invocation(
             command_name="prompt",
             scenario="prompt",
             display_user="本地 CLI 用户",
@@ -1880,12 +2113,70 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
         ),
         session_id="session-1",
         user_prompt="请总结收入变化",
-        run_overrides=prompt_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_ImmediateSigintMonitor(),
     )
 
     assert result is None
     assert fake_host.cancel_requests == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_sigint_before_run_id_does_not_advance_terminal_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run accepted 前本地退出没有 terminal 可渲染，不得推进 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 本地退出推进 cursor 或返回码错误时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请总结收入变化",
+        )
+    )
+    prepared = await session_execution.prepare_prompt_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请总结收入变化",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
+    )
+    fake_host = _BlockingSubmitHost(submit_terminal=None)
+
+    exit_code = await session_execution.execute_prompt_on_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        sigint_monitor=_ImmediateSigintMonitor(),
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert fake_host.cancel_requests == []
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=0)
+    assert cursor_record.seen_terminal_event_ids == ()
 
 
 @pytest.mark.asyncio
@@ -1952,7 +2243,7 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
     :raises Exception: runtime assembly 失败时向上透传。
     """
 
-    return await prompt_command.prepare_entrypoint_runtime(
+    return await session_execution.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
@@ -1962,13 +2253,13 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
-            assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
 
 
-async def _never_finishes_prompt_terminal() -> prompt_command.EntrypointRunTerminalResult:
+async def _never_finishes_prompt_terminal() -> EntrypointRunTerminalResult:
     """构造永不完成的 prompt terminal awaitable。
 
     :returns: 永不实际返回的 prompt terminal result。
@@ -1988,12 +2279,19 @@ def _run_snapshot(*, run_id: str, status: RunStatus) -> RunSnapshot:
     :raises Exception: 不主动抛出异常。
     """
 
+    terminal_summary = None
+    if is_terminal_run_status(status):
+        terminal_summary = TerminalResultSummary(
+            status=status,
+            summary_ref=None,
+            summary_digest=None,
+        )
     return RunSnapshot(
         run_id=run_id,
         session_id="session-1",
         status=status,
         current_attempt_id=None,
-        terminal_result_summary=None,
+        terminal_result_summary=terminal_summary,
         event_cursor=HostStreamCursor(event_sequence=0),
         source_run_id=None,
         source_run_relation=None,

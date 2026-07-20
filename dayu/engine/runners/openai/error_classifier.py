@@ -28,7 +28,11 @@ from typing import assert_never
 import aiohttp
 
 from dayu.contracts import JsonValue
-from dayu.engine.contracts.runner_events import RunnerHTTPErrorCode
+from dayu.engine.contracts.runner_events import (
+    ContextOverflowDetection,
+    ContextOverflowDetectionKind,
+    RunnerHTTPErrorCode,
+)
 
 _RETRYABLE_5XX: frozenset[int] = frozenset({500, 502, 503, 504})
 _OPENAI_CONTEXT_LENGTH_ERROR_CODE: str = "context_length_exceeded"
@@ -92,7 +96,7 @@ def detect_context_overflow(
     *,
     http_status: int,
     response_text: str,
-) -> bool:
+) -> ContextOverflowDetection:
     """识别 provider context overflow 响应。
 
     本函数是 OpenAI-compatible Runner 的 provider adapter 边界：优先读取
@@ -101,19 +105,44 @@ def detect_context_overflow(
 
     :param http_status: HTTP 状态码。
     :param response_text: provider 错误响应文本。
-    :returns: 明确为 context overflow 返回 ``True``。
+    :returns: 带来源 provenance 的 context overflow 检测结果。
     :raises Exception: 不主动抛出异常。
     """
 
     if http_status < 400 or http_status >= 600:
-        return False
+        return ContextOverflowDetection(
+            kind=ContextOverflowDetectionKind.NOT_OVERFLOW
+        )
     payload = _parse_json_object(response_text)
     if payload is not None:
         code = _payload_error_code(payload)
         if code is not None:
-            return code == _OPENAI_CONTEXT_LENGTH_ERROR_CODE
+            if code == _OPENAI_CONTEXT_LENGTH_ERROR_CODE:
+                return ContextOverflowDetection(
+                    kind=ContextOverflowDetectionKind.STRUCTURED_CODE
+                )
+            return ContextOverflowDetection(
+                kind=ContextOverflowDetectionKind.NOT_OVERFLOW
+            )
     lowered = response_text.lower()
-    return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
+    if any(marker in lowered for marker in _CONTEXT_OVERFLOW_MESSAGE_MARKERS):
+        return ContextOverflowDetection(
+            kind=ContextOverflowDetectionKind.MESSAGE_MARKER_FALLBACK,
+            diagnostic_code="context_overflow_message_marker_fallback",
+            message=(
+                "provider context overflow was detected by adapter-owned "
+                "message marker fallback"
+            ),
+            raw_payload={
+                "http_status": http_status,
+                "detection_kind": (
+                    ContextOverflowDetectionKind.MESSAGE_MARKER_FALLBACK.value
+                ),
+            },
+        )
+    return ContextOverflowDetection(
+        kind=ContextOverflowDetectionKind.NOT_OVERFLOW
+    )
 
 
 def is_retriable(error_code: RunnerHTTPErrorCode) -> bool:

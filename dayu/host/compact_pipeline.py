@@ -25,13 +25,15 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     build_compact_material_pack,
-    degrade_previous_compacted_view_for_recovery,
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
+    retained_previous_compacted_view_labels_for_recovery,
     select_compact_segment,
     selected_material_source_refs,
     selected_material_view_digest,
+    transform_previous_compacted_view_pair_for_recovery,
 )
+from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.compact_payload import (
     accepted_evidence_mapping_refs_for_candidate,
     prompt_local_label_mapping_refs,
@@ -41,17 +43,18 @@ from dayu.host.compaction import (
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialSection,
+    CompactReadableViewVNext,
     CompactQualityCheckResultVNext,
     CompactSegmentSelection,
     CompactSegmentTrigger,
     CompactionRequest,
     ConversationCompactOutputVNext,
+    validate_previous_compacted_view_pair,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
     FALLBACK_ACTION_FAIL_CLOSED,
-    FALLBACK_ACTION_NOT_APPLICABLE,
     FALLBACK_POLICY_DECISION_RECENT_WINDOW,
     FALLBACK_POLICY_DECISION_SELECTION_FAILED,
     RecentWindowFallbackBudgetResult,
@@ -72,17 +75,6 @@ _REACTIVE_SINGLE_PASS_REASON = "reactive_single_pass_block"
 _REACTIVE_NOT_IN_PASS_REASON = "not_in_pass"
 _RECENT_EVIDENCE_PREFIX = "Recent accepted tool evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
-_UNAVAILABLE_TOOL_QUERY = "The original tool query is not available in readable form."
-_EVIDENCE_SOURCE_PART_SEPARATOR = ", "
-_INTERNAL_EVIDENCE_SOURCE_PREFIXES = (
-    "tool_call_event:",
-    "tool_result_event:",
-    "event:",
-    "eventlog:",
-    "payload:",
-    "artifact:",
-    "digest:",
-)
 
 
 class MemorySnapshotView(Protocol):
@@ -156,15 +148,6 @@ class CompactPipelineCompactArtifactView(Protocol):
     """pipeline-owned second-read provider hook 所需的 compact artifact 协议。"""
 
     @property
-    def messages(self) -> tuple[AgentMessage, ...]:
-        """返回 compact artifact messages。
-
-        :returns: Agent messages。
-        """
-
-        ...
-
-    @property
     def compact_artifact_ref(self) -> str | None:
         """返回 compact artifact ref。
 
@@ -182,16 +165,6 @@ class CompactPipelineCompactArtifactView(Protocol):
 
         ...
 
-    @property
-    def represented_evidence_refs(self) -> tuple[str, ...]:
-        """返回 compact artifact 已表示的 evidence refs。
-
-        :returns: evidence refs。
-        """
-
-        ...
-
-
 class CompactPipelineAttemptDispatchSnapshot(Protocol):
     """pipeline-owned second-read provider hook 的 attempt snapshot 协议。"""
 
@@ -208,6 +181,7 @@ class CompactPipelineSourceSnapshot:
     :param input_event_sequence: 当前输入 EventLog sequence。
     :param material_blocks: compact / fallback 候选 material blocks。
     :param previous_compacted_view: latest accepted compacted view。
+    :param previous_compacted_readable_view: 与 previous blocks 同源的 typed view。
     :param source_boundary: material source boundary。
     :param material_view_digest: 完整 material view digest。
     :param material_source_refs: 完整 material view 覆盖的 canonical source refs。
@@ -224,6 +198,19 @@ class CompactPipelineSourceSnapshot:
     source_boundary: CompactMaterialSourceBoundary
     material_view_digest: str
     material_source_refs: tuple[str, ...]
+    previous_compacted_readable_view: CompactReadableViewVNext | None = None
+
+    def __post_init__(self) -> None:
+        """校验 source snapshot 中 previous blocks 与 typed view 的同源 pair。
+
+        :returns: ``None``。
+        :raises ValueError: previous pair invariant 不成立时抛出。
+        """
+
+        validate_previous_compacted_view_pair(
+            self.previous_compacted_view,
+            self.previous_compacted_readable_view,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +430,7 @@ def compact_pipeline_source_snapshot_from_pre_dispatch_view(
         input_event_sequence=run.input_event_sequence,
         material_blocks=material_view.material_blocks,
         previous_compacted_view=material_view.previous_compacted_view,
+        previous_compacted_readable_view=material_view.previous_compacted_readable_view,
         source_boundary=material_view.source_boundary,
         material_view_digest=selected_material_view_digest(material_view.material_blocks),
         material_source_refs=selected_material_source_refs(
@@ -484,6 +472,7 @@ def build_normal_compact_request_plan(
         source_snapshot=source_snapshot,
         selected_segment=segment,
         previous_compacted_view=source_snapshot.previous_compacted_view,
+        previous_compacted_readable_view=source_snapshot.previous_compacted_readable_view,
         budget_before_compact=budget_before_compact,
         attempt_id=attempt_id,
         execution_id=execution_id,
@@ -526,23 +515,32 @@ def build_tier_recovery_request_plans(
                 source_snapshot=source_snapshot,
                 selected_segment=bounded_selection,
                 previous_compacted_view=source_snapshot.previous_compacted_view,
+                previous_compacted_readable_view=source_snapshot.previous_compacted_readable_view,
                 budget_before_compact=root_request_plan.request.budget_before_compact,
                 attempt_id=root_request_plan.request.attempt_id,
                 execution_id=root_request_plan.request.execution_id,
             ),
         )
     ]
-    degraded = degrade_previous_compacted_view_for_recovery(
+    retained_labels = retained_previous_compacted_view_labels_for_recovery(
         source_snapshot.previous_compacted_view
     )
-    if len(degraded) > 0 and degraded != source_snapshot.previous_compacted_view:
+    degraded_blocks, degraded_readable_view = (
+        transform_previous_compacted_view_pair_for_recovery(
+            blocks=source_snapshot.previous_compacted_view,
+            readable_view=source_snapshot.previous_compacted_readable_view,
+            retained_block_labels=retained_labels,
+        )
+    )
+    if len(degraded_blocks) > 0 and degraded_blocks != source_snapshot.previous_compacted_view:
         plans.append(
             CompactPipelineRecoveryRequestPlan(
                 tier_name="tier_2_section_degrade",
                 request_plan=_request_plan_from_segment(
                     source_snapshot=source_snapshot,
                     selected_segment=root_request_plan.selected_segment,
-                    previous_compacted_view=degraded,
+                    previous_compacted_view=degraded_blocks,
+                    previous_compacted_readable_view=degraded_readable_view,
                     budget_before_compact=(
                         root_request_plan.request.budget_before_compact
                     ),
@@ -551,13 +549,21 @@ def build_tier_recovery_request_plans(
                 ),
             )
         )
+    empty_previous_blocks, empty_previous_readable_view = (
+        transform_previous_compacted_view_pair_for_recovery(
+            blocks=source_snapshot.previous_compacted_view,
+            readable_view=source_snapshot.previous_compacted_readable_view,
+            retained_block_labels=frozenset(),
+        )
+    )
     plans.append(
         CompactPipelineRecoveryRequestPlan(
             tier_name="tier_3_delta_only",
             request_plan=_request_plan_from_segment(
                 source_snapshot=source_snapshot,
                 selected_segment=bounded_selection,
-                previous_compacted_view=(),
+                previous_compacted_view=empty_previous_blocks,
+                previous_compacted_readable_view=empty_previous_readable_view,
                 budget_before_compact=root_request_plan.request.budget_before_compact,
                 attempt_id=root_request_plan.request.attempt_id,
                 execution_id=root_request_plan.request.execution_id,
@@ -597,6 +603,7 @@ def build_reactive_pass_queue_plan(
                 source_snapshot=source_snapshot,
                 selected_segment=segment,
                 previous_compacted_view=source_snapshot.previous_compacted_view,
+                previous_compacted_readable_view=source_snapshot.previous_compacted_readable_view,
                 budget_before_compact=(
                     root_request_plan.request.budget_before_compact
                 ),
@@ -816,6 +823,7 @@ def _request_plan_from_segment(
     source_snapshot: CompactPipelineSourceSnapshot,
     selected_segment: CompactSegmentSelection,
     previous_compacted_view: tuple[CompactMaterialBlock, ...],
+    previous_compacted_readable_view: CompactReadableViewVNext | None,
     budget_before_compact: BudgetEstimate,
     attempt_id: str | None,
     execution_id: str | None,
@@ -825,6 +833,7 @@ def _request_plan_from_segment(
     :param source_snapshot: compact source snapshot。
     :param selected_segment: selected segment。
     :param previous_compacted_view: request 使用的 previous compacted view。
+    :param previous_compacted_readable_view: 与 previous blocks 同源的 typed view。
     :param budget_before_compact: compact 前预算。
     :param attempt_id: reactive attempt id。
     :param execution_id: reactive execution id。
@@ -839,6 +848,7 @@ def _request_plan_from_segment(
         current_input_ref=source_snapshot.current_input_ref,
         current_input_text=source_snapshot.current_input_text,
         previous_compacted_view=previous_compacted_view,
+        previous_compacted_readable_view=previous_compacted_readable_view,
     )
     selected_evidence_refs = _selected_evidence_refs(
         material_blocks=source_snapshot.material_blocks,
@@ -1082,6 +1092,7 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
 
     :param block: selected raw-tail block。
     :returns: Agent message。
+    :raises HostDurableError: accepted evidence 缺 typed LLM material 时抛出。
     """
 
     if block.kind is CompactMaterialBlockKind.USER_INPUT:
@@ -1094,9 +1105,16 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
             tool_calls=(),
         )
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        if block.accepted_tool_evidence is None:
+            raise HostDurableError(
+                "accepted tool evidence LLM material is missing"
+            )
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
-            content=_accepted_tool_evidence_content(block),
+            content=(
+                f"{_ACCEPTED_TOOL_EVIDENCE_PREFIX}\n"
+                f"{render_accepted_tool_evidence_for_llm(block.accepted_tool_evidence)}"
+            ),
         )
     if block.section is CompactMaterialSection.EVIDENCE_MATERIAL:
         return SystemMessage(
@@ -1104,71 +1122,6 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
             content=f"{_RECENT_EVIDENCE_PREFIX}\n{block.text}",
         )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
-
-
-def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
-    """构造 accepted tool evidence 的 LLM-facing 文本。
-
-    :param block: accepted evidence material block。
-    :returns: 业务可读 evidence 文本。
-    :raises HostDurableError: readable tool name 缺失时抛出。
-    """
-
-    if block.readable_tool_name is None:
-        raise HostDurableError("accepted tool evidence requires readable tool name")
-    query_text = (
-        _UNAVAILABLE_TOOL_QUERY
-        if block.readable_query_text is None
-        else block.readable_query_text
-    )
-    lines = [
-        _ACCEPTED_TOOL_EVIDENCE_PREFIX,
-        f"tool_name={block.readable_tool_name}",
-        f"query={query_text}",
-    ]
-    source_text = _llm_facing_evidence_source_text(block.readable_source_text)
-    if source_text is not None:
-        lines.append(f"source={source_text}")
-    lines.append(f"result={block.text}")
-    return "\n".join(lines)
-
-
-def _llm_facing_evidence_source_text(source_text: str | None) -> str | None:
-    """过滤 accepted evidence source note 中的内部 provenance。
-
-    :param source_text: compact material provider 给出的 source note。
-    :returns: 仅含业务可读 source locator 的文本；无可读项时返回 ``None``。
-    """
-
-    if source_text is None:
-        return None
-    parts = tuple(
-        part.strip()
-        for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR)
-        if part.strip() != ""
-    )
-    visible_parts = tuple(
-        part for part in parts if not _is_internal_evidence_source_part(part)
-    )
-    if len(visible_parts) == 0:
-        return None
-    return _EVIDENCE_SOURCE_PART_SEPARATOR.join(visible_parts)
-
-
-def _is_internal_evidence_source_part(source_part: str) -> bool:
-    """判断 source note 分片是否为内部 provenance。
-
-    :param source_part: ``readable_source_text`` 的逗号分片。
-    :returns: 属于内部 ref / digest / artifact 标识时返回 ``True``。
-    """
-
-    normalized = source_part.strip().lower()
-    if normalized == "":
-        return True
-    return any(
-        normalized.startswith(prefix)
-        for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES
-    )
 
 
 __all__ = [

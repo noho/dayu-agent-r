@@ -53,7 +53,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--model-name",
         "--temperature",
     ),
-    "download": ("--ticker", "--forms", "--start", "--end", "--overwrite", "--infer"),
+    "download": ("--ticker", "--forms", "--start", "--end", "--overwrite"),
     "upload_filing": (
         "--ticker",
         "--action",
@@ -79,16 +79,19 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--output",
         "--recursive",
         "--material-forms",
+        "--infer",
+        "--overwrite",
     ),
-    "process": ("--ticker", "--document-id", "--overwrite", "--ci"),
-    "process_filing": ("--ticker", "--document-id", "--overwrite", "--ci"),
-    "process_material": ("--ticker", "--document-id", "--overwrite", "--ci"),
+    "process": ("--ticker", "--document-id", "--overwrite"),
+    "process_filing": ("--ticker", "--document-id", "--overwrite"),
+    "process_material": ("--ticker", "--document-id", "--overwrite"),
     "session": ("list", "resume", "purge"),
 }
 _TEST_LOGGER_NAME: str = "dayu.cli.test_arg_parsing"
 _FIRST_LOG_FILE_DIAGNOSTIC: str = "first run diagnostic"
 _SECOND_STDERR_DIAGNOSTIC: str = "second run diagnostic"
 _RESTORE_FAILURE_MESSAGE: str = "restore stderr failed"
+_ROOT_README_PATH: Path = Path(__file__).resolve().parents[2] / "README.md"
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +275,58 @@ def test_interactive_help_contains_optional_ticker(
     assert "--ticker" in help_text
 
 
+def test_upload_actions_default_to_auto_and_batch_rejects_delete() -> None:
+    """三个 upload parser 默认 auto，direct 可 delete，batch 必须拒绝 delete。"""
+
+    filing = parse_cli_args(("upload_filing", "--ticker", "AAPL"))
+    material = parse_cli_args(("upload_material", "--ticker", "AAPL"))
+    batch = parse_cli_args(
+        ("upload_filings_from", "--ticker", "AAPL", "--from", "source")
+    )
+    direct_delete = parse_cli_args(
+        ("upload_filing", "--ticker", "AAPL", "--action", "delete")
+    )
+
+    assert filing.action == "auto"
+    assert material.action == "auto"
+    assert batch.action == "auto"
+    assert batch.infer is False
+    assert batch.overwrite is False
+    assert direct_delete.action == "delete"
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(
+            (
+                "upload_filings_from",
+                "--ticker",
+                "AAPL",
+                "--from",
+                "source",
+                "--action",
+                "delete",
+            )
+        )
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_upload_filings_from_infer_and_overwrite_are_explicit_booleans() -> None:
+    """batch ``--infer``/``--overwrite`` 必须仅在显式传入时为 true。"""
+
+    explicit = parse_cli_args(
+        (
+            "upload_filings_from",
+            "--ticker",
+            "AAPL",
+            "--from",
+            "source",
+            "--infer",
+            "--overwrite",
+        )
+    )
+
+    assert explicit.infer is True
+    assert explicit.overwrite is True
+
+
 def test_interactive_help_omits_removed_new_session_flag(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -298,6 +353,63 @@ def test_interactive_new_session_flag_exits_with_usage_error() -> None:
         parse_cli_args(("interactive", "--new-session"))
 
     assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_root_readme_matches_current_cli_public_contract() -> None:
+    """根用户手册必须投影当前 CLI init 与其它公开行为。
+
+    :returns: ``None``。
+    :raises AssertionError: README 与当前 CLI command/输出契约漂移时抛出。
+    """
+
+    readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+    direct_upload_section = readme.split(
+        "### 5.2 上传单份 filing 或材料", maxsplit=1
+    )[1].split("### 5.3 从目录生成批量上传脚本", maxsplit=1)[0]
+    batch_upload_section = readme.split(
+        "### 5.3 从目录生成批量上传脚本", maxsplit=1
+    )[1].split("### 5.4 预处理", maxsplit=1)[0]
+    init_section = readme.split("## 2. 初始化工作区", maxsplit=1)[1].split(
+        "## 3. CLI 公共命令", maxsplit=1
+    )[0]
+    for removed_contract in (
+        "`write`",
+        "--ci",
+        "--web-provider",
+        "--new-session",
+        "--doc-limits-json",
+        "--fins-limits-json",
+    ):
+        assert removed_contract not in readme
+    assert "`init` 是非交互式文件初始化命令" not in readme
+    for init_mode in ("FIRST：", "PRESERVE：", "OVERWRITE：", "RESET："):
+        assert init_mode in init_section
+    assert "RESET 优先于 `--overwrite`" in init_section
+    assert "POSIX 写入当前 shell" in init_section
+    assert "Windows 使用当前用户的 `setx`" in init_section
+    assert "secret 值不写入 workspace" in init_section
+    assert "`.dayu-init.lock` 只用于串行多个 `init`" in init_section
+    assert "执行 RESET 前必须先停止" in init_section
+    assert "FIRST/RESET 发布成功后" in init_section
+    assert "`prompt` 与 `interactive`" in init_section
+    assert "不联网" in init_section
+    assert "prewarm warning" in init_section
+    assert "进程结束时自动清理" in readme
+    assert "dayu-cli upload_filings_from" in batch_upload_section
+    assert "--infer" in batch_upload_section
+    assert "`FMP_API_KEY`" in batch_upload_section
+    assert "--infer" not in direct_upload_section
+    assert "`upload_filings_<TICKER>.sh`" in batch_upload_section
+    assert "`upload_filings_<TICKER>.cmd`" in batch_upload_section
+    assert "/bin/sh" in batch_upload_section
+    assert "cmd.exe /d /c" in batch_upload_section
+    for removed_batch_contract in (
+        '"schema_version": 1',
+        '"commands"',
+        "不生成 shell",
+    ):
+        assert removed_batch_contract not in readme
+    assert "interactive --ticker" in readme
 
 
 def test_session_action_help_contains_fixed_parser_shape(
@@ -396,6 +508,46 @@ def test_main_reports_missing_command_runner(
     assert "内部错误" in captured.err
     assert "缺少注册 runner" in captured.err
     assert "prompt" in captured.err
+
+
+def test_cli_standard_stream_owner_reconfigures_real_wrapper_to_strict_utf8() -> None:
+    """CLI 标准流 owner 必须让 redirected wrapper 可严格输出中文 UTF-8。
+
+    :returns: ``None``。
+    :raises AssertionError: wrapper 仍使用 legacy charmap 或替换错误时抛出。
+    """
+
+    raw_stream = io.BytesIO()
+    text_stream = io.TextIOWrapper(
+        raw_stream,
+        encoding="cp1252",
+        errors="strict",
+    )
+    try:
+        cli_main._configure_cli_standard_stream(text_stream)
+        text_stream.write("初始化完成：中文输出")
+        text_stream.flush()
+
+        assert text_stream.encoding == "utf-8"
+        assert text_stream.errors == "strict"
+        assert raw_stream.getvalue().decode("utf-8") == "初始化完成：中文输出"
+    finally:
+        text_stream.detach()
+
+
+def test_cli_standard_stream_owner_preserves_non_wrapper_capture() -> None:
+    """CLI 标准流 owner 不得把测试或调用方提供的内存 capture 伪装成 OS 流。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 wrapper 流被替换或无法继续写入时抛出。
+    """
+
+    capture = io.StringIO()
+
+    cli_main._configure_cli_standard_stream(capture)
+    capture.write("中文")
+
+    assert capture.getvalue() == "中文"
 
 
 def test_main_maps_keyboard_interrupt(
@@ -592,26 +744,46 @@ def test_main_configures_runtime_log_file_stream(
     )
 
 
-def test_open_default_log_file_creates_persistent_temp_file() -> None:
-    """默认日志文件必须创建为可回查的持久临时文件。
+def test_open_default_log_file_uses_auto_deleted_temporary_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认日志必须使用随进程关闭的临时流，不遗留不可发现文件。
 
+    :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
-    :raises AssertionError: 临时日志文件不可写或关闭后不存在时抛出。
+    :raises AssertionError: 未使用 auto-delete 临时流或流不可写时抛出。
     """
 
+    calls: list[tuple[str, str, str, str]] = []
+
+    def temporary_file(
+        *,
+        mode: str,
+        encoding: str,
+        prefix: str,
+        suffix: str,
+    ) -> TextIO:
+        """记录默认临时流工厂调用。
+
+        :param mode: 文件打开模式。
+        :param encoding: 文本编码。
+        :param prefix: 临时文件名前缀。
+        :param suffix: 临时文件名后缀。
+        :returns: 测试用内存文本流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        calls.append((mode, encoding, prefix, suffix))
+        return io.StringIO()
+
+    monkeypatch.setattr(cli_main.tempfile, "TemporaryFile", temporary_file)
     stream = cli_main._open_default_log_file()
     assert stream is not None
-    log_path = Path(stream.name)
-    try:
-        stream.write("default diagnostic\n")
-        stream.close()
-        assert log_path.exists()
-        assert log_path.read_text(encoding="utf-8") == "default diagnostic\n"
-    finally:
-        if not stream.closed:
-            stream.close()
-        if log_path.exists():
-            log_path.unlink()
+    stream.write("default diagnostic\n")
+    stream.seek(0)
+    assert stream.read() == "default diagnostic\n"
+    stream.close()
+    assert calls == [("w+", "utf-8", "dayu-cli-", ".log")]
 
 
 def test_main_uses_separate_log_files_for_explicit_and_default_calls(
@@ -927,21 +1099,24 @@ def test_main_returns_usage_error_when_log_file_is_empty(
     assert "must not be empty" in captured.err
 
 
-def test_python_module_help_runs() -> None:
-    """验证 ``python -m dayu.cli --help`` 使用同一 parser 并成功退出。
+def test_python_module_help_decodes_cli_output_as_strict_utf8() -> None:
+    """验证模块入口使用同一 parser，并按严格 UTF-8 消费中文输出。
 
     :returns: ``None``。
-    :raises AssertionError: 模块入口退出码或 help 输出不符合契约时抛出。
+    :raises AssertionError: 模块入口退出码、解码或 help 输出不符合契约时抛出。
     """
 
     result = subprocess.run(
         [sys.executable, "-m", "dayu.cli", "--help"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         check=False,
     )
 
     assert result.returncode == EXIT_SUCCESS
+    assert "Dayu 财报分析命令行入口。" in result.stdout
     assert "dayu-cli" in result.stdout
     assert "interactive" in result.stdout
 
@@ -1000,6 +1175,26 @@ def test_default_namespace_initializes_reset_false() -> None:
     assert init_args.overwrite is False
     assert prompt_args.reset is False
     assert prompt_args.detail is True
+
+
+def test_init_help_describes_reset_precedence_and_overwrite_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Init help 必须描述真实四态中 RESET 与 OVERWRITE 的不同 owner boundary。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: None。
+    :raises AssertionError: help 仍承诺旧逐文件覆盖语义时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(("init", "--help"))
+
+    help_text = capsys.readouterr().out
+    assert raised.value.code == 0
+    assert "优先于 --overwrite" in help_text
+    assert "重建 .dayu 与 config" in help_text
+    assert "保留 .dayu" in help_text
 
 
 def test_prompt_detail_defaults_to_detail() -> None:

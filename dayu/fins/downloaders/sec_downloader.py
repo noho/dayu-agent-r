@@ -35,7 +35,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Iterator, Mapping, Sequence
-from typing import AsyncIterator, Awaitable, BinaryIO, Callable, Final, Literal, Optional, TextIO, TypeAlias, TypeVar, cast, overload
+from typing import AsyncIterator, Awaitable, BinaryIO, Callable, Final, Literal, Optional, Protocol, TextIO, TypeAlias, TypeVar, cast, overload
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
@@ -46,7 +46,7 @@ if sys.platform != "win32":
 
 from dayu.fins._log import Log
 from dayu.fins._converters import normalize_optional_text, optional_int
-from dayu.fins.domain.document_models import FileObjectMeta
+from dayu.fins.domain.document_models import BatchToken, FileObjectMeta
 from dayu.fins.ticker_normalization import try_normalize_ticker
 
 DownloadFileResultValue: TypeAlias = JsonValue | FileObjectMeta
@@ -58,6 +58,34 @@ DownloadFileResultValue: TypeAlias = JsonValue | FileObjectMeta
 
 DownloadFileResult: TypeAlias = dict[str, DownloadFileResultValue]
 """下载器聚合文件结果。"""
+
+
+class StoreDownloadedFile(Protocol):
+    """SEC downloader 所需的显式 batch 文件写入回调。"""
+
+    def __call__(
+        self,
+        filename: str,
+        stream: BinaryIO,
+        *,
+        batch: BatchToken,
+    ) -> FileObjectMeta:
+        """写入单个下载文件。
+
+        Args:
+            filename: 文件名。
+            stream: 文件二进制流。
+            batch: 本次 invocation 显式传入的 batch capability。
+
+        Returns:
+            文件对象元数据。
+
+        Raises:
+            OSError: 仓储写入失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        ...
 
 SEC_USER_AGENT_ENV: Final[str] = "SEC_USER_AGENT"
 SEC_TICKER_MAP_URL: Final[str] = "https://www.sec.gov/files/company_tickers.json"
@@ -1359,7 +1387,9 @@ class SecDownloader:
         self,
         remote_files: list[RemoteFileDescriptor],
         overwrite: bool,
-        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -1370,6 +1400,7 @@ class SecDownloader:
             remote_files: 远端文件描述列表。
             overwrite: 是否覆盖下载。
             store_file: 文件存储回调（入参：文件名、二进制流）。
+            batch: 每次回调 invocation 显式传入的 batch capability。
             existing_files: 既有文件元数据映射（按文件名）。
             primary_document: 主文档文件名（如 *.htm）；若指定且该文件下载为 0 字节，
                 立即停止生成器，后续文件不再下载，确保整个 filing 不落盘。
@@ -1456,7 +1487,11 @@ class SecDownloader:
                         # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
-                file_meta = store_file(descriptor.name, _to_binary_stream(payload))
+                file_meta = store_file(
+                    descriptor.name,
+                    _to_binary_stream(payload),
+                    batch=batch,
+                )
                 _raise_if_download_cancelled(cancellation_checker)
                 yield DownloaderEvent(
                     event_type="file_downloaded",
@@ -1482,7 +1517,11 @@ class SecDownloader:
                         # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
-                file_meta = store_file(descriptor.name, _to_binary_stream(payload))
+                file_meta = store_file(
+                    descriptor.name,
+                    _to_binary_stream(payload),
+                    batch=batch,
+                )
                 _raise_if_download_cancelled(cancellation_checker)
                 yield DownloaderEvent(
                     event_type="file_downloaded",
@@ -1512,7 +1551,9 @@ class SecDownloader:
         self,
         remote_files: list[RemoteFileDescriptor],
         overwrite: bool,
-        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -1523,6 +1564,7 @@ class SecDownloader:
             remote_files: 远端文件描述列表。
             overwrite: 是否覆盖下载。
             store_file: 文件存储回调（入参：文件名、二进制流）。
+            batch: 每次回调 invocation 显式传入的 batch capability。
             existing_files: 既有文件元数据映射（按文件名）。
             primary_document: 主文档文件名，转发给 download_files_stream。
             cancellation_checker: 可选协作式取消检查器。
@@ -1539,6 +1581,7 @@ class SecDownloader:
             remote_files=remote_files,
             overwrite=overwrite,
             store_file=store_file,
+            batch=batch,
             existing_files=existing_files,
             primary_document=primary_document,
             cancellation_checker=cancellation_checker,
@@ -2034,7 +2077,7 @@ class SecDownloader:
             return value
         Log.warning(
             f"SEC User-Agent 未配置。SEC 要求提供真实联系信息，否则可能限流或封禁。"
-            f"请通过环境变量 {SEC_USER_AGENT_ENV} 或 dayu-cli init 配置。",
+            f"请通过环境变量 {SEC_USER_AGENT_ENV} 或调用方/部署配置提供。",
             module=self.MODULE,
         )
         return _UNCONFIGURED_USER_AGENT

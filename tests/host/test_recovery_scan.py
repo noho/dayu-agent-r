@@ -8,10 +8,11 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 
+import dayu.host.recovery as host_recovery
 from dayu.contracts.json_value import JsonValue
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
@@ -20,6 +21,7 @@ from dayu.host.api import (
     HostMetadataEntry,
     RunStatus,
 )
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
@@ -40,11 +42,14 @@ from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_HOST_RUNS,
     TABLE_HOST_SESSIONS,
     TABLE_HOST_SESSION_SLOTS,
 )
 from dayu.host.durable.state import (
     DispatchRecordStatus,
+    NonTerminalRunKeysetCursor,
+    RunRow,
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
@@ -53,11 +58,19 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    read_non_terminal_runs_keyset_page,
+    serialize_run_start_reason,
 )
-from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostReadTransactionOperation,
+    HostRow,
+    HostTransaction,
+    HostTransactionRunner,
+)
 from dayu.host.recovery import (
     StartupRecoveryDecision,
     StartupRecoveryPolicy,
+    StartupRecoveryScanResult,
     StartupRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
@@ -79,6 +92,8 @@ _REASON_MISSING_CURRENT_ATTEMPT_OR_DISPATCH = "missing_current_attempt_or_dispat
 _COVERAGE_EXISTING = "existing"
 _COVERAGE_NEW = "new"
 _COVERAGE_NON_GOAL = "non-goal"
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,7 +654,7 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
+        _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
@@ -687,17 +702,22 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
 def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
     tmp_path: Path,
 ) -> None:
-    """watchdog enabled 时 accepted-cancel CANCELLING 不被 recovery 标为 LOST。"""
+    """watchdog enabled 且 scheduler 已注入时 accepted-cancel 交给 watchdog。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
+        wakeup = _RecordingWakeup()
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
             defer_accepted_cancel_to_watchdog=True,
         ).scan(_policy())
 
@@ -711,15 +731,18 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
 
 
-def test_scan_malformed_cancelling_payload_uses_orphan_policy(
+def test_scan_accepted_cancel_without_scheduler_uses_recovery_fallback(
     tmp_path: Path,
 ) -> None:
-    """malformed RUN_CANCELLING payload 不应中断 startup recovery scan。"""
+    """watchdog 可能不运行时 recovery 不再永久 defer CANCELLING Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
-        _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
+        _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
@@ -731,11 +754,40 @@ def test_scan_malformed_cancelling_payload_uses_orphan_policy(
         assert tuple(action.decision for action in result.actions) == (
             StartupRecoveryDecision.RUN_LOST,
         )
-        assert tuple(action.reason for action in result.actions) == (
-            _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST,
-        )
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
+
+
+def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
+    tmp_path: Path,
+) -> None:
+    """malformed RUN_CANCELLING payload 不影响 typed cancel link 判断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
+        wakeup = _RecordingWakeup()
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
+            defer_accepted_cancel_to_watchdog=True,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+        )
+        assert tuple(action.reason for action in result.actions) == (
+            "accepted_cancel_watchdog_owner",
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.CANCELLING.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
 
 
 def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
@@ -745,7 +797,6 @@ def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
@@ -891,6 +942,597 @@ def test_scan_skips_non_terminal_run_when_session_row_is_missing(
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_RECOVERING) == 0
 
 
+def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """batch size=2 时 keyset page 有界、严格递增且 tie-break 稳定。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    run_ids = ("run-c", "run-a", "run-e", "run-b", "run-d")
+    page_keys: list[tuple[tuple[int, str], ...]] = []
+    input_cursors: list[NonTerminalRunKeysetCursor | None] = []
+    upper_watermarks: list[NonTerminalRunKeysetCursor] = []
+    original_reader = read_non_terminal_runs_keyset_page
+    result: StartupRecoveryScanResult | None = None
+
+    def record_page(
+        transaction: HostTransaction,
+        *,
+        upper_watermark: NonTerminalRunKeysetCursor,
+        cursor: NonTerminalRunKeysetCursor | None,
+        batch_size: int,
+    ) -> tuple[RunRow, ...]:
+        """记录 bounded page 输入输出后委托真实 keyset reader。
+
+        :param transaction: 当前 recovery write transaction。
+        :param upper_watermark: fixed upper watermark。
+        :param cursor: 上一批 cursor。
+        :param batch_size: 单批上限。
+        :returns: 真实 bounded page。
+        """
+
+        rows = original_reader(
+            transaction,
+            upper_watermark=upper_watermark,
+            cursor=cursor,
+            batch_size=batch_size,
+        )
+        input_cursors.append(cursor)
+        upper_watermarks.append(upper_watermark)
+        page_keys.append(
+            tuple((row.accepted_event_sequence, row.run_id) for row in rows)
+        )
+        return rows
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        for run_id in run_ids:
+            _seed_unstarted_run(
+                store.transaction_runner,
+                run_id,
+                RunStatus.ACCEPTED,
+                slot_key=f"slot-{run_id}",
+            )
+        _set_shared_accepted_sequence_without_foreign_keys(
+            _options(tmp_path).db_path,
+            run_ids,
+            100,
+        )
+        monkeypatch.setattr(
+            host_recovery,
+            "read_non_terminal_runs_keyset_page",
+            record_page,
+        )
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            dispatch_wakeup_port=_RecordingWakeup(),
+            batch_size=2,
+        ).scan(_policy())
+
+    assert result is not None
+    assert tuple(len(page) for page in page_keys) == (2, 2, 1)
+    flattened = tuple(key for page in page_keys for key in page)
+    assert flattened == tuple((100, run_id) for run_id in sorted(run_ids))
+    assert all(left < right for left, right in zip(flattened, flattened[1:]))
+    assert tuple(action.run_id for action in result.actions) == tuple(sorted(run_ids))
+    assert len(frozenset(action.run_id for action in result.actions)) == len(run_ids)
+    assert input_cursors == [
+        None,
+        NonTerminalRunKeysetCursor(100, "run-b"),
+        NonTerminalRunKeysetCursor(100, "run-d"),
+    ]
+    assert upper_watermarks == [
+        NonTerminalRunKeysetCursor(100, "run-e"),
+    ] * 3
+
+
+def test_fixed_upper_watermark_defers_concurrent_higher_run_to_next_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """watermark 固定后插入的高序号 Run 只由下一次 scan 处理。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    original_run_read = HostTransactionRunner.run_read
+    inserted = False
+    first: StartupRecoveryScanResult | None = None
+    second: StartupRecoveryScanResult | None = None
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_unstarted_run(
+            store.transaction_runner,
+            "run-b",
+            RunStatus.ACCEPTED,
+            slot_key="watermark-b",
+        )
+        _seed_unstarted_run(
+            store.transaction_runner,
+            "run-a",
+            RunStatus.ACCEPTED,
+            slot_key="watermark-a",
+        )
+
+        def run_read_then_insert(
+            self: HostTransactionRunner,
+            operation: HostReadTransactionOperation[T],
+        ) -> T:
+            """upper watermark read commit 后插入更高序号 Run。
+
+            :param self: transaction runner。
+            :param operation: typed read operation。
+            :returns: 原始 read result。
+            :raises Exception: 原始 read 或 seed 失败时透传。
+            """
+
+            nonlocal inserted
+            result = original_run_read(self, operation)
+            if self is store.transaction_runner and not inserted:
+                inserted = True
+                _seed_unstarted_run(
+                    store.transaction_runner,
+                    "run-new",
+                    RunStatus.ACCEPTED,
+                    slot_key="watermark-new",
+                )
+            return result
+
+        monkeypatch.setattr(
+            HostTransactionRunner,
+            "run_read",
+            run_read_then_insert,
+        )
+        scanner = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            dispatch_wakeup_port=_RecordingWakeup(),
+            batch_size=1,
+        )
+        first = scanner.scan(_policy())
+        second = scanner.scan(_policy())
+
+    assert first is not None
+    assert second is not None
+    assert tuple(action.run_id for action in first.actions) == ("run-b", "run-a")
+    assert "run-new" not in tuple(action.run_id for action in first.actions)
+    assert tuple(action.run_id for action in second.actions) == (
+        "run-b",
+        "run-a",
+        "run-new",
+    )
+
+
+def test_policy_now_is_fixed_across_all_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """跨 batch 的潜在时钟推进不会改变同一 scan orphan 分类。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    default_calls = 0
+    observed_policy_times: list[datetime] = []
+    original_classify = StartupRecoveryScanner._classify_run
+    result: StartupRecoveryScanResult | None = None
+
+    def advancing_default(cls: type[StartupRecoveryPolicy]) -> StartupRecoveryPolicy:
+        """每次调用返回推进一分钟的 policy time。
+
+        :param cls: policy class。
+        :returns: 测试 recovery policy。
+        """
+
+        nonlocal default_calls
+        del cls
+        now = _NOW + timedelta(minutes=default_calls)
+        default_calls += 1
+        return StartupRecoveryPolicy(
+            now=now,
+            stale_after=timedelta(seconds=30),
+            recovery_dispatch_limit=1,
+        )
+
+    def record_policy_time(
+        self: StartupRecoveryScanner,
+        transaction: HostTransaction,
+        run: RunRow,
+        policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
+        queue_promotion_sessions: list[str],
+        seen_queue_promotion_sessions: set[str],
+    ) -> host_recovery.StartupRecoveryAction:
+        """记录每行分类使用的 policy time 并委托真实 owner。
+
+        :param self: recovery scanner。
+        :param transaction: 当前 batch transaction。
+        :param run: 当前 Run row。
+        :param policy: fixed scan policy。
+        :param pending_dispatches: 本批 pending dispatch accumulator。
+        :param queue_promotion_sessions: 本批 promotion accumulator。
+        :param seen_queue_promotion_sessions: 已提交批次 promotion 去重集合。
+        :returns: 真实 recovery action。
+        """
+
+        observed_policy_times.append(policy.now)
+        return original_classify(
+            self,
+            transaction,
+            run,
+            policy,
+            pending_dispatches,
+            queue_promotion_sessions,
+            seen_queue_promotion_sessions,
+        )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        for index in range(5):
+            _seed_running_dispatching_run(
+                store.transaction_runner,
+                f"run-fixed-now-{index}",
+                slot_key=f"fixed-now-{index}",
+            )
+        _mark_owner_heartbeat(
+            store.transaction_runner,
+            heartbeat_at="2026-05-19T03:03:55.000000Z",
+        )
+        monkeypatch.setattr(
+            StartupRecoveryPolicy,
+            "default",
+            classmethod(advancing_default),
+        )
+        monkeypatch.setattr(
+            StartupRecoveryScanner,
+            "_classify_run",
+            record_policy_time,
+        )
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            batch_size=2,
+        ).scan()
+
+    assert result is not None
+    assert default_calls == 1
+    assert observed_policy_times == [_NOW] * 5
+    assert tuple(action.decision for action in result.actions) == (
+        StartupRecoveryDecision.OWNER_STILL_LIVE,
+    ) * 5
+
+
+def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第2批失败不 wake；第1批 facts 保持且完整重跑收敛到 durable truth。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    run_ids = tuple(f"run-batch-failure-{index}" for index in range(5))
+    wakeup = _RecordingWakeup()
+    classify_count = 0
+    original_classify = StartupRecoveryScanner._classify_run
+
+    def fail_after_first_mutation_in_second_batch(
+        self: StartupRecoveryScanner,
+        transaction: HostTransaction,
+        run: RunRow,
+        policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
+        queue_promotion_sessions: list[str],
+        seen_queue_promotion_sessions: set[str],
+    ) -> host_recovery.StartupRecoveryAction:
+        """让第3行先写 mutation 后抛错，验证整批 rollback。
+
+        :param self: recovery scanner。
+        :param transaction: 当前 batch transaction。
+        :param run: 当前 Run row。
+        :param policy: fixed scan policy。
+        :param pending_dispatches: 本批 pending accumulator。
+        :param queue_promotion_sessions: 本批 promotion accumulator。
+        :param seen_queue_promotion_sessions: 已提交 promotion 去重集合。
+        :returns: 前两行真实 action；第3行不会返回。
+        :raises RuntimeError: 第3行 mutation 后固定抛出。
+        """
+
+        nonlocal classify_count
+        classify_count += 1
+        action = original_classify(
+            self,
+            transaction,
+            run,
+            policy,
+            pending_dispatches,
+            queue_promotion_sessions,
+            seen_queue_promotion_sessions,
+        )
+        if classify_count == 3:
+            raise RuntimeError("injected second recovery batch failure")
+        return action
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        for index, run_id in enumerate(run_ids):
+            _seed_running_dispatching_run(
+                store.transaction_runner,
+                run_id,
+                slot_key=f"batch-failure-{index}",
+            )
+        _insert_current_recovery_owner(store.transaction_runner)
+        scanner = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
+            recovery_owner_host_instance_id="host-instance-new",
+            batch_size=2,
+        )
+        monkeypatch.setattr(
+            StartupRecoveryScanner,
+            "_classify_run",
+            fail_after_first_mutation_in_second_batch,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="injected second recovery batch failure",
+        ):
+            scanner.scan(_policy())
+
+        assert len(wakeup.dispatches) == 2
+        assert _current_attempt_id(store.transaction_runner, run_ids[0]) != (
+            f"attempt-{run_ids[0]}"
+        )
+        assert _current_attempt_id(store.transaction_runner, run_ids[1]) != (
+            f"attempt-{run_ids[1]}"
+        )
+        assert _current_attempt_id(store.transaction_runner, run_ids[2]) == (
+            f"attempt-{run_ids[2]}"
+        )
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_ATTEMPT_LOST) == 2
+
+        monkeypatch.setattr(
+            StartupRecoveryScanner,
+            "_classify_run",
+            original_classify,
+        )
+        rerun = scanner.scan(_policy())
+
+        assert len(wakeup.dispatches) == 5
+        assert len(frozenset(item.dispatch_record_id for item in wakeup.dispatches)) == 5
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_ATTEMPT_LOST) == 5
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_RECOVERING) == 5
+        assert tuple(action.decision for action in rerun.actions[:2]) == (
+            StartupRecoveryDecision.OWNER_STILL_LIVE,
+            StartupRecoveryDecision.OWNER_STILL_LIVE,
+        )
+        assert tuple(action.decision for action in rerun.actions[2:]) == (
+            StartupRecoveryDecision.RECOVERY_DISPATCHED,
+        ) * 3
+        for run_id in run_ids:
+            current_dispatch_id = _current_dispatch_record_id(
+                store.transaction_runner,
+                run_id,
+            )
+            assert current_dispatch_id in tuple(
+                item.dispatch_record_id for item in wakeup.dispatches
+            )
+
+
+def test_paginated_scan_preserves_accepted_queued_waiting_and_cancel_owners(
+    tmp_path: Path,
+) -> None:
+    """分页不改变 ACCEPTED/QUEUED/WAITING/accepted-cancel 分类真源。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    wakeup = _RecordingWakeup()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_unstarted_run(
+            store.transaction_runner,
+            "run-mixed-accepted",
+            RunStatus.ACCEPTED,
+            slot_key="mixed-accepted",
+        )
+        _seed_unstarted_run(
+            store.transaction_runner,
+            "run-mixed-queued",
+            RunStatus.QUEUED,
+            slot_key="mixed-queued",
+        )
+        _seed_running_dispatching_run(
+            store.transaction_runner,
+            "run-mixed-waiting",
+            slot_key="mixed-waiting",
+        )
+        _mark_run_status(
+            store.transaction_runner,
+            "run-mixed-waiting",
+            RunStatus.WAITING,
+        )
+        _seed_running_dispatching_run(
+            store.transaction_runner,
+            "run-mixed-cancelling",
+            slot_key="mixed-cancelling",
+        )
+        _append_accepted_cancel_facts(
+            store.transaction_runner,
+            "run-mixed-cancelling",
+        )
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
+            defer_accepted_cancel_to_watchdog=True,
+            batch_size=2,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.ACCEPTED_WAKE,
+            StartupRecoveryDecision.QUEUE_PROMOTION_CHECK,
+            StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
+            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+        )
+        assert len(wakeup.promoted_sessions) == 2
+        assert wakeup.dispatches == []
+        assert _run_status(
+            store.transaction_runner,
+            "run-mixed-waiting",
+        ) == RunStatus.WAITING.value
+        assert _run_status(
+            store.transaction_runner,
+            "run-mixed-cancelling",
+        ) == RunStatus.CANCELLING.value
+
+
+def _set_shared_accepted_sequence_without_foreign_keys(
+    db_path: Path,
+    run_ids: tuple[str, ...],
+    accepted_event_sequence: int,
+) -> None:
+    """关闭 fixture FK 后把测试 Runs 调整为同 sequence 验证 tie-break。
+
+    production EventLog sequence 唯一，计划仍要求 keyset 对同 sequence 保持全序；
+    本 helper 只构造 reader-level defensive counterexample，不作为业务有效事实。
+
+    :param db_path: Host durable SQLite 路径。
+    :param run_ids: 目标 Run ids。
+    :param accepted_event_sequence: 共享 accepted sequence。
+    :returns: ``None``。
+    :raises sqlite3.Error: fixture 更新失败时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        for run_id in run_ids:
+            connection.execute(
+                f"""
+                UPDATE {TABLE_HOST_RUNS}
+                SET accepted_event_sequence = ?
+                WHERE run_id = ?
+                """,
+                (accepted_event_sequence, run_id),
+            )
+
+
+def _insert_current_recovery_owner(
+    transaction_runner: HostTransactionRunner,
+) -> None:
+    """写入本轮 recovery dispatch owner 的 recent liveness row。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """插入 current recovery owner。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            """
+            INSERT INTO host_instances (
+              host_instance_id,
+              pid,
+              process_start_token,
+              boot_id,
+              created_at,
+              heartbeat_at,
+              status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "host-instance-new",
+                888_888,
+                "process-start-token-new",
+                None,
+                "2026-05-19T03:04:05.000000Z",
+                "2026-05-19T03:04:05.000000Z",
+                "running",
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _current_attempt_id(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> str | None:
+    """读取 Run current Attempt id。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :returns: current Attempt id；未设置时返回 ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> str | None:
+        """读取 current Attempt id。
+
+        :param transaction: 当前 Host transaction。
+        :returns: current Attempt id。
+        """
+
+        run = read_run_by_id(transaction, run_id)
+        assert run is not None
+        return run.current_attempt_id
+
+    return transaction_runner.run_read(operation)
+
+
+def _current_dispatch_record_id(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> str:
+    """读取 Run current Attempt 的 dispatch record id。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :returns: current dispatch record id。
+    :raises AssertionError: current Attempt/dispatch 缺失时抛出。
+    """
+
+    def operation(transaction: HostTransaction) -> str:
+        """读取 current dispatch id。
+
+        :param transaction: 当前 Host transaction。
+        :returns: dispatch record id。
+        :raises AssertionError: current Attempt/dispatch 缺失时抛出。
+        """
+
+        run = read_run_by_id(transaction, run_id)
+        assert run is not None
+        assert run.current_attempt_id is not None
+        dispatch = read_dispatch_record_by_attempt_id(
+            transaction,
+            run.current_attempt_id,
+        )
+        assert dispatch is not None
+        return dispatch.dispatch_record_id
+
+    return transaction_runner.run_read(operation)
+
+
 def _policy() -> StartupRecoveryPolicy:
     """构造测试 recovery policy。
 
@@ -947,16 +1589,20 @@ def _delete_dispatch_record_for_attempt(
 
 
 def _seed_running_dispatching_run(
-    transaction_runner: HostTransactionRunner, run_id: str
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+    *,
+    slot_key: str = "recovery-scan",
 ) -> None:
     """写入 running Run 与 stale owner dispatch record。
 
     :param transaction_runner: Host transaction runner。
     :param run_id: Run id。
+    :param slot_key: 为多 Session batch fixture 隔离 active slot 的 key。
     :returns: ``None``。
     """
 
-    session_id = _ensure_session_id(transaction_runner)
+    session_id = _ensure_session_id(transaction_runner, slot_key=slot_key)
 
     def operation(transaction: HostTransaction) -> None:
         """写入测试数据。
@@ -1018,18 +1664,23 @@ def _seed_running_dispatching_run(
 
 
 def _seed_unstarted_run(
-    transaction_runner: HostTransactionRunner, run_id: str, status: RunStatus
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+    status: RunStatus,
+    *,
+    slot_key: str = "recovery-scan",
 ) -> None:
     """写入 ACCEPTED 或 QUEUED 测试 Run。
 
     :param transaction_runner: Host transaction runner。
     :param run_id: Run id。
     :param status: 目标非启动状态。
+    :param slot_key: 为 batch fixture 创建独立 Session 时使用的 slot key。
     :returns: ``None``。
     :raises AssertionError: status 不是 ACCEPTED 或 QUEUED 时抛出。
     """
 
-    session_id = _ensure_session_id(transaction_runner)
+    session_id = _ensure_session_id(transaction_runner, slot_key=slot_key)
 
     def operation(transaction: HostTransaction) -> None:
         """写入测试数据。
@@ -1083,10 +1734,15 @@ def _seed_unstarted_run(
     transaction_runner.run_write(operation)
 
 
-def _ensure_session_id(transaction_runner: HostTransactionRunner) -> str:
+def _ensure_session_id(
+    transaction_runner: HostTransactionRunner,
+    *,
+    slot_key: str = "recovery-scan",
+) -> str:
     """创建测试 Session。
 
     :param transaction_runner: Host transaction runner。
+    :param slot_key: 测试 Session slot key。
     :returns: Session id。
     """
 
@@ -1094,7 +1750,7 @@ def _ensure_session_id(transaction_runner: HostTransactionRunner) -> str:
         transaction_runner,
         EnsureSessionRequest(
             scope="workspace",
-            slot_key="recovery-scan",
+            slot_key=slot_key,
             metadata=(HostMetadataEntry(key="case", value="recovery-scan"),),
         ),
     )
@@ -1124,7 +1780,7 @@ def _create_accepted_input(
         source="pytest",
         idempotency_key=f"request-{run_id}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         call_context_digest=_CALL_CONTEXT_DIGEST,
     )
 
@@ -1153,7 +1809,7 @@ def _create_queued_input(
         source="pytest",
         idempotency_key=f"request-{run_id}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         queue_reason="active_run_exists",
         active_run_id="run-active",
         call_context_digest=_CALL_CONTEXT_DIGEST,
@@ -1188,7 +1844,7 @@ def _create_running_input(
         source="pytest",
         idempotency_key=f"request-{run_id}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         start_reason=RunStartReason.INITIAL,
         worker_kind=WorkerKind.LOCAL,
         owner_host_instance_id=None,
@@ -1244,7 +1900,7 @@ def _insert_stale_host_instance(transaction: HostTransaction) -> None:
 
     transaction.execute(
         """
-        INSERT INTO host_instances (
+        INSERT OR IGNORE INTO host_instances (
           host_instance_id,
           pid,
           process_start_token,
@@ -1448,7 +2104,9 @@ def _append_recovery_started_event(
                 event_type="RUN_STARTED",
                 payload={
                     "run_id": run_id,
-                    "start_reason": "recovery",
+                    "start_reason": serialize_run_start_reason(
+                        RunStartReason.RECOVERY
+                    ),
                     "source_attempt_id": f"attempt-{run_id}",
                     "attempt_id": f"attempt-recovery-{run_id}",
                     "dispatch_record_id": f"dispatch-recovery-{run_id}",
@@ -1499,6 +2157,15 @@ def _append_accepted_cancel_facts(
                 },
             ),
         )
+        transaction.execute(
+            "UPDATE host_runs SET status = ?, cancel_request_event_id = ?, updated_at = ? WHERE run_id = ?",
+            (
+                RunStatus.CANCELLING.value,
+                cancel_requested_id,
+                "2026-05-19T03:04:00.000000Z",
+                run_id,
+            ),
+        )
         event_log_store.append_event(
             transaction,
             _event(
@@ -1541,7 +2208,22 @@ def _append_malformed_run_cancelling_payload(
         )
         assert session_row is not None
         session_id = _required_text(session_row, "session_id")
+        cancel_requested_id = f"event-cancel-requested-malformed-{run_id}"
         event_log_store = EventLogStore()
+        event_log_store.append_event(
+            transaction,
+            _event(
+                event_id=cancel_requested_id,
+                session_id=session_id,
+                run_id=run_id,
+                event_type=_EVENT_TYPE_CANCEL_REQUESTED,
+                payload={
+                    "run_id": run_id,
+                    "reason": "user_stop",
+                    "mode": "graceful",
+                },
+            ),
+        )
         event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
@@ -1562,6 +2244,15 @@ def _append_malformed_run_cancelling_payload(
                 payload_json="malformed-cancelling-payload",
                 payload_ref=None,
                 payload_digest=None,
+            ),
+        )
+        transaction.execute(
+            "UPDATE host_runs SET status = ?, cancel_request_event_id = ?, updated_at = ? WHERE run_id = ?",
+            (
+                RunStatus.CANCELLING.value,
+                cancel_requested_id,
+                "2026-05-19T03:04:00.000000Z",
+                run_id,
             ),
         )
 

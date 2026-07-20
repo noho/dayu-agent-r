@@ -35,10 +35,8 @@ _FIELD_TOOL_CALL_REQUESTED_EVENT_REF = "tool_call_requested_event_ref"
 _FIELD_TOOL_NAME = "tool_name"
 _FIELD_TOOL_QUERY = "tool_query"
 _FIELD_TRUNCATION_APPLIED = "truncation_applied"
-ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH = (
-    "accepted evidence producer_event_ref mismatch"
-)
-"""Accepted evidence envelope producer event ref 与当前事件不一致的错误文本。"""
+ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT = "该工具结果未提供业务来源。"
+"""Accepted tool result 未携带显式业务来源时的唯一 LLM-facing 文案。"""
 _ENVELOPE_FIELDS = frozenset(
     {
         _FIELD_EVIDENCE_ID,
@@ -92,6 +90,91 @@ class OpaqueEvidenceRef:
         _require_non_empty_text(self.ref_kind, "ref_kind")
         _require_non_empty_text(self.ref_id, "ref_id")
         _require_optional_sha256_digest(self.digest, "digest")
+
+
+class AcceptedEvidenceProducerEventRefMismatchError(ValueError):
+    """Accepted evidence producer event ref 不一致的专用异常。
+
+    :param expected_event_ref: 当前读取方期望的 producer event ref。
+    :param observed_event_ref: envelope 实际携带的 producer event ref。
+    """
+
+    expected_event_ref: str
+    observed_event_ref: str
+
+    def __init__(self, *, expected_event_ref: str, observed_event_ref: str) -> None:
+        """初始化 mismatch 异常。
+
+        :param expected_event_ref: 当前读取方期望的 producer event ref。
+        :param observed_event_ref: envelope 实际携带的 producer event ref。
+        :returns: ``None``。
+        :raises ValueError: 任一 event ref 为空时抛出。
+        """
+
+        _require_non_empty_text(expected_event_ref, "expected_event_ref")
+        _require_non_empty_text(observed_event_ref, "observed_event_ref")
+        self.expected_event_ref = expected_event_ref
+        self.observed_event_ref = observed_event_ref
+        super().__init__("accepted evidence producer_event_ref mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedToolEvidenceLLMMaterial:
+    """Accepted tool evidence 的 LLM-facing material。
+
+    :param tool_name: 工具名称。
+    :param query_text: producer query 或 exact canonical 参数投影。
+    :param source_text: producer 显式 citation 或业务中性 unavailable 文案。
+    :param result_text: 工具结果 canonical 文本。
+    """
+
+    tool_name: str
+    query_text: str
+    source_text: str
+    result_text: str
+
+    def __post_init__(self) -> None:
+        """校验 LLM material 文本字段。
+
+        :returns: ``None``。
+        :raises ValueError: 任一字段不是非空文本时抛出。
+        """
+
+        _require_non_empty_text(self.tool_name, "AcceptedToolEvidenceLLMMaterial.tool_name")
+        _require_non_empty_text(
+            self.query_text,
+            "AcceptedToolEvidenceLLMMaterial.query_text",
+        )
+        _require_non_empty_text(
+            self.source_text,
+            "AcceptedToolEvidenceLLMMaterial.source_text",
+        )
+        _require_non_empty_text(
+            self.result_text,
+            "AcceptedToolEvidenceLLMMaterial.result_text",
+        )
+
+
+def render_accepted_tool_evidence_for_llm(
+    material: AcceptedToolEvidenceLLMMaterial,
+) -> str:
+    """渲染 accepted tool evidence 的唯一 LLM-facing 四行文本。
+
+    :param material: accepted evidence LLM material。
+    :returns: 业务可读 evidence 文本。
+    :raises TypeError: material 类型非法时抛出。
+    """
+
+    if not isinstance(material, AcceptedToolEvidenceLLMMaterial):
+        raise TypeError("material must be AcceptedToolEvidenceLLMMaterial")
+    return "\n".join(
+        (
+            f"工具名称：{material.tool_name}",
+            f"查询语义：{material.query_text}",
+            f"业务来源：{material.source_text}",
+            f"工具结果：{material.result_text}",
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,7 +411,10 @@ def accepted_evidence_envelope_from_payload(
         return None
     envelope = accepted_evidence_envelope_from_json_value(envelope_value)
     if envelope.producer_event_ref != producer_event_ref:
-        raise ValueError(ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH)
+        raise AcceptedEvidenceProducerEventRefMismatchError(
+            expected_event_ref=producer_event_ref,
+            observed_event_ref=envelope.producer_event_ref,
+        )
     return envelope
 
 
@@ -558,14 +644,17 @@ def _require_optional_sha256_digest(
 
 
 __all__ = [
+    "ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT",
     "AcceptedEvidenceEnvelope",
+    "AcceptedEvidenceProducerEventRefMismatchError",
     "AcceptedEvidenceResultRef",
     "AcceptedEvidenceToolQuery",
-    "ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH",
+    "AcceptedToolEvidenceLLMMaterial",
     "OpaqueEvidenceRef",
     "accepted_evidence_envelope_from_payload",
     "accepted_evidence_envelope_from_json_value",
     "accepted_evidence_envelope_to_json_value",
     "accepted_tool_raw_outcome_text_from_payload",
     "derive_accepted_evidence_id",
+    "render_accepted_tool_evidence_for_llm",
 ]

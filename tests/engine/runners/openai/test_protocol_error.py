@@ -15,6 +15,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEventType,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
     RunnerToolCallsCompletedData,
 )
 from dayu.engine.contracts.partial_tool_call import (
@@ -310,8 +311,32 @@ async def test_sse_missing_choices_without_usage_emits_protocol_error() -> None:
     diagnostic = _diagnostic_payload(error.raw_payload)
     assert diagnostic["source"] == "sse_missing_choices"
     assert diagnostic["kind"] == "protocol_object"
-    assert diagnostic["reason"] == "missing_choices_and_usage"
+    assert diagnostic["reason"] == "choices_missing"
     assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_sse_empty_choices_without_usage_emits_protocol_error() -> None:
+    """SSE ``choices=[]`` 但无 usage 时必须协议错误收口。"""
+
+    events = await parse_sse(
+        [_sse_json_chunk('{"choices":[]}'), b"data: [DONE]\n\n"]
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_missing_choices"
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["source"] == "sse_missing_choices"
+    assert diagnostic["kind"] == "protocol_object"
+    assert diagnostic["reason"] == "choices_empty_without_usage"
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
@@ -323,6 +348,7 @@ async def test_sse_usage_only_chunk_does_not_protocol_error() -> None:
 
     payload_json = json.dumps(
         {
+            "choices": [],
             "usage": {
                 "prompt_tokens": 5,
                 "completion_tokens": 0,
@@ -332,7 +358,12 @@ async def test_sse_usage_only_chunk_does_not_protocol_error() -> None:
         separators=(",", ":"),
     )
     events = await parse_sse(
-        [_sse_json_chunk(payload_json), b"data: [DONE]\n\n"]
+        [
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            _sse_json_chunk(payload_json),
+            b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
     )
 
     assert not any(
@@ -345,10 +376,10 @@ async def test_sse_usage_only_chunk_does_not_protocol_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sse_unknown_finish_reason_logs_diagnostic(
+async def test_sse_invalid_finish_reason_fails_closed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """SSE 未知 finish_reason 保留 STOP 回落，同时记录诊断日志。"""
+    """SSE 未知 finish_reason 必须 fatal，不得回落 STOP。"""
 
     caplog.set_level(
         logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
@@ -361,18 +392,49 @@ async def test_sse_unknown_finish_reason_logs_diagnostic(
         ]
     )
 
-    completed_events = [
-        event for event in events
-        if event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
+    assert [event.type for event in events] == [
+        RunnerEventType.RUNNER_CONTENT_DELTA,
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
     ]
-    assert len(completed_events) == 1
-    completed = completed_events[0].data
-    assert isinstance(completed, RunnerContentCompletedData)
-    assert completed.finish_reason is FinishReason.STOP
+    error = events[1].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_invalid_finish_reason"
+    done = events[2].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
     assert any(
-        "unknown_finish_reason" in record.getMessage()
+        "sse_invalid_finish_reason" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_sse_finish_reason_without_delta_emits_invalid_choice_shape() -> None:
+    """SSE choice 有 finish_reason 但缺 delta object 时必须 fatal。"""
+
+    events = await parse_sse(
+        [
+            b'data: {"choices":[{"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_invalid_choice_shape"
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["reason"] == "delta_missing"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in {
+        event.type for event in events
+    }
 
 
 @pytest.mark.asyncio
@@ -495,7 +557,7 @@ async def test_sse_partial_tool_call_summary_has_hard_bounds() -> None:
 async def test_sse_usage_malformed_after_tool_delta_logs_and_continues(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """tool call delta 后 malformed usage 只记日志，后续仍可 completed。"""
+    """tool call delta 后 malformed usage 产出诊断，后续仍可 completed。"""
 
     caplog.set_level(
         logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
@@ -547,15 +609,19 @@ async def test_sse_usage_malformed_after_tool_delta_logs_and_continues(
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.RUNNER_TOOL_CALL_DELTA,
+        RunnerEventType.PROVIDER_DIAGNOSTIC,
         RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
         RunnerEventType.RUNNER_DONE,
     ]
-    completed = events[1].data
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "usage_field_malformed"
+    completed = events[2].data
     assert isinstance(completed, RunnerToolCallsCompletedData)
     assert len(completed.tool_calls) == 1
     assert completed.tool_calls[0].tool_call_id == "call-1"
     assert completed.tool_calls[0].name == "lookup"
-    done = events[2].data
+    done = events[3].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.TOOL_CALLS
     assert RunnerEventType.PROVIDER_PROTOCOL_ERROR not in types
@@ -596,6 +662,14 @@ async def test_sse_usage_malformed_before_content_completion_continues(
 
     types = [event.type for event in events]
     assert RunnerEventType.PROVIDER_PROTOCOL_ERROR not in types
+    assert RunnerEventType.PROVIDER_DIAGNOSTIC in types
+    diagnostics = [
+        event.data for event in events
+        if event.type is RunnerEventType.PROVIDER_DIAGNOSTIC
+    ]
+    assert len(diagnostics) == 1
+    assert isinstance(diagnostics[0], RunnerProviderDiagnosticData)
+    assert diagnostics[0].diagnostic_code == "usage_field_malformed"
     assert RunnerEventType.RUNNER_CONTENT_COMPLETED in types
     completed_events = [
         event for event in events
@@ -605,7 +679,13 @@ async def test_sse_usage_malformed_before_content_completion_continues(
     completed = completed_events[0].data
     assert isinstance(completed, RunnerContentCompletedData)
     assert completed.content == "ok"
-    assert completed.finish_reason is FinishReason.STOP
+    done_events = [
+        event for event in events if event.type is RunnerEventType.RUNNER_DONE
+    ]
+    assert len(done_events) == 1
+    done = done_events[0].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.STOP
     assert any(
         "usage_field_malformed" in record.getMessage()
         for record in caplog.records
@@ -650,6 +730,13 @@ async def test_sse_bool_usage_logs_warning_and_continues(
         event.type is RunnerEventType.RUNNER_USAGE_RECORDED
         for event in events
     )
+    diagnostics = [
+        event.data for event in events
+        if event.type is RunnerEventType.PROVIDER_DIAGNOSTIC
+    ]
+    assert len(diagnostics) == 1
+    assert isinstance(diagnostics[0], RunnerProviderDiagnosticData)
+    assert diagnostics[0].diagnostic_code == "usage_field_malformed"
     completed_events = [
         event for event in events
         if event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
@@ -669,7 +756,7 @@ async def test_sse_bool_usage_logs_warning_and_continues(
 async def test_sse_non_object_choice_logs_diagnostic(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """SSE ``choices`` 内非 object 成员只记录诊断，不改变协议行为。"""
+    """SSE ``choices`` 内非 object 成员必须 fatal，不得合并其它 choice。"""
 
     caplog.set_level(
         logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
@@ -687,13 +774,19 @@ async def test_sse_non_object_choice_logs_diagnostic(
         ]
     )
 
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_invalid_choice_shape"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
     assert any(
-        "code=sse_choice_not_object" in record.getMessage()
+        "sse_invalid_choice_shape" in record.getMessage()
         for record in caplog.records
-    )
-    assert any(
-        event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
-        for event in events
     )
 
 
@@ -715,9 +808,9 @@ async def test_sse_all_non_object_choices_end_with_protocol_error() -> None:
     ]
     assert len(errors) == 1
     assert isinstance(errors[0], RunnerProtocolErrorData)
-    assert errors[0].error_code == "sse_missing_choices"
+    assert errors[0].error_code == "sse_invalid_choice_shape"
     diagnostic = _diagnostic_payload(errors[0].raw_payload)
-    assert diagnostic["reason"] == "no_valid_choice_object"
+    assert diagnostic["reason"] == "choice_not_object"
     done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
     assert len(done) == 1
 
@@ -745,9 +838,9 @@ async def test_sse_all_non_object_choices_with_usage_protocol_error() -> None:
     ]
     error = events[0].data
     assert isinstance(error, RunnerProtocolErrorData)
-    assert error.error_code == "sse_missing_choices"
+    assert error.error_code == "sse_invalid_choice_shape"
     diagnostic = _diagnostic_payload(error.raw_payload)
-    assert diagnostic["reason"] == "no_valid_choice_object"
+    assert diagnostic["reason"] == "choice_not_object"
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
@@ -859,3 +952,40 @@ def test_non_stream_missing_choices_error() -> None:
     assert events[0].type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
     assert isinstance(events[0].data, RunnerProtocolErrorData)
     assert events[0].data.error_code == "non_stream_missing_choices"
+
+
+@pytest.mark.parametrize(
+    "choices_value",
+    (
+        [],
+        {"0": {"message": {"content": "answer"}}},
+    ),
+)
+def test_non_stream_empty_or_non_list_choices_error(
+    choices_value: JsonValue,
+) -> None:
+    """非流式 ``choices`` 为空或非数组时必须协议错误收口。
+
+    :param choices_value: provider 返回的 choices 原始值。
+    :returns: 无返回值。
+    :raises AssertionError: 未按协议错误收口时由 pytest 抛出。
+    """
+
+    payload = json.dumps({"choices": choices_value}).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_missing_choices"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR

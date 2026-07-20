@@ -21,6 +21,7 @@ from dayu.host.api import (
     OperationContext,
     RunStatus,
 )
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable import run_transition as run_transition_module
@@ -72,6 +73,7 @@ from dayu.host.durable.state import (
     StateMutationStatus,
     WorkerKind,
     cancel_queued_run_row,
+    cancel_recovering_run_row,
     cancel_running_run_row,
     cancel_starting_dispatch_record_row,
     mark_attempt_running_row,
@@ -85,6 +87,10 @@ from dayu.host.durable.state import (
     terminal_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 
 _NOW = datetime(2026, 5, 14, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "run-transition-test"})
@@ -173,7 +179,7 @@ def test_create_running_run_creates_attempt_and_pending_dispatch(
             """执行 running Run 创建。
 
             :param transaction: Host transaction。
-            :returns: Run、Attempt、dispatch 状态。
+            :returns: Run、Attempt、dispatch 状态与 Run cancel link。
             """
 
             input_event = _append_user_input(
@@ -413,6 +419,39 @@ def test_terminal_closeout_appends_concrete_terminal_events(
         assert "RUN_TERMINAL" not in event_types
 
 
+def test_terminal_closeout_status_pair_invariant_uses_lifecycle_owner() -> None:
+    """terminal closeout status pair invariant 由 lifecycle owner helper 派生。"""
+
+    expected = tuple(
+        (attempt_status, RunStatus(attempt_status.value))
+        for attempt_status in AttemptStatus
+        if attempt_status
+        in (
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.CANCELLED,
+            AttemptStatus.LOST,
+        )
+    )
+    assert run_transition_module._TERMINAL_STATUS_PAIRS == expected
+    for attempt_status, run_status in expected:
+        assert run_transition_module._terminal_status_pair_is_compatible(
+            attempt_status=attempt_status,
+            run_status=run_status,
+        )
+        assert run_transition_module._attempt_terminal_event_type(
+            attempt_status
+        ) == closeout_attempt_terminal_event_type_for_status(attempt_status).value
+        assert run_transition_module._run_terminal_event_type(
+            run_status
+        ) == run_terminal_event_type_for_status(run_status).value
+    for durable_only_status in (AttemptStatus.SUSPENDED, AttemptStatus.STEERED):
+        assert not run_transition_module._terminal_status_pair_is_compatible(
+            attempt_status=durable_only_status,
+            run_status=RunStatus.SUCCEEDED,
+        )
+
+
 def test_failed_terminal_closeout_payload_includes_client_correlation_id(
     tmp_path: Path,
 ) -> None:
@@ -547,30 +586,24 @@ def test_terminal_closeout_replay_absorbs_same_terminal_status_without_new_event
 
 @pytest.mark.parametrize(
     ("attempt_status", "run_status", "attempt_event_type", "run_event_type"),
-    (
         (
-            AttemptStatus.SUCCEEDED,
-            RunStatus.SUCCEEDED,
-            "ATTEMPT_SUCCEEDED",
-            "RUN_SUCCEEDED",
-        ),
-        (
-            AttemptStatus.FAILED,
-            RunStatus.FAILED,
-            "ATTEMPT_FAILED",
-            "RUN_FAILED",
-        ),
-        (
-            AttemptStatus.CANCELLED,
-            RunStatus.CANCELLED,
-            "ATTEMPT_CANCELLED",
-            "RUN_CANCELLED",
-        ),
-        (
-            AttemptStatus.LOST,
-            RunStatus.LOST,
-            "ATTEMPT_LOST",
-            "RUN_LOST",
+            (
+                AttemptStatus.SUCCEEDED,
+                RunStatus.SUCCEEDED,
+                "ATTEMPT_SUCCEEDED",
+                "RUN_SUCCEEDED",
+            ),
+            (
+                AttemptStatus.FAILED,
+                RunStatus.FAILED,
+                "ATTEMPT_FAILED",
+                "RUN_FAILED",
+            ),
+            (
+                AttemptStatus.LOST,
+                RunStatus.LOST,
+                "ATTEMPT_LOST",
+                "RUN_LOST",
         ),
     ),
 )
@@ -785,7 +818,7 @@ def test_terminal_closeout_accepts_attempt_running_in_phase5(
         (
             AttemptStatus.SUSPENDED,
             RunStatus.SUCCEEDED,
-            "unsupported Attempt terminal status",
+            "unsupported closeout Attempt terminal status",
         ),
     ),
 )
@@ -1031,7 +1064,7 @@ def test_cancel_predispatch_starting_updates_dispatch_attempt_and_run(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def cancel(transaction: HostTransaction) -> tuple[str, str, str]:
+        def cancel(transaction: HostTransaction) -> tuple[str, str, str, str]:
             """执行 pre-dispatch cancel。
 
             :param transaction: Host transaction。
@@ -1060,16 +1093,20 @@ def test_cancel_predispatch_starting_updates_dispatch_attempt_and_run(
             assert result.run is not None
             assert result.attempt is not None
             assert result.dispatch_record is not None
+            cancel_request_event_id = result.run.cancel_request_event_id
+            assert cancel_request_event_id is not None
             return (
                 result.run.status.value,
                 result.attempt.status.value,
                 result.dispatch_record.status.value,
+                cancel_request_event_id,
             )
 
         assert store.transaction_runner.run_write(cancel) == (
             RunStatus.CANCELLED.value,
             AttemptStatus.CANCELLED.value,
             DispatchRecordStatus.CANCELLED.value,
+            "event-cancel-requested",
         )
 
 
@@ -1319,9 +1356,22 @@ def test_terminal_run_row_reports_cas_lost_for_deferred_active_statuses(
             :returns: mutation 状态与最新 Run 状态。
             """
 
+            cancel_request_event_id: str | None = None
+            if active_status is RunStatus.CANCELLING:
+                cancel_request_event = EventLogStore().append_event(
+                    transaction,
+                    _test_event(
+                        event_id="event-cancel-requested-cas-test",
+                        session_id=seeded.session_id,
+                        run_id=seeded.run_id,
+                        event_type="CANCEL_REQUESTED",
+                        payload={"reason": "cas-test"},
+                    ),
+                ).row
+                cancel_request_event_id = cancel_request_event.event_id
             transaction.execute(
-                "UPDATE host_runs SET status = ? WHERE run_id = ?",
-                (active_status.value, seeded.run_id),
+                "UPDATE host_runs SET status = ?, cancel_request_event_id = ? WHERE run_id = ?",
+                (active_status.value, cancel_request_event_id, seeded.run_id),
             )
             event = EventLogStore().append_event(
                 transaction,
@@ -1348,6 +1398,83 @@ def test_terminal_run_row_reports_cas_lost_for_deferred_active_statuses(
         assert store.transaction_runner.run_write(operation) == (
             StateMutationStatus.CAS_LOST.value,
             active_status.value,
+        )
+
+
+def test_cancel_recovering_run_row_cas_requires_current_attempt(
+    tmp_path: Path,
+) -> None:
+    """recovering cancel CAS 必须匹配 current Attempt id。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, str]:
+            """构造 recovering Run 并验证 current Attempt CAS。
+
+            :param transaction: Host transaction。
+            :returns: 错误 attempt 的 mutation 状态、正确 attempt 的 mutation
+                状态与最终 Run 状态。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_RUNS}
+                SET status = ?
+                WHERE run_id = ?
+                """,
+                (RunStatus.RECOVERING.value, seeded.run_id),
+            )
+            EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-cancel-requested-correct",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="CANCEL_REQUESTED",
+                    payload={"reason": "test_cancel"},
+                ),
+            )
+            terminal_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-recovering-cancelled-correct",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_CANCELLED",
+                    payload={"terminal_reason": "test_cancel"},
+                ),
+            )
+            wrong = cancel_recovering_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id="attempt-other",
+                terminal_event_id="event-recovering-cancelled-wrong",
+                terminal_event_sequence=101,
+                cancel_request_event_id="event-cancel-requested-wrong",
+                terminal_at="2026-05-14T01:02:09.000000Z",
+            )
+            correct = cancel_recovering_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id=seeded.attempt_id,
+                terminal_event_id="event-recovering-cancelled-correct",
+                terminal_event_sequence=terminal_event.row.event_sequence,
+                cancel_request_event_id="event-cancel-requested-correct",
+                terminal_at="2026-05-14T01:02:10.000000Z",
+            )
+            latest = read_run_by_id(transaction, seeded.run_id)
+            assert latest is not None
+            return wrong.status.value, correct.status.value, latest.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            StateMutationStatus.UPDATED.value,
+            RunStatus.CANCELLED.value,
         )
 
 
@@ -1387,15 +1514,29 @@ def test_terminal_run_row_absorbs_only_same_terminal_ref_replay(
                     payload={"reason": "cas-terminal-test"},
                 ),
             ).row
+            cancel_request_event_id: str | None = None
+            if terminal_status is RunStatus.CANCELLED:
+                cancel_request_event = EventLogStore().append_event(
+                    transaction,
+                    _test_event(
+                        event_id="event-cancel-requested-terminal-replay",
+                        session_id=seeded.session_id,
+                        run_id=seeded.run_id,
+                        event_type="CANCEL_REQUESTED",
+                        payload={"reason": "cas-terminal-test"},
+                    ),
+                ).row
+                cancel_request_event_id = cancel_request_event.event_id
             transaction.execute(
                 "UPDATE host_runs "
                 "SET status = ?, terminal_event_id = ?, "
-                "terminal_event_sequence = ?, terminal_at = ? "
+                "terminal_event_sequence = ?, cancel_request_event_id = ?, terminal_at = ? "
                 "WHERE run_id = ?",
                 (
                     terminal_status.value,
                     event.event_id,
                     event.event_sequence,
+                    cancel_request_event_id,
                     "2026-05-14T01:02:10Z",
                     seeded.run_id,
                 ),
@@ -1747,11 +1888,11 @@ def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def operation(transaction: HostTransaction) -> tuple[str, int]:
+        def operation(transaction: HostTransaction) -> tuple[str, str, int]:
             """先接受 worker，再执行两次 active cancel。
 
             :param transaction: Host transaction。
-            :returns: Run 状态与 RUN_CANCELLING 事件数。
+            :returns: Run 状态、typed cancel link 与 RUN_CANCELLING 事件数。
             """
 
             _mark_dispatching_tx(transaction, seeded.attempt_id)
@@ -1782,13 +1923,16 @@ def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
             )
             assert first.run is not None
             assert second.run is not None
+            assert second.run.cancel_request_event_id is not None
             return (
                 second.run.status.value,
+                second.run.cancel_request_event_id,
                 _count_events(transaction, _EVENT_TYPE_RUN_CANCELLING),
             )
 
         assert store.transaction_runner.run_write(operation) == (
             RunStatus.CANCELLING.value,
+            "event-active-cancel-requested-first",
             1,
         )
 
@@ -1909,10 +2053,10 @@ def test_active_cancel_watchdog_closeout_requires_cancelling_run(
         )
 
 
-def test_active_cancel_watchdog_closeout_rejects_malformed_cancelling_payload(
+def test_active_cancel_watchdog_closeout_uses_typed_link_with_malformed_payload(
     tmp_path: Path,
 ) -> None:
-    """RUN_CANCELLING payload 缺少 cancel request id 时不写 terminal facts。"""
+    """RUN_CANCELLING payload 缺少 cancel request id 时仍使用 typed row link。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
@@ -1961,9 +2105,9 @@ def test_active_cancel_watchdog_closeout_rejects_malformed_cancelling_payload(
             )
 
         assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.INVALID_STATE.value,
-            0,
-            0,
+            StateMutationStatus.UPDATED.value,
+            1,
+            1,
         )
 
 
@@ -2212,6 +2356,7 @@ def test_cancel_queued_run_row_requires_empty_terminal_refs(
                 run_id="run-queued-guard",
                 terminal_event_id="event-cancel-queued-guard",
                 terminal_event_sequence=terminal_event.event_sequence + 1,
+                cancel_request_event_id="event-cancel-request-queued-guard",
                 terminal_at="2026-05-14T01:02:10Z",
             )
 
@@ -2273,6 +2418,7 @@ def test_cancel_running_run_row_requires_empty_terminal_refs(
                 current_attempt_id=seeded.attempt_id,
                 terminal_event_id="event-cancel-running-guard",
                 terminal_event_sequence=terminal_event.event_sequence + 1,
+                cancel_request_event_id="event-cancel-request-running-guard",
                 terminal_at="2026-05-14T01:02:10Z",
             )
 
@@ -2813,7 +2959,7 @@ def _create_running_input(
         source="pytest",
         idempotency_key=f"request-{suffix}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         start_reason=RunStartReason.INITIAL,
         worker_kind=WorkerKind.LOCAL,
         owner_host_instance_id=None,
@@ -2850,7 +2996,7 @@ def _create_queued_input(
         source="pytest",
         idempotency_key=f"request-{request_index}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         queue_reason="active_run_exists",
         active_run_id="run-active",
         call_context_digest=_CALL_CONTEXT_DIGEST,

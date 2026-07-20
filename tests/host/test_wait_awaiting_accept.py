@@ -9,14 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import dayu.host.waiting as waiting_module
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus, WaitAdapterKey
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
+    EventLogAppendResult,
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
@@ -24,6 +27,11 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     register_current_instance,
+)
+from dayu.host.durable.idempotency import (
+    IdempotencyScope,
+    IdempotencyScopeKind,
+    IdempotencyStore,
 )
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -53,6 +61,7 @@ from dayu.host.durable.state import (
     read_wait_record_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.payload_resolution import tool_call_request_atoms
 from dayu.host.wait_adapter import (
     WaitAdapterBinding,
     WaitExternalJobRefSource,
@@ -228,27 +237,29 @@ def test_awaiting_accept_stale_execution_rejects_without_wait_record(
         assert events == ()
 
 
-def test_awaiting_accept_persists_only_llm_safe_replay_arguments(
+def test_awaiting_accept_persists_exact_shared_request_atom_and_governance_link(
     tmp_path: Path,
 ) -> None:
-    """awaiting accept payload 不持久化敏感原始参数值。"""
+    """awaiting 保存 exact request atom，治理事实只持有真实 row link。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        sensitive_arguments: dict[str, JsonValue] = {
-            "token": "token-raw-value",
-            "api_key": "api-key-raw-value",
-            "password": "password-raw-value",
-            "nested": {
-                "client-secret": "secret-raw-value",
-                "query": "business query",
-            },
+        accepted_arguments: dict[str, JsonValue] = {
+            "file_path": "/research/input/annual-report.pdf",
+            "scope_token": "scope-business-value",
+            "nested": {"query": "business query"},
         }
-        normalized_arguments_digest = sha256_digest_json({"arguments": sensitive_arguments})
+        normalized_arguments_digest = sha256_digest_json(
+            {"arguments": accepted_arguments}
+        )
+        tool_identity_digest = sha256_digest_json(
+            {"identity": "awaiting-owner-sentinel"}
+        )
         candidate = replace(
             _awaiting_candidate(seeded),
             normalized_arguments_digest=normalized_arguments_digest,
-            accepted_arguments=sensitive_arguments,
+            accepted_arguments=accepted_arguments,
+            tool_identity_digest=tool_identity_digest,
         )
         accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
 
@@ -256,42 +267,185 @@ def test_awaiting_accept_persists_only_llm_safe_replay_arguments(
 
         assert isinstance(result, ToolAwaitingAcceptedAck)
         events = _awaiting_events(store.transaction_runner)
-        for event in events:
-            assert "token-raw-value" not in event.payload_json
-            assert "api-key-raw-value" not in event.payload_json
-            assert "password-raw-value" not in event.payload_json
-            assert "secret-raw-value" not in event.payload_json
         tool_call_requested = next(
             event for event in events if event.event_type == "TOOL_CALL_REQUESTED"
         )
         request_payload = json.loads(tool_call_requested.payload_json)
         assert isinstance(request_payload, dict)
+        assert set(request_payload) == {
+            "session_id",
+            "run_id",
+            "attempt_id",
+            "execution_id",
+            "iteration_id",
+            "tool_call_id",
+            "tool_name",
+            "tool_schema_digest",
+            "tool_identity_digest",
+            "normalized_arguments_digest",
+            "arguments_json_size_bytes",
+            "arguments_storage_kind",
+            "arguments_inline_json",
+            "arguments_payload_ref",
+            "arguments_payload_digest",
+            "tool_fact_kind",
+            "accept_idempotency_key",
+            "semantic_input_digest",
+            "semantic_query_storage_kind",
+            "semantic_query_text",
+            "semantic_query_payload_ref",
+            "semantic_query_digest",
+        }
         assert request_payload["arguments_inline_json"] == {
-            "arguments": {
-                "token": "<redacted>",
-                "api_key": "<redacted>",
-                "password": "<redacted>",
-                "nested": {
-                    "client-secret": "<redacted>",
-                    "query": "business query",
-                },
-            }
+            "arguments": accepted_arguments
         }
-        assert "business query" in str(request_payload["semantic_query_text"])
+        assert request_payload["arguments_payload_digest"] == normalized_arguments_digest
+        assert request_payload["tool_identity_digest"] == tool_identity_digest
+        assert request_payload["semantic_query_storage_kind"] == "absent"
+        assert request_payload["semantic_query_text"] is None
+        assert request_payload["semantic_query_payload_ref"] is None
+        assert request_payload["semantic_query_digest"] is None
+        assert tool_call_requested.actor == "host.tool_runtime"
+        assert tool_call_requested.source == "host.tool_runtime.awaiting_accept"
+
         tool_awaiting = next(event for event in events if event.event_type == "TOOL_AWAITING")
-        payload_text = tool_awaiting.payload_json
-        payload = json.loads(payload_text)
+        payload = json.loads(tool_awaiting.payload_json)
         assert isinstance(payload, dict)
-        assert payload["accepted_arguments"] == {
-            "token": "<redacted>",
-            "api_key": "<redacted>",
-            "password": "<redacted>",
-            "nested": {
-                "client-secret": "<redacted>",
-                "query": "business query",
-            },
+        assert set(payload) == {
+            "session_id",
+            "run_id",
+            "attempt_id",
+            "execution_id",
+            "iteration_id",
+            "wait_id",
+            "tool_call_id",
+            "tool_name",
+            "tool_call_requested_event_ref",
+            "await_spec",
+            "adapter_key",
+            "resume_policy",
+            "snapshot_ref",
+            "external_job_ref",
+            "accept_idempotency_key",
+            "semantic_input_digest",
         }
-        assert payload["accepted_arguments_source_digest"] == normalized_arguments_digest
+        assert payload["tool_call_requested_event_ref"] == {
+            "event_id": tool_call_requested.event_id,
+            "event_sequence": tool_call_requested.event_sequence,
+        }
+        assert "accepted_arguments" not in payload
+        assert "accepted_arguments_source_digest" not in payload
+        assert "normalized_arguments_digest" not in payload
+        assert all(not key.startswith("arguments_") for key in payload)
+
+        atoms = store.transaction_runner.run_read(
+            lambda transaction: tool_call_request_atoms(
+                transaction, tool_call_requested
+            )
+        )
+        assert atoms.arguments_json == {"arguments": accepted_arguments}
+        assert atoms.normalized_arguments_digest == normalized_arguments_digest
+        assert atoms.arguments_payload_digest == normalized_arguments_digest
+
+
+def test_awaiting_accept_large_arguments_use_shared_descriptor_writer(
+    tmp_path: Path,
+) -> None:
+    """awaiting 大参数走共享 descriptor，hot request 与治理事实均不复制正文。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accepted_arguments: dict[str, JsonValue] = {
+            "file_path": "/research/input/large.pdf",
+            "content": "x" * 200_000,
+        }
+        digest = sha256_digest_json({"arguments": accepted_arguments})
+        candidate = replace(
+            _awaiting_candidate(seeded),
+            accepted_arguments=accepted_arguments,
+            normalized_arguments_digest=digest,
+        )
+
+        result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(candidate)
+
+        assert isinstance(result, ToolAwaitingAcceptedAck)
+        events = _awaiting_events(store.transaction_runner)
+        request_row = next(
+            event for event in events if event.event_type == "TOOL_CALL_REQUESTED"
+        )
+        awaiting_row = next(
+            event for event in events if event.event_type == "TOOL_AWAITING"
+        )
+        request_payload = json.loads(request_row.payload_json)
+        assert request_payload["arguments_storage_kind"] == "payload_descriptor"
+        assert request_payload["arguments_inline_json"] is None
+        assert isinstance(request_payload["arguments_payload_ref"], str)
+        assert "x" * 100 not in request_row.payload_json
+        assert "x" * 100 not in awaiting_row.payload_json
+        atoms = store.transaction_runner.run_read(
+            lambda transaction: tool_call_request_atoms(transaction, request_row)
+        )
+        assert atoms.arguments_json == {"arguments": accepted_arguments}
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("tool_awaiting_append", "run_waiting_append", "wait_record_mutation"),
+)
+def test_awaiting_accept_rolls_back_whole_group_after_request_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """request append 后任一后续失败都回滚 facts/state/wait/idempotency。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _awaiting_candidate(seeded)
+        event_log_store: EventLogStore
+        if failure_stage == "tool_awaiting_append":
+            event_log_store = _FailingEventLogStore("TOOL_AWAITING")
+        elif failure_stage == "run_waiting_append":
+            event_log_store = _FailingEventLogStore("RUN_WAITING")
+        elif failure_stage == "wait_record_mutation":
+            event_log_store = EventLogStore()
+            monkeypatch.setattr(
+                waiting_module,
+                "insert_wait_record",
+                _raise_on_wait_record_insert,
+            )
+        else:
+            raise AssertionError("unsupported failure_stage")
+        accept_port = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner,
+            event_log_store=event_log_store,
+        )
+
+        with pytest.raises(RuntimeError, match="injected"):
+            accept_port.accept_tool_awaiting(candidate)
+
+        run, attempt, wait_record, events = _read_state(
+            store.transaction_runner, candidate
+        )
+        assert run is not None
+        assert run.status is RunStatus.RUNNING
+        assert attempt is not None
+        assert attempt.status is AttemptStatus.RUNNING
+        assert wait_record is None
+        assert events == ()
+        scope = IdempotencyScope(
+            scope_kind=IdempotencyScopeKind.TOOL_AWAITING_ACCEPT,
+            scope_id=f"{candidate.attempt_id}:{candidate.tool_call_id}",
+            idempotency_key=candidate.accept_idempotency_key,
+        )
+        idempotency_record = store.transaction_runner.run_read(
+            lambda transaction: IdempotencyStore().read_idempotency_record(
+                transaction, scope
+            )
+        )
+        assert idempotency_record is None
 
 
 class _SeededRun:
@@ -321,6 +475,55 @@ class _SeededRun:
         self.attempt_id = attempt_id
         self.execution_id = execution_id
         self.dispatch_record_id = dispatch_record_id
+
+
+class _FailingEventLogStore(EventLogStore):
+    """在指定 event type append 前注入失败的 EventLog store。"""
+
+    def __init__(self, fail_event_type: str) -> None:
+        """初始化失败注入 store。
+
+        :param fail_event_type: 触发异常的 event type。
+        :returns: ``None``。
+        :raises ValueError: event type 为空时抛出。
+        """
+
+        if fail_event_type.strip() == "":
+            raise ValueError("fail_event_type must be non-empty")
+        self._fail_event_type = fail_event_type
+
+    def append_event(
+        self,
+        transaction: HostTransaction,
+        request: EventLogAppendRequest,
+    ) -> EventLogAppendResult:
+        """在目标 event append 前抛出测试异常。
+
+        :param transaction: Host transaction。
+        :param request: EventLog append request。
+        :returns: 非目标 event 的 append result。
+        :raises RuntimeError: request 命中目标 event type 时抛出。
+        """
+
+        if request.event_type == self._fail_event_type:
+            raise RuntimeError(f"injected append failure: {request.event_type}")
+        return super().append_event(transaction, request)
+
+
+def _raise_on_wait_record_insert(
+    transaction: HostTransaction,
+    row: WaitRecordRow,
+) -> None:
+    """在 wait record mutation 处注入失败。
+
+    :param transaction: Host transaction。
+    :param row: 待写入 wait record。
+    :returns: ``None``。
+    :raises RuntimeError: 始终抛出以验证整段 transaction rollback。
+    """
+
+    del transaction, row
+    raise RuntimeError("injected wait record mutation failure")
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -418,7 +621,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-awaiting",
                 execution_target="target-awaiting",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

@@ -1,11 +1,10 @@
-"""OLD/NEW Runner 协议一致性 regression 测试集。
+"""OpenAI adapter 历史高风险协议事实的 regression 测试集。
 
 本文件按 ``docs/engine/phase1-runner-old-new-review.md`` 14/15 节列出的
-阻塞 / 重要问题修复后补充的回归测试，确保以下 OLD 协议事实在 NEW
-Runner 上不再漂移：
+阻塞 / 重要问题修复后补充的回归测试，确保以下协议事实不再漂移：
 
-1. **non-stream tool call dict arguments**：dict 形态被保留为 JSON
-   string，list 形态触发协议错误。
+1. **non-stream tool call arguments**：wire shape 仅接受 JSON string，
+   其它 JSON 类型一律 fatal。
 2. **HTTP 408 可重试**：``classify_http_status(408)`` →
    :attr:`RunnerHTTPErrorCode.TIMEOUT`，且属于 retriable 集合。
 3. **429 专用 backoff**：429 无 ``Retry-After`` 首次 4s、cap 60s；
@@ -22,6 +21,7 @@ import json
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerEvent,
@@ -46,8 +46,25 @@ from tests.engine.runners.openai._sse_helpers import (
 )
 
 
-def test_non_stream_tool_call_dict_arguments_preserved() -> None:
-    """non-stream ``function.arguments`` 为 dict → 完整保留为 JSON。"""
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        {"a": 1},
+        [1, 2, 3],
+        1,
+        True,
+        None,
+    ),
+)
+def test_non_stream_tool_call_non_string_arguments_protocol_error(
+    arguments: JsonValue,
+) -> None:
+    """non-stream ``function.arguments`` 非 string 时必须 fatal。
+
+    :param arguments: provider wire arguments 的非法 JSON shape。
+    :returns: 无返回值。
+    :raises AssertionError: parser 未 fail closed 时由 pytest 抛出。
+    """
 
     payload = json.dumps(
         {
@@ -59,53 +76,11 @@ def test_non_stream_tool_call_dict_arguments_preserved() -> None:
                         "content": None,
                         "tool_calls": [
                             {
-                                "id": "call-a",
+                                "id": "call-invalid",
                                 "type": "function",
                                 "function": {
                                     "name": "do",
-                                    "arguments": {"a": 1, "b": "x"},
-                                },
-                            }
-                        ],
-                    },
-                }
-            ]
-        }
-    ).encode("utf-8")
-    events = list(
-        (parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None))
-    )
-    completed = next(
-        e.data
-        for e in events
-        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
-    )
-    assert isinstance(completed, RunnerToolCallsCompletedData)
-    assert len(completed.tool_calls) == 1
-    tc = completed.tool_calls[0]
-    assert tc.tool_call_id == "call-a"
-    assert tc.name == "do"
-    assert tc.arguments == {"a": 1, "b": "x"}
-
-
-def test_non_stream_tool_call_list_arguments_protocol_error() -> None:
-    """non-stream ``function.arguments`` 为 list → fatal 协议错误 + Done(ERROR)。"""
-
-    payload = json.dumps(
-        {
-            "choices": [
-                {
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call-b",
-                                "type": "function",
-                                "function": {
-                                    "name": "do",
-                                    "arguments": [1, 2, 3],
+                                    "arguments": arguments,
                                 },
                             }
                         ],
@@ -124,12 +99,57 @@ def test_non_stream_tool_call_list_arguments_protocol_error() -> None:
         if e.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
     )
     assert isinstance(error_event.data, RunnerProtocolErrorData)
-    assert error_event.data.error_code == "tool_call_arguments_not_object"
+    assert error_event.data.error_code == "tool_call_arguments_not_string"
     # 不能再产 successful tool_calls_completed
     assert (
         RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED not in types
     )
     assert types[-1] is RunnerEventType.RUNNER_DONE
+
+
+def test_non_stream_tool_call_missing_arguments_protocol_error() -> None:
+    """non-stream ``function.arguments`` 缺失时必须 fatal。"""
+
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call-missing",
+                                "type": "function",
+                                "function": {"name": "do"},
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload,
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+    errors = [
+        event.data
+        for event in events
+        if event.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
+    ]
+    assert len(errors) == 1
+    error = errors[0]
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "tool_call_arguments_not_string"
+    assert RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED not in {
+        event.type for event in events
+    }
+    assert events[-1].type is RunnerEventType.RUNNER_DONE
 
 
 def test_non_stream_tool_call_invalid_string_json_protocol_error() -> None:
@@ -168,6 +188,61 @@ def test_non_stream_tool_call_invalid_string_json_protocol_error() -> None:
         and isinstance(e.data, RunnerProtocolErrorData)
     ]
     assert "tool_call_arguments_invalid_json" in error_codes
+
+
+@pytest.mark.parametrize("arguments", ("[]", "1", "true", "null"))
+def test_non_stream_tool_call_json_non_object_string_protocol_error(
+    arguments: str,
+) -> None:
+    """合法 JSON 但非 object 的 arguments string 沿用聚合器 fatal 分类。
+
+    :param arguments: 可解析为非 object JSON value 的 string。
+    :returns: 无返回值。
+    :raises AssertionError: parser 接受非 object 参数时由 pytest 抛出。
+    """
+
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call-scalar",
+                                "type": "function",
+                                "function": {
+                                    "name": "do",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+    events = list(
+        parse_non_stream_response(
+            payload,
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+
+    errors = [
+        event.data
+        for event in events
+        if event.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
+    ]
+    assert len(errors) == 1
+    error = errors[0]
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "tool_call_arguments_not_object"
+    assert RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED not in {
+        event.type for event in events
+    }
 
 
 def test_http_408_classified_as_timeout_and_retriable() -> None:

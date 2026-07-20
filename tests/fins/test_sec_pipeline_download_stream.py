@@ -4,29 +4,46 @@ from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
 
-import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Optional, cast
 
-from dayu.fins.domain.document_models import FileObjectMeta
+import pytest
+
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    DocumentHandle,
+    FileObjectMeta,
+    ProcessedHandle,
+    SourceDocumentUpsertRequest,
+    SourceHandle,
+)
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
     SecDownloadCancelledError,
     SecDownloader,
+    StoreDownloadedFile,
 )
 from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_pipeline import (
-    SEC_PIPELINE_DOWNLOAD_VERSION,
     SecPipeline,
     SecPipelineDownloadResult,
     collect_download_result_from_events,
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage.fs_source_document_repository import FsSourceDocumentRepository
+from dayu.fins.storage import (
+    FsBatchingRepository,
+    FsCompanyMetaRepository,
+    FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
+    FsProcessedDocumentRepository,
+)
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 
 
 def _event_pipeline_result(event: DownloadEvent) -> SecPipelineDownloadResult:
@@ -172,7 +189,9 @@ class StreamStubDownloader(SecDownloader):
         self,
         remote_files: list[RemoteFileDescriptor],
         overwrite: bool,
-        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -189,7 +208,7 @@ class StreamStubDownloader(SecDownloader):
             http_last_modified=descriptor.http_last_modified,
             http_status=descriptor.http_status,
         )
-        file_meta = store_file(descriptor.name, BytesIO(b"payload"))
+        file_meta = store_file(descriptor.name, BytesIO(b"payload"), batch=batch)
         yield DownloaderEvent(
             event_type="file_downloaded",
             name=descriptor.name,
@@ -267,7 +286,9 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
         self,
         remote_files: list[RemoteFileDescriptor],
         overwrite: bool,
-        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -288,7 +309,11 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
                 http_last_modified=descriptor.http_last_modified,
                 http_status=descriptor.http_status,
             )
-            file_meta = store_file(descriptor.name, BytesIO(payload_by_name[descriptor.name]))
+            file_meta = store_file(
+                descriptor.name,
+                BytesIO(payload_by_name[descriptor.name]),
+                batch=batch,
+            )
             yield DownloaderEvent(
                 event_type="file_downloaded",
                 name=descriptor.name,
@@ -298,6 +323,45 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
                 http_status=descriptor.http_status,
                 file_meta=file_meta,
             )
+
+
+class FailingStreamStubDownloader(StreamStubDownloader):
+    """下载文件失败且不调用 store_file 的下载器桩。"""
+
+    async def download_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """输出失败事件，不写入 blob。"""
+
+        del overwrite, store_file, batch, existing_files, primary_document, cancellation_checker
+        descriptor = remote_files[0]
+        yield DownloaderEvent(
+            event_type="file_download_started",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=descriptor.http_status,
+        )
+        yield DownloaderEvent(
+            event_type="file_failed",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=descriptor.http_status,
+            reason_code="download_error",
+            reason_message="forced download failure",
+            error="forced download failure",
+        )
 
 
 class CancelAwareCollectionDownloader(StreamStubDownloader):
@@ -409,19 +473,91 @@ class CancelAwareCollectionDownloader(StreamStubDownloader):
 
 
 class _SpySourceRepository(FsSourceDocumentRepository):
-    """记录 has_filing_xbrl_instance 调用的源文档仓储 spy。"""
+    """记录 SEC source repository 调用的源文档仓储 spy。"""
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         """初始化 spy。"""
 
-        super().__init__(workspace_root)
+        super().__init__(workspace_root, repository_set=repository_set)
         self.has_filing_xbrl_instance_calls: list[tuple[str, str]] = []
+        self.final_source_calls = 0
+        self._events = events
 
     def has_filing_xbrl_instance(self, ticker: str, document_id: str) -> bool:
         """记录调用后转发到真实实现。"""
 
         self.has_filing_xbrl_instance_calls.append((ticker, document_id))
         return super().has_filing_xbrl_instance(ticker, document_id)
+
+    def create_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> DocumentHandle:
+        """记录唯一 final source create 后转发。"""
+
+        self.final_source_calls += 1
+        if self._events is not None:
+            self._events.append("final_source")
+        return super().create_source_document(req, source_kind, batch=batch)
+
+
+class _BlobFirstSecBlobRepository(FsDocumentBlobRepository):
+    """证明 SEC blob 写入时 published source 尚不存在的仓储 spy。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        source_repository: FsSourceDocumentRepository,
+        events: list[str],
+    ) -> None:
+        """初始化 SEC blob 仓储 spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._source_repository = source_repository
+        self._events = events
+        self.observed_source_absent: list[bool] = []
+
+    def store_file(
+        self,
+        handle: SourceHandle | ProcessedHandle,
+        filename: str,
+        data: BinaryIO,
+        *,
+        batch: BatchToken,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> FileObjectMeta:
+        """记录 published source 缺席事实后转发 batch blob 写入。"""
+
+        if isinstance(handle, SourceHandle):
+            try:
+                self._source_repository.get_source_meta(
+                    handle.ticker,
+                    handle.document_id,
+                    SourceKind(handle.source_kind),
+                )
+            except FileNotFoundError:
+                self.observed_source_absent.append(True)
+            else:
+                self.observed_source_absent.append(False)
+        self._events.append(f"store:{filename}")
+        return super().store_file(
+            handle,
+            filename,
+            data,
+            batch=batch,
+            content_type=content_type,
+            metadata=metadata,
+        )
 
 
 async def _collect_events(
@@ -481,6 +617,98 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     assert event_types[-1] == "pipeline_completed"
     final_result = _event_pipeline_result(events[-1])
     assert final_result["summary"]["downloaded"] == 1
+
+
+def test_download_stream_writes_blob_before_single_complete_source(tmp_path: Path) -> None:
+    """SEC stream 必须 blob-first，并且最终 source 只发布一次。"""
+
+    events_log: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source_repository = _SpySourceRepository(tmp_path, repository_set, events_log)
+    blob_repository = _BlobFirstSecBlobRepository(tmp_path, repository_set, source_repository, events_log)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        batching_repository=batching_repository,
+        downloader=StreamStubDownloader(),
+        company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set),
+        source_repository=source_repository,
+        processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=repository_set),
+        blob_repository=blob_repository,
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            tmp_path,
+            repository_set=repository_set,
+        ),
+        processor_registry=build_fins_processor_registry(),
+    )
+    import asyncio
+
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    final_result = _event_pipeline_result(events[-1])
+    meta = source_repository.get_source_meta("AAPL", "fil_0000000000-25-000001", SourceKind.FILING)
+
+    assert final_result["summary"]["downloaded"] == 1
+    assert events_log == ["store:sample-10k.htm", "final_source"]
+    assert blob_repository.observed_source_absent == [True]
+    assert source_repository.final_source_calls == 1
+    assert meta["ingest_complete"] is True
+
+
+def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_path: Path) -> None:
+    """失败下载不发布 source/blob；重试从干净 published state 完整提交。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source_repository = _SpySourceRepository(tmp_path, repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "fil_0000000000-25-000001"
+    failing_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        batching_repository=batching_repository,
+        downloader=FailingStreamStubDownloader(),
+        company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set),
+        source_repository=source_repository,
+        processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=repository_set),
+        blob_repository=blob_repository,
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            tmp_path,
+            repository_set=repository_set,
+        ),
+        processor_registry=build_fins_processor_registry(),
+    )
+    import asyncio
+
+    failed_events = asyncio.run(_collect_events(failing_pipeline, ticker="AAPL"))
+    failed_result = _event_pipeline_result(failed_events[-1])
+    failed_handle = SourceHandle(ticker="AAPL", document_id=document_id, source_kind=SourceKind.FILING.value)
+    assert failed_result["summary"]["failed"] == 1
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    assert blob_repository.list_entries(failed_handle) == []
+    assert source_repository.final_source_calls == 0
+
+    retry_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        batching_repository=batching_repository,
+        downloader=StreamStubDownloader(),
+        company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set),
+        source_repository=source_repository,
+        processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=repository_set),
+        blob_repository=blob_repository,
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            tmp_path,
+            repository_set=repository_set,
+        ),
+        processor_registry=build_fins_processor_registry(),
+    )
+    retry_events = asyncio.run(_collect_events(retry_pipeline, ticker="AAPL"))
+    retry_result = _event_pipeline_result(retry_events[-1])
+    completed_meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+
+    assert retry_result["summary"]["downloaded"] == 1
+    assert source_repository.final_source_calls == 1
+    assert completed_meta["ingest_complete"] is True
+    assert completed_meta["files"][0]["name"] == "sample-10k.htm"
 
 
 def test_download_stream_final_status_does_not_recheck_cancel_token(
@@ -661,21 +889,6 @@ def test_adapter_progress_sink_reports_filing_failure() -> None:
 def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path) -> None:
     """验证 filing 跳过事件会同时暴露扁平与嵌套的原因字段。"""
 
-    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    (document_dir / "meta.json").write_text(
-        json.dumps(
-            {
-                "document_version": "v1",
-                "source_fingerprint": "fp-ready",
-                "download_version": SEC_PIPELINE_DOWNLOAD_VERSION,
-                "ingest_complete": True,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         downloader=StreamStubDownloader(),
@@ -684,6 +897,8 @@ def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path)
 
     import asyncio
 
+    first_events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    assert _event_pipeline_result(first_events[-1])["summary"]["downloaded"] == 1
     events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
     filing_event = next(event for event in events if event.event_type == "filing_completed")
     assert filing_event.payload["skip_reason"] == "already_downloaded_complete"
@@ -692,14 +907,24 @@ def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path)
     assert _event_filing_result(filing_event)["skip_reason"] == "already_downloaded_complete"
 
 
-def test_download_stream_resolves_has_xbrl_via_source_repository(tmp_path: Path) -> None:
-    """验证下载完成后的 has_xbrl 由源文档仓储事实接口回填。"""
+def test_download_stream_resolves_has_xbrl_from_complete_file_entries(tmp_path: Path) -> None:
+    """验证 has_xbrl 由同批次完整文件事实派生，不读取未发布 source。"""
 
-    source_repository = _SpySourceRepository(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _SpySourceRepository(tmp_path, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
     pipeline = SecPipeline(
         workspace_root=tmp_path,
+        batching_repository=FsBatchingRepository(tmp_path, repository_set=repository_set),
         downloader=StreamXbrlStubDownloader(),
+        company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set),
         source_repository=source_repository,
+        processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=repository_set),
+        blob_repository=blob_repository,
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            tmp_path,
+            repository_set=repository_set,
+        ),
         processor_registry=build_fins_processor_registry(),
     )
 
@@ -707,6 +932,12 @@ def test_download_stream_resolves_has_xbrl_via_source_repository(tmp_path: Path)
 
     events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
     filing_event = next(event for event in events if event.event_type == "filing_completed")
+    published_meta = source_repository.get_source_meta(
+        "AAPL",
+        "fil_0000000000-25-000001",
+        SourceKind.FILING,
+    )
 
     assert filing_event.payload["has_xbrl"] is True
-    assert source_repository.has_filing_xbrl_instance_calls == [("AAPL", "fil_0000000000-25-000001")]
+    assert source_repository.has_filing_xbrl_instance_calls == []
+    assert published_meta["ingest_complete"] is True

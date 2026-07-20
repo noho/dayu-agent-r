@@ -6,13 +6,14 @@ import ast
 import json
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolCallable, ToolDefinition
 from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
@@ -20,7 +21,17 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
+from dayu.tools.web import provider as web_provider
+from dayu.tools.web import web_http_session
 from dayu.tools.web import web_tools as web_tools_module
+from dayu.tools.web.web_egress_policy import WebEgressPolicy
+from dayu.tools.web.web_resource_budget import (
+    DEFAULT_BROWSER_RESOURCE_BUDGET,
+    DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    DEFAULT_HTTP_RESOURCE_BUDGET,
+    DiagnosticResourceBudget,
+    HttpResourceBudget,
+)
 JsonObject = dict[str, JsonValue]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -38,6 +49,120 @@ _FORBIDDEN_IMPORTS = (
     "dayu.web",
     "dayu.ui",
 )
+
+
+class _SessionCloseSpy(diag.requests.Session):
+    """记录 diagnostic requests profile 是否关闭局部 Session。"""
+
+    instances: list["_SessionCloseSpy"] = []
+
+    def __init__(self) -> None:
+        """初始化 close 计数。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__()
+        self.close_count = 0
+        _SessionCloseSpy.instances.append(self)
+
+    def close(self) -> None:
+        """记录 close 调用并执行父类关闭。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 父类关闭失败时透出。
+        """
+
+        self.close_count += 1
+        super().close()
+
+
+class _BodyResponse:
+    """bounded Playwright response-body helper 测试替身。"""
+
+    def __init__(self, *, body: bytes, headers: Mapping[str, str]) -> None:
+        """保存 response bytes 与 headers。"""
+
+        self._body = body
+        self.headers = headers
+
+    def body(self) -> bytes:
+        """返回确定性 response bytes。"""
+
+        return self._body
+
+
+def _raise_diagnostic_request_exception(
+    session: diag.requests.Session,
+    *,
+    method: str,
+    url: str,
+    timeout: float,
+    headers: dict[str, str],
+    normalize_url_for_http: Callable[[str], str],
+    egress_policy: WebEgressPolicy,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
+    stream: bool,
+    cancellation_token: CancellationToken | None,
+) -> tuple[web_http_session.AuthorizedResponseLease, int, tuple[str, ...]]:
+    """模拟 diagnostic requests 路径的请求异常。
+
+    Args:
+        session: 当前 diagnostic 局部 Session。
+        method: HTTP 方法。
+        url: 请求 URL。
+        timeout: 超时秒数。
+        headers: 请求头。
+        normalize_url_for_http: URL 规范化函数。
+        egress_policy: 当前 Web 出站策略。
+        transport_policy: provider parser 产生的 HTTP transport 策略快照。
+        stream: 是否流式读取。
+        cancellation_token: 取消令牌。
+
+    Returns:
+        不返回；始终抛出请求异常。
+
+    Raises:
+        requests.Timeout: 始终抛出，用于验证异常路径 cleanup。
+    """
+
+    del session, method, url, timeout, headers, normalize_url_for_http, egress_policy
+    del transport_policy, stream, cancellation_token
+    raise diag.requests.Timeout("synthetic diagnostic timeout")
+
+
+def _preserve_materialized_response_body(
+    response_value: diag.requests.Response,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> None:
+    """保留测试已预置的 response body，不执行二次 materialize。
+
+    Args:
+        response_value: 已预置 body 的 diagnostic response。
+        http_resource_budget: 本次 HTTP child 资源预算。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    del response_value, http_resource_budget
 
 
 def test_jsonl_and_txt_corpus_parsing_retains_metadata_and_deduplicates(tmp_path: Path) -> None:
@@ -94,22 +219,147 @@ def test_invalid_jsonl_reports_line_number(tmp_path: Path) -> None:
         diag._read_url_entries(path)
 
 
-def test_storage_state_dir_resolves_existing_host_input_and_default_output(tmp_path: Path) -> None:
-    """storage-state 目录应按 URL host 解析输入和输出路径。"""
+def test_storage_state_dir_only_flows_to_provider_config(tmp_path: Path) -> None:
+    """storage state 目录只进入 production resolver 配置，不派生 raw 输入。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: utility 重新从目录推导 host 文件名时抛出。
+    """
 
     storage_dir = tmp_path / "state"
     storage_dir.mkdir()
-    host_state = storage_dir / "example.com.json"
+    host_state = storage_dir / "dayu-web-diagnostic-storage-state-example.com.json"
     host_state.write_text('{"cookies":[]}', encoding="utf-8")
     options = _options(storage_state_dir=str(storage_dir))
 
-    storage_state_in, storage_state_out = diag._resolve_storage_state_paths(
-        options,
-        "https://example.com/report",
+    provider_config = diag._provider_config(options)
+    storage_state_input = diag._resolve_explicit_storage_state_input(
+        options.storage_state_in
     )
 
-    assert storage_state_in == str(host_state)
-    assert storage_state_out == str(host_state)
+    assert provider_config["playwright_storage_state_dir"] == str(
+        storage_dir.resolve()
+    )
+    assert storage_state_input is None
+
+
+def test_explicit_storage_state_input_reads_valid_json_object(tmp_path: Path) -> None:
+    """显式 storage state 输入必须读取合法 JSON object 常规文件。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法输入未解析为同一绝对文件路径时抛出。
+    """
+
+    input_path = tmp_path / "storage-state.json"
+    input_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+
+    resolved = diag._resolve_explicit_storage_state_input(str(input_path))
+
+    assert resolved == input_path.resolve()
+
+
+@pytest.mark.parametrize("path_kind", ("missing", "directory"))
+def test_explicit_storage_state_input_rejects_missing_or_non_file(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    """显式 storage state 输入缺失或不是常规文件时必须 fail fast。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        path_kind: 待构造的非法路径类别。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非常规文件未触发 ValueError 时抛出。
+    """
+
+    input_path = tmp_path / path_kind
+    if path_kind == "directory":
+        input_path.mkdir()
+
+    with pytest.raises(ValueError, match="存在的常规文件"):
+        diag._resolve_explicit_storage_state_input(str(input_path))
+
+
+@pytest.mark.parametrize("payload_text", ("{", "[]", "null"))
+def test_explicit_storage_state_input_rejects_invalid_json_shape(
+    tmp_path: Path,
+    payload_text: str,
+) -> None:
+    """显式 storage state 输入必须拒绝非法 JSON 或非 object 根值。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        payload_text: 待写入的非法 JSON 或错误根值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法输入未触发 ValueError 时抛出。
+    """
+
+    input_path = tmp_path / "storage-state.json"
+    input_path.write_text(payload_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="JSON"):
+        diag._resolve_explicit_storage_state_input(str(input_path))
+
+
+def test_diagnostic_artifact_only_projects_storage_state_input_fact(
+    tmp_path: Path,
+) -> None:
+    """诊断 artifact 只投影显式输入事实，不得残留 lifecycle 字段。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: artifact 出现 lifecycle authority 字段时抛出。
+    """
+
+    input_path = tmp_path / "storage-state.json"
+    input_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+
+    payload = diag._build_single_diagnostic_payload(
+        _options(
+            storage_state_in=str(input_path),
+            skip_requests=True,
+            skip_tool_fetch=True,
+            skip_playwright=True,
+        )
+    )
+    playwright_profile = _object_field(payload, "playwright_profile")
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    assert playwright_profile["storage_state"] == {"input_used": True}
+    for forbidden in (
+        "output_enabled",
+        "output_label",
+        "ttl_seconds",
+        "published",
+        "reconcile",
+        "cleanup",
+    ):
+        assert forbidden not in serialized
 
 
 def test_url_normalization_requires_http_url() -> None:
@@ -124,6 +374,24 @@ def test_url_normalization_requires_http_url() -> None:
         diag._normalize_url_for_http("ftp://example.com/report")
     with pytest.raises(ValueError, match="只支持 http/https URL"):
         diag._normalize_url_for_http("https:///missing-host")
+
+
+def _resolve_example_public_address(hostname: str, port: int) -> tuple[str, ...]:
+    """把测试域名固定解析到公开示例地址。
+
+    Args:
+        hostname: 待解析 hostname。
+        port: 目标端口。
+
+    Returns:
+        单一公开 IPv4 地址。
+
+    Raises:
+        无。
+    """
+
+    del hostname, port
+    return ("93.184.216.34",)
 
 
 def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
@@ -143,22 +411,434 @@ def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
         "http://[::ffff:10.0.0.1]/report",
     )
 
+    public_policy = WebEgressPolicy(resolver=_resolve_example_public_address)
     for url in blocked_urls:
-        with pytest.raises(ValueError, match="安全策略阻止"):
-            diag._validate_url_safety(url, allow_private_network_url=False)
+        with pytest.raises(ValueError, match="Web egress policy rejected"):
+            public_policy.authorize_http_target(url, stage="diagnostic_test")
 
-    assert diag._is_private_or_local_host("::ffff:10.0.0.1") is True
-    assert diag._validate_url_safety(
-        "http://[::ffff:10.0.0.1]/report",
-        allow_private_network_url=True,
-    ) == "http://[::ffff:10.0.0.1]/report"
-    assert diag._validate_url_safety("example.com/report", allow_private_network_url=False) == (
-        "https://example.com/report"
+    local_policy = WebEgressPolicy(allow_private_network=True)
+    with pytest.raises(ValueError, match="IPv4-mapped"):
+        local_policy.authorize_http_target(
+            "http://[::ffff:10.0.0.1]/report",
+            stage="diagnostic_test",
+        )
+    target = public_policy.authorize_http_target(
+        diag._normalize_url_for_http("example.com/report"),
+        stage="diagnostic_test",
+    )
+    assert target.normalized_url == "https://example.com/report"
+
+
+def test_single_diagnostic_packaged_defaults_allow_private_custom_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diagnostic 必须消费 packaged typed private/custom-port true 默认值。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: utility 未从唯一 parser 取得完整 typed 默认值时抛出。
+    """
+
+    authorized_ports: list[int] = []
+
+    def fake_build_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """在 utility policy construction boundary 验证 custom-port 授权。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: 当前请求超时秒数。
+            egress_policy: utility 构造的 Web 出站策略。
+            transport_policy: provider parser 产生的 HTTP transport 策略快照。
+            diagnostic_resource_budget: provider parser 产生的诊断预算。
+
+        Returns:
+            完成授权后的确定性 skipped profile。
+
+        Raises:
+            WebEgressPolicyError: URL 未被当前出站策略授权时抛出。
+        """
+
+        del timeout_seconds, transport_policy
+        assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
+        target = egress_policy.authorize_http_target(
+            url,
+            stage="diagnostic_test",
+        )
+        authorized_ports.append(target.port)
+        return diag._skipped_profile(
+            "synthetic_after_authorization",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    monkeypatch.setattr(diag, "_build_requests_profile", fake_build_requests_profile)
+    payload = diag._build_single_diagnostic_payload(
+        _options(
+            url="http://127.0.0.1:43117/fixture.pdf",
+            skip_tool_fetch=True,
+            skip_playwright=True,
+        )
     )
 
+    assert authorized_ports == [43117]
+    assert payload["safe_url"] == "http://127.0.0.1:43117/fixture.pdf"
 
-def test_header_redaction_masks_sensitive_header_values() -> None:
-    """header 脱敏应按 header 名称隐藏凭据，同时保留非敏感 header。"""
+
+@pytest.mark.parametrize(
+    ("raw_provider_config", "expected_error"),
+    (
+        ({"allow_private_network_url": False, "allow_custom_port_url": True}, "not allowed"),
+        ({"allow_private_network_url": True, "allow_custom_port_url": False}, "port"),
+    ),
+)
+def test_single_diagnostic_private_and_custom_port_denies_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_provider_config: JsonObject,
+    expected_error: str,
+) -> None:
+    """显式 private/custom-port deny 必须经 typed provider parser 独立生效。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        raw_provider_config: 仅关闭一个出站维度的 provider overlay。
+        expected_error: 期望错误消息包含的维度文本。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 两个独立 typed 开关被重新耦合时抛出。
+    """
+
+    def fake_provider_config(options: diag.CliOptions) -> JsonObject:
+        """返回显式 typed deny overlay。
+
+        Args:
+            options: 当前 CLI 选项。
+
+        Returns:
+            测试提供的 raw provider 配置。
+
+        Raises:
+            无。
+        """
+
+        del options
+        return raw_provider_config
+
+    def authorize_in_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """在 raw requests 边界触发本次 typed 出站裁决。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: 当前请求超时。
+            egress_policy: 唯一 parser 配置产生的出站策略。
+            transport_policy: 唯一 parser 配置产生的 transport 策略。
+            diagnostic_resource_budget: 唯一 parser 配置产生的诊断预算。
+
+        Returns:
+            授权成功时的 synthetic profile；本测试预期不返回。
+
+        Raises:
+            ValueError: 当前独立 deny 拒绝本地 custom-port URL 时抛出。
+        """
+
+        del timeout_seconds, transport_policy, diagnostic_resource_budget
+        egress_policy.authorize_http_target(url, stage="diagnostic_test")
+        return diag._skipped_profile(
+            "unexpected_authorization",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    monkeypatch.setattr(diag, "_provider_config", fake_provider_config)
+    monkeypatch.setattr(diag, "_build_requests_profile", authorize_in_requests_profile)
+
+    with pytest.raises(ValueError, match=expected_error):
+        diag._build_single_diagnostic_payload(
+            _options(
+                url="http://127.0.0.1:43117/fixture.pdf",
+                skip_tool_fetch=True,
+                skip_playwright=True,
+            )
+        )
+
+
+def test_requests_profile_forwards_provider_owned_transport_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """single diagnostic 必须传播 provider parser 产生的 transport 快照。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw mapping 未同源传播或 transport 值被重建时抛出。
+    """
+
+    raw_provider_config: JsonObject = {
+        "dns_peer_proof_enabled": True,
+        "allow_environment_proxy": False,
+    }
+    observed_transport_policies: list[web_http_session.WebHttpTransportPolicy] = []
+    observed_diagnostic_budgets: list[DiagnosticResourceBudget] = []
+    observed_discovery_configs: list[Mapping[str, JsonValue]] = []
+    provider_config_calls = 0
+
+    def fake_provider_config(options: diag.CliOptions) -> JsonObject:
+        """返回含非默认 transport 组合的 raw provider 配置。
+
+        Args:
+            options: single diagnostic CLI 选项。
+
+        Returns:
+            由测试固定的 raw provider 配置对象。
+
+        Raises:
+            无。
+        """
+
+        nonlocal provider_config_calls
+        del options
+        provider_config_calls += 1
+        return raw_provider_config
+
+    def fake_build_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """记录 raw requests caller 收到的 typed transport 快照。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: requests 超时秒数。
+            egress_policy: utility 构造的 Web 出站策略。
+            transport_policy: provider parser 产生的 transport 策略快照。
+            diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
+
+        Returns:
+            确定性 skipped profile。
+
+        Raises:
+            无。
+        """
+
+        del timeout_seconds, egress_policy
+        observed_transport_policies.append(transport_policy)
+        observed_diagnostic_budgets.append(diagnostic_resource_budget)
+        return diag._skipped_profile(
+            "synthetic_requests",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    def fake_build_tool_fetch_profile(
+        url: str,
+        options: diag.CliOptions,
+        *,
+        provider_config: Mapping[str, JsonValue],
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """记录 provider discovery 将继续消费的同一 raw mapping。
+
+        Args:
+            url: 待诊断 URL。
+            options: single diagnostic CLI 选项。
+            provider_config: orchestration 传给 discovery 的 raw provider 配置。
+            diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
+
+        Returns:
+            确定性 skipped profile。
+
+        Raises:
+            无。
+        """
+
+        del options
+        observed_diagnostic_budgets.append(diagnostic_resource_budget)
+        observed_discovery_configs.append(provider_config)
+        return diag._skipped_profile(
+            "synthetic_tool_fetch",
+            url=url,
+            backend=diag.WebDiagnosticBackend.TOOL,
+        )
+
+    monkeypatch.setattr(diag, "_provider_config", fake_provider_config)
+    monkeypatch.setattr(diag, "_build_requests_profile", fake_build_requests_profile)
+    monkeypatch.setattr(diag, "_build_tool_fetch_profile", fake_build_tool_fetch_profile)
+
+    diag._build_single_diagnostic_payload(
+        _options(
+            url="https://example.com/report",
+            skip_playwright=True,
+        )
+    )
+
+    assert provider_config_calls == 1
+    expected_transport_policy = web_provider._parse_config(
+        raw_provider_config
+    ).transport_policy
+    assert expected_transport_policy.dns_peer_proof_enabled is True
+    assert expected_transport_policy.allow_environment_proxy is False
+    assert observed_transport_policies == [expected_transport_policy]
+    assert observed_diagnostic_budgets == [
+        DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+        DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    ]
+    assert observed_discovery_configs == [raw_provider_config]
+    assert observed_discovery_configs[0] is raw_provider_config
+
+
+@pytest.mark.parametrize(
+    ("max_network", "expected_events"),
+    ((None, 13), (7, 7)),
+)
+def test_single_diagnostic_uses_typed_budget_default_and_run_override(
+    monkeypatch: pytest.MonkeyPatch,
+    max_network: int | None,
+    expected_events: int,
+) -> None:
+    """缺省 events 与显式 override 必须形成同源 typed diagnostic value。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        max_network: 可选的本次 CLI override。
+        expected_events: raw profile 应收到的 typed events 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: utility 复制默认或丢失 error chars owner 时抛出。
+    """
+
+    raw_provider_config: JsonObject = {
+        "resource_budget": {
+            "diagnostics": {"error_chars": 37, "events": 13}
+        }
+    }
+    observed_budgets: list[DiagnosticResourceBudget] = []
+
+    def fake_provider_config(options: diag.CliOptions) -> JsonObject:
+        """返回含非默认 diagnostic child budget 的 raw 配置。
+
+        Args:
+            options: 当前 CLI 选项。
+
+        Returns:
+            测试固定的 raw provider 配置。
+
+        Raises:
+            无。
+        """
+
+        del options
+        return raw_provider_config
+
+    def capture_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """记录 raw requests 收到的 typed diagnostic child budget。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: 当前请求超时。
+            egress_policy: 本次 typed 出站策略。
+            transport_policy: 本次 typed transport 策略。
+            diagnostic_resource_budget: 本次 typed diagnostic child budget。
+
+        Returns:
+            synthetic skipped profile。
+
+        Raises:
+            无。
+        """
+
+        del timeout_seconds, egress_policy, transport_policy
+        observed_budgets.append(diagnostic_resource_budget)
+        return diag._skipped_profile(
+            "synthetic_budget_capture",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    monkeypatch.setattr(diag, "_provider_config", fake_provider_config)
+    monkeypatch.setattr(diag, "_build_requests_profile", capture_requests_profile)
+
+    diag._build_single_diagnostic_payload(
+        _options(
+            max_network=max_network,
+            skip_tool_fetch=True,
+            skip_playwright=True,
+        )
+    )
+
+    assert observed_budgets == [
+        DiagnosticResourceBudget(error_chars=37, events=expected_events)
+    ]
+
+
+def test_cli_max_network_absent_is_none_and_invalid_override_fails() -> None:
+    """CLI 缺省不得复制 events 默认，非正 override 必须由 typed value 拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 恢复本地默认或 typed validation 未执行时抛出。
+    """
+
+    options = diag._parse_options(["--url", "https://example.com"])
+
+    assert options.max_network is None
+    for invalid_value in (0, -1):
+        with pytest.raises(ValueError, match="positive integer"):
+            diag._build_single_diagnostic_payload(
+                _options(
+                    max_network=invalid_value,
+                    skip_requests=True,
+                    skip_tool_fetch=True,
+                    skip_playwright=True,
+                )
+            )
+
+
+def test_header_projection_never_persists_raw_values() -> None:
+    """header 投影只能保留存在性与受限 media-type 语义。"""
 
     redacted = diag._redact_headers(
         {
@@ -172,69 +852,204 @@ def test_header_redaction_masks_sensitive_header_values() -> None:
         }
     )
 
-    assert redacted["Authorization"] == "<redacted>"
-    assert redacted["Cookie"] == "<redacted>"
-    assert redacted["X-Api-Key"] == "<redacted>"
-    assert redacted["X-Access-Token"] == "<redacted>"
-    assert redacted["Client-Secret"] == "<redacted>"
-    assert redacted["User-Agent"] == "diagnostic-agent"
-    assert redacted["Cache-Control"] == "no-cache"
+    assert redacted["sensitive_names"] == [
+        "authorization",
+        "client-secret",
+        "cookie",
+        "x-access-token",
+        "x-api-key",
+    ]
+    assert redacted["present_names"] == ["cache-control"]
+    assert "secret-token" not in json.dumps(redacted)
+    assert "diagnostic-agent" not in json.dumps(redacted)
 
 
 def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.MonkeyPatch) -> None:
     """requests profile 应记录 response.content 的原始字节长度。"""
 
-    class FakeResponse:
-        """测试用 HTTP 响应。"""
+    response = diag.requests.Response()
+    response.status_code = 200
+    response.url = "http://127.0.0.1:43117/fixture.pdf"
+    response.headers.update({"Content-Type": "application/pdf"})
+    response._content = b"%PDF fixture bytes"
+    response.encoding = "utf-8"
 
-        def __init__(self) -> None:
-            """初始化测试响应。"""
+    def fake_request_with_safe_redirects(
+        session: diag.requests.Session,
+        *,
+        method: str,
+        url: str,
+        timeout: float,
+        headers: dict[str, str],
+        normalize_url_for_http: Callable[[str], str],
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        stream: bool,
+        cancellation_token: CancellationToken | None,
+    ) -> tuple[web_http_session.AuthorizedResponseLease, int, tuple[str, ...]]:
+        """返回确定性 diagnostic response lease。
 
-            self.text = "decoded"
-            self.content = b"%PDF fixture bytes"
-            self.headers: Mapping[str, str] = {"Content-Type": "application/pdf"}
-            self.status_code = 200
-            self.url = "http://127.0.0.1:43117/fixture.pdf"
+        Args:
+            session: 当前 diagnostic 局部 Session。
+            method: HTTP 方法。
+            url: 请求 URL。
+            timeout: 超时秒数。
+            headers: 请求头。
+            normalize_url_for_http: URL 规范化函数。
+            egress_policy: 当前 Web 出站策略。
+            transport_policy: provider parser 产生的 HTTP transport 策略快照。
+            stream: 是否流式读取。
+            cancellation_token: 取消令牌。
 
-    class FakeSession:
-        """测试用 requests session。"""
+        Returns:
+            确定性 response lease、redirect 次数与访问 URL 序列。
 
-        def prepare_request(self, request: diag.requests.Request) -> diag.requests.PreparedRequest:
-            """复用 requests 真实 prepare 逻辑。"""
+        Raises:
+            无。
+        """
 
-            return diag.requests.sessions.Session().prepare_request(request)
+        del session, headers, normalize_url_for_http, egress_policy, transport_policy
+        del cancellation_token
+        assert method == "GET"
+        assert url == "http://127.0.0.1:43117/fixture.pdf"
+        assert timeout == 1.0
+        assert stream is True
+        return (
+            web_http_session.AuthorizedResponseLease(
+                response=response,
+                session=diag.requests.Session(),
+            ),
+            0,
+            (url,),
+        )
 
-        def send(
-            self,
-            prepared: diag.requests.PreparedRequest,
-            *,
-            timeout: float,
-            allow_redirects: bool,
-        ) -> FakeResponse:
-            """返回固定响应。"""
+    monkeypatch.setattr(
+        diag._web_fetch_orchestrator,
+        "_request_with_safe_redirects",
+        fake_request_with_safe_redirects,
+    )
 
-            assert prepared.url == "http://127.0.0.1:43117/fixture.pdf"
-            assert timeout == 1.0
-            assert allow_redirects is True
-            return FakeResponse()
-
-        def close(self) -> None:
-            """关闭测试 session。"""
-
-            return
-
-    monkeypatch.setattr(diag.requests, "Session", FakeSession)
+    monkeypatch.setattr(
+        diag._web_fetch_orchestrator,
+        "_materialize_response_body",
+        _preserve_materialized_response_body,
+    )
 
     profile = diag._build_requests_profile(
         "http://127.0.0.1:43117/fixture.pdf",
         timeout_seconds=1.0,
-        allow_private_network_url=True,
+        egress_policy=WebEgressPolicy(allow_private_network=True),
+        transport_policy=web_provider._parse_config({}).transport_policy,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
-    result = _object_value(profile["result"])
+    response_headers = _object_value(profile["response_headers"])
+    assert profile["outcome"] == "completed"
+    assert response_headers["content_type"] == "application/pdf"
+    assert profile["content_length"] == len(b"%PDF fixture bytes")
+    assert str(profile["content_digest"]).startswith("sha256:")
 
-    assert result["content_type"] == "application/pdf"
-    assert result["content_length"] == len(b"%PDF fixture bytes")
-    assert result["text_length"] == len("decoded")
+
+def test_requests_profile_closes_session_on_request_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """requests profile 请求异常路径必须关闭局部 Session。"""
+
+    _SessionCloseSpy.instances = []
+    monkeypatch.setattr(diag.requests, "Session", _SessionCloseSpy)
+    monkeypatch.setattr(
+        diag._web_fetch_orchestrator,
+        "_request_with_safe_redirects",
+        _raise_diagnostic_request_exception,
+    )
+
+    profile = diag._build_requests_profile(
+        "https://example.com/report",
+        timeout_seconds=1.0,
+        egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
+        transport_policy=web_provider._parse_config({}).transport_policy,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    )
+
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "request_exception"
+    assert len(_SessionCloseSpy.instances) == 1
+    assert _SessionCloseSpy.instances[0].close_count == 1
+
+
+def test_diagnostic_requests_egress_rejection_uses_shared_policy() -> None:
+    """raw requests 诊断路径必须由共享 egress owner 在发送前拒绝私网。"""
+
+    profile = diag._build_requests_profile(
+        "http://127.0.0.1/internal",
+        timeout_seconds=1.0,
+        egress_policy=WebEgressPolicy(),
+        transport_policy=web_provider._parse_config({}).transport_policy,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    )
+
+    assert profile["sampled"] is False
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "blocked_by_web_egress_policy"
+
+
+def test_diagnostic_playwright_private_egress_rejection_precedes_browser() -> None:
+    """raw Playwright 必须在启动 browser 前保留共享 private egress 拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: browser 绕过 typed egress owner 时抛出。
+    """
+
+    profile = diag._build_playwright_profile(
+        "http://127.0.0.1/report",
+        _options(),
+        egress_policy=WebEgressPolicy(),
+        storage_state_input=None,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    )
+
+    assert profile["sampled"] is False
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "blocked_by_web_egress_policy"
+    assert profile["storage_state"] == {"input_used": False}
+
+
+def test_playwright_response_body_projection_uses_exact_bytes_and_budget() -> None:
+    """browser origin-content oracle 必须使用 exact bytes，并拒绝 declared/actual 超限。"""
+
+    assert diag._DIAGNOSTIC_HTTP_RESOURCE_BUDGET is DEFAULT_HTTP_RESOURCE_BUDGET
+    assert diag._DIAGNOSTIC_BROWSER_RESOURCE_BUDGET is DEFAULT_BROWSER_RESOURCE_BUDGET
+    budget = HttpResourceBudget(wire_body_bytes=4, decoded_body_bytes=4)
+    exact_response = _BodyResponse(
+        body=b"pdf!",
+        headers={"Content-Length": "4"},
+    )
+    declared_too_large = _BodyResponse(
+        body=b"ok",
+        headers={"Content-Length": "5"},
+    )
+    actual_too_large = _BodyResponse(
+        body=b"large",
+        headers={},
+    )
+
+    assert diag._read_bounded_playwright_response_body(
+        cast(diag._ResponseProtocol, exact_response),
+        http_resource_budget=budget,
+    ) == b"pdf!"
+    with pytest.raises(diag._DiagnosticBrowserBodyLimitExceeded):
+        diag._read_bounded_playwright_response_body(
+            cast(diag._ResponseProtocol, declared_too_large),
+            http_resource_budget=budget,
+        )
+    with pytest.raises(diag._DiagnosticBrowserBodyLimitExceeded):
+        diag._read_bounded_playwright_response_body(
+            cast(diag._ResponseProtocol, actual_too_large),
+            http_resource_budget=budget,
+        )
 
 
 def test_comparison_bucket_matrix() -> None:
@@ -276,7 +1091,7 @@ def test_comparison_bucket_matrix() -> None:
                 playwright_ok=True,
                 challenge_detected=True,
             ),
-            "all_success",
+            "playwright_challenge_detected",
         ),
         (
             "playwright_challenge_detected",
@@ -414,8 +1229,10 @@ def test_batch_rows_and_summary_counts(tmp_path: Path) -> None:
         "status": "child_process_error",
         "comparison_bucket": "child_process_error",
         "returncode": 7,
-        "stdout_prefix": "out",
-        "stderr_prefix": "err",
+        "stdout_length": 3,
+        "stdout_digest": "sha256:" + "0" * 64,
+        "stderr_length": 3,
+        "stderr_digest": "sha256:" + "1" * 64,
     }
     rows = [
         diag._build_batch_result_row(
@@ -443,25 +1260,25 @@ def test_batch_rows_and_summary_counts(tmp_path: Path) -> None:
     assert summary["fetch_sampled_count"] == 1
     assert summary["fetch_ok_count"] == 1
     assert summary["challenge_detected_count"] == 1
-    assert summary["comparison_buckets"] == {"all_success": 1, "child_process_error": 1}
-    assert summary["observed_buckets"] == {"all_success": 1, "child_process_error": 1}
+    assert summary["comparison_buckets"] == {"playwright_challenge_detected": 1, "child_process_error": 1}
+    assert summary["observed_buckets"] == {"playwright_challenge_detected": 1, "child_process_error": 1}
     assert summary["child_returncodes"] == {"7": 1}
-    assert rows[0]["observed_bucket"] == "all_success"
+    assert rows[0]["observed_bucket"] == "playwright_challenge_detected"
     assert rows[0]["evidence_path"] == str(tmp_path / "a.json")
-    assert rows[0]["failure_url"] == ""
-    assert rows[0]["diagnostic_schema_version"] == "web-diagnostics-v1"
+    assert rows[0]["failure_safe_url"] == "https://example.com/a"
+    assert rows[0]["diagnostic_schema_version"] == "web-diagnostics-v2"
     assert rows[1]["observed_bucket"] == "child_process_error"
     assert rows[1]["observed_failing_path"] == "diagnostic_child_process"
     assert rows[1]["evidence_path"] is None
-    assert rows[1]["failure_url"] == "https://example.com/b"
+    assert rows[1]["failure_safe_url"] == "https://example.com/b"
     assert "重新运行单 URL 诊断子进程" in str(rows[1]["diagnostic_action_hint"])
-    assert summary["diagnostic_schema_version"] == "web-diagnostics-v1"
+    assert summary["diagnostic_schema_version"] == "web-diagnostics-v2"
     observed_items = summary["observed_items"]
     assert isinstance(observed_items, list)
     assert len(observed_items) == 2
     action_hints = summary["diagnostic_action_hints"]
     assert isinstance(action_hints, list)
-    assert len(action_hints) == 1
+    assert len(action_hints) == 2
 
 
 def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
@@ -485,29 +1302,48 @@ def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
                     "final_url": "https://example.com/final",
                     "fetch_backend": "requests",
                     "content": "abcdef",
+                    "response_content_length": 6,
+                    "response_content_digest": "sha256:" + "b" * 64,
                 },
                 meta=None,
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回 current contract 形状的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回 current contract 形状的工具定义。
 
-        assert options.request_timeout == 1.0
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
-    profile = diag._build_tool_fetch_profile("https://example.com", _options(request_timeout=1.0))
+    options = _options(request_timeout=1.0)
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com",
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    )
 
     assert profile["sampled"] is True
     assert profile["ok"] is True
-    assert profile["status"] == "completed"
-    assert profile["title"] == "Report"
-    assert profile["final_url"] == "https://example.com/final"
-    assert profile["fetch_backend"] == "requests"
-    assert profile["content_prefix"] == "abcdef"
+    assert profile["outcome"] == "completed"
+    assert profile["safe_url"] == "https://example.com/final"
+    assert profile["backend"] == "requests"
     assert profile["content_length"] == 6
+    assert profile["content_digest"] == "sha256:" + "b" * 64
+    assert profile["projected_content_length"] == 6
+    assert "abcdef" not in json.dumps(profile)
 
 
 def test_docling_wrapper_records_invoked_true_and_restores_callable(
@@ -544,18 +1380,31 @@ def test_docling_wrapper_records_invoked_true_and_restores_callable(
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回会触发 Docling callable 的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回会触发 Docling callable 的工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
@@ -568,7 +1417,7 @@ def test_docling_wrapper_records_invoked_true_and_restores_callable(
     assert evidence["original_completed"] is True
     assert evidence["original_exception_type"] == ""
     assert evidence["docling_runtime_initialization_error"] is False
-    assert evidence["diagnostic_url"] == "https://example.com/report.pdf"
+    assert evidence["safe_url"] == "https://example.com/report.pdf"
     assert web_tools_module._docling_convert_to_markdown is fake_docling
 
 
@@ -598,17 +1447,30 @@ def test_html_fetch_profile_records_docling_invoked_false(
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回不触发 Docling 的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回不触发 Docling 的工具定义。
 
-        assert options.url == "https://example.com/page"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/page")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/page",
-        _options(url="https://example.com/page"),
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
@@ -646,24 +1508,37 @@ def test_pdf_fetch_success_without_docling_invocation_keeps_failure_evidence_for
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回未触发 Docling 的 PDF 工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回未触发 Docling 的 PDF 工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
 
     assert profile["ok"] is True
     assert profile["content_length"] == len("pdf markdown")
     assert evidence["invoked"] is False
-    assert evidence["diagnostic_url"] == "https://example.com/report.pdf"
+    assert evidence["safe_url"] == "https://example.com/report.pdf"
 
 
 def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
@@ -690,18 +1565,31 @@ def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
         web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
         raise AssertionError("Docling 初始化异常应在上一行透传。")
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回会触发 Docling 初始化异常的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回会触发 Docling 初始化异常的工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
     payload = _payload(
@@ -722,7 +1610,8 @@ def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
     )
     summary = diag._build_batch_summary(run_label="run", input_path=tmp_path / "urls.jsonl", rows=[row])
 
-    assert profile["status"] == "callable_exception"
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "callable_exception"
     assert evidence["invoked"] is True
     assert evidence["original_completed"] is False
     assert evidence["original_exception_type"] == "DoclingRuntimeInitializationError"
@@ -760,18 +1649,31 @@ def test_generic_docling_conversion_exception_is_not_skip_observed_item(
         web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
         raise AssertionError("普通转换异常应在上一行透传。")
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回会触发普通 Docling 转换异常的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回会触发普通 Docling 转换异常的工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
     payload = _payload(
@@ -825,24 +1727,38 @@ def test_current_fetch_adapter_failed_outcome_generates_business_readable_profil
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回 current contract 形状的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回 current contract 形状的工具定义。
 
-        assert options.tool_timeout_budget == 3.0
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
-    profile = diag._build_tool_fetch_profile("https://example.com", _options(tool_timeout_budget=3.0))
+    options = _options(tool_timeout_budget=3.0)
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com",
+        options,
+        provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    )
 
     assert profile["sampled"] is True
     assert profile["ok"] is False
-    assert profile["status"] == "failed"
+    assert profile["outcome"] == "failed"
     assert profile["error_code"] == "blocked_by_site_policy"
-    assert profile["message"] == "Target site blocked automated access."
-    assert profile["hint"] == "[change_source] Use another source."
+    assert profile["error_message"] == "Target site blocked automated access."
     assert profile["next_action"] == "change_source"
-    assert profile["http_status"] is None
     diagnostics = _object_field(profile, "diagnostics")
     assert diagnostics["diagnostic_source"] == "current_tool_failed_outcome"
     assert diagnostics["error_code"] == "blocked_by_site_policy"
@@ -871,14 +1787,14 @@ def test_cli_single_mode_writes_deterministic_json(
 
     payload = _load_json_object(output_path)
     assert exit_code == 0
-    assert payload["schema_version"] == "web-diagnostics-v1"
-    assert payload["diagnostic_schema_version"] == "web-diagnostics-v1"
-    assert payload["diagnostic_schema_revision"] == 1
+    assert payload["schema_version"] == "web-diagnostics-v2"
+    assert payload["diagnostic_schema_version"] == "web-diagnostics-v2"
+    assert payload["diagnostic_schema_revision"] == 2
     assert payload["generated_at"] == "2026-06-09T00:00:00+00:00"
     assert payload["comparison_bucket"] == "all_success"
     evidence = _object_field(payload, "docling_conversion_invocation_evidence")
     assert evidence["invoked"] is False
-    assert evidence["diagnostic_url"] == "https://example.com"
+    assert evidence["safe_url"] == "https://example.com/"
 
 
 def test_cli_requires_exactly_one_url_mode(
@@ -1010,15 +1926,42 @@ def _options(
     manual_wait_seconds: float = 0.0,
     pause_before_snapshot: bool = False,
     storage_state_in: str = "",
-    storage_state_out: str = "",
     storage_state_dir: str = "",
     skip_playwright: bool = False,
+    skip_requests: bool = False,
     skip_tool_fetch: bool = False,
-    max_network: int = 3,
+    max_network: int | None = None,
     fetch_truncate_chars: int = 1000,
-    allow_private_network_url: bool = False,
 ) -> diag.CliOptions:
-    """构造测试用 CLI 选项。"""
+    """构造测试用 CLI 选项。
+
+    Args:
+        url: 单 URL 输入。
+        url_file: 批量 URL 输入文件。
+        output: 单 URL artifact 路径。
+        batch_output_dir: 批量 artifact 目录。
+        run_label: 批量运行标签。
+        request_timeout: HTTP 请求超时。
+        tool_timeout_budget: 工具调用超时预算。
+        playwright_timeout: 浏览器导航超时。
+        playwright_channel: 浏览器 channel。
+        headed: 是否使用有界面浏览器。
+        manual_wait_seconds: 导航后等待秒数。
+        pause_before_snapshot: 是否在页面采样前等待确认。
+        storage_state_in: 显式 storage state 输入文件。
+        storage_state_dir: production provider storage state 目录。
+        skip_playwright: 是否跳过 Playwright。
+        skip_requests: 是否跳过 raw requests。
+        skip_tool_fetch: 是否跳过工具调用。
+        max_network: 可选的本次 diagnostic events override。
+        fetch_truncate_chars: 工具内容截断字符数。
+
+    Returns:
+        强类型诊断 CLI 选项。
+
+    Raises:
+        无。
+    """
 
     return diag.CliOptions(
         url=url,
@@ -1034,13 +1977,12 @@ def _options(
         manual_wait_seconds=manual_wait_seconds,
         pause_before_snapshot=pause_before_snapshot,
         storage_state_in=storage_state_in,
-        storage_state_out=storage_state_out,
         storage_state_dir=storage_state_dir,
         skip_playwright=skip_playwright,
+        skip_requests=skip_requests,
         skip_tool_fetch=skip_tool_fetch,
         max_network=max_network,
         fetch_truncate_chars=fetch_truncate_chars,
-        allow_private_network_url=allow_private_network_url,
     )
 
 
@@ -1056,34 +1998,64 @@ def _payload(
 ) -> JsonObject:
     """构造 synthetic 单 URL 诊断 payload。"""
 
+    def profile(
+        *,
+        sampled: bool,
+        completed: bool,
+        backend: str,
+        safe_url: str,
+    ) -> JsonObject:
+        """构造 schema v2 path profile。"""
+
+        outcome = "completed" if completed else "failed" if sampled else "skipped"
+        result: JsonObject = {
+            "stage": backend,
+            "sampled": sampled,
+            "outcome": outcome,
+            "ok": completed,
+            "safe_url": safe_url,
+            "elapsed_seconds": 0.1,
+            "backend": backend,
+        }
+        if completed:
+            result.update(
+                {
+                    "content_length": 8,
+                    "content_digest": "sha256:" + "a" * 64,
+                    "http_status": 200,
+                }
+            )
+        elif sampled:
+            result["error_code"] = f"{backend}_failed"
+        return result
+
     payload: JsonObject = {
-        "requests_profile": {
-            "sampled": requests_sampled,
-            "result": {
-                "ok": requests_ok,
-                "status": "completed" if requests_ok else "request_exception",
-                "status_code": 200 if requests_ok else None,
-            },
-        },
-        "fetch_web_page_profile": {
-            "sampled": fetch_sampled,
-            "ok": fetch_ok,
-            "status": "completed" if fetch_ok else "failed",
-            "error_code": "" if fetch_ok else "fetch_failed",
-            "final_url": "https://example.com/fetch",
-        },
-        "playwright_profile": {
-            "sampled": playwright_sampled,
-            "ok": playwright_ok,
-            "status": "completed" if playwright_ok else "skipped",
-            "challenge_detected": challenge_detected,
-            "challenge_signals": ["challenge"] if challenge_detected else [],
-            "navigation": {
-                "response_status": 200 if playwright_ok else None,
-                "final_url": "https://example.com/browser",
-            },
-        },
+        "schema_version": "web-diagnostics-v2",
+        "diagnostic_schema_version": "web-diagnostics-v2",
+        "diagnostic_schema_revision": 2,
+        "safe_url": "https://example.com/",
+        "requests_profile": profile(
+            sampled=requests_sampled,
+            completed=requests_ok,
+            backend="requests",
+            safe_url="https://example.com/requests",
+        ),
+        "fetch_web_page_profile": profile(
+            sampled=fetch_sampled,
+            completed=fetch_ok,
+            backend="tool",
+            safe_url="https://example.com/fetch",
+        ),
+        "playwright_profile": profile(
+            sampled=playwright_sampled,
+            completed=playwright_ok,
+            backend="playwright",
+            safe_url="https://example.com/browser",
+        ),
     }
+    playwright_profile = cast(JsonObject, payload["playwright_profile"])
+    playwright_profile["challenge_decision"] = "confirmed" if challenge_detected else "none"
+    playwright_profile["challenge_signals"] = ["challenge"] if challenge_detected else []
     payload["comparison_bucket"] = diag._classify_diagnostic_bucket(payload)
     return payload
 
@@ -1125,13 +2097,31 @@ def _fake_requests_profile(
     url: str,
     *,
     timeout_seconds: float,
-    allow_private_network_url: bool,
+    egress_policy: WebEgressPolicy,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
-    """返回确定性 requests profile。"""
+    """返回确定性 requests profile。
+
+    Args:
+        url: 待诊断 URL。
+        timeout_seconds: requests 超时秒数。
+        egress_policy: utility 构造的 Web 出站策略。
+        transport_policy: provider parser 产生的 transport 策略快照。
+        diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
+
+    Returns:
+        确定性 requests profile。
+
+    Raises:
+        AssertionError: 调用参数不符合测试约束时抛出。
+    """
 
     assert url == "https://example.com"
     assert timeout_seconds > 0
-    assert allow_private_network_url is False
+    assert egress_policy.allows_private_network is True
+    assert transport_policy == web_provider._parse_config({}).transport_policy
+    assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
     return cast(JsonObject, _payload(
         requests_sampled=True,
         requests_ok=True,
@@ -1142,11 +2132,32 @@ def _fake_requests_profile(
     )["requests_profile"])
 
 
-def _fake_fetch_profile(url: str, options: diag.CliOptions) -> JsonObject:
-    """返回确定性 fetch profile。"""
+def _fake_fetch_profile(
+    url: str,
+    options: diag.CliOptions,
+    *,
+    provider_config: Mapping[str, JsonValue],
+    diagnostic_resource_budget: DiagnosticResourceBudget,
+) -> JsonObject:
+    """返回确定性 fetch profile。
+
+    Args:
+        url: 待诊断 URL。
+        options: single diagnostic CLI 选项。
+        provider_config: orchestration 交给 provider discovery 的 raw 配置。
+        diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
+
+    Returns:
+        确定性 fetch profile。
+
+    Raises:
+        AssertionError: 调用参数不符合测试约束时抛出。
+    """
 
     assert url == "https://example.com"
     assert options.url == "https://example.com"
+    assert provider_config == diag._provider_config(options)
+    assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
     return cast(JsonObject, _payload(
         requests_sampled=False,
         requests_ok=False,
@@ -1164,11 +2175,35 @@ def _object_value(value: JsonValue) -> JsonObject:
     return {str(key): item for key, item in value.items()}
 
 
-def _fake_playwright_profile(url: str, options: diag.CliOptions) -> JsonObject:
-    """返回确定性 Playwright profile。"""
+def _fake_playwright_profile(
+    url: str,
+    options: diag.CliOptions,
+    *,
+    egress_policy: WebEgressPolicy,
+    storage_state_input: Path | None,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
+) -> JsonObject:
+    """返回确定性 Playwright profile。
+
+    Args:
+        url: 待诊断 URL。
+        options: single diagnostic CLI 选项。
+        egress_policy: 唯一 parser 配置产生的出站策略。
+        storage_state_input: 已校验的显式 storage state 输入。
+        diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
+
+    Returns:
+        确定性 Playwright profile。
+
+    Raises:
+        AssertionError: orchestration 未传播 typed owner 值时抛出。
+    """
 
     assert url == "https://example.com"
     assert options.url == "https://example.com"
+    assert egress_policy.allows_private_network is True
+    assert storage_state_input is None
+    assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
     return cast(JsonObject, _payload(
         requests_sampled=False,
         requests_ok=False,

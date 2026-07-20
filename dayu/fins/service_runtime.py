@@ -11,13 +11,13 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsJobCancellationChecker,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
+    FinsUploadPipelineResult,
     FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
@@ -25,9 +25,11 @@ from dayu.fins.ingestion_runtime import (
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
@@ -109,7 +111,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         ticker: str,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
-    ) -> dict[str, JsonValue]:
+    ) -> FinsUploadPipelineResult:
         """执行 filing 上传 handoff。
 
         Args:
@@ -119,7 +121,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             cancellation_checker: 协作式取消检查器。
 
         Returns:
-            pipeline 上传结果。
+            typed pipeline 上传结果。
 
         Raises:
             ValueError: 必填字段缺失或市场不支持时抛出。
@@ -133,34 +135,38 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             raise ValueError("filing 上传必须提供 fiscal_period")
         action = _pipeline_upload_action(request.action)
         if market == "US":
-            return self.sec_pipeline.upload_filing(
-                ticker=ticker,
-                action=action,
-                files=list(request.files),
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                amended=request.amended,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.sec_pipeline.upload_filing(
+                    ticker=ticker,
+                    action=action,
+                    files=list(request.files),
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    amended=request.amended,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         if market in {"CN", "HK"}:
-            return self.cn_pipeline.upload_filing(
-                ticker=ticker,
-                action=action,
-                files=list(request.files),
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                amended=request.amended,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.cn_pipeline.upload_filing(
+                    ticker=ticker,
+                    action=action,
+                    files=list(request.files),
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    amended=request.amended,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         raise ValueError(f"不支持的上传市场: {market}")
 
@@ -171,7 +177,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         ticker: str,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
-    ) -> dict[str, JsonValue]:
+    ) -> FinsUploadPipelineResult:
         """执行 material 上传 handoff。
 
         Args:
@@ -181,7 +187,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             cancellation_checker: 协作式取消检查器。
 
         Returns:
-            pipeline 上传结果。
+            typed pipeline 上传结果。
 
         Raises:
             ValueError: 必填字段缺失或市场不支持时抛出。
@@ -195,40 +201,44 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             raise ValueError("material 上传必须提供 material_name")
         action = _pipeline_upload_action(request.action)
         if market == "US":
-            return self.sec_pipeline.upload_material(
-                ticker=ticker,
-                action=action,
-                form_type=request.form_type,
-                material_name=request.material_name,
-                files=list(request.files),
-                document_id=request.document_id,
-                internal_document_id=request.internal_document_id,
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.sec_pipeline.upload_material(
+                    ticker=ticker,
+                    action=action,
+                    form_type=request.form_type,
+                    material_name=request.material_name,
+                    files=list(request.files),
+                    document_id=request.document_id,
+                    internal_document_id=request.internal_document_id,
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         if market in {"CN", "HK"}:
-            return self.cn_pipeline.upload_material(
-                ticker=ticker,
-                action=action,
-                form_type=request.form_type,
-                material_name=request.material_name,
-                files=list(request.files),
-                document_id=request.document_id,
-                internal_document_id=request.internal_document_id,
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.cn_pipeline.upload_material(
+                    ticker=ticker,
+                    action=action,
+                    form_type=request.form_type,
+                    material_name=request.material_name,
+                    files=list(request.files),
+                    document_id=request.document_id,
+                    internal_document_id=request.internal_document_id,
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         raise ValueError(f"不支持的上传市场: {market}")
 
@@ -255,13 +265,13 @@ def _pipeline_upload_action(action: str) -> str | None:
 def _upload_summary_from_result(
     *,
     request: FinsUploadRequest,
-    result: dict[str, JsonValue],
+    result: FinsUploadPipelineResult,
 ) -> FinsUploadResultSummary:
-    """从 pipeline 上传结果构建 runtime 摘要。
+    """从 typed pipeline 上传结果构建 runtime 摘要。
 
     Args:
         request: 上传请求。
-        result: pipeline 上传结果。
+        result: typed pipeline 上传结果。
 
     Returns:
         runtime 有界上传摘要。
@@ -272,77 +282,16 @@ def _upload_summary_from_result(
 
     return FinsUploadResultSummary(
         source_kind=request.source_kind,
-        document_id=_optional_upload_result_text(result, "document_id"),
-        internal_document_id=_optional_upload_result_text(result, "internal_document_id"),
-        status=_upload_result_text(result, "status", fallback="unknown"),
+        status=result.status,
+        document_id=result.document_id,
+        internal_document_id=result.internal_document_id,
         uploaded_files=tuple(path.name for path in request.files),
-        primary_document=_optional_upload_result_text(result, "primary_document"),
-        deleted=_upload_result_bool(result, "deleted"),
-        skip_reason=_optional_upload_result_text(result, "skip_reason"),
-        document_version=_optional_upload_result_text(result, "document_version"),
-        source_fingerprint=_optional_upload_result_text(result, "source_fingerprint"),
+        primary_document=result.primary_document,
+        deleted=result.deleted,
+        skip_reason=result.skip_reason,
+        document_version=result.document_version,
+        source_fingerprint=result.source_fingerprint,
     )
-
-
-def _upload_result_text(result: dict[str, JsonValue], key: str, *, fallback: str) -> str:
-    """从 upload result 读取文本字段。
-
-    Args:
-        result: pipeline 上传结果。
-        key: 字段名。
-        fallback: 缺失时使用的值。
-
-    Returns:
-        文本字段。
-
-    Raises:
-        无。
-    """
-
-    value = result.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return fallback
-
-
-def _optional_upload_result_text(result: dict[str, JsonValue], key: str) -> str | None:
-    """从 upload result 读取可选文本字段。
-
-    Args:
-        result: pipeline 上传结果。
-        key: 字段名。
-
-    Returns:
-        文本字段；缺失或非文本时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    value = result.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _upload_result_bool(result: dict[str, JsonValue], key: str) -> bool:
-    """从 upload result 读取布尔字段。
-
-    Args:
-        result: pipeline 上传结果。
-        key: 字段名。
-
-    Returns:
-        布尔字段；缺失或非布尔返回 ``False``。
-
-    Raises:
-        无。
-    """
-
-    value = result.get(key)
-    if isinstance(value, bool):
-        return value
-    return False
 
 
 @dataclass
@@ -355,6 +304,7 @@ class DefaultFinsRuntime:
     """
 
     workspace_root: Path
+    batching_repository: BatchingRepositoryProtocol
     company_repository: CompanyMetaRepositoryProtocol
     source_repository: SourceDocumentRepositoryProtocol
     blob_repository: DocumentBlobRepositoryProtocol
@@ -364,6 +314,7 @@ class DefaultFinsRuntime:
     ingestion_job_store: FsFinsIngestionJobStore
     _read_runtime: FinsReadRuntime | None = field(init=False, default=None, repr=False)
     _read_runtime_lock: Lock = field(init=False, repr=False)
+    _closed: bool = field(init=False, default=False, repr=False)
     _ingestion_runtime: FinsIngestionRuntime | None = field(init=False, default=None, repr=False)
     _ingestion_runtime_lock: Lock = field(init=False, repr=False)
 
@@ -400,6 +351,10 @@ class DefaultFinsRuntime:
         repository_set = build_fs_repository_set(workspace_root=workspace_root)
         return cls(
             workspace_root=workspace_root,
+            batching_repository=FsBatchingRepository(
+                workspace_root,
+                repository_set=repository_set,
+            ),
             company_repository=FsCompanyMetaRepository(
                 workspace_root,
                 repository_set=repository_set,
@@ -450,11 +405,12 @@ class DefaultFinsRuntime:
 
         Raises:
             ValueError: 缓存容量非法时由 FinsReadRuntime 抛出。
+            RuntimeError: runtime 已关闭时抛出。
         """
 
-        if self._read_runtime is not None:
-            return self._read_runtime
         with self._read_runtime_lock:
+            if self._closed:
+                raise RuntimeError("DefaultFinsRuntime 已关闭")
             if self._read_runtime is not None:
                 return self._read_runtime
             # dayu.fins.tools 包初始化会导入 provider，provider 又需要本模块；
@@ -470,6 +426,28 @@ class DefaultFinsRuntime:
             )
             self._read_runtime = read_runtime
             return read_runtime
+
+    def close(self) -> None:
+        """幂等关闭已经按需创建的 read runtime。
+
+        close 不会为了清理而创建 read runtime，因此仅使用 ingestion 能力的
+        ``DefaultFinsRuntime`` 仍保持 read path 的惰性装配。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: 已创建 read runtime 的 snapshot cleanup 失败时抛出。
+        """
+
+        with self._read_runtime_lock:
+            self._closed = True
+            read_runtime = self._read_runtime
+        if read_runtime is not None:
+            read_runtime.close()
 
     def get_ingestion_runtime(self) -> FinsIngestionRuntime:
         """返回共享的 Fins ingestion runtime 实例。
@@ -501,6 +479,7 @@ class DefaultFinsRuntime:
             sec_download_adapter = build_sec_download_adapter(
                 workspace_root=self.workspace_root,
                 processor_registry=self.processor_registry,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -509,6 +488,7 @@ class DefaultFinsRuntime:
             )
             cn_download_adapter = build_cn_download_adapter(
                 workspace_root=self.workspace_root,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -517,6 +497,7 @@ class DefaultFinsRuntime:
             )
             hk_download_adapter = build_hk_download_adapter(
                 workspace_root=self.workspace_root,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -528,6 +509,7 @@ class DefaultFinsRuntime:
             sec_upload_pipeline = SecPipeline(
                 workspace_root=self.workspace_root,
                 processor_registry=self.processor_registry,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -536,6 +518,7 @@ class DefaultFinsRuntime:
             )
             cn_upload_pipeline = CnPipeline(
                 workspace_root=self.workspace_root,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -547,6 +530,7 @@ class DefaultFinsRuntime:
                 cn_pipeline=cn_upload_pipeline,
             )
             runtime = FinsIngestionRuntime.create(
+                batching_repository=self.batching_repository,
                 source_repository=self.source_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,

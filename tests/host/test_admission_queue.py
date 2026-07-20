@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.admission import (
     AdmissionClock,
     AdmissionIdFactory,
@@ -31,6 +33,7 @@ from dayu.host.api import (
     AuthorizationClaim,
     CancelMode,
     CancelRunRequest,
+    CancelSessionRunsRequest,
     CloseSessionRequest,
     EnsureSessionRequest,
     FollowupBehavior,
@@ -53,6 +56,7 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.liveness import HostInstanceIdentity, register_current_instance
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -60,8 +64,11 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.run_transition import (
+    AcceptWorkerRunningInput,
     CreateRunningRunInput,
+    PromotionSkipReason,
     TerminalCloseoutInput,
+    accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
@@ -73,10 +80,13 @@ from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunRow,
     RunStartReason,
+    StateMutationStatus,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
     WorkerKind,
+    mark_dispatch_waiting_for_lane_row,
+    mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.memory import (
@@ -90,6 +100,7 @@ from dayu.host.projection import ProjectionCatchupPort
 
 _NOW = datetime(2026, 5, 14, 9, 30, 0, tzinfo=UTC)
 _CALLER_DIGEST = sha256_digest_json({"caller": "admission-test"})
+_LANE_NAME = "llm"
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +202,27 @@ class _ToggleFailingWakeupSpy(_WakeupSpy):
         self.promotions.append(session_id)
         if self.fail_queue_promotion:
             raise RuntimeError("forced queue wakeup failure")
+
+
+@dataclass(slots=True)
+class _CountingEventLogStore(EventLogStore):
+    """记录 read_event_by_id 调用次数的 EventLog primitive。"""
+
+    read_event_by_id_count: int = 0
+
+    def read_event_by_id(
+        self, transaction: HostTransaction, event_id: str
+    ) -> EventLogRow | None:
+        """统计并委托读取 EventLog row。
+
+        :param transaction: Host transaction。
+        :param event_id: Event id。
+        :returns: EventLog row；不存在时返回 ``None``。
+        :raises HostDurableError: Event id 非法时由底层抛出。
+        """
+
+        self.read_event_by_id_count += 1
+        return EventLogStore.read_event_by_id(self, transaction, event_id)
 
 
 @dataclass(slots=True)
@@ -941,6 +973,30 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
         assert session_id in caplog.text
 
 
+def test_promote_after_release_reports_delegated_to_governance(
+    tmp_path: Path,
+) -> None:
+    """active slot 释放后的 wakeup 结果不谎称 active Run 仍存在。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _WakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+
+        result = admission_module._promote_after_release(
+            service=service,
+            session_id=session_id,
+        )
+
+        assert result.skipped is True
+        assert result.skip_reason is PromotionSkipReason.DELEGATED_TO_GOVERNANCE
+        assert spy.promotions == [session_id]
+
+
 def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
     tmp_path: Path,
 ) -> None:
@@ -1267,6 +1323,41 @@ def test_cancel_attempt_running_enters_cancelling_with_cancel_facts(
         )
 
 
+def test_cancel_session_replay_uses_injected_event_log_store(
+    tmp_path: Path,
+) -> None:
+    """session cancel replay 通过注入的 EventLogStore 恢复 active cancel 目标。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    event_log_store = _CountingEventLogStore()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner, event_log_store=event_log_store)
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
+        _accept_active_worker(
+            store.transaction_runner,
+            run_id=active.run.run_id,
+            attempt_id=active.attempt.attempt_id,
+        )
+        request = _cancel_session_request("cancel-session-active-replay")
+
+        first = service.cancel_session_runs(
+            session_id, request, caller_semantic_digest=_CALLER_DIGEST
+        )
+        replay = service.cancel_session_runs(
+            session_id, request, caller_semantic_digest=_CALLER_DIGEST
+        )
+
+        assert first.active_cancel_targets == replay.active_cancel_targets
+        assert replay.idempotent_replay is True
+        assert len(replay.active_cancel_targets) == 1
+        assert replay.active_cancel_targets[0].run_id == active.run.run_id
+        assert event_log_store.read_event_by_id_count >= 1
+
+
 def test_rollback_before_cancel_commit_does_not_wake_or_promote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1388,6 +1479,7 @@ def _service(
     *,
     spy: _WakeupSpy | None = None,
     projection_catchup: ProjectionCatchupPort | None = None,
+    event_log_store: EventLogStore | None = None,
     label: str = "main",
 ) -> HostAdmissionService:
     """构造测试 admission service。
@@ -1395,6 +1487,7 @@ def _service(
     :param transaction_runner: Host transaction runner。
     :param spy: 可选 wakeup spy。
     :param projection_catchup: 可选 projection catch-up port。
+    :param event_log_store: 可选 EventLog primitive。
     :param label: id factory 标签。
     :returns: HostAdmissionService。
     """
@@ -1405,6 +1498,7 @@ def _service(
         id_factory=_SequentialIdFactory(label),
         wakeup_port=spy if spy is not None else _WakeupSpy(),
         projection_catchup_port=projection_catchup,
+        event_log_store=event_log_store,
         ordinary_run_baseline=_ordinary_run_baseline(),
         tooling_options=None,
     )
@@ -1441,6 +1535,8 @@ def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
     )
 
@@ -1545,7 +1641,7 @@ def _seed_active_run(
                 source="pytest",
                 idempotency_key=f"idem-{run_id}",
                 execution_target="target-seeded-active",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
@@ -1708,6 +1804,86 @@ def _cancel_request(client_request_id: str) -> CancelRunRequest:
         reason="user_cancel",
         mode=CancelMode.GRACEFUL,
     )
+
+
+def _cancel_session_request(client_request_id: str) -> CancelSessionRunsRequest:
+    """构造 cancel session runs 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: CancelSessionRunsRequest。
+    """
+
+    return CancelSessionRunsRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="user_cancel_all",
+        mode=CancelMode.GRACEFUL,
+    )
+
+
+def _accept_active_worker(
+    transaction_runner: HostTransactionRunner, *, run_id: str, attempt_id: str
+) -> None:
+    """用 durable transition helper 构造 active worker accepted 状态。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """写入 worker accepted 状态。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        register_current_instance(
+            transaction,
+            HostInstanceIdentity(
+                host_instance_id="host-admission-test",
+                pid=os.getpid(),
+                process_start_token="admission-test",
+                boot_id=None,
+            ),
+        )
+        waiting = mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-admission-test",
+            lane_name=_LANE_NAME,
+            waiting_for_lane_at="2026-05-14T09:30:00.000000Z",
+        )
+        assert waiting.status == StateMutationStatus.UPDATED
+        dispatching = mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-admission-test",
+            lane_name=_LANE_NAME,
+            lane_claim_id=f"claim-{attempt_id}",
+            lane_owner_id="owner-admission-test",
+            lane_acquired_at="2026-05-14T09:30:00.000000Z",
+            dispatching_at="2026-05-14T09:30:00.000000Z",
+        )
+        assert dispatching.status == StateMutationStatus.UPDATED
+        accepted = accept_worker_running_in_transaction(
+            transaction,
+            EventLogStore(),
+            AcceptWorkerRunningInput(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                attempt_running_event_id=f"event-attempt-running-{attempt_id}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="host.dispatch",
+                worker_accept_reason="local_worker_accepted",
+                local_worker_id=f"worker-{attempt_id}",
+            ),
+        )
+        assert accepted.status == StateMutationStatus.UPDATED
+
+    transaction_runner.run_write(operation)
 
 
 def _closeout_active(

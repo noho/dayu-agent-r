@@ -8,18 +8,25 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime, timezone
+from typing import cast
 
 import dayu.engine as engine
+import pytest
 from dayu.engine.contracts.engine_events import (
+    ENGINE_EVENT_TYPE_TO_DATA,
     ContentCompleteData,
     ContentDeltaData,
     ContextCompactionRequestedData,
+    EngineEventData,
     EngineEventType,
     FinalAnswerData,
     IterationCompletedData,
     IterationStartedData,
+    ProviderDiagnosticData,
     ProviderProtocolErrorData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
     RunCancelledData,
     RunFailedData,
@@ -32,35 +39,142 @@ from dayu.engine.contracts.engine_events import (
     ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
+    engine_event_type_for_data,
     runner_role_sequence_digest,
+    validate_engine_event_pairing,
+)
+from dayu.engine.contracts.runner_events import RunnerDiagnosticSeverity
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AwaitingToolExecutionRecord,
 )
 
-EVENT_TYPE_TO_DATA: dict[EngineEventType, type] = {
-    EngineEventType.ITERATION_STARTED: IterationStartedData,
-    EngineEventType.CONTENT_DELTA: ContentDeltaData,
-    EngineEventType.REASONING_DELTA: ReasoningDeltaData,
-    EngineEventType.CONTENT_COMPLETED: ContentCompleteData,
-    EngineEventType.TOOL_CALL_DELTA: ToolCallDeltaData,
-    EngineEventType.TOOL_CALLS_BATCH_READY: ToolCallsBatchReadyData,
-    EngineEventType.TOOL_CALL_REQUESTED: ToolCallRequestedData,
-    EngineEventType.TOOL_RESULT_ACCEPTED: ToolResultAcceptedData,
-    EngineEventType.TOOL_CALLS_BATCH_DONE: ToolCallsBatchDoneData,
-    EngineEventType.TOOL_AWAITING: ToolAwaitingData,
-    EngineEventType.CONTEXT_COMPACTION_REQUESTED: ContextCompactionRequestedData,
-    EngineEventType.USAGE_REPORTED: UsageReportedData,
-    EngineEventType.PROVIDER_PROTOCOL_ERROR: ProviderProtocolErrorData,
-    EngineEventType.ITERATION_COMPLETED: IterationCompletedData,
-    EngineEventType.FINAL_ANSWER: FinalAnswerData,
-    EngineEventType.RUN_SUSPENDED: RunSuspendedData,
-    EngineEventType.RUN_CANCELLED: RunCancelledData,
-    EngineEventType.RUN_FAILED: RunFailedData,
-}
+
+def _engine_event_data_samples() -> tuple[EngineEventData, ...]:
+    """构造覆盖 EngineEventData 封闭联合的最小外层实例。
+
+    Pairing owner 只观察 data 的具体类型；各 data 字段不变量由各自契约
+    测试负责，因此复杂 record 字段使用静态 cast 占位，不重复构造下游
+    工具执行协议。
+
+    :returns: 每种 EngineEventData 具体类型各一个实例。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    now = datetime.now(tz=timezone.utc)
+    return (
+        IterationStartedData(
+            iteration_id="iteration-contract",
+            iteration_index=0,
+            message_count=1,
+            role_sequence_digest="sha256:contract",
+            runner_input_serializer_schema_version="contract.v1",
+        ),
+        ContentDeltaData(iteration_id="iteration-contract", delta="x"),
+        ReasoningDeltaData(iteration_id="iteration-contract", delta="x"),
+        ContentCompleteData(
+            iteration_id="iteration-contract",
+            content="x",
+            reasoning_content=None,
+        ),
+        ToolCallDeltaData(
+            iteration_id="iteration-contract",
+            tool_call_index=0,
+            tool_call_id="call-contract",
+            name_delta="lookup",
+            arguments_delta="{}",
+        ),
+        ToolCallsBatchReadyData(
+            iteration_id="iteration-contract",
+            tool_calls=(),
+        ),
+        ToolCallRequestedData(
+            iteration_id="iteration-contract",
+            tool_call_id="call-contract",
+            name="lookup",
+            arguments={},
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+        ToolResultAcceptedData(
+            iteration_id="iteration-contract",
+            record=cast(AcceptedToolExecutionRecord, None),
+        ),
+        ToolCallsBatchDoneData(
+            iteration_id="iteration-contract",
+            tool_call_ids=(),
+            completed_count=0,
+            failed_count=0,
+            cancelled_count=0,
+        ),
+        ToolAwaitingData(
+            iteration_id="iteration-contract",
+            record=cast(AwaitingToolExecutionRecord, None),
+        ),
+        ContextCompactionRequestedData(
+            iteration_id="iteration-contract",
+            budget_state=None,
+            reason="context_compaction_required",
+            provider_request_id=None,
+        ),
+        UsageReportedData(
+            iteration_id="iteration-contract",
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+            provider_request_id=None,
+        ),
+        ProviderDiagnosticData(
+            iteration_id="iteration-contract",
+            diagnostic_code="contract-diagnostic",
+            severity=RunnerDiagnosticSeverity.WARNING,
+            message="diagnostic",
+            provider_request_id=None,
+            raw_payload=None,
+        ),
+        ProviderProtocolErrorData(
+            iteration_id="iteration-contract",
+            error_code=engine.EngineRunErrorCode.RUNNER_EXCEPTION,
+            message="protocol error",
+            provider_request_id=None,
+            raw_payload=None,
+        ),
+        IterationCompletedData(
+            iteration_id="iteration-contract",
+            finish_reason=engine.FinishReason.STOP,
+            provider_request_id=None,
+        ),
+        FinalAnswerData(
+            content="answer",
+            filtered=False,
+            degraded=False,
+            finish_reason=engine.FinishReason.STOP,
+        ),
+        RunSuspendedData(
+            reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
+            resume_hint=None,
+            accepted_records=(),
+            awaiting_records=(cast(AwaitingToolExecutionRecord, None),),
+        ),
+        RunCancelledData(
+            reason="cancelled",
+            requested_at=now,
+            accepted_at=now,
+            finished_at=now,
+        ),
+        RunFailedData(
+            error_code=engine.EngineRunErrorCode.RUNNER_EXCEPTION,
+            message="failed",
+            provider_request_id=None,
+            recoverable=False,
+        ),
+    )
 
 
 def test_event_type_members_match_mapping_keys() -> None:
     """枚举成员集合与映射键集合必须严格相等。"""
 
-    assert set(EngineEventType) == set(EVENT_TYPE_TO_DATA.keys())
+    assert set(EngineEventType) == set(ENGINE_EVENT_TYPE_TO_DATA.keys())
 
 
 def test_event_type_wire_values_are_locked() -> None:
@@ -79,6 +193,7 @@ def test_event_type_wire_values_are_locked() -> None:
         "tool_awaiting",
         "context_compaction_requested",
         "usage_reported",
+        "provider_diagnostic",
         "provider_protocol_error",
         "iteration_completed",
         "final_answer",
@@ -91,8 +206,86 @@ def test_event_type_wire_values_are_locked() -> None:
 def test_each_data_dataclass_is_distinct() -> None:
     """所有 EngineEvent data dataclass 必须互不相同。"""
 
-    data_classes = list(EVENT_TYPE_TO_DATA.values())
+    data_classes = list(ENGINE_EVENT_TYPE_TO_DATA.values())
     assert len(data_classes) == len(set(data_classes))
+
+
+def test_each_legal_engine_event_pair_constructs() -> None:
+    """production mapping 中每个合法 discriminator/data pair 都能构造。"""
+
+    samples = _engine_event_data_samples()
+    assert {type(data) for data in samples} == set(
+        ENGINE_EVENT_TYPE_TO_DATA.values()
+    )
+    for data in samples:
+        event_type = engine_event_type_for_data(data)
+
+        validate_engine_event_pairing(event_type, data)
+        event = engine.EngineEvent(
+            occurred_at=datetime.now(tz=timezone.utc),
+            session_id="session-contract",
+            run_id="run-contract",
+            type=event_type,
+            data=data,
+            metadata=None,
+        )
+
+        assert event.data is data
+        assert engine_event_type_for_data(data) is event_type
+
+
+def test_engine_event_rejects_mismatched_discriminator_and_data() -> None:
+    """EngineEvent 构造边界拒绝合法成员间的错误 pairing。"""
+
+    with pytest.raises(ValueError, match="type/data mismatch"):
+        engine.EngineEvent(
+            occurred_at=datetime.now(tz=timezone.utc),
+            session_id="session-contract",
+            run_id="run-contract",
+            type=EngineEventType.FINAL_ANSWER,
+            data=ToolCallRequestedData(
+                iteration_id="iteration-contract",
+                tool_call_id="call-contract",
+                name="lookup",
+                arguments={},
+                index_in_iteration=0,
+                provider_state=None,
+            ),
+            metadata=None,
+        )
+
+
+def test_engine_event_rejects_non_enum_discriminator() -> None:
+    """EngineEvent 构造边界拒绝 raw string discriminator。"""
+
+    with pytest.raises(TypeError, match="EngineEvent.type"):
+        engine.EngineEvent(
+            occurred_at=datetime.now(tz=timezone.utc),
+            session_id="session-contract",
+            run_id="run-contract",
+            type=cast(EngineEventType, "final_answer"),
+            data=FinalAnswerData(
+                content="answer",
+                filtered=False,
+                degraded=False,
+                finish_reason=engine.FinishReason.STOP,
+            ),
+            metadata=None,
+        )
+
+
+def test_engine_event_rejects_data_outside_closed_union() -> None:
+    """EngineEvent 构造边界拒绝 data 封闭联合之外的实例。"""
+
+    with pytest.raises(TypeError, match="unsupported type"):
+        engine.EngineEvent(
+            occurred_at=datetime.now(tz=timezone.utc),
+            session_id="session-contract",
+            run_id="run-contract",
+            type=EngineEventType.FINAL_ANSWER,
+            data=cast(EngineEventData, "not-engine-event-data"),
+            metadata=None,
+        )
 
 
 def test_iteration_completed_data_is_distinct_from_runner_done_data() -> None:
@@ -134,9 +327,9 @@ def test_engine_event_required_fields_have_no_default() -> None:
 
     for f in dataclasses.fields(engine.EngineEvent):
         assert f.default is dataclasses.MISSING, f"field {f.name} has default"
-        assert f.default_factory is dataclasses.MISSING, (
-            f"field {f.name} has default_factory"
-        )
+        assert (
+            f.default_factory is dataclasses.MISSING
+        ), f"field {f.name} has default_factory"
 
 
 def test_tool_awaiting_and_suspended_data_fields_are_locked() -> None:
@@ -160,6 +353,13 @@ def test_tool_awaiting_and_suspended_data_fields_are_locked() -> None:
 def test_provider_request_id_fields_are_locked() -> None:
     """provider request id 字段必须是显式契约字段。"""
 
+    assert {f.name for f in dataclasses.fields(UsageReportedData)} == {
+        "iteration_id",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "provider_request_id",
+    }
     assert {f.name for f in dataclasses.fields(IterationCompletedData)} == {
         "iteration_id",
         "finish_reason",
@@ -173,14 +373,22 @@ def test_provider_request_id_fields_are_locked() -> None:
         "client_correlation_id",
         "recoverable",
     }
-    assert {
-        f.name for f in dataclasses.fields(ContextCompactionRequestedData)
-    } == {
+    assert {f.name for f in dataclasses.fields(ContextCompactionRequestedData)} == {
         "iteration_id",
         "budget_state",
         "reason",
         "provider_request_id",
         "client_correlation_id",
+    }
+
+
+def test_content_completed_fields_exclude_finish_reason() -> None:
+    """正文完成事件不得重复承载 Runner 调用完成原因。"""
+
+    assert {f.name for f in dataclasses.fields(ContentCompleteData)} == {
+        "iteration_id",
+        "content",
+        "reasoning_content",
     }
 
 
@@ -193,10 +401,10 @@ def test_iteration_started_runner_input_signal_fields_are_locked() -> None:
         "message_count",
         "role_sequence_digest",
         "runner_input_serializer_schema_version",
+        "input_projection",
     }
     assert runner_role_sequence_digest(("system", "user")) == (
-        "sha256:"
-        "12217463eda5df10663547ab698e0aebc9e7d7620d3f2caea52f122a1abe8547"
+        "sha256:" "12217463eda5df10663547ab698e0aebc9e7d7620d3f2caea52f122a1abe8547"
     )
     assert RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION == "runner_input_roles.v1"
 
@@ -204,9 +412,7 @@ def test_iteration_started_runner_input_signal_fields_are_locked() -> None:
 def test_context_compaction_budget_state_accepts_unknown_and_snapshot() -> None:
     """上下文压缩预算字段同时支持未知与真实快照。"""
 
-    fields = {
-        f.name: f for f in dataclasses.fields(ContextCompactionRequestedData)
-    }
+    fields = {f.name: f for f in dataclasses.fields(ContextCompactionRequestedData)}
     assert fields["budget_state"].default is dataclasses.MISSING
     assert fields["budget_state"].default_factory is dataclasses.MISSING
 

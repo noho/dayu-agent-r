@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing.context
+import multiprocessing.queues
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -11,6 +14,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import TypeAlias, cast
 
 import pytest
@@ -219,6 +223,243 @@ class _FakeProcessCleanupHandle:
         """
 
         return self._alive
+
+
+class _LifecycleFakeProcess:
+    """覆盖 partial start/cleanup checkpoint 的 process fake。"""
+
+    def __init__(
+        self,
+        *,
+        start_failure: str | None = None,
+        fail_once: str | None = None,
+    ) -> None:
+        """初始化可控 process lifecycle。
+
+        :param start_failure: ``pre`` / ``post`` start failure；``None`` 表示成功。
+        :param fail_once: 首次抛 transient error 的 cleanup checkpoint。
+        :returns: ``None``。
+        """
+
+        self._start_failure = start_failure
+        self._fail_once = fail_once
+        self._exitcode: int | None = None
+        self.pid: int | None = None
+        self.alive = False
+        self.calls: dict[str, int] = {
+            "start": 0,
+            "kill": 0,
+            "join": 0,
+            "close": 0,
+        }
+        self.join_started: Event | None = None
+        self.join_release: Event | None = None
+        self.on_kill: Callable[[], None] | None = None
+        self.on_join: Callable[[], None] | None = None
+        self.on_close: Callable[[], None] | None = None
+
+    @property
+    def exitcode(self) -> int | None:
+        """返回 fake exitcode。
+
+        :returns: fake exitcode。
+        """
+
+        return self._exitcode
+
+    def start(self) -> None:
+        """执行可控 start。
+
+        :returns: ``None``。
+        :raises RuntimeError: 按 start failure 配置抛出。
+        """
+
+        self.calls["start"] += 1
+        if self._start_failure == "pre":
+            raise RuntimeError("pre-spawn start failure")
+        self.pid = _TEST_CHILD_PID
+        self.alive = True
+        if self._start_failure == "post":
+            raise RuntimeError("post-spawn start failure")
+
+    def terminate(self) -> None:
+        """按 kill 等价行为终止 fake process。
+
+        :returns: ``None``。
+        """
+
+        self.kill()
+
+    def kill(self) -> None:
+        """执行可控 kill checkpoint。
+
+        :returns: ``None``。
+        :raises RuntimeError: 配置 kill transient failure 时首次抛出。
+        """
+
+        self.calls["kill"] += 1
+        if self.on_kill is not None:
+            self.on_kill()
+        self._raise_once("kill")
+        self.alive = False
+        self._exitcode = -signal.SIGKILL
+
+    def join(self, timeout: float | None = None) -> None:
+        """执行可控有限 join checkpoint。
+
+        :param timeout: join timeout。
+        :returns: ``None``。
+        :raises RuntimeError: 配置 join transient failure 时首次抛出。
+        """
+
+        assert timeout is not None
+        self.calls["join"] += 1
+        if self.join_started is not None:
+            self.join_started.set()
+        if self.join_release is not None:
+            assert self.join_release.wait(2.0) is True
+        if self.on_join is not None:
+            self.on_join()
+        self._raise_once("join")
+
+    def is_alive(self) -> bool:
+        """返回 fake process 存活状态。
+
+        :returns: 当前存活状态。
+        """
+
+        return self.alive
+
+    def close(self) -> None:
+        """执行可控 process.close checkpoint。
+
+        :returns: ``None``。
+        :raises RuntimeError: 配置 close transient failure 时首次抛出。
+        """
+
+        self.calls["close"] += 1
+        if self.on_close is not None:
+            self.on_close()
+        self._raise_once("close")
+
+    def _raise_once(self, checkpoint: str) -> None:
+        """在指定 checkpoint 首次调用时抛 transient error。
+
+        :param checkpoint: cleanup checkpoint 名称。
+        :returns: ``None``。
+        :raises RuntimeError: 当前 checkpoint 配置为 fail-once 时抛出。
+        """
+
+        failure_call = 2 if checkpoint == "join" else 1
+        if (
+            self._fail_once == checkpoint
+            and self.calls[checkpoint] == failure_call
+        ):
+            raise RuntimeError(f"transient {checkpoint} failure")
+
+
+class _LifecycleFakeQueue:
+    """覆盖 queue close / feeder cleanup checkpoint 的 queue fake。"""
+
+    def __init__(self, *, fail_once: str | None = None) -> None:
+        """初始化可控 queue cleanup。
+
+        :param fail_once: 首次抛 transient error 的 queue checkpoint。
+        :returns: ``None``。
+        """
+
+        self._fail_once = fail_once
+        self.calls: dict[str, int] = {
+            "close": 0,
+            "cancel_join_thread": 0,
+            "join_thread": 0,
+        }
+        self.on_close: Callable[[], None] | None = None
+        self.on_join_thread: Callable[[], None] | None = None
+        self.join_started: Event | None = None
+        self.join_release: Event | None = None
+
+    def get_nowait(self) -> interruptible_process._ProcessMessage:
+        """模拟空 queue。
+
+        :returns: 不会返回。
+        :raises queue.Empty: 始终抛出。
+        """
+
+        raise queue.Empty
+
+    def close(self) -> None:
+        """执行可控 queue.close checkpoint。
+
+        :returns: ``None``。
+        :raises RuntimeError: 配置 close transient failure 时首次抛出。
+        """
+
+        self.calls["close"] += 1
+        if self.on_close is not None:
+            self.on_close()
+        self._raise_once("close")
+
+    def cancel_join_thread(self) -> None:
+        """执行可控 cancel-join checkpoint。
+
+        :returns: ``None``。
+        :raises RuntimeError: 配置 cancel-join failure 时首次抛出。
+        """
+
+        self.calls["cancel_join_thread"] += 1
+        self._raise_once("cancel_join_thread")
+
+    def join_thread(self) -> None:
+        """执行可控 feeder join checkpoint。
+
+        :returns: ``None``。
+        :raises RuntimeError: 配置 join failure 时首次抛出。
+        """
+
+        self.calls["join_thread"] += 1
+        if self.join_started is not None:
+            self.join_started.set()
+        if self.join_release is not None:
+            assert self.join_release.wait(2.0) is True
+        if self.on_join_thread is not None:
+            self.on_join_thread()
+        self._raise_once("join_thread")
+
+    def _raise_once(self, checkpoint: str) -> None:
+        """在指定 queue checkpoint 首次调用时抛 transient error。
+
+        :param checkpoint: queue cleanup checkpoint 名称。
+        :returns: ``None``。
+        :raises RuntimeError: 当前 checkpoint 配置为 fail-once 时抛出。
+        """
+
+        if self._fail_once == checkpoint and self.calls[checkpoint] == 1:
+            raise RuntimeError(f"transient queue {checkpoint} failure")
+
+
+def _handle_with_fake_resources(
+    process: _LifecycleFakeProcess,
+    result_queue: _LifecycleFakeQueue,
+) -> InterruptibleProcessHandle:
+    """构造并替换为可控 process / queue resource 的 handle。
+
+    :param process: fake process。
+    :param result_queue: fake result queue。
+    :returns: 使用 fake resources 的 handle。
+    """
+
+    handle = InterruptibleProcessHandle(_ReturnTarget({"ok": True}))
+    handle._process.close()
+    handle._result_queue.close()
+    handle._result_queue.cancel_join_thread()
+    handle._result_queue.join_thread()
+    handle._process = cast("multiprocessing.context.SpawnProcess", process)
+    handle._result_queue = cast(
+        "multiprocessing.queues.Queue[interruptible_process._ProcessMessage]",
+        result_queue,
+    )
+    return handle
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,3 +1183,244 @@ async def test_interruptible_process_rejects_invalid_grace_seconds(
             await handle.close(kill_grace_seconds=value)
     finally:
         await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (-0.1, float("nan"), float("inf"), float("-inf")),
+)
+async def test_interruptible_process_wait_rejects_invalid_timeout(
+    timeout_seconds: float,
+) -> None:
+    """process wait 必须在进入轮询前拒绝负数与非有限 timeout。
+
+    :param timeout_seconds: 非法 wait timeout。
+    :returns: ``None``。
+    :raises AssertionError: 非法 timeout 未被拒绝时抛出。
+    """
+
+    handle = InterruptibleProcessHandle(_ReturnTarget({"ok": True}))
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await handle.wait(timeout_seconds=timeout_seconds)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_failure", ("pre", "post"))
+async def test_start_failure_is_non_retryable_and_close_cleans_partial_resources(
+    start_failure: str,
+) -> None:
+    """pre/post-spawn start failure 都禁止同 handle 重试并允许完整 close。
+
+    :param start_failure: ``pre`` 或 ``post`` partial start 场景。
+    """
+
+    process = _LifecycleFakeProcess(start_failure=start_failure)
+    result_queue = _LifecycleFakeQueue()
+    handle = _handle_with_fake_resources(process, result_queue)
+
+    with pytest.raises(RuntimeError, match=f"{start_failure}-spawn"):
+        handle.start()
+    with pytest.raises(RuntimeError, match="already started"):
+        handle.start()
+
+    await handle.close(kill_grace_seconds=0.1)
+
+    expected_process_calls = (
+        {"start": 1, "kill": 0, "join": 0, "close": 1}
+        if start_failure == "pre"
+        else {"start": 1, "kill": 1, "join": 2, "close": 1}
+    )
+    assert process.calls == expected_process_calls
+    assert process.alive is False
+    assert result_queue.calls == {
+        "close": 1,
+        "cancel_join_thread": 1,
+        "join_thread": 1,
+    }
+    assert handle._cleanup_completed is True
+
+    replacement_process = _LifecycleFakeProcess()
+    replacement = _handle_with_fake_resources(
+        replacement_process,
+        _LifecycleFakeQueue(),
+    )
+    replacement.start()
+    await replacement.close(kill_grace_seconds=0.1)
+    assert replacement_process.calls["start"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checkpoint",
+    (
+        "kill",
+        "join",
+        "process_close",
+        "queue_close",
+        "cancel_join_thread",
+        "join_thread",
+    ),
+)
+async def test_cleanup_checkpoint_failure_is_retryable_without_repeating_success(
+    checkpoint: str,
+) -> None:
+    """任一 transient cleanup failure 后 queue 仍清理，第二次只补未完成步骤。
+
+    :param checkpoint: 注入首次异常的 cleanup checkpoint。
+    """
+
+    process_failure = (
+        "close" if checkpoint == "process_close" else checkpoint
+    )
+    queue_failure = (
+        checkpoint.removeprefix("queue_")
+        if checkpoint in {"queue_close", "cancel_join_thread", "join_thread"}
+        else None
+    )
+    process = _LifecycleFakeProcess(
+        fail_once=(
+            process_failure
+            if checkpoint in {"kill", "join", "process_close"}
+            else None
+        )
+    )
+    result_queue = _LifecycleFakeQueue(fail_once=queue_failure)
+    handle = _handle_with_fake_resources(process, result_queue)
+    handle.start()
+
+    with pytest.raises(RuntimeError, match="transient"):
+        await handle.close(kill_grace_seconds=0.1)
+
+    # process failure 不能跳过独立 queue cleanup；queue 自身失败时其它可执行
+    # feeder checkpoint 仍被尝试。
+    assert result_queue.calls["close"] == 1
+    assert result_queue.calls["cancel_join_thread"] >= 1
+    if checkpoint != "cancel_join_thread":
+        assert result_queue.calls["join_thread"] == 1
+    assert handle._cleanup_completed is False
+
+    await handle.close(kill_grace_seconds=0.1)
+
+    assert handle._cleanup_completed is True
+    assert process.alive is False
+    process_retry_counts = {
+        "kill": {"start": 1, "kill": 2, "join": 2, "close": 1},
+        "join": {"start": 1, "kill": 1, "join": 3, "close": 1},
+        "process_close": {"start": 1, "kill": 1, "join": 2, "close": 2},
+    }
+    queue_retry_counts = {
+        "queue_close": {
+            "close": 2,
+            "cancel_join_thread": 1,
+            "join_thread": 1,
+        },
+        "cancel_join_thread": {
+            "close": 1,
+            "cancel_join_thread": 2,
+            "join_thread": 1,
+        },
+        "join_thread": {
+            "close": 1,
+            "cancel_join_thread": 1,
+            "join_thread": 2,
+        },
+    }
+    assert process.calls == process_retry_counts.get(
+        checkpoint,
+        {"start": 1, "kill": 1, "join": 2, "close": 1},
+    )
+    assert result_queue.calls == queue_retry_counts.get(
+        checkpoint,
+        {"close": 1, "cancel_join_thread": 1, "join_thread": 1},
+    )
+
+    final_counts = (dict(process.calls), dict(result_queue.calls))
+    await handle.close(kill_grace_seconds=0.1)
+    assert (process.calls, result_queue.calls) == final_counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checkpoint",
+    ("kill", "join", "process_close", "queue_close", "join_thread"),
+)
+async def test_caller_cancellation_does_not_cancel_single_cleanup_task(
+    checkpoint: str,
+) -> None:
+    """caller 在各 cleanup checkpoint 取消时 private task 继续且只执行一次。
+
+    :param checkpoint: 触发 caller cancellation 的 checkpoint。
+    """
+
+    process = _LifecycleFakeProcess()
+    result_queue = _LifecycleFakeQueue()
+    handle = _handle_with_fake_resources(process, result_queue)
+    handle.start()
+    loop = asyncio.get_running_loop()
+    caller: asyncio.Task[None] | None = None
+
+    def cancel_caller() -> None:
+        """线程安全请求取消 public close caller。
+
+        :returns: ``None``。
+        """
+
+        assert caller is not None
+        loop.call_soon_threadsafe(caller.cancel)
+
+    if checkpoint == "kill":
+        process.on_kill = cancel_caller
+    elif checkpoint == "join":
+        process.on_join = cancel_caller
+    elif checkpoint == "process_close":
+        process.on_close = cancel_caller
+    elif checkpoint == "queue_close":
+        result_queue.on_close = cancel_caller
+    else:
+        result_queue.on_join_thread = cancel_caller
+
+    caller = asyncio.create_task(handle.close(kill_grace_seconds=0.1))
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    cleanup_task = handle._cleanup_task
+    assert cleanup_task is not None
+
+    await handle.close(kill_grace_seconds=0.1)
+
+    assert cleanup_task.done() is True
+    assert handle._cleanup_completed is True
+    assert process.calls == {"start": 1, "kill": 1, "join": 2, "close": 1}
+    assert result_queue.calls == {
+        "close": 1,
+        "cancel_join_thread": 1,
+        "join_thread": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_callers_share_cleanup_and_failure() -> None:
+    """并发 close 只执行一套 cleanup，并观察同一个 transient failure。"""
+
+    process = _LifecycleFakeProcess(fail_once="join")
+    process.join_started = Event()
+    process.join_release = Event()
+    handle = _handle_with_fake_resources(process, _LifecycleFakeQueue())
+    handle.start()
+
+    first = asyncio.create_task(handle.close(kill_grace_seconds=0.1))
+    assert await asyncio.to_thread(process.join_started.wait, 2.0) is True
+    second = asyncio.create_task(handle.close(kill_grace_seconds=0.1))
+    process.join_release.set()
+    outcomes = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert isinstance(outcomes[0], RuntimeError)
+    assert outcomes[0] is outcomes[1]
+    assert process.calls["kill"] == 1
+    assert process.calls["join"] == 2
+    assert handle._cleanup_completed is False
+
+    await handle.close(kill_grace_seconds=0.1)
+    assert process.calls["kill"] == 1
+    assert process.calls["join"] == 3
+    assert handle._cleanup_completed is True

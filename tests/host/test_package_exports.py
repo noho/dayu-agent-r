@@ -29,6 +29,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HOST_EVENT_STREAM_MAX_LIMIT",
         "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
         "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
+        "TERMINAL_RUN_STATUSES",
         "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
         "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
         "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -42,6 +43,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostApiErrorCode",
         "HostApiErrorDetail",
         "Host",
+        "HostAdmin",
         "HostActivityCounts",
         "HostActivityKind",
         "HostActivitySeverity",
@@ -57,11 +59,14 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostPayloadRef",
         "HostStreamCursor",
         "HostTerminalStatus",
+        "HostThinkingView",
+        "HostUnavailableDetail",
         "ListSessionsResult",
         "LocalEngineWorker",
         "LocalEngineWorkerFactory",
         "LocalWorkerHandle",
         "OpenHostOptions",
+        "OpenHostAdminOptions",
         "OperationContext",
         "OrdinaryRunExecutionBaseline",
         "OutboxProjectionStatus",
@@ -95,6 +100,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "WaitAdapterKey",
         "WaitProviderStatusRef",
         "WaitResolutionSource",
+        "is_terminal_run_status",
     }
 )
 
@@ -119,6 +125,7 @@ EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
         "get_session",
         "list_sessions",
         "open_host",
+        "open_host_admin",
         "purge_session",
         "replay_run",
         "report_storage_usage",
@@ -408,14 +415,10 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
             "ensure_session",
             "get_run",
             "get_session",
-            "list_sessions",
-            "purge_session",
             "read_outbox_terminal_items",
-            "report_storage_usage",
             "replay_run",
             "resolve_wait",
             "retry_run",
-            "run_storage_maintenance",
             "submit_followup",
         }
     )
@@ -427,6 +430,34 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
 
     assert actual_async_methods == expected_async_methods
     assert callable(getattr(api.Host, "watch_session_events", None))
+
+
+def test_host_admin_protocol_is_independent_capability_boundary() -> None:
+    """HostAdmin 与 execution Host 必须是无继承关系的独立协议。"""
+
+    admin_methods = frozenset(
+        {
+            "close",
+            "get_session",
+            "list_sessions",
+            "purge_session",
+            "report_storage_usage",
+            "run_storage_maintenance",
+        }
+    )
+    assert all(
+        inspect.iscoroutinefunction(getattr(api.HostAdmin, name, None))
+        for name in admin_methods
+    )
+    assert inspect.getsource(api.Host).startswith("class Host(Protocol):")
+    assert inspect.getsource(api.HostAdmin).startswith("class HostAdmin(Protocol):")
+    assert not hasattr(api.Host, "list_sessions")
+    assert not hasattr(api.Host, "purge_session")
+    assert not hasattr(api.Host, "report_storage_usage")
+    assert not hasattr(api.Host, "run_storage_maintenance")
+    assert not hasattr(api.HostAdmin, "submit_followup")
+    assert not hasattr(api.HostAdmin, "cancel_run")
+    assert not hasattr(api.HostAdmin, "watch_session_events")
 
 
 def test_read_api_all_keeps_service_facing_read_boundary() -> None:

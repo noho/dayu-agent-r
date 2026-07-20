@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.document_models import FilingUpdateRequest, now_iso8601
+from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateRequest, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
     CN_PIPELINE_DOWNLOAD_VERSION,
@@ -30,7 +30,6 @@ from dayu.fins.pipelines.cn_form_utils import (
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
-_INGEST_METHOD_DOWNLOAD = "download"
 _DOCLING_SUFFIX = "_docling.json"
 _PDF_SUFFIX = ".pdf"
 
@@ -132,7 +131,7 @@ def _should_rebuild_meta(
 ) -> bool:
     """判断 source meta 是否属于本次 CN/HK rebuild 范围。"""
 
-    if str(meta.get("ingest_method") or "").strip().lower() != _INGEST_METHOD_DOWNLOAD:
+    if FinsIngestMethod.from_storage_value(str(meta["ingest_method"])) is not FinsIngestMethod.DOWNLOAD:
         return False
     if bool(meta.get("is_deleted", False)):
         return False
@@ -201,12 +200,18 @@ def _rebuild_single_cn_download_document(
             reason_message="重建失败：CN/HK 下载完成态缺少 primary_document",
         )
     source_fingerprint = _resolve_source_fingerprint(previous_meta=previous_meta, file_entries=file_entries)
+    try:
+        host.processed_repository.get_processed_meta(ticker, document_id)
+    except FileNotFoundError:
+        has_processed_document = False
+    else:
+        has_processed_document = True
     meta_payload = dict(previous_meta)
     file_values: list[JsonValue] = [item for item in file_entries]
     update_payload: JsonObject = {
         "document_id": document_id,
         "internal_document_id": internal_document_id,
-        "ingest_method": _INGEST_METHOD_DOWNLOAD,
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "form_type": form_type,
         "primary_document": primary_document,
@@ -214,29 +219,35 @@ def _rebuild_single_cn_download_document(
         "ingest_complete": True,
         "download_version": CN_PIPELINE_DOWNLOAD_VERSION,
         "source_fingerprint": source_fingerprint,
-        "staging_remote_fingerprint": None,
-        "staging_pdf_sha256": None,
         "updated_at": now_iso8601(),
     }
     meta_payload.update(update_payload)
-    host.source_repository.update_source_document(
-        FilingUpdateRequest(
-            ticker=ticker,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=form_type,
-            primary_document=primary_document,
-            file_entries=file_entries,
-            meta=meta_payload,
-        ),
-        source_kind=SourceKind.FILING,
-    )
-    host.source_repository.replace_source_meta(
-        ticker=ticker,
-        document_id=document_id,
-        source_kind=SourceKind.FILING,
-        meta=meta_payload,
-    )
+    batch = host.batching_repository.begin_batch(ticker)
+    try:
+        host.source_repository.update_source_document(
+            FilingUpdateRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                primary_document=primary_document,
+                file_entries=file_entries,
+                meta=meta_payload,
+            ),
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
+        if has_processed_document:
+            host.processed_repository.mark_processed_reprocess_required(
+                ticker,
+                document_id,
+                True,
+                batch=batch,
+            )
+    except BaseException:
+        host.batching_repository.rollback_batch(batch)
+        raise
+    host.batching_repository.commit_batch(batch)
     return {
         "document_id": document_id,
         "internal_document_id": internal_document_id,

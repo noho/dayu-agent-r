@@ -15,8 +15,8 @@
   Docling JSON bytes 转换函数。
 - ``Protocol`` 用 ``runtime_checkable`` 修饰仅在确实有运行期 ``isinstance``
   检查时才使用；本模块仅做静态契约，不开 runtime check。
-- 不在协议内塞入"取消检查"/"日志模块名"等横切关注；横切由 workflow 层显式
-  接收 ``cancel_checker`` 参数管理。
+- raw ``cancel_checker`` 只由 workflow 解释；协议仅为 discovery 运输
+  workflow 已收敛的无参、无返回值 cancellation checkpoint。
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
@@ -83,6 +84,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """列出符合 ``target_periods`` 与窗口约束的候选报告。
 
@@ -93,6 +96,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
         Args:
             query: 单次 download 的查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
+                provider 只在真实 discovery I/O 边界调用并原样传播异常。
 
         Returns:
             候选报告 tuple；候选已经按 fiscal_period 收敛、amended 优先。
@@ -108,8 +113,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
         """下载单份候选 PDF 并返回强类型资产对象。
 
         实现层负责 ``%PDF-`` magic bytes 校验、最小长度校验、Content-Type
-        校验、必要的 retry / sleep。返回值 ``pdf_path`` 指向本地暂存路径，
-        workflow 层取字节后会自行 ``unlink``。
+        校验、必要的 retry / sleep。返回值直接携带已校验的 ``pdf_bytes``，
+        downloader 不创建临时文件。
 
         Args:
             candidate: 单份候选远端元数据。
@@ -139,6 +144,12 @@ class CnDownloadWorkflowHost(Protocol):
     其它横切（取消、日志）由 workflow 层显式接收 ``cancel_checker`` 等参数
     管理，不放进 host。
     """
+
+    @property
+    def batching_repository(self) -> BatchingRepositoryProtocol:
+        """batch lifecycle 唯一仓储。"""
+
+        ...
 
     @property
     def company_meta_repository(self) -> CompanyMetaRepositoryProtocol:

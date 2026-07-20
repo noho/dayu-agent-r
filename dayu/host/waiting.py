@@ -13,12 +13,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitSpec
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.contracts.tool_result import ToolResultFailure
 from dayu.host._event_payload import (
     attempt_suspended_payload,
-    llm_safe_replay_arguments,
     payload_object,
     required_payload_text,
     resume_requested_payload,
@@ -31,18 +33,19 @@ from dayu.host.api import (
     AttemptStatus,
     HostApiError,
     HostApiErrorCode,
+    HostCallContext,
     HostPayloadRef,
+    OperationContext,
     ResolveWaitCancelledOutcome,
     ResolveWaitCompletedOutcome,
     ResolveWaitFailedOutcome,
     ResolveWaitLostOutcome,
-    ResolveWaitOutcome,
     ResolveWaitRequest,
     RunStatus,
+    WaitResolutionSource,
     WaitProviderStatusRef,
 )
 from dayu.host.durable.codec import (
-    canonical_json_dumps,
     format_utc_timestamp,
     is_sha256_digest,
     sha256_digest_json,
@@ -57,15 +60,14 @@ from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictEr
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
-)
-from dayu.host.durable.schema import (
-    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
-    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.run_transition import (
     ResumeRunFromWaitingInput,
+    WaitResolutionTransitionResult,
     WaitingRunTerminalInput,
     fail_run_from_waiting_in_transaction,
     mark_run_lost_from_waiting_in_transaction,
@@ -88,7 +90,6 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
     read_wait_record_by_id,
-    run_snapshot_from_row,
     WorkerKind,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -99,15 +100,16 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
     derive_accepted_evidence_id,
 )
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_json,
+)
 from dayu.host.durable.wait_resolution_digest import (
     WAIT_RESOLUTION_OUTCOME_KIND_CANCELLED as _TOOL_FACT_KIND_CANCELLED,
     WAIT_RESOLUTION_OUTCOME_KIND_COMPLETED as _TOOL_FACT_KIND_COMPLETED,
     WAIT_RESOLUTION_OUTCOME_KIND_FAILED as _TOOL_FACT_KIND_FAILED,
     WAIT_RESOLUTION_OUTCOME_KIND_LOST as _TOOL_FACT_KIND_LOST,
     resolve_wait_outcome_json,
-    resolve_wait_cancelled_result_json as _tool_cancelled_json,
-    resolve_wait_completed_result_json as _tool_success_json,
-    resolve_wait_failed_result_json as _tool_failure_json,
     resolve_wait_lost_result_json as _tool_lost_json,
     wait_resolution_digest,
 )
@@ -115,20 +117,34 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
-from dayu.host.wait_adapter import WaitAdapterBinding
+from dayu.host.payload_resolution import ToolCallRequestAtoms, tool_call_request_atoms
+from dayu.host.tool_call_request import (
+    AcceptedToolCallRequestAtomInput,
+    ToolCallRequestEventOrigin,
+    build_tool_call_requested_event_request,
+)
+from dayu.host.wait_boundary import (
+    WaitBoundaryDecisionKind,
+    classify_wait_time_boundary,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
+if TYPE_CHECKING:
+    from dayu.host.wait_adapter import WaitAdapterBinding
+
 _LOGGER = logging.getLogger(__name__)
-_TOOL_AWAITING_ACCEPT_SCOPE_KIND = "tool_awaiting_accept"
-_TOOL_AWAITING_ACCEPT_RESULT_KIND = "tool_awaiting_accept_ack"
+_TOOL_AWAITING_ACCEPT_SCOPE_KIND = IdempotencyScopeKind.TOOL_AWAITING_ACCEPT
+_TOOL_AWAITING_ACCEPT_RESULT_KIND = IdempotencyResultKind.TOOL_AWAITING_ACCEPT_ACK
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
-_WAIT_RESOLUTION_SCOPE_KIND = "wait_resolution"
-_WAIT_RESOLUTION_RESULT_KIND = "wait_resolution"
-_WAIT_LATE_REJECTION_SCOPE_KIND = "wait_late_rejection"
-_WAIT_LATE_REJECTION_RESULT_KIND = "wait_late_rejection_diagnostic"
+_WAIT_RESOLUTION_SCOPE_KIND = IdempotencyScopeKind.WAIT_RESOLUTION
+_WAIT_RESOLUTION_RESULT_KIND = IdempotencyResultKind.WAIT_RESOLUTION
+_WAIT_LATE_REJECTION_SCOPE_KIND = IdempotencyScopeKind.WAIT_LATE_REJECTION
+_WAIT_LATE_REJECTION_RESULT_KIND = (
+    IdempotencyResultKind.WAIT_LATE_REJECTION_DIAGNOSTIC
+)
 _AWAITING_ACCEPT_ACTOR = "host.tool_runtime"
 _AWAITING_ACCEPT_SOURCE = "host.tool_runtime.awaiting_accept"
 _EVENT_ID_TOOL_CALL_REQUESTED_PREFIX = "event-tool-call-requested-awaiting-"
@@ -149,6 +165,10 @@ _TOOL_FACT_ID_PREFIX = "tool-fact-wait-"
 _WAIT_RESOLUTION_SOURCE = "host.resolve_wait"
 _WAIT_TERMINAL_REASON_FAILED = "wait_result_failed"
 _WAIT_TERMINAL_REASON_LOST = "wait_result_lost"
+_WAIT_EXPIRY_REASON = "wait_deadline_expired"
+_WAIT_EXPIRY_MESSAGE = "等待任务已超过 Host 期限，结果未被接受。"
+_WAIT_EXPIRY_SOURCE = "host.wait_expiry"
+_WAIT_EXPIRY_KEY_PREFIX = "wait-expiry-"
 _EVENT_TYPE_WAIT_LATE_RESULT_REJECTED = "WAIT_LATE_RESULT_REJECTED"
 
 
@@ -169,6 +189,7 @@ class WaitLateRejectionReason(StrEnum):
     """晚到 wait result 拒绝原因。"""
 
     WAIT_CANCELLED = "wait_cancelled"
+    WAIT_EXPIRED = "wait_expired"
     WAIT_LOST = "wait_lost"
     WAIT_ALREADY_RESOLVED = "wait_already_resolved"
     WAIT_ALREADY_FAILED = "wait_already_failed"
@@ -274,7 +295,7 @@ class ToolAwaitingAcceptCandidate:
                 raise ValueError(f"{field_name} must be sha256 digest")
         if self.binding.resume_policy is WaitResumePolicy.POLL:
             if self.external_job_ref is None:
-                raise ValueError("poll awaiting candidate requires external_job_ref")
+                raise ValueError("background task candidate requires external_job_ref")
         if (
             self.external_job_ref is not None
             and self.external_job_ref.adapter_key != self.binding.adapter_key
@@ -350,10 +371,62 @@ class ResolveWaitResult:
     :param run: resolve 后最新 Run row。
     :param dispatch_record: 新建 resume dispatch record；无则为 ``None``。
     :param idempotent_replay: 本次是否为幂等重放。
+    :param queue_promotion_session_id: terminal wait 释放 active slot 后需唤醒
+        queue promotion 的 Session id；无需唤醒时为 ``None``。
     """
 
     run: RunRow
     dispatch_record: DispatchRecordRow | None
+    idempotent_replay: bool
+    queue_promotion_session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExpireWaitInput:
+    """Host-internal wait expiry transaction 输入。
+
+    :param wait_id: 目标 wait record id。
+    :param observed_at: Host 确认 deadline 的 UTC aware 时间。
+    :param actor: canonical terminal fact actor。
+    :param source: 触发 expiry 检查的 typed 来源；不参与幂等 identity。
+    """
+
+    wait_id: str
+    observed_at: datetime
+    actor: str
+    source: WaitResolutionSource
+
+    def __post_init__(self) -> None:
+        """校验 expiry 输入。
+
+        :returns: ``None``。
+        :raises ValueError: 文本为空或 observed time 非 UTC aware 时抛出。
+        :raises TypeError: source 类型非法时抛出。
+        """
+
+        if self.wait_id.strip() == "":
+            raise ValueError("wait_id must be non-empty")
+        if self.actor.strip() == "":
+            raise ValueError("actor must be non-empty")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware")
+        if self.observed_at.utcoffset() != UTC.utcoffset(self.observed_at):
+            raise ValueError("observed_at must be UTC")
+        if not isinstance(self.source, WaitResolutionSource):
+            raise TypeError("source must be WaitResolutionSource")
+
+
+@dataclass(frozen=True, slots=True)
+class ExpireWaitResult:
+    """wait expiry owner 的 transaction 结果。
+
+    :param transition: waiting terminal transition 或 CAS no-op snapshot。
+    :param queue_promotion_session_id: 本次实际释放 slot 后的 Session id。
+    :param idempotent_replay: expiry terminal 已由同一稳定 identity 提交。
+    """
+
+    transition: WaitResolutionTransitionResult
+    queue_promotion_session_id: str | None
     idempotent_replay: bool
 
 
@@ -362,9 +435,26 @@ class _LateRejectResult:
     """late wait result 已完成 durable diagnostic 后的内部拒绝结果。
 
     :param message: 对外错误消息。
+    :param queue_promotion_session_id: expiry 在同一 transaction 释放 slot 后需
+        commit 后唤醒的 Session id。
     """
 
     message: str
+    queue_promotion_session_id: str | None = None
+
+
+class QueuePromotionWakeupPort(Protocol):
+    """wait terminal commit 后唤醒 Session queue promotion 的最小端口。"""
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """唤醒指定 Session 的 pre-start governance。
+
+        :param session_id: 已释放 active slot 的 Session id。
+        :returns: ``None``。
+        :raises Exception: wake bridge 失败时由调用方传播。
+        """
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +485,18 @@ class _WaitResolutionPayloadPlan:
     payload_ref: HostPayloadRef | None
     provider_status_ref: WaitProviderStatusRef | None
     result_json: JsonValue
+
+
+@dataclass(frozen=True, slots=True)
+class _WaitToolCallRequest:
+    """wait 显式链接的 canonical request row 与 strict atoms。
+
+    :param row: ``TOOL_CALL_REQUESTED`` durable row。
+    :param atoms: 已通过 storage、shape 与 digest 校验的 request atoms。
+    """
+
+    row: EventLogRow
+    atoms: ToolCallRequestAtoms
 
 
 class HostToolAwaitingAcceptPort(ABC):
@@ -527,13 +629,22 @@ class DefaultHostToolAwaitingAcceptPort(HostToolAwaitingAcceptPort):
         occurred_at = datetime.now(UTC)
         tool_call_requested = self._event_log_store.append_event(
             transaction,
-            _tool_call_requested_event_request(
-                candidate, plan.tool_call_requested_id, occurred_at
+            build_tool_call_requested_event_request(
+                transaction,
+                atom=_tool_call_request_atom(candidate),
+                event_id=plan.tool_call_requested_id,
+                occurred_at=occurred_at,
+                origin=ToolCallRequestEventOrigin.AWAITING_ACCEPT,
             ),
         ).row
         tool_awaiting = self._event_log_store.append_event(
             transaction,
-            _tool_awaiting_event_request(candidate, plan.tool_awaiting_id, occurred_at),
+            _tool_awaiting_event_request(
+                candidate,
+                plan.tool_awaiting_id,
+                occurred_at,
+                tool_call_requested,
+            ),
         ).row
         run_waiting = self._event_log_store.append_event(
             transaction,
@@ -611,6 +722,7 @@ class DefaultHostResolveWaitService:
         event_log_store: EventLogStore | None = None,
         idempotency_store: IdempotencyStore | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        queue_promotion_wakeup_port: QueuePromotionWakeupPort | None = None,
     ) -> None:
         """初始化默认 resolve wait service。
 
@@ -618,6 +730,8 @@ class DefaultHostResolveWaitService:
         :param event_log_store: EventLog primitive；无则创建默认实现。
         :param idempotency_store: Idempotency primitive；无则创建默认实现。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+        :param queue_promotion_wakeup_port: terminal wait 释放 active slot 后的
+            queue promotion wake 端口；纯 transaction owner 测试可不提供。
         :returns: ``None``。
         """
 
@@ -631,6 +745,7 @@ class DefaultHostResolveWaitService:
             else IdempotencyStore()
         )
         self._projection_catchup_port = projection_catchup_port
+        self._queue_promotion_wakeup_port = queue_promotion_wakeup_port
 
     def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> ResolveWaitResult:
         """接收等待结果并推进 Run。
@@ -658,13 +773,16 @@ class DefaultHostResolveWaitService:
                     transaction, wait_id, request
                 )
             )
+            catch_up_projection_best_effort(self._projection_catchup_port)
+            self._wake_queue_promotion_after_commit(
+                result.queue_promotion_session_id
+            )
             if isinstance(result, _LateRejectResult):
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,
                     message=result.message,
                     retryable=False,
                 )
-            catch_up_projection_best_effort(self._projection_catchup_port)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
                 (
@@ -688,6 +806,39 @@ class DefaultHostResolveWaitService:
                 message="resolve wait idempotency conflict",
                 retryable=False,
             ) from exc
+
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """按 durable deadline 收口 wait 并执行 commit 后 projection/promotion。
+
+        :param request: expiry owner 输入。
+        :returns: expiry transition 结果。
+        :raises HostApiError: wait 缺失、边界非法或仍未到期时抛出。
+        :raises HostDurableError: durable transaction 失败时透传。
+        """
+
+        result = self._transaction_runner.run_write(
+            lambda transaction: _expire_wait_in_transaction(
+                transaction,
+                request,
+            )
+        )
+        catch_up_projection_best_effort(self._projection_catchup_port)
+        self._wake_queue_promotion_after_commit(
+            result.queue_promotion_session_id
+        )
+        return result
+
+    def _wake_queue_promotion_after_commit(self, session_id: str | None) -> None:
+        """在 transaction commit 与 projection catch-up 后执行 promotion wake。
+
+        :param session_id: 需唤醒的 Session id；无则为 ``None``。
+        :returns: ``None``。
+        :raises Exception: wake bridge 失败时透传，避免静默丢失 committed work。
+        """
+
+        if session_id is None or self._queue_promotion_wakeup_port is None:
+            return
+        self._queue_promotion_wakeup_port.wake_queue_promotion(session_id)
 
     def _resolve_in_transaction(
         self,
@@ -736,6 +887,19 @@ class DefaultHostResolveWaitService:
                 WaitRecordStatus.RESOLVED,
                 WaitRecordStatus.FAILED,
             ):
+                if (
+                    wait_record.status is WaitRecordStatus.FAILED
+                    and wait_record.resolve_idempotency_key is not None
+                    and wait_record.resolve_idempotency_key.startswith(
+                        _WAIT_EXPIRY_KEY_PREFIX
+                    )
+                ):
+                    return self._reject_late_result(
+                        transaction=transaction,
+                        wait_record=wait_record,
+                        request=request,
+                        rejection_reason=WaitLateRejectionReason.WAIT_EXPIRED,
+                    )
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,
                     message="wait record is already resolved by another key",
@@ -760,6 +924,47 @@ class DefaultHostResolveWaitService:
                 wait_record=wait_record,
                 request=request,
                 rejection_reason=WaitLateRejectionReason.INVALID_WAIT_STATE,
+            )
+        boundary_decision = classify_wait_time_boundary(
+            wait_record, observed_at=request.observed_at
+        )
+        if boundary_decision.kind is WaitBoundaryDecisionKind.INVALID:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record contains invalid time boundary",
+                retryable=False,
+            )
+        if boundary_decision.kind is WaitBoundaryDecisionKind.EXPIRED:
+            expiry = _expire_wait_in_transaction(
+                transaction,
+                ExpireWaitInput(
+                    wait_id=wait_id,
+                    observed_at=request.observed_at,
+                    actor=request.context.actor,
+                    source=request.source,
+                ),
+            )
+            expired_wait = expiry.transition.wait_record
+            if expired_wait is None:
+                latest_wait = read_wait_record_by_id(transaction, wait_id)
+                if latest_wait is None:
+                    raise HostApiError(
+                        code=HostApiErrorCode.NOT_FOUND,
+                        message="wait record not found after expiry",
+                        retryable=False,
+                    )
+                expired_wait = latest_wait
+            late_result = self._reject_late_result(
+                transaction=transaction,
+                wait_record=expired_wait,
+                request=request,
+                rejection_reason=WaitLateRejectionReason.WAIT_EXPIRED,
+            )
+            return _LateRejectResult(
+                message=late_result.message,
+                queue_promotion_session_id=(
+                    expiry.queue_promotion_session_id
+                ),
             )
         if owner_run.status in (
             RunStatus.SUCCEEDED,
@@ -976,6 +1181,7 @@ class DefaultHostResolveWaitService:
                 ),
                 tool_result_payload=_tool_result_resolution_payload(
                     transaction=transaction,
+                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1045,6 +1251,7 @@ class DefaultHostResolveWaitService:
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
                     transaction=transaction,
+                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1066,6 +1273,7 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=None,
             idempotent_replay=False,
+            queue_promotion_session_id=transition.run.session_id,
         )
 
     def _resolve_lost(
@@ -1112,6 +1320,7 @@ class DefaultHostResolveWaitService:
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
                     transaction=transaction,
+                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1133,8 +1342,233 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=None,
             idempotent_replay=False,
+            queue_promotion_session_id=transition.run.session_id,
         )
 
+
+def _expire_wait_in_transaction(
+    transaction: HostTransaction,
+    input: ExpireWaitInput,
+) -> ExpireWaitResult:
+    """在调用方提供的 transaction 内按 durable deadline 收口 wait。
+
+    本 helper 不打开 transaction、不调用 public resolver。expiry identity 只由
+    wait id、实际 durable boundary 与固定 reason 派生；actor/source 只进入首个
+    获胜 terminal fact 的审计字段。
+
+    :param transaction: 调用方已打开的 Host write transaction。
+    :param input: expiry owner 输入。
+    :returns: updated、idempotent replay 或 CAS no-op typed 结果。
+    :raises HostApiError: wait 缺失、边界非法或尚未到期时抛出。
+    :raises HostDurableError: terminal transition 或幂等记录失败时透传。
+    """
+
+    wait_record = read_wait_record_by_id(transaction, input.wait_id)
+    if wait_record is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="wait record not found",
+            retryable=False,
+        )
+    owner_run = read_run_by_id(transaction, wait_record.run_id)
+    if owner_run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="wait owner run not found",
+            retryable=False,
+        )
+    if wait_record.status is not WaitRecordStatus.WAITING:
+        expiry_replay = (
+            wait_record.resolve_idempotency_key is not None
+            and wait_record.resolve_idempotency_key.startswith(
+                _WAIT_EXPIRY_KEY_PREFIX
+            )
+        )
+        return ExpireWaitResult(
+            transition=_expiry_noop_transition(
+                wait_record=wait_record,
+                run=owner_run,
+            ),
+            queue_promotion_session_id=None,
+            idempotent_replay=expiry_replay,
+        )
+    decision = classify_wait_time_boundary(wait_record, observed_at=input.observed_at)
+    if decision.kind is WaitBoundaryDecisionKind.INVALID:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="wait record contains invalid time boundary",
+            retryable=False,
+        )
+    if decision.kind is WaitBoundaryDecisionKind.ACTIVE:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="wait deadline has not expired",
+            retryable=False,
+        )
+    boundary_value = (
+        wait_record.deadline_at
+        if decision.boundary_field == "deadline_at"
+        else wait_record.expires_at
+    )
+    if boundary_value is None:
+        raise HostDurableError("expired wait boundary value is missing")
+    expiry_digest = sha256_digest_json(
+        {
+            "wait_id": wait_record.wait_id,
+            "boundary_field": decision.boundary_field,
+            "boundary_value": boundary_value,
+            "reason": _WAIT_EXPIRY_REASON,
+        }
+    )
+    suffix = expiry_digest.removeprefix("sha256:")
+    expiry_key = f"{_WAIT_EXPIRY_KEY_PREFIX}{suffix}"
+    scope = _wait_resolution_scope(wait_record.wait_id, expiry_key)
+    idempotency_store = IdempotencyStore()
+    existing = idempotency_store.read_idempotency_record(transaction, scope)
+    if existing is not None:
+        if existing.semantic_input_digest != expiry_digest:
+            raise HostIdempotencyConflictError(
+                "wait expiry stable idempotency digest conflict"
+            )
+        return ExpireWaitResult(
+            transition=_expiry_noop_transition(
+                wait_record=wait_record,
+                run=owner_run,
+            ),
+            queue_promotion_session_id=None,
+            idempotent_replay=True,
+        )
+    request = ResolveWaitRequest(
+        context=HostCallContext(
+            actor=input.actor,
+            source=_WAIT_EXPIRY_SOURCE,
+            request_id=f"wait-expiry-{suffix}",
+            authorization_claims=(),
+            operation_context=OperationContext(
+                operation_name="expire_wait",
+                operation_kind="background",
+                business_domain="host_wait",
+                business_object_type="wait",
+                business_object_id=wait_record.wait_id,
+                scenario=None,
+                correlation_id=None,
+            ),
+        ),
+        idempotency_key=expiry_key,
+        outcome=ResolveWaitFailedOutcome(
+            result=ToolResultFailure(
+                ok=False,
+                error=_WAIT_EXPIRY_REASON,
+                message=_WAIT_EXPIRY_MESSAGE,
+                hint=None,
+                meta=None,
+            ),
+            payload_ref=None,
+        ),
+        source=input.source,
+        observed_at=input.observed_at,
+    )
+    payload_plan = _wait_resolution_payload_plan(request)
+    event_plan = _resolve_wait_event_plan(expiry_digest)
+    event_log_store = EventLogStore()
+    transition = fail_run_from_waiting_in_transaction(
+        transaction,
+        event_log_store,
+        WaitingRunTerminalInput(
+            wait_id=wait_record.wait_id,
+            run_id=wait_record.run_id,
+            suspended_attempt_id=wait_record.attempt_id,
+            tool_result_event_id=event_plan.tool_result_event_id,
+            run_terminal_event_id=event_plan.run_failed_event_id,
+            run_terminal_status=RunStatus.FAILED,
+            wait_terminal_status=WaitRecordStatus.FAILED,
+            occurred_at=input.observed_at,
+            actor=input.actor,
+            source=_WAIT_EXPIRY_SOURCE,
+            reason=_WAIT_EXPIRY_REASON,
+            message=_WAIT_EXPIRY_MESSAGE,
+            resolution_idempotency_key=expiry_key,
+            resolution_digest=expiry_digest,
+            tool_result_payload=_tool_result_resolution_payload(
+                transaction=transaction,
+                event_log_store=event_log_store,
+                wait_record=wait_record,
+                request=request,
+                payload_plan=payload_plan,
+                event_plan=event_plan,
+                wait_status_after=WaitRecordStatus.FAILED,
+                resume=False,
+            ),
+            tool_result_payload_ref=None,
+            tool_result_payload_digest=None,
+        ),
+    )
+    if transition.status is not StateMutationStatus.UPDATED:
+        return ExpireWaitResult(
+            transition=transition,
+            queue_promotion_session_id=None,
+            idempotent_replay=False,
+        )
+    created_event_id, created_event_sequence = _transition_created_event_ref(
+        transition
+    )
+    idempotency_store.record_idempotent_result(
+        transaction,
+        scope,
+        expiry_digest,
+        IdempotencyResultRef(
+            result_kind=_WAIT_RESOLUTION_RESULT_KIND,
+            result_ref=wait_record.wait_id,
+            created_event_id=created_event_id,
+            created_event_sequence=created_event_sequence,
+        ),
+    )
+    return ExpireWaitResult(
+        transition=transition,
+        queue_promotion_session_id=owner_run.session_id,
+        idempotent_replay=False,
+    )
+
+
+def _expiry_noop_transition(
+    *,
+    wait_record: WaitRecordRow,
+    run: RunRow,
+) -> WaitResolutionTransitionResult:
+    """构造 first-committer loser 的 typed durable snapshot。
+
+    :param wait_record: 当前 wait truth。
+    :param run: 当前 owner Run truth。
+    :returns: 不含新 event/dispatch 的 CAS_LOST transition。
+    """
+
+    return WaitResolutionTransitionResult(
+        status=StateMutationStatus.CAS_LOST,
+        run=run,
+        attempt=None,
+        dispatch_record=None,
+        wait_record=wait_record,
+        resume_requested_event=None,
+        tool_result_event=None,
+        run_event=None,
+        attempt_started_event=None,
+    )
+
+
+def _transition_created_event_ref(
+    transition: WaitResolutionTransitionResult,
+) -> tuple[str, int]:
+    """读取 expiry transition 的稳定 created event ref。
+
+    :param transition: 已成功 terminal 的 wait transition。
+    :returns: tool result event id 与 sequence。
+    :raises HostDurableError: transition 缺失 created event 时抛出。
+    """
+
+    event = transition.tool_result_event
+    if event is None:
+        raise HostDurableError("wait expiry transition has no tool result event")
+    return event.event_id, event.event_sequence
 
 @dataclass(frozen=True, slots=True)
 class _AwaitingEventPlan:
@@ -1290,53 +1724,43 @@ def _wait_resolution_payload_plan(
 
     outcome = request.outcome
     if isinstance(outcome, ResolveWaitCompletedOutcome):
-        result_json = _tool_success_json(outcome.result)
+        tool_outcome = ToolCompletedOutcome(outcome.result)
+        result_json = accepted_tool_outcome_json(tool_outcome)
         return _WaitResolutionPayloadPlan(
             resolution_kind=_TOOL_FACT_KIND_COMPLETED,
             tool_fact_kind=_TOOL_FACT_KIND_COMPLETED,
-            outcome_digest=sha256_digest_json(
-                {"kind": _TOOL_FACT_KIND_COMPLETED, "result": result_json}
-            ),
+            outcome_digest=accepted_tool_outcome_digest(tool_outcome),
             payload_digest=_completed_payload_digest(outcome),
             payload_ref=outcome.payload_ref,
             provider_status_ref=None,
-            result_json={
-                "kind": _TOOL_FACT_KIND_COMPLETED,
-                "result": result_json,
-            },
+            result_json=result_json,
         )
     if isinstance(outcome, ResolveWaitFailedOutcome):
-        result_json = _tool_failure_json(outcome.result)
+        tool_outcome = ToolFailedOutcome(outcome.result)
+        result_json = accepted_tool_outcome_json(tool_outcome)
         return _WaitResolutionPayloadPlan(
             resolution_kind=_TOOL_FACT_KIND_FAILED,
             tool_fact_kind=_TOOL_FACT_KIND_FAILED,
-            outcome_digest=sha256_digest_json(
-                {"kind": _TOOL_FACT_KIND_FAILED, "result": result_json}
-            ),
+            outcome_digest=accepted_tool_outcome_digest(tool_outcome),
             payload_digest=outcome.payload_ref.payload_digest
             if outcome.payload_ref is not None
             else None,
             payload_ref=outcome.payload_ref,
             provider_status_ref=None,
-            result_json={"kind": _TOOL_FACT_KIND_FAILED, "result": result_json},
+            result_json=result_json,
         )
     if isinstance(outcome, ResolveWaitCancelledOutcome):
-        result_json = _tool_cancelled_json(outcome.result)
+        result_json = accepted_tool_outcome_json(outcome.result)
         return _WaitResolutionPayloadPlan(
             resolution_kind=_TOOL_FACT_KIND_CANCELLED,
             tool_fact_kind=_TOOL_FACT_KIND_CANCELLED,
-            outcome_digest=sha256_digest_json(
-                {"kind": _TOOL_FACT_KIND_CANCELLED, "result": result_json}
-            ),
+            outcome_digest=accepted_tool_outcome_digest(outcome.result),
             payload_digest=outcome.payload_ref.payload_digest
             if outcome.payload_ref is not None
             else None,
             payload_ref=outcome.payload_ref,
             provider_status_ref=None,
-            result_json={
-                "kind": _TOOL_FACT_KIND_CANCELLED,
-                "result": result_json,
-            },
+            result_json=result_json,
         )
     if isinstance(outcome, ResolveWaitLostOutcome):
         result_json = _tool_lost_json(outcome)
@@ -1414,6 +1838,7 @@ def _resume_requested_payload(
 def _tool_result_resolution_payload(
     *,
     transaction: HostTransaction,
+    event_log_store: EventLogStore,
     wait_record: WaitRecordRow,
     request: ResolveWaitRequest,
     payload_plan: _WaitResolutionPayloadPlan,
@@ -1424,6 +1849,7 @@ def _tool_result_resolution_payload(
     """构造 resolve wait ``TOOL_RESULT_ACCEPTED`` payload。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: 注入的 EventLog store。
     :param wait_record: active wait record。
     :param request: resolve wait 请求。
     :param payload_plan: payload 规划。
@@ -1433,14 +1859,15 @@ def _tool_result_resolution_payload(
     :returns: JSON payload。
     """
 
-    tool_call_requested = _wait_tool_call_requested_event(transaction, wait_record)
-    request_payload = payload_object(tool_call_requested)
+    tool_call_request = _wait_tool_call_requested_event(
+        transaction, wait_record, event_log_store=event_log_store
+    )
+    request_payload = payload_object(tool_call_request.row)
     accepted_evidence_envelope = _wait_resolution_evidence_envelope(
         wait_record=wait_record,
         payload_plan=payload_plan,
         event_plan=event_plan,
-        tool_call_requested=tool_call_requested,
-        request_payload=request_payload,
+        tool_call_request=tool_call_request,
     )
     return tool_result_wait_resolution_payload(
         tool_fact_id=event_plan.tool_fact_id,
@@ -1457,8 +1884,8 @@ def _tool_result_resolution_payload(
         tool_identity_digest=required_payload_text(
             request_payload, field_name="tool_identity_digest"
         ),
-        normalized_arguments_digest=required_payload_text(
-            request_payload, field_name="normalized_arguments_digest"
+        normalized_arguments_digest=(
+            tool_call_request.atoms.normalized_arguments_digest
         ),
         tool_fact_kind=payload_plan.tool_fact_kind,
         outcome_digest=payload_plan.outcome_digest,
@@ -1493,22 +1920,45 @@ def _tool_result_resolution_payload(
 
 
 def _wait_tool_call_requested_event(
-    transaction: HostTransaction, wait_record: WaitRecordRow
-) -> EventLogRow:
+    transaction: HostTransaction,
+    wait_record: WaitRecordRow,
+    *,
+    event_log_store: EventLogStore,
+) -> _WaitToolCallRequest:
     """读取 wait 对应的 canonical ``TOOL_CALL_REQUESTED`` request atom。
 
     :param transaction: 当前 Host transaction。
     :param wait_record: active wait record。
-    :returns: 对应 request atom row。
-    :raises HostDurableError: request atom 缺失或身份不匹配时抛出。
+    :param event_log_store: 注入的 EventLog store。
+    :returns: 显式链接的 request row 与 strict atoms。
+    :raises HostDurableError: awaiting link、request atom、身份或正文损坏时抛出。
     """
 
-    event_id = _tool_call_requested_event_id_from_wait_id(wait_record.wait_id)
-    row = EventLogStore().read_event_by_id(transaction, event_id)
+    awaiting = event_log_store.read_event_by_id(
+        transaction, wait_record.created_event_id
+    )
+    if awaiting is None:
+        raise HostDurableError("wait created event is missing")
+    if (
+        awaiting.event_type != _EVENT_TYPE_TOOL_AWAITING
+        or awaiting.session_id != wait_record.session_id
+        or awaiting.run_id != wait_record.run_id
+        or awaiting.attempt_id != wait_record.attempt_id
+        or awaiting.execution_id != wait_record.execution_id
+    ):
+        raise HostDurableError("wait created event identity mismatch")
+    awaiting_payload = payload_object(awaiting)
+    request_ref = _required_event_ref(
+        awaiting_payload,
+        field_name="tool_call_requested_event_ref",
+    )
+    row = event_log_store.read_event_by_id(transaction, request_ref.event_id)
     if row is None:
         raise HostDurableError("wait tool call request atom is missing")
     if (
-        row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
+        row.event_id != request_ref.event_id
+        or row.event_sequence != request_ref.event_sequence
+        or row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
         or row.session_id != wait_record.session_id
         or row.run_id != wait_record.run_id
         or row.attempt_id != wait_record.attempt_id
@@ -1523,49 +1973,10 @@ def _wait_tool_call_requested_event(
         != wait_record.tool_name
     ):
         raise HostDurableError("wait tool call request atom tool mismatch")
-    _validate_wait_request_arguments_digest(
-        transaction,
-        wait_record=wait_record,
-        request_payload=payload,
+    return _WaitToolCallRequest(
+        row=row,
+        atoms=tool_call_request_atoms(transaction, row),
     )
-    return row
-
-
-def _validate_wait_request_arguments_digest(
-    transaction: HostTransaction,
-    *,
-    wait_record: WaitRecordRow,
-    request_payload: Mapping[str, JsonValue],
-) -> None:
-    """校验 wait request atom 与 awaiting accept 事实的参数 digest 同源。
-
-    :param transaction: 当前 Host transaction。
-    :param wait_record: active wait record。
-    :param request_payload: ``TOOL_CALL_REQUESTED`` payload。
-    :returns: ``None``。
-    :raises HostDurableError: awaiting 事实缺失、身份错误或参数 digest 不一致时抛出。
-    """
-
-    awaiting = EventLogStore().read_event_by_id(transaction, wait_record.created_event_id)
-    if awaiting is None:
-        raise HostDurableError("wait created event is missing")
-    if (
-        awaiting.event_type != _EVENT_TYPE_TOOL_AWAITING
-        or awaiting.session_id != wait_record.session_id
-        or awaiting.run_id != wait_record.run_id
-        or awaiting.attempt_id != wait_record.attempt_id
-        or awaiting.execution_id != wait_record.execution_id
-    ):
-        raise HostDurableError("wait created event identity mismatch")
-    awaiting_payload = payload_object(awaiting)
-    awaiting_digest = required_payload_text(
-        awaiting_payload, field_name="normalized_arguments_digest"
-    )
-    request_digest = required_payload_text(
-        request_payload, field_name="normalized_arguments_digest"
-    )
-    if request_digest != awaiting_digest:
-        raise HostDurableError("wait tool call request atom arguments digest mismatch")
 
 
 def _wait_resolution_evidence_envelope(
@@ -1573,16 +1984,14 @@ def _wait_resolution_evidence_envelope(
     wait_record: WaitRecordRow,
     payload_plan: _WaitResolutionPayloadPlan,
     event_plan: _ResolveWaitEventPlan,
-    tool_call_requested: EventLogRow,
-    request_payload: Mapping[str, JsonValue],
+    tool_call_request: _WaitToolCallRequest,
 ) -> AcceptedEvidenceEnvelope:
     """构造 wait-resolution accepted result 的 evidence envelope。
 
     :param wait_record: active wait record。
     :param payload_plan: resolution payload 规划。
     :param event_plan: resolution event id 规划。
-    :param tool_call_requested: 同一等待工具调用的 request atom。
-    :param request_payload: request atom payload。
+    :param tool_call_request: 显式链接且严格校验的 request row/atoms。
     :returns: accepted evidence envelope。
     """
 
@@ -1592,13 +2001,11 @@ def _wait_resolution_evidence_envelope(
         tool_name=wait_record.tool_name,
         tool_call_id=wait_record.tool_call_id,
         tool_query=AcceptedEvidenceToolQuery(
-            tool_call_requested_event_ref=tool_call_requested.event_id,
-            normalized_arguments_digest=required_payload_text(
-                request_payload, field_name="normalized_arguments_digest"
+            tool_call_requested_event_ref=tool_call_request.row.event_id,
+            normalized_arguments_digest=(
+                tool_call_request.atoms.normalized_arguments_digest
             ),
-            semantic_input_digest=required_payload_text(
-                request_payload, field_name="semantic_input_digest"
-            ),
+            semantic_input_digest=tool_call_request.atoms.semantic_input_digest,
         ),
         result_ref=AcceptedEvidenceResultRef(
             payload_ref=(
@@ -1613,20 +2020,6 @@ def _wait_resolution_evidence_envelope(
         source_refs=(),
         locator_refs=(),
     )
-
-
-def _tool_call_requested_event_id_from_wait_id(wait_id: str) -> str:
-    """从 Host wait id 派生 awaiting request atom event id。
-
-    :param wait_id: ``wait-<awaiting-accept-digest>`` 形式的 wait id。
-    :returns: request atom event id。
-    :raises HostDurableError: wait id 非 awaiting accept 派生形态时抛出。
-    """
-
-    prefix = "wait-"
-    if not wait_id.startswith(prefix) or len(wait_id) <= len(prefix):
-        raise HostDurableError("wait id cannot derive tool call request atom")
-    return f"{_EVENT_ID_TOOL_CALL_REQUESTED_PREFIX}{wait_id.removeprefix(prefix)}"
 
 
 def _wait_late_result_rejected_event_request(
@@ -1904,113 +2297,47 @@ def _invalid_awaiting_precondition(
     return None
 
 
-def _tool_call_requested_event_request(
+def _tool_call_request_atom(
     candidate: ToolAwaitingAcceptCandidate,
-    event_id: str,
-    occurred_at: datetime,
-) -> EventLogAppendRequest:
-    """构造 awaiting 工具调用的 ``TOOL_CALL_REQUESTED`` append request。
+) -> AcceptedToolCallRequestAtomInput:
+    """把 awaiting candidate 显式映射为共享 request atom。
 
-    :param candidate: awaiting candidate。
-    :param event_id: 事件 id。
-    :param occurred_at: 事件发生时间。
-    :returns: EventLog append request。
+    :param candidate: Host awaiting accept candidate。
+    :returns: exact arguments、原始 identity digest 且无 synthetic query 的 atom。
+    :raises ValueError: candidate 字段违反 request atom 基础约束时抛出。
     """
 
-    safe_arguments = llm_safe_replay_arguments(candidate.accepted_arguments)
-    arguments_json = _accepted_arguments_json(safe_arguments)
-    arguments_payload_digest = sha256_digest_json(arguments_json)
-    semantic_query_text = _awaiting_semantic_query_text(
-        tool_name=candidate.tool_name,
-        safe_arguments=safe_arguments,
-    )
-    return EventLogAppendRequest(
-        event_id=event_id,
-        event_class=EventClass.CANONICAL_FACT,
+    return AcceptedToolCallRequestAtomInput(
         session_id=candidate.session_id,
         run_id=candidate.run_id,
         attempt_id=candidate.attempt_id,
         execution_id=candidate.execution_id,
-        event_type=_EVENT_TYPE_TOOL_CALL_REQUESTED,
-        occurred_at=occurred_at,
-        actor=_AWAITING_ACCEPT_ACTOR,
-        source=_AWAITING_ACCEPT_SOURCE,
-        client_request_id=None,
-        idempotency_key=candidate.accept_idempotency_key,
-        policy_decision=None,
-        reason={"reason": "tool_call_requested"},
-        payload_json={
-            "session_id": candidate.session_id,
-            "run_id": candidate.run_id,
-            "attempt_id": candidate.attempt_id,
-            "execution_id": candidate.execution_id,
-            "iteration_id": candidate.iteration_id,
-            "tool_call_id": candidate.tool_call_id,
-            "tool_name": candidate.tool_name,
-            "tool_schema_digest": candidate.tool_schema_digest,
-            "tool_identity_digest": candidate.tool_identity_digest,
-            "normalized_arguments_digest": candidate.normalized_arguments_digest,
-            "arguments_json_size_bytes": _payload_size_bytes(arguments_json),
-            "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
-            "arguments_inline_json": arguments_json,
-            "arguments_payload_ref": None,
-            "arguments_payload_digest": arguments_payload_digest,
-            "tool_fact_kind": "awaiting",
-            "accept_idempotency_key": candidate.accept_idempotency_key,
-            "semantic_input_digest": candidate.semantic_input_digest,
-            "semantic_query_storage_kind": TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
-            "semantic_query_text": semantic_query_text,
-            "semantic_query_payload_ref": None,
-            "semantic_query_digest": sha256_digest_json(
-                {"semantic_query_text": semantic_query_text}
-            ),
-        },
-        payload_ref=None,
-        payload_digest=None,
+        iteration_id=candidate.iteration_id,
+        tool_call_id=candidate.tool_call_id,
+        tool_name=candidate.tool_name,
+        tool_schema_digest=candidate.tool_schema_digest,
+        tool_identity_digest=candidate.tool_identity_digest,
+        accepted_arguments=candidate.accepted_arguments,
+        normalized_arguments_digest=candidate.normalized_arguments_digest,
+        tool_fact_kind="awaiting",
+        accept_idempotency_key=candidate.accept_idempotency_key,
+        semantic_input_digest=candidate.semantic_input_digest,
+        semantic_query_text=None,
     )
 
 
-def _accepted_arguments_json(arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-    """构造 request atom 使用的 accepted arguments canonical JSON。
-
-    :param arguments: 已接受参数。
-    :returns: canonical arguments JSON object。
-    """
-
-    return {"arguments": dict(arguments)}
-
-
-def _awaiting_semantic_query_text(
-    *, tool_name: str, safe_arguments: Mapping[str, JsonValue]
-) -> str:
-    """构造 awaiting 工具调用的业务可读请求摘要。
-
-    :param tool_name: 工具名。
-    :param safe_arguments: 已脱敏的工具参数投影。
-    :returns: 不含 Host 等待治理概念的 LLM-facing query 文本。
-    """
-
-    return f"工具 {tool_name} 请求参数：{canonical_json_dumps(dict(safe_arguments))}"
-
-
-def _payload_size_bytes(payload: Mapping[str, JsonValue]) -> int:
-    """计算 canonical JSON payload 的 UTF-8 字节数。
-
-    :param payload: JSON payload。
-    :returns: 字节数。
-    """
-
-    return len(canonical_json_dumps(payload).encode("utf-8"))
-
-
 def _tool_awaiting_event_request(
-    candidate: ToolAwaitingAcceptCandidate, event_id: str, occurred_at: datetime
+    candidate: ToolAwaitingAcceptCandidate,
+    event_id: str,
+    occurred_at: datetime,
+    tool_call_requested: EventLogRow,
 ) -> EventLogAppendRequest:
     """构造 ``TOOL_AWAITING`` append request。
 
     :param candidate: awaiting candidate。
     :param event_id: 事件 id。
     :param occurred_at: 事件发生时间。
+    :param tool_call_requested: 同事务 append 返回的真实 request row。
     :returns: EventLog append request。
     """
 
@@ -2038,8 +2365,7 @@ def _tool_awaiting_event_request(
             wait_id=candidate.wait_id,
             tool_call_id=candidate.tool_call_id,
             tool_name=candidate.tool_name,
-            normalized_arguments_digest=candidate.normalized_arguments_digest,
-            accepted_arguments=candidate.accepted_arguments,
+            tool_call_requested_event_ref=_event_ref_json(tool_call_requested),
             await_spec=candidate.await_spec,
             adapter_key=candidate.binding.adapter_key.value,
             resume_policy=candidate.binding.resume_policy.value,
@@ -2324,6 +2650,40 @@ def _event_ref_json(row: EventLogRow) -> dict[str, int | str]:
     """
 
     return {"event_id": row.event_id, "event_sequence": row.event_sequence}
+
+
+def _required_event_ref(
+    payload: Mapping[str, JsonValue], *, field_name: str
+) -> ToolAwaitingEventRef:
+    """读取 exact ``{event_id,event_sequence}`` durable event ref。
+
+    :param payload: canonical payload object。
+    :param field_name: event ref 字段名。
+    :returns: 已校验的 event ref。
+    :raises HostDurableError: 字段缺失、key set 或值类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"payload field {field_name} must be event ref")
+    if set(value) != {"event_id", "event_sequence"}:
+        raise HostDurableError(f"payload field {field_name} has invalid shape")
+    event_id = value.get("event_id")
+    event_sequence = value.get("event_sequence")
+    if not isinstance(event_id, str) or event_id.strip() == "":
+        raise HostDurableError(f"payload field {field_name}.event_id is invalid")
+    if (
+        not isinstance(event_sequence, int)
+        or isinstance(event_sequence, bool)
+        or event_sequence <= 0
+    ):
+        raise HostDurableError(
+            f"payload field {field_name}.event_sequence is invalid"
+        )
+    return ToolAwaitingEventRef(
+        event_id=event_id,
+        event_sequence=event_sequence,
+    )
 
 
 def build_tool_awaiting_accept_identity_digest(

@@ -11,17 +11,20 @@ import asyncio
 import os
 import select
 import sys
-import termios
 import threading
-import tty
 from enum import StrEnum
 from typing import Final, Protocol, TextIO, cast
+
+if os.name == "posix":
+    import termios
+    import tty
 
 _CTRL_T: Final[bytes] = b"\x14"
 _ESC: Final[bytes] = b"\x1b"
 _READ_SIZE_BYTES: Final[int] = 1
 _POLL_INTERVAL_SECONDS: Final[float] = 0.05
 _THREAD_JOIN_TIMEOUT_SECONDS: Final[float] = 0.2
+_POSIX_TERMINAL_CONTROL_AVAILABLE: Final[bool] = os.name == "posix"
 _TerminalAttribute = int | list[bytes | int]
 _TerminalAttributes = list[_TerminalAttribute]
 
@@ -145,6 +148,8 @@ class TtyRunningKeyMonitor:
 
         if self._started or self._closed:
             return
+        if not _POSIX_TERMINAL_CONTROL_AVAILABLE:
+            return
         if not self._stdin.isatty():
             return
         loop = asyncio.get_running_loop()
@@ -243,12 +248,12 @@ def new_running_key_monitor(*, stdin: TextIO | None = None) -> RunningKeyMonitor
     """按默认 TTY policy 创建运行态按键 monitor。
 
     :param stdin: 按键读取来源；``None`` 表示当前 ``sys.stdin``。
-    :returns: TTY monitor 或 no-op monitor。
+    :returns: POSIX TTY monitor 或 no-op monitor；非 POSIX 固定为 no-op。
     :raises Exception: 不主动抛出异常。
     """
 
     effective_stdin = sys.stdin if stdin is None else stdin
-    if not effective_stdin.isatty():
+    if not _POSIX_TERMINAL_CONTROL_AVAILABLE or not effective_stdin.isatty():
         return NoopRunningKeyMonitor()
     return TtyRunningKeyMonitor(stdin=effective_stdin)
 
@@ -277,6 +282,8 @@ def _restore_terminal_attrs(fd: int, attrs: _TerminalAttributes) -> None:
     :raises Exception: 不主动抛出异常。
     """
 
+    if not _POSIX_TERMINAL_CONTROL_AVAILABLE:
+        return
     try:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
     except (OSError, termios.error):

@@ -6,7 +6,7 @@ import inspect
 import pathlib
 from collections.abc import AsyncIterator
 from dataclasses import fields, is_dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol, cast, get_type_hints
 
 import pytest
 
@@ -33,7 +33,25 @@ from dayu.host import (
     OrdinaryRunExecutionBaseline,
     open_host,
 )
+from dayu.host.api import WaitPollerRuntimePolicy
 from dayu.host.memory import default_memory_projection_policy
+
+
+class _InvalidWaitPollerPolicy:
+    """测试用结构完整但字段类型非法的 wait poller policy。"""
+
+    enabled: str = "yes"
+    poll_interval_seconds: float = 1.0
+    claim_ttl_seconds: float = 60.0
+    claim_batch_size: int = 100
+    backoff_initial_delay_seconds: float = 30.0
+    backoff_multiplier: float = 2.0
+    backoff_max_delay_seconds: float = 300.0
+    not_ready_observe_interval_seconds: float = 1.0
+    idle_poll_interval_seconds: float = 5.0
+    adapter_call_timeout_seconds: float = 30.0
+    close_drain_timeout_seconds: float = 5.0
+    max_outstanding_adapter_calls: int = 8
 
 
 class _FrozenSlotsDataclassClass(Protocol):
@@ -182,6 +200,8 @@ def _agent_policy() -> AgentPolicy:
         continuation_max_attempts=0,
         allow_tool_calls=False,
         tool_execution_timeout_seconds=1.0,
+        fallback_prompt="test fallback prompt",
+        continuation_prompt="test continuation prompt",
     )
 
 
@@ -272,6 +292,35 @@ def test_open_host_options_do_not_expose_process_capsule_policy_directly() -> No
     assert "process_capsule_interrupt_policy" not in constructor_parameters
 
 
+def test_open_host_options_type_hints_resolve_wait_poller_policy() -> None:
+    """OpenHostOptions runtime type hints 必须能解析 wait poller policy。"""
+
+    hints = get_type_hints(OpenHostOptions)
+
+    assert hints["wait_poller_policy"] == WaitPollerRuntimePolicy | None
+
+
+def test_open_host_options_reject_invalid_wait_poller_policy(
+    tmp_path: pathlib.Path,
+) -> None:
+    """OpenHostOptions 构造期拒绝非法 wait poller policy。"""
+
+    valid = _options(tmp_path)
+    with pytest.raises(TypeError, match="enabled"):
+        replace(
+            valid,
+            wait_poller_policy=cast(
+                WaitPollerRuntimePolicy,
+                _InvalidWaitPollerPolicy(),
+            ),
+        )
+    with pytest.raises(TypeError, match="wait_poller_policy"):
+        replace(
+            valid,
+            wait_poller_policy=cast(WaitPollerRuntimePolicy, "bad"),
+        )
+
+
 def test_open_host_options_validate_lane_and_baseline(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -350,6 +399,15 @@ def test_host_event_terminal_final_answer_contract() -> None:
         cancel_reason=None,
     )
     assert event.final_answer is final_answer
+
+    with pytest.raises(ValueError, match="HostFinalAnswerView.content"):
+        HostFinalAnswerView(
+            content=" \n\t",
+            filtered=False,
+            degraded=False,
+            finish_reason="stop",
+            terminal_status=HostTerminalStatus.SUCCEEDED,
+        )
 
     with pytest.raises(ValueError, match="requires final_answer"):
         HostEvent(

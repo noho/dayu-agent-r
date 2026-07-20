@@ -13,7 +13,7 @@ from typing import TypeVar, cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host import open_host
+from dayu.host import OpenHostAdminOptions, OpenHostOptions, open_host, open_host_admin
 from dayu.host import command as host_command_module
 from dayu.host.audit import (
     LogAuditSinkOptions,
@@ -37,7 +37,9 @@ from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.idempotency import (
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.options import (
@@ -133,6 +135,8 @@ _RUN_STATUS_RECOVERING = "recovering"
 _RUN_STATUS_FAILED = "failed"
 _RUN_STATUS_CANCELLED = "cancelled"
 _RUN_STATUS_LOST = "lost"
+_EVENT_TYPE_TEST = "USER_INPUT_ACCEPTED"
+_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _NON_TERMINAL_RUN_STATUSES = (
     _RUN_STATUS_ACCEPTED,
     _RUN_STATUS_QUEUED,
@@ -459,8 +463,8 @@ async def _purge_in_independent_process_async(*, root_path: Path, result_marker:
         worker_factory=None,
         allow_tool_calls=False,
     )
-    async with open_host(options) as host:
-        result = await host.purge_session(_SESSION_ID, _purge_api_request())
+    async with open_host_admin(_admin_options_from_execution(options)) as host_admin:
+        result = await host_admin.purge_session(_SESSION_ID, _purge_api_request())
     result_marker.write_text(
         json.dumps(
             {
@@ -471,6 +475,35 @@ async def _purge_in_independent_process_async(*, root_path: Path, result_marker:
             sort_keys=True,
         ),
         encoding="utf-8",
+    )
+
+
+def _admin_options_from_execution(
+    options: OpenHostOptions,
+) -> OpenHostAdminOptions:
+    """从测试 execution options 投影同源 admin durable policy。
+
+    :param options: execution opener options。
+    :returns: admin opener options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return OpenHostAdminOptions(
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
     )
 
 
@@ -523,8 +556,9 @@ async def _read_after_purge_in_independent_process_async(*, root_path: Path, res
                 _replay_api_request("replay-after-purge-process"),
             )
         )
+        watcher = host.watch_session_events(_SESSION_ID)
         try:
-            host.watch_session_events(_SESSION_ID)
+            await anext(watcher)
         except HostApiError as exc:
             observed["watch_session_events"] = exc.code.value
         else:
@@ -943,7 +977,7 @@ class _ReadPurgeIdempotencyOperation:
             FROM {TABLE_IDEMPOTENCY_RECORDS}
             WHERE scope_kind = ? AND scope_id = ? AND idempotency_key = ?
             """,
-            (PURGE_IDEMPOTENCY_SCOPE_KIND, _SESSION_ID, _CLIENT_REQUEST_ID),
+            (PURGE_IDEMPOTENCY_SCOPE_KIND.value, _SESSION_ID, _CLIENT_REQUEST_ID),
         )
         assert row is not None
         result_ref = row.get("result_ref")
@@ -1206,6 +1240,7 @@ def _insert_event(
     attempt_id: str | None,
     execution_id: str | None,
     payload_ref: str | None,
+    event_type: str = _EVENT_TYPE_TEST,
 ) -> int:
     """写入 EventLog row 并返回 sequence。
 
@@ -1216,7 +1251,9 @@ def _insert_event(
     :param attempt_id: Attempt id。
     :param execution_id: execution id。
     :param payload_ref: payload descriptor ref。
+    :param event_type: EventLog 事件类型。
     :returns: EventLog sequence。
+    :raises AssertionError: SQLite insert 未返回 row id 时抛出。
     """
 
     result = transaction.execute(
@@ -1251,7 +1288,7 @@ def _insert_event(
             run_id,
             attempt_id,
             execution_id,
-            "TEST_EVENT",
+            event_type,
             _TIMESTAMP,
             "tester",
             "test",
@@ -1532,6 +1569,36 @@ def _insert_run_rows(transaction: HostTransaction, run_status: str, events: _Tar
     )
 
 
+def _insert_cancel_request_event_if_needed(
+    transaction: HostTransaction, *, run_id: str, status: str
+) -> str | None:
+    """按 Run 状态写入专用 ``CANCEL_REQUESTED`` 事件。
+
+    参数：
+        transaction: Host transaction。
+        run_id: Run id。
+        status: Run 状态。
+    返回值：取消语义状态对应的 EventLog id；其它状态返回 ``None``。
+    异常：EventLog 插入未返回 row id 时由 ``_insert_event`` 抛出
+        ``AssertionError``。
+    """
+
+    if status not in (_RUN_STATUS_CANCELLING, _RUN_STATUS_CANCELLED):
+        return None
+    event_id = f"event-{run_id}-cancel-requested"
+    _insert_event(
+        transaction,
+        event_id=event_id,
+        session_id=_SESSION_ID,
+        run_id=run_id,
+        attempt_id=None,
+        execution_id=None,
+        payload_ref=None,
+        event_type=_EVENT_TYPE_CANCEL_REQUESTED,
+    )
+    return event_id
+
+
 def _insert_run_row(
     transaction: HostTransaction,
     *,
@@ -1566,6 +1633,9 @@ def _insert_run_row(
     )
     queued_event_id = accepted_event[0] if status == _RUN_STATUS_QUEUED else None
     queued_event_sequence = accepted_event[1] if status == _RUN_STATUS_QUEUED else None
+    cancel_request_event_id = _insert_cancel_request_event_if_needed(
+        transaction, run_id=run_id, status=status
+    )
     started_event_id = (
         accepted_event[0] if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) and not is_terminal else None
     )
@@ -1589,6 +1659,7 @@ def _insert_run_row(
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1597,7 +1668,7 @@ def _insert_run_row(
           created_at,
           updated_at,
           terminal_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -1614,6 +1685,7 @@ def _insert_run_row(
             started_event_sequence,
             terminal_event[0] if is_terminal else None,
             terminal_event[1] if is_terminal else None,
+            cancel_request_event_id,
             current_attempt_id if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) else None,
             source_run_id,
             source_run_relation,
@@ -2148,7 +2220,7 @@ def _insert_timeline_item(
             event_ref[0],
             event_ref[1],
             "run_lifecycle",
-            "TEST_EVENT",
+            "USER_INPUT_ACCEPTED",
             "display",
             payload_ref,
             _DIGEST_A if payload_ref is not None else None,
@@ -2477,13 +2549,13 @@ def _insert_old_idempotency_rows(transaction: HostTransaction, events: _TargetEv
     IdempotencyStore().record_idempotent_result(
         transaction,
         IdempotencyScope(
-            scope_kind="close_session",
+            scope_kind=IdempotencyScopeKind.CLOSE_SESSION,
             scope_id=_SESSION_ID,
             idempotency_key="old-close-key",
         ),
         _DIGEST_A,
         IdempotencyResultRef(
-            result_kind="session",
+            result_kind=IdempotencyResultKind.SESSION,
             result_ref=_SESSION_ID,
             created_event_id=events.session_closed[0],
             created_event_sequence=events.session_closed[1],
@@ -2492,31 +2564,42 @@ def _insert_old_idempotency_rows(transaction: HostTransaction, events: _TargetEv
     IdempotencyStore().record_idempotent_result(
         transaction,
         IdempotencyScope(
-            scope_kind="cancel_run",
+            scope_kind=IdempotencyScopeKind.CANCEL_RUN,
             scope_id=_PARENT_RUN_ID,
             idempotency_key="old-cancel-key",
         ),
         _DIGEST_B,
         IdempotencyResultRef(
-            result_kind="run",
+            result_kind=IdempotencyResultKind.RUN,
             result_ref=_PARENT_RUN_ID,
             created_event_id=events.parent_terminal[0],
             created_event_sequence=events.parent_terminal[1],
         ),
     )
-    IdempotencyStore().record_idempotent_result(
-        transaction,
-        IdempotencyScope(
-            scope_kind=_OUT_OF_SCOPE_IDEMPOTENCY_SCOPE_KIND,
-            scope_id=_SESSION_ID,
-            idempotency_key=_OUT_OF_SCOPE_IDEMPOTENCY_KEY,
-        ),
-        _DIGEST_C,
-        IdempotencyResultRef(
-            result_kind="external_ack",
-            result_ref="external-ack-1",
-            created_event_id=None,
-            created_event_sequence=None,
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
+          scope_kind,
+          scope_id,
+          idempotency_key,
+          semantic_input_digest,
+          result_kind,
+          result_ref,
+          created_event_id,
+          created_event_sequence,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _OUT_OF_SCOPE_IDEMPOTENCY_SCOPE_KIND,
+            _SESSION_ID,
+            _OUT_OF_SCOPE_IDEMPOTENCY_KEY,
+            _DIGEST_C,
+            "external_ack",
+            "external-ack-1",
+            None,
+            None,
+            _TIMESTAMP,
         ),
     )
 

@@ -32,6 +32,7 @@ from dayu.fins.downloaders.cninfo_downloader import (
 )
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
+    CnDownloadCancelledError,
     CnReportCandidate,
     CnReportQuery,
 )
@@ -1072,6 +1073,227 @@ def test_list_report_candidates_uses_per_period_category() -> None:
     )
 
 
+def test_list_report_candidates_calls_same_checkpoint_around_each_period_post() -> None:
+    """两个受支持财期应按 POST 边界产生精确 checkpoint 序列。"""
+
+    events: list[str] = []
+    checkpoint_calls = 0
+
+    def checkpoint() -> None:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        events.append(f"CP{checkpoint_calls}")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CNINFO_QUERY_URL:
+            category = _read_form(request)["category"]
+            events.append(f"POST({category})")
+            return httpx.Response(200, json={"announcements": [], "hasMore": False})
+        raise AssertionError(f"unexpected {request}")
+
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("FY", "H1"),
+    )
+    profile = CnCompanyProfile(
+        provider="cninfo",
+        company_id="CNINFO:gssz0002594",
+        company_name="比亚迪",
+        ticker="002594",
+    )
+
+    candidates = _build_client(handler).list_report_candidates(
+        query,
+        profile,
+        cancellation_checkpoint=checkpoint,
+    )
+
+    assert candidates == ()
+    assert events == [
+        "CP1",
+        "POST(category_ndbg_szsh;)",
+        "CP2",
+        "CP3",
+        "POST(category_bndbg_szsh;)",
+        "CP4",
+    ]
+
+
+def test_list_report_candidates_calls_checkpoint_around_every_paginated_post() -> None:
+    """同一财期翻页时，每个真实 POST 都应有前后 checkpoint。"""
+
+    events: list[str] = []
+    checkpoint_calls = 0
+
+    def checkpoint() -> None:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        events.append(f"CP{checkpoint_calls}")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CNINFO_QUERY_URL:
+            page_num = _read_form(request)["pageNum"]
+            events.append(f"POST({page_num})")
+            return httpx.Response(
+                200,
+                json={
+                    "announcements": [
+                        _build_announcement(
+                            announcement_id=f"PAGE-{page_num}",
+                            title=f"比亚迪：202{5 - int(page_num)}年年度报告",
+                            announcement_date=f"202{6 - int(page_num)}-04-01",
+                            adjunct_url=f"page-{page_num}.PDF",
+                        )
+                    ],
+                    "hasMore": page_num == "1",
+                },
+            )
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected {request}")
+
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("FY",),
+    )
+    profile = CnCompanyProfile(
+        provider="cninfo",
+        company_id="CNINFO:gssz0002594",
+        company_name="比亚迪",
+        ticker="002594",
+    )
+
+    _build_client(handler).list_report_candidates(
+        query,
+        profile,
+        cancellation_checkpoint=checkpoint,
+    )
+
+    assert events == ["CP1", "POST(1)", "CP2", "CP3", "POST(2)", "CP4"]
+
+
+@pytest.mark.parametrize(
+    ("cancel_call", "expected_events"),
+    [
+        (2, ["CP1", "POST(FY)", "CP2"]),
+        (3, ["CP1", "POST(FY)", "CP2", "CP3"]),
+    ],
+)
+def test_list_report_candidates_preserves_cancel_identity_and_stops_next_period(
+    cancel_call: int,
+    expected_events: list[str],
+) -> None:
+    """响应后或下一财期 POST 前取消应保持 identity 并零发布。"""
+
+    events: list[str] = []
+    checkpoint_calls = 0
+    expected = CnDownloadCancelledError(f"cancel at {cancel_call}")
+    head_count = 0
+
+    def checkpoint() -> None:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        events.append(f"CP{checkpoint_calls}")
+        if checkpoint_calls == cancel_call:
+            raise expected
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal head_count
+        if str(request.url) == CNINFO_QUERY_URL:
+            category = _read_form(request)["category"]
+            period = "FY" if category == "category_ndbg_szsh;" else "H1"
+            events.append(f"POST({period})")
+            return httpx.Response(
+                200,
+                json={
+                    "announcements": [
+                        _build_announcement(
+                            announcement_id="PARTIAL",
+                            title="比亚迪：2024年年度报告",
+                            announcement_date="2025-04-01",
+                            adjunct_url="partial.PDF",
+                        )
+                    ],
+                    "hasMore": False,
+                },
+            )
+        if request.method == "HEAD":
+            head_count += 1
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected {request}")
+
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("FY", "H1"),
+    )
+    profile = CnCompanyProfile(
+        provider="cninfo",
+        company_id="CNINFO:gssz0002594",
+        company_name="比亚迪",
+        ticker="002594",
+    )
+
+    with pytest.raises(CnDownloadCancelledError) as exc_info:
+        _build_client(handler).list_report_candidates(
+            query,
+            profile,
+            cancellation_checkpoint=checkpoint,
+        )
+
+    assert exc_info.value is expected
+    assert events == expected_events
+    assert head_count == 0
+
+
+def test_list_report_candidates_preserves_checkpoint_failure_full_cause_chain() -> None:
+    """CNInfo generic context wrapper 应保留 workflow checkpoint 与 raw failure 两层 cause。"""
+
+    original = ValueError("checker exploded")
+    post_count = 0
+
+    def checkpoint() -> None:
+        raise RuntimeError("取消检查失败") from original
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        post_count += 1
+        return httpx.Response(200, json={"announcements": [], "hasMore": False})
+
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("FY",),
+    )
+    profile = CnCompanyProfile(
+        provider="cninfo",
+        company_id="CNINFO:gssz0002594",
+        company_name="比亚迪",
+        ticker="002594",
+    )
+
+    with pytest.raises(RuntimeError, match="巨潮公告分类查询失败") as exc_info:
+        _build_client(handler).list_report_candidates(
+            query,
+            profile,
+            cancellation_checkpoint=checkpoint,
+        )
+
+    assert type(exc_info.value.__cause__) is RuntimeError
+    assert exc_info.value.__cause__.__cause__ is original
+    assert post_count == 0
+
+
 # ---------- download_report_pdf ----------
 
 
@@ -1109,9 +1331,8 @@ def test_download_report_pdf_returns_asset_with_sha256() -> None:
     import hashlib
 
     assert asset.sha256 == hashlib.sha256(payload).hexdigest()
-    assert asset.pdf_path.exists()
-    assert asset.pdf_path.read_bytes().startswith(b"%PDF-")
-    asset.pdf_path.unlink()
+    assert asset.pdf_bytes == payload
+    assert len(asset.pdf_bytes) == asset.content_length
 
 
 def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
@@ -1132,7 +1353,7 @@ def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
     asset = client.download_report_pdf(_make_candidate())
 
     assert sleep_calls == []
-    asset.pdf_path.unlink()
+    assert asset.pdf_bytes == payload
 
 
 def test_download_report_pdf_throttles_between_successful_requests() -> None:
@@ -1155,12 +1376,12 @@ def test_download_report_pdf_throttles_between_successful_requests() -> None:
 
     assert len(sleep_calls) == 1
     assert 0 < sleep_calls[0] <= 0.3
-    first.pdf_path.unlink()
-    second.pdf_path.unlink()
+    assert first.pdf_bytes == payload
+    assert second.pdf_bytes == payload
 
 
-def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None:
-    """同一 candidate 并发/重复下载也应落到不同临时文件路径。"""
+def test_download_report_pdf_repeated_calls_return_complete_bytes() -> None:
+    """同一 candidate 重复下载均应返回完整且自洽的内存资产。"""
 
     payload = _build_pdf_payload()
 
@@ -1171,11 +1392,10 @@ def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None
     first = client.download_report_pdf(_make_candidate())
     second = client.download_report_pdf(_make_candidate())
 
-    assert first.pdf_path != second.pdf_path
-    assert first.pdf_path.exists()
-    assert second.pdf_path.exists()
-    first.pdf_path.unlink()
-    second.pdf_path.unlink()
+    assert first.pdf_bytes == payload
+    assert second.pdf_bytes == payload
+    assert first.sha256 == second.sha256
+    assert first.content_length == second.content_length == len(payload)
 
 
 def test_download_report_pdf_rejects_short_content() -> None:

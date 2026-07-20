@@ -15,6 +15,7 @@ from typing import cast
 
 import pytest
 
+import dayu.host.tool_runtime as tool_runtime_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSnapshot, ToolAwaitSpec
@@ -48,6 +49,10 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
     ToolTruncateSpec,
     ToolTruncationStrategy,
+)
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_json,
 )
 from dayu.host.api import WaitAdapterKey
 from dayu.host.durable.state import WaitResumePolicy
@@ -109,6 +114,7 @@ from dayu.host.wait_adapter import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.tool_duplicate_governance import (
+    DuplicateAcceptedEntry,
     DuplicateAwaitingAcceptedEntry,
     DuplicateDurableMissingReason,
     DuplicateGovernanceRequest,
@@ -135,6 +141,10 @@ _TEST_PROCESS_CLOSE_DEFAULT_GRACE_SECONDS = 1.0
 _CUSTOM_PROCESS_CLOSE_GRACE_SECONDS = 0.73
 _RECORDED_PROCESS_HANDLE_CLOSE_KILL_GRACES: list[float] = []
 _ORIGINAL_INTERRUPTIBLE_PROCESS_HANDLE_CLOSE = InterruptibleProcessHandle.close
+_LEGACY_GOVERNED_FAILURE_MESSAGE = "host_tool_governed_error"
+_INTERNAL_GOVERNANCE_REASON = "internal_governance_reason"
+_REUSE_GOVERNANCE_REASON = "duplicate_reuse"
+_REUSE_READABLE_MESSAGE = "请直接使用上一次工具结果继续分析。"
 
 
 async def _recording_interruptible_process_handle_close(
@@ -1238,6 +1248,9 @@ async def test_tool_runtime_produces_tool_failed_failure_metadata(
     result = await executor.execute(_request(_call("tool-call-1")))
 
     assert result.records[0].outcome == outcome
+    candidate_result = _required_result(accept_port.candidates[0])
+    assert candidate_result.raw_tool_outcome == accepted_tool_outcome_json(outcome)
+    assert candidate_result.outcome_digest == accepted_tool_outcome_digest(outcome)
     metadata = _required_failure_metadata(accept_port.candidates[0])
     assert metadata["failure_kind"] == "tool_failed"
     assert metadata["error_code"] == "lookup_failed"
@@ -1275,6 +1288,9 @@ async def test_tool_runtime_produces_tool_cancelled_failure_metadata(
     result = await executor.execute(_request(_call("tool-call-1")))
 
     assert result.records[0].outcome == outcome
+    candidate_result = _required_result(accept_port.candidates[0])
+    assert candidate_result.raw_tool_outcome == accepted_tool_outcome_json(outcome)
+    assert candidate_result.outcome_digest == accepted_tool_outcome_digest(outcome)
     metadata = _required_failure_metadata(accept_port.candidates[0])
     assert metadata["failure_kind"] == "tool_cancelled"
     assert metadata["failure_kind"] != "tool_failed"
@@ -1410,7 +1426,7 @@ async def test_accept_rejected_does_not_expose_raw_fake_result() -> None:
         (
             ToolFactRejectedAck(
                 reason_code=ToolAcceptRejectReason.IDEMPOTENCY_CONFLICT,
-                message="reject fake result",
+                message="idempotency_conflict: reject fake result",
                 diagnostic_refs=(),
                 retryable=False,
             ),
@@ -1424,6 +1440,8 @@ async def test_accept_rejected_does_not_expose_raw_fake_result() -> None:
     assert callable_.call_count == 1
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_accept_rejected"
+    assert record.outcome.result.hint is None
+    assert "idempotency_conflict" in record.outcome.result.message
     assert "must-not-leak" not in record.outcome.result.message
 
 
@@ -1432,6 +1450,7 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
     """accept timeout 只有限重试，耗尽后返回 governed error。"""
 
     callable_ = _CountingCallable({"secret": "timeout-raw"})
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
     accept_port = _SequencedAcceptPort(
         (
             ToolFactAcceptTimedOut(
@@ -1450,6 +1469,7 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
         callable_,
         accept_port,
         retry_policy=ToolAcceptRetryPolicy(max_attempts=2, backoff_seconds=0.0),
+        diagnostic_emitter=diagnostics,
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -1459,7 +1479,10 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
     assert len(accept_port.candidates) == 2
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_accept_timeout"
+    assert record.outcome.result.hint is None
+    assert "last_error_code=ack_lost" in record.outcome.result.message
     assert "timeout-raw" not in record.outcome.result.message
+    assert diagnostics.records[-1].reason_code == "accept_timeout"
 
 
 @pytest.mark.asyncio
@@ -1538,7 +1561,7 @@ async def test_duplicate_cleanup_failure_does_not_replace_tool_timeout_return(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_call_governed"
-    assert record.outcome.result.hint == "tool_runtime_timeout"
+    assert record.outcome.result.hint is None
     assert diagnostics.records[-1].reason_code == "duplicate_cleanup_failed"
 
 
@@ -1575,6 +1598,80 @@ async def test_duplicate_cleanup_failure_does_not_replace_original_exception(
 
     with pytest.raises(TimeoutError, match="sync timeout"):
         await executor.execute(_request(_call("tool-call-1")))
+
+
+@pytest.mark.asyncio
+async def test_duplicate_accepted_index_failure_keeps_durable_accept_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """durable accept 后 duplicate accepted index 失败不改写工具结果。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    durable_missing_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _raise_record_accepted(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        entry: DuplicateAcceptedEntry,
+    ) -> None:
+        """模拟 accepted index 写入失败。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate accepted 请求。
+        :param entry: accepted entry。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出 index 失败。
+        """
+
+        del self, request, entry
+        raise RuntimeError("duplicate accepted index failed")
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录是否错误写入 durable_missing。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate cleanup 请求。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        durable_missing_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_accepted",
+        _raise_record_accepted,
+    )
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
+    callable_ = _CountingCallable({"secret": "accepted"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    assert record.outcome.result.value == {"secret": "accepted"}
+    assert len(accept_port.candidates) == 1
+    assert durable_missing_reasons == []
+    assert diagnostics.records[-1].reason_code == "duplicate_accepted_index_failed"
 
 
 @pytest.mark.asyncio
@@ -1625,7 +1722,7 @@ async def test_tool_runtime_timeout_returns_governed_failure() -> None:
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_call_governed"
-    assert record.outcome.result.hint == "tool_runtime_timeout"
+    assert record.outcome.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -1660,7 +1757,7 @@ async def test_tool_runtime_process_backed_cancel_does_not_wait_for_natural_comp
         "tool_runtime_cancelled"
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -2019,7 +2116,7 @@ async def test_tool_runtime_process_backed_cancel_kills_when_terminate_is_ignore
     assert capsule.kill_result.supported
     assert capsule.kill_result.completed
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -2052,7 +2149,7 @@ async def test_tool_runtime_interrupt_close_failure_keeps_governed_cancel_outcom
     assert callable_.call_count == 0
     assert capsule.close_calls == 1
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
     assert "host.tool_runtime.capsule_close_failed" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
 
@@ -2108,7 +2205,7 @@ async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> 
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_call_governed"
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
     assert "must-not-run" not in record.outcome.result.message
     assert activation_adapter.requests == []
 
@@ -2409,7 +2506,7 @@ async def test_awaiting_outcome_without_adapter_binding_is_governed_error() -> N
     assert callable_.call_count == 1
     assert accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "awaiting_adapter_not_configured"
+    assert record.outcome.result.hint is None
     assert activation_adapter.requests == []
 
 
@@ -2467,7 +2564,7 @@ async def test_awaiting_accept_rejected_returns_governed_error(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_rejected"
-    assert record.outcome.result.hint == "accept_rejected:idempotency_conflict"
+    assert record.outcome.result.hint is None
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
     assert activation_adapter.requests == []
 
@@ -2526,7 +2623,7 @@ async def test_stale_execution_awaiting_rejection_does_not_activate_wait(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_rejected"
-    assert record.outcome.result.hint == "accept_rejected:stale_execution"
+    assert record.outcome.result.hint is None
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
     assert activation_adapter.requests == []
 
@@ -2584,16 +2681,15 @@ async def test_awaiting_accept_timeout_returns_governed_error(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_timeout"
-    assert record.outcome.result.hint is not None
-    assert record.outcome.result.hint.startswith("accept_ack_lost;diagnostic_refs=")
-    assert "tool-diagnostic-" in record.outcome.result.hint
+    assert record.outcome.result.hint is None
+    assert "last_error_code=accept_ack_lost" in record.outcome.result.message
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT]
     assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
 async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
-    """awaiting accept retry 耗尽时最终失败 outcome 携带诊断引用。"""
+    """awaiting accept retry 耗尽时保留 Tool Trace 诊断且不写入 hint。"""
 
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
@@ -2614,10 +2710,8 @@ async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_timeout"
-    assert (
-        record.outcome.result.hint
-        == "accept_ack_lost;diagnostic_refs=tool-diagnostic-memory-1"
-    )
+    assert record.outcome.result.hint is None
+    assert "last_error_code=accept_ack_lost" in record.outcome.result.message
     assert len(diagnostics.records) == 1
     assert diagnostics.records[0].reason_code == "accept_timeout"
     assert activation_adapter.requests == []
@@ -2661,7 +2755,7 @@ async def test_poll_awaiting_without_external_job_ref_is_governed_error() -> Non
     record = outcome.records[0]
     assert awaiting_accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "awaiting_external_job_missing"
+    assert record.outcome.result.hint is None
     assert activation_adapter.requests == []
 
 
@@ -2727,7 +2821,7 @@ async def test_awaiting_outcome_stops_remaining_batch_calls() -> None:
     assert len(awaiting_accept_port.candidates) == 1
     assert isinstance(first, ToolAwaitingOutcome)
     assert isinstance(second, ToolFailedOutcome)
-    assert second.result.hint == "run_suspended_by_tool_awaiting"
+    assert second.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -2792,6 +2886,91 @@ async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
     assert second.result.error == "tool_accept_rejected"
     assert isinstance(third, ToolFailedOutcome)
     assert third.result.error == "tool_accept_timeout"
+
+
+@pytest.mark.parametrize("message", (None, "", " \t "))
+def test_governed_failure_projection_rejects_missing_readable_message(
+    message: str | None,
+) -> None:
+    """治理失败投影在 owner 边界拒绝缺失或空白业务可读说明。
+
+    :param message: 对抗性决策中的缺失或空白说明。
+    :returns: ``None``。
+    """
+
+    decision = ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        reason_code=_INTERNAL_GOVERNANCE_REASON,
+        message=message,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        tool_runtime_module._governed_failure_outcome(decision)
+
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(exc_info.value)
+    with pytest.raises(ValueError) as governance_exc_info:
+        ToolAcceptGovernance(
+            policy_decision=decision,
+            tool_idempotency_key=None,
+            duplicate=None,
+        )
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(governance_exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "decision",
+    (
+        ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.ALLOW,
+            reason_code=None,
+            message=None,
+        ),
+        ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.REUSE,
+            reason_code=_REUSE_GOVERNANCE_REASON,
+            message=_REUSE_READABLE_MESSAGE,
+        ),
+    ),
+)
+def test_governed_failure_projection_rejects_non_failure_decision(
+    decision: ToolPolicyDecision,
+) -> None:
+    """``ALLOW`` / ``REUSE`` 决策不得被投影为治理失败 outcome。
+
+    :param decision: 不属于治理失败的合法决策。
+    :returns: ``None``。
+    """
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"{decision.kind.value} policy decision cannot produce governed failure"
+        ),
+    ) as exc_info:
+        tool_runtime_module._governed_failure_outcome(decision)
+
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(exc_info.value)
+
+
+def test_governed_failure_projection_preserves_readable_message() -> None:
+    """合法治理决策仍投影原业务可读说明，不使用内部 reason code。
+
+    :returns: ``None``。
+    """
+
+    readable_message = "当前工具调用未获允许；请调整请求后重试。"
+    decision = ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        reason_code=_INTERNAL_GOVERNANCE_REASON,
+        message=readable_message,
+    )
+
+    outcome = tool_runtime_module._governed_failure_outcome(decision)
+    serialized_outcome = accepted_tool_outcome_json(outcome)
+
+    assert outcome.result.message == readable_message
+    assert _INTERNAL_GOVERNANCE_REASON not in str(serialized_outcome)
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(serialized_outcome)
 
 
 def _executor(

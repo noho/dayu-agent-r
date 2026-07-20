@@ -12,20 +12,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import html
 import http.server
+import importlib.util
 import json
 import logging
 import os
+import re
+import secrets
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Final, Iterator, TypeAlias, cast
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -35,6 +40,15 @@ from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.log import LogLevel, configure
+from dayu.tools.web.web_diagnostics import (
+    WEB_DIAGNOSTIC_SCHEMA_REVISION,
+    WEB_DIAGNOSTIC_SCHEMA_VERSION,
+    WebDiagnosticOutcome,
+    content_diagnostic_from_bytes,
+    content_diagnostic_from_text,
+    project_error_message,
+    project_safe_url_or_empty,
+)
 from dayu.service.host_assembly import (
     assemble_effective_tool_provider_configs,
     discover_service_tools,
@@ -47,8 +61,8 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 _DEFAULT_OUTPUT_ROOT: Final[Path] = Path("workspace/output/web_smoke")
 _DEFAULT_EXTERNAL_URL_FILE: Final[Path] = Path(__file__).resolve().with_name("web_ci_urls.jsonl")
 _DEFAULT_EXTERNAL_LIMIT: Final[int] = 2
-_DIAGNOSTIC_SCHEMA_VERSION: Final[str] = "web-diagnostics-v1"
-_MIN_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = 1
+_DIAGNOSTIC_SCHEMA_VERSION: Final[str] = WEB_DIAGNOSTIC_SCHEMA_VERSION
+_MIN_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = WEB_DIAGNOSTIC_SCHEMA_REVISION
 _STATUS_PASSED: Final[str] = "passed"
 _STATUS_FAILED: Final[str] = "failed"
 _STATUS_SKIPPED: Final[str] = "skipped"
@@ -59,7 +73,11 @@ _EXIT_SCHEMA_OR_INFRA_FAILURE: Final[int] = 2
 _CASE_LOCAL_HTML: Final[str] = "local_html"
 _CASE_LOCAL_PDF: Final[str] = "local_pdf"
 _CASE_LOCAL_BROWSER: Final[str] = "local_browser"
+_CASE_LOCAL_CHALLENGE_CONTROL: Final[str] = "local_challenge_control"
 _CASE_LOCAL_ASSEMBLY_CONFIG: Final[str] = "local_assembly_config"
+_CASE_LOCAL_FILING: Final[str] = "local_filing"
+_CASE_LOCAL_PRIVATE_DENY: Final[str] = "local_private_deny"
+_CASE_LOCAL_CUSTOM_PORT_DENY: Final[str] = "local_custom_port_deny"
 _CASE_EXTERNAL: Final[str] = "external"
 _CASE_SEARCH_PROVIDER: Final[str] = "search_provider"
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
@@ -68,9 +86,14 @@ _LOCAL_FIXTURE_HOST: Final[str] = "127.0.0.1"
 _LOCAL_HTML_PATH: Final[str] = "/index.html"
 _LOCAL_PDF_PATH: Final[str] = "/fixture.pdf"
 _LOCAL_BROWSER_PATH: Final[str] = "/client-rendered.html"
+_LOCAL_CHALLENGE_PATH: Final[str] = "/challenge-control.html"
+_LOCAL_FILING_PATH: Final[str] = "/aapl-20240928.htm"
+_LOCAL_NEGATIVE_PATH: Final[str] = "/negative-control"
+_FIXTURE_TOKEN_QUERY_KEY: Final[str] = "dayu_smoke_token"
 _LOCAL_HTML_CONTENT_TYPE: Final[str] = "text/html; charset=utf-8"
 _LOCAL_PDF_CONTENT_TYPE: Final[str] = "application/pdf"
 _HTTP_GET_METHOD: Final[str] = "GET"
+_HTTP_HEAD_METHOD: Final[str] = "HEAD"
 _HTTP_HEADER_CONTENT_TYPE: Final[str] = "Content-Type"
 _HTTP_HEADER_CONTENT_LENGTH: Final[str] = "Content-Length"
 _HTTP_HEADER_CACHE_CONTROL: Final[str] = "Cache-Control"
@@ -78,6 +101,7 @@ _HTTP_CACHE_CONTROL_NO_STORE: Final[str] = "no-store"
 _HTTP_STATUS_OK: Final[int] = 200
 _HTTP_STATUS_NOT_FOUND: Final[int] = 404
 _HTTP_STATUS_METHOD_NOT_ALLOWED: Final[int] = 405
+_HTTP_STATUS_FORBIDDEN: Final[int] = 403
 _SERVER_JOIN_TIMEOUT_SECONDS: Final[float] = 2.0
 _DOCLING_INVOCATION_BLOCKER_FILE: Final[str] = "local-pdf-docling-invocation-blocker.md"
 _BUCKET_PASSED: Final[str] = "passed"
@@ -94,12 +118,17 @@ _BUCKET_DOCLING_INIT_SKIP: Final[str] = "docling_runtime_initialization_error"
 _BUCKET_BROWSER_BACKEND_NOT_OBSERVED: Final[str] = "browser_backend_not_observed"
 _BUCKET_BROWSER_FETCH_FAILURE: Final[str] = "browser_fetch_failure"
 _BUCKET_BROWSER_PROFILE_NOT_SAMPLED: Final[str] = "browser_profile_not_sampled"
+_BUCKET_FIXTURE_LEDGER_GAP: Final[str] = "fixture_ledger_gap"
+_BUCKET_CONTENT_ORACLE_MISMATCH: Final[str] = "content_oracle_mismatch"
+_BUCKET_NEGATIVE_CONTROL_FAILED: Final[str] = "negative_control_failed"
+_BUCKET_CHALLENGE_CONTROL_FAILED: Final[str] = "challenge_control_failed"
 _BUCKET_WEB_CONFIG_LOADER_FAILURE: Final[str] = "web_config_loader_failure"
 _BUCKET_WEB_ASSEMBLY_DISCOVERY_FAILURE: Final[str] = "web_assembly_discovery_failure"
 _BUCKET_WEB_TOOL_MISSING: Final[str] = "web_tool_missing"
 _BUCKET_WEB_ASSEMBLY_FETCH_FAILURE: Final[str] = "web_assembly_fetch_failure"
 _BUCKET_WEB_ASSEMBLY_FETCH_CONTENT_FAILURE: Final[str] = "web_assembly_fetch_content_failure"
 _BUCKET_WEB_ASSEMBLY_CONFIG_MISMATCH: Final[str] = "web_assembly_config_mismatch"
+_BUCKET_TYPED_EGRESS_DENY_FAILED: Final[str] = "typed_egress_deny_failed"
 _BUCKET_SEARCH_PROVIDER_PASSED: Final[str] = "search_provider_passed"
 _BUCKET_PROVIDER_KEY_MISSING: Final[str] = "provider_key_missing"
 _BUCKET_PROVIDER_AUTH_FAILURE: Final[str] = "provider_auth_failure"
@@ -118,6 +147,15 @@ _ASSEMBLY_PATH_LABEL: Final[str] = (
     "discover_service_tools -> ToolDefinition.callable"
 )
 _PACKAGE_CONFIG_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "dayu" / "config"
+_VERSIONED_FILING_FIXTURE: Final[Path] = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fins"
+    / "fixtures"
+    / "aapl_xbrl"
+    / "fil_0000320193-24-000123"
+    / "aapl-20240928.htm"
+)
 _NOISY_DEBUG_LOGGER_NAMES: Final[tuple[str, ...]] = (
     "dayu.fins",
     "dayu.tools.web",
@@ -132,7 +170,6 @@ _ASSEMBLY_PROVIDER_CONFIG: Final[JsonObject] = {
     "request_timeout_seconds": 6.0,
     "max_search_results": 3,
     "fetch_truncate_chars": _ASSEMBLY_FETCH_TRUNCATE_CHARS,
-    "allow_private_network_url": True,
     "playwright_channel": "chrome",
     "playwright_storage_state_dir": "",
 }
@@ -159,7 +196,11 @@ _PDF_STREAM_LINE_STEP: Final[int] = 28
 _PDF_PAGE_WIDTH: Final[int] = 612
 _PDF_PAGE_HEIGHT: Final[int] = 792
 _PDF_OBJECT_COUNT: Final[int] = 5
-_CHILD_STDIO_LOG_CHARS: Final[int] = 1_000
+_FIXTURE_LEDGER_MAX_OBSERVATIONS: Final[int] = 256
+_NEGATIVE_CONTROL_TIMEOUT_SECONDS: Final[float] = 2.0
+_CHALLENGE_FIXTURE_BYTES: Final[bytes] = (
+    b"<!doctype html><html><body>verify you are human bot challenge</body></html>"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +257,267 @@ class LocalFixtureUrls:
     browser_url: str
 
 
+class FixtureResponseKind(StrEnum):
+    """本地 fixture 响应或负控的封闭类型。"""
+
+    HTML = "html"
+    PDF = "pdf"
+    BROWSER = "browser"
+    CHALLENGE = "challenge"
+    NEGATIVE_MISSING_TOKEN = "negative_missing_token"
+    NEGATIVE_WRONG_TOKEN = "negative_wrong_token"
+    NEGATIVE_REPLAY_TOKEN = "negative_replay_token"
+    NEGATIVE_METHOD = "negative_method"
+    NEGATIVE_UNKNOWN_PATH = "negative_unknown_path"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalFixtureCase:
+    """父进程注册的单个 local smoke case。
+
+    Args:
+        case_name: 稳定 case 名称。
+        case_kind: smoke 分类类型。
+        path: 规范化 fixture path。
+        url: 含一次性 256-bit token 的 child URL。
+        token: 只保留在父进程活跃 session 的 raw token。
+        token_digest: ledger 使用的 token SHA-256。
+        response_kind: fixture 响应类型。
+        response_body: 父进程实际注册的 exact response bytes。
+        response_digest: exact response bytes 的 SHA-256。
+        expected_backend: artifact 必须证明的 backend。
+        sample_playwright: diagnostics 是否执行 Playwright profile。
+        skip_requests: diagnostics 是否跳过 raw requests profile。
+        skip_tool_fetch: diagnostics 是否跳过 tool profile。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    case_name: str
+    case_kind: str
+    path: str
+    url: str
+    token: str
+    token_digest: str
+    response_kind: FixtureResponseKind
+    response_body: bytes
+    response_digest: str
+    expected_backend: str
+    sample_playwright: bool
+    skip_requests: bool
+    skip_tool_fetch: bool
+
+    @property
+    def response_length(self) -> int:
+        """返回父进程注册的 exact response bytes 长度。
+
+        Args:
+            无。
+
+        Returns:
+            response bytes 长度。
+
+        Raises:
+            无。
+        """
+
+        return len(self.response_body)
+
+
+@dataclass(frozen=True, slots=True)
+class FixtureRequestObservation:
+    """handler 追加到父进程内存 ledger 的有界观察项。
+
+    Args:
+        token_digest: 请求 token 的 SHA-256；缺失 token 使用空字符串摘要。
+        method: HTTP method。
+        normalized_path: 删除 query 后的 path。
+        response_kind: 响应或拒绝类型。
+        response_digest: 实际响应 bytes 的 SHA-256。
+        accepted: token/path/method 是否被接受。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    token_digest: str
+    method: str
+    normalized_path: str
+    response_kind: FixtureResponseKind
+    response_digest: str
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenFixtureLedger:
+    """server 停止后冻结的 local fixture ledger 快照。
+
+    Args:
+        observations: 有界 typed request observations。
+        dropped_count: 超出 ledger 上限的观察项数量。
+        lifecycle: 父进程记录的生命周期顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    observations: tuple[FixtureRequestObservation, ...]
+    dropped_count: int
+    lifecycle: tuple[str, ...]
+
+
+class ParentFixtureLedger:
+    """父进程拥有、handler 只追加的内存 ledger。"""
+
+    def __init__(self, *, max_observations: int) -> None:
+        """初始化可变 ledger。
+
+        Args:
+            max_observations: 最大 request observation 数。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 上限不是正整数时抛出。
+        """
+
+        if isinstance(max_observations, bool) or max_observations <= 0:
+            raise ValueError("fixture ledger max_observations must be positive")
+        self._max_observations = max_observations
+        self._observations: list[FixtureRequestObservation] = []
+        self._dropped_count = 0
+        self._lifecycle: list[str] = ["created"]
+        self._frozen = False
+        self._lock = threading.Lock()
+
+    def record_lifecycle(self, stage: str) -> None:
+        """由父进程记录 lifecycle stage。
+
+        Args:
+            stage: 稳定 lifecycle 标签。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: ledger 已冻结时抛出。
+        """
+
+        with self._lock:
+            if self._frozen:
+                raise RuntimeError("fixture ledger is frozen")
+            self._lifecycle.append(stage)
+
+    def append(self, observation: FixtureRequestObservation) -> None:
+        """由 fixture handler 追加一条 typed observation。
+
+        Args:
+            observation: 不含 raw token/header/body 的观察项。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: ledger 已冻结时抛出。
+        """
+
+        with self._lock:
+            if self._frozen:
+                raise RuntimeError("fixture ledger is frozen")
+            if len(self._observations) >= self._max_observations:
+                self._dropped_count += 1
+                return
+            self._observations.append(observation)
+
+    def freeze(self) -> FrozenFixtureLedger:
+        """在 server 停止后冻结 ledger。
+
+        Args:
+            无。
+
+        Returns:
+            不可变 ledger 快照。
+
+        Raises:
+            RuntimeError: 重复冻结时抛出。
+        """
+
+        with self._lock:
+            if self._frozen:
+                raise RuntimeError("fixture ledger already frozen")
+            self._lifecycle.append("frozen")
+            self._frozen = True
+            return FrozenFixtureLedger(
+                observations=tuple(self._observations),
+                dropped_count=self._dropped_count,
+                lifecycle=tuple(self._lifecycle),
+            )
+
+
+@dataclass(slots=True)
+class LocalFixtureSession:
+    """local fixture server 与父进程 ledger 的共生 session。
+
+    Args:
+        urls: 旧 direct assembly consumer 使用的基础 URL 集合。
+        cases: 已注册 local cases。
+        ledger: 活跃父进程 ledger。
+        frozen_ledger: server 停止后由 context manager 写入的冻结快照。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    urls: LocalFixtureUrls
+    cases: tuple[LocalFixtureCase, ...]
+    ledger: ParentFixtureLedger
+    frozen_ledger: FrozenFixtureLedger | None = None
+
+
+class _LocalFixtureServer(http.server.ThreadingHTTPServer):
+    """携带父进程 registrations 与 ledger 的 typed HTTP server。"""
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        cases: tuple[LocalFixtureCase, ...],
+        ledger: ParentFixtureLedger,
+    ) -> None:
+        """初始化 typed fixture server。
+
+        Args:
+            server_address: host/port 监听地址。
+            cases: 父进程预注册 cases。
+            ledger: 父进程内存 ledger。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: server 绑定失败时抛出。
+        """
+
+        self.fixture_cases = cases
+        self.fixture_ledger = ledger
+        self.accepted_token_digests: set[str] = set()
+        self.fixture_lock = threading.Lock()
+        super().__init__(server_address, _LocalFixtureRequestHandler)
+
+
 @dataclass(frozen=True, slots=True)
 class DiagnosticChildResult:
     """diagnostics 子进程执行结果。
@@ -235,6 +537,27 @@ class DiagnosticChildResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingLocalDiagnostic:
+    """server 活跃期间暂存、freeze 后才能分类的 local child 结果。
+
+    Args:
+        fixture_case: 父进程注册 case。
+        artifact_path: child 诊断 artifact 路径。
+        child_result: child 进程退出事实。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    fixture_case: LocalFixtureCase
+    artifact_path: Path
+    child_result: DiagnosticChildResult
 
 
 class _OpenCancellationToken:
@@ -495,6 +818,228 @@ def _local_fixture_urls(port: int) -> LocalFixtureUrls:
     )
 
 
+def _token_digest(token: str) -> str:
+    """计算 fixture token 的 SHA-256 hex。
+
+    Args:
+        token: 父进程生成的 raw token。
+
+    Returns:
+        64 位小写 SHA-256 hex。
+
+    Raises:
+        无。
+    """
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _fixture_url(*, port: int, path: str, token: str) -> str:
+    """构造携带一次性 query token 的 local fixture URL。
+
+    Args:
+        port: local server 端口。
+        path: normalized fixture path。
+        token: 256-bit hex token。
+
+    Returns:
+        仅供 child 调用的 tokenized URL。
+
+    Raises:
+        ValueError: port 非正时抛出。
+    """
+
+    if port <= 0:
+        raise ValueError("local fixture server 端口必须大于 0。")
+    query = urlencode({_FIXTURE_TOKEN_QUERY_KEY: token})
+    return f"http://{_LOCAL_FIXTURE_HOST}:{port}{path}?{query}"
+
+
+def _new_fixture_case(
+    *,
+    port: int,
+    case_name: str,
+    case_kind: str,
+    path: str,
+    response_kind: FixtureResponseKind,
+    response_body: bytes,
+    expected_backend: str,
+    sample_playwright: bool,
+    skip_requests: bool,
+    skip_tool_fetch: bool,
+) -> LocalFixtureCase:
+    """创建带唯一 256-bit sentinel 的父进程 fixture case。
+
+    Args:
+        port: local server 端口。
+        case_name: 稳定 case 名称。
+        case_kind: smoke case 类型。
+        path: fixture path。
+        response_kind: 响应类型。
+        response_body: exact registered bytes。
+        expected_backend: artifact 必须证明的 backend。
+        sample_playwright: 是否执行 Playwright。
+        skip_requests: 是否跳过 raw requests。
+        skip_tool_fetch: 是否跳过 tool fetch。
+
+    Returns:
+        raw token 仅存在父进程 session 的 typed case。
+
+    Raises:
+        ValueError: port 非正时抛出。
+    """
+
+    token = secrets.token_hex(32)
+    response = content_diagnostic_from_bytes(response_body)
+    return LocalFixtureCase(
+        case_name=case_name,
+        case_kind=case_kind,
+        path=path,
+        url=_fixture_url(port=port, path=path, token=token),
+        token=token,
+        token_digest=_token_digest(token),
+        response_kind=response_kind,
+        response_body=response_body,
+        response_digest=response.digest,
+        expected_backend=expected_backend,
+        sample_playwright=sample_playwright,
+        skip_requests=skip_requests,
+        skip_tool_fetch=skip_tool_fetch,
+    )
+
+
+def _build_local_fixture_cases(port: int) -> tuple[LocalFixtureCase, ...]:
+    """为每个 local smoke case 注册唯一 sentinel 与 exact response bytes。
+
+    Args:
+        port: local server 端口。
+
+    Returns:
+        HTML、PDF、browser、challenge、版本化 filing 与 assembly cases。
+
+    Raises:
+        OSError: 版本化 filing fixture 读取失败时抛出。
+        ValueError: port 非正或版本化 fixture 不是常规文件时抛出。
+    """
+
+    html_bytes = _html_fixture_bytes()
+    pdf_bytes = _pdf_fixture_bytes()
+    browser_bytes = _browser_fixture_bytes()
+    if not _VERSIONED_FILING_FIXTURE.is_file():
+        raise ValueError("版本化 AAPL filing fixture 缺失或不是常规文件。")
+    filing_bytes = _VERSIONED_FILING_FIXTURE.read_bytes()
+    return (
+        _new_fixture_case(
+            port=port,
+            case_name="local-html-requests",
+            case_kind=_CASE_LOCAL_HTML,
+            path=_LOCAL_HTML_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=html_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=False,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-html-tool",
+            case_kind=_CASE_LOCAL_HTML,
+            path=_LOCAL_HTML_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=html_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=True,
+            skip_tool_fetch=False,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-pdf-requests",
+            case_kind=_CASE_LOCAL_PDF,
+            path=_LOCAL_PDF_PATH,
+            response_kind=FixtureResponseKind.PDF,
+            response_body=pdf_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=False,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-pdf-tool",
+            case_kind=_CASE_LOCAL_PDF,
+            path=_LOCAL_PDF_PATH,
+            response_kind=FixtureResponseKind.PDF,
+            response_body=pdf_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=True,
+            skip_tool_fetch=False,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-browser-playwright",
+            case_kind=_CASE_LOCAL_BROWSER,
+            path=_LOCAL_BROWSER_PATH,
+            response_kind=FixtureResponseKind.BROWSER,
+            response_body=browser_bytes,
+            expected_backend="playwright",
+            sample_playwright=True,
+            skip_requests=True,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-challenge-control",
+            case_kind=_CASE_LOCAL_CHALLENGE_CONTROL,
+            path=_LOCAL_CHALLENGE_PATH,
+            response_kind=FixtureResponseKind.CHALLENGE,
+            response_body=_CHALLENGE_FIXTURE_BYTES,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=False,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-filing-http",
+            case_kind=_CASE_LOCAL_FILING,
+            path=_LOCAL_FILING_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=filing_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=False,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-filing-playwright",
+            case_kind=_CASE_LOCAL_FILING,
+            path=_LOCAL_FILING_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=filing_bytes,
+            expected_backend="playwright",
+            sample_playwright=True,
+            skip_requests=True,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-assembly-config",
+            case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+            path=_LOCAL_HTML_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=html_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=True,
+            skip_tool_fetch=False,
+        ),
+    )
+
+
 def _html_fixture_bytes() -> bytes:
     """构造本地 HTML fixture 响应体。
 
@@ -637,37 +1182,7 @@ class _LocalFixtureRequestHandler(http.server.BaseHTTPRequestHandler):
             无。
         """
 
-        path = urlparse(self.path).path
-        if path == _LOCAL_HTML_PATH:
-            _send_fixture_response(
-                self,
-                status_code=_HTTP_STATUS_OK,
-                content_type=_LOCAL_HTML_CONTENT_TYPE,
-                body=_html_fixture_bytes(),
-            )
-            return
-        if path == _LOCAL_PDF_PATH:
-            _send_fixture_response(
-                self,
-                status_code=_HTTP_STATUS_OK,
-                content_type=_LOCAL_PDF_CONTENT_TYPE,
-                body=_pdf_fixture_bytes(),
-            )
-            return
-        if path == _LOCAL_BROWSER_PATH:
-            _send_fixture_response(
-                self,
-                status_code=_HTTP_STATUS_OK,
-                content_type=_LOCAL_HTML_CONTENT_TYPE,
-                body=_browser_fixture_bytes(),
-            )
-            return
-        _send_fixture_response(
-            self,
-            status_code=_HTTP_STATUS_NOT_FOUND,
-            content_type="text/plain; charset=utf-8",
-            body=b"not found\n",
-        )
+        _handle_fixture_request(self)
 
     def do_HEAD(self) -> None:
         """拒绝非 smoke 必需的 HEAD 请求。
@@ -682,12 +1197,7 @@ class _LocalFixtureRequestHandler(http.server.BaseHTTPRequestHandler):
             无。
         """
 
-        _send_fixture_response(
-            self,
-            status_code=_HTTP_STATUS_METHOD_NOT_ALLOWED,
-            content_type="text/plain; charset=utf-8",
-            body=b"",
-        )
+        _handle_fixture_request(self)
 
     def log_message(self, format: str, *args: str) -> None:
         """关闭默认 stderr 访问日志。
@@ -704,6 +1214,171 @@ class _LocalFixtureRequestHandler(http.server.BaseHTTPRequestHandler):
         """
 
         return
+
+
+def _fixture_content_type(case: LocalFixtureCase) -> str:
+    """返回注册 case 的稳定 Content-Type。
+
+    Args:
+        case: 父进程注册 case。
+
+    Returns:
+        PDF 使用 application/pdf，其余使用 HTML UTF-8。
+
+    Raises:
+        无。
+    """
+
+    if case.response_kind is FixtureResponseKind.PDF:
+        return _LOCAL_PDF_CONTENT_TYPE
+    return _LOCAL_HTML_CONTENT_TYPE
+
+
+def _negative_response_body(kind: FixtureResponseKind) -> bytes:
+    """构造不含 raw token 的负控响应体。
+
+    Args:
+        kind: 负控类型。
+
+    Returns:
+        稳定 ASCII response bytes。
+
+    Raises:
+        ValueError: kind 不是负控类型时抛出。
+    """
+
+    if kind not in {
+        FixtureResponseKind.NEGATIVE_MISSING_TOKEN,
+        FixtureResponseKind.NEGATIVE_WRONG_TOKEN,
+        FixtureResponseKind.NEGATIVE_REPLAY_TOKEN,
+        FixtureResponseKind.NEGATIVE_METHOD,
+        FixtureResponseKind.NEGATIVE_UNKNOWN_PATH,
+    }:
+        raise ValueError("fixture response kind is not negative")
+    return f"rejected:{kind.value}\n".encode("ascii")
+
+
+def _append_fixture_observation(
+    *,
+    server: _LocalFixtureServer,
+    token: str,
+    method: str,
+    path: str,
+    response_kind: FixtureResponseKind,
+    body: bytes,
+    accepted: bool,
+) -> None:
+    """向父进程 ledger 追加不含 raw token/body 的 typed observation。
+
+    Args:
+        server: typed local fixture server。
+        token: 请求携带 token；只在追加前计算摘要。
+        method: HTTP method。
+        path: normalized path。
+        response_kind: 响应或拒绝类型。
+        body: 实际响应 bytes；只计算摘要。
+        accepted: 请求是否接受。
+
+    Returns:
+        无。
+
+    Raises:
+        RuntimeError: ledger 已冻结时抛出。
+    """
+
+    body_diagnostic = content_diagnostic_from_bytes(body)
+    server.fixture_ledger.append(
+        FixtureRequestObservation(
+            token_digest=_token_digest(token),
+            method=method,
+            normalized_path=path,
+            response_kind=response_kind,
+            response_digest=body_diagnostic.digest,
+            accepted=accepted,
+        )
+    )
+
+
+def _handle_fixture_request(handler: _LocalFixtureRequestHandler) -> None:
+    """校验一次性 token、记录 ledger 并发送 fixture 响应。
+
+    Args:
+        handler: 当前 typed request handler。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: HTTP response 写入失败时由 stdlib 透出。
+    """
+
+    server = cast(_LocalFixtureServer, handler.server)
+    parsed = urlparse(handler.path)
+    path = parsed.path or "/"
+    token_values = parse_qs(parsed.query, keep_blank_values=True).get(
+        _FIXTURE_TOKEN_QUERY_KEY,
+        [],
+    )
+    token = token_values[0] if len(token_values) == 1 else ""
+    path_cases = tuple(case for case in server.fixture_cases if case.path == path)
+    matched_case = next((case for case in path_cases if case.token == token), None)
+    if not path_cases:
+        kind = FixtureResponseKind.NEGATIVE_UNKNOWN_PATH
+    elif not token:
+        kind = FixtureResponseKind.NEGATIVE_MISSING_TOKEN
+    elif matched_case is None:
+        kind = FixtureResponseKind.NEGATIVE_WRONG_TOKEN
+    elif handler.command != _HTTP_GET_METHOD:
+        kind = FixtureResponseKind.NEGATIVE_METHOD
+    else:
+        with server.fixture_lock:
+            if matched_case.token_digest in server.accepted_token_digests:
+                kind = FixtureResponseKind.NEGATIVE_REPLAY_TOKEN
+            else:
+                server.accepted_token_digests.add(matched_case.token_digest)
+                kind = matched_case.response_kind
+    if matched_case is not None and kind is matched_case.response_kind:
+        body = matched_case.response_body
+        _append_fixture_observation(
+            server=server,
+            token=token,
+            method=handler.command,
+            path=path,
+            response_kind=kind,
+            body=body,
+            accepted=True,
+        )
+        _send_fixture_response(
+            handler,
+            status_code=_HTTP_STATUS_OK,
+            content_type=_fixture_content_type(matched_case),
+            body=body,
+        )
+        return
+    body = _negative_response_body(kind)
+    observed_body = body if handler.command == _HTTP_GET_METHOD else b""
+    _append_fixture_observation(
+        server=server,
+        token=token,
+        method=handler.command,
+        path=path,
+        response_kind=kind,
+        body=observed_body,
+        accepted=False,
+    )
+    status_code = (
+        _HTTP_STATUS_NOT_FOUND
+        if kind is FixtureResponseKind.NEGATIVE_UNKNOWN_PATH
+        else _HTTP_STATUS_METHOD_NOT_ALLOWED
+        if kind is FixtureResponseKind.NEGATIVE_METHOD
+        else _HTTP_STATUS_FORBIDDEN
+    )
+    _send_fixture_response(
+        handler,
+        status_code=status_code,
+        content_type="text/plain; charset=utf-8",
+        body=body,
+    )
 
 
 def _send_fixture_response(
@@ -738,32 +1413,147 @@ def _send_fixture_response(
 
 
 @contextlib.contextmanager
-def _running_local_fixture_server() -> Iterator[LocalFixtureUrls]:
+def _running_local_fixture_server() -> Iterator[LocalFixtureSession]:
     """启动本地 loopback fixture server。
 
     Args:
         无。
 
     Returns:
-        context manager 期间可访问的 fixture URLs。
+        context manager 期间可访问的 fixture session；退出后含 frozen ledger。
 
     Raises:
         OSError: server 绑定或启动失败时抛出。
     """
 
-    server = http.server.ThreadingHTTPServer((_LOCAL_FIXTURE_HOST, 0), _LocalFixtureRequestHandler)
+    ledger = ParentFixtureLedger(
+        max_observations=_FIXTURE_LEDGER_MAX_OBSERVATIONS
+    )
+    server = _LocalFixtureServer((_LOCAL_FIXTURE_HOST, 0), (), ledger)
+    port = int(server.server_address[1])
+    cases = _build_local_fixture_cases(port)
+    server.fixture_cases = cases
+    assembly_case = next(
+        case for case in cases if case.case_kind == _CASE_LOCAL_ASSEMBLY_CONFIG
+    )
+    pdf_case = next(
+        case for case in cases if case.case_name == "local-pdf-requests"
+    )
+    browser_case = next(
+        case for case in cases if case.case_name == "local-browser-playwright"
+    )
+    session = LocalFixtureSession(
+        urls=LocalFixtureUrls(
+            html_url=assembly_case.url,
+            pdf_url=pdf_case.url,
+            browser_url=browser_case.url,
+        ),
+        cases=cases,
+        ledger=ledger,
+    )
     thread = threading.Thread(
         target=server.serve_forever,
         name="dayu-web-smoke-local-fixture",
         daemon=True,
     )
     thread.start()
+    ledger.record_lifecycle("server_started")
     try:
-        yield _local_fixture_urls(int(server.server_address[1]))
+        yield session
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=_SERVER_JOIN_TIMEOUT_SECONDS)
+        ledger.record_lifecycle("server_stopped")
+        session.frozen_ledger = ledger.freeze()
+
+
+def _replace_fixture_query_token(url: str, token: str) -> str:
+    """替换 fixture URL 的 query token。
+
+    Args:
+        url: 原始 tokenized URL。
+        token: 新 token；空字符串表示删除 query。
+
+    Returns:
+        替换后的 URL。
+
+    Raises:
+        无。
+    """
+
+    parsed = urlparse(url)
+    query = urlencode({_FIXTURE_TOKEN_QUERY_KEY: token}) if token else ""
+    return urlunparse(parsed._replace(query=query))
+
+
+def _send_negative_control_request(
+    url: str,
+    *,
+    method: str = _HTTP_GET_METHOD,
+) -> None:
+    """由父进程发送一次应被 fixture 拒绝的负控请求。
+
+    Args:
+        url: 负控 URL。
+        method: 封闭的 GET 或 HEAD method。
+
+    Returns:
+        无；HTTP 结果只由 ledger classifier 判断，不由此函数签发结论。
+
+    Raises:
+        ValueError: method 不是 GET/HEAD 时抛出。
+        requests.RequestException: local fixture 请求失败时抛出。
+    """
+
+    if method not in {_HTTP_GET_METHOD, _HTTP_HEAD_METHOD}:
+        raise ValueError("fixture negative control method must be GET or HEAD")
+    response = requests.request(
+        method,
+        url,
+        timeout=_NEGATIVE_CONTROL_TIMEOUT_SECONDS,
+        allow_redirects=False,
+    )
+    response.close()
+
+
+def _exercise_pre_child_negative_controls(case: LocalFixtureCase) -> None:
+    """在 child 启动前发送 missing/wrong/method/unknown-path 负控。
+
+    Args:
+        case: 当前父进程 fixture case。
+
+    Returns:
+        无。
+
+    Raises:
+        requests.RequestException: local fixture 请求失败时抛出。
+    """
+
+    _send_negative_control_request(_replace_fixture_query_token(case.url, ""))
+    _send_negative_control_request(
+        _replace_fixture_query_token(case.url, secrets.token_hex(32))
+    )
+    _send_negative_control_request(case.url, method=_HTTP_HEAD_METHOD)
+    parsed = urlparse(case.url)
+    unknown_url = urlunparse(parsed._replace(path=_LOCAL_NEGATIVE_PATH))
+    _send_negative_control_request(unknown_url)
+
+
+def _exercise_post_child_replay_control(case: LocalFixtureCase) -> None:
+    """在 child 返回后重放同一 token，证明一次性 token 拒绝语义。
+
+    Args:
+        case: 当前父进程 fixture case。
+
+    Returns:
+        无。
+
+    Raises:
+        requests.RequestException: local fixture 请求失败时抛出。
+    """
+
+    _send_negative_control_request(case.url)
 
 
 def _utc_run_label() -> str:
@@ -1135,25 +1925,6 @@ def _mapping_or_empty(value: JsonValue) -> JsonObject:
     return {}
 
 
-def _stdio_log_prefix(value: str) -> str:
-    """生成可写入 DEBUG 日志的子进程输出前缀。
-
-    Args:
-        value: 子进程 stdout 或 stderr。
-
-    Returns:
-        有界且单行化的输出前缀；空输入返回空字符串。
-
-    Raises:
-        无。
-    """
-
-    normalized = " ".join(value.split())
-    if len(normalized) <= _CHILD_STDIO_LOG_CHARS:
-        return normalized
-    return normalized[:_CHILD_STDIO_LOG_CHARS] + "...<truncated>"
-
-
 def _diagnostic_schema_gap(payload: Mapping[str, JsonValue], *, case_kind: str) -> str:
     """返回 diagnostics artifact schema gap 描述。
 
@@ -1168,18 +1939,116 @@ def _diagnostic_schema_gap(payload: Mapping[str, JsonValue], *, case_kind: str) 
         无。
     """
 
-    version = _string_field(payload, "diagnostic_schema_version") or _string_field(payload, "schema_version")
+    del case_kind
+    version = _string_field(payload, "diagnostic_schema_version")
+    schema_version = _string_field(payload, "schema_version")
     revision = _int_field(payload, "diagnostic_schema_revision")
-    if version != _DIAGNOSTIC_SCHEMA_VERSION:
-        return "diagnostics artifact 缺少当前 smoke 需要的 diagnostic_schema_version。"
-    if revision is None or revision < _MIN_DIAGNOSTIC_SCHEMA_REVISION:
-        return "diagnostics artifact 的 diagnostic_schema_revision 低于当前 smoke 要求。"
+    if version != _DIAGNOSTIC_SCHEMA_VERSION or schema_version != _DIAGNOSTIC_SCHEMA_VERSION:
+        return "diagnostics artifact 必须精确使用 web-diagnostics-v2，旧 schema 不兼容。"
+    if revision != _MIN_DIAGNOSTIC_SCHEMA_REVISION:
+        return "diagnostics artifact 必须精确使用 diagnostic_schema_revision=2。"
+    legacy_field = _legacy_diagnostic_field(payload)
+    if legacy_field:
+        return f"diagnostics artifact 包含禁止的旧 schema 字段：{legacy_field}。"
+    for profile_name in (
+        "requests_profile",
+        "fetch_web_page_profile",
+        "playwright_profile",
+    ):
+        profile = _nested_object(payload, profile_name)
+        gap = _profile_schema_gap(profile, profile_name=profile_name)
+        if gap:
+            return gap
+    return ""
 
-    required_gap = _required_fetch_fact_gap(payload)
-    if required_gap:
-        return required_gap
-    if case_kind == _CASE_LOCAL_PDF:
-        return _required_pdf_fact_gap(payload)
+
+def _legacy_diagnostic_field(value: JsonValue) -> str:
+    """递归查找 schema v2 禁止的可逆前缀或旧 URL 字段。
+
+    Args:
+        value: diagnostics JSON 值。
+
+    Returns:
+        首个禁止字段名；不存在时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    forbidden = {
+        "content_prefix",
+        "html_prefix",
+        "page_text_prefix",
+        "stderr_prefix",
+        "stdout_prefix",
+        "text_prefix",
+    }
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in forbidden:
+                return key
+            nested = _legacy_diagnostic_field(item)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for item in value:
+            nested = _legacy_diagnostic_field(item)
+            if nested:
+                return nested
+    return ""
+
+
+def _profile_schema_gap(
+    profile: Mapping[str, JsonValue],
+    *,
+    profile_name: str,
+) -> str:
+    """校验一个 schema v2 path profile 的自足字段。
+
+    Args:
+        profile: path profile。
+        profile_name: 错误信息使用的字段名。
+
+    Returns:
+        空字符串表示通过；否则返回 gap。
+
+    Raises:
+        无。
+    """
+
+    if not isinstance(profile.get("sampled"), bool):
+        return f"{profile_name}.sampled 必须是 bool。"
+    outcome = profile.get("outcome")
+    if outcome not in {item.value for item in WebDiagnosticOutcome}:
+        return f"{profile_name}.outcome 不是 schema v2 封闭值。"
+    if not isinstance(profile.get("safe_url"), str):
+        return f"{profile_name}.safe_url 必须是字符串。"
+    elapsed = profile.get("elapsed_seconds")
+    if (
+        not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or elapsed < 0
+    ):
+        return f"{profile_name}.elapsed_seconds 必须是非负数。"
+    if outcome == WebDiagnosticOutcome.COMPLETED.value:
+        backend = profile.get("backend")
+        if backend not in {"requests", "playwright", "tool"}:
+            return f"{profile_name}.backend 缺失或非法。"
+        content_length = profile.get("content_length")
+        if (
+            not isinstance(content_length, int)
+            or isinstance(content_length, bool)
+            or content_length < 0
+        ):
+            return f"{profile_name}.content_length 必须是非负整数。"
+        content_digest = profile.get("content_digest")
+        if not isinstance(content_digest, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            content_digest,
+        ) is None:
+            return f"{profile_name}.content_digest 必须是 SHA-256 摘要。"
+        if "http_status" not in profile:
+            return f"{profile_name}.http_status 缺失。"
     return ""
 
 
@@ -1217,18 +2086,7 @@ def _required_fetch_fact_gap(payload: Mapping[str, JsonValue]) -> str:
         无。
     """
 
-    requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
-    fetch_profile = _nested_object(payload, "fetch_web_page_profile")
-    if "sampled" not in requests_profile:
-        return "diagnostics artifact 缺少 requests_profile.sampled。"
-    if "ok" not in requests_result:
-        return "diagnostics artifact 缺少 requests_profile.result.ok。"
-    if "sampled" not in fetch_profile:
-        return "diagnostics artifact 缺少 fetch_web_page_profile.sampled。"
-    if "ok" not in fetch_profile:
-        return "diagnostics artifact 缺少 fetch_web_page_profile.ok。"
-    return ""
+    return _diagnostic_schema_gap(payload, case_kind=_CASE_LOCAL_HTML)
 
 
 def _required_pdf_fact_gap(payload: Mapping[str, JsonValue]) -> str:
@@ -1270,12 +2128,11 @@ def _raw_content_type(payload: Mapping[str, JsonValue]) -> str:
     """
 
     requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
-    headers = _nested_object(requests_result, "response_headers")
-    for key, value in headers.items():
-        if key.lower() == "content-type" and isinstance(value, str):
-            return value
-    return _string_field(requests_result, "content_type") or _string_field(requests_profile, "content_type")
+    response_headers = _nested_object(requests_profile, "response_headers")
+    projected_content_type = _string_field(response_headers, "content_type")
+    if projected_content_type:
+        return projected_content_type
+    return _string_field(requests_profile, "content_type")
 
 
 def _raw_content_length(payload: Mapping[str, JsonValue]) -> int | None:
@@ -1292,11 +2149,7 @@ def _raw_content_length(payload: Mapping[str, JsonValue]) -> int | None:
     """
 
     requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
-    direct = _int_field(requests_result, "content_length")
-    if direct is not None:
-        return direct
-    return _int_field(requests_result, "text_length")
+    return _int_field(requests_profile, "content_length")
 
 
 def _fetch_content_length(payload: Mapping[str, JsonValue]) -> int | None:
@@ -1330,7 +2183,7 @@ def _fetch_backend(payload: Mapping[str, JsonValue]) -> str:
     """
 
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
-    return _string_field(fetch_profile, "fetch_backend")
+    return _string_field(fetch_profile, "backend")
 
 
 def _playwright_profile_sampled(payload: Mapping[str, JsonValue]) -> bool:
@@ -1404,8 +2257,11 @@ def _requests_ok(payload: Mapping[str, JsonValue]) -> bool:
     """
 
     requests_profile = _nested_object(payload, "requests_profile")
-    requests_result = _nested_object(requests_profile, "result")
-    return _bool_field(requests_profile, "sampled") and _bool_field(requests_result, "ok")
+    return (
+        _bool_field(requests_profile, "sampled")
+        and _string_field(requests_profile, "outcome")
+        == WebDiagnosticOutcome.COMPLETED.value
+    )
 
 
 def _fetch_ok(payload: Mapping[str, JsonValue]) -> bool:
@@ -1422,7 +2278,11 @@ def _fetch_ok(payload: Mapping[str, JsonValue]) -> bool:
     """
 
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
-    return _bool_field(fetch_profile, "sampled") and _bool_field(fetch_profile, "ok")
+    return (
+        _bool_field(fetch_profile, "sampled")
+        and _string_field(fetch_profile, "outcome")
+        == WebDiagnosticOutcome.COMPLETED.value
+    )
 
 
 def _url_from_payload(payload: Mapping[str, JsonValue], fallback_url: str) -> str:
@@ -1439,7 +2299,7 @@ def _url_from_payload(payload: Mapping[str, JsonValue], fallback_url: str) -> st
         无。
     """
 
-    return _string_field(payload, "url") or fallback_url
+    return _string_field(payload, "safe_url") or project_safe_url_or_empty(fallback_url)
 
 
 def _observed_bucket(payload: Mapping[str, JsonValue], default_bucket: str) -> str:
@@ -1480,6 +2340,124 @@ def _suggested_next_step(payload: Mapping[str, JsonValue], default_step: str) ->
     return _string_field(payload, "diagnostic_action_hint") or default_step
 
 
+def _fixture_ledger_gap(
+    *,
+    case: LocalFixtureCase,
+    ledger: FrozenFixtureLedger,
+) -> str:
+    """用冻结 ledger 独立证明 token/path/response 与负控事实。
+
+    Args:
+        case: 当前父进程注册 case。
+        ledger: server 停止后冻结的 ledger。
+
+    Returns:
+        空字符串表示独立 oracle 通过；否则返回 gap。
+
+    Raises:
+        无。
+    """
+
+    if len(ledger.lifecycle) < 4 or ledger.lifecycle[-2:] != (
+        "server_stopped",
+        "frozen",
+    ):
+        return "fixture ledger 必须在 server 停止后 freeze，并在 classify 前保持冻结。"
+    if ledger.dropped_count != 0:
+        return "fixture ledger observation 超过有界上限，无法完整分类。"
+    accepted = tuple(
+        observation
+        for observation in ledger.observations
+        if observation.accepted
+        and observation.token_digest == case.token_digest
+        and observation.normalized_path == case.path
+    )
+    if len(accepted) != 1:
+        return "fixture ledger 缺少当前 token/path 的唯一 accepted request。"
+    accepted_observation = accepted[0]
+    if accepted_observation.method != _HTTP_GET_METHOD:
+        return "fixture ledger accepted request method 不是 GET。"
+    if accepted_observation.response_kind is not case.response_kind:
+        return "fixture ledger response kind 与父进程注册事实不一致。"
+    if accepted_observation.response_digest != case.response_digest:
+        return "fixture ledger response digest 与父进程注册 bytes 不一致。"
+    rejected_kinds = {
+        observation.response_kind
+        for observation in ledger.observations
+        if not observation.accepted
+        and observation.normalized_path in {case.path, _LOCAL_NEGATIVE_PATH}
+    }
+    required_negative_kinds = {
+        FixtureResponseKind.NEGATIVE_MISSING_TOKEN,
+        FixtureResponseKind.NEGATIVE_WRONG_TOKEN,
+        FixtureResponseKind.NEGATIVE_REPLAY_TOKEN,
+        FixtureResponseKind.NEGATIVE_METHOD,
+        FixtureResponseKind.NEGATIVE_UNKNOWN_PATH,
+    }
+    missing_negative_kinds = required_negative_kinds - rejected_kinds
+    if missing_negative_kinds:
+        missing = ",".join(sorted(item.value for item in missing_negative_kinds))
+        return f"fixture negative controls 未全部失败：{missing}。"
+    return ""
+
+
+def _exact_response_artifact_gap(
+    *,
+    profile: Mapping[str, JsonValue],
+    case: LocalFixtureCase,
+) -> str:
+    """比较 artifact content length/digest 与父进程 exact response bytes。
+
+    Args:
+        profile: 对应 requests path profile。
+        case: 父进程注册 case。
+
+    Returns:
+        空字符串表示匹配；否则返回 gap。
+
+    Raises:
+        无。
+    """
+
+    if _int_field(profile, "content_length") != case.response_length:
+        return "artifact content_length 与父进程 expected bytes 不一致。"
+    if _string_field(profile, "content_digest") != case.response_digest:
+        return "artifact content_digest 与父进程 expected bytes 不一致。"
+    return ""
+
+
+def _playwright_package_missing_independently() -> bool:
+    """由 smoke 父进程独立判断 Playwright Python package 是否缺失。
+
+    Args:
+        无。
+
+    Returns:
+        package spec 缺失时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return importlib.util.find_spec("playwright") is None
+
+
+def _docling_package_missing_independently() -> bool:
+    """由 smoke 父进程独立判断 Docling package 是否缺失。
+
+    Args:
+        无。
+
+    Returns:
+        package spec 缺失时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return importlib.util.find_spec("docling") is None
+
+
 def _classify_loaded_artifact(
     *,
     case_name: str,
@@ -1488,6 +2466,8 @@ def _classify_loaded_artifact(
     artifact_path: Path,
     payload: Mapping[str, JsonValue],
     child_returncode: int,
+    fixture_case: LocalFixtureCase | None = None,
+    frozen_ledger: FrozenFixtureLedger | None = None,
 ) -> SmokeCaseResult:
     """根据已加载 artifact 分类 smoke case。
 
@@ -1498,6 +2478,8 @@ def _classify_loaded_artifact(
         artifact_path: artifact 路径。
         payload: diagnostics artifact。
         child_returncode: diagnostics 子进程退出码。
+        fixture_case: local case 的父进程注册事实；external 为空。
+        frozen_ledger: server 停止后冻结的父进程 ledger；external 为空。
 
     Returns:
         smoke case 结果。
@@ -1540,7 +2522,23 @@ def _classify_loaded_artifact(
             suggested_next_step=_suggested_next_step(payload, "查看外部诊断证据；不要把站点不稳定直接判为生产 regression。"),
         )
 
-    if child_returncode != _EXIT_OK and _docling_init_skip(payload) and case_kind == _CASE_LOCAL_PDF:
+    if fixture_case is None or frozen_ledger is None:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=_BUCKET_FIXTURE_LEDGER_GAP,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            suggested_next_step="local PASS 必须由父进程 fixture registration 与 frozen ledger 证明。",
+        )
+
+    if (
+        child_returncode != _EXIT_OK
+        and _docling_init_skip(payload)
+        and case_kind == _CASE_LOCAL_PDF
+        and _docling_package_missing_independently()
+    ):
         return _case_skip(
             case_name=case_name,
             case_kind=case_kind,
@@ -1571,7 +2569,11 @@ def _classify_loaded_artifact(
             exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
             suggested_next_step=schema_gap,
         )
-    if case_kind == _CASE_LOCAL_PDF and _docling_init_skip(payload):
+    if (
+        case_kind == _CASE_LOCAL_PDF
+        and _docling_init_skip(payload)
+        and _docling_package_missing_independently()
+    ):
         return _case_skip(
             case_name=case_name,
             case_kind=case_kind,
@@ -1580,38 +2582,132 @@ def _classify_loaded_artifact(
             bucket=_BUCKET_DOCLING_INIT_SKIP,
             reason="diagnostics 观察到 Docling 初始化或依赖缺失，PDF local smoke 本轮跳过。",
         )
-    if not _requests_ok(payload):
+    if case_kind == _CASE_LOCAL_BROWSER:
+        playwright_profile = _nested_object(payload, "playwright_profile")
+        if (
+            _string_field(playwright_profile, "error_code")
+            == "playwright_package_missing"
+            and _playwright_package_missing_independently()
+        ):
+            return SmokeCaseResult(
+                case_name=case_name,
+                case_kind=case_kind,
+                url=url,
+                status=_STATUS_SKIPPED,
+                bucket=_BUCKET_BROWSER_PROFILE_NOT_SAMPLED,
+                evidence_path=evidence_path,
+                suggested_next_step="安装 Playwright Python package 后重跑 browser smoke。",
+                reason="父进程独立确认 Playwright Python package 缺失。",
+                exit_code=_EXIT_OK,
+            )
+
+    ledger_gap = _fixture_ledger_gap(case=fixture_case, ledger=frozen_ledger)
+    if ledger_gap:
         return _case_failure(
             case_name=case_name,
             case_kind=case_kind,
             url=url,
             evidence_path=evidence_path,
-            bucket=_BUCKET_LOCAL_REQUESTS_FAILURE,
-            exit_code=_EXIT_LOCAL_FAILURE,
-            suggested_next_step="先检查 local fixture raw requests 路径；requests 失败不能由 fetch 成功掩盖。",
+            bucket=_BUCKET_FIXTURE_LEDGER_GAP,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            suggested_next_step=ledger_gap,
         )
-    if not _fetch_ok(payload):
-        if case_kind == _CASE_LOCAL_BROWSER:
-            return _case_diagnostic_only(
+
+    profile_name = (
+        "playwright_profile"
+        if case_kind == _CASE_LOCAL_BROWSER
+        or (
+            case_kind == _CASE_LOCAL_FILING
+            and case_name == "local-filing-playwright"
+        )
+        else "fetch_web_page_profile"
+        if case_name.endswith("-tool")
+        else "requests_profile"
+    )
+    profile = _nested_object(payload, profile_name)
+    if _string_field(profile, "outcome") != WebDiagnosticOutcome.COMPLETED.value:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=(
+                _BUCKET_BROWSER_FETCH_FAILURE
+                if profile_name == "playwright_profile"
+                else _BUCKET_LOCAL_FETCH_FAILURE
+                if profile_name == "fetch_web_page_profile"
+                else _BUCKET_LOCAL_REQUESTS_FAILURE
+            ),
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=f"{profile_name} 未证明 completed execution。",
+        )
+
+    content_gap = _exact_response_artifact_gap(profile=profile, case=fixture_case)
+    if content_gap:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=_BUCKET_CONTENT_ORACLE_MISMATCH,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=content_gap,
+        )
+    if _string_field(profile, "backend") != fixture_case.expected_backend:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=(
+                _BUCKET_BROWSER_BACKEND_NOT_OBSERVED
+                if profile_name == "playwright_profile"
+                else _BUCKET_LOCAL_FETCH_FAILURE
+            ),
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step="artifact backend execution evidence 与父进程 case contract 不一致。",
+        )
+
+    if case_kind == _CASE_LOCAL_CHALLENGE_CONTROL:
+        if _string_field(profile, "challenge_decision") != "confirmed":
+            return _case_failure(
                 case_name=case_name,
                 case_kind=case_kind,
                 url=url,
                 evidence_path=evidence_path,
-                bucket=_BUCKET_BROWSER_FETCH_FAILURE,
-                reason="client-rendered fixture 未观察到 fetch_web_page 成功；该 browser path 结果交给 Agent 结合 artifact 判断。",
-                suggested_next_step="查看 fetch_web_page_profile 的 error/message/hint，确认是 Playwright 环境缺失、浏览器回退未触发还是工具回归。",
+                bucket=_BUCKET_CHALLENGE_CONTROL_FAILED,
+                exit_code=_EXIT_LOCAL_FAILURE,
+                suggested_next_step="challenge negative control 必须观察到 confirmed decision。",
             )
+    elif _string_field(profile, "challenge_decision") == "confirmed":
         return _case_failure(
             case_name=case_name,
             case_kind=case_kind,
             url=url,
             evidence_path=evidence_path,
-            bucket=_BUCKET_LOCAL_FETCH_FAILURE,
+            bucket=_BUCKET_CHALLENGE_CONTROL_FAILED,
             exit_code=_EXIT_LOCAL_FAILURE,
-            suggested_next_step="检查 current fetch_web_page callable 路径；local fixture fetch 失败是 smoke failure。",
+            suggested_next_step="普通 local fixture 不得被分类为 confirmed challenge。",
         )
-    if case_kind == _CASE_LOCAL_PDF:
-        pdf_failure = _classify_pdf_loaded_artifact(
+
+    if case_kind == _CASE_LOCAL_FILING:
+        filing_gap = _filing_artifact_gap(
+            payload=payload,
+            profile_name=profile_name,
+        )
+        if filing_gap:
+            return _case_failure(
+                case_name=case_name,
+                case_kind=case_kind,
+                url=url,
+                evidence_path=evidence_path,
+                bucket=_BUCKET_BROWSER_BACKEND_NOT_OBSERVED,
+                exit_code=_EXIT_LOCAL_FAILURE,
+                suggested_next_step=filing_gap,
+            )
+
+    if case_kind == _CASE_LOCAL_PDF and profile_name == "fetch_web_page_profile":
+        pdf_failure = _classify_pdf_tool_loaded_artifact(
             case_name=case_name,
             url=url,
             evidence_path=evidence_path,
@@ -1631,7 +2727,7 @@ def _classify_loaded_artifact(
     return SmokeCaseResult(
         case_name=case_name,
         case_kind=case_kind,
-        url=url,
+        url=project_safe_url_or_empty(url),
         status=_STATUS_PASSED,
         bucket=_BUCKET_PASSED,
         evidence_path=evidence_path,
@@ -1639,6 +2735,67 @@ def _classify_loaded_artifact(
         reason="",
         exit_code=_EXIT_OK,
     )
+
+
+def _classify_pdf_tool_loaded_artifact(
+    *,
+    case_name: str,
+    url: str,
+    evidence_path: str,
+    payload: Mapping[str, JsonValue],
+) -> SmokeCaseResult | None:
+    """校验 PDF tool case 的转换正文与 Docling execution evidence。
+
+    PDF 原始 response kind/length/digest 已由父进程 registration、ledger 与
+    通用 exact-content oracle 证明；本 helper 只校验工具转换这一独立事实，
+    不从已跳过的 requests profile 反推 content-type。
+
+    Args:
+        case_name: case 名称。
+        url: safe URL 输入。
+        evidence_path: 诊断 artifact 路径。
+        payload: schema v2 diagnostics artifact。
+
+    Returns:
+        tool 转换证据失败结果；全部满足时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    fetch_profile = _nested_object(payload, "fetch_web_page_profile")
+    projected_length = _int_field(fetch_profile, "projected_content_length")
+    if projected_length is None or projected_length < PDF_FETCH_MIN_CHARS:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_PDF,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=_BUCKET_PDF_CONTENT_LENGTH_FAILURE,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=(
+                f"PDF tool projected content 必须至少 {PDF_FETCH_MIN_CHARS} 个字符。"
+            ),
+        )
+    evidence = _docling_evidence(payload)
+    if (
+        not _bool_field(evidence, "invoked")
+        or _string_field(evidence, "stream_name") != _PDF_EXPECTED_STREAM_NAME
+        or not _bool_field(evidence, "original_completed")
+    ):
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_PDF,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=_BUCKET_PDF_DOCLING_INVOCATION_FAILURE,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=(
+                "PDF tool case 必须观察到 Docling callable 实际调用、"
+                f"stream_name={_PDF_EXPECTED_STREAM_NAME} 且原始 callable 正常返回。"
+            ),
+        )
+    return None
 
 
 def _classify_pdf_loaded_artifact(
@@ -1734,37 +2891,82 @@ def _classify_browser_loaded_artifact(
         payload: diagnostics artifact。
 
     Returns:
-        diagnostic-only 结果；browser backend 被观察到时返回 ``None``。
+        browser 必需证据失败结果；全部满足时返回 ``None``。
 
     Raises:
         无。
     """
 
     if not _playwright_profile_sampled(payload):
-        return _case_diagnostic_only(
+        return _case_failure(
             case_name=case_name,
             case_kind=_CASE_LOCAL_BROWSER,
             url=url,
             evidence_path=evidence_path,
             bucket=_BUCKET_BROWSER_PROFILE_NOT_SAMPLED,
-            reason="client-rendered fixture 未采样 Playwright profile，无法用本次 artifact 证明 browser path 环境。",
+            exit_code=_EXIT_LOCAL_FAILURE,
             suggested_next_step="确认 smoke 默认 browser case 未被 --skip-playwright 或旧 diagnostics 命令绕过。",
         )
-    fetch_backend = _fetch_backend(payload)
-    if fetch_backend != _BROWSER_EXPECTED_FETCH_BACKEND:
-        return _case_diagnostic_only(
+    playwright_profile = _nested_object(payload, "playwright_profile")
+    if not _bool_field(playwright_profile, "browser_executed"):
+        return _case_failure(
             case_name=case_name,
             case_kind=_CASE_LOCAL_BROWSER,
             url=url,
             evidence_path=evidence_path,
             bucket=_BUCKET_BROWSER_BACKEND_NOT_OBSERVED,
-            reason=(
-                "client-rendered fixture 未观察到 fetch_web_page 使用 Playwright backend；"
-                f"实际 backend={fetch_backend or '<missing>'}。"
-            ),
-            suggested_next_step="查看 raw HTML、fetch_web_page_profile 与 playwright_profile，判断是否浏览器回退未触发或 fixture 已被 requests 路径直接处理。",
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step="Playwright profile 未提供 browser_executed=true 的执行证据。",
         )
     return None
+
+
+def _filing_artifact_gap(
+    *,
+    payload: Mapping[str, JsonValue],
+    profile_name: str,
+) -> str:
+    """校验版本化 filing 的 HTTP 或真实 Playwright 执行事实。
+
+    Args:
+        payload: diagnostics artifact。
+        profile_name: 当前 filing case 的执行 profile 名称。
+
+    Returns:
+        空字符串表示 filing 执行证据完整；否则返回 gap 说明。
+
+    Raises:
+        无。
+    """
+
+    if profile_name != "playwright_profile":
+        return ""
+    profile = _nested_object(payload, profile_name)
+    if not _playwright_profile_sampled(payload):
+        return "版本化 filing 未执行 Playwright profile。"
+    if not _bool_field(profile, "browser_executed"):
+        return "版本化 filing 缺少 browser_executed=true。"
+    storage_state = _nested_object(profile, "storage_state")
+    if not _bool_field(storage_state, "input_used"):
+        return "版本化 filing 未证明显式 storage state 输入已被 raw Playwright 消费。"
+    if _int_field(profile, "rendered_html_length") is None:
+        return "版本化 filing 缺少 rendered HTML length metric。"
+    if _int_field(profile, "rendered_text_length") is None:
+        return "版本化 filing 缺少 rendered text length metric。"
+    if _int_field(profile, "network_event_count") is None:
+        return "版本化 filing 缺少 network event count metric。"
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    for forbidden_field in (
+        "output_enabled",
+        "output_label",
+        "ttl_seconds",
+        "published",
+        "reconcile",
+        "cleanup",
+    ):
+        if forbidden_field in serialized:
+            return f"版本化 filing artifact 残留 credential lifecycle 字段：{forbidden_field}。"
+    return ""
 
 
 def _case_failure(
@@ -1798,7 +3000,7 @@ def _case_failure(
     return SmokeCaseResult(
         case_name=case_name,
         case_kind=case_kind,
-        url=url,
+        url=project_safe_url_or_empty(url),
         status=_STATUS_FAILED,
         bucket=bucket,
         evidence_path=evidence_path,
@@ -1837,7 +3039,7 @@ def _case_skip(
     return SmokeCaseResult(
         case_name=case_name,
         case_kind=case_kind,
-        url=url,
+        url=project_safe_url_or_empty(url),
         status=_STATUS_SKIPPED,
         bucket=bucket,
         evidence_path=evidence_path,
@@ -1878,7 +3080,7 @@ def _case_diagnostic_only(
     return SmokeCaseResult(
         case_name=case_name,
         case_kind=case_kind,
-        url=url,
+        url=project_safe_url_or_empty(url),
         status=_STATUS_DIAGNOSTIC_ONLY,
         bucket=bucket,
         evidence_path=evidence_path,
@@ -1895,6 +3097,8 @@ def _classify_child_result(
     fallback_url: str,
     artifact_path: Path,
     child_result: DiagnosticChildResult,
+    fixture_case: LocalFixtureCase | None = None,
+    frozen_ledger: FrozenFixtureLedger | None = None,
 ) -> SmokeCaseResult:
     """按子进程结果与 artifact 分类 smoke case。
 
@@ -1904,6 +3108,8 @@ def _classify_child_result(
         fallback_url: artifact 缺少 URL 时的后备 URL。
         artifact_path: artifact 路径。
         child_result: diagnostics 子进程结果。
+        fixture_case: local case 的父进程注册事实；external 为空。
+        frozen_ledger: server 停止后冻结的 ledger；external 为空。
 
     Returns:
         smoke case 结果。
@@ -1916,7 +3122,7 @@ def _classify_child_result(
         return _case_diagnostic_only(
             case_name=case_name,
             case_kind=case_kind,
-            url=fallback_url,
+            url=project_safe_url_or_empty(fallback_url),
             evidence_path=str(artifact_path),
             bucket=_BUCKET_CHILD_PROCESS_ERROR,
             reason="外部 URL diagnostics 子进程失败；外部站点行为不作为 local smoke gate。",
@@ -1927,7 +3133,7 @@ def _classify_child_result(
             return _case_diagnostic_only(
                 case_name=case_name,
                 case_kind=case_kind,
-                url=fallback_url,
+                url=project_safe_url_or_empty(fallback_url),
                 evidence_path=str(artifact_path),
                 bucket=_BUCKET_ARTIFACT_MISSING,
                 reason="外部 diagnostics 未生成 artifact；不影响 local smoke gate。",
@@ -1936,7 +3142,7 @@ def _classify_child_result(
         return _case_failure(
             case_name=case_name,
             case_kind=case_kind,
-            url=fallback_url,
+            url=project_safe_url_or_empty(fallback_url),
             evidence_path=str(artifact_path),
             bucket=_BUCKET_ARTIFACT_MISSING,
             exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
@@ -1949,7 +3155,7 @@ def _classify_child_result(
             return _case_diagnostic_only(
                 case_name=case_name,
                 case_kind=case_kind,
-                url=fallback_url,
+                url=project_safe_url_or_empty(fallback_url),
                 evidence_path=str(artifact_path),
                 bucket=_BUCKET_ARTIFACT_PARSE_FAILURE,
                 reason=f"外部 diagnostics artifact 无法解析：{exc}",
@@ -1958,7 +3164,7 @@ def _classify_child_result(
         return _case_failure(
             case_name=case_name,
             case_kind=case_kind,
-            url=fallback_url,
+            url=project_safe_url_or_empty(fallback_url),
             evidence_path=str(artifact_path),
             bucket=_BUCKET_ARTIFACT_PARSE_FAILURE,
             exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
@@ -1971,6 +3177,8 @@ def _classify_child_result(
         artifact_path=artifact_path,
         payload=payload,
         child_returncode=child_result.returncode,
+        fixture_case=fixture_case,
+        frozen_ledger=frozen_ledger,
     )
 
 
@@ -2235,7 +3443,7 @@ def _run_diagnostic_command(command: Sequence[str]) -> DiagnosticChildResult:
 
 
 def _log_diagnostic_child_result(*, case_name: str, child_result: DiagnosticChildResult) -> None:
-    """记录 diagnostics 子进程的有界输出前缀。
+    """只记录 diagnostics 子进程输出的不可逆 length/digest。
 
     Args:
         case_name: smoke case 名称。
@@ -2248,12 +3456,17 @@ def _log_diagnostic_child_result(*, case_name: str, child_result: DiagnosticChil
         无。
     """
 
+    stdout_diagnostic = content_diagnostic_from_text(child_result.stdout)
+    stderr_diagnostic = content_diagnostic_from_text(child_result.stderr)
     _LOGGER.debug(
-        "diagnostics child finished: case=%s returncode=%s stdout_prefix=%s stderr_prefix=%s",
+        "diagnostics child finished: case=%s returncode=%s "
+        "stdout_length=%s stdout_digest=%s stderr_length=%s stderr_digest=%s",
         case_name,
         child_result.returncode,
-        _stdio_log_prefix(child_result.stdout),
-        _stdio_log_prefix(child_result.stderr),
+        stdout_diagnostic.length,
+        stdout_diagnostic.digest,
+        stderr_diagnostic.length,
+        stderr_diagnostic.digest,
     )
 
 
@@ -2262,8 +3475,10 @@ def _diagnostic_command(
     url: str,
     artifact_path: Path,
     options: SmokeOptions,
-    allow_private_network_url: bool,
     sample_playwright: bool,
+    skip_requests: bool = False,
+    skip_tool_fetch: bool = False,
+    storage_state_input: Path | None = None,
 ) -> list[str]:
     """构造单 URL diagnostics 命令。
 
@@ -2271,8 +3486,10 @@ def _diagnostic_command(
         url: 待诊断 URL。
         artifact_path: diagnostics 输出 artifact。
         options: smoke 选项。
-        allow_private_network_url: 是否允许 diagnostics 访问内网或本地 URL。
         sample_playwright: 是否让 diagnostics 采样 Playwright。
+        skip_requests: 是否跳过 raw requests profile。
+        skip_tool_fetch: 是否跳过 tool fetch profile。
+        storage_state_input: 可选的显式 Playwright storage state 输入文件。
 
     Returns:
         子进程命令参数列表。
@@ -2294,11 +3511,106 @@ def _diagnostic_command(
         "--tool-timeout-budget",
         str(options.tool_timeout_budget),
     ]
-    if allow_private_network_url:
-        command.append("--allow-private-network-url")
     if not sample_playwright:
         command.append("--skip-playwright")
+    if skip_requests:
+        command.append("--skip-requests")
+    if skip_tool_fetch:
+        command.append("--skip-tool-fetch")
+    if storage_state_input is not None:
+        command.extend(["--storage-state-in", str(storage_state_input)])
     return command
+
+
+def _run_local_typed_egress_deny_case(
+    *,
+    case_name: str,
+    case_kind: str,
+    fixture_url: str,
+    diagnostics_dir: Path,
+    provider_config: Mapping[str, JsonValue],
+) -> SmokeCaseResult:
+    """通过正式 config assembly 与工具 callable 验证一个 typed egress deny。
+
+    Args:
+        case_name: 稳定 smoke case 名称。
+        case_kind: private 或 custom-port deny case 类型。
+        fixture_url: 本地 custom-port fixture URL。
+        diagnostics_dir: local diagnostics 输出目录。
+        provider_config: 含单一显式 deny 的 Web provider overlay。
+
+    Returns:
+        typed deny 的 smoke 分类结果。
+
+    Raises:
+        OSError: overlay 或 artifact 写入失败时抛出。
+    """
+
+    artifact_path = diagnostics_dir / f"{case_name}.json"
+    workspace_config_dir = diagnostics_dir / f"{case_name}-workspace-config"
+    _write_web_tool_discovery_overlay(
+        workspace_config_dir,
+        provider_config=provider_config,
+    )
+    error_type = ""
+    observed_error_code = ""
+    try:
+        config = _load_runtime_config_for_overlay(workspace_config_dir)
+        definitions = _discover_tools_by_name(config, workspace_root=diagnostics_dir)
+        fetch_definition = definitions.get("fetch_web_page")
+        if fetch_definition is None:
+            error_type = "MissingFetchWebPage"
+        else:
+            outcome = asyncio.run(
+                fetch_definition.callable(
+                    _tool_call("fetch_web_page", {"url": fixture_url}),
+                    _tool_context(),
+                )
+            )
+            if isinstance(outcome, ToolFailedOutcome):
+                observed_error_code = outcome.result.error
+            else:
+                error_type = type(outcome).__name__
+    except Exception as exc:
+        error_type = type(exc).__name__
+
+    passed = observed_error_code == "permission_denied"
+    _write_json(
+        artifact_path,
+        {
+            "schema_version": "web-smoke-typed-egress-v1",
+            "case_kind": case_kind,
+            "safe_url": project_safe_url_or_empty(fixture_url),
+            "provider_config": dict(provider_config),
+            "expected_error_code": "permission_denied",
+            "observed_error_code": observed_error_code,
+            "error_type": error_type,
+            "passed": passed,
+        },
+    )
+    if not passed:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=fixture_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_TYPED_EGRESS_DENY_FAILED,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=(
+                "显式 typed provider deny 必须在正式 fetch_web_page callable 中投影为 permission_denied。"
+            ),
+        )
+    return SmokeCaseResult(
+        case_name=case_name,
+        case_kind=case_kind,
+        url=project_safe_url_or_empty(fixture_url),
+        status=_STATUS_PASSED,
+        bucket=_BUCKET_PASSED,
+        evidence_path=str(artifact_path),
+        suggested_next_step="",
+        reason="",
+        exit_code=_EXIT_OK,
+    )
 
 
 def _run_local_assembly_config_case(
@@ -2455,7 +3767,12 @@ def _run_local_assembly_config_case(
     value = _mapping_or_empty(outcome.result.value)
     content = _string_field(value, "content")
     content_contains_fixture_text = _HTML_FIXTURE_BODY in content
-    content_length = len(content)
+    projected_content_length = len(content)
+    response_content_length = _int_field(value, "response_content_length")
+    response_content_digest = _string_field(value, "response_content_digest")
+    artifact_content_length = (
+        response_content_length if response_content_length is not None else 0
+    )
     if not content_contains_fixture_text:
         _write_assembly_artifact(
             artifact_path=artifact_path,
@@ -2463,11 +3780,13 @@ def _run_local_assembly_config_case(
             tool_names=tool_names,
             provider_config=provider_config,
             fetch_ok=True,
-            content_length=content_length,
+            content_length=artifact_content_length,
             content_contains_fixture_text=False,
             truncate_max_chars=truncate_max_chars,
             bucket=_BUCKET_WEB_ASSEMBLY_FETCH_CONTENT_FAILURE,
             suggested_next_step="fetch_web_page 成功但未返回 local HTML fixture 正文，检查内容抽取或 URL 路径。",
+            content_digest=response_content_digest,
+            projected_content_length=projected_content_length,
         )
         return _case_failure(
             case_name=case_name,
@@ -2485,16 +3804,18 @@ def _run_local_assembly_config_case(
         tool_names=tool_names,
         provider_config=provider_config,
         fetch_ok=True,
-        content_length=content_length,
+        content_length=artifact_content_length,
         content_contains_fixture_text=True,
         truncate_max_chars=truncate_max_chars,
         bucket=_BUCKET_PASSED,
         suggested_next_step="",
+        content_digest=response_content_digest,
+        projected_content_length=projected_content_length,
     )
     return SmokeCaseResult(
         case_name=case_name,
         case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
-        url=fixture_urls.html_url,
+        url=project_safe_url_or_empty(fixture_urls.html_url),
         status=_STATUS_PASSED,
         bucket=_BUCKET_PASSED,
         evidence_path=str(artifact_path),
@@ -2544,7 +3865,7 @@ def _assembly_failure_result(
         bucket=bucket,
         suggested_next_step=suggested_next_step,
         error_type=type(error).__name__,
-        error_summary=str(error),
+        error_summary=project_error_message(str(error), max_chars=512),
     )
     return _case_failure(
         case_name=case_name,
@@ -2571,6 +3892,8 @@ def _write_assembly_artifact(
     suggested_next_step: str,
     error_type: str = "",
     error_summary: str = "",
+    content_digest: str = "",
+    projected_content_length: int = 0,
 ) -> None:
     """写入 local assembly config artifact。
 
@@ -2587,6 +3910,8 @@ def _write_assembly_artifact(
         suggested_next_step: 建议下一步。
         error_type: 可选错误类型。
         error_summary: 可选错误摘要。
+        content_digest: 原始响应 bytes 的 SHA-256。
+        projected_content_length: 工具转换后正文长度。
 
     Returns:
         无。
@@ -2600,12 +3925,14 @@ def _write_assembly_artifact(
         {
             "schema_version": _ASSEMBLY_SCHEMA_VERSION,
             "case_kind": _CASE_LOCAL_ASSEMBLY_CONFIG,
-            "url": url,
+            "url": project_safe_url_or_empty(url),
             "tool_names": list(tool_names),
             "provider_config": dict(provider_config),
             "called_tool": "fetch_web_page",
             "fetch_ok": fetch_ok,
             "content_length": content_length,
+            "content_digest": content_digest,
+            "projected_content_length": projected_content_length,
             "content_contains_fixture_text": content_contains_fixture_text,
             "truncate_max_chars": truncate_max_chars,
             "assembly_path": _ASSEMBLY_PATH_LABEL,
@@ -2615,6 +3942,68 @@ def _write_assembly_artifact(
             "error_summary": error_summary,
         },
     )
+
+
+def _classify_assembly_with_ledger(
+    *,
+    preliminary_result: SmokeCaseResult,
+    fixture_case: LocalFixtureCase,
+    frozen_ledger: FrozenFixtureLedger,
+) -> SmokeCaseResult:
+    """用 frozen ledger 与 exact digest 为 assembly PASS 追加独立证明。
+
+    Args:
+        preliminary_result: assembly callable 的初步执行结果。
+        fixture_case: 父进程注册 assembly case。
+        frozen_ledger: server 停止后冻结的 ledger。
+
+    Returns:
+        独立 oracle 分类后的 assembly 结果。
+
+    Raises:
+        无。artifact 读取错误投影为 failure。
+    """
+
+    if preliminary_result.status != _STATUS_PASSED:
+        return preliminary_result
+    ledger_gap = _fixture_ledger_gap(case=fixture_case, ledger=frozen_ledger)
+    if ledger_gap:
+        return _case_failure(
+            case_name=preliminary_result.case_name,
+            case_kind=preliminary_result.case_kind,
+            url=preliminary_result.url,
+            evidence_path=preliminary_result.evidence_path,
+            bucket=_BUCKET_FIXTURE_LEDGER_GAP,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            suggested_next_step=ledger_gap,
+        )
+    try:
+        payload = _load_json_artifact(Path(preliminary_result.evidence_path))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return _case_failure(
+            case_name=preliminary_result.case_name,
+            case_kind=preliminary_result.case_kind,
+            url=preliminary_result.url,
+            evidence_path=preliminary_result.evidence_path,
+            bucket=_BUCKET_ARTIFACT_PARSE_FAILURE,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            suggested_next_step=f"assembly artifact 无法解析：{type(exc).__name__}。",
+        )
+    if (
+        _int_field(payload, "content_length") != fixture_case.response_length
+        or _string_field(payload, "content_digest")
+        != fixture_case.response_digest
+    ):
+        return _case_failure(
+            case_name=preliminary_result.case_name,
+            case_kind=preliminary_result.case_kind,
+            url=preliminary_result.url,
+            evidence_path=preliminary_result.evidence_path,
+            bucket=_BUCKET_CONTENT_ORACLE_MISMATCH,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step="assembly artifact 的原始响应 length/digest 与父进程 expected bytes 不一致。",
+        )
+    return preliminary_result
 
 
 def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list[SmokeCaseResult]:
@@ -2632,95 +4021,142 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
     """
 
     diagnostics_dir = options.output_dir / "diagnostics" / "local"
+    filing_diagnostics_dir = options.output_dir / "diagnostics" / "filing"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
-    results: list[SmokeCaseResult] = []
-    with _running_local_fixture_server() as fixture_urls:
+    filing_diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    filing_storage_state_input = filing_diagnostics_dir / "explicit-storage-state-input.json"
+    _write_json(
+        filing_storage_state_input,
+        {"cookies": [], "origins": []},
+    )
+    pending_diagnostics: list[PendingLocalDiagnostic] = []
+    typed_deny_results: list[SmokeCaseResult] = []
+    assembly_pending: tuple[LocalFixtureCase, SmokeCaseResult] | None = None
+    with _running_local_fixture_server() as session:
         _LOGGER.info(
-            "local fixture server started: html=%s pdf=%s browser=%s",
-            fixture_urls.html_url,
-            fixture_urls.pdf_url,
-            fixture_urls.browser_url,
+            "local fixture server started: origin=%s registered_cases=%s",
+            project_safe_url_or_empty(session.urls.html_url),
+            len(session.cases),
         )
-        local_cases = (
-            (
-                "local-html",
-                _CASE_LOCAL_HTML,
-                fixture_urls.html_url,
-                diagnostics_dir / "local-html.json",
-                False,
-            ),
-            (
-                "local-pdf",
-                _CASE_LOCAL_PDF,
-                fixture_urls.pdf_url,
-                diagnostics_dir / "local-pdf.json",
-                False,
-            ),
-            (
-                "local-browser",
-                _CASE_LOCAL_BROWSER,
-                fixture_urls.browser_url,
-                diagnostics_dir / "local-browser.json",
-                True,
-            ),
+        diagnostic_cases = tuple(
+            case
+            for case in session.cases
+            if case.case_kind != _CASE_LOCAL_ASSEMBLY_CONFIG
         )
-        for case_name, case_kind, url, artifact_path, sample_playwright in local_cases:
+        for case in diagnostic_cases:
+            artifact_dir = (
+                filing_diagnostics_dir
+                if case.case_kind == _CASE_LOCAL_FILING
+                else diagnostics_dir
+            )
+            artifact_path = artifact_dir / f"{case.case_name}.json"
             _LOGGER.debug(
                 "running local smoke case: case=%s kind=%s sample_playwright=%s artifact=%s",
-                case_name,
-                case_kind,
-                sample_playwright,
+                case.case_name,
+                case.case_kind,
+                case.sample_playwright,
                 artifact_path,
             )
+            session.ledger.record_lifecycle(
+                f"negative_controls_started:{case.case_name}"
+            )
+            _exercise_pre_child_negative_controls(case)
+            session.ledger.record_lifecycle(f"child_started:{case.case_name}")
             command = _diagnostic_command(
-                url=url,
+                url=case.url,
                 artifact_path=artifact_path,
                 options=options,
-                allow_private_network_url=True,
-                sample_playwright=sample_playwright,
+                sample_playwright=case.sample_playwright,
+                skip_requests=case.skip_requests,
+                skip_tool_fetch=case.skip_tool_fetch,
+                storage_state_input=(
+                    filing_storage_state_input
+                    if case.case_name == "local-filing-playwright"
+                    else None
+                ),
             )
             child_result = runner(command)
-            _log_diagnostic_child_result(case_name=case_name, child_result=child_result)
-            case_result = _classify_child_result(
-                case_name=case_name,
-                case_kind=case_kind,
-                fallback_url=url,
-                artifact_path=artifact_path,
+            _log_diagnostic_child_result(
+                case_name=case.case_name,
                 child_result=child_result,
             )
-            results.append(case_result)
-            _LOGGER.debug(
-                "classified local smoke case: case=%s status=%s bucket=%s exit_code=%s evidence=%s",
-                case_result.case_name,
-                case_result.status,
-                case_result.bucket,
-                case_result.exit_code,
-                case_result.evidence_path,
-            )
-            if (
-                case_result.case_kind == _CASE_LOCAL_PDF
-                and case_result.status == _STATUS_FAILED
-                and case_result.bucket == _BUCKET_PDF_DOCLING_INVOCATION_FAILURE
-            ):
-                _LOGGER.warning(
-                    "stopping local matrix after Docling invocation blocker: evidence=%s",
-                    case_result.evidence_path,
+            _exercise_post_child_replay_control(case)
+            pending_diagnostics.append(
+                PendingLocalDiagnostic(
+                    fixture_case=case,
+                    artifact_path=artifact_path,
+                    child_result=child_result,
                 )
-                break
-        if not _has_docling_invocation_blocker(results):
-            assembly_case = _run_local_assembly_config_case(
-                fixture_urls=fixture_urls,
+            )
+        private_deny_config = dict(_ASSEMBLY_PROVIDER_CONFIG)
+        private_deny_config["allow_private_network_url"] = False
+        private_deny_config["allow_custom_port_url"] = True
+        typed_deny_results.append(
+            _run_local_typed_egress_deny_case(
+                case_name="local-private-deny",
+                case_kind=_CASE_LOCAL_PRIVATE_DENY,
+                fixture_url=session.urls.html_url,
                 diagnostics_dir=diagnostics_dir,
+                provider_config=private_deny_config,
             )
-            results.append(assembly_case)
-            _LOGGER.debug(
-                "classified local assembly config case: case=%s status=%s bucket=%s exit_code=%s evidence=%s",
-                assembly_case.case_name,
-                assembly_case.status,
-                assembly_case.bucket,
-                assembly_case.exit_code,
-                assembly_case.evidence_path,
+        )
+        custom_port_deny_config = dict(_ASSEMBLY_PROVIDER_CONFIG)
+        custom_port_deny_config["allow_private_network_url"] = True
+        custom_port_deny_config["allow_custom_port_url"] = False
+        typed_deny_results.append(
+            _run_local_typed_egress_deny_case(
+                case_name="local-custom-port-deny",
+                case_kind=_CASE_LOCAL_CUSTOM_PORT_DENY,
+                fixture_url=session.urls.html_url,
+                diagnostics_dir=diagnostics_dir,
+                provider_config=custom_port_deny_config,
             )
+        )
+        assembly_fixture_case = next(
+            case
+            for case in session.cases
+            if case.case_kind == _CASE_LOCAL_ASSEMBLY_CONFIG
+        )
+        session.ledger.record_lifecycle(
+            f"negative_controls_started:{assembly_fixture_case.case_name}"
+        )
+        _exercise_pre_child_negative_controls(assembly_fixture_case)
+        session.ledger.record_lifecycle(
+            f"child_started:{assembly_fixture_case.case_name}"
+        )
+        assembly_result = _run_local_assembly_config_case(
+            fixture_urls=session.urls,
+            diagnostics_dir=diagnostics_dir,
+        )
+        _exercise_post_child_replay_control(assembly_fixture_case)
+        assembly_pending = (assembly_fixture_case, assembly_result)
+
+    frozen_ledger = session.frozen_ledger
+    if frozen_ledger is None:
+        raise RuntimeError("local fixture ledger 未在 server shutdown 后冻结。")
+    results = [
+        _classify_child_result(
+            case_name=pending.fixture_case.case_name,
+            case_kind=pending.fixture_case.case_kind,
+            fallback_url=pending.fixture_case.url,
+            artifact_path=pending.artifact_path,
+            child_result=pending.child_result,
+            fixture_case=pending.fixture_case,
+            frozen_ledger=frozen_ledger,
+        )
+        for pending in pending_diagnostics
+    ]
+    results.extend(typed_deny_results)
+    if assembly_pending is None:
+        raise RuntimeError("local assembly case 未执行。")
+    assembly_fixture_case, preliminary_assembly_result = assembly_pending
+    results.append(
+        _classify_assembly_with_ledger(
+            preliminary_result=preliminary_assembly_result,
+            fixture_case=assembly_fixture_case,
+            frozen_ledger=frozen_ledger,
+        )
+    )
     return results
 
 
@@ -2754,7 +4190,6 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
             url=url,
             artifact_path=artifact_path,
             options=options,
-            allow_private_network_url=False,
             sample_playwright=options.include_playwright,
         )
         child_result = runner(command)

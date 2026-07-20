@@ -14,8 +14,17 @@ from datetime import UTC, datetime
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
+from dayu.host._terminal_answer import (
+    required_assistant_final_answer_continuity_text,
+)
 from dayu.host._event_payload import optional_payload_text
 from dayu.host.api import HostTerminalStatus
+from dayu.host.lifecycle_events import (
+    HOST_RUN_TERMINAL_EVENT_TYPES,
+    HostRunEventType,
+    event_type_values,
+    host_terminal_status_for_terminal_event,
+)
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
@@ -45,16 +54,13 @@ OUTBOX_TERMINAL_CONSUMER_ID = ProjectionConsumerId("host.outbox-terminal")
 DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE = 128
 """默认 Outbox terminal projection 单批 catch-up 扫描上限。"""
 
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _DETAIL_CODE_RUN_LOST_SKIPPED = "run_lost_not_public_terminal_item"
 _PAYLOAD_FIELD_RESULT_REF = "result_ref"
 _PAYLOAD_FIELD_RESULT_DIGEST = "result_digest"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_FILTERED = "filtered"
 _PAYLOAD_FIELD_DEGRADED = "degraded"
@@ -73,17 +79,7 @@ _IDENTITY_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _OUTBOX_ITEM_ID_PREFIX = "outbox-terminal-"
 _DIGEST_PREFIX = "sha256:"
 _ITEM_STATE_PENDING = "pending"
-_TERMINAL_EVENT_TYPES: tuple[str, ...] = (
-    _EVENT_TYPE_RUN_SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED,
-    _EVENT_TYPE_RUN_CANCELLED,
-    _EVENT_TYPE_RUN_LOST,
-)
-_TERMINAL_STATUS_BY_EVENT_TYPE: Mapping[str, HostTerminalStatus] = {
-    _EVENT_TYPE_RUN_SUCCEEDED: HostTerminalStatus.SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED: HostTerminalStatus.FAILED,
-    _EVENT_TYPE_RUN_CANCELLED: HostTerminalStatus.CANCELLED,
-}
+_HOST_TERMINAL_EVENT_TYPE_VALUES = event_type_values(HOST_RUN_TERMINAL_EVENT_TYPES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +141,7 @@ class OutboxTerminalProjectionConsumer:
             (
                 ProjectionEventClassFilter(
                     event_class=EventClass.CANONICAL_FACT,
-                    event_types=_TERMINAL_EVENT_TYPES,
+                    event_types=_HOST_TERMINAL_EVENT_TYPE_VALUES,
                 ),
             )
         )
@@ -163,13 +159,13 @@ class OutboxTerminalProjectionConsumer:
 
         if not self.event_filter.matches(event):
             return ProjectionApplyResult(ProjectionApplyStatus.SKIPPED)
-        if event.event_type == _EVENT_TYPE_RUN_LOST:
+        if event.event_type == HostRunEventType.RUN_LOST.value:
             return ProjectionApplyResult(
                 ProjectionApplyStatus.SKIPPED,
                 idempotency_key=event.event_id,
                 detail_code=_DETAIL_CODE_RUN_LOST_SKIPPED,
             )
-        row = build_outbox_terminal_item_row(event)
+        row = build_outbox_terminal_item_row(transaction, event)
         result = insert_outbox_terminal_item_if_absent(transaction, row)
         if result.status is OutboxTerminalItemWriteStatus.DUPLICATE:
             return ProjectionApplyResult(
@@ -232,10 +228,12 @@ def build_outbox_terminal_item_identity(
 
 
 def build_outbox_terminal_item_row(
+    transaction: HostTransaction,
     event: ProjectionEventView,
 ) -> OutboxTerminalItemRow:
     """从 terminal projection event 构造 Outbox terminal item row。
 
+    :param transaction: 当前 projection write transaction。
     :param event: terminal projection event。
     :returns: 可写入 durable outbox table 的 item row。
     :raises HostDurableError: event 缺少 Run id、event type 不支持或 payload 字段非法时抛出。
@@ -243,7 +241,7 @@ def build_outbox_terminal_item_row(
 
     if event.run_id is None:
         raise HostDurableError("outbox terminal event requires run_id")
-    terminal_status = _TERMINAL_STATUS_BY_EVENT_TYPE.get(event.event_type)
+    terminal_status = host_terminal_status_for_terminal_event(event.event_type)
     if terminal_status is None:
         raise HostDurableError("outbox terminal event type is unsupported")
     result_ref, result_digest = _payload_ref_pair(
@@ -278,7 +276,11 @@ def build_outbox_terminal_item_row(
         run_id=event.run_id,
         terminal_status=terminal_status.value,
         dedupe_key=event.event_id,
-        final_answer_json=_final_answer_json(event.payload, terminal_status),
+        final_answer_json=_final_answer_json(
+            transaction,
+            event.payload,
+            terminal_status,
+        ),
         error_message=_error_message(event),
         cancel_reason=_cancel_reason(event),
         result_ref=result_ref,
@@ -350,22 +352,22 @@ def catch_up_outbox_terminal_projection(
 
 
 def _final_answer_json(
+    transaction: HostTransaction,
     payload: Mapping[str, JsonValue],
     terminal_status: HostTerminalStatus,
 ) -> str | None:
-    """从 succeeded payload 构造可选 final answer JSON。
+    """从 terminal-answer owner 构造 succeeded final answer JSON。
 
+    :param transaction: 当前 projection write transaction。
     :param payload: terminal EventLog payload。
     :param terminal_status: terminal 状态。
-    :returns: canonical final answer JSON 文本；缺失时为 ``None``。
-    :raises HostDurableError: final answer 相关字段类型非法时抛出。
+    :returns: succeeded 的 canonical final answer JSON；非 succeeded 为 ``None``。
+    :raises HostDurableError: succeeded answer source 或 metadata 非法时抛出。
     """
 
     if terminal_status is not HostTerminalStatus.SUCCEEDED:
         return None
-    content = optional_payload_text(payload, field_name=_PAYLOAD_FIELD_FINAL_ANSWER)
-    if content is None:
-        return None
+    content = required_assistant_final_answer_continuity_text(transaction, payload)
     final_answer_json: JsonValue = {
         _PAYLOAD_FIELD_CONTENT: content,
         _PAYLOAD_FIELD_FILTERED: _required_payload_bool(

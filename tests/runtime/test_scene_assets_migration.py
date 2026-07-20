@@ -79,7 +79,7 @@ _CURRENT_TIME_MARKDOWN: Final[str] = (
     "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
     "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
 )
-_NO_DEFAULT_SUBJECT_SCENES: Final[frozenset[str]] = frozenset({"interactive", "wechat"})
+_NO_DEFAULT_SUBJECT_SCENES: Final[frozenset[str]] = frozenset({"wechat"})
 _CONVERSATION_MEMORY_SMOKE_SCENES: Final[frozenset[str]] = frozenset(
     {
         "smoke_host_public_conversation_memory",
@@ -621,12 +621,15 @@ def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidanc
     """interactive/wechat scene 应暴露下载、预处理和当前时间指引。"""
 
     for scene_id in ("interactive", "wechat"):
+        context_slot_values = {"current_time": "测试当前时间"}
+        if scene_id == "interactive":
+            context_slot_values["fins_default_subject"] = ""
         result = prepare_scene(
             ScenePrepareRequest(
                 scene_id=scene_id,
                 scene_manifest_root=_manifest_root(),
                 prompt_asset_root=_prompt_asset_root(),
-                context_slot_values={"current_time": "测试当前时间"},
+                context_slot_values=context_slot_values,
                 available_tools=_fake_tool_catalog(),
             )
         )

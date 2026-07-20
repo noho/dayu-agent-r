@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -24,6 +25,11 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import (
+    EngineRunErrorCode,
+    adapter_error_code,
+    runner_protocol_error_code,
+)
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     ContentCompleteData,
@@ -34,6 +40,7 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
     IterationCompletedData,
     IterationStartedData,
+    ProviderDiagnosticData,
     ProviderProtocolErrorData,
     ReasoningDeltaData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
@@ -52,6 +59,7 @@ from dayu.engine.contracts.engine_events import (
     UsageReportedData,
     runner_role_sequence_digest,
 )
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
@@ -60,12 +68,23 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
+from dayu.engine.contracts.runner_events import (
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AssistantToolCallBatchSnapshot,
     AwaitingToolExecutionRecord,
 )
 from dayu.host.admission import PendingDispatchRecord
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host.api import (
     AttemptStatus,
     CancelMode,
@@ -104,6 +123,7 @@ from dayu.host.context_policy import (
 )
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -119,7 +139,12 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.payload import PayloadKind, PayloadStore
+from dayu.host.durable.payload import (
+    PayloadKind,
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     ActiveCancelWatchdogCloseoutInput,
@@ -127,6 +152,7 @@ from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     FailRecoveringRunInput,
     RunTransitionResult,
+    TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     active_cancel_watchdog_closeout_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
@@ -137,12 +163,16 @@ from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
+    TABLE_HOST_RUNS,
+    TABLE_PAYLOAD_DESCRIPTORS,
+    TABLE_SQLITE_PAYLOADS,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordStatus,
+    RunRow,
     RunStartReason,
     StateMutationStatus,
     WaitResumePolicy,
@@ -158,10 +188,14 @@ from dayu.host.durable.state import (
     steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
@@ -182,6 +216,18 @@ _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "engine-ingest-test"})
 _REACTIVE_POLICY_REF = "test-reactive-policy"
 
 
+class _EngineHotTamperKind(StrEnum):
+    """Engine ingest shared hot parser 的篡改分类。"""
+
+    MISSING_DIAGNOSTIC = "missing_diagnostic"
+    NULL_DIAGNOSTIC = "null_diagnostic"
+    MALFORMED_DIAGNOSTIC = "malformed_diagnostic"
+    LEGACY_METADATA_ARRAY = "legacy_metadata_array"
+    STATUS_MISMATCH = "status_mismatch"
+    COUNT_MISMATCH = "count_mismatch"
+    DIGEST_MISMATCH = "digest_mismatch"
+
+
 @dataclass(frozen=True, slots=True)
 class _SeededRun:
     """测试中创建的 active Engine run。"""
@@ -191,6 +237,37 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+def _cas_lost_terminal_closeout(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: TerminalCloseoutInput,
+) -> RunTransitionResult:
+    """模拟 terminal helper 在写 payload 后返回 CAS loser。
+
+    :param transaction: 当前真实 Host transaction。
+    :param event_log_store: 生产 EventLog store；本注入点不写事件。
+    :param request: terminal closeout 输入。
+    :returns: 携带真实 durable rows 的 ``CAS_LOST`` transition 结果。
+    :raises AssertionError: seeded durable rows 缺失时抛出。
+    """
+
+    del event_log_store
+    run = read_run_by_id(transaction, request.run_id)
+    attempt = read_attempt_by_id(transaction, request.attempt_id)
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, request.attempt_id
+    )
+    assert run is not None
+    assert attempt is not None
+    assert dispatch_record is not None
+    return RunTransitionResult(
+        status=StateMutationStatus.CAS_LOST,
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+    )
 
 
 class _TransactionReadableCompactor(FakeContextCompactor):
@@ -458,23 +535,102 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         assert "summary_text" not in terminal_payload
 
 
-def test_empty_final_answer_closes_failed_without_run_succeeded(
+def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
+    """两类 terminal plan 类型分离并复用 lifecycle event owner helper。
+
+    :returns: ``None``。
+    :raises AssertionError: 类型边界或 owner helper 映射漂移时抛出。
+    """
+
+    succeeded = engine_ingest_module._final_answer_plan(
+        FinalAnswerData(
+            content="完成答案",
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    failed = engine_ingest_module._run_failed_plan(
+        RunFailedData(
+            error_code=adapter_error_code("provider_error"),
+            message="provider failed",
+            provider_request_id=None,
+            client_correlation_id=None,
+            recoverable=False,
+        )
+    )
+    lost = engine_ingest_module._lost_lifecycle_plan(
+        worker_lifecycle_signal="worker_crashed",
+        stream_error_code=None,
+        last_observed_worker_event_index=3,
+        last_accepted_event_id=None,
+    )
+
+    assert isinstance(succeeded, engine_ingest_module._EngineTerminalPlan)
+    assert isinstance(failed, engine_ingest_module._EngineTerminalPlan)
+    assert isinstance(lost, engine_ingest_module._HostLifecycleTerminalPlan)
+    engine_plan_fields = {field.name for field in fields(succeeded)}
+    host_plan_fields = {field.name for field in fields(lost)}
+    assert engine_plan_fields == {
+        "terminal",
+        "finish_reason",
+        "filtered",
+        "degraded",
+        "error_code",
+        "message",
+        "provider_request_id",
+        "client_correlation_id",
+        "recoverable",
+        "unsupported_later_owner",
+    }
+    assert host_plan_fields == {
+        "terminal",
+        "error_code",
+        "message",
+        "recoverable",
+        "worker_lifecycle_signal",
+        "stream_error_code",
+        "last_observed_worker_event_index",
+        "last_accepted_event_id",
+    }
+    assert succeeded.terminal.attempt_event_type == (
+        closeout_attempt_terminal_event_type_for_status(AttemptStatus.SUCCEEDED).value
+    )
+    assert succeeded.terminal.run_event_type == (
+        run_terminal_event_type_for_status(RunStatus.SUCCEEDED).value
+    )
+    assert failed.terminal.attempt_event_type == (
+        closeout_attempt_terminal_event_type_for_status(AttemptStatus.FAILED).value
+    )
+    assert failed.terminal.run_event_type == (
+        run_terminal_event_type_for_status(RunStatus.FAILED).value
+    )
+    assert lost.terminal.attempt_event_type == (
+        closeout_attempt_terminal_event_type_for_status(AttemptStatus.LOST).value
+    )
+    assert lost.terminal.run_event_type == (
+        run_terminal_event_type_for_status(RunStatus.LOST).value
+    )
+
+
+def test_engine_owned_empty_final_failure_closes_failed(
     tmp_path: Path,
 ) -> None:
-    """空 final_answer 不写入无法 public 投影的 RUN_SUCCEEDED。"""
+    """Engine-owned 空 final 失败事实映射为 Host FAILED。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _candidate(
             seeded,
             worker_event_index=2,
-            data=FinalAnswerData(
-                content="",
-                filtered=False,
-                degraded=True,
-                finish_reason=FinishReason.LENGTH,
+            data=RunFailedData(
+                error_code=EngineRunErrorCode.RUNNER_EMPTY_FINAL_CONTENT,
+                message="runner did not produce final content",
+                provider_request_id=None,
+                client_correlation_id=None,
+                recoverable=False,
             ),
-            event_type=EngineEventType.FINAL_ANSWER,
+            event_type=EngineEventType.RUN_FAILED,
         )
 
         result = EngineEventIngestor(
@@ -489,12 +645,12 @@ def test_empty_final_answer_closes_failed_without_run_succeeded(
         assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 0
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
         payload = _payload(result.events[0])
-        assert payload["error_code"] == "empty_final_answer"
+        assert payload["error_code"] == "runner_empty_final_content"
         assert payload["recoverable"] is False
         assert "content" not in payload
         assert "final_answer" not in payload
         run_payload = _payload(result.events[1])
-        assert run_payload["error_code"] == "empty_final_answer"
+        assert run_payload["error_code"] == "runner_empty_final_content"
         assert "content" not in run_payload
         assert "final_answer" not in run_payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
@@ -511,7 +667,7 @@ def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
             seeded,
             worker_event_index=2,
             data=RunFailedData(
-                error_code="provider_error",
+                error_code=adapter_error_code("provider_error"),
                 message="provider failed",
                 provider_request_id="req-1",
                 client_correlation_id="client-req-1",
@@ -547,7 +703,7 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
             seeded,
             worker_event_index=3,
             data=RunFailedData(
-                error_code="context_recovery_needed",
+                error_code=adapter_error_code("context_recovery_needed"),
                 message="recoverable",
                 provider_request_id="req-2",
                 client_correlation_id="client-req-2",
@@ -792,6 +948,64 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
         assert result.status is EngineIngestStatus.ACCEPTED
         assert compactor.calls == 1
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reactive compact 返回后的 gate 直接消费 Attempt terminal status owner。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: reactive gate 未消费 terminal status owner 时抛出。
+    """
+
+    owner_predicate = engine_ingest_module.is_terminal_attempt_status
+    observed_statuses: list[AttemptStatus] = []
+
+    def status_gate(status: AttemptStatus) -> bool:
+        """记录 gate 输入并让 FAILED status 明确阻止 compact commit。
+
+        :param status: reactive gate 读取的 Attempt status。
+        :returns: 非 FAILED status 使用真实 owner predicate；FAILED 返回 ``False``。
+        :raises: 无主动抛出。
+        """
+
+        observed_statuses.append(status)
+        if status is AttemptStatus.FAILED:
+            return False
+        return owner_predicate(status)
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "is_terminal_attempt_status",
+        status_gate,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        compactor = _TransactionReadableCompactor(store.transaction_runner)
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(seeded, worker_event_index=141)
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert compactor.calls == 1
+        assert AttemptStatus.FAILED in observed_statuses
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.RECOVERING,
+            AttemptStatus.FAILED,
+        )
 
 
 @pytest.mark.asyncio
@@ -1120,7 +1334,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
                 seeded,
                 worker_event_index=44,
                 data=RunFailedData(
-                    error_code="context_compaction_required",
+                    error_code=EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
                     message="provider closed old attempt",
                     provider_request_id="req-overflow",
                     recoverable=True,
@@ -1157,7 +1371,6 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
                     iteration_id="iter-stale",
                     content="old",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
                 event_type=EngineEventType.CONTENT_COMPLETED,
             )
@@ -1170,7 +1383,6 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
                     iteration_id="iter-current",
                     content="new",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
                 event_type=EngineEventType.CONTENT_COMPLETED,
             )
@@ -1465,7 +1677,7 @@ def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
         assert payload["waiting_confirmation_accepted"] is True
         assert payload["waiting_confirmation_mismatch_reason"] is None
         assert payload["wait_id"] == accept_result.wait_id
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1546,7 +1758,7 @@ def test_tool_awaiting_rejects_mismatched_engine_record_without_state_change(
         assert payload["waiting_confirmation_accepted"] is False
         assert payload["waiting_confirmation_mismatch_reason"] == "awaiting_spec_mismatch"
         assert payload["wait_id"] == accept_result.wait_id
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1587,7 +1799,7 @@ def test_waiting_confirmation_wrong_attempt_identity_is_rejected(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert _payload(result.events[0])["reason"] == "stale_execution_id"
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1628,7 +1840,7 @@ def test_waiting_confirmation_wrong_execution_identity_is_rejected(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert _event_count(store.transaction_runner, "ENGINE_EVENT_REJECTED") == 1
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1669,7 +1881,7 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert _payload(result.events[0])["reason"] == "stale_execution_id"
-        assert _canonical_tool_event_count(store.transaction_runner) == 2
+        assert _canonical_tool_event_count(store.transaction_runner) == 3
 
 
 def test_usage_reported_is_projection_signal_without_state_change(
@@ -1687,6 +1899,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id="req-usage",
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1707,7 +1920,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
         assert payload["prompt_tokens"] == 10
         assert payload["completion_tokens"] == 20
         assert payload["total_tokens"] == 30
-        assert payload["provider_request_id"] is None
+        assert payload["provider_request_id"] == "req-usage"
         assert payload["policy_ref"] == _REACTIVE_POLICY_REF
         assert isinstance(payload["estimator_digest"], str)
         assert payload["estimated_input_tokens"] == 14
@@ -1754,6 +1967,7 @@ def test_usage_reported_without_policy_keeps_projection_non_failing(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id=None,
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1808,6 +2022,7 @@ def test_usage_reported_missing_input_event_keeps_projection_non_failing(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id=None,
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1852,6 +2067,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id="req-unreadable-input",
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1867,7 +2083,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
         assert payload["estimator_digest"] is None
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
-        assert payload["provider_request_id"] is None
+        assert payload["provider_request_id"] == "req-unreadable-input"
         context_pressure = payload["context_pressure"]
         assert isinstance(context_pressure, Mapping)
         assert context_pressure["status"] == "estimate_unavailable"
@@ -1892,6 +2108,7 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
                 prompt_tokens=-1,
                 completion_tokens=20,
                 total_tokens=19,
+                provider_request_id="req-invalid-usage",
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1904,6 +2121,7 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
         assert result.status == EngineIngestStatus.ACCEPTED
         payload = _payload(result.events[0])
         assert payload["prompt_tokens"] == -1
+        assert payload["provider_request_id"] == "req-invalid-usage"
         assert payload["policy_ref"] == _REACTIVE_POLICY_REF
         assert isinstance(payload["estimator_digest"], str)
         assert payload["estimated_input_tokens"] == 14
@@ -2012,7 +2230,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
             worker_event_index=10,
             data=ProviderProtocolErrorData(
                 iteration_id="iter-protocol",
-                error_code="invalid_stream",
+                error_code=runner_protocol_error_code("invalid_stream"),
                 message="bad stream",
                 provider_request_id="req-protocol",
                 client_correlation_id="client-protocol",
@@ -2060,6 +2278,55 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
             "provider_error_code": "invalid_stream",
             "diagnostic_refs": [payload["raw_payload_ref"], "req-protocol"],
         }
+        assert "RunnerSpecificErrorCode" not in json.dumps(payload)
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_provider_diagnostic_is_nonfatal_diagnostic_without_failure_metadata(
+    tmp_path: Path,
+) -> None:
+    """provider diagnostic 持久化为非致命诊断，不改变 active Run 状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=11,
+            data=ProviderDiagnosticData(
+                iteration_id="iter-diagnostic",
+                diagnostic_code="usage_field_malformed",
+                severity=RunnerDiagnosticSeverity.WARNING,
+                message="usage ignored",
+                provider_request_id="req-diagnostic",
+                raw_payload={"prompt_tokens_type": "str"},
+                partial_tool_calls=(),
+                diagnostic_source=RunnerDiagnosticSource.SSE_PARSER,
+                client_correlation_id="client-diagnostic",
+            ),
+            event_type=EngineEventType.PROVIDER_DIAGNOSTIC,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.terminal_closeout is False
+        assert result.events[0].event_class == EventClass.DIAGNOSTIC
+        assert result.events[0].event_type == "PROVIDER_DIAGNOSTIC"
+        payload = _payload(result.events[0])
+        assert payload["diagnostic_code"] == "usage_field_malformed"
+        assert payload["severity"] == "warning"
+        assert payload["message"] == "usage ignored"
+        assert payload["provider_request_id"] == "req-diagnostic"
+        assert payload["client_correlation_id"] == "client-diagnostic"
+        assert payload["diagnostic_source"] == "sse_parser"
+        assert payload["payload_ref"] is not None
+        assert payload["payload_digest"] is not None
+        assert payload["partial_tool_call_count"] == 0
+        assert "failure_metadata" not in payload
+        assert "provider_error_code" not in payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -2078,7 +2345,7 @@ def test_provider_protocol_error_serializes_partial_tool_call_signal(
             worker_event_index=11,
             data=ProviderProtocolErrorData(
                 iteration_id="iter-protocol-partial",
-                error_code="invalid_stream",
+                error_code=runner_protocol_error_code("invalid_stream"),
                 message="bad stream",
                 provider_request_id="req-protocol-partial",
                 client_correlation_id="client-protocol-partial",
@@ -2333,8 +2600,8 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         late = _candidate(
             seeded,
             worker_event_index=14,
-            data=RunFailedData(
-                error_code="late",
+                data=RunFailedData(
+                    error_code=adapter_error_code("late"),
                 message="late",
                 provider_request_id=None,
                 recoverable=False,
@@ -2411,20 +2678,21 @@ def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None
 
         assert result.status == EngineIngestStatus.REJECTED
         assert _payload(result.events[0])["reason"] == (
-            "run_cancelled_without_active_cancel"
+            "run_cancelled_invalid_active_cancel_link"
         )
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
+def test_run_cancelled_with_malformed_active_cancel_payload_uses_typed_link(
     tmp_path: Path,
 ) -> None:
-    """RUN_CANCELLING payload 缺少 request id 时返回 rejected diagnostic。"""
+    """RUN_CANCELLING payload 缺少 request id 时仍使用 typed row link。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
         store.transaction_runner.run_write(
             _AppendMalformedRunCancellingOperation(seeded)
         )
@@ -2444,13 +2712,48 @@ def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
             transaction_runner=store.transaction_runner
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == (
-            "run_cancelled_invalid_active_cancel_payload"
-        )
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.terminal_closeout is True
+        assert _event_count(store.transaction_runner, "RUN_CANCELLED") == 1
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
-        assert run_status == RunStatus.RUNNING
-        assert attempt_status == AttemptStatus.RUNNING
+        assert run_status == RunStatus.CANCELLED
+        assert attempt_status == AttemptStatus.CANCELLED
+
+
+def test_run_cancelled_requested_at_uses_cancel_requested_event_time(
+    tmp_path: Path,
+) -> None:
+    """cancel terminal requested_at 来自 committed CANCEL_REQUESTED fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        engine_requested_at = _NOW.replace(second=33)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=17,
+            data=RunCancelledData(
+                reason="user_stop",
+                requested_at=engine_requested_at,
+                accepted_at=_NOW.replace(second=34),
+                finished_at=_NOW.replace(second=35),
+            ),
+            event_type=EngineEventType.RUN_CANCELLED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        run_cancelled = _latest_event(store.transaction_runner, "RUN_CANCELLED")
+        payload = _payload(run_cancelled)
+        assert payload["requested_at"] == "2026-05-15T01:02:03.000000Z"
+        assert payload["requested_at"] != engine_requested_at.isoformat()
 
 
 def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
@@ -2464,8 +2767,8 @@ def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
         candidate = _candidate(
             seeded,
             worker_event_index=17,
-            data=RunFailedData(
-                error_code="late_after_timeout",
+                data=RunFailedData(
+                    error_code=adapter_error_code("late_after_timeout"),
                 message="late after timeout",
                 provider_request_id=None,
                 recoverable=False,
@@ -2533,8 +2836,8 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         candidate = _candidate(
             seeded,
             worker_event_index=19,
-            data=RunFailedData(
-                error_code="late_failure",
+                data=RunFailedData(
+                    error_code=adapter_error_code("late_failure"),
                 message="late failure",
                 provider_request_id=None,
                 recoverable=False,
@@ -2552,6 +2855,64 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         )
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
         assert _event_count(store.transaction_runner, "ATTEMPT_FAILED") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.CANCELLING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+@pytest.mark.parametrize(
+    "lifecycle_source",
+    ("worker_clean_eof", "worker_lost"),
+)
+def test_host_lifecycle_after_run_cancelling_is_diagnostic_only(
+    tmp_path: Path,
+    lifecycle_source: str,
+) -> None:
+    """active cancel 后 Host lifecycle signal 不写失败或 lost terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :param lifecycle_source: 待验证的 Host lifecycle 来源。
+    :returns: ``None``。
+    :raises AssertionError: lifecycle decision table 不满足时由 pytest 报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        if lifecycle_source == "worker_clean_eof":
+            result = ingestor.close_clean_eof(
+                _envelope(seeded),
+                observed_at=_NOW,
+                last_observed_worker_event_index=0,
+            )
+        else:
+            result = ingestor.close_worker_lost(
+                _envelope(seeded),
+                observed_at=_NOW,
+                worker_lifecycle_signal="worker_crash",
+                stream_error_code="RuntimeError",
+                last_observed_worker_event_index=0,
+            )
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.terminal_closeout is False
+        assert len(result.events) == 1
+        diagnostic = result.events[0]
+        assert diagnostic.event_type == "HOST_LIFECYCLE_DIAGNOSTIC"
+        assert diagnostic.event_id.startswith("event-host-lifecycle-")
+        assert diagnostic.source == "host.worker_lifecycle"
+        diagnostic_payload = _payload(diagnostic)
+        assert diagnostic_payload["reason"] == (
+            "host_lifecycle_after_active_cancel"
+        )
+        assert diagnostic_payload["lifecycle_source"] == lifecycle_source
+        assert "engine_event_type" not in diagnostic_payload
+        assert "engine_event_ref" not in diagnostic_payload
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_FAILED") == 0
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_LOST") == 0
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.CANCELLING
         assert attempt_status == AttemptStatus.RUNNING
@@ -2724,10 +3085,125 @@ class _CloseActiveCancelWatchdogOperation:
         assert result.status == StateMutationStatus.UPDATED
 
 
+def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
+    tmp_path: Path,
+) -> None:
+    """worker clean EOF 使用 Host lifecycle identity，不伪造 Engine fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: lifecycle identity、source 或 payload 不满足时报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_clean_eof(
+            _envelope(seeded),
+            observed_at=_NOW,
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in result.events] == [
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert all(
+            event.event_id.startswith("event-host-lifecycle-")
+            for event in result.events
+        )
+        assert all(event.source == "host.worker_lifecycle" for event in result.events)
+        attempt_payload = _payload(result.events[0])
+        assert "engine_event_ref" not in attempt_payload
+        assert "engine_event_type" not in attempt_payload
+        terminal_payload = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=cast(str, attempt_payload["terminal_summary_ref"]),
+                payload_digest=cast(
+                    str, attempt_payload["terminal_summary_digest"]
+                ),
+                payload_label="host lifecycle terminal payload",
+            )
+        )
+        assert terminal_payload["lifecycle_source"] == "worker_clean_eof"
+        assert terminal_payload["host_lifecycle_ref"] == (
+            f"host-lifecycle:{seeded.execution_id}:1:worker_clean_eof:"
+            "stream_ended_without_terminal"
+        )
+        assert "engine_event_type" not in terminal_payload
+
+
+def test_host_lifecycle_ingress_rejects_mismatched_run_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host lifecycle ingress 显式拒绝 repository 返回的错 run identity。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: ingress 接受错 Run identity 时抛出。
+    """
+
+    durable_read_run = engine_ingest_module.read_run_by_id
+
+    def mismatched_read_run(
+        transaction: HostTransaction, run_id: str
+    ) -> RunRow | None:
+        """返回 key 查询命中但 row identity 漂移的测试 double。
+
+        :param transaction: 当前 Host transaction。
+        :param run_id: envelope 请求的 Run id。
+        :returns: identity 被替换的 Run row；不存在时返回 ``None``。
+        :raises HostDurableError: durable Run row 读取失败时抛出。
+        """
+
+        run = durable_read_run(transaction, run_id)
+        if run is None:
+            return None
+        return replace(run, run_id=f"{run_id}-mismatched")
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "read_run_by_id",
+        mismatched_read_run,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_clean_eof(
+            _envelope(seeded),
+            observed_at=_NOW,
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "stale_execution_id"
+        assert result.terminal_closeout is False
+        assert [event.event_type for event in result.events] == [
+            "HOST_LIFECYCLE_DIAGNOSTIC"
+        ]
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.RUNNING,
+            AttemptStatus.RUNNING,
+        )
+
+
 def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
     tmp_path: Path,
 ) -> None:
-    """worker lost synthetic lifecycle 使用 LOST facts，重复 closeout 幂等。"""
+    """worker lost 使用 Host lifecycle LOST facts，重复 closeout 幂等。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: LOST closeout 或幂等 identity 不满足时报告。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -2757,28 +3233,209 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
             "ATTEMPT_LOST",
             "RUN_LOST",
         ]
-        payload = _payload(first.events[1])
-        assert payload["engine_event_ref"] == (
-            f"engine:{seeded.execution_id}:1:worker_lost_before_terminal"
+        assert all(
+            event.event_id.startswith("event-host-lifecycle-")
+            for event in first.events
         )
+        assert all(event.source == "host.worker_lifecycle" for event in first.events)
+        payload = _payload(first.events[1])
+        assert "engine_event_ref" not in payload
+        attempt_payload = _payload(first.events[0])
+        terminal_payload = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=cast(str, attempt_payload["terminal_summary_ref"]),
+                payload_digest=cast(
+                    str, attempt_payload["terminal_summary_digest"]
+                ),
+                payload_label="host lifecycle terminal payload",
+            )
+        )
+        assert terminal_payload["lifecycle_source"] == "worker_lost"
+        assert terminal_payload["host_lifecycle_ref"] == (
+            f"host-lifecycle:{seeded.execution_id}:1:worker_lost:"
+            "worker_lost_before_terminal"
+        )
+        assert "engine_event_type" not in terminal_payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.LOST
         assert attempt_status == AttemptStatus.LOST
 
 
-def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
-    """EngineEvent type/data 不匹配时写 rejected diagnostic。"""
+def test_engine_terminal_invalid_state_rolls_back_payload_and_events(
+    tmp_path: Path,
+) -> None:
+    """Engine terminal 遇 WAITING/RUNNING invalid-state 时原子回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: payload、EventLog 或状态未原子回滚时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _force_run_status_for_invalid_terminal_precondition(
+            store.transaction_runner,
+            seeded,
+            status=RunStatus.WAITING,
+        )
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(
+            _candidate(
+                seeded,
+                worker_event_index=61,
+                data=FinalAnswerData(
+                    content="late answer",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.FINAL_ANSWER,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_host_lifecycle_invalid_state_rolls_back_payload_and_events(
+    tmp_path: Path,
+) -> None:
+    """Host lifecycle terminal 遇 WAITING/RUNNING invalid-state 时原子回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: payload、EventLog 或状态未原子回滚时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _force_run_status_for_invalid_terminal_precondition(
+            store.transaction_runner,
+            seeded,
+            status=RunStatus.WAITING,
+        )
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_worker_lost(
+            _envelope(seeded),
+            observed_at=_NOW,
+            worker_lifecycle_signal="worker_stream_error",
+            stream_error_code="RuntimeError",
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_engine_terminal_cas_lost_rolls_back_real_payload_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Engine terminal CAS loser 经真实 transaction 与 payload repository 回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: CAS loser 未原子回滚时抛出。
+    """
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "terminal_closeout_in_transaction",
+        _cas_lost_terminal_closeout,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(
+            _candidate(
+                seeded,
+                worker_event_index=62,
+                data=FinalAnswerData(
+                    content="answer",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.FINAL_ANSWER,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_host_lifecycle_cas_lost_rolls_back_real_payload_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host lifecycle CAS loser 经真实 transaction 与 payload repository 回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: CAS loser 未原子回滚时抛出。
+    """
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "terminal_closeout_in_transaction",
+        _cas_lost_terminal_closeout,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_clean_eof(
+            _envelope(seeded),
+            observed_at=_NOW,
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_engine_run_failed_with_worker_lifecycle_reason_remains_engine_failed(
+    tmp_path: Path,
+) -> None:
+    """真实 Engine run_failed 不因 Host lifecycle reason 文本被重解释为 LOST。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Engine-origin closeout 被错误重解释时报告。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _candidate(
             seeded,
-            worker_event_index=16,
-            data=FinalAnswerData(
-                content="wrong shape",
-                filtered=False,
-                degraded=False,
-                finish_reason=FinishReason.STOP,
+            worker_event_index=1,
+            data=RunFailedData(
+                error_code=adapter_error_code("worker_lost_before_terminal"),
+                message="Engine reported its own failure",
+                provider_request_id=None,
+                recoverable=False,
             ),
             event_type=EngineEventType.RUN_FAILED,
         )
@@ -2787,15 +3444,123 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
             transaction_runner=store.transaction_runner
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
-        assert result.stop_worker_stream is True
+        assert [event.event_type for event in result.events] == [
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert all(event.event_id.startswith("event-engine-") for event in result.events)
+        payload = _payload(result.events[0])
+        assert payload["engine_event_ref"] == (
+            f"engine:{seeded.execution_id}:1:run_failed"
+        )
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.FAILED,
+            AttemptStatus.FAILED,
+        )
+
+
+def test_late_rejection_uses_status_even_when_terminal_refs_are_missing(
+    tmp_path: Path,
+) -> None:
+    """late rejection 直接消费 Run / Attempt status，而不依赖 nullable refs。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: status truth 未优先于 nullable refs 时报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=1,
+            data=ReasoningDeltaData(
+                iteration_id="iter-status-truth",
+                delta="late",
+            ),
+            event_type=EngineEventType.REASONING_DELTA,
+        )
+
+        def _context(
+            transaction: HostTransaction,
+        ) -> engine_ingest_module._ValidatedCandidate:
+            """构造只用于 predicate 单测的异常 nullable-ref 上下文。
+
+            :param transaction: Host read transaction。
+            :returns: status 已终态但 terminal refs 为空的校验上下文。
+            :raises AssertionError: seeded durable rows 缺失时抛出。
+            """
+
+            run = read_run_by_id(transaction, seeded.run_id)
+            attempt = read_attempt_by_id(transaction, seeded.attempt_id)
+            dispatch = read_dispatch_record_by_attempt_id(
+                transaction, seeded.attempt_id
+            )
+            assert run is not None
+            assert attempt is not None
+            assert dispatch is not None
+            return engine_ingest_module._ValidatedCandidate(
+                candidate=candidate,
+                run=replace(
+                    run,
+                    status=RunStatus.FAILED,
+                    terminal_event_id=None,
+                    terminal_event_sequence=None,
+                    terminal_at=None,
+                ),
+                attempt=attempt,
+                dispatch_record=dispatch,
+            )
+
+        run_terminal_context = store.transaction_runner.run_read(_context)
+        attempt_terminal_context = replace(
+            run_terminal_context,
+            run=replace(run_terminal_context.run, status=RunStatus.RUNNING),
+            attempt=replace(
+                run_terminal_context.attempt,
+                status=AttemptStatus.FAILED,
+                terminal_event_id=None,
+                terminal_event_sequence=None,
+                terminal_at=None,
+            ),
+        )
+
+        assert engine_ingest_module._late_engine_event_rejection_reason(
+            run_terminal_context
+        ) == "terminal_already_closed"
+        assert engine_ingest_module._late_engine_event_rejection_reason(
+            attempt_terminal_context
+        ) == "terminal_already_closed"
+
+
+def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
+    """EngineEvent owner 在 Host ingest 前拒绝 type/data mismatch。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        with pytest.raises(ValueError, match="type/data mismatch"):
+            _candidate(
+                seeded,
+                worker_event_index=16,
+                data=FinalAnswerData(
+                    content="wrong shape",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.RUN_FAILED,
+            )
 
 
 @pytest.mark.parametrize(
-    ("worker_event_index", "data"),
+    ("worker_event_index", "data", "expected_error", "expected_message"),
     (
-        (17, cast(EngineEventData, None)),
+        (
+            17,
+            cast(EngineEventData, None),
+            TypeError,
+            "unsupported type",
+        ),
         (
             18,
             IterationStartedData(
@@ -2807,6 +3572,8 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
                     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
                 ),
             ),
+            ValueError,
+            "type/data mismatch",
         ),
     ),
 )
@@ -2814,27 +3581,20 @@ def test_transient_delta_event_rejects_missing_or_wrong_data(
     tmp_path: Path,
     worker_event_index: int,
     data: EngineEventData,
+    expected_error: type[TypeError] | type[ValueError],
+    expected_message: str,
 ) -> None:
-    """transient delta event 必须同时匹配 event type 与 data 类型。"""
+    """非法 transient delta 在构造 owner 处失败，不进入 Host repair。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        candidate = _candidate(
-            seeded,
-            worker_event_index=worker_event_index,
-            data=data,
-            event_type=EngineEventType.CONTENT_DELTA,
-        )
-
-        result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
-        ).ingest(candidate)
-
-        assert result.status == EngineIngestStatus.REJECTED
-        assert result.events[0].event_class == EventClass.DIAGNOSTIC
-        assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
-        assert result.stop_worker_stream is True
-        assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
+        with pytest.raises(expected_error, match=expected_message):
+            _candidate(
+                seeded,
+                worker_event_index=worker_event_index,
+                data=data,
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
 
 
 def test_transient_delta_event_accepts_matching_type_without_row(
@@ -3548,7 +4308,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "status": "limited_signal",
             "reason": "missing_projection_artifact",
             "missing_atom_kind": None,
-            "missing_ref_kind": "runner_call_projection_artifact",
+                "missing_ref_kind": "artifact_ref",
             "missing_ref": None,
             "observed_count": 4,
             "expected_count": None,
@@ -3666,7 +4426,31 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             )
         )
         message_entries = _json_object_sequence(manifest_body["message_entries"])
+        projector_metadata = _json_object_sequence(
+            manifest_body["projector_metadata"]
+        )
         assert len(message_entries) == 4
+        assert len(projector_metadata) == 1
+        projector_metadata_ids: set[str] = set()
+        for item in projector_metadata:
+            metadata_id = item["projector_metadata_id"]
+            assert isinstance(metadata_id, str)
+            projector_metadata_ids.add(metadata_id)
+        assert all(
+            entry["projector_metadata_id"] in projector_metadata_ids
+            for entry in message_entries
+        )
+        assert frozenset(projector_metadata[0]) == frozenset(
+            {
+                "projector_metadata_id",
+                "projector_id",
+                "projector_schema_version",
+                "projector_digest",
+                "purpose",
+                "source_contract_refs",
+            }
+        )
+        assert "projector_metadata_summary" not in manifest_hot
         projection_ref = manifest_hot["runner_call_projection_artifact_ref"]
         projection_digest = manifest_hot["runner_call_projection_artifact_digest"]
         assert isinstance(projection_ref, str)
@@ -3696,6 +4480,62 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             assert message["content_digest"] == entry["content_digest"]
             assert entry["projection_artifact_ref"] == projection_ref
             assert entry["projection_artifact_digest"] == projection_digest
+
+
+@pytest.mark.parametrize("tamper_kind", tuple(_EngineHotTamperKind))
+def test_engine_ingest_rejects_invalid_runner_call_hot_payload(
+    tmp_path: Path,
+    tamper_kind: _EngineHotTamperKind,
+) -> None:
+    """Engine ingest 不得为损坏 hot row 合成 complete diagnostic。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_kind: diagnostic、旧数组或跨字段冲突分类。
+    :returns: ``None``。
+    :raises AssertionError: Engine consumer 接受损坏 hot payload 时抛出。
+    """
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        event = _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id=f"event-engine-hot-{tamper_kind.value}",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        payload: dict[str, JsonValue] = dict(_payload(event))
+        diagnostic_value = payload["diagnostic"]
+        assert isinstance(diagnostic_value, Mapping)
+        diagnostic: dict[str, JsonValue] = dict(diagnostic_value)
+        if tamper_kind is _EngineHotTamperKind.MISSING_DIAGNOSTIC:
+            del payload["diagnostic"]
+        elif tamper_kind is _EngineHotTamperKind.NULL_DIAGNOSTIC:
+            payload["diagnostic"] = None
+        elif tamper_kind is _EngineHotTamperKind.MALFORMED_DIAGNOSTIC:
+            payload["diagnostic"] = []
+        elif tamper_kind is _EngineHotTamperKind.LEGACY_METADATA_ARRAY:
+            payload["projector_metadata_summary"] = []
+        elif tamper_kind is _EngineHotTamperKind.STATUS_MISMATCH:
+            payload["validation_status"] = "limited_signal"
+        elif tamper_kind is _EngineHotTamperKind.COUNT_MISMATCH:
+            diagnostic["observed_count"] = 3
+            payload["diagnostic"] = diagnostic
+        else:
+            diagnostic["expected_digest"] = sha256_digest_json(
+                {"roles": ["tampered"]}
+            )
+            payload["diagnostic"] = diagnostic
+
+        with pytest.raises(HostDurableError):
+            engine_ingest_module._runner_call_payload_diagnostic(
+                payload,
+                consumer_boundary="engine_ingest_test",
+            )
 
 
 def test_iteration_completed_preview_includes_client_correlation_id(
@@ -3832,7 +4672,7 @@ def _seed_active_run(
                 source="pytest",
                 idempotency_key="idem-ingest",
                 execution_target="target-ingest",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
@@ -4077,7 +4917,7 @@ def _candidate(
             worker_kind=WorkerKind.LOCAL,
             execution_target="target-ingest",
             local_worker_id="local-worker-ingest",
-            cancellation_token=StubCancellationToken(),
+            cancellation_token=ControllableCancellationToken(),
         ),
         worker_event_index=worker_event_index,
         engine_event=EngineEvent(
@@ -4154,10 +4994,12 @@ def _proposal_agent_request(
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 
@@ -4199,7 +5041,7 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
         worker_kind=WorkerKind.LOCAL,
         execution_target="target-ingest",
         local_worker_id="local-worker-ingest",
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 
@@ -4410,6 +5252,91 @@ def _statuses(
     return transaction_runner.run_read(_operation)
 
 
+def _terminal_storage_snapshot(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+) -> tuple[int, int, int, RunStatus, AttemptStatus]:
+    """读取 terminal 原子性断言所需的真实 durable snapshot。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :returns: payload row、descriptor、EventLog row 数与 Run/Attempt status。
+    :raises AssertionError: durable count 或 Run/Attempt row 缺失时抛出。
+    """
+
+    def _operation(
+        transaction: HostTransaction,
+    ) -> tuple[int, int, int, RunStatus, AttemptStatus]:
+        """在同一 read transaction 内读取原子性快照。
+
+        :param transaction: Host read transaction。
+        :returns: payload row、descriptor、EventLog row 数与 Run/Attempt status。
+        :raises AssertionError: durable count 或 Run/Attempt row 缺失时抛出。
+        """
+
+        run = read_run_by_id(transaction, seeded.run_id)
+        attempt = read_attempt_by_id(transaction, seeded.attempt_id)
+        assert run is not None
+        assert attempt is not None
+        return (
+            _table_row_count(transaction, TABLE_SQLITE_PAYLOADS),
+            _table_row_count(transaction, TABLE_PAYLOAD_DESCRIPTORS),
+            _table_row_count(transaction, TABLE_EVENT_LOG),
+            run.status,
+            attempt.status,
+        )
+
+    return transaction_runner.run_read(_operation)
+
+
+def _force_run_status_for_invalid_terminal_precondition(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    status: RunStatus,
+) -> None:
+    """构造 row 可解码但不满足 terminal closeout 的跨对象状态组合。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :param status: 写入 Run row 的非终态 status。
+    :returns: ``None``。
+    :raises AssertionError: 状态更新未命中唯一 Run row 时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """更新测试 Run status，不改变 Attempt 与 terminal refs。
+
+        :param transaction: Host write transaction。
+        :returns: ``None``。
+        :raises AssertionError: 状态更新未命中唯一 Run row 时抛出。
+        """
+
+        changed = transaction.execute(
+            f"UPDATE {TABLE_HOST_RUNS} SET status = ? WHERE run_id = ?",
+            (status.value, seeded.run_id),
+        )
+        assert changed.rowcount == 1
+
+    transaction_runner.run_write(_operation)
+
+
+def _table_row_count(transaction: HostTransaction, table_name: str) -> int:
+    """读取测试白名单 durable table 的 row count。
+
+    :param transaction: Host transaction。
+    :param table_name: schema 常量提供的 durable table 名称。
+    :returns: row count。
+    :raises AssertionError: SQLite 未返回整数 count 时抛出。
+    """
+
+    row = transaction.fetchone(f"SELECT COUNT(*) AS total FROM {table_name}")
+    assert row is not None
+    total = row.get("total")
+    assert isinstance(total, int)
+    return total
+
+
 def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> int:
     """统计指定 event type 数量。
 
@@ -4454,10 +5381,103 @@ def _append_prepared_runner_call_manifest(
     :returns: 写入的 EventLog row。
     """
 
-    manifest_digest = sha256_digest_json(
-        {"event_id": event_id, "role_sequence_digest": role_sequence_digest}
-    )
-    payload: dict[str, JsonValue] = {
+    roles = ("system", "user")
+    if message_count != len(roles):
+        raise AssertionError("prepared manifest fixture message_count must be two")
+    if role_sequence_digest != runner_role_sequence_digest(roles):
+        raise AssertionError("prepared manifest fixture role digest mismatch")
+    is_compactor = compactor_identity is not None
+    projection_ref = f"payload-runner-call-projection:{event_id}"
+    projection_digest = sha256_digest_json({"projection": event_id})
+    metadata_items: list[JsonValue] = []
+    message_entries: list[JsonValue] = []
+    for index, role in enumerate(roles):
+        metadata_id = (
+            f"compactor-projector:{role}"
+            if is_compactor
+            else f"projector:{index}:{role}"
+        )
+        projector_id = (
+            f"compactor_{role}_prompt"
+            if is_compactor
+            else (
+                "run_input_system_context"
+                if role == "system"
+                else "user_input_message"
+            )
+        )
+        purpose = (
+            "compactor_proposal_input"
+            if is_compactor
+            else (
+                "post_compaction_input"
+                if runner_call_kind == "post_compaction_dispatch"
+                else "ordinary_run_input"
+            )
+        )
+        source_contract_refs = (f"event:source:{event_id}:{index}",)
+        projector_schema_version = (
+            "compactor_projector.v1"
+            if is_compactor
+            else "run_input_projector.v1"
+        )
+        projector_digest = sha256_digest_json(
+            {
+                "projector_id": projector_id,
+                "projector_schema_version": projector_schema_version,
+                "purpose": purpose,
+                "source_contract_refs": list(source_contract_refs),
+            }
+        )
+        metadata_items.append(
+            runner_call_projector_metadata_descriptor(
+                RunnerCallProjectorMetadata(
+                    projector_metadata_id=metadata_id,
+                    projector_id=projector_id,
+                    projector_schema_version=projector_schema_version,
+                    projector_digest=projector_digest,
+                    purpose=purpose,
+                    source_contract_refs=source_contract_refs,
+                )
+            )
+        )
+        message_entries.append(
+            {
+                "index": index,
+                "role": role,
+                "content_digest": sha256_digest_json(
+                    {"event_id": event_id, "message_index": index}
+                ),
+                "content_size_bytes": index + 1,
+                "source_refs": list(source_contract_refs),
+                "projection_artifact_ref": (
+                    None if is_compactor and index == 0 else projection_ref
+                ),
+                "projection_artifact_digest": (
+                    None if is_compactor and index == 0 else projection_digest
+                ),
+                "projector_metadata_id": metadata_id,
+                "provider_tool_calls_digest": None,
+                "reasoning_content_digest": None,
+            }
+        )
+    valid_compactor_identity: Mapping[str, JsonValue] | None = None
+    if is_compactor:
+        operation_id = compactor_identity.get("compaction_operation_id")
+        if not isinstance(operation_id, str):
+            raise AssertionError("compactor operation id must be text")
+        valid_compactor_identity = {
+            "parent_host_run_id": seeded.run_id,
+            "parent_session_id": seeded.session_id,
+            "compaction_operation_id": operation_id,
+            "compactor_engine_run_id": "compactor-engine-run-test",
+            "compaction_attempt_number": runner_call_index + 1,
+            "compaction_request_digest": sha256_digest_json(
+                {"compaction_operation_id": operation_id}
+            ),
+            "compactor_input_projection_ref": projection_ref,
+        }
+    manifest: dict[str, JsonValue] = {
         "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
         "manifest_id": f"runner-call-manifest:{event_id}",
         "session_id": seeded.session_id,
@@ -4469,21 +5489,86 @@ def _append_prepared_runner_call_manifest(
         "runner_call_trigger_reason": runner_call_trigger_reason,
         "iteration_id": None,
         "iteration_index": None,
-        "manifest_payload_ref": f"payload-runner-call-manifest:{event_id}",
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-        "validation_status": "complete",
         "message_count": message_count,
         "role_sequence_digest": role_sequence_digest,
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
         "input_projection_digest": sha256_digest_json(
             {"projection": event_id}
         ),
-        "projector_metadata_summary": [],
+        "message_entries": message_entries,
+        "source_cursor_refs": [f"event:{event_id}"],
+        "tool_schema_snapshot_refs": [],
+        "memory_snapshot_cursor_ref": None,
+        "compact_artifact_refs": [],
+        "context_fallback_decision_ref": None,
+        "projector_metadata": metadata_items,
         "diagnostic": None,
-        "compactor_identity": compactor_identity,
+        "compactor_identity": valid_compactor_identity,
     }
+    if not is_compactor:
+        manifest.update(
+            {
+                "runner_call_projection_artifact_ref": projection_ref,
+                "runner_call_projection_artifact_digest": projection_digest,
+                "runner_call_projection_artifact_size_bytes": 128,
+            }
+        )
+    manifest_digest = sha256_digest_json(manifest)
+    manifest_payload_ref = f"payload-runner-call-manifest:{event_id}"
+    hot_payload = runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=seeded.session_id,
+            host_run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            runner_call_index=runner_call_index,
+            runner_call_kind=runner_call_kind,
+            runner_call_trigger_reason=runner_call_trigger_reason,
+            iteration_id=None,
+            iteration_index=None,
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+            validation_status="complete",
+            message_count=message_count,
+            role_sequence_digest=role_sequence_digest,
+            input_projection_digest=sha256_digest_json(
+                {"projection": event_id}
+            ),
+            runner_call_projection_artifact_ref=(
+                None if is_compactor else projection_ref
+            ),
+            runner_call_projection_artifact_digest=(
+                None if is_compactor else projection_digest
+            ),
+            runner_call_projection_artifact_size_bytes=(
+                None if is_compactor else 128
+            ),
+            diagnostic=complete_runner_call_hot_diagnostic(
+                status="complete",
+                message_count=message_count,
+                role_sequence_digest=role_sequence_digest,
+                consumer_boundary="test.engine_ingest",
+            ),
+        ),
+        manifest=manifest,
+    )
 
     def _operation(transaction: HostTransaction) -> EventLogRow:
+        descriptor = PayloadStore().write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=manifest_payload_ref,
+                payload_id=f"sqlite-runner-call-manifest:{event_id}",
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=manifest,
+                media_type="application/json",
+                metadata={},
+                expected_digest=manifest_digest,
+            ),
+        )
         return EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -4501,9 +5586,9 @@ def _append_prepared_runner_call_manifest(
                 idempotency_key=None,
                 policy_decision=None,
                 reason=None,
-                payload_json=payload,
-                payload_ref=None,
-                payload_digest=None,
+                payload_json=hot_payload,
+                payload_ref=descriptor.payload_ref,
+                payload_digest=descriptor.payload_digest,
             ),
         ).row
 

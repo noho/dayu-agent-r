@@ -28,9 +28,9 @@ torchvision==0.17.2
 rapidocr==3.8.0
 ocrmac==1.0.0 ; sys_platform == "darwin"
 httpxthrottlecache==0.3.5
-transformers==5.5.4
+transformers==4.57.6
 tokenizers==0.22.2
-huggingface_hub==1.11.0
+huggingface_hub==0.36.2
 streamlit==1.49.0
 
 # 已验证的测试/静态检查工具版本。

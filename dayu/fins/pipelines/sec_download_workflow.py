@@ -9,12 +9,16 @@ import inspect
 import time
 from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
-from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry
 from dayu.fins.downloaders.sec_downloader import SecDownloadCancelledError
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.ticker_normalization import normalize_ticker
-from dayu.fins.storage import FilingMaintenanceRepositoryProtocol, SourceDocumentRepositoryProtocol
+from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    FilingMaintenanceRepositoryProtocol,
+    SourceDocumentRepositoryProtocol,
+)
 from dayu.fins._log import Log
 
 _FILING_STATUS_DOWNLOADED: Final[str] = "downloaded"
@@ -55,8 +59,75 @@ class _DownloadWorkflowDownloader(Protocol):
         ...
 
 
+class _SaveRejectionRegistry(Protocol):
+    """SEC maintenance registry 写入回调边界。"""
+
+    def __call__(
+        self,
+        repository: FilingMaintenanceRepositoryProtocol,
+        ticker: str,
+        registry: DownloadRejectionRegistry,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """写入拒绝注册表。
+
+        Args:
+            repository: filing 维护仓储。
+            ticker: 股票代码。
+            registry: 拒绝注册表。
+            batch: invocation-time 显式 batch capability。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 仓储写入失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        ...
+
+
+class _CleanupStaleFilingDirs(Protocol):
+    """SEC stale filing 清理回调边界。"""
+
+    def __call__(
+        self,
+        repository: FilingMaintenanceRepositoryProtocol,
+        ticker: str,
+        form_windows: dict[str, dt.date],
+        filing_results: list[dict[str, JsonValue]],
+        *,
+        batch: BatchToken,
+    ) -> int:
+        """清理不再有效的 filing。
+
+        Args:
+            repository: filing 维护仓储。
+            ticker: 股票代码。
+            form_windows: 当前 form 窗口。
+            filing_results: 本次 filing 结果。
+            batch: invocation-time 显式 batch capability。
+
+        Returns:
+            清理数量。
+
+        Raises:
+            OSError: 仓储写入失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        ...
+
 class SecDownloadWorkflowHost(Protocol):
     """Sec download 工作流所需的最小宿主边界。"""
+
+    @property
+    def _batching_repository(self) -> BatchingRepositoryProtocol:
+        """返回 batch lifecycle 唯一仓储。"""
+
+        ...
 
     @property
     def MODULE(self) -> str:
@@ -129,6 +200,8 @@ class SecDownloadWorkflowHost(Protocol):
         company_id: str,
         company_name: str,
         ticker_aliases: Optional[list[str]],
+        *,
+        batch: BatchToken,
     ) -> None:
         """写入公司元数据。"""
 
@@ -151,7 +224,7 @@ class SecDownloadWorkflowHost(Protocol):
         cik: str,
         filing: FilingRecord,
         overwrite: bool,
-        rejection_registry: dict[str, dict[str, str]],
+        rejection_registry: DownloadRejectionRegistry,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行单 filing 下载流。"""
@@ -167,7 +240,7 @@ class SecDownloadWorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[tuple[list[FilingRecord], set[str]]]:
@@ -185,7 +258,7 @@ class SecDownloadWorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
@@ -204,7 +277,7 @@ class SecDownloadWorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
@@ -238,22 +311,18 @@ async def run_download_stream_impl(
     parse_date: Callable[[str, bool], dt.date],
     extract_sec_ticker_aliases: Callable[..., list[str]],
     merge_ticker_aliases: Callable[..., list[str]],
-    clear_filings_dir: Callable[[FilingMaintenanceRepositoryProtocol, str], None],
     load_rejection_registry: Callable[
         [FilingMaintenanceRepositoryProtocol, str],
-        dict[str, dict[str, str]],
+        DownloadRejectionRegistry,
     ],
-    save_rejection_registry: Callable[
-        [FilingMaintenanceRepositoryProtocol, str, dict[str, dict[str, str]]],
-        None,
-    ],
+    save_rejection_registry: _SaveRejectionRegistry,
     should_warn_missing_sc13: Callable[[dict[str, dt.date], list[FilingRecord]], bool],
     warn_insufficient_filings: Callable[
-        [dict[str, dt.date], list[dict[str, JsonValue]], dict[str, dict[str, str]]],
+        [dict[str, dt.date], list[dict[str, JsonValue]], DownloadRejectionRegistry],
         list[str],
     ],
     warn_xbrl_missing_filings: Callable[[list[dict[str, JsonValue]]], list[str]],
-    cleanup_stale_filing_dirs: Callable[..., int],
+    cleanup_stale_filing_dirs: _CleanupStaleFilingDirs,
     build_download_filing_event_payload: Callable[[dict[str, JsonValue]], dict[str, JsonValue]],
 ) -> AsyncIterator[DownloadEvent]:
     """执行 SecPipeline 下载主工作流。
@@ -271,7 +340,6 @@ async def run_download_stream_impl(
         parse_date: 日期解析 helper。
         extract_sec_ticker_aliases: SEC alias 提取 helper。
         merge_ticker_aliases: alias 合并 helper。
-        clear_filings_dir: 清空 filings 目录 helper。
         load_rejection_registry: 加载拒绝注册表 helper。
         save_rejection_registry: 保存拒绝注册表 helper。
         should_warn_missing_sc13: SC13 缺失 warning helper。
@@ -416,15 +484,20 @@ async def run_download_stream_impl(
         ),
         module=host.MODULE,
     )
-    host._upsert_company_meta(
-        ticker=normalized_ticker,
-        company_id=cik,
-        company_name=company_name,
-        ticker_aliases=merged_ticker_aliases,
-    )
+    company_batch = host._batching_repository.begin_batch(normalized_ticker)
+    try:
+        host._upsert_company_meta(
+            ticker=normalized_ticker,
+            company_id=cik,
+            company_name=company_name,
+            ticker_aliases=merged_ticker_aliases,
+            batch=company_batch,
+        )
+    except BaseException:
+        host._batching_repository.rollback_batch(company_batch)
+        raise
+    host._batching_repository.commit_batch(company_batch)
     sc13_direction_cache: dict[str, Optional[bool]] = {}
-    if overwrite:
-        clear_filings_dir(host._filing_maintenance_repository, normalized_ticker)
     rejection_registry = load_rejection_registry(host._filing_maintenance_repository, normalized_ticker)
     try:
         filings, filenums = await host._filter_filings(
@@ -542,7 +615,25 @@ async def run_download_stream_impl(
             )
             break
 
-    save_rejection_registry(host._filing_maintenance_repository, normalized_ticker, rejection_registry)
+    maintenance_batch = host._batching_repository.begin_batch(normalized_ticker)
+    try:
+        save_rejection_registry(
+            host._filing_maintenance_repository,
+            normalized_ticker,
+            rejection_registry,
+            batch=maintenance_batch,
+        )
+        cleaned = cleanup_stale_filing_dirs(
+            repository=host._filing_maintenance_repository,
+            ticker=normalized_ticker,
+            form_windows=form_windows,
+            filing_results=filing_results,
+            batch=maintenance_batch,
+        )
+    except BaseException:
+        host._batching_repository.rollback_batch(maintenance_batch)
+        raise
+    host._batching_repository.commit_batch(maintenance_batch)
     for warning in warn_insufficient_filings(
         form_windows,
         filing_results,
@@ -553,12 +644,6 @@ async def run_download_stream_impl(
     for warning in warn_xbrl_missing_filings(filing_results):
         warnings.append(warning)
         Log.warn(warning, module=host.MODULE)
-    cleaned = cleanup_stale_filing_dirs(
-        repository=host._filing_maintenance_repository,
-        ticker=normalized_ticker,
-        form_windows=form_windows,
-        filing_results=filing_results,
-    )
     if cleaned:
         Log.info(
             f"清理过期 filing 目录: ticker={normalized_ticker} cleaned={cleaned}",

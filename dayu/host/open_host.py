@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from concurrent.futures import Future
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import Future
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 from uuid import uuid4
 
 from dayu.host.audit import (
@@ -27,6 +27,11 @@ from dayu.host.audit import (
     default_log_audit_sink_options,
 )
 from dayu.host.admission import create_host_admission_service
+from dayu.host._durable_actor import DurableActor, open_durable_actor
+from dayu.host._execution_health import (
+    HostExecutionHealthGate,
+    HostExecutionHealthState,
+)
 from dayu.host.api import (
     CancelRunRequest,
     CancelSessionRunsRequest,
@@ -36,6 +41,7 @@ from dayu.host.api import (
     EnsureSessionRequest,
     FollowupSnapshot,
     Host,
+    HostAdmin,
     HostApiError,
     HostApiErrorCode,
     HostClosedError,
@@ -47,6 +53,7 @@ from dayu.host.api import (
     OperationContext,
     OutboxTerminalItemsBatch,
     OpenHostOptions,
+    OpenHostAdminOptions,
     PurgeSessionRequest,
     PurgeSessionResult,
     ReadOutboxTerminalItemsRequest,
@@ -64,20 +71,26 @@ from dayu.host.command import (
     close_session as _close_session,
     create_session as _create_session,
     ensure_session as _ensure_session,
+    expire_wait as _expire_wait,
     purge_session as _purge_session,
     resolve_wait as _resolve_wait,
     retry_run as _retry_run,
     replay_run as _replay_run,
     submit_followup as _submit_followup,
 )
-from dayu.host.command import (
-    _durable_options_from_public_options as _durable_options_from_command_options,
+from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
+from dayu.host.dispatch import (
+    ActiveCancelMessage,
+    ActiveWorkerCancelPort,
+    ActiveWorkerRegistry,
+    HostDispatchScheduler,
+    NoActiveWorkerCancelPort,
 )
-from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import (
     HostDurableStore,
     open_host_durable_store,
 )
+from dayu.host.durable.options import project_host_durable_store_options
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.outbox import (
@@ -100,7 +113,7 @@ from dayu.host.read_api import (
 from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
-from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.recovery import StartupRecoveryScanResult, StartupRecoveryScanner
 from dayu.host.storage_maintenance import (
     HostStorageMaintenanceRequest,
     HostStorageMaintenanceResult,
@@ -122,12 +135,16 @@ from dayu.host.wait_adapter import (
     WaitPollerRuntimePolicy,
     WaitPollerSupervisor,
 )
+from dayu.host._wait_observation import WaitObservationRunner
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 if TYPE_CHECKING:
     from dayu.host.admission import PendingDispatchRecord
 
+T = TypeVar("T")
+
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
+_GENERATED_OPEN_HOST_ADMIN_ID_PREFIX = "open-host-admin"
 _LOGGER = logging.getLogger(__name__)
 _INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE = 8192
 """``context_budget_policy=None`` 时内部 command options 使用的兜底窗口。"""
@@ -149,6 +166,9 @@ _TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
 
 _WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX = "wait-poller"
 """open_host wait poller 每轮 command handle id 后缀。"""
+
+_DURABLE_ACTOR_THREAD_NAME_SUFFIX = "durable-actor"
+"""public durable actor worker thread 名称后缀。"""
 
 @dataclass(frozen=True, slots=True)
 class _CommandContextBudgetFields:
@@ -295,6 +315,18 @@ class _ThreadsafeSchedulerWakeupPort:
             return
         self._run_on_loop(lambda: self.scheduler.wake_queue_promotion(session_id))
 
+    def wake_active_cancel_watchdog(self) -> None:
+        """在线程安全边界唤醒 active cancel watchdog。
+
+        :returns: ``None``。
+        :raises Exception: scheduler wakeup 失败时透传。
+        """
+
+        if _is_current_event_loop(self.loop):
+            self.scheduler.wake_active_cancel_watchdog()
+            return
+        self._run_on_loop(self.scheduler.wake_active_cancel_watchdog)
+
     def _run_on_loop(self, callback: Callable[[], None]) -> None:
         """在 opener event loop 上同步执行 callback。
 
@@ -303,23 +335,99 @@ class _ThreadsafeSchedulerWakeupPort:
         :raises Exception: callback 抛出的异常。
         """
 
-        future: Future[None] = Future()
+        _run_callback_on_event_loop(self.loop, callback)
 
-        def run_callback() -> None:
-            """执行 wakeup callback 并回填跨线程 future。
 
-            :returns: ``None``。
-            """
+@dataclass(frozen=True, slots=True)
+class _ThreadsafeActiveWorkerCancelPort(ActiveWorkerCancelPort):
+    """把 actor thread 的 active worker cancel 桥接回 opener loop。
 
-            try:
-                callback()
-            except Exception as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(None)
+    :param loop: ``open_host`` 所属 asyncio event loop。
+    :param active_registry: opener loop 拥有的 active worker registry。
+    """
 
-        self.loop.call_soon_threadsafe(run_callback)
-        future.result()
+    loop: asyncio.AbstractEventLoop
+    active_registry: ActiveWorkerRegistry
+
+    def cancel(self, message: ActiveCancelMessage) -> bool:
+        """在 opener loop 上传播 active worker cancel。
+
+        :param message: durable commit 后的 active cancel 消息。
+        :returns: 找到匹配 active worker 时返回 ``True``。
+        :raises Exception: bridge 或 registry callback 失败时透传。
+        """
+
+        if _is_current_event_loop(self.loop):
+            return self.active_registry.cancel(message)
+        return _run_callback_on_event_loop(
+            self.loop,
+            lambda: self.active_registry.cancel(message),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _StartupRecoveryActorOperation:
+    """在 S2 durable actor connection 上执行全部 bounded recovery batches。
+
+    :param wakeup_port: actor thread 到 opener loop 的 scheduler wake bridge。
+    :param recovery_owner_host_instance_id: 当前 scheduler Host instance id。
+    """
+
+    wakeup_port: _ThreadsafeSchedulerWakeupPort
+    recovery_owner_host_instance_id: str
+
+    def __call__(self, handle: HostCommandHandle) -> StartupRecoveryScanResult:
+        """使用 actor-owned transaction runner 完成 startup recovery scan。
+
+        :param handle: actor worker thread 独占的 command handle。
+        :returns: 全部 committed batches 的 immutable aggregate result。
+        :raises Exception: 任一 batch、invariant 或 wake bridge 失败时透传。
+        """
+
+        return StartupRecoveryScanner(
+            transaction_runner=handle._transaction_runner(),
+            event_log_store=EventLogStore(),
+            dispatch_wakeup_port=self.wakeup_port,
+            recovery_owner_host_instance_id=self.recovery_owner_host_instance_id,
+            defer_accepted_cancel_to_watchdog=True,
+        ).scan()
+
+
+def _run_callback_on_event_loop(
+    loop: asyncio.AbstractEventLoop,
+    callback: Callable[[], T],
+) -> T:
+    """从非 loop thread 同步执行 opener-loop callback。
+
+    :param loop: opener event loop。
+    :param callback: 只允许在该 loop thread 执行的 typed callback。
+    :returns: callback 返回值。
+    :raises Exception: callback 异常原样返回发起线程。
+    """
+
+    future: Future[T] = Future()
+    loop.call_soon_threadsafe(_complete_event_loop_callback, callback, future)
+    return future.result()
+
+
+def _complete_event_loop_callback(
+    callback: Callable[[], T],
+    future: Future[T],
+) -> None:
+    """在 opener loop 执行 callback 并完成跨线程 future。
+
+    :param callback: 待执行 typed callback。
+    :param future: 向 actor thread 回传结果的 future。
+    :returns: ``None``。
+    :raises Exception: callback 异常写入 future，不向 event loop 泄漏。
+    """
+
+    try:
+        result = callback()
+    except Exception as exc:
+        future.set_exception(exc)
+    else:
+        future.set_result(result)
 
 
 class _CommandHandleWaitResolver:
@@ -343,6 +451,16 @@ class _CommandHandleWaitResolver:
         """
 
         return _resolve_wait(self._command_handle, wait_id, request)
+
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """通过 command path 执行 common wait expiry owner。
+
+        :param request: expiry owner 输入。
+        :returns: expiry transition 结果。
+        :raises Exception: durable transition 或 wake bridge 失败时透传。
+        """
+
+        return _expire_wait(self._command_handle, request)
 
 
 class _ClosingWaitPoller(WaitPoller):
@@ -377,7 +495,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
 
     :param command_options: 派生自 opener options 的 command handle options。
     :param adapter_registry: production poll adapter registry。
-    :param active_registry: 当前 open_host active worker registry。
+    :param active_cancel_port: 当前 open_host active worker cancel bridge。
     :param wakeup_port: 线程安全 scheduler wakeup port。
     :param policy: wait poller runtime policy。
     :param owner_id: poller owner id。
@@ -385,21 +503,26 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
 
     command_options: HostCommandHandleOptions
     adapter_registry: WaitPollAdapterRegistry
-    active_registry: ActiveWorkerRegistry
+    active_cancel_port: ActiveWorkerCancelPort
     wakeup_port: _ThreadsafeSchedulerWakeupPort
     policy: WaitPollerRuntimePolicy
     owner_id: str
 
-    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+    def create_wait_poller(
+        self,
+        lifecycle_gate: WaitPollLifecycleGate,
+        observation_runner: WaitObservationRunner,
+    ) -> WaitPoller:
         """在调用线程内打开独立 durable store 并创建 wait poller。
 
         :param lifecycle_gate: supervisor close gate。
+        :param observation_runner: supervisor-owned bounded observation runner。
         :returns: 单轮 poller wrapper。
         :raises Exception: durable store 或 poller 构造失败时透传。
         """
 
         durable_store = open_host_durable_store(
-            _durable_options_from_command_options(self.command_options)
+            project_host_durable_store_options(self.command_options)
         )
         try:
             admission_service = create_host_admission_service(
@@ -410,7 +533,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
                 host_handle_id=self.owner_id,
                 durable_store=durable_store,
                 admission_service=admission_service,
-                active_registry=self.active_registry,
+                active_registry=self.active_cancel_port,
             )
             poller = WaitPoller(
                 transaction_runner=command_handle._transaction_runner(),
@@ -419,6 +542,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
                 context=_wait_poller_call_context(self.owner_id),
                 policy=self.policy,
                 lifecycle_gate=lifecycle_gate,
+                observation_runner=observation_runner,
                 owner_id=self.owner_id,
             )
             return _ClosingWaitPoller(command_handle=command_handle, poller=poller)
@@ -439,48 +563,140 @@ class _EnabledWaitPollerConfiguration:
     adapter_registry: WaitPollAdapterRegistry
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionCommandHandleFactory:
+    """在 actor thread 打开 execution command handle 的 factory。
+
+    :param command_options: durable store typed options 来源。
+    :param host_handle_id: execution Host 诊断 id。
+    :param wakeup_port: scheduler event-loop wake bridge。
+    :param active_cancel_port: active worker event-loop cancel bridge。
+    :param open_options: execution opener options，用于 admission baseline/tooling。
+    """
+
+    command_options: HostCommandHandleOptions
+    host_handle_id: str
+    wakeup_port: _ThreadsafeSchedulerWakeupPort
+    active_cancel_port: _ThreadsafeActiveWorkerCancelPort
+    open_options: OpenHostOptions
+
+    def __call__(self) -> HostCommandHandle:
+        """在当前 actor thread 创建 store、admission 与 command handle。
+
+        :returns: actor 独占 command handle。
+        :raises Exception: durable store 或 admission 构造失败时透传。
+        """
+
+        durable_store = open_host_durable_store(
+            project_host_durable_store_options(self.command_options)
+        )
+        try:
+            admission_service = create_host_admission_service(
+                durable_store.transaction_runner,
+                wakeup_port=self.wakeup_port,
+                projection_catchup_port=None,
+                ordinary_run_baseline=self.open_options.ordinary_run_baseline,
+                tooling_options=self.open_options.tooling_options,
+            )
+            return HostCommandHandle(
+                host_handle_id=self.host_handle_id,
+                durable_store=durable_store,
+                admission_service=admission_service,
+                active_registry=self.active_cancel_port,
+                active_cancel_watchdog_wakeup_port=self.wakeup_port,
+            )
+        except Exception:
+            durable_store.close()
+            raise
+
+
+@dataclass(frozen=True, slots=True)
+class _AdminCommandHandleFactory:
+    """在 actor thread 打开纯 durable admin command handle 的 factory。
+
+    :param command_options: admin durable store typed options 来源。
+    :param host_handle_id: admin handle 诊断 id。
+    """
+
+    command_options: HostCommandHandleOptions
+    host_handle_id: str
+
+    def __call__(self) -> HostCommandHandle:
+        """创建不含 scheduler、recovery、lane 或 worker 的 command handle。
+
+        :returns: actor 独占 command handle。
+        :raises Exception: durable store 或只读 admission primitive 构造失败时透传。
+        """
+
+        durable_store = open_host_durable_store(
+            project_host_durable_store_options(self.command_options)
+        )
+        try:
+            admission_service = create_host_admission_service(
+                durable_store.transaction_runner
+            )
+            return HostCommandHandle(
+                host_handle_id=self.host_handle_id,
+                durable_store=durable_store,
+                admission_service=admission_service,
+                active_registry=NoActiveWorkerCancelPort(),
+            )
+        except Exception:
+            durable_store.close()
+            raise
+
+
 class _PublicHostHandle:
     """``open_host`` 返回的 public async Host handle。
 
-    :param command_handle: 内部同步 command handle。
+    :param durable_actor: public durable command 单线程 actor。
     :param scheduler: 内部 dispatch scheduler。
     :param projection_catchup_port: close 阶段使用的 projection flush 端口。
+    :param scheduler_store: scheduler 独占的 durable store。
     """
 
     __slots__ = (
-        "_closed",
-        "_command_handle",
+        "_close_lock",
+        "_durable_actor",
+        "_health_gate",
         "_host_handle_id",
         "_projection_catchup_port",
         "_scheduler",
+        "_scheduler_store",
         "_wait_poller",
     )
 
     def __init__(
         self,
         *,
-        command_handle: HostCommandHandle,
+        durable_actor: DurableActor,
+        health_gate: HostExecutionHealthGate,
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
+        scheduler_store: HostDurableStore,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
         """初始化 public Host handle。
 
-        :param command_handle: 内部同步 command handle。
+        :param durable_actor: public durable command 单线程 actor。
+        :param health_gate: public admission 与 scheduler fatal 共享的 lifecycle gate。
         :param host_handle_id: 当前 Host handle 诊断 id。
         :param scheduler: 内部 dispatch scheduler。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
+        :param scheduler_store: scheduler 独占的 durable store。
         :param wait_poller: 可选 production wait poller supervisor。
         :returns: ``None``。
         """
 
-        self._command_handle = command_handle
+        self._durable_actor = durable_actor
+        self._health_gate = health_gate
         self._host_handle_id = host_handle_id
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
+        self._scheduler_store = scheduler_store
         self._wait_poller = wait_poller
-        self._closed: bool = False
+        self._close_lock = asyncio.Lock()
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
@@ -491,7 +707,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _ensure_session(self._command_handle, request)
+        return await self._durable_actor.call(
+            lambda handle: _ensure_session(handle, request)
+        )
 
     async def create_session(self, request: CreateSessionRequest) -> SessionSnapshot:
         """显式创建 Session。
@@ -502,7 +720,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _create_session(self._command_handle, request)
+        return await self._durable_actor.call(
+            lambda handle: _create_session(handle, request)
+        )
 
     async def get_session(self, session_id: str) -> SessionSnapshot:
         """读取 Session snapshot。
@@ -513,17 +733,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _get_session(self._command_handle, session_id)
-
-    async def list_sessions(self) -> ListSessionsResult:
-        """读取全部未 purge Session 的列表摘要。
-
-        :returns: durable truth 生成的 Session 列表结果。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        """
-
-        self._raise_if_closed()
-        return _list_sessions(self._command_handle)
+        return await self._durable_actor.call(
+            lambda handle: _get_session(handle, session_id)
+        )
 
     async def get_run(self, run_id: str) -> RunSnapshot:
         """读取 Run snapshot。
@@ -534,7 +746,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _get_run(self._command_handle, run_id)
+        return await self._durable_actor.call(
+            lambda handle: _get_run(handle, run_id)
+        )
 
     async def read_outbox_terminal_items(
         self,
@@ -550,10 +764,12 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _read_outbox_terminal_items(
-            self._command_handle,
-            session_id,
-            request,
+        return await self._durable_actor.call(
+            lambda handle: _read_outbox_terminal_items(
+                handle,
+                session_id,
+                request,
+            )
         )
 
     async def drain_outbox_terminal_items(
@@ -570,10 +786,12 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _drain_outbox_terminal_items(
-            self._command_handle,
-            session_id,
-            request,
+        return await self._durable_actor.call(
+            lambda handle: _drain_outbox_terminal_items(
+                handle,
+                session_id,
+                request,
+            )
         )
 
     async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
@@ -586,7 +804,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _submit_followup(self._command_handle, session_id, request)
+        return await self._invoke_new_work(
+            lambda handle: _submit_followup(handle, session_id, request)
+        )
 
     async def retry_run(self, run_id: str, request: RetryRunRequest) -> RunSnapshot:
         """重试源 Run。
@@ -598,7 +818,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _retry_run(self._command_handle, run_id, request)
+        return await self._invoke_new_work(
+            lambda handle: _retry_run(handle, run_id, request)
+        )
 
     async def replay_run(self, run_id: str, request: ReplayRunRequest) -> RunSnapshot:
         """基于源 Run 创建结构化 replay Run。
@@ -610,7 +832,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _replay_run(self._command_handle, run_id, request)
+        return await self._invoke_new_work(
+            lambda handle: _replay_run(handle, run_id, request)
+        )
 
     async def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
         """接收已取得的 wait result 并恢复治理路径。
@@ -622,7 +846,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _resolve_wait(self._command_handle, wait_id, request)
+        return await self._durable_actor.call(
+            lambda handle: _resolve_wait(handle, wait_id, request)
+        )
 
     async def cancel_run(self, run_id: str, request: CancelRunRequest) -> RunSnapshot:
         """取消单个 Run。
@@ -634,7 +860,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _cancel_run(self._command_handle, run_id, request)
+        return await self._durable_actor.call(
+            lambda handle: _cancel_run(handle, run_id, request)
+        )
 
     async def cancel_session_runs(self, session_id: str, request: CancelSessionRunsRequest) -> SessionSnapshot:
         """取消 Session 下全部未终态 Run。
@@ -646,7 +874,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _cancel_session_runs(self._command_handle, session_id, request)
+        return await self._durable_actor.call(
+            lambda handle: _cancel_session_runs(handle, session_id, request)
+        )
 
     async def close_session(self, session_id: str, request: CloseSessionRequest) -> SessionSnapshot:
         """关闭 Session 的新输入入口。
@@ -658,49 +888,9 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return _close_session(self._command_handle, session_id, request)
-
-    async def purge_session(self, session_id: str, request: PurgeSessionRequest) -> PurgeSessionResult:
-        """清理已关闭 Session 的 Host 本地可恢复事实。
-
-        :param session_id: 目标 Session id。
-        :param request: purge session 请求。
-        :returns: purge tombstone 与删除计数摘要。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        """
-
-        self._raise_if_closed()
-        return _purge_session(self._command_handle, session_id, request)
-
-    async def report_storage_usage(self) -> HostStorageUsageReport:
-        """读取 Host durable storage usage report。
-
-        :returns: storage usage report。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: durable 读取失败时抛出。
-        """
-
-        self._raise_if_closed()
-        return _report_storage_usage(self._command_handle)
-
-    async def run_storage_maintenance(
-        self,
-        request: HostStorageMaintenanceRequest,
-    ) -> HostStorageMaintenanceResult:
-        """执行 Host storage maintenance。
-
-        :param request: maintenance 请求。
-            默认 dry-run 不删除文件；当
-            ``request.reclaim_orphan_artifacts`` 为 ``True`` 时，会执行破坏性
-            orphan artifact 回收。
-        :returns: maintenance 结果。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: maintenance 读取、扫描、checkpoint 或 orphan artifact
-            回收失败时抛出。
-        """
-
-        self._raise_if_closed()
-        return _run_storage_maintenance(self._command_handle, request)
+        return await self._durable_actor.call(
+            lambda handle: _close_session(handle, session_id, request)
+        )
 
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
@@ -712,18 +902,36 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        cursor = _session_live_event_start_cursor(
-            self._command_handle,
-            session_id,
+        cursor_future = self._durable_actor.submit(
+            lambda handle: _session_live_event_start_cursor(handle, session_id)
         )
+        cursor_future.add_done_callback(_observe_watch_cursor_future)
+        return self._watch_session_events(session_id, cursor_future)
+
+    async def _watch_session_events(
+        self,
+        session_id: str,
+        cursor_future: asyncio.Future[int],
+    ) -> AsyncIterator[HostEvent]:
+        """在 actor 中 attach cursor 后持续产出 Session live event。
+
+        :param session_id: 目标 Session id。
+        :param cursor_future: watch 调用时已同步排队的 actor cursor attach future。
+        :returns: Host-owned typed event async iterator。
+        :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
+        """
+
+        cursor = await asyncio.shield(cursor_future)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.public_handle.watch_attached host_handle_id=%s " "session_id=%s cursor=%s",
+            "host.public_handle.watch_attached host_handle_id=%s "
+            "session_id=%s cursor=%s",
             self._host_handle_id,
             session_id,
             cursor,
         )
-        return self._watch_session_events_after(session_id, cursor)
+        async for event in self._watch_session_events_after(session_id, cursor):
+            yield event
 
     async def _watch_session_events_after(self, session_id: str, cursor: int) -> AsyncIterator[HostEvent]:
         """从指定 cursor 后持续产出 Session live HostEvent。
@@ -736,11 +944,16 @@ class _PublicHostHandle:
         """
 
         next_cursor = cursor
-        while not self._closed:
-            batch = _read_session_host_events_after(
-                self._command_handle,
-                session_id,
-                next_cursor,
+        while self._health_gate.state not in (
+            HostExecutionHealthState.CLOSING,
+            HostExecutionHealthState.CLOSED,
+        ):
+            batch = await self._durable_actor.call(
+                lambda handle: _read_session_host_events_after(
+                    handle,
+                    session_id,
+                    next_cursor,
+                )
             )
             next_cursor = batch.next_cursor
             if len(batch.events) == 0:
@@ -752,16 +965,27 @@ class _PublicHostHandle:
     async def close(self) -> None:
         """关闭当前 Host handle lifecycle。
 
-        关闭顺序为 public gate、wait poller、scheduler、projection flush、
-        durable store。poller / scheduler close 失败时仍会尽力执行后续
-        cleanup；本方法幂等，不写 cancel / failed terminal facts。
+        关闭顺序为 public gate、wait poller、actor drain、scheduler、projection
+        flush、actor handle、actor executor、scheduler store。actor drain 保证
+        after-commit wake 已在 scheduler 仍存活时收口；本方法幂等，不写
+        cancel / failed terminal facts。
 
         :returns: ``None``。
         """
 
-        if self._closed:
-            return
-        self._closed = True
+        async with self._close_lock:
+            if self._health_gate.state is HostExecutionHealthState.CLOSED:
+                return
+            await self._close_owned_resources()
+
+    async def _close_owned_resources(self) -> None:
+        """按 owner 顺序关闭 execution Host 全部资源。
+
+        :returns: ``None``。
+        :raises Exception: cleanup 首个错误在全部 owner cleanup 尝试后传播。
+        """
+
+        await self._health_gate.begin_closing()
         _LOGGER.info(
             "host.public_handle.close_start host_handle_id=%s",
             self._host_handle_id,
@@ -780,6 +1004,19 @@ class _PublicHostHandle:
                 exc_info=True,
             )
         try:
+            await self._durable_actor.stop_and_drain()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_actor_drain_failed "
+                    "host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+        try:
             await self._scheduler.close()
         except Exception as exc:
             if close_error is None:
@@ -792,17 +1029,90 @@ class _PublicHostHandle:
                     exc.__class__.__name__,
                     exc_info=True,
                 )
-        finally:
-            try:
-                self._projection_catchup_port.catch_up_projection()
-            finally:
-                self._command_handle.close()
-                _LOGGER.info(
-                    "host.public_handle.close_done host_handle_id=%s",
+        try:
+            self._projection_catchup_port.catch_up_projection()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_projection_failed "
+                    "host_handle_id=%s error_type=%s",
                     self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
                 )
+        try:
+            await self._durable_actor.close_handle()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_actor_handle_failed "
+                    "host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+        try:
+            self._durable_actor.shutdown_executor()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_actor_executor_failed "
+                    "host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+        try:
+            self._scheduler_store.close()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_scheduler_store_failed "
+                    "host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+        _LOGGER.info(
+            "host.public_handle.close_done host_handle_id=%s",
+            self._host_handle_id,
+        )
+        self._health_gate.mark_closed()
         if close_error is not None:
             raise close_error
+
+    async def _invoke_new_work(
+        self,
+        operation: Callable[[HostCommandHandle], T],
+    ) -> T:
+        """在 shared admission lease 下提交 new-work actor operation。
+
+        lease 绑定 actor future 而不是 caller awaiter，因此 caller cancellation
+        不会让 fatal transition 越过尚未完成的 commit/rollback 与 matching wake。
+
+        :param operation: new-work command operation。
+        :returns: actor operation 返回值。
+        :raises HostApiError: Host 尚未 READY 或已经 UNAVAILABLE 时抛出。
+        :raises HostClosedError: Host 正在关闭或已经关闭时抛出。
+        :raises Exception: actor operation 异常原样透传。
+        """
+
+        lease = await self._health_gate.acquire_admission()
+        try:
+            future = self._durable_actor.submit(operation)
+        except Exception:
+            lease.release()
+            raise
+        lease.release_when_done(future)
+        return await asyncio.shield(future)
 
     def _raise_if_closed(self) -> None:
         """校验 public handle 仍处于打开状态。
@@ -811,8 +1121,149 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
+        self._health_gate.raise_if_public_closed()
+
+
+def _observe_watch_cursor_future(future: asyncio.Future[int]) -> None:
+    """消费未开始迭代的 watch cursor future 异常，避免后台告警。
+
+    调用 ``future.exception()`` 只标记异常已被观察；后续 async iterator await
+    同一 future 时仍会得到原异常，不改变 fail-closed 语义。
+
+    :param future: watch 调用时同步排队的 cursor future。
+    :returns: ``None``。
+    :raises Exception: 不向 event loop 抛出 future 中的业务异常。
+    """
+
+    if future.cancelled():
+        return
+    future.exception()
+
+
+class _PublicHostAdminHandle:
+    """``open_host_admin`` 返回的纯 durable async handle。
+
+    :param durable_actor: admin command 的单线程 durable actor。
+    :param host_handle_id: admin handle 诊断 id。
+    """
+
+    __slots__ = ("_closed", "_durable_actor", "_host_handle_id")
+
+    def __init__(
+        self,
+        *,
+        durable_actor: DurableActor,
+        host_handle_id: str,
+    ) -> None:
+        """初始化 public HostAdmin handle。
+
+        :param durable_actor: admin command 的单线程 durable actor。
+        :param host_handle_id: admin handle 诊断 id。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._durable_actor = durable_actor
+        self._host_handle_id = host_handle_id
+        self._closed = False
+
+    async def list_sessions(self) -> ListSessionsResult:
+        """读取全部未 purge Session 列表。
+
+        :returns: durable truth 生成的 Session 列表结果。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return await self._durable_actor.call(_list_sessions)
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """读取单个 Session snapshot。
+
+        :param session_id: 目标 Session id。
+        :returns: durable truth 生成的 Session snapshot。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return await self._durable_actor.call(
+            lambda handle: _get_session(handle, session_id)
+        )
+
+    async def purge_session(
+        self,
+        session_id: str,
+        request: PurgeSessionRequest,
+    ) -> PurgeSessionResult:
+        """清理满足前置条件的 Session durable facts。
+
+        :param session_id: 目标 Session id。
+        :param request: purge session 请求。
+        :returns: purge tombstone 与删除计数摘要。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: purge 前置条件或 durable command 失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return await self._durable_actor.call(
+            lambda handle: _purge_session(handle, session_id, request)
+        )
+
+    async def report_storage_usage(self) -> HostStorageUsageReport:
+        """读取 Host durable storage usage report。
+
+        :returns: storage usage report。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return await self._durable_actor.call(_report_storage_usage)
+
+    async def run_storage_maintenance(
+        self,
+        request: HostStorageMaintenanceRequest,
+    ) -> HostStorageMaintenanceResult:
+        """执行 Host storage maintenance。
+
+        :param request: maintenance 请求。
+        :returns: maintenance 结果。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: maintenance 失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return await self._durable_actor.call(
+            lambda handle: _run_storage_maintenance(handle, request)
+        )
+
+    async def close(self) -> None:
+        """幂等关闭 admin actor、handle、store 与 executor。
+
+        :returns: ``None``。
+        :raises Exception: actor chain 关闭失败时透传。
+        """
+
         if self._closed:
-            raise HostClosedError()
+            return
+        self._closed = True
+        await self._durable_actor.close()
+        _LOGGER.info(
+            "host.admin_handle.close_done host_handle_id=%s",
+            self._host_handle_id,
+        )
+
+    def _raise_if_closed(self) -> None:
+        """校验 admin handle 仍处于打开状态。
+
+        :returns: ``None``。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        """
+
+        if self._closed:
+            raise HostClosedError("Host admin handle is closed")
 
 
 class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
@@ -855,25 +1306,30 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             "host.open.start host_handle_id=%s",
             host_handle_id,
         )
-        durable_store = open_host_durable_store(_durable_options_from_command_options(command_options))
+        scheduler_store = open_host_durable_store(
+            project_host_durable_store_options(command_options)
+        )
         scheduler: HostDispatchScheduler | None = None
         close_projection_catchup_port: ProjectionCatchupPort | None = None
         wait_poller: WaitPollerSupervisor | None = None
+        durable_actor: DurableActor | None = None
+        health_gate = HostExecutionHealthGate()
         try:
+            loop = asyncio.get_running_loop()
             active_registry = ActiveWorkerRegistry()
             audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
-                durable_store=durable_store,
+                durable_store=scheduler_store,
                 options=default_log_audit_sink_options(
                     self._options.artifact_root,
                     create_parent_dirs=self._options.create_parent_dirs,
                 ),
             )
             tool_trace_projection_catchup_port = _ToolTraceProjectionCatchupPort(
-                durable_store=durable_store,
+                durable_store=scheduler_store,
                 options=_tool_trace_sink_options_from_open_host_options(self._options),
             )
             outbox_projection_catchup_port = _OutboxTerminalProjectionCatchupPort(
-                durable_store=durable_store,
+                durable_store=scheduler_store,
             )
             close_projection_catchup_port = _CompositeProjectionCatchupPort(
                 ports=(
@@ -883,51 +1339,61 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 )
             )
             scheduler = await HostDispatchScheduler.open(
-                transaction_runner=durable_store.transaction_runner,
+                transaction_runner=scheduler_store.transaction_runner,
                 local_execution=local_execution,
                 host_handle_id=host_handle_id,
                 active_registry=active_registry,
                 projection_catchup_port=None,
+                health_gate=health_gate,
             )
             scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
-            StartupRecoveryScanner(
-                transaction_runner=durable_store.transaction_runner,
-                event_log_store=EventLogStore(),
-                dispatch_wakeup_port=scheduler,
-                recovery_owner_host_instance_id=scheduler.host_instance_id,
-                defer_accepted_cancel_to_watchdog=True,
-            ).scan()
-            admission_service = create_host_admission_service(
-                durable_store.transaction_runner,
-                wakeup_port=scheduler,
-                projection_catchup_port=None,
-                ordinary_run_baseline=self._options.ordinary_run_baseline,
-                tooling_options=self._options.tooling_options,
+            wakeup_port = _ThreadsafeSchedulerWakeupPort(
+                loop=loop,
+                scheduler=scheduler,
             )
-            command_handle = HostCommandHandle(
-                host_handle_id=host_handle_id,
-                durable_store=durable_store,
-                admission_service=admission_service,
+            active_cancel_port = _ThreadsafeActiveWorkerCancelPort(
+                loop=loop,
                 active_registry=active_registry,
-                active_cancel_watchdog_wakeup_port=scheduler,
+            )
+            durable_actor = await open_durable_actor(
+                _ExecutionCommandHandleFactory(
+                    command_options=command_options,
+                    host_handle_id=host_handle_id,
+                    wakeup_port=wakeup_port,
+                    active_cancel_port=active_cancel_port,
+                    open_options=self._options,
+                ),
+                thread_name_prefix=(
+                    f"{host_handle_id}-{_DURABLE_ACTOR_THREAD_NAME_SUFFIX}"
+                ),
+            )
+            await durable_actor.call(
+                _StartupRecoveryActorOperation(
+                    wakeup_port=wakeup_port,
+                    recovery_owner_host_instance_id=scheduler.host_instance_id,
+                )
             )
             wait_poller = _wait_poller_supervisor_from_open_host_options(
                 self._options,
                 command_options=command_options,
                 active_registry=active_registry,
                 scheduler=scheduler,
-                loop=asyncio.get_running_loop(),
+                loop=loop,
                 host_handle_id=host_handle_id,
             )
             if wait_poller is not None:
                 wait_poller.open()
-            self._host = _PublicHostHandle(
-                command_handle=command_handle,
+            host = _PublicHostHandle(
+                durable_actor=durable_actor,
+                health_gate=health_gate,
                 host_handle_id=host_handle_id,
                 scheduler=scheduler,
                 projection_catchup_port=close_projection_catchup_port,
+                scheduler_store=scheduler_store,
                 wait_poller=wait_poller,
             )
+            health_gate.mark_ready()
+            self._host = host
             _LOGGER.info(
                 "host.open.ready host_handle_id=%s",
                 host_handle_id,
@@ -950,6 +1416,17 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
                     )
+            if durable_actor is not None:
+                try:
+                    await durable_actor.stop_and_drain()
+                except Exception as cleanup_exc:
+                    _LOGGER.error(
+                        "host.open.cleanup_durable_actor_drain_failed "
+                        "host_handle_id=%s error_type=%s",
+                        host_handle_id,
+                        cleanup_exc.__class__.__name__,
+                        exc_info=True,
+                    )
             if scheduler is not None:
                 try:
                     await scheduler.close()
@@ -964,8 +1441,20 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 close_projection_catchup_port,
                 host_handle_id=host_handle_id,
             )
+            if durable_actor is not None:
+                try:
+                    await durable_actor.close_handle()
+                    durable_actor.shutdown_executor()
+                except Exception as cleanup_exc:
+                    _LOGGER.error(
+                        "host.open.cleanup_durable_actor_failed "
+                        "host_handle_id=%s error_type=%s",
+                        host_handle_id,
+                        cleanup_exc.__class__.__name__,
+                        exc_info=True,
+                    )
             try:
-                durable_store.close()
+                scheduler_store.close()
             except Exception as cleanup_exc:
                 _LOGGER.error(
                     "host.open.cleanup_durable_store_failed host_handle_id=%s " "error_type=%s",
@@ -1003,6 +1492,91 @@ def open_host(options: OpenHostOptions) -> AbstractAsyncContextManager[Host]:
     """
 
     return _OpenHostContextManager(options)
+
+
+class _OpenHostAdminContextManager(AbstractAsyncContextManager[HostAdmin]):
+    """``open_host_admin`` 的纯 durable async context manager。
+
+    :param options: HostAdmin public opener 构造选项。
+    """
+
+    _host: _PublicHostAdminHandle | None
+    _options: OpenHostAdminOptions
+
+    def __init__(self, options: OpenHostAdminOptions) -> None:
+        """保存并校验 admin opener options。
+
+        :param options: HostAdmin public opener 构造选项。
+        :returns: ``None``。
+        :raises TypeError: options 类型错误时抛出。
+        """
+
+        if not isinstance(options, OpenHostAdminOptions):
+            raise TypeError("open_host_admin options must be OpenHostAdminOptions")
+        self._options = options
+        self._host = None
+
+    async def __aenter__(self) -> HostAdmin:
+        """打开不含 execution side effect 的 admin durable actor。
+
+        :returns: public async HostAdmin handle。
+        :raises Exception: durable store 或 actor 打开失败时透传。
+        """
+
+        host_handle_id = _new_open_host_admin_handle_id()
+        command_options = _command_options_from_open_host_admin_options(
+            self._options,
+            host_handle_id=host_handle_id,
+        )
+        durable_actor = await open_durable_actor(
+            _AdminCommandHandleFactory(
+                command_options=command_options,
+                host_handle_id=host_handle_id,
+            ),
+            thread_name_prefix=(
+                f"{host_handle_id}-{_DURABLE_ACTOR_THREAD_NAME_SUFFIX}"
+            ),
+        )
+        self._host = _PublicHostAdminHandle(
+            durable_actor=durable_actor,
+            host_handle_id=host_handle_id,
+        )
+        _LOGGER.info(
+            "host.admin.open.ready host_handle_id=%s",
+            host_handle_id,
+        )
+        return self._host
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        """退出 admin opener 并关闭 actor chain。
+
+        :param exc_type: context body 异常类型；无异常时为 ``None``。
+        :param exc_value: context body 异常；无异常时为 ``None``。
+        :param traceback: context body traceback；无异常时为 ``None``。
+        :returns: ``None`` 表示不吞掉异常。
+        """
+
+        if self._host is not None:
+            await self._host.close()
+        return None
+
+
+def open_host_admin(
+    options: OpenHostAdminOptions,
+) -> AbstractAsyncContextManager[HostAdmin]:
+    """打开纯 durable Host 管理 handle。
+
+    :param options: 不含 execution 配置或 secret 的 admin opener options。
+    :returns: public async HostAdmin context manager。
+    :raises TypeError: options 类型错误时抛出。
+    """
+
+    return _OpenHostAdminContextManager(options)
 
 
 def _best_effort_catch_up_projection_on_open_failure(
@@ -1058,8 +1632,6 @@ def _enabled_wait_poller_configuration(
     policy = options.wait_poller_policy
     if policy is None:
         return None
-    if not isinstance(policy, WaitPollerRuntimePolicy):
-        raise TypeError("OpenHostOptions.wait_poller_policy must be WaitPollerRuntimePolicy")
     if not policy.enabled:
         return None
     tooling_options = options.tooling_options
@@ -1073,11 +1645,6 @@ def _enabled_wait_poller_configuration(
             retryable=False,
         )
     adapter_registry = tooling_options.wait_poll_adapter_registry
-    if not isinstance(adapter_registry, WaitPollAdapterRegistry):
-        raise TypeError(
-            "HostToolingOptions.wait_poll_adapter_registry must be "
-            "WaitPollAdapterRegistry"
-        )
     return _EnabledWaitPollerConfiguration(
         policy=policy,
         adapter_registry=adapter_registry,
@@ -1117,7 +1684,10 @@ def _wait_poller_supervisor_from_open_host_options(
         poller_factory=_OpenHostWaitPollerFactory(
             command_options=poller_command_options,
             adapter_registry=configuration.adapter_registry,
-            active_registry=active_registry,
+            active_cancel_port=_ThreadsafeActiveWorkerCancelPort(
+                loop=loop,
+                active_registry=active_registry,
+            ),
             wakeup_port=_ThreadsafeSchedulerWakeupPort(
                 loop=loop,
                 scheduler=scheduler,
@@ -1197,6 +1767,45 @@ def _command_options_from_open_host_options(
         context_budget_hard_threshold_tokens=None,
         context_budget_minimum_protection_tokens=None,
         local_execution=local_execution,
+    )
+
+
+def _command_options_from_open_host_admin_options(
+    options: OpenHostAdminOptions,
+    *,
+    host_handle_id: str,
+) -> HostCommandHandleOptions:
+    """从 admin opener options 构造纯 durable command options。
+
+    context budget 字段仅满足既有内部 command handle 的必填 typed contract；
+    admin public capability 不调用 admission 或 execution command。
+
+    :param options: admin public opener options。
+    :param host_handle_id: admin opener 诊断 id。
+    :returns: ``local_execution=None`` 的内部 command options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostCommandHandleOptions(
+        host_handle_id=host_handle_id,
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
+        context_window_size=_INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE,
+        reserved_output_tokens=_INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS,
+        local_execution=None,
     )
 
 
@@ -1353,4 +1962,14 @@ def _new_open_host_handle_id() -> str:
     return f"{_GENERATED_OPEN_HOST_ID_PREFIX}-{uuid4().hex}"
 
 
-__all__ = ["open_host"]
+def _new_open_host_admin_handle_id() -> str:
+    """生成 admin opener 使用的 Host handle id。
+
+    :returns: 本 admin opener 生命周期唯一诊断 id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"{_GENERATED_OPEN_HOST_ADMIN_ID_PREFIX}-{uuid4().hex}"
+
+
+__all__ = ["open_host", "open_host_admin"]

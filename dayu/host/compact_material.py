@@ -26,11 +26,10 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT,
     CurrentInputAnchorVNext,
     EvidenceReadableItemVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
     CompactSegmentSelection,
     CompactSegmentTrigger,
     CurrentInputAnchor,
+    ConversationCompactOutputVNext,
     PromptLocalEvidenceMap,
     PromptLocalMaterialLabel,
     PromptLocalProvenanceEntry,
@@ -39,22 +38,25 @@ from dayu.host.compaction import (
     ReadableFactItemVNext,
     ReadableForwardIntentVNext,
     ReadableReferenceContinuityItemVNext,
-    ReferenceContinuityReasonVNext,
     TraceReadableItemVNext,
     TraceReadableKindVNext,
+    previous_answer_anchor_block_text,
+    validate_previous_compacted_view_pair,
 )
 from dayu.host.context_budget import BudgetTextFragment
 from dayu.host.context_events import CONTEXT_COMPACTED, validate_context_compacted_payload
-from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
+from dayu.host.accepted_result_projection import (
+    project_accepted_tool_result,
+)
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import RunRow
 from dayu.host.durable.transaction import HostRow, HostTransaction
-from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
-from dayu.host.evidence import OpaqueEvidenceRef
-from dayu.host.evidence import accepted_evidence_envelope_from_payload
-from dayu.host.evidence import accepted_tool_raw_outcome_text_from_payload
+from dayu.host.evidence import AcceptedToolEvidenceLLMMaterial
+from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.memory import (
     ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
@@ -66,8 +68,6 @@ from dayu.host.memory import (
 )
 from dayu.host.payload_resolution import (
     event_payload_object,
-    event_payload_object_for_result_ref,
-    tool_call_request_atoms,
 )
 from dayu.host.terminal_payload import PayloadTextReadPolicy
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
@@ -98,49 +98,13 @@ _REASON_PREVIOUS_COMPACTED_VIEW = "previous_compacted_view_not_selected"
 _STABLE_GOALS_BLOCK_ID = "stable:goals"
 _STABLE_FACTS_BLOCK_ID = "stable:evidence_backed_facts"
 _STABLE_ASSUMPTIONS_BLOCK_ID = "stable:questions_assumptions"
-_PREVIOUS_ANSWER_ANCHOR_PREFIX = "answer_anchor="
-_PREVIOUS_FORWARD_INTENT_PREFIX = "forward_intent="
-_PREVIOUS_FORWARD_STATUS_PREFIX = "status="
-_PREVIOUS_FORWARD_TEXT_PREFIX = "text="
-_PREVIOUS_REFERENCE_PREFIX = "reference_continuity="
-_PREVIOUS_REFERENCE_TEXT_PREFIX = "text="
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
-_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
-_PAYLOAD_FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
-_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
-_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
-_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
-_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
-_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
-_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
-_PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
-_PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
-_PAYLOAD_FIELD_DISPLAY_TEXT_CANDIDATE = "display_text"
-_PAYLOAD_FIELD_ORDINAL = "ordinal"
-_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
-_PAYLOAD_FIELD_INTENT_TYPE = "intent_type"
-_PAYLOAD_FIELD_TEXT = "text"
-_PAYLOAD_FIELD_STATUS = "status"
-_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
-_PAYLOAD_FIELD_REASON = "reason"
-_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
 _PAYLOAD_REF_PREFIX = "payload"
-_READABLE_SOURCE_EMPTY = "accepted tool evidence"
-_READABLE_SOURCE_SEPARATOR = ", "
-_LIMITED_SIGNAL_STATUS = "limited_signal"
-_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS = "已验收工具请求参数材料缺失"
-_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS = "已验收工具请求参数材料不可验证"
-_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH = "工具请求与当前证据来源不一致"
-_LIMITED_SIGNAL_DETAIL_UNAVAILABLE = "无法从已验收工具请求恢复查询参数"
-_LIMITED_SIGNAL_DETAIL_UNSAFE = "无法安全展示查询参数"
-_READABLE_ARGUMENTS_PREFIX = "工具参数: "
 _PRE_DISPATCH_BUDGET_FRAGMENT_CURRENT_REF = "current_input_anchor"
 _PRE_DISPATCH_BUDGET_FRAGMENT_PREVIOUS_PREFIX = "previous:"
 
@@ -228,10 +192,7 @@ class RunInputMaterialBlock:
     :param tool_call_event_ref: evidence block 对应 TOOL_CALL_REQUESTED ref。
     :param payload_refs: evidence payload / artifact refs。
     :param artifact_refs: evidence artifact refs。
-    :param source_locator_refs: evidence source locator refs。
-    :param readable_tool_name: evidence block 的可读工具名。
-    :param readable_query_text: evidence block 的可读查询文本。
-    :param readable_source_text: evidence block 的可读来源文本。
+    :param accepted_tool_evidence: accepted tool evidence 的 LLM-facing typed material。
     """
 
     block_id: str
@@ -252,10 +213,7 @@ class RunInputMaterialBlock:
     tool_call_event_ref: str | None = None
     payload_refs: tuple[str, ...] = ()
     artifact_refs: tuple[str, ...] = ()
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
-    readable_tool_name: str | None = None
-    readable_query_text: str | None = None
-    readable_source_text: str | None = None
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None
 
     def __post_init__(self) -> None:
         """校验 ordinary input material block。
@@ -298,23 +256,25 @@ class RunInputMaterialBlock:
         )
         _require_string_tuple(self.payload_refs, "RunInputMaterialBlock.payload_refs")
         _require_string_tuple(self.artifact_refs, "RunInputMaterialBlock.artifact_refs")
-        _require_opaque_evidence_ref_tuple(
-            self.source_locator_refs,
-            "RunInputMaterialBlock.source_locator_refs",
+        if (
+            self.accepted_tool_evidence is not None
+            and not isinstance(
+                self.accepted_tool_evidence,
+                AcceptedToolEvidenceLLMMaterial,
+            )
+        ):
+            raise TypeError(
+                "RunInputMaterialBlock.accepted_tool_evidence is invalid"
+            )
+        is_evidence = (
+            self.section is CompactMaterialSection.EVIDENCE_MATERIAL
+            or self.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
         )
-        _require_optional_text(
-            self.readable_tool_name,
-            "RunInputMaterialBlock.readable_tool_name",
-        )
-        _require_optional_text(
-            self.readable_query_text,
-            "RunInputMaterialBlock.readable_query_text",
-        )
-        _require_optional_text(
-            self.readable_source_text,
-            "RunInputMaterialBlock.readable_source_text",
-        )
-        if self.section is CompactMaterialSection.EVIDENCE_MATERIAL:
+        if is_evidence:
+            if self.section is not CompactMaterialSection.EVIDENCE_MATERIAL:
+                raise ValueError("accepted evidence block section is invalid")
+            if self.kind is not CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+                raise ValueError("accepted evidence block kind is invalid")
             _require_non_empty_text(
                 self.accepted_evidence_id,
                 "RunInputMaterialBlock.accepted_evidence_id",
@@ -327,18 +287,24 @@ class RunInputMaterialBlock:
                 self.tool_call_event_ref,
                 "RunInputMaterialBlock.tool_call_event_ref",
             )
-            _require_non_empty_text(
-                self.readable_tool_name,
-                "RunInputMaterialBlock.readable_tool_name",
-            )
-            _require_non_empty_text(
-                self.readable_query_text,
-                "RunInputMaterialBlock.readable_query_text",
-            )
-            _require_non_empty_text(
-                self.readable_source_text,
-                "RunInputMaterialBlock.readable_source_text",
-            )
+            if len(self.payload_refs) == 0 and len(self.artifact_refs) == 0:
+                raise ValueError("accepted evidence block requires payload or artifact refs")
+            if self.accepted_tool_evidence is None:
+                raise ValueError("accepted evidence block requires typed LLM material")
+            if self.text != render_accepted_tool_evidence_for_llm(
+                self.accepted_tool_evidence
+            ):
+                raise ValueError("accepted evidence block text must use shared renderer")
+        else:
+            if (
+                self.accepted_evidence_id is not None
+                or self.tool_result_event_ref is not None
+                or self.tool_call_event_ref is not None
+                or len(self.payload_refs) > 0
+                or len(self.artifact_refs) > 0
+                or self.accepted_tool_evidence is not None
+            ):
+                raise ValueError("non-evidence block must not carry evidence provenance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +359,7 @@ class PreDispatchCompactMaterialView:
 
     :param material_blocks: latest compact 后、当前输入前的 delta material blocks。
     :param previous_compacted_view: latest accepted compact candidate 映射出的 previous view。
+    :param previous_compacted_readable_view: 与 previous blocks 同源的 typed previous view。
     :param current_input_text: 当前 USER_INPUT_ACCEPTED display text。
     :param source_boundary: EventLog 来源边界诊断。
     :param latest_compacted_event_id: latest accepted compact event id 便捷诊断字段。
@@ -405,6 +372,7 @@ class PreDispatchCompactMaterialView:
 
     material_blocks: tuple[RunInputMaterialBlock, ...]
     previous_compacted_view: tuple[CompactMaterialBlock, ...]
+    previous_compacted_readable_view: CompactReadableViewVNext | None
     current_input_text: str
     source_boundary: CompactMaterialSourceBoundary
     latest_compacted_event_id: str | None
@@ -426,6 +394,10 @@ class PreDispatchCompactMaterialView:
         _require_compact_material_block_tuple(
             self.previous_compacted_view,
             "previous_compacted_view",
+        )
+        validate_previous_compacted_view_pair(
+            self.previous_compacted_view,
+            self.previous_compacted_readable_view,
         )
         _require_non_empty_text(self.current_input_text, "current_input_text")
         if not isinstance(self.source_boundary, CompactMaterialSourceBoundary):
@@ -497,10 +469,10 @@ def build_pre_dispatch_compact_material_view(
             latest_compact,
         )
     )
-    previous_view = (
-        ()
+    previous_view, previous_readable_view = (
+        ((), None)
         if latest_compact is None
-        else _previous_compacted_view_from_compacted_event(
+        else _previous_compacted_view_pair_from_compacted_event(
             transaction,
             latest_compact,
         )
@@ -535,6 +507,7 @@ def build_pre_dispatch_compact_material_view(
     return PreDispatchCompactMaterialView(
         material_blocks=material_blocks,
         previous_compacted_view=previous_view,
+        previous_compacted_readable_view=previous_readable_view,
         current_input_text=current_display_text,
         source_boundary=boundary,
         latest_compacted_event_id=boundary.latest_compacted_event_id,
@@ -609,7 +582,7 @@ def conversation_compact_input_vnext_from_material_pack(
         raise TypeError("material_pack must be CompactMaterialPack")
     return ConversationCompactInputVNext(
         schema_version=CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT,
-        previous_compacted_view=_previous_compacted_view_vnext(material_pack.previous_compacted_view),
+        previous_compacted_view=material_pack.previous_compacted_readable_view,
         trace_material=_trace_material_vnext(material_pack.trace_material),
         evidence_material=_evidence_material_vnext(material_pack.evidence_material),
         answer_material=_answer_material_vnext(material_pack.answer_material),
@@ -684,7 +657,6 @@ class InitialEvidenceMaterial:
     :param readable_source_text: LLM 可读来源文本。
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
-    :param source_locator_refs: source locator refs。
     """
 
     canonical_source_ref: str
@@ -697,7 +669,6 @@ class InitialEvidenceMaterial:
     readable_source_text: str
     payload_refs: tuple[str, ...]
     artifact_refs: tuple[str, ...] = ()
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
 
 
 def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocalMaterialLabel:
@@ -788,23 +759,6 @@ def _normalized_material_line(text: str) -> str:
     return " ".join(text.split())
 
 
-def _normalized_structured_field_text(text: str) -> str:
-    """把结构化 previous view 字段规范化为单行文本。
-
-    :param text: 字段原始文本。
-    :returns: 单行字段文本。
-    :raises TypeError: 文本类型非法时抛出。
-    :raises ValueError: 规范化后为空时抛出。
-    """
-
-    if not isinstance(text, str):
-        raise TypeError("text must be str")
-    normalized = _normalized_material_line(text)
-    if normalized == "":
-        raise ValueError("text must be non-empty after normalization")
-    return normalized
-
-
 def run_input_material_block(
     *,
     block_id: str,
@@ -823,17 +777,15 @@ def run_input_material_block(
     tool_call_event_ref: str | None = None,
     payload_refs: tuple[str, ...] = (),
     artifact_refs: tuple[str, ...] = (),
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
-    readable_tool_name: str | None = None,
-    readable_query_text: str | None = None,
-    readable_source_text: str | None = None,
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None,
 ) -> RunInputMaterialBlock:
     """构造共享 ordinary input material block。
 
     :param block_id: ordinary material list 稳定 block id。
     :param section: compact section owner。
     :param kind: material kind。
-    :param text: 原始或已规范化文本。
+    :param text: ordinary material 的原始文本，或 typed accepted evidence 的唯一
+        renderer exact 文本。
     :param canonical_source_refs: canonical source refs。
     :param event_sequence: 来源 EventLog sequence；stable block 可为 ``None``。
     :param turn_group_id: Host admitted user Run id；stable semantic block 可为 ``None``。
@@ -846,24 +798,25 @@ def run_input_material_block(
     :param tool_call_event_ref: evidence block 的 TOOL_CALL_REQUESTED ref。
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
-    :param source_locator_refs: source locator refs。
-    :param readable_tool_name: evidence block 可读工具名。
-    :param readable_query_text: evidence block 可读查询文本。
-    :param readable_source_text: evidence block 可读来源文本。
+    :param accepted_tool_evidence: accepted tool evidence 的 LLM-facing typed material。
     :returns: RunInputMaterialBlock。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
     """
 
-    normalized = normalized_material_text(text)
+    material_text = (
+        text
+        if accepted_tool_evidence is not None
+        else normalized_material_text(text)
+    )
     return RunInputMaterialBlock(
         block_id=block_id,
         section=section,
         kind=kind,
-        text=normalized,
-        size_units=len(normalized),
+        text=material_text,
+        size_units=len(material_text),
         canonical_source_refs=canonical_source_refs,
-        content_digest=_text_digest(normalized),
+        content_digest=_text_digest(material_text),
         event_sequence=event_sequence,
         turn_group_id=turn_group_id,
         event_sub_index=event_sub_index,
@@ -875,10 +828,7 @@ def run_input_material_block(
         tool_call_event_ref=tool_call_event_ref,
         payload_refs=payload_refs,
         artifact_refs=artifact_refs,
-        source_locator_refs=source_locator_refs,
-        readable_tool_name=readable_tool_name,
-        readable_query_text=readable_query_text,
-        readable_source_text=readable_source_text,
+        accepted_tool_evidence=accepted_tool_evidence,
     )
 
 
@@ -985,16 +935,17 @@ def select_compact_segment(
     )
 
 
-def degrade_previous_compacted_view_for_recovery(
-    previous_compacted_view: tuple[CompactMaterialBlock, ...]
-) -> tuple[CompactMaterialBlock, ...]:
-    """按 S4 recovery 优先级对 latest accepted compacted view 做 whole-drop 降级。
+def retained_previous_compacted_view_labels_for_recovery(
+    previous_compacted_view: tuple[CompactMaterialBlock, ...],
+) -> frozenset[PromptLocalMaterialLabel]:
+    """按 recovery 优先级选择 previous compacted view 保留 labels。
 
-    该 helper 只保留最高优先级的非空 semantic section，并按确定性顺序返回
-    原始 block；不会截断、改写、重写摘要或合成新的 semantic memory。
+    该 helper 只选择最高优先级的非空 semantic section，不直接过滤 blocks
+    或 typed view；实际 pair 过滤必须走
+    ``transform_previous_compacted_view_pair_for_recovery``。
 
     :param previous_compacted_view: latest accepted compacted view blocks。
-    :returns: 降级后的 previous compacted view blocks；无可保留项时为空元组。
+    :returns: 保留的 prompt-local labels；无可保留项时为空集合。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
     """
@@ -1010,8 +961,180 @@ def degrade_previous_compacted_view_for_recovery(
             if block.kind is kind
         )
         if len(candidates) > 0:
-            return tuple(block for _index, block in _sort_recovery_previous_blocks(candidates))
-    return ()
+            return frozenset(
+                block.block_label
+                for _index, block in _sort_recovery_previous_blocks(candidates)
+            )
+    return frozenset()
+
+
+def transform_previous_compacted_view_pair_for_recovery(
+    *,
+    blocks: tuple[CompactMaterialBlock, ...],
+    readable_view: CompactReadableViewVNext | None,
+    retained_block_labels: frozenset[PromptLocalMaterialLabel],
+) -> tuple[tuple[CompactMaterialBlock, ...], CompactReadableViewVNext | None]:
+    """同步过滤 previous compacted blocks 与 typed readable view。
+
+    :param blocks: 已验证 previous compacted view blocks。
+    :param readable_view: 与 blocks 同源的 typed view。
+    :param retained_block_labels: 需要保留的 block labels。
+    :returns: 过滤后的 blocks / typed view pair。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: pair invariant 不成立时抛出。
+    """
+
+    validate_previous_compacted_view_pair(blocks, readable_view)
+    if not isinstance(retained_block_labels, frozenset):
+        raise TypeError("retained_block_labels must be frozenset")
+    for label in retained_block_labels:
+        _require_non_empty_text(label, "retained_block_labels item")
+    retained_blocks = tuple(
+        block for block in blocks if block.block_label in retained_block_labels
+    )
+    if len(retained_blocks) == 0:
+        validate_previous_compacted_view_pair((), None)
+        return (), None
+    if readable_view is None:
+        raise ValueError("readable_view is required with retained blocks")
+    transformed_view = CompactReadableViewVNext(
+        session_summary=(
+            readable_view.session_summary
+            if _has_retained_previous_kind(
+                retained_blocks,
+                CompactMaterialBlockKind.SESSION_SUMMARY,
+            )
+            else None
+        ),
+        evidence_backed_facts=_ordered_fact_items_for_blocks(
+            retained_blocks,
+            readable_view.evidence_backed_facts,
+        ),
+        answer_anchors=_ordered_answer_anchor_items_for_blocks(
+            retained_blocks,
+            readable_view.answer_anchors,
+        ),
+        forward_intents=_ordered_forward_intent_items_for_blocks(
+            retained_blocks,
+            readable_view.forward_intents,
+        ),
+        reference_continuity_items=_ordered_reference_items_for_blocks(
+            retained_blocks,
+            readable_view.reference_continuity_items,
+        ),
+    )
+    validate_previous_compacted_view_pair(retained_blocks, transformed_view)
+    return retained_blocks, transformed_view
+
+
+def _has_retained_previous_kind(
+    blocks: tuple[CompactMaterialBlock, ...],
+    kind: CompactMaterialBlockKind,
+) -> bool:
+    """判断 filtered previous blocks 是否包含指定 kind。
+
+    :param blocks: filtered previous blocks。
+    :param kind: 目标 kind。
+    :returns: 包含该 kind 时返回 ``True``。
+    """
+
+    return any(block.kind is kind for block in blocks)
+
+
+def _ordered_fact_items_for_blocks(
+    blocks: tuple[CompactMaterialBlock, ...],
+    items: tuple[ReadableFactItemVNext, ...],
+) -> tuple[ReadableFactItemVNext, ...]:
+    """按 filtered fact block 顺序返回 typed readable facts。
+
+    :param blocks: filtered previous blocks。
+    :param items: typed readable fact items。
+    :returns: 与 block 顺序一致的 fact item tuple。
+    :raises ValueError: block label 找不到 typed item 时抛出。
+    """
+
+    item_by_label = {item.source_label: item for item in items}
+    ordered: list[ReadableFactItemVNext] = []
+    for block in blocks:
+        if block.kind is not CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
+            continue
+        item = item_by_label.get(block.block_label)
+        if item is None:
+            raise ValueError("retained previous block label is missing from readable view")
+        ordered.append(item)
+    return tuple(ordered)
+
+
+def _ordered_answer_anchor_items_for_blocks(
+    blocks: tuple[CompactMaterialBlock, ...],
+    items: tuple[ReadableAnswerAnchorVNext, ...],
+) -> tuple[ReadableAnswerAnchorVNext, ...]:
+    """按 filtered answer-anchor block 顺序返回 typed readable anchors。
+
+    :param blocks: filtered previous blocks。
+    :param items: typed readable answer anchors。
+    :returns: 与 block 顺序一致的 answer anchor tuple。
+    :raises ValueError: block label 找不到 typed item 时抛出。
+    """
+
+    item_by_label = {item.source_label: item for item in items}
+    ordered: list[ReadableAnswerAnchorVNext] = []
+    for block in blocks:
+        if block.kind is not CompactMaterialBlockKind.ANSWER_ANCHOR:
+            continue
+        item = item_by_label.get(block.block_label)
+        if item is None:
+            raise ValueError("retained previous block label is missing from readable view")
+        ordered.append(item)
+    return tuple(ordered)
+
+
+def _ordered_forward_intent_items_for_blocks(
+    blocks: tuple[CompactMaterialBlock, ...],
+    items: tuple[ReadableForwardIntentVNext, ...],
+) -> tuple[ReadableForwardIntentVNext, ...]:
+    """按 filtered forward-intent block 顺序返回 typed readable intents。
+
+    :param blocks: filtered previous blocks。
+    :param items: typed readable forward intents。
+    :returns: 与 block 顺序一致的 forward intent tuple。
+    :raises ValueError: block label 找不到 typed item 时抛出。
+    """
+
+    item_by_label = {item.source_label: item for item in items}
+    ordered: list[ReadableForwardIntentVNext] = []
+    for block in blocks:
+        if block.kind is not CompactMaterialBlockKind.FORWARD_INTENT:
+            continue
+        item = item_by_label.get(block.block_label)
+        if item is None:
+            raise ValueError("retained previous block label is missing from readable view")
+        ordered.append(item)
+    return tuple(ordered)
+
+
+def _ordered_reference_items_for_blocks(
+    blocks: tuple[CompactMaterialBlock, ...],
+    items: tuple[ReadableReferenceContinuityItemVNext, ...],
+) -> tuple[ReadableReferenceContinuityItemVNext, ...]:
+    """按 filtered reference-continuity block 顺序返回 typed readable references。
+
+    :param blocks: filtered previous blocks。
+    :param items: typed readable reference continuity items。
+    :returns: 与 block 顺序一致的 reference continuity tuple。
+    :raises ValueError: block label 找不到 typed item 时抛出。
+    """
+
+    item_by_label = {item.source_label: item for item in items}
+    ordered: list[ReadableReferenceContinuityItemVNext] = []
+    for block in blocks:
+        if block.kind is not CompactMaterialBlockKind.REFERENCE_CONTINUITY:
+            continue
+        item = item_by_label.get(block.block_label)
+        if item is None:
+            raise ValueError("retained previous block label is missing from readable view")
+        ordered.append(item)
+    return tuple(ordered)
 
 
 def build_compact_material_pack(
@@ -1023,6 +1146,7 @@ def build_compact_material_pack(
     current_input_ref: str,
     current_input_text: str,
     previous_compacted_view: tuple[CompactMaterialBlock, ...] | None = None,
+    previous_compacted_readable_view: CompactReadableViewVNext | None = None,
 ) -> CompactMaterialPack:
     """从 selected segment 和 memory view 构造 compact material pack。
 
@@ -1032,7 +1156,8 @@ def build_compact_material_pack(
     :param inline_delta_repair_view: inline delta repair view；无 repair 时为 ``None``。
     :param current_input_ref: 当前 USER_INPUT_ACCEPTED canonical ref。
     :param current_input_text: 当前用户输入 display text。
-    :param previous_compacted_view: 显式 previous view；``None`` 时走既有 snapshot path。
+    :param previous_compacted_view: 显式 previous view blocks。
+    :param previous_compacted_readable_view: 与 previous blocks 同源的 typed previous view。
     :returns: CompactMaterialPack。
     :raises DuplicateMaterialSectionOwnerError: 同一 canonical content 跨 section 重复时抛出。
     :raises TypeError: 参数类型非法时抛出。
@@ -1043,7 +1168,6 @@ def build_compact_material_pack(
         raise TypeError("selected_segment must be CompactSegmentSelection")
     _require_material_block_tuple(material_blocks, "material_blocks")
     _require_non_empty_text(current_input_ref, "current_input_ref")
-    snapshot = _effective_snapshot(memory_snapshot, inline_delta_repair_view)
     current_anchor = _current_input_anchor(current_input_ref, current_input_text)
     selected_blocks = _selected_material_blocks(
         selected_segment.selected_block_ids,
@@ -1051,13 +1175,16 @@ def build_compact_material_pack(
         current_anchor=current_anchor,
     )
     if previous_compacted_view is None:
-        previous_blocks = _previous_blocks_from_snapshot(snapshot)
+        previous_blocks = ()
+        previous_readable_view = None
     else:
         _require_compact_material_block_tuple(
             previous_compacted_view,
             "previous_compacted_view",
         )
         previous_blocks = previous_compacted_view
+        previous_readable_view = previous_compacted_readable_view
+    validate_previous_compacted_view_pair(previous_blocks, previous_readable_view)
     trace_blocks = _pack_section_blocks(selected_blocks, CompactMaterialSection.TRACE_MATERIAL)
     evidence_blocks = _pack_evidence_blocks(selected_blocks)
     answer_blocks = _pack_section_blocks(selected_blocks, CompactMaterialSection.ANSWER_MATERIAL)
@@ -1071,6 +1198,7 @@ def build_compact_material_pack(
     _raise_on_duplicate_section_owner(provenance_entries)
     return CompactMaterialPack(
         previous_compacted_view=previous_blocks,
+        previous_compacted_readable_view=previous_readable_view,
         trace_material=trace_blocks,
         evidence_material=evidence_blocks,
         answer_material=answer_blocks,
@@ -1247,6 +1375,7 @@ def build_initial_material_pack(
     provenance_map = {entry.label: entry for entry in provenance_entries}
     return CompactMaterialPack(
         previous_compacted_view=previous_blocks,
+        previous_compacted_readable_view=None,
         trace_material=trace_blocks,
         evidence_material=evidence_blocks,
         answer_material=answer_blocks,
@@ -1441,7 +1570,7 @@ def _evidence_provenance(
                 tool_call_event_ref=material.tool_call_event_ref,
                 payload_refs=material.payload_refs,
                 artifact_refs=material.artifact_refs,
-                source_locator_refs=material.source_locator_refs,
+                source_locator_refs=(),
             )
         )
     return tuple(entries)
@@ -1805,22 +1934,6 @@ def _ordered_reason_mapping(values: dict[str, str]) -> dict[str, str]:
     return {key: values[key] for key in sorted(values)}
 
 
-def _effective_snapshot(
-    memory_snapshot: ConversationMemorySnapshotVNext | None,
-    inline_delta_repair_view: InlineDeltaRepairMaterialView | None,
-) -> ConversationMemorySnapshotVNext | None:
-    """选取 material pack stable input 使用的 snapshot。
-
-    :param memory_snapshot: ready memory snapshot。
-    :param inline_delta_repair_view: inline repair view。
-    :returns: 有效 snapshot 或 ``None``。
-    """
-
-    if inline_delta_repair_view is not None:
-        return inline_delta_repair_view.snapshot
-    return memory_snapshot
-
-
 def _validated_current_input_event(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -1921,98 +2034,269 @@ def _accepted_evidence_mapping_refs_from_compacted_event(
     """
 
     payload = _validated_compacted_payload(transaction, row)
-    return _required_json_text_tuple(payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
+    try:
+        return parse_context_compacted_semantic_payload(
+            payload
+        ).accepted_evidence_mapping_refs
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("compact semantic payload is invalid") from exc
 
 
-def _previous_compacted_view_from_compacted_event(
+def _previous_compacted_view_pair_from_compacted_event(
     transaction: HostTransaction,
     row: EventLogRow,
-) -> tuple[CompactMaterialBlock, ...]:
-    """把 latest accepted compact candidate 映射为 previous compacted view。
+) -> tuple[tuple[CompactMaterialBlock, ...], CompactReadableViewVNext | None]:
+    """把 latest accepted compact candidate 映射为 previous compacted pair。
 
     :param transaction: 当前 Host transaction。
     :param row: ``CONTEXT_COMPACTED`` EventLog row。
-    :returns: prompt-local previous compacted view blocks。
+    :returns: prompt-local previous compacted blocks 与 typed view。
     :raises HostDurableError: accepted candidate JSON 损坏或 digest 不匹配时抛出。
     """
 
     payload = _validated_compacted_payload(transaction, row)
-    candidate = _required_json_mapping(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
-    expected_digest = _required_json_text(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE_DIGEST)
-    if sha256_digest_json(candidate) != expected_digest:
-        raise HostDurableError("accepted candidate digest mismatch")
+    try:
+        candidate = parse_context_compacted_semantic_payload(payload).accepted_candidate
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("compact semantic payload is invalid") from exc
+    return _previous_compacted_view_pair_from_candidate(
+        event_id=row.event_id,
+        event_sequence=row.event_sequence,
+        candidate=candidate,
+    )
+
+
+def _previous_compacted_view_pair_from_candidate(
+    *,
+    event_id: str,
+    event_sequence: int,
+    candidate: ConversationCompactOutputVNext,
+) -> tuple[tuple[CompactMaterialBlock, ...], CompactReadableViewVNext | None]:
+    """从 typed accepted candidate 原子生成 previous blocks 与 typed view。
+
+    :param event_id: compacted EventLog id。
+    :param event_sequence: compacted EventLog sequence。
+    :param candidate: typed accepted candidate。
+    :returns: 已通过 exact invariant 的 blocks / readable view pair。
+    :raises HostDurableError: pair invariant 不成立时抛出。
+    """
+
     blocks: list[RunInputMaterialBlock] = []
-    summary_text = _candidate_session_summary_text(candidate)
-    if summary_text is not None:
+    if candidate.session_summary is not None:
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:session_summary",
+                block_id=f"previous:{event_id}:session_summary",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=summary_text,
-                canonical_source_refs=(row.event_id,),
-                event_sequence=row.event_sequence,
+                text=candidate.session_summary.summary_text,
+                canonical_source_refs=(event_id,),
+                event_sequence=event_sequence,
                 event_sub_index=0,
             )
         )
-    for index, fact_text in enumerate(_candidate_facts_texts(candidate), start=1):
+    for index, fact in enumerate(candidate.evidence_backed_facts, start=1):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:evidence_backed_fact:{index}",
+                block_id=f"previous:{event_id}:evidence_backed_fact:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
-                text=fact_text,
-                canonical_source_refs=(row.event_id,),
-                event_sequence=row.event_sequence,
+                text=fact.claim_text,
+                canonical_source_refs=(event_id,),
+                event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    for index, anchor_text in enumerate(
-        _candidate_answer_anchor_texts(candidate),
-        start=1,
-    ):
+    readable_anchors = _readable_answer_anchors_from_candidate(candidate)
+    for index, anchor in enumerate(readable_anchors, start=1):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:answer_anchor:{index}",
+                block_id=f"previous:{event_id}:answer_anchor:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=anchor_text,
-                canonical_source_refs=(row.event_id,),
-                event_sequence=row.event_sequence,
+                text=previous_answer_anchor_block_text(anchor),
+                canonical_source_refs=(event_id,),
+                event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    for index, intent_text in enumerate(
-        _candidate_forward_intent_texts(candidate),
-        start=1,
-    ):
+    for index, intent in enumerate(candidate.forward_intents, start=1):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:forward_intent:{index}",
+                block_id=f"previous:{event_id}:forward_intent:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=intent_text,
-                canonical_source_refs=(row.event_id,),
-                event_sequence=row.event_sequence,
+                text=intent.text,
+                canonical_source_refs=(event_id,),
+                event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    for index, reference_text in enumerate(
-        _candidate_reference_continuity_texts(candidate),
-        start=1,
-    ):
+    for index, reference in enumerate(candidate.reference_continuity_items, start=1):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:reference_continuity:{index}",
+                block_id=f"previous:{event_id}:reference_continuity:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
-                text=reference_text,
-                canonical_source_refs=(row.event_id,),
-                event_sequence=row.event_sequence,
+                text=reference.text,
+                canonical_source_refs=(event_id,),
+                event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    return _pack_previous_blocks(tuple(blocks))
+    packed_blocks = _pack_previous_blocks(tuple(blocks))
+    readable_view = _readable_previous_view_from_candidate(
+        candidate,
+        packed_blocks,
+        readable_anchors=readable_anchors,
+    )
+    try:
+        validate_previous_compacted_view_pair(packed_blocks, readable_view)
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("previous compacted view pair is invalid") from exc
+    return packed_blocks, readable_view
+
+
+def _readable_answer_anchors_from_candidate(
+    candidate: ConversationCompactOutputVNext,
+) -> tuple[ReadableAnswerAnchorVNext, ...]:
+    """把 accepted candidate answer anchors 映射为无 label readable anchors。
+
+    :param candidate: typed accepted candidate。
+    :returns: 临时 label anchors；最终 label 由 packed blocks 覆盖。
+    """
+
+    anchors: list[ReadableAnswerAnchorVNext] = []
+    for index, anchor in enumerate(candidate.answer_anchors, start=_FIRST_ORDINAL):
+        anchors.append(
+            ReadableAnswerAnchorVNext(
+                source_label=material_label(
+                    CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                    index,
+                ),
+                anchor_title=anchor.anchor_title,
+                anchor_items=tuple(
+                    ReadableAnswerAnchorItemVNext(
+                        display_text=item.display_text,
+                        ordinal=item.ordinal,
+                    )
+                    for item in anchor.anchor_items
+                ),
+            )
+        )
+    return tuple(anchors)
+
+
+def _readable_previous_view_from_candidate(
+    candidate: ConversationCompactOutputVNext,
+    blocks: tuple[CompactMaterialBlock, ...],
+    *,
+    readable_anchors: tuple[ReadableAnswerAnchorVNext, ...],
+) -> CompactReadableViewVNext | None:
+    """从 typed candidate 和 packed blocks 生成 typed previous view。
+
+    :param candidate: typed accepted candidate。
+    :param blocks: 已生成的 previous compacted blocks。
+    :param readable_anchors: candidate answer anchors 的 typed value。
+    :returns: typed previous view；candidate 无内容时返回 ``None``。
+    :raises HostDurableError: block label 数量与 typed candidate 不一致时抛出。
+    """
+
+    fact_labels = _labels_for_previous_kind(
+        blocks,
+        CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+    )
+    anchor_labels = _labels_for_previous_kind(
+        blocks,
+        CompactMaterialBlockKind.ANSWER_ANCHOR,
+    )
+    intent_labels = _labels_for_previous_kind(
+        blocks,
+        CompactMaterialBlockKind.FORWARD_INTENT,
+    )
+    reference_labels = _labels_for_previous_kind(
+        blocks,
+        CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+    )
+    if (
+        len(fact_labels) != len(candidate.evidence_backed_facts)
+        or len(anchor_labels) != len(readable_anchors)
+        or len(intent_labels) != len(candidate.forward_intents)
+        or len(reference_labels) != len(candidate.reference_continuity_items)
+    ):
+        raise HostDurableError("previous compacted view label count mismatch")
+    if (
+        candidate.session_summary is None
+        and len(candidate.evidence_backed_facts) == 0
+        and len(candidate.answer_anchors) == 0
+        and len(candidate.forward_intents) == 0
+        and len(candidate.reference_continuity_items) == 0
+    ):
+        return None
+    return CompactReadableViewVNext(
+        session_summary=(
+            None
+            if candidate.session_summary is None
+            else candidate.session_summary.summary_text
+        ),
+        evidence_backed_facts=tuple(
+            ReadableFactItemVNext(
+                source_label=label,
+                claim_text=fact.claim_text,
+            )
+            for label, fact in zip(
+                fact_labels,
+                candidate.evidence_backed_facts,
+                strict=True,
+            )
+        ),
+        answer_anchors=tuple(
+            ReadableAnswerAnchorVNext(
+                source_label=label,
+                anchor_title=anchor.anchor_title,
+                anchor_items=anchor.anchor_items,
+            )
+            for label, anchor in zip(anchor_labels, readable_anchors, strict=True)
+        ),
+        forward_intents=tuple(
+            ReadableForwardIntentVNext(
+                source_label=label,
+                intent_type=intent.intent_type,
+                text=intent.text,
+                status=intent.status,
+            )
+            for label, intent in zip(
+                intent_labels,
+                candidate.forward_intents,
+                strict=True,
+            )
+        ),
+        reference_continuity_items=tuple(
+            ReadableReferenceContinuityItemVNext(
+                source_label=label,
+                text=item.text,
+                reason=item.reason,
+            )
+            for label, item in zip(
+                reference_labels,
+                candidate.reference_continuity_items,
+                strict=True,
+            )
+        ),
+    )
+
+
+def _labels_for_previous_kind(
+    blocks: tuple[CompactMaterialBlock, ...],
+    kind: CompactMaterialBlockKind,
+) -> tuple[PromptLocalMaterialLabel, ...]:
+    """返回 previous compacted view 指定 kind 的 block labels。
+
+    :param blocks: previous compacted blocks。
+    :param kind: 目标 kind。
+    :returns: label tuple。
+    """
+
+    return tuple(block.block_label for block in blocks if block.kind is kind)
 
 
 def _validated_compacted_payload(
@@ -2248,10 +2532,9 @@ def _accepted_tool_evidence_delta_blocks(
 ) -> tuple[RunInputMaterialBlock, ...]:
     """把 ``TOOL_RESULT_ACCEPTED`` 映射为 evidence material blocks。
 
-    当 accepted evidence envelope 缺少 durable request atom 时，
-    ``tool_call_event_ref`` 会退化为当前 producer event ref。这个 ref 只用于
-    prompt-local provenance 追溯，不表示对应的 ``TOOL_CALL_REQUESTED`` event
-    一定存在。
+    accepted evidence envelope 声明 request provenance 时，必须由共享
+    accepted-result projection 证明该 ref 指向同 identity 的 canonical
+    ``TOOL_CALL_REQUESTED`` request atom；缺失或不一致一律 fail closed。
 
     :param transaction: 当前 Host transaction。
     :param event_log_store: EventLog store。
@@ -2261,173 +2544,49 @@ def _accepted_tool_evidence_delta_blocks(
     :raises HostDurableError: evidence envelope 或 raw tool payload 损坏时抛出。
     """
 
-    payload = event_payload_object(
+    resolved_payload = event_payload_object(
         transaction,
         row,
         payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            payload,
-            producer_event_ref=row.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope is None:
-        return ()
-    if envelope.evidence_id in represented_evidence_refs:
-        return ()
-    result_payload = event_payload_object_for_result_ref(
+    projection = project_accepted_tool_result(
         transaction,
         row,
-        expected_payload_ref=envelope.result_ref.payload_ref,
-        expected_payload_digest=envelope.result_ref.payload_digest,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+        resolved_payload=resolved_payload,
     )
-    try:
-        raw_text = accepted_tool_raw_outcome_text_from_payload(result_payload)
-    except ValueError as exc:
-        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed") from exc
-    if raw_text is None:
-        raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
-    tool_call_event_ref = envelope.tool_query.tool_call_requested_event_ref
+    if not projection.envelope_available:
+        return ()
+    tool_call_event_ref = projection.tool_call_requested_event_ref
     if tool_call_event_ref is None:
-        # 缺少 request atom 时只保留本地 provenance 线索，不伪造 request event。
-        tool_call_event_ref = row.event_id
+        raise HostDurableError(
+            "accepted evidence tool_call_requested_event_ref is missing"
+        )
+    if projection.request_arguments_json is None:
+        raise HostDurableError(
+            "accepted evidence tool call request provenance is invalid"
+        )
+    if projection.evidence_id in represented_evidence_refs:
+        return ()
+    if projection.llm_material is None:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
+    payload_refs = tuple(
+        dict.fromkeys((*projection.payload_refs, *_payload_refs_for_event(row)))
+    )
     return (
         run_input_material_block(
-            block_id=f"eventlog:evidence:{row.event_id}:{envelope.evidence_id}",
+            block_id=f"eventlog:evidence:{row.event_id}:{projection.evidence_id}",
             section=CompactMaterialSection.EVIDENCE_MATERIAL,
             kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-            text=raw_text,
-            canonical_source_refs=(envelope.evidence_id,),
+            text=render_accepted_tool_evidence_for_llm(projection.llm_material),
+            canonical_source_refs=(projection.evidence_id,),
             event_sequence=row.event_sequence,
             turn_group_id=row.run_id,
-            accepted_evidence_id=envelope.evidence_id,
+            accepted_evidence_id=projection.evidence_id,
             tool_result_event_ref=row.event_id,
             tool_call_event_ref=tool_call_event_ref,
-            payload_refs=_payload_refs_for_event(row),
-            source_locator_refs=envelope.locator_refs,
-            readable_tool_name=envelope.tool_name,
-            readable_query_text=_readable_query_text_from_envelope(
-                transaction,
-                event_log_store,
-                row,
-                envelope_tool_call_id=envelope.tool_call_id,
-                envelope_tool_name=envelope.tool_name,
-                envelope_arguments_digest=envelope.tool_query.normalized_arguments_digest,
-                requested_event_ref=envelope.tool_query.tool_call_requested_event_ref,
-            ),
-            readable_source_text=_readable_source_text_from_refs(
-                (*envelope.source_refs, *envelope.locator_refs)
-            ),
+            payload_refs=payload_refs,
+            accepted_tool_evidence=projection.llm_material,
         ),
-    )
-
-
-def _readable_query_text_from_envelope(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    result_row: EventLogRow,
-    *,
-    envelope_tool_call_id: str,
-    envelope_tool_name: str,
-    envelope_arguments_digest: str,
-    requested_event_ref: str | None,
-) -> str:
-    """从 accepted request atom 构造 evidence query 可读文本。
-
-    :param transaction: 当前 Host transaction。
-    :param event_log_store: EventLog store。
-    :param result_row: TOOL_RESULT_ACCEPTED row。
-    :param envelope_tool_call_id: evidence envelope 中的 tool call id。
-    :param envelope_tool_name: evidence envelope 中的 tool name。
-    :param envelope_arguments_digest: evidence envelope 中的参数 digest。
-    :param requested_event_ref: envelope 指向的 TOOL_CALL_REQUESTED event id。
-    :returns: LLM-facing query text。
-    """
-
-    if requested_event_ref is None:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
-            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
-        )
-    request_row = event_log_store.read_event_by_id(transaction, requested_event_ref)
-    if request_row is None:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
-            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
-        )
-    if request_row.session_id != result_row.session_id:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
-            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
-        )
-    if request_row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
-            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
-        )
-    try:
-        atoms = tool_call_request_atoms(transaction, request_row)
-    except HostDurableError:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS,
-            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
-        )
-    if (
-        atoms.tool_call_id != envelope_tool_call_id
-        or atoms.tool_name != envelope_tool_name
-        or atoms.normalized_arguments_digest != envelope_arguments_digest
-    ):
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
-            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
-        )
-    if atoms.semantic_query_text is not None:
-        return _normalized_query_text(atoms.semantic_query_text)
-    return _normalized_query_text(
-        f"{_READABLE_ARGUMENTS_PREFIX}{canonical_json_dumps(atoms.arguments_json)}"
-    )
-
-
-def _limited_signal_query_text(*, reason: str, detail: str) -> str:
-    """构造 query material 的 limited-signal 文本。
-
-    :param reason: 不含内部 ref 的原因文本。
-    :param detail: 不含内部 ref 的影响说明。
-    :returns: 规范化 query 文本。
-    """
-
-    return _normalized_query_text(
-        f"状态={_LIMITED_SIGNAL_STATUS}；原因={reason}；说明={detail}"
-    )
-
-
-def _normalized_query_text(text: str) -> str:
-    """规范化 query 文本并保留完整非空内容。
-
-    :param text: 原始 query 文本。
-    :returns: 规范化后的非空 query 文本。
-    :raises ValueError: 规范化后为空时抛出。
-    """
-
-    return normalized_material_text(text)
-
-
-def _readable_source_text_from_refs(refs: tuple[OpaqueEvidenceRef, ...]) -> str:
-    """把 opaque evidence refs 映射为 LLM-facing source note。
-
-    :param refs: opaque source / locator refs。
-    :returns: source note 文本。
-    """
-
-    if len(refs) == 0:
-        return _READABLE_SOURCE_EMPTY
-    return _READABLE_SOURCE_SEPARATOR.join(
-        f"{ref.ref_kind}:{ref.ref_id}" for ref in refs
     )
 
 
@@ -2462,133 +2621,6 @@ def _pre_dispatch_budget_fragments(
         )
     )
     return tuple(fragments)
-
-
-def _candidate_session_summary_text(
-    candidate: Mapping[str, JsonValue],
-) -> str | None:
-    """读取 accepted candidate 的 session summary 文本。
-
-    :param candidate: accepted candidate JSON object。
-    :returns: summary text；无 summary 时为 ``None``。
-    :raises HostDurableError: candidate 结构损坏时抛出。
-    """
-
-    value = candidate.get(_PAYLOAD_FIELD_SESSION_SUMMARY)
-    if value is None:
-        return None
-    summary = _json_mapping(value, _PAYLOAD_FIELD_SESSION_SUMMARY)
-    return _required_json_text(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
-
-
-def _candidate_facts_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    """把 accepted candidate facts 渲染为 previous view 单项文本。
-
-    :param candidate: accepted candidate JSON object。
-    :returns: facts 单项文本 tuple；无 facts 时为空 tuple。
-    :raises HostDurableError: candidate facts 结构损坏时抛出。
-    """
-
-    facts = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
-    lines: list[str] = []
-    for fact in facts:
-        claim_text = _normalized_structured_field_text(
-            _required_json_text(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
-        )
-        evidence_refs = ",".join(
-            _normalized_structured_field_text(label)
-            for label in _required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
-        )
-        evidence_kind = _normalized_structured_field_text(
-            _required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)
-        )
-        lines.append(
-            "fact="
-            f"claim_text={claim_text}; "
-            f"evidence_refs={evidence_refs}; "
-            f"evidence_kind={evidence_kind}"
-        )
-    return tuple(lines)
-
-
-def _candidate_answer_anchor_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    """把 accepted candidate answer anchors 渲染为 previous view 单项文本。
-
-    :param candidate: accepted candidate JSON object。
-    :returns: answer anchors 单项文本 tuple；无 anchors 时为空 tuple。
-    :raises HostDurableError: candidate anchors 结构损坏时抛出。
-    """
-
-    anchors = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
-    lines: list[str] = []
-    for anchor in anchors:
-        title = _normalized_structured_field_text(
-            _required_json_text(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)
-        )
-        lines.append(f"{_PREVIOUS_ANSWER_ANCHOR_PREFIX}{title}")
-    return tuple(lines)
-
-
-def _candidate_forward_intent_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    """把 accepted candidate forward intents 渲染为 previous view 单项文本。
-
-    :param candidate: accepted candidate JSON object。
-    :returns: forward intents 单项文本 tuple；无 intents 时为空 tuple。
-    :raises HostDurableError: candidate intents 结构损坏时抛出。
-    """
-
-    intents = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    lines: list[str] = []
-    for intent in intents:
-        intent_type = _normalized_structured_field_text(
-            _required_json_text(intent, _PAYLOAD_FIELD_INTENT_TYPE)
-        )
-        status = _normalized_structured_field_text(
-            _required_json_text(intent, _PAYLOAD_FIELD_STATUS)
-        )
-        text = _normalized_structured_field_text(
-            _required_json_text(intent, _PAYLOAD_FIELD_TEXT)
-        )
-        lines.append(
-            f"{_PREVIOUS_FORWARD_INTENT_PREFIX}"
-            f"{intent_type}; "
-            f"{_PREVIOUS_FORWARD_STATUS_PREFIX}"
-            f"{status}; "
-            f"{_PREVIOUS_FORWARD_TEXT_PREFIX}"
-            f"{text}"
-        )
-    return tuple(lines)
-
-
-def _candidate_reference_continuity_texts(
-    candidate: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """把 accepted candidate reference continuity 渲染为 previous view 单项文本。
-
-    :param candidate: accepted candidate JSON object。
-    :returns: reference continuity 单项文本 tuple；无 items 时为空 tuple。
-    :raises HostDurableError: candidate references 结构损坏时抛出。
-    """
-
-    items = _required_json_mapping_tuple(
-        candidate,
-        _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS,
-    )
-    lines: list[str] = []
-    for item in items:
-        reason = _normalized_structured_field_text(
-            _required_json_text(item, _PAYLOAD_FIELD_REASON)
-        )
-        text = _normalized_structured_field_text(
-            _required_json_text(item, _PAYLOAD_FIELD_TEXT)
-        )
-        lines.append(
-            f"{_PREVIOUS_REFERENCE_PREFIX}"
-            f"{reason}; "
-            f"{_PREVIOUS_REFERENCE_TEXT_PREFIX}"
-            f"{text}"
-        )
-    return tuple(lines)
 
 
 def _current_input_anchor(current_input_ref: str, current_input_text: str) -> CurrentInputAnchor:
@@ -2651,172 +2683,6 @@ def _is_current_input_history_duplicate(block: RunInputMaterialBlock, current_an
     if current_anchor.canonical_source_refs[0] in block.canonical_source_refs:
         return True
     return block.content_digest == current_anchor.content_digest
-
-
-def _previous_blocks_from_snapshot(
-    snapshot: ConversationMemorySnapshotVNext | None,
-) -> tuple[CompactMaterialBlock, ...]:
-    """从 memory snapshot 构造 previous compacted view blocks。
-
-    :param snapshot: memory snapshot。
-    :returns: previous compacted view blocks。
-    """
-
-    if snapshot is None:
-        return ()
-    blocks: list[RunInputMaterialBlock] = []
-    summary_text = _snapshot_summary_text(snapshot)
-    if summary_text is not None:
-        blocks.append(
-            run_input_material_block(
-                block_id="previous:session_summary",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=summary_text,
-                canonical_source_refs=(snapshot.snapshot_id,),
-                event_sequence=None,
-                event_sub_index=0,
-            )
-        )
-    for index, fact_text in enumerate(_snapshot_fact_texts(snapshot), start=1):
-        blocks.append(
-            run_input_material_block(
-                block_id=f"{_STABLE_FACTS_BLOCK_ID}:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
-                text=fact_text,
-                canonical_source_refs=(snapshot.snapshot_id,),
-                event_sequence=None,
-                event_sub_index=len(blocks),
-            )
-        )
-    for index, anchor_text in enumerate(
-        _snapshot_answer_anchor_texts(snapshot),
-        start=1,
-    ):
-        blocks.append(
-            run_input_material_block(
-                block_id=f"previous:answer_anchor:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=anchor_text,
-                canonical_source_refs=(snapshot.snapshot_id,),
-                event_sequence=None,
-                event_sub_index=len(blocks),
-            )
-        )
-    for index, intent_text in enumerate(
-        _snapshot_forward_intent_texts(snapshot),
-        start=1,
-    ):
-        blocks.append(
-            run_input_material_block(
-                block_id=f"previous:forward_intent:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=intent_text,
-                canonical_source_refs=(snapshot.snapshot_id,),
-                event_sequence=None,
-                event_sub_index=len(blocks),
-            )
-        )
-    for index, reference_text in enumerate(
-        _snapshot_reference_continuity_texts(snapshot),
-        start=1,
-    ):
-        blocks.append(
-            run_input_material_block(
-                block_id=f"previous:reference_continuity:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
-                text=reference_text,
-                canonical_source_refs=(snapshot.snapshot_id,),
-                event_sequence=None,
-                event_sub_index=len(blocks),
-            )
-        )
-    return _pack_previous_blocks(tuple(blocks))
-
-
-def _snapshot_summary_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous session summary 文本。
-
-    :param snapshot: memory snapshot。
-    :returns: summary 文本；无内容时返回 ``None``。
-    """
-
-    return snapshot.session_summary_memory.summary_text
-
-
-def _snapshot_fact_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
-    """构造 evidence-backed facts stable 单项文本。
-
-    :param snapshot: memory snapshot。
-    :returns: stable 单项文本 tuple；无内容时为空 tuple。
-    """
-
-    facts = snapshot.evidence_fact_memory.evidence_backed_facts
-    lines: list[str] = []
-    for fact in facts:
-        evidence_refs = ",".join(
-            _normalized_structured_field_text(ref)
-            for ref in fact.evidence_refs
-        )
-        lines.append(
-            "fact="
-            f"claim_text={_normalized_structured_field_text(fact.claim_text)}; "
-            f"evidence_refs={evidence_refs}; "
-            f"evidence_kind={_normalized_structured_field_text(fact.evidence_kind.value)}"
-        )
-    return tuple(lines)
-
-
-def _snapshot_answer_anchor_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
-    """构造 previous answer anchor 单项文本。
-
-    :param snapshot: memory snapshot。
-    :returns: answer anchor 单项文本 tuple；无内容时为空 tuple。
-    """
-
-    lines: list[str] = []
-    for anchor in snapshot.answer_anchor_memory.anchors:
-        lines.append(
-            f"answer_anchor={_normalized_structured_field_text(anchor.anchor_title)}"
-        )
-    return tuple(lines)
-
-
-def _snapshot_forward_intent_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
-    """构造 previous forward intent 单项文本。
-
-    :param snapshot: memory snapshot。
-    :returns: forward intent 单项文本 tuple；无内容时为空 tuple。
-    """
-
-    lines: list[str] = []
-    for intent in snapshot.forward_intent_memory.intents:
-        lines.append(
-            f"forward_intent={_normalized_structured_field_text(intent.intent_type)}; "
-            f"status={_normalized_structured_field_text(intent.status)}; "
-            f"text={_normalized_structured_field_text(intent.text)}"
-        )
-    return tuple(lines)
-
-
-def _snapshot_reference_continuity_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
-    """构造 previous reference continuity 单项文本。
-
-    :param snapshot: memory snapshot。
-    :returns: reference continuity 单项文本 tuple；无内容时为空 tuple。
-    """
-
-    lines: list[str] = []
-    for item in snapshot.trace_memory.reference_continuity_items:
-        lines.append(
-            f"reference_continuity={_normalized_structured_field_text(item.reason)}; "
-            f"text={_normalized_structured_field_text(item.text)}"
-        )
-    return tuple(lines)
 
 
 def _pack_previous_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactMaterialBlock, ...]:
@@ -2882,23 +2748,22 @@ def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[Co
     result: list[CompactEvidenceBlock] = []
     evidence_blocks = tuple(block for block in blocks if block.section is CompactMaterialSection.EVIDENCE_MATERIAL)
     for index, block in enumerate(evidence_blocks, start=_FIRST_ORDINAL):
-        if block.readable_tool_name is None:
-            raise ValueError("RunInputMaterialBlock.readable_tool_name is required")
-        if block.readable_query_text is None:
-            raise ValueError("RunInputMaterialBlock.readable_query_text is required")
-        if block.readable_source_text is None:
-            raise ValueError("RunInputMaterialBlock.readable_source_text is required")
+        if block.accepted_tool_evidence is None:
+            raise HostDurableError(
+                "RunInputMaterialBlock.accepted_tool_evidence is required"
+            )
         _require_non_empty_text(block.text, "evidence_text")
+        material = block.accepted_tool_evidence
         result.append(
             CompactEvidenceBlock(
                 evidence_label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
-                readable_tool_name=block.readable_tool_name,
-                readable_query_text=block.readable_query_text,
-                raw_result_text=block.text,
-                readable_source_text=block.readable_source_text,
-                size_units=len(block.text),
+                readable_tool_name=material.tool_name,
+                readable_query_text=material.query_text,
+                raw_result_text=material.result_text,
+                readable_source_text=material.source_text,
+                size_units=len(material.result_text),
                 canonical_source_refs=block.canonical_source_refs,
-                content_digest=block.content_digest,
+                content_digest=_text_digest(material.result_text),
             )
         )
     return tuple(result)
@@ -2962,7 +2827,7 @@ def _provenance_from_evidence_blocks(
                 tool_call_event_ref=source.tool_call_event_ref,
                 payload_refs=source.payload_refs,
                 artifact_refs=source.artifact_refs,
-                source_locator_refs=source.source_locator_refs,
+                source_locator_refs=(),
             )
         )
     return tuple(entries)
@@ -3219,56 +3084,6 @@ def _required_json_text(payload: Mapping[str, JsonValue], field_name: str) -> st
     raise HostDurableError(f"payload field {field_name} must be non-empty text")
 
 
-def _required_json_mapping(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> Mapping[str, JsonValue]:
-    """读取 JSON object 必填 object 字段。
-
-    :param payload: JSON object。
-    :param field_name: 字段名。
-    :returns: 子 object。
-    :raises HostDurableError: 字段缺失或非 object 时抛出。
-    """
-
-    return _json_mapping(payload.get(field_name), field_name)
-
-
-def _json_mapping(value: JsonValue | None, field_name: str) -> Mapping[str, JsonValue]:
-    """校验 JSON 值为 object。
-
-    :param value: JSON 值。
-    :param field_name: 字段名。
-    :returns: JSON object。
-    :raises HostDurableError: 值不是 object 时抛出。
-    """
-
-    if not isinstance(value, Mapping):
-        raise HostDurableError(f"payload field {field_name} must be object")
-    return value
-
-
-def _required_json_mapping_tuple(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """读取 JSON object 必填 object list 字段。
-
-    :param payload: JSON object。
-    :param field_name: 字段名。
-    :returns: object tuple。
-    :raises HostDurableError: 字段缺失或元素类型非法时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    result: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError(f"payload field {field_name} item must be object")
-        result.append(item)
-    return tuple(result)
-
-
 def _required_json_text_tuple(
     payload: Mapping[str, JsonValue], field_name: str
 ) -> tuple[str, ...]:
@@ -3319,7 +3134,7 @@ def _trace_material_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[Tra
             trace_kind = (
                 TraceReadableKindVNext.USER_INPUT
                 if block.kind is CompactMaterialBlockKind.USER_INPUT
-                else TraceReadableKindVNext.USER_VISIBLE_RUN_STATE
+                else TraceReadableKindVNext.USER_VISIBLE_PROGRESS
             )
             items.append(
                 TraceReadableItemVNext(
@@ -3366,195 +3181,6 @@ def _evidence_material_vnext(blocks: tuple[CompactEvidenceBlock, ...]) -> tuple[
     return tuple(items)
 
 
-def _previous_compacted_fact_material_vnext(
-    blocks: tuple[CompactMaterialBlock, ...],
-) -> tuple[ReadableFactItemVNext, ...]:
-    """把 previous evidence-backed fact block 映射为 vNext 可读 fact。
-
-    :param blocks: previous compacted view material blocks。
-    :returns: vNext readable fact tuple。
-    """
-
-    items: list[ReadableFactItemVNext] = []
-    for block in blocks:
-        if block.kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
-            items.append(ReadableFactItemVNext(source_label=block.block_label, claim_text=block.text))
-    return tuple(items)
-
-
-def _previous_compacted_answer_anchors_vnext(
-    blocks: tuple[CompactMaterialBlock, ...],
-) -> tuple[ReadableAnswerAnchorVNext, ...]:
-    """把 previous answer anchor blocks 映射为 vNext 可读 anchor。
-
-    :param blocks: previous compacted view material blocks。
-    :returns: vNext answer anchor tuple。
-    """
-
-    items: list[ReadableAnswerAnchorVNext] = []
-    for block in blocks:
-        if block.kind is CompactMaterialBlockKind.ANSWER_ANCHOR:
-            for line in block.text.splitlines():
-                anchor_title = line.removeprefix(_PREVIOUS_ANSWER_ANCHOR_PREFIX)
-                if anchor_title == line:
-                    raise ValueError("previous answer anchor text is invalid")
-                items.append(
-                    ReadableAnswerAnchorVNext(
-                        source_label=block.block_label,
-                        anchor_title=anchor_title,
-                        anchor_items=(
-                            ReadableAnswerAnchorItemVNext(
-                                display_text=anchor_title,
-                                ordinal=None,
-                            ),
-                        ),
-                    )
-                )
-    return tuple(items)
-
-
-def _previous_compacted_forward_intents_vnext(
-    blocks: tuple[CompactMaterialBlock, ...],
-) -> tuple[ReadableForwardIntentVNext, ...]:
-    """把 previous forward intent blocks 映射为 vNext 可读 intent。
-
-    :param blocks: previous compacted view material blocks。
-    :returns: vNext forward intent tuple。
-    """
-
-    items: list[ReadableForwardIntentVNext] = []
-    for block in blocks:
-        if block.kind is CompactMaterialBlockKind.FORWARD_INTENT:
-            for line in block.text.splitlines():
-                intent_type, status, text = _parse_previous_forward_intent_text(line)
-                items.append(
-                    ReadableForwardIntentVNext(
-                        source_label=block.block_label,
-                        intent_type=intent_type,
-                        text=text,
-                        status=status,
-                    )
-                )
-    return tuple(items)
-
-
-def _previous_compacted_references_vnext(
-    blocks: tuple[CompactMaterialBlock, ...],
-) -> tuple[ReadableReferenceContinuityItemVNext, ...]:
-    """把 previous reference continuity blocks 映射为 vNext 可读 continuity item。
-
-    :param blocks: previous compacted view material blocks。
-    :returns: vNext reference continuity tuple。
-    """
-
-    items: list[ReadableReferenceContinuityItemVNext] = []
-    for block in blocks:
-        if block.kind is CompactMaterialBlockKind.REFERENCE_CONTINUITY:
-            for line in block.text.splitlines():
-                reason, text = _parse_previous_reference_continuity_text(line)
-                items.append(
-                    ReadableReferenceContinuityItemVNext(
-                        source_label=block.block_label,
-                        text=text,
-                        reason=reason,
-                    )
-                )
-    return tuple(items)
-
-
-def _previous_compacted_view_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> CompactReadableViewVNext | None:
-    """把 previous compacted view blocks 映射为 vNext previous view。
-
-    :param blocks: previous compacted view material blocks。
-    :returns: vNext previous compacted view；无可迁移内容时返回 ``None``。
-    """
-
-    session_summary = _previous_compacted_session_summary_vnext(blocks)
-    facts = _previous_compacted_fact_material_vnext(blocks)
-    answer_anchors = _previous_compacted_answer_anchors_vnext(blocks)
-    forward_intents = _previous_compacted_forward_intents_vnext(blocks)
-    references = _previous_compacted_references_vnext(blocks)
-    if (
-        session_summary is None
-        and len(facts) == 0
-        and len(answer_anchors) == 0
-        and len(forward_intents) == 0
-        and len(references) == 0
-    ):
-        return None
-    return CompactReadableViewVNext(
-        session_summary=session_summary,
-        evidence_backed_facts=facts,
-        answer_anchors=answer_anchors,
-        forward_intents=forward_intents,
-        reference_continuity_items=references,
-    )
-
-
-def _previous_compacted_session_summary_vnext(
-    blocks: tuple[CompactMaterialBlock, ...],
-) -> str | None:
-    """返回 previous view 的 session summary 文本。
-
-    :param blocks: previous compacted view material blocks。
-    :returns: session summary；无 summary block 时返回 ``None``。
-    """
-
-    for block in blocks:
-        if block.kind is CompactMaterialBlockKind.SESSION_SUMMARY:
-            return block.text
-    return None
-
-
-def _parse_previous_forward_intent_text(
-    text: str,
-) -> tuple[ForwardIntentTypeVNext, ForwardIntentStatusVNext, str]:
-    """解析本模块生成的 previous forward intent 文本。
-
-    :param text: ``_snapshot_forward_intent_texts`` 生成的单项文本。
-    :returns: intent type、status 与可读文本。
-    :raises ValueError: 文本格式或枚举值非法时抛出。
-    """
-
-    parts = text.split("; ")
-    if len(parts) != 3:
-        raise ValueError("previous forward intent text is invalid")
-    intent_type_text = parts[0].removeprefix(_PREVIOUS_FORWARD_INTENT_PREFIX)
-    status_text = parts[1].removeprefix(_PREVIOUS_FORWARD_STATUS_PREFIX)
-    readable_text = parts[2].removeprefix(_PREVIOUS_FORWARD_TEXT_PREFIX)
-    if (
-        intent_type_text == parts[0]
-        or status_text == parts[1]
-        or readable_text == parts[2]
-    ):
-        raise ValueError("previous forward intent text is invalid")
-    return (
-        ForwardIntentTypeVNext(intent_type_text),
-        ForwardIntentStatusVNext(status_text),
-        readable_text,
-    )
-
-
-def _parse_previous_reference_continuity_text(
-    text: str,
-) -> tuple[ReferenceContinuityReasonVNext, str]:
-    """解析本模块生成的 previous reference continuity 文本。
-
-    :param text: ``_snapshot_reference_continuity_texts`` 生成的单项文本。
-    :returns: reference reason 与可读文本。
-    :raises ValueError: 文本格式或枚举值非法时抛出。
-    """
-
-    parts = text.split("; ")
-    if len(parts) != 2:
-        raise ValueError("previous reference continuity text is invalid")
-    reason_text = parts[0].removeprefix(_PREVIOUS_REFERENCE_PREFIX)
-    readable_text = parts[1].removeprefix(_PREVIOUS_REFERENCE_TEXT_PREFIX)
-    if reason_text == parts[0] or readable_text == parts[1]:
-        raise ValueError("previous reference continuity text is invalid")
-    return ReferenceContinuityReasonVNext(reason_text), readable_text
-
-
 def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
     """校验字符串 tuple。
 
@@ -3569,22 +3195,6 @@ def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
         raise TypeError(f"{field_name} must be tuple")
     for item in value:
         _require_non_empty_text(item, field_name)
-
-
-def _require_opaque_evidence_ref_tuple(value: tuple[OpaqueEvidenceRef, ...], field_name: str) -> None:
-    """校验 OpaqueEvidenceRef tuple。
-
-    :param value: 待校验 tuple。
-    :param field_name: 字段名。
-    :returns: ``None``。
-    :raises TypeError: 字段不是 tuple 或元素类型不正确时抛出。
-    """
-
-    if not isinstance(value, tuple):
-        raise TypeError(f"{field_name} must be tuple")
-    for item in value:
-        if not isinstance(item, OpaqueEvidenceRef):
-            raise TypeError(f"{field_name} items must be OpaqueEvidenceRef")
 
 
 def _require_optional_text(value: str | None, field_name: str) -> None:
@@ -3640,9 +3250,11 @@ __all__ = [
     "material_label",
     "normalized_material_text",
     "prompt_local_evidence_map",
+    "retained_previous_compacted_view_labels_for_recovery",
     "run_input_material_block",
     "select_compact_segment",
     "selected_material_source_refs",
     "selected_material_view_digest",
+    "transform_previous_compacted_view_pair_for_recovery",
     "validate_material_label",
 ]

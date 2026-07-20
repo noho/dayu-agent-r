@@ -24,6 +24,7 @@ from dayu.host.api import (
     HOST_EVENT_STREAM_MAX_LIMIT,
     HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT,
     HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT,
+    TERMINAL_RUN_STATUSES,
     HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
     HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
     HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
@@ -37,6 +38,7 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostApiErrorDetail,
     Host,
+    HostAdmin,
     HostActivityCounts,
     HostActivityKind,
     HostActivitySeverity,
@@ -53,10 +55,12 @@ from dayu.host.api import (
     HostStreamCursor,
     HostTerminalStatus,
     HostThinkingView,
+    HostUnavailableDetail,
     ListSessionsResult,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
+    OpenHostAdminOptions,
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
@@ -91,6 +95,7 @@ from dayu.host.api import (
     WaitAdapterKey,
     WaitProviderStatusRef,
     WaitResolutionSource,
+    is_terminal_run_status,
 )
 from dayu.host.command import (
     cancel_run,
@@ -122,7 +127,7 @@ from dayu.host.wait_callback import (
     callback_payload_digest,
 )
 from dayu.host.read_api import get_run, get_session, list_sessions
-from dayu.host.open_host import open_host
+from dayu.host.open_host import open_host, open_host_admin
 from dayu.host.durable.maintenance import HostWalCheckpointMode, HostWalCheckpointResult
 from dayu.host.storage_maintenance import (
     DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS,
@@ -164,6 +169,7 @@ __all__ = [
     "HOST_EVENT_STREAM_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
+    "TERMINAL_RUN_STATUSES",
     "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
     "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
     "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -177,6 +183,7 @@ __all__ = [
     "HostApiErrorCode",
     "HostApiErrorDetail",
     "Host",
+    "HostAdmin",
     "HostActivityCounts",
     "HostActivityKind",
     "HostActivitySeverity",
@@ -198,12 +205,14 @@ __all__ = [
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostThinkingView",
+    "HostUnavailableDetail",
     "ListSessionsResult",
     "HostWalCheckpointMode",
     "HostWalCheckpointResult",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
+    "OpenHostAdminOptions",
     "HostToolingOptions",
     "OpenHostOptions",
     "OperationContext",
@@ -261,8 +270,10 @@ __all__ = [
     "ensure_session",
     "get_run",
     "get_session",
+    "is_terminal_run_status",
     "list_sessions",
     "open_host",
+    "open_host_admin",
     "purge_session",
     "replay_run",
     "report_storage_usage",

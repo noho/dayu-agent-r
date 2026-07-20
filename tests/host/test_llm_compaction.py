@@ -19,6 +19,7 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
 )
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
@@ -49,7 +50,7 @@ from dayu.host.llm_compaction import (
     LLMContextCompactor,
     parse_conversation_compact_output_vnext,
 )
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import fake_compaction_proposal_from_material_json
 
 _TEST_SYSTEM_PROMPT = "test compactor system prompt"
@@ -59,6 +60,8 @@ _TEST_AGENT_POLICY = AgentPolicy(
     continuation_max_attempts=0,
     allow_tool_calls=False,
     tool_execution_timeout_seconds=1.0,
+    fallback_prompt="test fallback prompt",
+    continuation_prompt="test continuation prompt",
 )
 _PROMPT_TEMPLATE_PATH = Path("dayu/config/prompts/scenes/conversation_compaction_user.md")
 _UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
@@ -78,6 +81,20 @@ def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
     assert "threading" not in source
     assert "thread.join(" not in source
     assert "asyncio.run" not in source
+
+
+def test_llm_compaction_dead_post_compact_budget_constants_removed() -> None:
+    """post-compact budget 常量归 context_budget owner，llm_compaction 不再定义副本。"""
+
+    source = inspect.getsource(llm_compaction_module)
+    removed_constants = (
+        "_POST_COMPACT_" + "SYSTEM_PROMPT_ESTIMATE",
+        "_POST_COMPACT_" + "BASE_MESSAGE_COUNT",
+        "_POST_COMPACT_" + "TOOL_SCHEMA_OVERHEAD_COUNT",
+    )
+
+    for constant_name in removed_constants:
+        assert constant_name not in source
 
 
 @pytest.mark.parametrize(
@@ -148,7 +165,7 @@ def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
     compaction_request = _request_with_long_input_material()
     prepared = _llm_compactor().prepare_compactor_proposal_run_input(
         compaction_request,
-        StubCancellationToken(),
+        ControllableCancellationToken(),
         compaction_operation_id="event-context-compact-requested-test",
         compaction_attempt_number=2,
     )
@@ -220,6 +237,17 @@ def test_prompt_forward_intent_enum_values_match_parser_vnext() -> None:
 
     assert len(parsed_intent_types) == len(intent_type_values)
     assert len(parsed_statuses) == len(status_values)
+
+
+def test_compaction_prompt_does_not_expose_internal_evidence_or_run_state_terms() -> None:
+    """compaction prompt 不暴露 Host run-state 或 evidence pipeline 内部枚举。"""
+
+    prompt = _PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    assert "user_visible_run_state" not in prompt
+    assert "tool_source_text" not in prompt
+    assert "accepted_evidence_material" not in prompt
+    assert "evidence_kind" not in prompt
 
 
 def test_parse_conversation_compact_output_vnext_fails_closed_for_old_schema() -> None:
@@ -460,11 +488,11 @@ def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() 
         )
 
 
-def test_parse_conversation_compact_output_vnext_reports_fact_evidence_kind_path() -> None:
-    """vNext parser 对 fact evidence_kind 返回完整嵌套字段路径与非法值。
+def test_parse_conversation_compact_output_vnext_does_not_accept_fact_evidence_kind() -> None:
+    """vNext parser 不要求也不保留 unsupported fact evidence kind。
 
     :returns: ``None``。
-    :raises AssertionError: parser 未返回 evidence_kind 路径和非法枚举值时抛出。
+    :raises AssertionError: parser 错误保留 unsupported 字段时抛出。
     """
 
     compact_input = conversation_compact_input_vnext_from_material_pack(
@@ -475,19 +503,21 @@ def test_parse_conversation_compact_output_vnext_reports_fact_evidence_kind_path
         {
             "claim_text": "经营现金流同比增长",
             "evidence_labels": ["E1"],
-            "evidence_kind": "bad_evidence_kind",
+            "evidence_kind": "tool_result",
             "source_labels": [],
         }
     ]
 
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match=r"evidence_backed_facts\[0\]\.evidence_kind.*bad_evidence_kind",
-    ):
-        parse_conversation_compact_output_vnext(
-            compact_input,
-            json.dumps(proposal, sort_keys=True),
-        )
+    parsed = parse_conversation_compact_output_vnext(
+        compact_input,
+        json.dumps(proposal, sort_keys=True),
+    )
+
+    assert parsed.evidence_backed_facts[0].to_json() == {
+        "claim_text": "经营现金流同比增长",
+        "evidence_labels": ["E1"],
+        "source_labels": [],
+    }
 
 
 def test_parse_conversation_compact_output_vnext_reports_forward_intent_type_enum_value() -> None:
@@ -646,7 +676,6 @@ def test_parse_conversation_compact_output_vnext_rejects_cross_section_label() -
         {
             "claim_text": "经营现金流同比增长",
             "evidence_labels": ["A1"],
-            "evidence_kind": "accepted_evidence_material",
             "source_labels": [],
         }
     ]
@@ -744,7 +773,7 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
-    candidate = await _llm_compactor().compact(_request(), StubCancellationToken())
+    candidate = await _llm_compactor().compact(_request(), ControllableCancellationToken())
 
     assert isinstance(candidate, ConversationCompactOutputVNext)
     assert len(calls) == 1
@@ -788,7 +817,7 @@ async def test_llm_context_compactor_rejects_non_final_outcome(
         return EngineRunOutcomeFailed(
             session_id="session-1",
             run_id="run-1",
-            error_code="provider_error",
+            error_code=adapter_error_code("provider_error"),
             message="provider failed api_key=secret",
             provider_request_id=None,
             client_correlation_id=None,
@@ -798,7 +827,7 @@ async def test_llm_context_compactor_rejects_non_final_outcome(
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
     with pytest.raises(LLMCompactionProposalError, match="<redacted>"):
-        await _llm_compactor().compact(_request(), StubCancellationToken())
+        await _llm_compactor().compact(_request(), ControllableCancellationToken())
 
 
 def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, JsonValue]:
@@ -839,7 +868,6 @@ def _fact_json() -> dict[str, JsonValue]:
     return {
         "claim_text": "经营现金流同比增长",
         "evidence_labels": ["E1"],
-        "evidence_kind": "accepted_evidence_material",
         "source_labels": ["E1"],
     }
 

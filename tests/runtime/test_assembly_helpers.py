@@ -8,9 +8,10 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts import AgentFallbackMode
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.runtime.assembly import (
-    AgentPolicyDefaults,
+    AgentPolicyBaseline,
     AgentPolicyOverrideConfig,
     RuntimeAssemblyFieldError,
     RuntimeAssemblySelectionError,
@@ -24,19 +25,18 @@ from dayu.runtime.assembly import (
 )
 from dayu.runtime.config_loader import ExecutionBaselineConfig, load_runtime_config
 from dayu.runtime.scene_prepare import (
-    SceneAgentFallbackMode,
     SceneAgentPolicyOverride,
     SceneModelHints,
 )
 
 
-def _agent_policy_defaults() -> AgentPolicyDefaults:
-    """返回测试用完整代码默认 Agent policy。
+def _agent_policy_baseline() -> AgentPolicyBaseline:
+    """返回测试用完整 runtime assembly Agent policy 基线。
 
-    :returns: 代码默认 Agent policy 字段。
+    :returns: runtime assembly Agent policy 基线字段。
     """
 
-    return AgentPolicyDefaults(
+    return AgentPolicyBaseline(
         max_iterations=1,
         continuation_max_attempts=0,
         allow_tool_calls=True,
@@ -69,7 +69,7 @@ def test_select_runner_option_hint_uses_field_level_precedence() -> None:
         execution_baseline=baseline,
         scene_model_hints=scene_hints,
         run_override=override,
-        code_default=ExecutionBaselineConfig(
+        base_policy=ExecutionBaselineConfig(
             model_id="deepseek-v4-flash",
             runner_option_hint_id="interactive",
         ),
@@ -95,7 +95,7 @@ def test_select_runner_option_hint_fails_fast_for_missing_model_or_hint() -> Non
                 {"model_id": "missing", "runner_option_hint_id": "interactive"},
                 source_name="run_override",
             ),
-            code_default=None,
+            base_policy=None,
         )
 
     with pytest.raises(RuntimeAssemblySelectionError, match="runner option hint"):
@@ -110,7 +110,7 @@ def test_select_runner_option_hint_fails_fast_for_missing_model_or_hint() -> Non
                 },
                 source_name="run_override",
             ),
-            code_default=None,
+            base_policy=None,
         )
 
 
@@ -131,9 +131,9 @@ def test_parse_overrides_fail_fast_for_unknown_fields() -> None:
 
 
 def test_parse_agent_policy_override_accepts_scene_fallback_enum_values() -> None:
-    """runtime fallback_mode 白名单必须与 scene typed enum 保持同源。"""
+    """runtime fallback_mode 白名单必须与共享枚举保持同源。"""
 
-    for fallback_mode in SceneAgentFallbackMode:
+    for fallback_mode in AgentFallbackMode:
         override = parse_agent_policy_override_config(
             {"fallback_mode": fallback_mode.value},
             source_name="run_override",
@@ -158,11 +158,11 @@ def test_merge_agent_policy_config_uses_typed_allowlist_precedence() -> None:
     )
     scene_override = SceneAgentPolicyOverride(
         max_iterations=7,
-        fallback_mode=SceneAgentFallbackMode.RAISE_ERROR,
+        fallback_mode=AgentFallbackMode.RAISE_ERROR,
     )
 
     merged = merge_agent_policy_config(
-        code_default=_agent_policy_defaults(),
+        base_policy=_agent_policy_baseline(),
         execution_profile=profile,
         scene_override=scene_override,
         run_override=run_override,
@@ -184,7 +184,7 @@ def test_merge_agent_policy_config_revalidates_selected_fallback_mode() -> None:
 
     with pytest.raises(RuntimeAssemblyFieldError, match="unsupported value"):
         merge_agent_policy_config(
-            code_default=_agent_policy_defaults(),
+            base_policy=_agent_policy_baseline(),
             execution_profile=None,
             scene_override=None,
             run_override=AgentPolicyOverrideConfig(fallback_mode="finalize"),
@@ -200,7 +200,7 @@ def test_merge_agent_policy_config_field_sources_is_runtime_immutable() -> None:
     )
 
     merged = merge_agent_policy_config(
-        code_default=_agent_policy_defaults(),
+        base_policy=_agent_policy_baseline(),
         execution_profile=profile,
         scene_override=None,
         run_override=None,
@@ -258,10 +258,10 @@ def test_runtime_assembly_helpers_do_not_construct_host_or_engine_objects() -> N
         ].run_baseline,
         scene_model_hints=None,
         run_override=None,
-        code_default=None,
+        base_policy=None,
     )
     merged = merge_agent_policy_config(
-        code_default=_agent_policy_defaults(),
+        base_policy=_agent_policy_baseline(),
         execution_profile=profile,
         scene_override=None,
         run_override=None,

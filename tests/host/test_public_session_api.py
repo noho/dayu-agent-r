@@ -27,6 +27,7 @@ from dayu.host import (
     HostClosedError,
     HostMetadataEntry,
     LocalEngineWorker,
+    OpenHostAdminOptions,
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
@@ -38,6 +39,7 @@ from dayu.host import (
     get_session,
     list_sessions,
     open_host,
+    open_host_admin,
     purge_session,
 )
 from dayu.host.api import HostCommandHandleOptions
@@ -127,6 +129,8 @@ def _open_host_options(tmp_path: Path) -> OpenHostOptions:
                 continuation_max_attempts=0,
                 allow_tool_calls=False,
                 tool_execution_timeout_seconds=1.0,
+                fallback_prompt="test fallback prompt",
+                continuation_prompt="test continuation prompt",
             ),
         ),
         worker_factory=_UnusedWorkerFactory(),
@@ -136,6 +140,34 @@ def _open_host_options(tmp_path: Path) -> OpenHostOptions:
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+    )
+
+
+def _open_host_admin_options(tmp_path: Path) -> OpenHostAdminOptions:
+    """构造与 execution opener 使用同一 durable policy 的 admin options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: HostAdmin opener options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    options = _open_host_options(tmp_path)
+    return OpenHostAdminOptions(
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
     )
 
 
@@ -675,17 +707,20 @@ def test_list_sessions_malformed_timestamp_returns_public_internal_error(
 
 
 @pytest.mark.asyncio
-async def test_open_host_list_sessions_and_closed_handle(tmp_path: Path) -> None:
-    """open_host public handle 暴露 list_sessions，并在关闭后 fail fast。"""
+async def test_open_host_admin_lists_sessions_and_closed_handle(tmp_path: Path) -> None:
+    """HostAdmin 暴露 list_sessions，并在关闭后 fail fast。"""
 
-    host_manager = open_host(_open_host_options(tmp_path))
-    host = await host_manager.__aenter__()
+    async with open_host(_open_host_options(tmp_path)) as execution_host:
+        created = await execution_host.create_session(
+            _create_request("open-host-list")
+        )
+    host_manager = open_host_admin(_open_host_admin_options(tmp_path))
+    host_admin = await host_manager.__aenter__()
     try:
-        created = await host.create_session(_create_request("open-host-list"))
-        result = await host.list_sessions()
+        result = await host_admin.list_sessions()
         assert [item.session_id for item in result.sessions] == [created.session_id]
     finally:
         await host_manager.__aexit__(None, None, None)
 
     with pytest.raises(HostClosedError):
-        await host.list_sessions()
+        await host_admin.list_sessions()

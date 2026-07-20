@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +13,8 @@ import dayu.service.fins_direct as fins_direct_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.direct_events import (
     FinsErrorKind,
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsEvent,
     FinsEventDetail,
     FinsEventType,
@@ -21,6 +23,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
+from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
@@ -34,41 +37,10 @@ from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
     FINS_DIRECT_EXIT_SUCCESS,
     FinsDirectCommandService,
-    FinsDirectUsageError,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 
 _NOW: datetime = datetime(2026, 6, 14, tzinfo=timezone.utc)
-
-
-class _FakeCancellationToken:
-    """测试用取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回当前是否已取消。
-
-        :returns: 始终返回 ``False``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终返回 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终返回 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
 
 
 class _FakeIngestionRuntime:
@@ -84,6 +56,7 @@ class _FakeIngestionRuntime:
     pause_after_first_event: bool
     first_event_yielded: asyncio.Event
     release_paused_stream: asyncio.Event
+    returned_streams: list[ValidatedFinsEventStream]
 
     def __init__(
         self,
@@ -111,13 +84,14 @@ class _FakeIngestionRuntime:
         self.pause_after_first_event = pause_after_first_event
         self.first_event_yielded = asyncio.Event()
         self.release_paused_stream = asyncio.Event()
+        self.returned_streams = []
 
     def download(
         self,
         request: FinsDownloadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """记录下载请求并返回 fake direct stream。
 
         :param request: 下载请求。
@@ -128,14 +102,14 @@ class _FakeIngestionRuntime:
 
         self.download_requests.append(request)
         self.cancellation_tokens.append(cancellation_token)
-        return self._stream()
+        return self._validated_stream(FinsOperationKind.DOWNLOAD)
 
     def preprocess(
         self,
         request: FinsPreprocessRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """记录预处理请求并返回 fake direct stream。
 
         :param request: 预处理请求。
@@ -146,14 +120,14 @@ class _FakeIngestionRuntime:
 
         self.preprocess_requests.append(request)
         self.cancellation_tokens.append(cancellation_token)
-        return self._stream()
+        return self._validated_stream(FinsOperationKind.PREPROCESS)
 
     def upload(
         self,
         request: FinsUploadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """记录上传请求并返回 fake direct stream。
 
         :param request: 上传请求。
@@ -164,12 +138,34 @@ class _FakeIngestionRuntime:
 
         self.upload_requests.append(request)
         self.cancellation_tokens.append(cancellation_token)
-        return self._stream()
+        if isinstance(request, FinsUploadFilingRequest):
+            operation_kind = FinsOperationKind.UPLOAD_FILING
+        else:
+            operation_kind = FinsOperationKind.UPLOAD_MATERIAL
+        return self._validated_stream(operation_kind)
 
-    async def _stream(self) -> AsyncIterator[FinsEvent]:
-        """产出预设事件并在关闭时记录 close。
+    def _validated_stream(
+        self,
+        operation_kind: FinsOperationKind,
+    ) -> ValidatedFinsEventStream:
+        """用 production owner 包装 raw fake stream。
 
-        :returns: Fins direct 事件异步迭代器。
+        :param operation_kind: runtime 拥有的 direct 操作来源。
+        :returns: production validator stream。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        stream = ValidatedFinsEventStream(
+            self._raw_stream(),
+            operation_kind=operation_kind,
+        )
+        self.returned_streams.append(stream)
+        return stream
+
+    async def _raw_stream(self) -> AsyncGenerator[FinsEvent, None]:
+        """产出预设 raw 事件并在关闭时记录 close。
+
+        :returns: 未校验的 Fins direct raw 事件 async generator。
         :raises Exception: stream_error 不为空时在事件后抛出。
         """
 
@@ -287,7 +283,7 @@ async def _consume_until_cancelled(events: AsyncIterator[FinsEvent]) -> None:
 async def test_download_stream_builds_request_and_yields_progress_result() -> None:
     """download 必须构造请求并产出 progress -> result。"""
 
-    token = _FakeCancellationToken()
+    token = ControllableCancellationToken()
     runtime = _FakeIngestionRuntime((_progress_event(), _result_event()))
     service = FinsDirectCommandService(runtime)
 
@@ -496,33 +492,101 @@ async def test_stream_exception_is_propagated_without_synthetic_result() -> None
 
 
 @pytest.mark.asyncio
-async def test_stream_without_result_closes_as_failure_result() -> None:
-    """stream 正常结束但没有 RESULT 时 Service 必须产出清晰 failure。"""
+async def test_fins_owned_protocol_error_fields_and_object_are_propagated_by_identity() -> None:
+    """验证 Service 透传同一个 Fins owner stream 与 typed error 对象。
 
-    runtime = _FakeIngestionRuntime((_progress_event(),))
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stream/error identity 或 typed fields 改变时抛出。
+    """
+
+    owner_error = FinsDirectStreamProtocolError(
+        FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT,
+        FinsOperationKind.DOWNLOAD,
+        "Fins direct stream produced multiple RESULT events",
+    )
+    runtime = _FakeIngestionRuntime(
+        (_progress_event(),),
+        stream_error=owner_error,
+    )
     service = FinsDirectCommandService(runtime)
+    stream = service.download(ticker="AAPL")
 
-    events = await _collect_events(service.download(ticker="AAPL"))
+    assert stream is runtime.returned_streams[-1]
+    with pytest.raises(FinsDirectStreamProtocolError) as captured:
+        await _collect_events(stream)
 
-    assert [event.event_type for event in events] == [
-        FinsEventType.PROGRESS,
-        FinsEventType.RESULT,
-    ]
-    assert events[-1].result is not None
-    assert events[-1].result.status is FinsResultStatus.FAILURE
-    assert events[-1].result.error_kind is FinsErrorKind.EXECUTION
-    assert events[-1].result.exit_code == FINS_DIRECT_EXIT_FAILURE
+    assert captured.value is owner_error
+    assert captured.value.reason is FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT
+    assert captured.value.operation_kind is FinsOperationKind.DOWNLOAD
+    assert captured.value.message == "Fins direct stream produced multiple RESULT events"
 
 
 @pytest.mark.asyncio
-async def test_duplicate_result_fails_fast() -> None:
-    """runtime 重复产出 RESULT 时 Service 必须 fail fast。"""
+async def test_process_filing_keeps_runtime_preprocess_protocol_error_provenance() -> None:
+    """验证 process_filing 不把 runtime PREPROCESS 来源改成入口 alias。
 
-    runtime = _FakeIngestionRuntime((_result_event(), _result_event()))
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stream identity 或 operation provenance 改变时抛出。
+    """
+
+    runtime = _FakeIngestionRuntime(
+        (
+            _result_event(operation_kind=FinsOperationKind.PREPROCESS),
+            _result_event(operation_kind=FinsOperationKind.PREPROCESS),
+        )
+    )
     service = FinsDirectCommandService(runtime)
+    stream = service.process_filing(ticker="AAPL")
 
-    with pytest.raises(FinsDirectUsageError, match="multiple RESULT"):
-        await _collect_events(service.download(ticker="AAPL"))
+    assert stream is runtime.returned_streams[-1]
+    with pytest.raises(FinsDirectStreamProtocolError) as captured:
+        await _collect_events(stream)
+
+    assert captured.value.reason is FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT
+    assert captured.value.operation_kind is FinsOperationKind.PREPROCESS
+
+
+@pytest.mark.asyncio
+async def test_process_material_keeps_runtime_preprocess_protocol_error_provenance() -> None:
+    """验证 process_material 不把 runtime PREPROCESS 来源改成入口 alias。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stream identity 或 operation provenance 改变时抛出。
+    """
+
+    runtime = _FakeIngestionRuntime(
+        (
+            _result_event(operation_kind=FinsOperationKind.PREPROCESS),
+            _result_event(operation_kind=FinsOperationKind.PREPROCESS),
+        )
+    )
+    service = FinsDirectCommandService(runtime)
+    stream = service.process_material(ticker="AAPL")
+
+    assert stream is runtime.returned_streams[-1]
+    with pytest.raises(FinsDirectStreamProtocolError) as captured:
+        await _collect_events(stream)
+
+    assert captured.value.reason is FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT
+    assert captured.value.operation_kind is FinsOperationKind.PREPROCESS
 
 
 @pytest.mark.asyncio
