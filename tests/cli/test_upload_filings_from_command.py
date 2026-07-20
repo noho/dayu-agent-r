@@ -1000,10 +1000,21 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
         assert snapshot.source_kind is SourceKind.FILING
         descriptors = snapshot.files
         assert descriptors
-        assert snapshot.primary_filename == source_path.name
-        assert snapshot.primary_filename in tuple(
-            descriptor.name for descriptor in descriptors
+        primary_descriptors = tuple(
+            descriptor
+            for descriptor in descriptors
+            if descriptor.name == snapshot.primary_filename
         )
+        assert len(primary_descriptors) == 1
+        raw_source_descriptors = tuple(
+            descriptor
+            for descriptor in descriptors
+            if descriptor.name == source_path.name
+        )
+        assert len(raw_source_descriptors) == 1
+        raw_source_descriptor = raw_source_descriptors[0]
+        assert raw_source_descriptor.sha256 is not None
+        assert raw_source_descriptor.sha256 == hashlib.sha256(fixture).hexdigest()
     source_artifacts = tuple(
         path for path in (storage / "portfolio").rglob("*") if path.is_file()
     )
