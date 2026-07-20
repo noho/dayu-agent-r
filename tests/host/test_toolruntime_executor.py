@@ -15,6 +15,7 @@ from typing import cast
 
 import pytest
 
+import dayu.host.tool_runtime as tool_runtime_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSnapshot, ToolAwaitSpec
@@ -140,6 +141,10 @@ _TEST_PROCESS_CLOSE_DEFAULT_GRACE_SECONDS = 1.0
 _CUSTOM_PROCESS_CLOSE_GRACE_SECONDS = 0.73
 _RECORDED_PROCESS_HANDLE_CLOSE_KILL_GRACES: list[float] = []
 _ORIGINAL_INTERRUPTIBLE_PROCESS_HANDLE_CLOSE = InterruptibleProcessHandle.close
+_LEGACY_GOVERNED_FAILURE_MESSAGE = "host_tool_governed_error"
+_INTERNAL_GOVERNANCE_REASON = "internal_governance_reason"
+_REUSE_GOVERNANCE_REASON = "duplicate_reuse"
+_REUSE_READABLE_MESSAGE = "请直接使用上一次工具结果继续分析。"
 
 
 async def _recording_interruptible_process_handle_close(
@@ -2881,6 +2886,91 @@ async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
     assert second.result.error == "tool_accept_rejected"
     assert isinstance(third, ToolFailedOutcome)
     assert third.result.error == "tool_accept_timeout"
+
+
+@pytest.mark.parametrize("message", (None, "", " \t "))
+def test_governed_failure_projection_rejects_missing_readable_message(
+    message: str | None,
+) -> None:
+    """治理失败投影在 owner 边界拒绝缺失或空白业务可读说明。
+
+    :param message: 对抗性决策中的缺失或空白说明。
+    :returns: ``None``。
+    """
+
+    decision = ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        reason_code=_INTERNAL_GOVERNANCE_REASON,
+        message=message,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        tool_runtime_module._governed_failure_outcome(decision)
+
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(exc_info.value)
+    with pytest.raises(ValueError) as governance_exc_info:
+        ToolAcceptGovernance(
+            policy_decision=decision,
+            tool_idempotency_key=None,
+            duplicate=None,
+        )
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(governance_exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "decision",
+    (
+        ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.ALLOW,
+            reason_code=None,
+            message=None,
+        ),
+        ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.REUSE,
+            reason_code=_REUSE_GOVERNANCE_REASON,
+            message=_REUSE_READABLE_MESSAGE,
+        ),
+    ),
+)
+def test_governed_failure_projection_rejects_non_failure_decision(
+    decision: ToolPolicyDecision,
+) -> None:
+    """``ALLOW`` / ``REUSE`` 决策不得被投影为治理失败 outcome。
+
+    :param decision: 不属于治理失败的合法决策。
+    :returns: ``None``。
+    """
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"{decision.kind.value} policy decision cannot produce governed failure"
+        ),
+    ) as exc_info:
+        tool_runtime_module._governed_failure_outcome(decision)
+
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(exc_info.value)
+
+
+def test_governed_failure_projection_preserves_readable_message() -> None:
+    """合法治理决策仍投影原业务可读说明，不使用内部 reason code。
+
+    :returns: ``None``。
+    """
+
+    readable_message = "当前工具调用未获允许；请调整请求后重试。"
+    decision = ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        reason_code=_INTERNAL_GOVERNANCE_REASON,
+        message=readable_message,
+    )
+
+    outcome = tool_runtime_module._governed_failure_outcome(decision)
+    serialized_outcome = accepted_tool_outcome_json(outcome)
+
+    assert outcome.result.message == readable_message
+    assert _INTERNAL_GOVERNANCE_REASON not in str(serialized_outcome)
+    assert _LEGACY_GOVERNED_FAILURE_MESSAGE not in str(serialized_outcome)
 
 
 def _executor(

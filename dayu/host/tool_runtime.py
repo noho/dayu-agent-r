@@ -237,7 +237,6 @@ _MIN_ACCEPT_BACKOFF_SECONDS = 0.0
 _DEFAULT_ACCEPT_RETRY_ATTEMPTS = 2
 _DEFAULT_ACCEPT_BACKOFF_SECONDS = 0.0
 _TOOL_RESULT_SIZE_LOG_THRESHOLD_BYTES = 65536
-_TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
 _TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
 _TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR = "tool_accept_timeout"
@@ -7210,11 +7209,25 @@ def _governed_failure_outcome(
 
     :param policy_decision: 工具治理决策。
     :returns: governed ``ToolFailedOutcome``。
+    :raises ValueError: 决策字段非法，或 ``ALLOW`` / ``REUSE``
+        误入治理失败投影时抛出。
     """
 
+    _validate_policy_decision_fields(policy_decision)
+    if policy_decision.kind in (
+        ToolPolicyDecisionKind.ALLOW,
+        ToolPolicyDecisionKind.REUSE,
+    ):
+        raise ValueError(
+            f"{policy_decision.kind.value} policy decision cannot produce "
+            "governed failure"
+        )
+    message = policy_decision.message
+    if message is None:
+        raise ValueError("governed failure requires policy decision message")
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_POLICY_BLOCKED_ERROR,
-        message=policy_decision.message or _TOOL_RUNTIME_GOVERNED_ERROR,
+        message=message,
         hint=None,
     )
 
