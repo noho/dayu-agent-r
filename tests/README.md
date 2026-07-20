@@ -63,6 +63,10 @@ RESET No→RESET Yes 与 `ConfigLoader`/scene 重载，验证 ordinary Windows t
 POSIX directory fsync；还覆盖真实 nested junction/reparse 外部 sentinel、普通 symlink 的精确
 privilege skip、workspace root identity、replace rollback、scan-delete race、真实 `setx` 用户环境
 round-trip/幂等 absent cleanup、非 POSIX TTY no-op owner boundary，以及 R11 的两个真实 cmd/upload nodes。
+real-init 的 secret 输入 owner 按 stdin capability 分流：TTY 继续使用隐藏输入，redirected stdin 把提示写到 stderr 后
+逐项读取一行，避免 Windows console path 忽略重定向输入。跨平台 owner tests 固定覆盖 TTY/redirected 分流、LF/CRLF/
+bare CR、prompt flush、EOF 收敛、KeyboardInterrupt、required/optional/confirmation 顺序以及值不进入公开输出；真实
+Windows redirected-handle 组合仍由本 workflow 验收。
 outer CLI timeout 失败只投影 `category`、`timeout_seconds`、`returncode_at_timeout`、`cleanup`、
 `cleanup_returncode`，cleanup timeout 时再投影 `process_state_after_cleanup_timeout`；artifact 可记录环境变量名，但不记录
 stdin input value。上传 artifact 只包含 JUnit、版本、capability、source hashes 和环境变量名，不保存

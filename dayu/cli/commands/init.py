@@ -465,6 +465,34 @@ def _parse_model_choice(raw_choice: str) -> InitModelChoice:
         raise CliInitOperationError(str(exc)) from exc
 
 
+def _read_secret_input(prompt: str) -> str:
+    """按当前 stdin 能力读取一个 secret 值且不回显内容。
+
+    :param prompt: 只包含环境变量名与输入说明的用户可见提示。
+    :returns: TTY 隐藏输入，或 redirected stdin 中移除一个 logical line ending 后的值。
+    :raises CliInitOperationError: TTY 或 redirected stdin 在值完成前到达 EOF 时抛出。
+    :raises KeyboardInterrupt: 用户中断输入时原样透传。
+    :raises OSError: stdin/stderr 能力检查、写入、刷新或读取失败时透传。
+    """
+
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass(prompt)
+        except EOFError as exc:
+            raise CliInitOperationError("secret input ended before completion") from exc
+
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    value = sys.stdin.readline()
+    if value == "":
+        raise CliInitOperationError("secret input ended before completion")
+    if value.endswith("\n"):
+        value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+    return value
+
+
 def _collect_environment_persistence_plan(
     selection: InitModelSelection,
 ) -> EnvironmentPersistencePlan | None:
@@ -479,7 +507,7 @@ def _collect_environment_persistence_plan(
     entries: list[EnvironmentPersistenceEntry] = []
     required_name = selection.choice.required_secret_env_name
     if required_name is not None and not has_non_empty_environment_value(required_name, os.environ):
-        required_value = getpass.getpass(f"{required_name}（输入隐藏，不写日志）: ")
+        required_value = _read_secret_input(f"{required_name}（输入隐藏，不写日志）: ")
         if not required_value:
             raise CliInitOperationError(f"required environment value was not provided: {required_name}")
         entries.append(
@@ -491,7 +519,7 @@ def _collect_environment_persistence_plan(
     for optional_name in OPTIONAL_ENVIRONMENT_NAMES:
         if has_non_empty_environment_value(optional_name, os.environ):
             continue
-        optional_value = getpass.getpass(f"可选 {optional_name}（留空跳过，输入隐藏）: ")
+        optional_value = _read_secret_input(f"可选 {optional_name}（留空跳过，输入隐藏）: ")
         if optional_value:
             entries.append(
                 EnvironmentPersistenceEntry(

@@ -6,6 +6,7 @@ import builtins
 import errno
 import getpass
 import importlib
+import io
 import os
 import platform
 import secrets
@@ -166,6 +167,80 @@ class _GetpassSequence:
         return ""
 
 
+class _TtySecretInput(io.StringIO):
+    """只允许 capability 检查、禁止 secret owner 读取明文行的 TTY fake。"""
+
+    def isatty(self) -> bool:
+        """声明当前 test-owned stream 具有 TTY 能力。
+
+        :returns: 始终返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    def readline(self, size: int = -1, /) -> str:
+        """拒绝 TTY secret owner 误入明文逐行读取路径。
+
+        :param size: 兼容文本流协议的最大读取长度；测试不消费。
+        :returns: 本方法不返回。
+        :raises AssertionError: 任何调用都表示 TTY owner path 漂移。
+        """
+
+        del size
+        raise AssertionError("TTY secret input must not call stdin.readline")
+
+
+class _FlushRecordingStderr(io.StringIO):
+    """记录 redirected secret prompt 的显式 flush 次数。"""
+
+    def __init__(self) -> None:
+        """初始化内存 stderr 与 flush 计数。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        """记录一次 flush 并刷新内存文本流。
+
+        :returns: ``None``。
+        :raises OSError: 底层内存文本流刷新失败时透传。
+        """
+
+        self.flush_count += 1
+        super().flush()
+
+
+class _InterruptingRedirectedSecretInput(io.StringIO):
+    """在 redirected readline 边界抛出指定 KeyboardInterrupt。"""
+
+    def __init__(self, interrupt: KeyboardInterrupt) -> None:
+        """初始化中断输入流。
+
+        :param interrupt: 必须保持 identity 透传的用户中断。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self._interrupt = interrupt
+
+    def readline(self, size: int = -1, /) -> str:
+        """在首次逐行读取时抛出用户中断。
+
+        :param size: 兼容文本流协议的最大读取长度；测试不消费。
+        :returns: 本方法不返回。
+        :raises KeyboardInterrupt: 始终抛出初始化时提供的中断。
+        """
+
+        del size
+        raise self._interrupt
+
+
 class _EofInput:
     """所有 input 调用都抛 EOF。"""
 
@@ -247,6 +322,24 @@ class _CompetingInitRunner:
         self.results.append(cli_main.main(("init", "--base", str(self._workspace_root))))
 
 
+def _install_tty_getpass(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: tuple[str, ...] = (),
+) -> _GetpassSequence:
+    """安装确定性 TTY stdin 与隐藏输入序列。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param responses: getpass 按顺序返回的隐藏值。
+    :returns: 可检查 prompt 与消费顺序的 getpass 序列。
+    :raises Exception: monkeypatch 失败时抛出。
+    """
+
+    getpass_sequence = _GetpassSequence(responses)
+    monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
+    monkeypatch.setattr(getpass, "getpass", getpass_sequence)
+    return getpass_sequence
+
+
 def _install_ollama_inputs(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -269,7 +362,7 @@ def _install_ollama_inputs(
     )
     input_sequence = _InputSequence(responses)
     monkeypatch.setattr(builtins, "input", input_sequence)
-    monkeypatch.setattr(getpass, "getpass", _GetpassSequence())
+    _install_tty_getpass(monkeypatch)
     return input_sequence
 
 
@@ -284,6 +377,285 @@ def _write_text(path: Path, value: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
+
+
+def test_read_secret_input_uses_hidden_getpass_for_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TTY secret 必须只经隐藏输入读取且不得触碰 stdin.readline。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: capability 分流、prompt 或返回值漂移时抛出。
+    """
+
+    secret = secrets.token_urlsafe(24)
+    prompt = "PROVIDER_API_KEY（输入隐藏，不写日志）: "
+    getpass_sequence = _install_tty_getpass(monkeypatch, (secret,))
+
+    assert init_command._read_secret_input(prompt) == secret
+    assert getpass_sequence.prompts == [prompt]
+
+
+@pytest.mark.parametrize(
+    ("line_ending", "expected_trailer", "remaining"),
+    (
+        ("\n", "", "next-line\n"),
+        ("\r\n", "", "next-line\n"),
+        ("\r", "\r", ""),
+        (" \t\n", " \t", "next-line\n"),
+    ),
+    ids=("lf", "crlf", "bare-cr", "other-trailing-whitespace"),
+)
+def test_read_secret_input_redirected_reads_exactly_one_logical_line(
+    monkeypatch: pytest.MonkeyPatch,
+    line_ending: str,
+    expected_trailer: str,
+    remaining: str,
+) -> None:
+    """Redirected secret 只读一行、条件移除 CRLF 并立即刷新 prompt。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param line_ending: 当前 case 的尾随字符。
+    :param expected_trailer: logical line ending 移除后应保留的尾随字符。
+    :param remaining: helper 返回后仍应留在 stdin 的内容。
+    :returns: ``None``。
+    :raises AssertionError: 读取次数、字符保留、prompt、flush 或 getpass 分流漂移时抛出。
+    """
+
+    secret = secrets.token_urlsafe(24)
+    prompt = "PROVIDER_API_KEY（重定向输入）: "
+    redirected_stdin = io.StringIO(f"{secret}{line_ending}{remaining}")
+    redirected_stderr = _FlushRecordingStderr()
+    hidden_input = Mock(side_effect=AssertionError("redirected input must not call getpass"))
+    monkeypatch.setattr(init_command.sys, "stdin", redirected_stdin)
+    monkeypatch.setattr(init_command.sys, "stderr", redirected_stderr)
+    monkeypatch.setattr(getpass, "getpass", hidden_input)
+
+    value = init_command._read_secret_input(prompt)
+
+    assert value == f"{secret}{expected_trailer}"
+    assert redirected_stdin.read() == remaining
+    assert redirected_stderr.getvalue() == prompt
+    assert redirected_stderr.flush_count == 1
+    assert secret not in redirected_stderr.getvalue()
+    hidden_input.assert_not_called()
+
+
+def test_redirected_secret_owner_is_reused_for_required_and_optional_values(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Required 与 optional 两个调用点必须复用 redirected owner 并保持确认顺序。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 调用点、输入顺序、typed plan 或 non-disclosure 漂移时抛出。
+    """
+
+    required_secret = secrets.token_urlsafe(24)
+    optional_secret = secrets.token_urlsafe(24)
+    required_name = "OPENAI_API_KEY"
+    optional_name = init_command.OPTIONAL_ENVIRONMENT_NAMES[0]
+    for name in init_command.OPTIONAL_ENVIRONMENT_NAMES:
+        monkeypatch.setenv(name, "already-configured")
+    monkeypatch.delenv(required_name, raising=False)
+    monkeypatch.delenv(optional_name, raising=False)
+    redirected_stdin = io.StringIO(f"{required_secret}\n{optional_secret}\n")
+    redirected_stderr = _FlushRecordingStderr()
+    confirmation = _InputSequence(("y",))
+    hidden_input = Mock(side_effect=AssertionError("redirected input must not call getpass"))
+    monkeypatch.setattr(init_command.sys, "stdin", redirected_stdin)
+    monkeypatch.setattr(init_command.sys, "stderr", redirected_stderr)
+    monkeypatch.setattr(builtins, "input", confirmation)
+    monkeypatch.setattr(getpass, "getpass", hidden_input)
+    monkeypatch.setattr(init_command.platform, "system", Mock(return_value="Windows"))
+    selection = init_command.InitModelSelection(choice=init_command.INIT_MODEL_CHOICES[5])
+
+    plan = init_command._collect_environment_persistence_plan(selection)
+    captured = capsys.readouterr()
+
+    assert isinstance(plan, WindowsEnvironmentPersistencePlan)
+    assert plan.confirmed is True
+    assert plan.entries == (
+        EnvironmentPersistenceEntry(name=required_name, value=required_secret),
+        EnvironmentPersistenceEntry(name=optional_name, value=optional_secret),
+    )
+    assert redirected_stdin.read() == ""
+    assert redirected_stderr.flush_count == 2
+    assert required_name in redirected_stderr.getvalue()
+    assert optional_name in redirected_stderr.getvalue()
+    assert confirmation.prompts == ["确认持久化这一批环境变量? [y/N]: "]
+    assert required_name in captured.out
+    assert optional_name in captured.out
+    assert required_secret not in captured.out
+    assert optional_secret not in captured.out
+    assert required_secret not in redirected_stderr.getvalue()
+    assert optional_secret not in redirected_stderr.getvalue()
+    hidden_input.assert_not_called()
+
+
+@pytest.mark.parametrize("is_tty", (True, False), ids=("tty", "redirected"))
+def test_secret_input_eof_paths_share_value_free_owner_error(
+    monkeypatch: pytest.MonkeyPatch,
+    is_tty: bool,
+) -> None:
+    """TTY EOFError 与 redirected empty read 必须收敛为同一 value-free 错误。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param is_tty: 是否验证 TTY hidden-getpass 路径。
+    :returns: ``None``。
+    :raises AssertionError: EOF 类型、错误文本或 capability 分流漂移时抛出。
+    """
+
+    raw_exception_value = secrets.token_urlsafe(24)
+    if is_tty:
+        monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
+        monkeypatch.setattr(
+            getpass,
+            "getpass",
+            Mock(side_effect=EOFError(raw_exception_value)),
+        )
+    else:
+        monkeypatch.setattr(init_command.sys, "stdin", io.StringIO())
+        monkeypatch.setattr(
+            getpass,
+            "getpass",
+            Mock(side_effect=AssertionError("redirected input must not call getpass")),
+        )
+
+    with pytest.raises(init_command.CliInitOperationError) as raised:
+        init_command._read_secret_input("PROVIDER_API_KEY: ")
+
+    assert str(raised.value) == "secret input ended before completion"
+    assert raw_exception_value not in str(raised.value)
+
+
+@pytest.mark.parametrize("is_tty", (True, False), ids=("tty", "redirected"))
+def test_secret_input_eof_is_publicly_value_free_and_stops_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    is_tty: bool,
+) -> None:
+    """Secret EOF 的公开失败文本不得泄值，且不得发布 config/trace/audit state。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :param is_tty: 是否验证 TTY hidden-getpass 路径。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、公开文本、后续输入或 publication 漂移时抛出。
+    """
+
+    raw_exception_value = secrets.token_urlsafe(24)
+    workspace_root = tmp_path / "workspace"
+    model_input = _InputSequence(("6",))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", model_input)
+    if is_tty:
+        monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
+        hidden_input = Mock(side_effect=EOFError(raw_exception_value))
+    else:
+        monkeypatch.setattr(init_command.sys, "stdin", io.StringIO())
+        hidden_input = Mock(side_effect=AssertionError("redirected input must not call getpass"))
+    monkeypatch.setattr(getpass, "getpass", hidden_input)
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "secret input ended before completion" in captured.err
+    assert raw_exception_value not in captured.out
+    assert raw_exception_value not in captured.err
+    assert len(model_input.prompts) == 1
+    assert not (workspace_root / "config").exists()
+    assert not (workspace_root / ".dayu").exists()
+    if is_tty:
+        hidden_input.assert_called_once()
+    else:
+        hidden_input.assert_not_called()
+
+
+@pytest.mark.parametrize("is_tty", (True, False), ids=("tty", "redirected"))
+def test_secret_input_keyboard_interrupt_preserves_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    is_tty: bool,
+) -> None:
+    """TTY 与 redirected secret 输入必须原样传播 KeyboardInterrupt。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param is_tty: 是否验证 TTY hidden-getpass 路径。
+    :returns: ``None``。
+    :raises AssertionError: interrupt identity 或 capability 分流漂移时抛出。
+    """
+
+    interrupt = KeyboardInterrupt()
+    if is_tty:
+        monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
+        monkeypatch.setattr(getpass, "getpass", Mock(side_effect=interrupt))
+    else:
+        monkeypatch.setattr(
+            init_command.sys,
+            "stdin",
+            _InterruptingRedirectedSecretInput(interrupt),
+        )
+        monkeypatch.setattr(
+            getpass,
+            "getpass",
+            Mock(side_effect=AssertionError("redirected input must not call getpass")),
+        )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        init_command._read_secret_input("PROVIDER_API_KEY: ")
+
+    assert raised.value is interrupt
+
+
+@pytest.mark.parametrize("is_tty", (True, False), ids=("tty", "redirected"))
+def test_secret_input_keyboard_interrupt_maps_to_cli_exit_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_tty: bool,
+) -> None:
+    """Secret 输入中断必须映射 exit 130 且停止 confirmation/persistence/publication。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param is_tty: 是否验证 TTY hidden-getpass 路径。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、后续调用或 publication 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    model_input = _InputSequence(("6",))
+    persistence = Mock(side_effect=AssertionError("persistence must not run after interrupt"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", model_input)
+    monkeypatch.setattr(init_command, "persist_environment", persistence)
+    if is_tty:
+        monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
+        monkeypatch.setattr(getpass, "getpass", Mock(side_effect=KeyboardInterrupt()))
+    else:
+        monkeypatch.setattr(
+            init_command.sys,
+            "stdin",
+            _InterruptingRedirectedSecretInput(KeyboardInterrupt()),
+        )
+        monkeypatch.setattr(
+            getpass,
+            "getpass",
+            Mock(side_effect=AssertionError("redirected input must not call getpass")),
+        )
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert len(model_input.prompts) == 1
+    persistence.assert_not_called()
+    assert not (workspace_root / "config").exists()
+    assert not (workspace_root / ".dayu").exists()
 
 
 def test_first_cli_flow_uses_real_lock_discovery_and_current_config(
@@ -538,11 +910,7 @@ def test_required_secret_refusal_stops_before_transaction_publication(
     workspace_root = tmp_path / "workspace"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(builtins, "input", _InputSequence(("6", "n")))
-    monkeypatch.setattr(
-        getpass,
-        "getpass",
-        _GetpassSequence((secret, "", "", "", "", "")),
-    )
+    _install_tty_getpass(monkeypatch, (secret, "", "", "", "", ""))
 
     exit_code = cli_main.main(("init", "--base", str(workspace_root)))
     captured = capsys.readouterr()
@@ -576,7 +944,7 @@ def test_environment_persistence_failure_never_publishes_workspace(
     retained_path = tmp_path / ".dayu-init-env-retained"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
-    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    _install_tty_getpass(monkeypatch, (secret,))
     if failure_kind == "posix-error":
         retained_path.write_text(secret, encoding="utf-8")
         persistence = Mock(
@@ -635,7 +1003,7 @@ def test_persistence_interrupt_aborts_real_prepared_transaction_and_exits_130(
     retained_path = tmp_path / ".dayu-init-env-retained"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
-    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    _install_tty_getpass(monkeypatch, (secret,))
     if typed_interrupt:
         retained_path.write_text(secret, encoding="utf-8")
         side_effect: KeyboardInterrupt = EnvironmentPersistenceInterrupted(
@@ -697,7 +1065,7 @@ def test_persistence_interrupt_abort_failure_reports_retained_truth_and_exits_13
     )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
-    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    _install_tty_getpass(monkeypatch, (secret,))
     monkeypatch.setattr(init_command, "persist_environment", Mock(side_effect=interrupt))
 
     def fail_abort(prepared: PreparedWorkspaceTransaction) -> None:
@@ -758,7 +1126,7 @@ def test_persistence_interrupt_aborts_before_broken_stderr_and_exits_130(
     events: list[str] = []
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
-    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    _install_tty_getpass(monkeypatch, (secret,))
     if typed_interrupt:
         side_effect: KeyboardInterrupt = EnvironmentPersistenceInterrupted(
             EnvironmentPersistenceResult(

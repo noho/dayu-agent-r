@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import dayu.cli.commands.init as init_command
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
@@ -98,6 +99,30 @@ _PROMPT_CURRENT_TIME_TEXT = (
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+
+
+class _TtySecretInput(io.StringIO):
+    """只允许 capability 检查、禁止 init secret owner 逐行读取的 TTY fake。"""
+
+    def isatty(self) -> bool:
+        """声明 caller-owned stdin 具有 TTY 能力。
+
+        :returns: 始终返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    def readline(self, size: int = -1, /) -> str:
+        """拒绝 TTY secret owner 误入 redirected stdin 路径。
+
+        :param size: 兼容文本流协议的最大读取长度；测试不消费。
+        :returns: 本方法不返回。
+        :raises AssertionError: 任何调用都表示 TTY capability 分流漂移。
+        """
+
+        del size
+        raise AssertionError("TTY secret input must not call stdin.readline")
 
 
 async def _raise_cli_terminal_cursor_error(
@@ -1216,6 +1241,7 @@ def test_prompt_command_uses_init_generated_workspace_config(
         "input",
         Mock(side_effect=("14", "", "", "")),
     )
+    monkeypatch.setattr(init_command.sys, "stdin", _TtySecretInput())
     monkeypatch.setattr(
         getpass,
         "getpass",

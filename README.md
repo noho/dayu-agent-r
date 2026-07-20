@@ -92,11 +92,12 @@ dayu-cli init --base ./my-workspace --reset
 四种状态都不会创建、删除或重建 public `portfolio/`、`assets/`。为防止写出工作区，
 workspace、锁文件、受管树或其子树中的 symlink / Windows reparse entry 会被拒绝。
 
-当所选模型需要 API Key 且当前进程没有对应变量时，`init` 会隐藏输入值，并在一次最终
-确认中只展示目标与变量名。POSIX 写入当前 shell 对应的 `~/.zshrc` 或 `~/.bashrc` 的唯一
-managed block；Windows 使用当前用户的 `setx`。可选集成只包括 `TAVILY_API_KEY`、
-`SERPER_API_KEY`、`FMP_API_KEY`、`HF_ENDPOINT`、`HF_TOKEN`。默认 No；拒绝或持久化失败
-时不会发布 workspace 配置。secret 值不写入 workspace，也不进入成功/失败输出。
+当所选模型需要 API Key 且当前进程没有对应变量时，`init` 在真实终端（TTY）隐藏输入值；
+stdin 被重定向时，每个 secret 提示写入 stderr，并从 stdin 逐项读取一行，CLI 不把值写回
+stdout/stderr。两种方式都在一次最终确认中只展示目标与变量名。POSIX 写入当前 shell 对应的
+`~/.zshrc` 或 `~/.bashrc` 的唯一 managed block；Windows 使用当前用户的 `setx`。可选集成只包括
+`TAVILY_API_KEY`、`SERPER_API_KEY`、`FMP_API_KEY`、`HF_ENDPOINT`、`HF_TOKEN`。默认 No；拒绝或
+持久化失败时不会发布 workspace 配置。secret 值不写入 workspace，也不进入成功/失败输出。
 
 FIRST/RESET 发布成功后会在当前进程中导入 `prompt` 与 `interactive` 入口以减少首次冷启动；
 该步骤不读取 workspace/env、不装配运行时、不联网。若出现 `prewarm warning`，配置仍已成功
