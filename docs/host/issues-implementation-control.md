@@ -154,13 +154,13 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CLI-SMOKE-01-R1` Slice 2 accepted commit |
+| phase | `WU-CLI-SMOKE-01-R1` accepted aggregate commit |
 | active work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
 | completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
-| gate | `accepted-slice-commit` |
+| gate | `accepted-aggregate-commit` |
 | prerequisite PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 已于 2026-07-20 merge；本地 `main` 已同步到 merge commit `bd1d3e94`。 |
 | selected work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
-| next gate | `accepted Slice 2 commit` |
+| next gate | `accepted aggregate commit` |
 | goal confirmation artifact | `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`；用户已确认，decision=`pass`。 |
 | plan artifact | `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`；2 个语义闭环 slices，controller decision=`ready-for-plan-review`。 |
 | plan review artifacts | `docs/reviews/plan-review-20260720-230213.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-230039.md`（AgentDS）；均为 `pass-with-risks`。 |
@@ -180,11 +180,14 @@ git push -u github <branch>
 | Slice 2 implementation artifact | `docs/reviews/wu-cli-smoke-01-r1-slice2-implementation-codex.md`；AgentCodex status=`completed`。生产 Python 零修改；新增 adversarial lifecycle/scale、真实 Host→Service→CLI slow-consumer E2E 与 3×1000 stress，DS-F02 已由真实 mixed stream 路径收口。Reported validation：transient owner coverage 90.96%，Host focused 295 passed，Service 51 passed，CLI 109 passed，最终 Host/Service/CLI 2816 passed / 8 skipped / 6 deselected，独立 stress 1 passed，pyright 0 errors，static boundary grep 与 `git diff --check` pass。Controller 已核对改动边界与 artifact，当前进入双路 code review。 |
 | Slice 2 code review artifacts | `docs/reviews/wu-cli-smoke-01-r1-slice2-code-review-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-slice2-code-review-ds.md`（AgentDS，PASS）；两路均为 0 blocking finding。 |
 | Slice 2 code review adjudication | `docs/reviews/wu-cli-smoke-01-r1-slice2-code-review-controller-adjudication.md`；controller decision=`accepted-slice2-review`。MiMo/DS 的 private barrier、bounded polling、局部 Host probe 与默认排除 stress 项均经直接 owner-state 证据裁决为 rejected-with-reason 或 accepted-as-designed，0 个 accepted current-fix finding；无需 fix / code re-review 或新增 supplemental batch。Controller validation：新增闭环 21 passed，相关文件 pyright 0 errors，独立 stress 1 passed，`git diff --check` pass。 |
+| accepted Slice 2 commit | `d58014cf`（`gateflow: accept Slice 2 for WU-CLI-SMOKE-01-R1`）。 |
+| aggregate deepreview artifacts | `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-ds.md`（AgentDS，PASS）；两路均为 0 blocking finding。MiMo 独立复跑 Host/Service/CLI 2816 passed / 8 skipped、owner coverage 90.96%、pyright 0 errors 与静态边界检查。 |
+| aggregate deepreview adjudication | `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-controller-adjudication.md`；controller decision=`accepted-aggregate-deepreview`。DS 的 7 个低项均经 owner/可达 schedule/变更归属直接证据裁决为 rejected-with-reason，0 个 accepted current-fix finding；无需 aggregate fix / re-review 或新增 supplemental batch。Residual risk reconciliation 已完成。 |
 | next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
 | CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
 | next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
 | blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
-| next entry point | Controller 复核最终工作树、`git diff --check` 与 review artifacts 后创建 accepted Slice 2 commit；不得在同一 commit 后直接跳过 aggregate deepreview。 |
+| next entry point | Controller 复核 aggregate artifacts、control/residual reconciliation、`git diff --check` 与工作树后创建 accepted aggregate commit；随后进入 draft PR gate。 |
 
 
 ## 推进规则
@@ -236,7 +239,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
-| WU-CLI-SMOKE-01-R1 | active | 当前进入 goal confirmation；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU并裁决完整目标：`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 共用 Host-owned transient live contract，全部不写 EventLog。当前 content/tool-call 已 accepted-without-row，但缺少公共 transient live delivery；`c1b546ac` 仅因 `watch_session_events` 轮询 EventLog，把 reasoning 改成每 delta 一条 durable `PREVIEW` row。R1 必须撤销该持久化并补齐三类 delta 的统一 live path；retention 只能清理结果、不能修复 owner drift。PR #179 已 merge 且本地 `main` 已同步，当前从工作分支进入 goal confirmation。 |
 | WU-CLI-SMOKE-01-R2 | deferred-with-owner | Future CLI UI enhancement / user decision | `CliThinkingRenderer` 当前保留 160 字符单行运行态展示；如后续用户要求 Codex / Claude Code 风格可展开 thinking panel，再在 CLI UI adapter lane 设计，不阻塞 WU-CLI-SMOKE-01 draft PR。 |
 
 ## 当前 Work Units
@@ -261,7 +263,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
-| WU-CLI-SMOKE-01-R1 | active-slice2-implementation | Engine delta transient live stream remediation | 工作分支 `phaseflow/wu-cli-smoke-01-r1` | Accepted Slice 1 commit 为 `70ccda60`。当前执行 Slice 2 adversarial lifecycle/scale、slow-consumer E2E、README 与全域验证；DS-F02 在本 Slice 收口。 |
+| WU-CLI-SMOKE-01-R1 | aggregate-deepreview-pass | Engine delta transient live stream remediation | 工作分支 `phaseflow/wu-cli-smoke-01-r1` | Accepted plan `929691ea`、Slice 1 `70ccda60`、Slice 2 `d58014cf`。双路 aggregate deepreview 均 PASS，0 blocking / 0 accepted current-fix finding；residual reconciliation 已完成，下一步 accepted aggregate commit 后进入 draft PR gate。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
@@ -335,7 +337,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；后续不得重新收窄为只处理 thinking。PR #179 已于 2026-07-20 merge，本地 `main` 已同步到 merge commit `bd1d3e94`，当前工作分支为 `phaseflow/wu-cli-smoke-01-r1`。Goal confirmation artifact 为 `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`，用户已确认且 gate pass；plan artifact 为 `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`，包含 2 个语义闭环 slices。Plan review、fix 与两路 re-review 已全部通过，controller accepted-plan；accepted plan commit 为 `929691ea`。Slice 1 implementation artifact 为 `docs/reviews/wu-cli-smoke-01-r1-slice1-implementation-codex.md`。双路 code review artifacts 为 `docs/reviews/code-review-20260721-005108.md` 与 `docs/reviews/code-review-20260721-005320.md`，controller adjudication 为 `docs/reviews/wu-cli-smoke-01-r1-slice1-code-review-controller-adjudication.md`；当前只修复 accepted DS-F03 test-only direct coverage finding。除非同步后的代码或设计真源与本裁决直接矛盾，否则不得重新询问“三类还是一种”这一已裁决问题。
+用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；后续不得重新收窄为只处理 thinking。PR #179 已于 2026-07-20 merge，本地 `main` 已同步到 merge commit `bd1d3e94`，当前工作分支为 `phaseflow/wu-cli-smoke-01-r1`。Goal confirmation、plan review/fix/re-review、两个 implementation slices、Slice 1 accepted finding fix/re-review 与全 WU aggregate deepreview 均已完成；accepted plan commit 为 `929691ea`，accepted Slice 1 commit 为 `70ccda60`，accepted Slice 2 commit 为 `d58014cf`。Aggregate artifacts 为 `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-mimo.md`、`docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-ds.md` 与 `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-controller-adjudication.md`；两路均 PASS，0 blocking finding，controller 裁决 0 accepted current-fix finding，residual risk reconciliation 已完成。除非同步后的代码或设计真源与本裁决直接矛盾，否则不得重新询问“三类还是一种”这一已裁决问题。
 
 ### 直接证据与动机
 
