@@ -159,11 +159,11 @@ git push -u github <branch>
 | completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
 | gate | `final-closeout-pass` |
 | draft PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 为 draft/open；用户将手工 merge。 |
-| selected next work unit | `WU-CLI-SMOKE-01-R1` Reasoning Delta Transient Live Stream Remediation；bug fix。 |
+| selected next work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
 | next gate | `goal confirmation` |
-| next goal | 删除 `REASONING_DELTA` 的 durable `PREVIEW` EventLog 持久化，恢复 accepted non-durable delta，并由 Host-owned transient live path 支持已 attach UI / Service / CLI 的实时 thinking 展示。 |
-| next non-goals | 不承诺 reasoning token replay；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement。 |
-| blocking open questions | None；R1 的 transient ordering / identity 与现有 `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛。 |
+| next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
+| next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
+| blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
 | next entry point | 用户手工 merge PR #179 后，从 `main` 同步最新代码，再以本文档启动 `WU-CLI-SMOKE-01-R1` goal confirmation；确认后由 AgentCodex 进入 `plan` gate。 |
 
 
@@ -216,7 +216,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
-| WU-CLI-SMOKE-01-R1 | deferred-with-owner | PR #179 merge 后的 selected next WU；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU：`f17ffcc8` 曾明确让 `REASONING_DELTA` 与其它 per-delta event 一样只做 live stream、默认不写 EventLog；`c1b546ac` 仅因当前 `watch_session_events` 轮询 EventLog，改为每个 delta 追加一条 durable `PREVIEW` row。实时 thinking 不天然要求持久化，retention 只能清理结果、不能修复 owner drift。PR #179 merge 并同步 `main` 后进入 goal confirmation。 |
+| WU-CLI-SMOKE-01-R1 | deferred-with-owner | PR #179 merge 后的 selected next WU；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU并裁决完整目标：`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 共用 Host-owned transient live contract，全部不写 EventLog。当前 content/tool-call 已 accepted-without-row，但缺少公共 transient live delivery；`c1b546ac` 仅因 `watch_session_events` 轮询 EventLog，把 reasoning 改成每 delta 一条 durable `PREVIEW` row。R1 必须撤销该持久化并补齐三类 delta 的统一 live path；retention 只能清理结果、不能修复 owner drift。PR #179 merge 并同步 `main` 后进入 goal confirmation。 |
 | WU-CLI-SMOKE-01-R2 | deferred-with-owner | Future CLI UI enhancement / user decision | `CliThinkingRenderer` 当前保留 160 字符单行运行态展示；如后续用户要求 Codex / Claude Code 风格可展开 thinking panel，再在 CLI UI adapter lane 设计，不阻塞 WU-CLI-SMOKE-01 draft PR。 |
 
 ## 当前 Work Units
@@ -241,7 +241,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
-| WU-CLI-SMOKE-01-R1 | selected-next | Reasoning delta transient live stream remediation | PR #179 merge 后启动 | 高严重度 EventLog amplification bug：恢复 `REASONING_DELTA` non-durable ingest，并建立 Host-owned transient live thinking path；当前不在 PR #179 merge 前提前进入 plan。 |
+| WU-CLI-SMOKE-01-R1 | selected-next | Engine delta transient live stream remediation | PR #179 merge 后启动 | 高严重度 EventLog amplification bug：三类 per-chunk delta 统一走 Host-owned transient live stream 且全部不写 EventLog；直接持久化修复点是恢复 `REASONING_DELTA` non-durable ingest，content/tool-call 则从当前 accepted-without-row 接入同一 live contract。当前不在 PR #179 merge 前提前进入 plan。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
@@ -311,39 +311,42 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - Controller reran final validation：`source .venv/bin/activate && pytest tests/cli -q` -> `225 passed, 3 warnings`；`source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py tests/host/test_engine_ingest_mapping.py tests/host/test_host_activity_event_projection.py -q` -> `126 passed, 3 warnings`；`source .venv/bin/activate && pyright` -> `0 errors, 0 warnings, 0 informations`；`git diff --check` pass。
 - Remaining display semantics residual risks are classified below：R1 调查已证明实时 thinking 不要求 durable `PREVIEW` row；当前持久化只是在 `watch_session_events` 轮询 EventLog 的架构下复用既有 watcher，因此 owner 已纠正为 future Host transient live fanout / watcher contract remediation，不再归 retention / purge。R2 的 `CliThinkingRenderer` 160-character single-line truncation 继续归 future CLI UI enhancement。
 
-## WU-CLI-SMOKE-01-R1 Reasoning Delta Transient Live Stream Remediation
+## WU-CLI-SMOKE-01-R1 Engine Delta Transient Live Stream Remediation
 
 ### 状态
 
-用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。当前不提前启动：PR #179 仍为 draft/open，用户将手工 merge；merge 后必须先从 `main` 同步，再进入本项 `goal confirmation`。
+用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；下一会话不得重新收窄为只处理 thinking。当前不提前启动：PR #179 仍为 draft/open，用户将手工 merge；merge 后必须先从 `main` 同步，再进入本项 `goal confirmation`。除非同步后的代码或设计真源与本裁决直接矛盾，否则 goal confirmation 不再询问“三类还是一种”这一已裁决问题。
 
 ### 直接证据与动机
 
 - `f17ffcc8` / WU-CLI-ACTIVITY-01 follow-up 已明确三类 per-delta EngineEvent（`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA`）只服务即时展示，默认 accepted 但不写 EventLog；其直接动机是避免 token/chunk 级 durable rows 放大 EventLog、拖慢 projection catch-up，并错误暗示 token-level durable replay。
-- `c1b546ac` 为实现 `--thinking` 展示，把 `REASONING_DELTA` 从 transient 分支移出并改为每个 delta 追加一条 `PREVIEW` EventLog row。当前 `watch_session_events` 又通过 EventLog cursor 轮询读取，因此持久化只是复用现有 watcher 的局部最小实现，不是实时 thinking 的业务要求。
+- 当前代码中 `CONTENT_DELTA`、`TOOL_CALL_DELTA` 已经 accepted-without-row，但 Host 没有把它们投影到公共 transient live delivery；`REASONING_DELTA` 是三类 delta 中唯一仍写 EventLog 的特例。
+- `c1b546ac` 为实现 `--thinking` 展示，把 `REASONING_DELTA` 从 transient 分支移出并改为每个 delta 追加一条 `PREVIEW` EventLog row。当前 `watch_session_events` 又通过 EventLog cursor 轮询读取，因此持久化只是复用现有 watcher 的局部最小实现，不是实时 thinking 的业务要求，也不能成为为 reasoning 单独保留第二套 delivery contract 的理由。
 - 一次模型 Attempt 可以产生大量 reasoning chunks；当前是一条 delta 对应一条 SQLite EventLog row，并同时带来 event id、sequence、payload、索引和后续扫描成本。该放大随 token/chunk 数增长，不应等待 retention/purge 再清理。
 - `docs/host/design.md` 已承认未来多客户端 live token 展示需要另行设计 transient fanout，不能把主 EventLog durable replay 改成 token-level 保真。
 
-### 候选目标（下轮 goal confirmation）
+### 已裁决目标（下轮 goal confirmation 负责代码/设计复核）
 
-- 恢复 `REASONING_DELTA` accepted non-durable ingest；任意数量的 reasoning delta 均不追加 `PREVIEW`、canonical、diagnostic 或其它替代 EventLog row。
-- 在 Host lifecycle / governance owner 内提供 transient live thinking path，让已经 attach 的 Service / UI / CLI 继续实时接收 reasoning delta；不得让 Service 绕过 Host 直接消费 raw EngineEvent。
+- `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一由一个 Host-owned transient delta contract 接受、校验并 live fanout；三者任意数量的 delta 均不追加 `PREVIEW`、canonical、diagnostic 或其它替代 EventLog row。
+- 删除 `REASONING_DELTA` 当前 durable `PREVIEW` 特例并恢复 accepted non-durable ingest；保留 content/tool-call 现有 non-durable 语义，但把三者一并接入公共 transient live delivery，不得把 accepted-without-row 等同于已经完成 live stream。
+- 已 attach 的 Service / UI / CLI 可以按需消费三类 delta，例如 CLI thinking renderer 只选择 reasoning；不得让 Service 绕过 Host 直接消费 raw EngineEvent，也不得建立 reasoning 专用持久化或专用旁路。
 - 明确 transient event 的运行态 identity、ordering、multi-watcher fanout、slow-consumer、detach 与 Host close 语义；不得伪造 durable `event_sequence`，不得把 transient cursor 解释为离线 replay cursor。
-- 保持 final answer、activity、outbox terminal、Conversation Memory、audit、Tool Trace 与 durable recovery 不消费 reasoning delta；断线或重启后不补放 token-level thinking。
+- 保持 final answer、durable activity、outbox terminal、Conversation Memory、audit、Tool Trace 与 durable recovery 不消费 raw delta；断线或重启后不补放任何 token/chunk-level delta。
 
 ### 非目标
 
-- 不实现 reasoning token durable replay、历史 thinking 查询或跨 Host restart 恢复。
+- 不实现任何 delta 的 durable replay、历史 token/thinking 查询、断线补放或跨 Host restart 恢复。
 - 不把 R1 下放给 retention / purge，也不通过缩短 retention、批量删除或 EventLog 压缩掩盖写入放大。
 - 不顺带实现 `WU-CLI-SMOKE-01-R2` 可展开 thinking panel，不修改模型是否启用 reasoning 的 provider / runner 配置。
-- 不重写普通 canonical HostEvent、outbox terminal delivery、activity projection、Tool Trace、audit 或 Conversation Memory。
+- 不删除整个 `PREVIEW` event class；iteration、content-completed、tool-batch 等非 per-chunk 粗粒度 preview 是否 durable 继续遵循各自既有 owner contract。
+- 不重写普通 canonical HostEvent、outbox terminal delivery、durable activity projection、Tool Trace、audit 或 Conversation Memory。
 
 ### 验收信号
 
-- 构造单个 Attempt 产生大量 `REASONING_DELTA`，断言 durable EventLog 中 reasoning delta row 为 `0`，且 final answer / terminal canonical facts 正常提交。
-- 已 attach 的一个或多个 live watcher 能按 Host-defined transient ordering 接收 thinking；`--thinking` 展示、`--no-thinking` 抑制、取消和 renderer close 行为保持正确。
+- 构造单个 Attempt 分别产生大量 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA`，断言 durable EventLog 中三类 delta row 均为 `0`，且 final answer / terminal canonical facts 正常提交。
+- 已 attach 的一个或多个 live watcher 能按同一 Host-defined transient contract 接收三类 delta，消费者可按 type 选择；`--thinking` 展示、`--no-thinking` 抑制、取消和 renderer close 行为保持正确。
 - 慢 watcher、提前 detach、Host close 与 worker terminal 不反压 EventLog append、不泄漏 task、不取消 Run、不产生伪 terminal fact。
-- 断线重连、Host restart 与离线 reader 不重放 reasoning delta；content/tool-call delta 既有 non-durable 行为不回归。
+- 断线重连、Host restart 与离线 reader 不重放三类 delta；transient identity/order 不混入 durable `HostEvent.event_sequence` cursor，既有粗粒度 preview/canonical 补读不回归。
 - 受影响 Host / Service / CLI tests、单文件 coverage、pyright、`git diff --check`、README 触发检查与 EventLog source/propagation scans 通过。
 
 ## WU-WAIT-03 External Job Physical Cancel / Revoke / Abandon
