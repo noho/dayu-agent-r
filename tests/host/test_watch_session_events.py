@@ -47,6 +47,8 @@ from dayu.host import (
     HostTerminalStatus,
     HostReasoningDelta,
     HostTransientDelta,
+    HostTransientDeltaType,
+    HostUnavailableDetail,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
@@ -60,6 +62,14 @@ from dayu.host import (
 from dayu.host.api import AuthorizationClaim
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.memory import default_memory_projection_policy
+from dayu.host.open_host import _PublicHostHandle
+from tests.host.transient_stream_support import (
+    TransientStreamCounts,
+    TransientStreamWorkerFactory,
+    event_log_type_count,
+    read_transient_durable_snapshot,
+    transient_stream_open_host_options,
+)
 
 _WORKER_MODE_FINAL = "final"
 _WORKER_MODE_BLOCKING = "blocking"
@@ -532,6 +542,82 @@ async def test_watch_attaches_before_return_and_delivers_transient_before_termin
 
 
 @pytest.mark.asyncio
+async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_terminal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """容量 256 的慢 watcher overflow 不得阻塞快 watcher 或 durable terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: overflow 隔离、typed detail 或 durable facts 漂移时抛出。
+    """
+
+    expected_counts = TransientStreamCounts(
+        content=86,
+        reasoning=86,
+        tool_call=86,
+    )
+    factory = TransientStreamWorkerFactory(
+        counts=expected_counts,
+        final_answer="capacity-overflow-final",
+    )
+    options = transient_stream_open_host_options(tmp_path, factory)
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request("capacity-overflow"))
+        slow_watcher = host.watch_session_events(session.session_id)
+        fast_watcher = host.watch_session_events(session.session_id)
+        fast_task = asyncio.create_task(_collect_mixed_stream_until_terminal(fast_watcher))
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(
+                session.session_id,
+                "capacity-overflow-followup",
+            ),
+        )
+
+        fast_counts, fast_terminal = await asyncio.wait_for(fast_task, timeout=20.0)
+        slow_prefix: list[HostTransientDelta] = []
+        with pytest.raises(HostApiError) as exc_info:
+            while True:
+                event = await asyncio.wait_for(anext(slow_watcher), timeout=2.0)
+                if not isinstance(event, HostTransientDelta):
+                    raise AssertionError("slow watcher received a fake durable terminal")
+                slow_prefix.append(event)
+
+        run = await host.get_run(followup.accepted_run_id)
+        await _close_iterator(fast_watcher)
+        await _close_iterator(slow_watcher)
+
+    assert len(slow_prefix) == 256
+    assert fast_counts == expected_counts
+    assert fast_terminal.kind is HostEventKind.SUCCEEDED
+    assert fast_terminal.final_answer is not None
+    assert fast_terminal.final_answer.content == "capacity-overflow-final"
+    assert run.status is RunStatus.SUCCEEDED
+    assert factory.cancel_reasons == []
+
+    overflow = exc_info.value
+    assert overflow.code is HostApiErrorCode.UNAVAILABLE
+    assert overflow.retryable is True
+    assert overflow.detail == HostUnavailableDetail(
+        component="session_live_stream",
+        reason_code="slow_consumer",
+    )
+    assert event_log_type_count(options.db_path, EngineEventType.CONTENT_DELTA.value) == 0
+    assert event_log_type_count(options.db_path, EngineEventType.REASONING_DELTA.value) == 0
+    assert event_log_type_count(options.db_path, EngineEventType.TOOL_CALL_DELTA.value) == 0
+    assert event_log_type_count(options.db_path, "RUN_SUCCEEDED") == 1
+    durable = read_transient_durable_snapshot(
+        options.db_path,
+        run_id=followup.accepted_run_id,
+    )
+    assert durable.run_status == "succeeded"
+    assert durable.attempt_status == "succeeded"
+    assert durable.run_terminal_event_id == fast_terminal.event_id
+    assert durable.run_terminal_event_sequence == fast_terminal.event_sequence
+
+
+@pytest.mark.asyncio
 async def test_consumer_early_cancel_does_not_cancel_run_or_write_eventlog(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -567,6 +653,245 @@ async def test_consumer_early_cancel_does_not_cancel_run_or_write_eventlog(
         release_event.set()
         terminal = await _wait_run_terminal(host, followup.accepted_run_id)
         assert terminal.status is RunStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
+    tmp_path: pathlib.Path,
+) -> None:
+    """never-started、首次取消、missing 与 Host close 均回收 subscription。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: public error 或 subscription cleanup contract 漂移时抛出。
+    """
+
+    manager = open_host(_options(tmp_path, _Factory(_WORKER_MODE_FINAL)))
+    host = await manager.__aenter__()
+    session = await host.ensure_session(_ensure_request("watch-cleanup"))
+
+    never_started = host.watch_session_events(session.session_id)
+    assert _subscription_count(host, session.session_id) == 1
+    await _close_iterator(never_started)
+    assert _subscription_count(host, session.session_id) == 0
+
+    missing = host.watch_session_events("missing-session")
+    assert _subscription_count(host, "missing-session") == 1
+    with pytest.raises(HostApiError) as missing_exc:
+        await anext(missing)
+    assert missing_exc.value.code is HostApiErrorCode.NOT_FOUND
+    assert missing_exc.value.retryable is False
+    assert _subscription_count(host, "missing-session") == 0
+
+    first_cancel = host.watch_session_events(session.session_id)
+    first_next = asyncio.ensure_future(anext(first_cancel))
+    await asyncio.sleep(0.05)
+    assert _subscription_count(host, session.session_id) == 1
+    first_next.cancel()
+    with suppress(asyncio.CancelledError):
+        await first_next
+    assert _subscription_count(host, session.session_id) == 0
+
+    started = host.watch_session_events(session.session_id)
+    await host.submit_followup(
+        session.session_id,
+        _followup_request(session.session_id, "started-aclose-run"),
+    )
+    started_terminal = await _next_terminal(started)
+    assert started_terminal.kind is HostEventKind.SUCCEEDED
+    assert _subscription_count(host, session.session_id) == 1
+    await _close_iterator(started)
+    assert _subscription_count(host, session.session_id) == 0
+
+    close_watcher = host.watch_session_events(session.session_id)
+    close_next = asyncio.ensure_future(anext(close_watcher))
+    await asyncio.sleep(0.05)
+    await host.close()
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(close_next, timeout=1.0)
+    assert _subscription_count(host, session.session_id) == 0
+    with pytest.raises(HostClosedError):
+        host.watch_session_events(session.session_id)
+    await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_watch_cancel_after_first_delta_detaches_without_cancelling_run(
+    tmp_path: pathlib.Path,
+) -> None:
+    """后续 iteration cancel 只 detach watcher，不改变正在运行的 Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: detach、Run 或 worker cancel contract 漂移时抛出。
+    """
+
+    terminal_release = asyncio.Event()
+    factory = TransientStreamWorkerFactory(
+        counts=TransientStreamCounts(content=0, reasoning=1, tool_call=0),
+        final_answer="post-delta-cancel-final",
+        terminal_release_event=terminal_release,
+    )
+    async with open_host(
+        transient_stream_open_host_options(tmp_path, factory)
+    ) as host:
+        session = await host.ensure_session(_ensure_request("post-delta-cancel"))
+        watcher = host.watch_session_events(session.session_id)
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(
+                session.session_id,
+                "post-delta-cancel-followup",
+            ),
+        )
+        transient = await _next_transient(watcher)
+        assert transient.run_id == followup.accepted_run_id
+        await asyncio.wait_for(factory.deltas_finished_event.wait(), timeout=1.0)
+        before_cancel = await _wait_run_status(
+            host,
+            followup.accepted_run_id,
+            RunStatus.RUNNING,
+        )
+
+        await _cancel_pending_next_iteration(watcher)
+
+        assert _subscription_count(host, session.session_id) == 0
+        after_cancel = await host.get_run(followup.accepted_run_id)
+        assert before_cancel.status is RunStatus.RUNNING
+        assert after_cancel.status is RunStatus.RUNNING
+        assert factory.cancel_reasons == []
+
+        terminal_release.set()
+        terminal_run = await _wait_run_terminal(host, followup.accepted_run_id)
+        assert terminal_run.status is RunStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_watch_does_not_replay_pre_attach_transient_and_keeps_first_post_attach_delta(
+    tmp_path: pathlib.Path,
+) -> None:
+    """attach 前 delta 不 replay，返回后的下一 Run 首个 delta 不丢。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: live-only attach 边界或下一 Run fence 漂移时抛出。
+    """
+
+    factory = TransientStreamWorkerFactory(
+        counts=TransientStreamCounts(content=1, reasoning=1, tool_call=1),
+        final_answer="attach-boundary-final",
+    )
+    async with open_host(
+        transient_stream_open_host_options(tmp_path, factory)
+    ) as host:
+        session = await host.ensure_session(_ensure_request("attach-boundary"))
+        first = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "pre-attach-run"),
+        )
+        await _wait_run_terminal(host, first.accepted_run_id)
+
+        watcher = host.watch_session_events(session.session_id)
+        second = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "post-attach-run"),
+        )
+        first_post_attach_delta = await _next_transient(watcher)
+        terminal = await _next_terminal(watcher)
+
+        assert first_post_attach_delta.run_id == second.accepted_run_id
+        assert first_post_attach_delta.run_id != first.accepted_run_id
+        assert terminal.run_id == second.accepted_run_id
+        await _close_iterator(watcher)
+
+
+@pytest.mark.asyncio
+async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach(
+    tmp_path: pathlib.Path,
+) -> None:
+    """首次及 transient 后 durable read failure 均映射为 public error 并 detach。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: typed error mapping 或 subscription cleanup 漂移时抛出。
+    """
+
+    first_path = tmp_path / "first"
+    first_options = _options(first_path, _Factory(_WORKER_MODE_FINAL))
+    async with open_host(first_options) as host:
+        session = await host.ensure_session(_ensure_request("durable-failure-first"))
+        watcher = host.watch_session_events(session.session_id)
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "durable-failure-first-run"),
+        )
+        await _wait_run_terminal(host, followup.accepted_run_id)
+        durable = read_transient_durable_snapshot(
+            first_options.db_path,
+            run_id=followup.accepted_run_id,
+        )
+        original_payload = _replace_event_payload(
+            first_options.db_path,
+            event_id=durable.terminal_event_id,
+            payload_json="{",
+        )
+        with pytest.raises(HostApiError) as first_exc:
+            await anext(watcher)
+        _replace_event_payload(
+            first_options.db_path,
+            event_id=durable.terminal_event_id,
+            payload_json=original_payload,
+        )
+        _assert_public_durable_failure(first_exc.value)
+        assert _subscription_count(host, session.session_id) == 0
+
+    subsequent_path = tmp_path / "subsequent"
+    subsequent_factory = TransientStreamWorkerFactory(
+        counts=TransientStreamCounts(content=0, reasoning=1, tool_call=0),
+        final_answer="durable-failure-subsequent-final",
+    )
+    subsequent_options = transient_stream_open_host_options(
+        subsequent_path,
+        subsequent_factory,
+    )
+    async with open_host(subsequent_options) as host:
+        session = await host.ensure_session(
+            _ensure_request("durable-failure-subsequent")
+        )
+        watcher = host.watch_session_events(session.session_id)
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(
+                session.session_id,
+                "durable-failure-subsequent-run",
+            ),
+        )
+        transient = await _next_transient(watcher)
+        assert transient.run_id == followup.accepted_run_id
+        await _wait_run_terminal(host, followup.accepted_run_id)
+        durable = read_transient_durable_snapshot(
+            subsequent_options.db_path,
+            run_id=followup.accepted_run_id,
+        )
+        original_payload = _replace_event_payload(
+            subsequent_options.db_path,
+            event_id=durable.terminal_event_id,
+            payload_json="{",
+        )
+        with pytest.raises(HostApiError) as subsequent_exc:
+            while True:
+                event = await anext(watcher)
+                if isinstance(event, HostEvent) and event.terminal_status is not None:
+                    raise AssertionError(
+                        "corrupt durable terminal was exposed as a public terminal"
+                    )
+        _replace_event_payload(
+            subsequent_options.db_path,
+            event_id=durable.terminal_event_id,
+            payload_json=original_payload,
+        )
+        _assert_public_durable_failure(subsequent_exc.value)
+        assert _subscription_count(host, session.session_id) == 0
 
 
 @pytest.mark.asyncio
@@ -700,6 +1025,44 @@ async def _next_terminal(iterator: AsyncIterator[HostSessionEvent]) -> HostEvent
     return await asyncio.wait_for(_read_next_terminal(iterator), timeout=2.0)
 
 
+async def _collect_mixed_stream_until_terminal(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> tuple[TransientStreamCounts, HostEvent]:
+    """快速消费 watcher，统计三类 delta 并返回成功 terminal。
+
+    :param iterator: Host Session event iterator。
+    :returns: 三类 delta 计数与成功 terminal。
+    :raises AssertionError: watcher 提前结束或出现非成功 terminal 时抛出。
+    """
+
+    content_count = 0
+    reasoning_count = 0
+    tool_call_count = 0
+    async for event in iterator:
+        if isinstance(event, HostTransientDelta):
+            if event.type is HostTransientDeltaType.CONTENT_DELTA:
+                content_count += 1
+            elif event.type is HostTransientDeltaType.REASONING_DELTA:
+                reasoning_count += 1
+            elif event.type is HostTransientDeltaType.TOOL_CALL_DELTA:
+                tool_call_count += 1
+            else:
+                raise AssertionError(f"unexpected transient type: {event.type}")
+            continue
+        if event.kind is HostEventKind.SUCCEEDED:
+            return (
+                TransientStreamCounts(
+                    content=content_count,
+                    reasoning=reasoning_count,
+                    tool_call=tool_call_count,
+                ),
+                event,
+            )
+        if event.terminal_status is not None:
+            raise AssertionError(f"unexpected terminal kind: {event.kind}")
+    raise AssertionError("watcher ended before terminal")
+
+
 async def _next_transient(
     iterator: AsyncIterator[HostSessionEvent],
 ) -> HostTransientDelta:
@@ -769,6 +1132,31 @@ async def _consume_forever(iterator: AsyncIterator[HostSessionEvent]) -> None:
         await asyncio.sleep(0)
 
 
+async def _cancel_pending_next_iteration(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> None:
+    """排空有限 progress，随后取消一个确定处于等待态的后续 iteration。
+
+    :param iterator: 已至少交付一条 transient 的 Session event iterator。
+    :returns: ``None``。
+    :raises AssertionError: 未在有限轮次内进入等待态，或提前收到 terminal 时抛出。
+    """
+
+    for _attempt in range(20):
+        next_task = asyncio.ensure_future(anext(iterator))
+        await asyncio.sleep(0.05)
+        if next_task.done():
+            event = await next_task
+            if isinstance(event, HostEvent) and event.terminal_status is not None:
+                raise AssertionError("watcher reached terminal before cancellation barrier")
+            continue
+        next_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await next_task
+        return
+    raise AssertionError("watcher did not enter a pending next iteration")
+
+
 async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
     """关闭测试中持有的 async generator iterator。
 
@@ -818,6 +1206,66 @@ async def _wait_run_status(
             return snapshot
         await asyncio.sleep(0.01)
     raise AssertionError(f"run {run_id} did not reach {expected_status.value} status")
+
+
+def _subscription_count(host: Host, session_id: str) -> int:
+    """读取真实 ``open_host`` runtime 的 Session subscription owner 计数。
+
+    :param host: ``open_host`` 返回的 public Host handle。
+    :param session_id: 目标 Session 标识。
+    :returns: 当前 hub 注册的 subscription 数量。
+    :raises AssertionError: 调用方传入的不是 production public handle 时抛出。
+    """
+
+    if not isinstance(host, _PublicHostHandle):
+        raise AssertionError("expected production _PublicHostHandle")
+    return host._transient_delta_hub.subscription_count(session_id)
+
+
+def _replace_event_payload(
+    db_path: pathlib.Path,
+    *,
+    event_id: str,
+    payload_json: str,
+) -> str:
+    """替换一条 EventLog payload 并返回原文，用于可恢复 durable failure 注入。
+
+    :param db_path: Host durable SQLite 路径。
+    :param event_id: 目标 EventLog 标识。
+    :param payload_json: 替换后的 payload JSON 文本。
+    :returns: 替换前的 payload JSON 文本。
+    :raises AssertionError: row 缺失或原 payload 不是字符串时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            f"SELECT payload_json FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise AssertionError("EventLog payload row is missing")
+        original_payload = row[0]
+        if not isinstance(original_payload, str):
+            raise AssertionError("EventLog payload is not str")
+        connection.execute(
+            f"UPDATE {TABLE_EVENT_LOG} SET payload_json = ? WHERE event_id = ?",
+            (payload_json, event_id),
+        )
+    return original_payload
+
+
+def _assert_public_durable_failure(error: HostApiError) -> None:
+    """断言 durable corruption 只暴露稳定 public HostApiError。
+
+    :param error: watcher 对外抛出的 public error。
+    :returns: ``None``。
+    :raises AssertionError: code、retryable、detail 或消息漂移时抛出。
+    """
+
+    assert error.code is HostApiErrorCode.INTERNAL_ERROR
+    assert error.message == "Host durable operation failed"
+    assert error.retryable is False
+    assert error.detail is None
 
 
 def _event_log_count(db_path: pathlib.Path) -> int:

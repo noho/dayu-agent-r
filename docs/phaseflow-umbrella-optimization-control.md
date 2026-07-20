@@ -299,7 +299,8 @@ control doc 每次更新只记录：
 - Controller validation: `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-controller-validation.md`；99 tests passed、pyright 0 errors、diff check pass。
 - Re-review artifacts: `docs/reviews/code-review-20260721-011148.md` 与 `docs/reviews/code-review-20260721-010824.md`；两路均确认 DS-F03 fixed，无新增 material defect。
 - Re-review adjudication: `docs/reviews/wu-cli-smoke-01-r1-slice1-code-rereview-controller-adjudication.md`；decision=`accepted-slice1-rereview`。
-- Final batch status: completed。Next entry point 回到主 control doc 的 accepted Slice 1 commit gate；DS-F02 继续由 Slice 2 owner 收口。
+- Accepted Slice 1 commit: `70ccda60`。
+- Final batch status: completed。主 control doc 已进入 Slice 2 implementation；DS-F02 由 Slice 2 owner 收口。
 
 ## 下次使用方式
 

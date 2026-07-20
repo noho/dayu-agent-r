@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import fields
 from datetime import UTC, datetime
+from typing import Literal
 
 import pytest
 
@@ -25,6 +27,68 @@ from dayu.host.transient_delta import (
 )
 
 _OBSERVED_AT = datetime(2026, 7, 20, 1, 2, 3, tzinfo=UTC)
+
+
+class _WaitEnteredEvent(asyncio.Event):
+    """暴露 ``wait`` 已开始的 deterministic asyncio.Event barrier。"""
+
+    def __init__(self) -> None:
+        """初始化 wait-entry barrier。
+
+        :returns: 无返回值。
+        :raises Exception: ``asyncio.Event`` 构造失败时透传。
+        """
+
+        super().__init__()
+        self.wait_entered = asyncio.Event()
+
+    async def wait(self) -> Literal[True]:
+        """记录 wait 已进入，再等待真实 Event state。
+
+        :returns: Event 被 set 后返回 ``True``。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        self.wait_entered.set()
+        return await super().wait()
+
+
+class _PublishOnClearEvent(asyncio.Event):
+    """在首次 ``clear`` 线性化点同步发布的 deterministic barrier。"""
+
+    def __init__(
+        self,
+        *,
+        hub: HostTransientDeltaHub,
+        candidate: ValidatedTransientDeltaCandidate,
+    ) -> None:
+        """初始化 clear/publish 交界 barrier。
+
+        :param hub: 首次 clear 时调用的真实 transient hub。
+        :param candidate: 首次 clear 时发布的候选。
+        :returns: 无返回值。
+        :raises Exception: ``asyncio.Event`` 构造失败时透传。
+        """
+
+        super().__init__()
+        self._hub = hub
+        self._candidate = candidate
+        self._armed = True
+
+    def clear(self) -> None:
+        """首次 clear 时先发布，再执行真实 clear。
+
+        该顺序覆盖最不利交错：publish 的 ``set`` 会被随后 ``clear`` 清除，
+        subscription 必须依靠 owner state recheck 恢复 readiness。
+
+        :returns: ``None``。
+        :raises Exception: 注入的发布动作失败时透传。
+        """
+
+        if self._armed:
+            self._armed = False
+            self._hub.publish(self._candidate)
+        super().clear()
 
 
 def test_public_payload_mapping_is_closed_and_strict() -> None:
@@ -153,22 +217,95 @@ def test_subscription_terminal_fence_detach_and_hub_close_are_local() -> None:
 
 
 @pytest.mark.asyncio
-async def test_subscription_readiness_timeout_publish_and_close() -> None:
-    """readiness 对 queue state、timeout 与 close 保持 level-triggered。
+async def test_subscription_publish_before_wait_is_level_triggered() -> None:
+    """publish-before-wait 必须从 queue owner state 立即观察 readiness。
 
     :returns: ``None``。
-    :raises AssertionError: readiness 状态未在 timeout 内收口时报告。
+    :raises AssertionError: publish 后 readiness 或排空状态错误时报告。
     """
 
     hub = HostTransientDeltaHub()
     subscription = hub.subscribe("session-1")
-    assert await subscription.wait_ready(0.001) is False
     hub.publish(_candidate(worker_event_index=1))
-    assert await subscription.wait_ready(0.001) is True
+    assert await subscription.wait_ready(0.1) is True
     assert len(subscription.drain_nowait()) == 1
     assert await subscription.wait_ready(0.001) is False
-    hub.close()
-    assert await subscription.wait_ready(0.001) is True
+
+
+@pytest.mark.asyncio
+async def test_subscription_wait_before_publish_wakes_at_barrier() -> None:
+    """wait-before-publish 必须在真实 Event wait 已进入后可靠唤醒。
+
+    :returns: ``None``。
+    :raises AssertionError: publish 未在 timeout 内唤醒 waiter 时报告。
+    """
+
+    hub = HostTransientDeltaHub()
+    subscription = hub.subscribe("session-1")
+    controlled_event = _WaitEnteredEvent()
+    subscription._ready = controlled_event
+    waiter = asyncio.create_task(subscription.wait_ready(1.0))
+
+    await asyncio.wait_for(controlled_event.wait_entered.wait(), timeout=0.5)
+    hub.publish(_candidate(worker_event_index=1))
+
+    assert await asyncio.wait_for(waiter, timeout=0.5) is True
+    assert [event.worker_event_index for event in subscription.drain_nowait()] == [1]
+
+
+@pytest.mark.asyncio
+async def test_subscription_drain_clear_publish_intersection_rechecks_owner_state() -> None:
+    """排空最后一项并 clear 时同步 publish 不得丢失 level-trigger wakeup。
+
+    :returns: ``None``。
+    :raises AssertionError: clear 覆盖 publish set 后未由 state recheck 修复时报告。
+    """
+
+    hub = HostTransientDeltaHub()
+    subscription = hub.subscribe("session-1")
+    hub.publish(_candidate(worker_event_index=1))
+    controlled_event = _PublishOnClearEvent(
+        hub=hub,
+        candidate=_candidate(worker_event_index=2),
+    )
+    controlled_event.set()
+    subscription._ready = controlled_event
+
+    first = subscription.drain_nowait()
+
+    assert [event.worker_event_index for event in first] == [1]
+    assert await subscription.wait_ready(0.1) is True
+    assert [event.worker_event_index for event in subscription.drain_nowait()] == [2]
+
+
+@pytest.mark.asyncio
+async def test_subscription_overflow_and_close_states_remain_ready() -> None:
+    """overflow 与 close 都必须在 queue prefix 清空后保持 ready 并唤醒 waiter。
+
+    :returns: ``None``。
+    :raises AssertionError: overflow/close owner state 或 wakeup 丢失时报告。
+    """
+
+    overflow_hub = HostTransientDeltaHub()
+    overflowed = overflow_hub.subscribe("session-1")
+    for worker_event_index in range(
+        1,
+        transient_delta_module._TRANSIENT_WATCH_BUFFER_CAPACITY + 2,
+    ):
+        overflow_hub.publish(_candidate(worker_event_index=worker_event_index))
+    assert len(overflowed.drain_nowait()) == transient_delta_module._TRANSIENT_WATCH_BUFFER_CAPACITY
+    assert overflowed.overflow_error() is not None
+    assert await overflowed.wait_ready(0.1) is True
+
+    close_hub = HostTransientDeltaHub()
+    closed = close_hub.subscribe("session-1")
+    controlled_event = _WaitEnteredEvent()
+    closed._ready = controlled_event
+    close_waiter = asyncio.create_task(closed.wait_ready(1.0))
+    await asyncio.wait_for(controlled_event.wait_entered.wait(), timeout=0.5)
+    close_hub.close()
+    assert await asyncio.wait_for(close_waiter, timeout=0.5) is True
+    assert closed.is_closed is True
 
 
 def test_slow_subscription_overflow_preserves_prefix_and_fast_watcher() -> None:
