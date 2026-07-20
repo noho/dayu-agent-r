@@ -1,93 +1,100 @@
 # WU-SEMANTIC-OWNERSHIP-01 Final Closeout
 
-## Scope
+## Scope and authority
 
-- Work unit: `WU-SEMANTIC-OWNERSHIP-01`
-- Gate: umbrella final reconciliation / closeout
-- Design truth: `docs/host/design.md`, `docs/engine/design.md`
-- Control truth: `docs/host/issues-implementation-control.md`, `docs/phaseflow-umbrella-optimization-control.md`
-- Source review ledgers:
-  - `docs/reviews/fullrepo-semantic-ownership-controller-adjudication.md`
-  - `docs/reviews/wu-semantic-ownership-01-fullrepo-deepreview-round2-controller-adjudication.md`
-  - `docs/reviews/wu-semantic-ownership-01-fullrepo-deepreview-round3-controller-adjudication.md`
+- Work unit：`WU-SEMANTIC-OWNERSHIP-01`，本 artifact 关闭的是同一 umbrella WU 的 overdesign remediation continuation，不是新 WU，也不是重新打开历史 sub-WU。
+- 权威产品裁决：`docs/reviews/wu-semantic-ownership-01-overdesign-controller-discussion.md`。
+- 设计真源：`docs/host/design.md`、`docs/engine/design.md`、`docs/tool/design.md`、`docs/fins/design.md`、`docs/ui/design.md`。
+- 总控真源：`docs/host/issues-implementation-control.md`、`docs/phaseflow-umbrella-optimization-control.md`。
+- 审查起点：`b1a0631f397967e7530b676a90ef7467d83a1817^..HEAD`；draft PR 为 [PR 179](https://github.com/noho/dayu-agent-r/pull/179)，base 为 `main`。
 
-## Final Decision
+## Final decision
 
-PASS. `WU-SEMANTIC-OWNERSHIP-01` reached local final-closeout-pass for the accepted findings known to this umbrella WU.
+`PASS / FINAL-CLOSEOUT-PASS`。
 
-This closeout does not claim that future full-repository deepreview rounds cannot discover new findings. It closes the accepted findings that were already discovered, adjudicated, sliced, implemented, reviewed, fixed, validated, and recorded under this umbrella.
+Topic 1-7 的 accepted code fixes、各 remediation sub-WU 的 accepted plan/code/aggregate findings、最终 aggregate regression findings、Windows evidence findings，以及 draft PR 179 deepreview finding 均已修复、验证并关闭。Topic 8-9 按权威裁决保持 no-code。当前 accepted/open、needs-evidence、design-contradiction、blocker、unclassified finding 均为 0；remaining remediation sub-WU 为 0。
 
-## Completed Sub WU Set
+## Product decisions closed
 
-The controller confirms the accepted sub WU chain has reached local final-closeout-pass or equivalent accepted aggregate closeout:
-
-| Sub WU group | Status |
+| Topic | Final state |
 | --- | --- |
-| P0-A / P0-B | Closed in earlier accepted commits |
-| P1-A / P1-B / P1-C | Closed in earlier accepted commits |
-| P2-A / P2-B / P2-C / P2-D / P2-E | Closed in earlier accepted commits |
-| P3-A through P3-K | Closed before the Round3 full-repository review entry |
-| Round3 R3-F | Final closeout pass: `docs/reviews/wu-semantic-ownership-01-round3-r3-f-final-closeout.md` |
-| Round3 R3-A | Final closeout pass: `docs/reviews/wu-semantic-ownership-01-round3-r3-a-final-closeout.md` |
-| Round3 R3-B | Final closeout pass: `docs/reviews/wu-semantic-ownership-01-round3-r3-b-final-closeout.md` |
-| Round3 R3-C | Final closeout pass: `docs/reviews/wu-semantic-ownership-01-round3-r3-c-final-closeout.md` |
-| Round3 R3-D | Final closeout pass: `docs/reviews/wu-semantic-ownership-01-round3-r3-d-final-closeout.md` |
-| Round3 R3-E | Final closeout pass: `docs/reviews/wu-semantic-ownership-01-round3-r3-e-final-closeout.md` |
+| 1 Doc | 删除 32 MiB 单文件失败、10,000 entries partial、对应 source/directory limit、oversized skip 与 LLM-facing 引导；保留 `ToolTruncateSpec`/`fetch_more`，Issue 177 仍拥有完整输出接通。 |
+| 2 Web | 私网/自定义端口改由 `tool_discovery.json` 控制且默认 allow；DNS pin/peer proof 可配置且默认关闭；proxy 默认不 ban；`browser_enabled` 与私网权限解耦；保留按 owner 可配置的财报预算、challenge detection、diagnostics v2；删除本轮 storage-state lifecycle，Issue 178 继续拥有未来 lifecycle。 |
+| 3 Host LLM-safe projection | 删除下游 safe/normalized argument repair 和字段名黑名单；只保留 digest、幂等、audit、replay 所需内部 canonicalization；prompt、tool schema 与 Host/Engine/Tool LLM-facing 投影由源头提供业务可读语义。 |
+| 4 OpaqueEvidenceRef | opaque ref 仅保留 internal provenance；删除 unknown-kind 业务来源猜测；opaque、拼写错误或 internal ref 不再进入 RunInput、Memory、Compact 或 LLM-readable trace 充当业务来源；未引入 speculative `BusinessSource`。 |
+| 5 wait poller | provider mode 由 `tool_discovery.json` 拥有，poller runtime policy 由 `host_runtime.json` 拥有；Service 不再按 scene 构造默认 policy；observation timeout 撤销 late publication、记录 transient diagnostic、释放 claim 并 backoff，不推断 LOST；仅 authoritative typed lost outcome 或显式 Host durable evidence 可进入 LOST。Issue 175 不在本轮实现。 |
+| 6 Fins | batch transaction 收敛为唯一显式 authority；完整 source 只在 commit 一次发布；storage 唯一拥有 revision/snapshot；financial/XBRL LLM contract 收窄；exactly-one terminal 由单一 Fins validator 判定；HKEX 按官方 cumulative `rowRange`/`hasNextRow`/`loadedRecord`/`recordCnt` 完整续取；保留 filesystem containment 和 storage-owned opaque identity mapping。 |
+| 7 CLI/Web/WeChat/render | `upload_filings_from` 完成 OLD 对齐的分类扫描、macOS/Linux shell 与 Windows cmd 脚本生成、默认/显式输出、正确 quoting 和摘要；删除 JSON argv v1 公共协议及未实现 package placeholders；`dayu-cli init` 完成当前架构下的 provider/model/key/optional integration/prewarm、补 prompt/overwrite/reset/atomic rollback 行为。Issue 142、151 与既有 Web/WeChat/render trackers 继续拥有 deferred 能力。 |
+| 8 Engine exception | 保留 generic exception message 的 240 字符硬编码、脱敏和截断后缀；no-code。 |
+| 9 tool authorization | 不实施统一 tool authorization framework；不设计 permission schema、policy DSL、role/capability 或 sandbox；未来若需要，其 owner 为 Host ToolRuntime 或同级 Host governance boundary。 |
 
-## Round3 Final Reconciliation
+## Remediation sub-WU reconciliation
 
-- R3-F fixed CLI/config/packaging/public-doc numeric and public-contract findings; final validation included default pytest `3930 passed, 3 skipped, 5 deselected`, pyright `0 errors`, and `git diff --check`.
-- R3-A fixed Host lifecycle, wait/admin, durable integrity, scheduler, active cancel, wait expiry, compaction cancel, and runtime cleanup findings across eight slices; all accepted slice and aggregate findings are closed.
-- R3-B fixed Engine provider protocol, OpenAI tool identity, terminal protocol normalization, JSON schema bounds, and typed enum equality findings; aggregate review passed with zero findings.
-- R3-C fixed Fins storage/upload/download provenance and atomicity findings without implementing tool-security policy; aggregate review passed and no current-scope findings remain open.
-- R3-D fixed Fins financial/read semantics findings; aggregate review passed after documentation hygiene, and no current-scope findings remain open.
-- R3-E fixed Web/Documents egress, resource, diagnostics, and oracle findings; aggregate review passed with 10/10 accepted findings closed and zero material findings.
+| Internal remediation unit | Semantic boundary | Status |
+| --- | --- | --- |
+| R01 | Doc complete-input semantics | complete |
+| R02 | Web config/transport/diagnostics owners | complete |
+| R03 | accepted-call evidence、LLM projection、opaque provenance | complete |
+| R04 | awaiting provider resolution composition | complete |
+| R05 | wait observation state machine | complete |
+| R06 | Fins transaction complete publication | complete |
+| R07 | Fins storage snapshot / opaque identity | complete |
+| R08 | Fins financial / XBRL contract | complete |
+| R09 | Fins direct-stream terminal validator | complete |
+| R10 | HKEX cumulative discovery | complete |
+| R11 | upload script / placeholder removal | complete |
+| R12 | init/reset workflow | complete |
 
-## Current Validation Evidence
+All units followed the required plan、dual plan review/fix/re-review、implementation、dual code review/fix/re-review、accepted local commit sequence. The combined tree then passed dual aggregate deepreview, aggregate regression fix/re-review, fresh Windows evidence, and full draft-PR deepreview/fix/re-review.
 
-- R3-E aggregate validation: `pytest tests/tools/web tests/documents tests/tools/test_doc_tools_provider.py -q` passed with `280 passed, 2 skipped, 3 warnings`.
-- Final HEAD type check: `source .venv/bin/activate && pyright` passed with `0 errors, 0 warnings, 0 informations`.
-- Final whitespace check: `git diff --check` passed.
-- Final worktree state before this artifact: clean.
+## Findings and review closeout
 
-Warnings recorded during validation are existing upstream `edgar` deprecation warnings or pyright version-update notices, not accepted WU regressions.
+- Aggregate regression `AR-F01` through `AR-F05`：closed。
+- `AR-F07` and its Windows rounds `WIN2` through `WIN4`：closed by fresh non-skipped Windows evidence and current-code-head checks。
+- Draft PR finding `PR179-DR-F01`：closed at the Host ToolRuntime owner boundary by rejecting malformed governed decisions before LLM-readable outcome projection and removing the internal-code fallback。
+- AgentMiMo and AgentDS final PR re-reviews both returned PASS with finding/new/backflow/blocker/open/unclassified/pending all 0。
+- Rejected/no-code observations remain unimplemented with recorded reasons；no accepted finding was deferred as “future optimization”。
 
-## Tool-Security Audit
+## Validation evidence
 
-No tool-security implementation was added by this umbrella WU.
+- Final aggregate canonical suite：`5260 passed / 10 skipped / 5 deselected`。
+- Exact-exclusion coverage suite：`5259 passed / 10 skipped / 6 deselected`；changed production files `219/219 >= 80%`。
+- Full pyright：0 errors；full Ruff accepted current set 142、added 0；`git diff --check`、README triggers、source/propagation/security/configured-secret scans：PASS。
+- PR finding focused adversarial tests：`6 passed`；ToolRuntime owner aggregate：`179 passed`；accepted-result projection / Phase 6 integration：`37 passed`；modified ToolRuntime file coverage：85%。
+- Read-only HKEX official cumulative smoke、public awaiting smoke、CLI/init/upload cross-platform tests and real browser/local smokes：PASS。
+- Explicit fresh Windows evidence：R11 run `29713519099` success，R12 run `29713522620` success；R11 `4/4`，R12 init `9/9`，embedded R11 `2/2`。
+- Accepted code head `7166ae1f13a3016b0e010703d1c220a0524699da` current-head checks：R11 run `29716162938` success，R12 run `29716162959` success。
+- Gemini is a low-budget test account；quota/provider adherence is `EXPECTED_TEST_ACCOUNT_QUOTA / NO_CODE_ACTION / NON_BLOCKING`。
 
-The final controller scan over `dayu/`, `tests/`, and `utils/` for repository-wide tool-security implementation terms found zero matches for:
+## Security-related behavior
 
-- `ToolSecurity`
-- `tool-security`
-- `generic capability`
-- `capability governance`
-- `file-authority`
-- `symlink-safe`
-- `upload allowlist`
-- `download security`
-- `LLM-facing upload/download security`
+This WU did not introduce a unified tool authorization framework. It did retain or modify local permission and defense-in-depth behavior where those mechanisms already have a concrete owner:
 
-Broader scans that include `docs/host` and `docs/reviews` only find plan, review, and closeout text documenting explicit exclusions, residual destinations, or historical control context. Existing Web egress/TLS code and tests are current-scope R3-E egress/resource diagnostics, not a generic tool-security framework.
+- Doc `allowed_paths`、filesystem containment、symlink rejection and Dayu-owned reset containment remain active。
+- Web DNS/redirect/peer checks、configurable proof policy、resource budgets、challenge detection and diagnostic redaction remain active；private/custom ports are product-configurable and default allow per Topic 2。
+- Atomic staging/swap/rollback、storage identity containment、process fencing and late-publication fencing remain active。
+- Config and Host-internal SQLite/EventLog belong to the same trusted local domain；configured API keys or headers may exist there。Plaintext configured credential/header values must not appear in Tool Trace、audit output、public/log/LLM-readable material or review evidence。
+- No permission schema、policy DSL、role/capability model、generic sandbox or replacement authorization WU was created。
 
-Tool-security remains deferred to a later dedicated owner if the project chooses to design it.
+## Residual risks and owners
 
-## Residuals With Owners
-
-Remaining residuals are not unclosed accepted findings in this WU:
-
-| Residual | Owner / destination |
+| Residual | Final status / owner |
 | --- | --- |
-| Tool-security / file-authority / upload-download policy | Future dedicated tool-security or file-authority WU |
-| Fins downloader charset policy | Future Fins downloader decode-policy WU |
-| Broad durable metadata typing | Future Fins storage/domain metadata typing WU |
-| Doc processor object expansion budget | Future processor-complexity budget WU |
-| Browser public egress proxy/deployment profile | Future browser egress deployment WU |
-| Validation tooling quirks such as pytest-cov dotted-source NumPy double-load | Validation/toolchain owner |
-| Existing dependency deprecation warnings | Dependency upgrade tracking |
+| `AR-F06` coverage-instrumented scheduler close/promotion node | `RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX`。Canonical non-coverage node passes；future Host scheduler/lifecycle owner must handle it when that owner boundary is changed。It is not reassigned to Issue 175 and does not create a new WU。 |
+| Doc output continuation | Existing Issue 177；not implemented here。 |
+| Web storage-state lifecycle | Existing Issue 178；not implemented here。 |
+| Fins Docling process isolation | Existing Issue 175；not implemented here。 |
+| Workspace migration | Existing Issue 142；not implemented here。 |
+| write/assets ownership | Existing Issue 151；not implemented here。 |
+| Web/WeChat/render real entrypoints | Existing trackers；placeholder surfaces were removed, real implementations were not added here。 |
+| Gemini quota | Expected test-account quota；no code action。 |
 
-## Final Controller State
+These are owned residuals or explicit deferred product capabilities, not open accepted findings in this WU.
 
-All accepted findings discovered and adjudicated for `WU-SEMANTIC-OWNERSHIP-01` are fixed or explicitly rejected/deferred with owner. No current accepted finding remains open.
+## Final controller state
 
-The control document should now mark `WU-SEMANTIC-OWNERSHIP-01` as local final-closeout-pass and clear the active umbrella implementation gate.
+- `WU-SEMANTIC-OWNERSHIP-01`：`final-closeout-pass`。
+- Active work unit：None。
+- Default next work unit：None。
+- Draft PR 179 remains open and draft；this closeout does not authorize merge、mark-ready、request reviewers、delete branch or close deferred issues。
+- Next entry point：user/maintainer decides how to handle draft PR 179；after merge, synchronize from `main` before selecting any separate backlog work。
