@@ -154,18 +154,25 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-SEMANTIC-OWNERSHIP-01` final-closeout transition |
-| active work unit | None；当前不在 PR #179 合并前提前启动独立 backlog WU。 |
+| phase | `WU-CLI-SMOKE-01-R1` accepted plan commit |
+| active work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
 | completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
-| gate | `final-closeout-pass` |
-| draft PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 为 draft/open；用户将手工 merge。 |
-| selected next work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
-| next gate | `goal confirmation` |
+| gate | `accepted-plan-commit` |
+| prerequisite PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 已于 2026-07-20 merge；本地 `main` 已同步到 merge commit `bd1d3e94`。 |
+| selected work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
+| next gate | `accepted plan commit` |
+| goal confirmation artifact | `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`；用户已确认，decision=`pass`。 |
+| plan artifact | `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`；2 个语义闭环 slices，controller decision=`ready-for-plan-review`。 |
+| plan review artifacts | `docs/reviews/plan-review-20260720-230213.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-230039.md`（AgentDS）；均为 `pass-with-risks`。 |
+| plan review adjudication | `docs/reviews/wu-cli-smoke-01-r1-plan-review-controller-adjudication.md`；controller decision=`fix-required`。 |
+| plan fix artifact | `docs/reviews/wu-cli-smoke-01-r1-plan-fix-codex.md`；AgentCodex status=`completed`，accepted findings 已按 controller handoff 修复，待原 reviewers re-review。 |
+| plan re-review artifacts | `docs/reviews/plan-review-20260720-233342.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-233259.md`（AgentDS）；两路均为 `pass`，A-E 全部 fixed。 |
+| plan re-review adjudication | `docs/reviews/wu-cli-smoke-01-r1-plan-rereview-controller-adjudication.md`；controller decision=`accepted-plan`。 |
 | next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
 | CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
 | next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
 | blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
-| next entry point | 用户手工 merge PR #179 后，从 `main` 同步最新代码，再以本文档启动 `WU-CLI-SMOKE-01-R1` goal confirmation；确认后由 AgentCodex 进入 `plan` gate。 |
+| next entry point | Phaseflow controller 创建 accepted plan commit；commit 完成后进入 Slice 1 implementation，由 AgentCodex 执行。 |
 
 
 ## 推进规则
@@ -217,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
-| WU-CLI-SMOKE-01-R1 | deferred-with-owner | PR #179 merge 后的 selected next WU；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU并裁决完整目标：`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 共用 Host-owned transient live contract，全部不写 EventLog。当前 content/tool-call 已 accepted-without-row，但缺少公共 transient live delivery；`c1b546ac` 仅因 `watch_session_events` 轮询 EventLog，把 reasoning 改成每 delta 一条 durable `PREVIEW` row。R1 必须撤销该持久化并补齐三类 delta 的统一 live path；retention 只能清理结果、不能修复 owner drift。PR #179 merge 并同步 `main` 后进入 goal confirmation。 |
+| WU-CLI-SMOKE-01-R1 | active | 当前进入 goal confirmation；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU并裁决完整目标：`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 共用 Host-owned transient live contract，全部不写 EventLog。当前 content/tool-call 已 accepted-without-row，但缺少公共 transient live delivery；`c1b546ac` 仅因 `watch_session_events` 轮询 EventLog，把 reasoning 改成每 delta 一条 durable `PREVIEW` row。R1 必须撤销该持久化并补齐三类 delta 的统一 live path；retention 只能清理结果、不能修复 owner drift。PR #179 已 merge 且本地 `main` 已同步，当前从工作分支进入 goal confirmation。 |
 | WU-CLI-SMOKE-01-R2 | deferred-with-owner | Future CLI UI enhancement / user decision | `CliThinkingRenderer` 当前保留 160 字符单行运行态展示；如后续用户要求 Codex / Claude Code 风格可展开 thinking panel，再在 CLI UI adapter lane 设计，不阻塞 WU-CLI-SMOKE-01 draft PR。 |
 
 ## 当前 Work Units
@@ -242,7 +249,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
-| WU-CLI-SMOKE-01-R1 | selected-next | Engine delta transient live stream remediation | PR #179 merge 后启动 | 高严重度 EventLog amplification bug：三类 per-chunk delta 统一走 Host-owned transient live stream 且全部不写 EventLog；直接持久化修复点是恢复 `REASONING_DELTA` non-durable ingest，content/tool-call 则从当前 accepted-without-row 接入同一 live contract。当前不在 PR #179 merge 前提前进入 plan。 |
+| WU-CLI-SMOKE-01-R1 | active-accepted-plan-commit | Engine delta transient live stream remediation | 工作分支 `phaseflow/wu-cli-smoke-01-r1` | Plan-fix 后两路 re-review 均为 pass；controller adjudication 为 `docs/reviews/wu-cli-smoke-01-r1-plan-rereview-controller-adjudication.md`，当前创建 accepted plan commit。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
@@ -316,7 +323,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；下一会话不得重新收窄为只处理 thinking。当前不提前启动：PR #179 仍为 draft/open，用户将手工 merge；merge 后必须先从 `main` 同步，再进入本项 `goal confirmation`。除非同步后的代码或设计真源与本裁决直接矛盾，否则 goal confirmation 不再询问“三类还是一种”这一已裁决问题。
+用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；后续不得重新收窄为只处理 thinking。PR #179 已于 2026-07-20 merge，本地 `main` 已同步到 merge commit `bd1d3e94`，当前工作分支为 `phaseflow/wu-cli-smoke-01-r1`。Goal confirmation artifact 为 `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`，用户已确认且 gate pass；plan artifact 为 `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`，包含 2 个语义闭环 slices。Plan review artifacts 为 `docs/reviews/plan-review-20260720-230213.md` 与 `docs/reviews/plan-review-20260720-230039.md`，两路均为 `pass-with-risks`；controller adjudication 为 `docs/reviews/wu-cli-smoke-01-r1-plan-review-controller-adjudication.md`。AgentCodex 已完成 `docs/reviews/wu-cli-smoke-01-r1-plan-fix-codex.md`，当前进入原 reviewers plan re-review。除非同步后的代码或设计真源与本裁决直接矛盾，否则不得重新询问“三类还是一种”这一已裁决问题。
 
 ### 直接证据与动机
 
