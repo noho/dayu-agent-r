@@ -15,6 +15,7 @@ import pytest
 
 import dayu.host.dispatch as host_dispatch
 import dayu.host.engine_ingest as host_engine_ingest
+from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
 from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
@@ -2039,9 +2040,7 @@ class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
             self._first_tick_seen.set()
             if self._wake_during_first_tick:
                 self.wake_active_cancel_watchdog()
-                self._event_state_after_nested_wake = (
-                    self._active_cancel_watchdog_event.is_set()
-                )
+                self._event_state_after_nested_wake = self._active_cancel_watchdog_event.is_set()
         elif self._tick_count == 2:
             self._second_tick_seen.set()
         return host_dispatch.ActiveCancelWatchdogTickResult(
@@ -2101,6 +2100,7 @@ async def _open_watchdog_probe_scheduler(
     )
     return scheduler_type(
         transaction_runner=store.transaction_runner,
+        transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         event_log_store=EventLogStore(),
         local_execution=HostLocalExecutionOptions(
             lane_db_path=lane_db_path,
@@ -2757,6 +2757,7 @@ async def test_drain_loop_unexpected_exception_reports_fatal(
         )
         scheduler = _FailingDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
                 lane_db_path=tmp_path / "lane-drain-loop.sqlite3",
@@ -2829,6 +2830,7 @@ async def test_drain_loop_retries_durable_retry_exhausted_without_self_close(
         )
         scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
                 lane_db_path=tmp_path / "lane-drain-loop-retry-exhausted.sqlite3",
@@ -2981,10 +2983,7 @@ async def test_active_cancel_watchdog_unexpected_failure_reports_typed_fatal(
             assert exc_info.value.code is HostApiErrorCode.UNAVAILABLE
             assert isinstance(exc_info.value.detail, HostUnavailableDetail)
             assert exc_info.value.detail.component == "active_cancel_watchdog"
-            assert (
-                exc_info.value.detail.reason_code
-                == "critical_task_unexpected_exit"
-            )
+            assert exc_info.value.detail.reason_code == "critical_task_unexpected_exit"
             assert "private failure" not in str(exc_info.value.detail)
         finally:
             await scheduler.close()
@@ -3019,6 +3018,7 @@ async def test_drain_loop_retry_exhausted_preserves_pending_durable_truth(
         )
         scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
                 lane_db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3",
@@ -3155,7 +3155,7 @@ async def test_drain_loop_logs_idle_once_per_idle_streak_and_close(
     idle_messages = [
         record.getMessage() for record in caplog.records if "dispatch.drain_loop.idle" in record.getMessage()
     ]
-    assert idle_messages == ["dispatch.drain_loop.idle " "host_handle_id=host-test interval_seconds=0.01"]
+    assert idle_messages == ["dispatch.drain_loop.idle host_handle_id=host-test interval_seconds=0.01"]
     assert observed_queue.empty_call_count >= 3
     assert any("dispatch drain loop cancelled during close" in record.getMessage() for record in caplog.records)
 
@@ -4663,17 +4663,10 @@ async def test_proactive_compact_selection_passes_protected_recent_floor(
             await scheduler.run_queue_promotion(seeded.session_id)
 
             request = compactor.prepared_requests[0]
-            assert request.segment_selection.policy_digest == (
-                digest_memory_projection_policy(memory_policy)
-            )
+            assert request.segment_selection.policy_digest == (digest_memory_projection_policy(memory_policy))
+            assert "eventlog:user:event-proactive-floor-old-input" in request.segment_selection.selected_block_ids
             assert (
-                "eventlog:user:event-proactive-floor-old-input"
-                in request.segment_selection.selected_block_ids
-            )
-            assert (
-                request.segment_selection.excluded_reason_codes[
-                    "eventlog:user:event-proactive-floor-recent-input"
-                ]
+                request.segment_selection.excluded_reason_codes["eventlog:user:event-proactive-floor-recent-input"]
                 == "protected_recent_raw_floor"
             )
         finally:
@@ -5137,10 +5130,7 @@ async def test_critical_task_exception_reports_typed_fatal_to_shared_health(
             assert exc_info.value.retryable is True
             assert isinstance(exc_info.value.detail, HostUnavailableDetail)
             assert exc_info.value.detail.component == component
-            assert (
-                exc_info.value.detail.reason_code
-                == "critical_task_unexpected_exit"
-            )
+            assert exc_info.value.detail.reason_code == "critical_task_unexpected_exit"
             assert "private provider diagnostic" not in str(exc_info.value.detail)
         finally:
             await scheduler.close()
@@ -5203,9 +5193,7 @@ async def test_proactive_compaction_rechecks_durable_state_after_manifest(
             display_text=_soft_threshold_prompt(),
         )
         compactor = _PreparedManifestProactiveCompactor()
-        original_record = (
-            DurableCompactorProposalManifestRecorder.record_compactor_proposal_manifest
-        )
+        original_record = DurableCompactorProposalManifestRecorder.record_compactor_proposal_manifest
 
         def record_then_fail_run(
             recorder: DurableCompactorProposalManifestRecorder,
@@ -5253,10 +5241,13 @@ async def test_proactive_compaction_rechecks_durable_state_after_manifest(
 
             assert compactor.calls == 0
             assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.FAILED
-            assert _event_count(
-                store.transaction_runner,
-                "RUNNER_CALL_INPUT_ASSEMBLED",
-            ) == 1
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    "RUNNER_CALL_INPUT_ASSEMBLED",
+                )
+                == 1
+            )
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
         finally:
             await scheduler.close()
@@ -5479,13 +5470,16 @@ async def test_proactive_compaction_recovery_tier2_degrades_previous_view(
             await scheduler.run_queue_promotion(seeded.session_id)
 
             assert compactor.calls == 3
-            assert len(
-                _events_for_run_by_type(
-                    store.transaction_runner,
-                    seeded.run_id,
-                    CONTEXT_COMPACTED,
+            assert (
+                len(
+                    _events_for_run_by_type(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
                 )
-            ) == 1
+                == 1
+            )
             compacted_payload = _event_payload(
                 _latest_event_for_run(
                     store.transaction_runner,
@@ -5552,13 +5546,16 @@ async def test_proactive_compaction_recovery_tier3_uses_delta_only(
             await scheduler.run_queue_promotion(seeded.session_id)
 
             assert compactor.calls == 4
-            assert len(
-                _events_for_run_by_type(
-                    store.transaction_runner,
-                    seeded.run_id,
-                    CONTEXT_COMPACTED,
+            assert (
+                len(
+                    _events_for_run_by_type(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
                 )
-            ) == 1
+                == 1
+            )
             compacted_payload = _event_payload(
                 _latest_event_for_run(
                     store.transaction_runner,
@@ -5794,10 +5791,12 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
             )
             assert _event_payload(rejected)["operation_id"] == requested.event_id
             assert len(rejected_rows) == 4
-            assert tuple(
-                _event_payload(rejected_row)["attempt_number"]
-                for rejected_row in rejected_rows
-            ) == (1, 2, 3, 4)
+            assert tuple(_event_payload(rejected_row)["attempt_number"] for rejected_row in rejected_rows) == (
+                1,
+                2,
+                3,
+                4,
+            )
             for rejected_row in rejected_rows:
                 _assert_rejected_payload_has_proposal_manifest(
                     _event_payload(rejected_row)
@@ -6346,15 +6345,9 @@ async def test_reactive_root_compact_selection_passes_protected_recent_floor(
             )
         )
         current_blocks = tuple(
-            block
-            for block in frozen_blocks
-            if block.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
+            block for block in frozen_blocks if block.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
         )
-        protected_blocks = tuple(
-            block
-            for block in frozen_blocks
-            if block.turn_group_id == "run-reactive-floor-recent"
-        )
+        protected_blocks = tuple(block for block in frozen_blocks if block.turn_group_id == "run-reactive-floor-recent")
         protected_kinds = frozenset(block.kind for block in protected_blocks)
 
         assert len(current_blocks) == 1
@@ -6394,15 +6387,9 @@ async def test_reactive_root_compact_selection_passes_protected_recent_floor(
 
             request = reactive_compactor.prepared_requests[0]
             assert request.trigger_source is ContextCompactionTriggerSource.REACTIVE
-            assert (
-                "eventlog:user:event-reactive-floor-old-input"
-                in request.segment_selection.selected_block_ids
-            )
+            assert "eventlog:user:event-reactive-floor-old-input" in request.segment_selection.selected_block_ids
             for block in protected_blocks:
-                assert (
-                    request.segment_selection.excluded_reason_codes[block.block_id]
-                    == "protected_recent_raw_floor"
-                )
+                assert request.segment_selection.excluded_reason_codes[block.block_id] == "protected_recent_raw_floor"
         finally:
             await reactive_scheduler.close()
 
@@ -6777,6 +6764,7 @@ async def _open_scheduler(
     if host_instance_identity is None:
         return await HostDispatchScheduler.open(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             local_execution=local_execution,
             host_handle_id=host_handle_id,
             active_registry=active_registry,
@@ -6802,6 +6790,7 @@ async def _open_scheduler(
     )
     return HostDispatchScheduler(
         transaction_runner=store.transaction_runner,
+        transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         event_log_store=EventLogStore(),
         local_execution=local_execution,
         lane_controller=lane_controller,
@@ -6866,10 +6855,7 @@ def _proposal_compactor_agent_request(
     """
 
     return AgentRunRequest(
-        run_id=(
-            f"compactor-run:{request.run_id}:"
-            f"{compaction_operation_id}:{compaction_attempt_number}"
-        ),
+        run_id=(f"compactor-run:{request.run_id}:{compaction_operation_id}:{compaction_attempt_number}"),
         session_id="context-compactor:test",
         attempt_id=None,
         execution_id=None,
@@ -7084,11 +7070,7 @@ def _seed_accepted_run(
     :returns: accepted Run 摘要。
     """
 
-    actual_session_id = (
-        _ensure_session_id(store.transaction_runner)
-        if session_id is None
-        else session_id
-    )
+    actual_session_id = _ensure_session_id(store.transaction_runner) if session_id is None else session_id
     input_event_id = f"event-input-{run_id}"
     input_event_sequence = _append_user_input(
         store.transaction_runner,
@@ -8445,7 +8427,7 @@ async def _wait_for_accepted_snapshot_count(factory: _ReactiveRecoveryWorkerFact
         if len(factory.accepted_snapshots) >= expected_count:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError("accepted snapshot count did not converge: " f"{len(factory.accepted_snapshots)}")
+    raise AssertionError(f"accepted snapshot count did not converge: {len(factory.accepted_snapshots)}")
 
 
 async def _wait_for_statuses(
@@ -8472,7 +8454,7 @@ async def _wait_for_statuses(
             return rows
         await asyncio.sleep(0.01)
     run, attempt, _dispatch_record = _read_rows(transaction_runner, seeded)
-    raise AssertionError("status did not converge: " f"run={run.status.value} attempt={attempt.status.value}")
+    raise AssertionError(f"status did not converge: run={run.status.value} attempt={attempt.status.value}")
 
 
 async def _wait_for_active_tasks_to_finish(

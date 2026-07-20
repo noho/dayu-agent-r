@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import sqlite3
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -19,6 +19,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    ReasoningDeltaData,
     RunFailedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
@@ -42,7 +43,10 @@ from dayu.host import (
     HostEvent,
     HostEventClass,
     HostEventKind,
+    HostSessionEvent,
     HostTerminalStatus,
+    HostReasoningDelta,
+    HostTransientDelta,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
@@ -61,6 +65,20 @@ _WORKER_MODE_FINAL = "final"
 _WORKER_MODE_BLOCKING = "blocking"
 _WORKER_MODE_FAILED = "failed"
 _WORKER_MODE_EMPTY_FINAL = "empty_final"
+_WORKER_MODE_TRANSIENT_FINAL = "transient_final"
+
+
+class _ClosableSessionEventIterator(Protocol):
+    """测试使用的可关闭 Host Session iterator 窄协议。"""
+
+    async def aclose(self) -> None:
+        """关闭 iterator。
+
+        :returns: ``None``。
+        :raises Exception: 具体 Host iterator cleanup 失败时透传。
+        """
+
+        ...
 
 
 class _ImmediateFinalAnswerHandle:
@@ -105,6 +123,72 @@ class _ImmediateFinalAnswerHandle:
 
         :param reason: 取消原因。
         :returns: ``None``。
+        """
+
+        del reason
+
+
+class _TransientThenFinalAnswerHandle:
+    """测试用依次产出 reasoning delta 与 final answer 的 worker handle。"""
+
+    def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
+        """初始化 handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不抛出异常。
+        """
+
+        self._snapshot = snapshot
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 本地 worker id。
+        :raises Exception: 本属性不抛出异常。
+        """
+
+        return "watch-transient-final-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """依次产出 reasoning delta 与 final answer。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises Exception: 本生成器不主动抛出异常。
+        """
+
+        yield EngineEvent(
+            occurred_at=datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC),
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.REASONING_DELTA,
+            data=ReasoningDeltaData(
+                iteration_id="iteration-1",
+                delta="正在分析收入变化",
+            ),
+            metadata=None,
+        )
+        yield _final_answer_event(
+            self._snapshot,
+            f"answer:{self._snapshot.run_id}",
+        )
+
+    async def close(self) -> None:
+        """关闭 handle。
+
+        :returns: ``None``。
+        :raises Exception: 本方法不抛出异常。
+        """
+
+        return None
+
+    def on_cancel(self, reason: str) -> None:
+        """忽略取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 本方法不抛出异常。
         """
 
         del reason
@@ -336,6 +420,8 @@ class _Factory:
 
         if self._mode == _WORKER_MODE_FINAL:
             handle: LocalWorkerHandle = _ImmediateFinalAnswerHandle(snapshot)
+        elif self._mode == _WORKER_MODE_TRANSIENT_FINAL:
+            handle = _TransientThenFinalAnswerHandle(snapshot)
         elif self._mode == _WORKER_MODE_FAILED:
             handle = _FailedHandle(snapshot)
         elif self._mode == _WORKER_MODE_EMPTY_FINAL:
@@ -388,6 +474,58 @@ async def test_two_watchers_observe_same_terminal_event_and_iterator_continues(
         next_terminal = await _next_terminal(first_watcher)
         assert next_terminal.kind is HostEventKind.SUCCEEDED
         assert next_terminal.event_id != first_terminal.event_id
+
+        await _close_iterator(first_watcher)
+        await _close_iterator(second_watcher)
+
+
+@pytest.mark.asyncio
+async def test_watch_attaches_before_return_and_delivers_transient_before_terminal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """watcher 在首次迭代前已 attach，并先交付共享瞬态 envelope。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: attach、fanout、merge 或 zero-row contract 失效时抛出。
+    """
+
+    factory = _Factory(_WORKER_MODE_TRANSIENT_FINAL)
+    options = _options(tmp_path, factory)
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request("watch-transient"))
+        first_watcher = host.watch_session_events(session.session_id)
+        second_watcher = host.watch_session_events(session.session_id)
+
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-transient"),
+        )
+        first_delta, second_delta = await asyncio.gather(
+            _next_transient(first_watcher),
+            _next_transient(second_watcher),
+        )
+
+        assert isinstance(first_delta, HostTransientDelta)
+        assert isinstance(second_delta, HostTransientDelta)
+        assert first_delta is second_delta
+        assert first_delta.run_id == followup.accepted_run_id
+        assert isinstance(first_delta.data, HostReasoningDelta)
+        assert first_delta.data.text_delta == "正在分析收入变化"
+
+        first_terminal, second_terminal = await asyncio.gather(
+            _next_terminal(first_watcher),
+            _next_terminal(second_watcher),
+        )
+        assert first_terminal.event_id == second_terminal.event_id
+        assert first_terminal.run_id == followup.accepted_run_id
+        assert (
+            _event_log_type_count(
+                options.db_path,
+                EngineEventType.REASONING_DELTA.value,
+            )
+            == 0
+        )
 
         await _close_iterator(first_watcher)
         await _close_iterator(second_watcher)
@@ -551,7 +689,7 @@ async def test_watch_lifecycle_errors_and_closed_session_watch(
         await _close_iterator(watcher)
 
 
-async def _next_terminal(iterator: AsyncIterator[HostEvent]) -> HostEvent:
+async def _next_terminal(iterator: AsyncIterator[HostSessionEvent]) -> HostEvent:
     """读取下一条 terminal HostEvent。
 
     :param iterator: HostEvent async iterator。
@@ -562,7 +700,46 @@ async def _next_terminal(iterator: AsyncIterator[HostEvent]) -> HostEvent:
     return await asyncio.wait_for(_read_next_terminal(iterator), timeout=2.0)
 
 
-async def _read_next_terminal(iterator: AsyncIterator[HostEvent]) -> HostEvent:
+async def _next_transient(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> HostTransientDelta:
+    """读取下一条瞬态增量，并拒绝 terminal 抢先交付。
+
+    :param iterator: HostSessionEvent async iterator。
+    :returns: 下一条 Host 瞬态增量。
+    :raises AssertionError: terminal 早于应存在的瞬态增量交付时抛出。
+    """
+
+    return await asyncio.wait_for(_read_next_transient(iterator), timeout=2.0)
+
+
+async def _read_next_transient(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> HostTransientDelta:
+    """跳过 durable 非终态事件，读取下一条瞬态增量。
+
+    :param iterator: HostSessionEvent async iterator。
+    :returns: 下一条 Host 瞬态增量。
+    :raises AssertionError: terminal 早于瞬态增量交付时抛出。
+    """
+
+    terminal_kinds = {
+        HostEventKind.SUCCEEDED,
+        HostEventKind.FAILED,
+        HostEventKind.CANCELLED,
+        HostEventKind.LOST,
+    }
+    while True:
+        event = await anext(iterator)
+        if isinstance(event, HostTransientDelta):
+            return event
+        if event.kind in terminal_kinds:
+            raise AssertionError("terminal event was delivered before transient delta")
+
+
+async def _read_next_terminal(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> HostEvent:
     """从 iterator 中顺序读取下一条 terminal 事件。
 
     :param iterator: HostEvent async iterator。
@@ -571,7 +748,7 @@ async def _read_next_terminal(iterator: AsyncIterator[HostEvent]) -> HostEvent:
 
     while True:
         event = await anext(iterator)
-        if event.kind in {
+        if isinstance(event, HostEvent) and event.kind in {
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
             HostEventKind.CANCELLED,
@@ -580,7 +757,7 @@ async def _read_next_terminal(iterator: AsyncIterator[HostEvent]) -> HostEvent:
             return event
 
 
-async def _consume_forever(iterator: AsyncIterator[HostEvent]) -> None:
+async def _consume_forever(iterator: AsyncIterator[HostSessionEvent]) -> None:
     """持续消费 watcher，直到调用方取消任务。
 
     :param iterator: HostEvent async iterator。
@@ -592,14 +769,14 @@ async def _consume_forever(iterator: AsyncIterator[HostEvent]) -> None:
         await asyncio.sleep(0)
 
 
-async def _close_iterator(iterator: AsyncIterator[HostEvent]) -> None:
+async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
     """关闭测试中持有的 async generator iterator。
 
-    :param iterator: HostEvent async iterator。
+    :param iterator: HostSessionEvent async iterator。
     :returns: ``None``。
     """
 
-    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+    await cast(_ClosableSessionEventIterator, iterator).aclose()
 
 
 async def _wait_run_terminal(host: Host, run_id: str) -> RunSnapshot:
@@ -657,6 +834,28 @@ def _event_log_count(db_path: pathlib.Path) -> int:
     value = row[0]
     if not isinstance(value, int):
         raise AssertionError("EventLog count is not int")
+    return value
+
+
+def _event_log_type_count(db_path: pathlib.Path, event_type: str) -> int:
+    """读取指定事件类型的 EventLog row 数量。
+
+    :param db_path: Host durable SQLite 路径。
+    :param event_type: 目标 Engine 事件类型值。
+    :returns: 匹配的 EventLog row 数量。
+    :raises AssertionError: 查询未返回整数计数时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            f"SELECT COUNT(*) FROM {TABLE_EVENT_LOG} WHERE event_type = ?",
+            (event_type,),
+        ).fetchone()
+    if row is None:
+        raise AssertionError("EventLog type count query returned no row")
+    value = row[0]
+    if not isinstance(value, int):
+        raise AssertionError("EventLog type count is not int")
     return value
 
 

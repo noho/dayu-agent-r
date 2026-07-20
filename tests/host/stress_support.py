@@ -34,6 +34,7 @@ from dayu.host import (
     Host,
     HostEvent,
     HostEventKind,
+    HostSessionEvent,
     HostTerminalStatus,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
@@ -646,7 +647,7 @@ class InspectableStressWorkerFactory(DeterministicStressWorkerFactory):
 
 
 async def consume_terminals(
-    iterator: AsyncIterator[HostEvent],
+    iterator: AsyncIterator[HostSessionEvent],
     *,
     expected_count: int,
     delay_seconds: float,
@@ -686,6 +687,8 @@ async def consume_terminals(
         if remaining <= 0:
             raise TimeoutError("timed out while consuming terminal HostEvents")
         event = await asyncio.wait_for(anext(iterator), timeout=remaining)
+        if not isinstance(event, HostEvent):
+            continue
         if event.kind not in {
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
@@ -701,7 +704,9 @@ async def consume_terminals(
     return tuple(observed)
 
 
-async def close_host_event_iterator(iterator: AsyncIterator[HostEvent]) -> None:
+async def close_host_event_iterator(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> None:
     """关闭测试持有的 HostEvent async generator。
 
     本 helper 镜像 recovery 测试中的 watch iterator 清理语义，但归属
@@ -709,12 +714,12 @@ async def close_host_event_iterator(iterator: AsyncIterator[HostEvent]) -> None:
     也不表达 Host close 治理。它只关闭 public watch iterator，不写
     EventLog、不取消 Run，只服务测试清理。
 
-    :param iterator: HostEvent iterator。
+    :param iterator: Host durable/transient 联合事件 iterator。
     :returns: ``None``。
     :raises Exception: 底层 async generator close 失败时透传。
     """
 
-    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+    await cast(AsyncGenerator[HostSessionEvent, None], iterator).aclose()
 
 
 def read_latest_event_sequence(root_path: pathlib.Path) -> int:

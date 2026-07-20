@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
+
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import (
@@ -444,19 +446,13 @@ def test_poll_observation_timeout_keeps_waiting_then_ready_resumes_run(
         adapter.poll_release.set()
         _wait_for_runner_count(runner, expected=0)
         assert runner.diagnostics_snapshot().dropped_count == 1
-        assert (
-            _read_wait(host._transaction_runner(), waiting.wait_id).status
-            is WaitRecordStatus.WAITING
-        )
+        assert _read_wait(host._transaction_runner(), waiting.wait_id).status is WaitRecordStatus.WAITING
 
         clock.advance(0.01)
         ready = poller.poll_once()
         assert ready.resolved == 1
         assert ready.lost == 0
-        assert (
-            _read_wait(host._transaction_runner(), waiting.wait_id).status
-            is WaitRecordStatus.RESOLVED
-        )
+        assert _read_wait(host._transaction_runner(), waiting.wait_id).status is WaitRecordStatus.RESOLVED
         assert _run(host._transaction_runner(), seeded.run_id).status is RunStatus.RUNNING
     finally:
         adapter.poll_release.set()
@@ -474,6 +470,7 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
     tool = _AwaitingBusinessTool()
     scheduler = await HostDispatchScheduler.open(
         transaction_runner=host._transaction_runner(),
+        transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         local_execution=_local_execution_options(tmp_path, factory, tool),
         host_handle_id="phase7-awaiting-production",
     )

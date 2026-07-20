@@ -45,8 +45,6 @@ from dayu.host import (
     HostEvent,
     HostEventClass,
     HostEventKind,
-    HostTerminalStatus,
-    HostThinkingView,
     HostToolingOptions,
     LocalEngineWorker,
     LocalWorkerHandle,
@@ -257,7 +255,6 @@ def test_public_host_event_excludes_internal_effective_execution_value(
     assert event.final_answer is None
     assert event.error_message is None
     assert event.cancel_reason is None
-    assert event.thinking is None
     public_dto_json = canonical_json_dumps(cast(JsonValue, asdict(event)))
     assert _CONFIGURED_SECRET_SENTINEL not in public_dto_json
 
@@ -734,8 +731,7 @@ def test_activity_descriptor_read_degrades_to_no_activity(
             event_type="TOOL_CALL_REQUESTED",
             payload={"tool_name": "lookup_filing"},
             payload_ref="payload-missing-activity",
-            payload_digest="sha256:"
-            "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            payload_digest="sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
         ),
     )
 
@@ -825,33 +821,11 @@ async def test_tool_display_fallback_when_input_event_missing(
     assert activity.tool_display_name == "lookup_filing"
 
 
-def test_delta_and_unknown_events_keep_identity_without_activity(
+def test_unknown_event_keeps_identity_without_activity(
     tmp_path: pathlib.Path,
 ) -> None:
-    """delta 与未知非终态事件保留 identity 且不投影 raw activity。"""
+    """未知非终态 durable event 保留 identity 且不投影 activity。"""
 
-    content = _project_event(
-        tmp_path,
-        _row(
-            event_id="event-content-delta",
-            event_class=EventClass.PREVIEW,
-            session_id="session-direct",
-            run_id="run-direct",
-            event_type="CONTENT_DELTA",
-            payload={"delta": "raw model content"},
-        ),
-    )
-    reasoning = _project_event(
-        tmp_path,
-        _row(
-            event_id="event-reasoning-delta",
-            event_class=EventClass.PREVIEW,
-            session_id="session-direct",
-            run_id="run-direct",
-            event_type="REASONING_DELTA",
-            payload={"delta": "hidden reasoning"},
-        ),
-    )
     unknown = _project_event(
         tmp_path,
         _row(
@@ -864,37 +838,9 @@ def test_delta_and_unknown_events_keep_identity_without_activity(
         ),
     )
 
-    assert content.event_type == "CONTENT_DELTA"
-    assert content.activity is None
-    assert reasoning.event_type == "REASONING_DELTA"
-    assert reasoning.activity is None
-    assert reasoning.thinking is not None
-    assert reasoning.thinking.text_delta == "hidden reasoning"
     assert unknown.event_class is HostEventClass.PROJECTION_SIGNAL
     assert unknown.event_type == "FUTURE_PROGRESS"
     assert unknown.activity is None
-
-
-def test_terminal_host_event_rejects_thinking_payload() -> None:
-    """terminal HostEvent 防卫性拒绝 thinking payload。"""
-
-    with pytest.raises(ValueError, match="terminal kind must not include thinking"):
-        HostEvent(
-            event_id="event-failed-with-thinking",
-            event_sequence=1,
-            session_id="session-direct",
-            run_id="run-direct",
-            event_class=HostEventClass.CANONICAL_FACT,
-            event_type="RUN_FAILED",
-            kind=HostEventKind.FAILED,
-            activity=None,
-            dedupe_key="event-failed-with-thinking",
-            terminal_status=HostTerminalStatus.FAILED,
-            final_answer=None,
-            error_message="provider failed safely",
-            cancel_reason=None,
-            thinking=HostThinkingView(text_delta="hidden reasoning"),
-        )
 
 
 def _project_event(tmp_path: pathlib.Path, row: EventLogRow) -> HostEvent:
@@ -1228,9 +1174,7 @@ def _options(
                     source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
                     source_id="activity-test",
                     version_ref=None,
-                    content_digest="sha256:"
-                    "0123456789abcdef0123456789abcdef"
-                    "0123456789abcdef0123456789abcdef",
+                    content_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ),
             ),
         ),

@@ -13,10 +13,11 @@ from __future__ import annotations
 import pathlib
 import re
 import math
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, TypeAlias, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
@@ -71,6 +72,7 @@ else:
         adapter_call_timeout_seconds: float
         close_drain_timeout_seconds: float
         max_outstanding_adapter_calls: int
+
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -340,10 +342,7 @@ def _validate_wait_poller_policy(policy: WaitPollerRuntimePolicy) -> None:
     )
     _require_positive_float(
         policy.not_ready_observe_interval_seconds,
-        field_name=(
-            "OpenHostOptions.wait_poller_policy."
-            "not_ready_observe_interval_seconds"
-        ),
+        field_name=("OpenHostOptions.wait_poller_policy.not_ready_observe_interval_seconds"),
     )
     _require_positive_float(
         policy.idle_poll_interval_seconds,
@@ -356,19 +355,13 @@ def _validate_wait_poller_policy(policy: WaitPollerRuntimePolicy) -> None:
         ),
     )
     if not math.isfinite(float(policy.adapter_call_timeout_seconds)):
-        raise ValueError(
-            "OpenHostOptions.wait_poller_policy.adapter_call_timeout_seconds "
-            "must be finite"
-        )
+        raise ValueError("OpenHostOptions.wait_poller_policy.adapter_call_timeout_seconds must be finite")
     _require_positive_float(
         policy.close_drain_timeout_seconds,
         field_name="OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds",
     )
     if not math.isfinite(float(policy.close_drain_timeout_seconds)):
-        raise ValueError(
-            "OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds "
-            "must be finite"
-        )
+        raise ValueError("OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds must be finite")
     _require_positive_int(
         policy.max_outstanding_adapter_calls,
         field_name=(
@@ -690,13 +683,8 @@ class ResolveWaitLostOutcome:
             self.reason_code, field_name="ResolveWaitLostOutcome.reason_code"
         )
         _require_non_empty(self.message, field_name="ResolveWaitLostOutcome.message")
-        if self.provider_status_ref is not None and not isinstance(
-            self.provider_status_ref, WaitProviderStatusRef
-        ):
-            raise TypeError(
-                "ResolveWaitLostOutcome.provider_status_ref must be "
-                "WaitProviderStatusRef"
-            )
+        if self.provider_status_ref is not None and not isinstance(self.provider_status_ref, WaitProviderStatusRef):
+            raise TypeError("ResolveWaitLostOutcome.provider_status_ref must be WaitProviderStatusRef")
 
 
 ResolveWaitOutcome: TypeAlias = (
@@ -929,15 +917,9 @@ class HostLocalExecutionOptions:
             if isinstance(self.lane_default_timeout_seconds, bool) or not isinstance(
                 self.lane_default_timeout_seconds, int | float
             ):
-                raise TypeError(
-                    "HostLocalExecutionOptions.lane_default_timeout_seconds "
-                    "must be float"
-                )
+                raise TypeError("HostLocalExecutionOptions.lane_default_timeout_seconds must be float")
             if self.lane_default_timeout_seconds < 0:
-                raise ValueError(
-                    "HostLocalExecutionOptions.lane_default_timeout_seconds "
-                    "must be non-negative"
-                )
+                raise ValueError("HostLocalExecutionOptions.lane_default_timeout_seconds must be non-negative")
         _require_positive_float(
             self.lane_claim_ttl_seconds,
             field_name="HostLocalExecutionOptions.lane_claim_ttl_seconds",
@@ -966,26 +948,14 @@ class HostLocalExecutionOptions:
             )
         if self.worker_factory is None:
             raise TypeError("HostLocalExecutionOptions.worker_factory must be non-None")
-        if self.context_budget_policy is not None and not isinstance(
-            self.context_budget_policy, ContextBudgetPolicy
-        ):
-            raise TypeError(
-                "HostLocalExecutionOptions.context_budget_policy must be "
-                "ContextBudgetPolicy"
-            )
-        if self.compactor_runner_spec is not None and not isinstance(
-            self.compactor_runner_spec, RunnerSpec
-        ):
-            raise TypeError(
-                "HostLocalExecutionOptions.compactor_runner_spec must be " "RunnerSpec"
-            )
+        if self.context_budget_policy is not None and not isinstance(self.context_budget_policy, ContextBudgetPolicy):
+            raise TypeError("HostLocalExecutionOptions.context_budget_policy must be ContextBudgetPolicy")
+        if self.compactor_runner_spec is not None and not isinstance(self.compactor_runner_spec, RunnerSpec):
+            raise TypeError("HostLocalExecutionOptions.compactor_runner_spec must be RunnerSpec")
         if self.compactor_runner_options is not None and not isinstance(
             self.compactor_runner_options, RunnerCallOptions
         ):
-            raise TypeError(
-                "HostLocalExecutionOptions.compactor_runner_options must be "
-                "RunnerCallOptions"
-            )
+            raise TypeError("HostLocalExecutionOptions.compactor_runner_options must be RunnerCallOptions")
         _require_optional_non_empty(
             self.compactor_policy_ref,
             field_name="HostLocalExecutionOptions.compactor_policy_ref",
@@ -1002,10 +972,7 @@ class HostLocalExecutionOptions:
             ),
         )
         if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
-            raise TypeError(
-                "HostLocalExecutionOptions.memory_projection_policy must be "
-                "MemoryProjectionPolicy"
-            )
+            raise TypeError("HostLocalExecutionOptions.memory_projection_policy must be MemoryProjectionPolicy")
         _require_positive_int(
             self.memory_projection_catchup_batch_size,
             field_name=(
@@ -1049,10 +1016,7 @@ class OrdinaryRunExecutionBaseline:
                 "OrdinaryRunExecutionBaseline.runner_spec must be RunnerSpec"
             )
         if not isinstance(self.runner_options, RunnerCallOptions):
-            raise TypeError(
-                "OrdinaryRunExecutionBaseline.runner_options must be "
-                "RunnerCallOptions"
-            )
+            raise TypeError("OrdinaryRunExecutionBaseline.runner_options must be RunnerCallOptions")
         if not isinstance(self.agent_policy, AgentPolicy):
             raise TypeError(
                 "OrdinaryRunExecutionBaseline.agent_policy must be AgentPolicy"
@@ -1090,18 +1054,11 @@ class CompactorRunnerBaseline:
         """
 
         if not isinstance(self.compactor_runner_spec, RunnerSpec):
-            raise TypeError(
-                "CompactorRunnerBaseline.compactor_runner_spec must be " "RunnerSpec"
-            )
+            raise TypeError("CompactorRunnerBaseline.compactor_runner_spec must be RunnerSpec")
         if not isinstance(self.compactor_runner_options, RunnerCallOptions):
-            raise TypeError(
-                "CompactorRunnerBaseline.compactor_runner_options must be "
-                "RunnerCallOptions"
-            )
+            raise TypeError("CompactorRunnerBaseline.compactor_runner_options must be RunnerCallOptions")
         if not isinstance(self.compactor_agent_policy, AgentPolicy):
-            raise TypeError(
-                "CompactorRunnerBaseline.compactor_agent_policy must be " "AgentPolicy"
-            )
+            raise TypeError("CompactorRunnerBaseline.compactor_agent_policy must be AgentPolicy")
         _require_non_empty(
             self.compactor_system_prompt,
             field_name="CompactorRunnerBaseline.compactor_system_prompt",
@@ -1116,9 +1073,7 @@ class CompactorRunnerBaseline:
         )
         _require_bool(
             self.compact_artifact_create_parent_dirs,
-            field_name=(
-                "CompactorRunnerBaseline." "compact_artifact_create_parent_dirs"
-            ),
+            field_name=("CompactorRunnerBaseline.compact_artifact_create_parent_dirs"),
         )
 
 
@@ -1239,10 +1194,7 @@ class OpenHostOptions:
                     "OpenHostOptions.lane_default_timeout_seconds must be float"
                 )
             if self.lane_default_timeout_seconds < 0:
-                raise ValueError(
-                    "OpenHostOptions.lane_default_timeout_seconds must be "
-                    "non-negative"
-                )
+                raise ValueError("OpenHostOptions.lane_default_timeout_seconds must be non-negative")
         _require_positive_float(
             self.lane_claim_ttl_seconds,
             field_name="OpenHostOptions.lane_claim_ttl_seconds",
@@ -1253,8 +1205,7 @@ class OpenHostOptions:
         )
         if self.lane_claim_ttl_seconds <= self.lane_heartbeat_interval_seconds:
             raise ValueError(
-                "OpenHostOptions.lane_claim_ttl_seconds must be greater than "
-                "lane_heartbeat_interval_seconds"
+                "OpenHostOptions.lane_claim_ttl_seconds must be greater than lane_heartbeat_interval_seconds"
             )
         _require_positive_float(
             self.worker_startup_timeout_seconds,
@@ -1265,36 +1216,19 @@ class OpenHostOptions:
             field_name="OpenHostOptions.dispatch_poll_interval_seconds",
         )
         if not isinstance(self.ordinary_run_baseline, OrdinaryRunExecutionBaseline):
-            raise TypeError(
-                "OpenHostOptions.ordinary_run_baseline must be "
-                "OrdinaryRunExecutionBaseline"
-            )
+            raise TypeError("OpenHostOptions.ordinary_run_baseline must be OrdinaryRunExecutionBaseline")
         if self.worker_factory is None:
             raise TypeError("OpenHostOptions.worker_factory must be non-None")
-        if self.tooling_options is not None and not isinstance(
-            self.tooling_options, _HostToolingOptions
-        ):
-            raise TypeError(
-                "OpenHostOptions.tooling_options must be HostToolingOptions"
-            )
-        if self.context_budget_policy is not None and not isinstance(
-            self.context_budget_policy, ContextBudgetPolicy
-        ):
-            raise TypeError(
-                "OpenHostOptions.context_budget_policy must be " "ContextBudgetPolicy"
-            )
+        if self.tooling_options is not None and not isinstance(self.tooling_options, _HostToolingOptions):
+            raise TypeError("OpenHostOptions.tooling_options must be HostToolingOptions")
+        if self.context_budget_policy is not None and not isinstance(self.context_budget_policy, ContextBudgetPolicy):
+            raise TypeError("OpenHostOptions.context_budget_policy must be ContextBudgetPolicy")
         if self.compactor_runner_baseline is not None and not isinstance(
             self.compactor_runner_baseline, CompactorRunnerBaseline
         ):
-            raise TypeError(
-                "OpenHostOptions.compactor_runner_baseline must be "
-                "CompactorRunnerBaseline"
-            )
+            raise TypeError("OpenHostOptions.compactor_runner_baseline must be CompactorRunnerBaseline")
         if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
-            raise TypeError(
-                "OpenHostOptions.memory_projection_policy must be "
-                "MemoryProjectionPolicy"
-            )
+            raise TypeError("OpenHostOptions.memory_projection_policy must be MemoryProjectionPolicy")
         _require_positive_int(
             self.memory_projection_catchup_batch_size,
             field_name="OpenHostOptions.memory_projection_catchup_batch_size",
@@ -1758,21 +1692,15 @@ class HostCommandHandleOptions:
         )
         _require_positive_float(
             self.sqlite_write_retry_initial_delay_seconds,
-            field_name=(
-                "HostCommandHandleOptions." "sqlite_write_retry_initial_delay_seconds"
-            ),
+            field_name=("HostCommandHandleOptions.sqlite_write_retry_initial_delay_seconds"),
         )
         _require_positive_float(
             self.sqlite_write_retry_backoff_multiplier,
-            field_name=(
-                "HostCommandHandleOptions." "sqlite_write_retry_backoff_multiplier"
-            ),
+            field_name=("HostCommandHandleOptions.sqlite_write_retry_backoff_multiplier"),
         )
         _require_positive_float(
             self.sqlite_write_retry_max_delay_seconds,
-            field_name=(
-                "HostCommandHandleOptions." "sqlite_write_retry_max_delay_seconds"
-            ),
+            field_name=("HostCommandHandleOptions.sqlite_write_retry_max_delay_seconds"),
         )
         _require_positive_int(
             self.payload_inline_threshold_bytes,
@@ -1815,10 +1743,7 @@ def _context_budget_policy_from_command_options(
         field_name="HostCommandHandleOptions.reserved_output_tokens",
     )
     if options.reserved_output_tokens >= options.context_window_size:
-        raise ValueError(
-            "HostCommandHandleOptions.reserved_output_tokens must be smaller "
-            "than context_window_size"
-        )
+        raise ValueError("HostCommandHandleOptions.reserved_output_tokens must be smaller than context_window_size")
     input_budget_tokens = options.context_window_size - options.reserved_output_tokens
     soft_threshold_tokens = max(
         1, int(input_budget_tokens * DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO)
@@ -1851,14 +1776,11 @@ def _command_hard_threshold_tokens(
     if options.context_budget_hard_threshold_tokens is not None:
         _require_positive_int(
             options.context_budget_hard_threshold_tokens,
-            field_name=(
-                "HostCommandHandleOptions." "context_budget_hard_threshold_tokens"
-            ),
+            field_name=("HostCommandHandleOptions.context_budget_hard_threshold_tokens"),
         )
         if options.context_budget_hard_threshold_tokens > input_budget_tokens:
             raise ValueError(
-                "HostCommandHandleOptions.context_budget_hard_threshold_tokens "
-                "must not exceed input budget"
+                "HostCommandHandleOptions.context_budget_hard_threshold_tokens must not exceed input budget"
             )
         return options.context_budget_hard_threshold_tokens
     minimum_protection_tokens = (
@@ -1868,14 +1790,11 @@ def _command_hard_threshold_tokens(
     )
     _require_non_negative_int(
         minimum_protection_tokens,
-        field_name=(
-            "HostCommandHandleOptions." "context_budget_minimum_protection_tokens"
-        ),
+        field_name=("HostCommandHandleOptions.context_budget_minimum_protection_tokens"),
     )
     if minimum_protection_tokens >= input_budget_tokens:
         raise ValueError(
-            "HostCommandHandleOptions.context_budget_minimum_protection_tokens "
-            "must be smaller than input budget"
+            "HostCommandHandleOptions.context_budget_minimum_protection_tokens must be smaller than input budget"
         )
     return input_budget_tokens - minimum_protection_tokens
 
@@ -2660,15 +2579,11 @@ class FollowupSnapshot:
             if self.accepted_run_status == RunStatus.QUEUED:
                 if self.queued_run_id != self.accepted_run_id:
                     raise ValueError(
-                        "FollowupSnapshot.queued_run_id must equal "
-                        "accepted_run_id for queued queue result"
+                        "FollowupSnapshot.queued_run_id must equal accepted_run_id for queued queue result"
                     )
             if self.accepted_run_status != RunStatus.QUEUED:
                 if self.queued_run_id is not None:
-                    raise ValueError(
-                        "FollowupSnapshot.queued_run_id must be None "
-                        "unless accepted Run is queued"
-                    )
+                    raise ValueError("FollowupSnapshot.queued_run_id must be None unless accepted Run is queued")
             if self.accepted_run_status == RunStatus.RECOVERING:
                 raise ValueError(
                     "FollowupSnapshot.accepted_run_status must not be recovering"
@@ -2919,23 +2834,224 @@ class HostActivityView:
             raise TypeError("HostActivityView.counts must be HostActivityCounts")
 
 
-@dataclass(frozen=True, slots=True)
-class HostThinkingView:
-    """Host public event 的运行态 thinking 展示视图。
+class HostTransientDeltaType(StrEnum):
+    """Host 当前运行期瞬态增量类型。
 
-    :param text_delta: 本次 thinking 增量文本，必须非空。
+    成员：
+
+    - ``CONTENT_DELTA``：回答正文增量。
+    - ``REASONING_DELTA``：推理过程增量。
+    - ``TOOL_CALL_DELTA``：工具调用参数增量。
     """
 
+    CONTENT_DELTA = "content_delta"
+    REASONING_DELTA = "reasoning_delta"
+    TOOL_CALL_DELTA = "tool_call_delta"
+
+
+def _require_string(value: str, *, field_name: str) -> None:
+    """校验值是字符串，同时保留空串与空白原文。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息使用的字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是字符串时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str")
+
+
+def _require_optional_string(value: str | None, *, field_name: str) -> None:
+    """校验值是字符串或 ``None``，同时保留字符串原文。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息使用的字段名。
+    :returns: ``None``。
+    :raises TypeError: 值既不是字符串也不是 ``None`` 时抛出。
+    """
+
+    if value is not None:
+        _require_string(value, field_name=field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class HostContentDelta:
+    """Host public 回答正文瞬态增量。
+
+    :param iteration_id: Engine iteration 稳定标识。
+    :param text_delta: 本次正文原始增量，允许为空。
+    """
+
+    iteration_id: str
     text_delta: str
 
     def __post_init__(self) -> None:
-        """校验 thinking 展示视图字段。
+        """校验回答正文瞬态增量。
 
         :returns: ``None``。
-        :raises ValueError: thinking 增量为空时抛出。
+        :raises TypeError: 文本增量不是字符串时抛出。
+        :raises ValueError: iteration 标识为空时抛出。
         """
 
-        _require_non_empty(self.text_delta, field_name="HostThinkingView.text_delta")
+        _require_non_empty(self.iteration_id, field_name="HostContentDelta.iteration_id")
+        _require_string(self.text_delta, field_name="HostContentDelta.text_delta")
+
+
+@dataclass(frozen=True, slots=True)
+class HostReasoningDelta:
+    """Host public 推理过程瞬态增量。
+
+    :param iteration_id: Engine iteration 稳定标识。
+    :param text_delta: 本次推理原始增量，允许为空。
+    """
+
+    iteration_id: str
+    text_delta: str
+
+    def __post_init__(self) -> None:
+        """校验推理过程瞬态增量。
+
+        :returns: ``None``。
+        :raises TypeError: 文本增量不是字符串时抛出。
+        :raises ValueError: iteration 标识为空时抛出。
+        """
+
+        _require_non_empty(
+            self.iteration_id,
+            field_name="HostReasoningDelta.iteration_id",
+        )
+        _require_string(self.text_delta, field_name="HostReasoningDelta.text_delta")
+
+
+@dataclass(frozen=True, slots=True)
+class HostToolCallDelta:
+    """Host public 工具调用瞬态增量。
+
+    :param iteration_id: Engine iteration 稳定标识。
+    :param tool_call_index: 当前 iteration 内的工具调用序号。
+    :param tool_call_id: 工具调用标识增量或 ``None``。
+    :param name_delta: 工具名原始增量或 ``None``。
+    :param arguments_delta: 参数原始增量或 ``None``。
+    """
+
+    iteration_id: str
+    tool_call_index: int
+    tool_call_id: str | None
+    name_delta: str | None
+    arguments_delta: str | None
+
+    def __post_init__(self) -> None:
+        """校验工具调用瞬态增量。
+
+        :returns: ``None``。
+        :raises TypeError: 序号或可选字符串类型非法时抛出。
+        :raises ValueError: iteration 标识为空或序号为负数时抛出。
+        """
+
+        _require_non_empty(
+            self.iteration_id,
+            field_name="HostToolCallDelta.iteration_id",
+        )
+        _require_non_negative_int(
+            self.tool_call_index,
+            field_name="HostToolCallDelta.tool_call_index",
+        )
+        _require_optional_string(
+            self.tool_call_id,
+            field_name="HostToolCallDelta.tool_call_id",
+        )
+        _require_optional_string(
+            self.name_delta,
+            field_name="HostToolCallDelta.name_delta",
+        )
+        _require_optional_string(
+            self.arguments_delta,
+            field_name="HostToolCallDelta.arguments_delta",
+        )
+
+
+HostTransientDeltaData: TypeAlias = HostContentDelta | HostReasoningDelta | HostToolCallDelta
+HostTransientDeltaDataType: TypeAlias = type[HostContentDelta] | type[HostReasoningDelta] | type[HostToolCallDelta]
+
+HOST_TRANSIENT_DELTA_TYPE_TO_DATA: Final[Mapping[HostTransientDeltaType, HostTransientDeltaDataType]] = (
+    MappingProxyType(
+        {
+            HostTransientDeltaType.CONTENT_DELTA: HostContentDelta,
+            HostTransientDeltaType.REASONING_DELTA: HostReasoningDelta,
+            HostTransientDeltaType.TOOL_CALL_DELTA: HostToolCallDelta,
+        }
+    )
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HostTransientDelta:
+    """Host 当前运行期内的 public 瞬态增量 envelope。
+
+    :param runtime_id: 当前 Host runtime 的 opaque 标识。
+    :param runtime_sequence: 当前 runtime 内由 Host 分配的全局正整数序列。
+    :param session_id: 关联 Session 标识。
+    :param run_id: 关联 Run 标识。
+    :param attempt_id: 已通过 Host ingest 校验的 Attempt 标识。
+    :param execution_id: 已通过 Host ingest 校验的 execution 标识。
+    :param worker_event_index: execution 内由 Host dispatch 分配的正整数序号。
+    :param observed_at: Engine event 的 UTC 观测时间。
+    :param type: 瞬态增量 discriminator。
+    :param data: 与 discriminator 严格对应的 public payload。
+    :param dedupe_key: 当前 runtime 内稳定的 opaque 等值去重键。
+    """
+
+    runtime_id: str
+    runtime_sequence: int
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    worker_event_index: int
+    observed_at: datetime
+    type: HostTransientDeltaType
+    data: HostTransientDeltaData
+    dedupe_key: str
+
+    def __post_init__(self) -> None:
+        """校验 Host public 瞬态增量 envelope。
+
+        :returns: ``None``。
+        :raises TypeError: enum、序号、时间或 payload 类型非法时抛出。
+        :raises ValueError: identity 为空、序号非正数、时间非 UTC 或
+            discriminator/data 不匹配时抛出。
+        """
+
+        _require_non_empty(self.runtime_id, field_name="HostTransientDelta.runtime_id")
+        _require_positive_int(
+            self.runtime_sequence,
+            field_name="HostTransientDelta.runtime_sequence",
+        )
+        _require_non_empty(self.session_id, field_name="HostTransientDelta.session_id")
+        _require_non_empty(self.run_id, field_name="HostTransientDelta.run_id")
+        _require_non_empty(self.attempt_id, field_name="HostTransientDelta.attempt_id")
+        _require_non_empty(
+            self.execution_id,
+            field_name="HostTransientDelta.execution_id",
+        )
+        _require_positive_int(
+            self.worker_event_index,
+            field_name="HostTransientDelta.worker_event_index",
+        )
+        _require_utc_datetime(
+            self.observed_at,
+            field_name="HostTransientDelta.observed_at",
+        )
+        if not isinstance(self.type, HostTransientDeltaType):
+            raise TypeError("HostTransientDelta.type must be HostTransientDeltaType")
+        expected_data_type = HOST_TRANSIENT_DELTA_TYPE_TO_DATA[self.type]
+        if not isinstance(self.data, expected_data_type):
+            raise ValueError("HostTransientDelta.type does not match data")
+        _require_non_empty(
+            self.dedupe_key,
+            field_name="HostTransientDelta.dedupe_key",
+        )
 
 
 class HostTerminalStatus(StrEnum):
@@ -3275,20 +3391,11 @@ class OutboxTerminalItemsBatch:
                 "OutboxTerminalItemsBatch.next_cursor must be OutboxTerminalCursor"
             )
         if not isinstance(self.scanned_watermark, OutboxTerminalCursor):
-            raise TypeError(
-                "OutboxTerminalItemsBatch.scanned_watermark must be "
-                "OutboxTerminalCursor"
-            )
+            raise TypeError("OutboxTerminalItemsBatch.scanned_watermark must be OutboxTerminalCursor")
         if not isinstance(self.projection_checkpoint, OutboxTerminalCursor):
-            raise TypeError(
-                "OutboxTerminalItemsBatch.projection_checkpoint must be "
-                "OutboxTerminalCursor"
-            )
+            raise TypeError("OutboxTerminalItemsBatch.projection_checkpoint must be OutboxTerminalCursor")
         if not isinstance(self.projection_status, OutboxProjectionStatus):
-            raise TypeError(
-                "OutboxTerminalItemsBatch.projection_status must be "
-                "OutboxProjectionStatus"
-            )
+            raise TypeError("OutboxTerminalItemsBatch.projection_status must be OutboxProjectionStatus")
         _require_optional_non_empty(
             self.projection_error_code,
             field_name="OutboxTerminalItemsBatch.projection_error_code",
@@ -3313,7 +3420,6 @@ class HostEvent:
     :param event_type: EventLog row 的 public 事件类型标签。
     :param kind: Service-facing event 类型。
     :param activity: 安全 activity 展示视图；无可展示 activity 时为 ``None``。
-    :param thinking: 运行态 thinking 展示视图；无 thinking 增量时为 ``None``。
     :param dedupe_key: 调用方去重使用的稳定键。
     :param terminal_status: terminal event 状态；非终态事件为 ``None``。
     :param final_answer: 成功终态事件内联的最终回答视图；非成功终态为
@@ -3336,7 +3442,6 @@ class HostEvent:
     final_answer: HostFinalAnswerView | None
     error_message: str | None
     cancel_reason: str | None
-    thinking: HostThinkingView | None = None
 
     def __post_init__(self) -> None:
         """校验 Service-facing Host event 字段。
@@ -3361,10 +3466,6 @@ class HostEvent:
             self.activity, HostActivityView
         ):
             raise TypeError("HostEvent.activity must be HostActivityView")
-        if self.thinking is not None and not isinstance(
-            self.thinking, HostThinkingView
-        ):
-            raise TypeError("HostEvent.thinking must be HostThinkingView")
         _require_non_empty(self.dedupe_key, field_name="HostEvent.dedupe_key")
         _require_optional_non_empty(
             self.error_message, field_name="HostEvent.error_message"
@@ -3390,8 +3491,6 @@ def _validate_host_event_terminal_payload(event: HostEvent) -> None:
             )
         return
 
-    if event.thinking is not None:
-        raise ValueError("HostEvent terminal kind must not include thinking")
     expected_status = _terminal_status_for_event_kind(event.kind)
     if event.terminal_status != expected_status:
         raise ValueError("HostEvent.terminal_status does not match kind")
@@ -3400,9 +3499,10 @@ def _validate_host_event_terminal_payload(event: HostEvent) -> None:
             raise ValueError("HostEvent succeeded kind requires final_answer")
         return
     if event.final_answer is not None:
-        raise ValueError(
-            "HostEvent failed, cancelled or lost kind must not include final_answer"
-        )
+        raise ValueError("HostEvent failed, cancelled or lost kind must not include final_answer")
+
+
+HostSessionEvent: TypeAlias = HostEvent | HostTransientDelta
 
 
 def _terminal_status_for_event_kind(kind: HostEventKind) -> HostTerminalStatus:
@@ -3472,13 +3572,10 @@ def _validate_outbox_read_page_fields(
         raise TypeError(f"{request_name}.seen_terminal_event_ids must be tuple")
     _require_positive_int(limit, field_name=f"{request_name}.limit")
     if limit > HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT:
-        raise ValueError(
-            f"{request_name}.limit must be <= " f"{HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT}"
-        )
+        raise ValueError(f"{request_name}.limit must be <= {HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT}")
     if len(seen_terminal_event_ids) > HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT:
         raise ValueError(
-            f"{request_name}.seen_terminal_event_ids length must be <= "
-            f"{HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT}"
+            f"{request_name}.seen_terminal_event_ids length must be <= {HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT}"
         )
     seen: set[str] = set()
     for terminal_event_id in seen_terminal_event_ids:
@@ -3802,11 +3899,11 @@ class Host(Protocol):
 
         ...
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
-        """创建 Session live HostEvent 订阅。
+    def watch_session_events(self, session_id: str) -> AsyncIterator[HostSessionEvent]:
+        """创建 Session durable/transient 联合事件订阅。
 
         :param session_id: 目标 Session id。
-        :returns: Host-owned typed event async iterator。
+        :returns: Host-owned typed durable/transient event async iterator。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: Session 不存在或不可 watch 时抛出。
         """
@@ -3862,15 +3959,22 @@ __all__ = [
     "HostActivitySeverity",
     "HostActivityStatus",
     "HostActivityView",
+    "HostContentDelta",
     "HostEvent",
     "HostEventClass",
     "HostEventKind",
     "HostFinalAnswerView",
     "HostMetadataEntry",
     "HostPayloadRef",
+    "HostReasoningDelta",
+    "HostSessionEvent",
     "HostStreamCursor",
     "HostTerminalStatus",
-    "HostThinkingView",
+    "HostToolCallDelta",
+    "HostTransientDelta",
+    "HostTransientDeltaData",
+    "HostTransientDeltaType",
+    "HOST_TRANSIENT_DELTA_TYPE_TO_DATA",
     "HostUnavailableDetail",
     "ListSessionsResult",
     "LocalEngineWorker",

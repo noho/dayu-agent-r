@@ -6,6 +6,7 @@ import asyncio
 import io
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -51,9 +52,12 @@ from dayu.host.api import (
     HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
+    HostReasoningDelta,
+    HostSessionEvent,
     HostStreamCursor,
     HostTerminalStatus,
-    HostThinkingView,
+    HostTransientDelta,
+    HostTransientDeltaType,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItemsBatch,
@@ -93,6 +97,7 @@ _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
     ("--debug-sse-throttle-sec", "1.0"),
 )
 _API_KEY = "test-provider-key"
+_TRANSIENT_OBSERVED_AT = datetime(2026, 7, 20, 1, 2, 3, tzinfo=UTC)
 
 
 async def _raise_cli_terminal_cursor_error(
@@ -124,7 +129,7 @@ class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostEvent | _StopSignal]
+    _queue: asyncio.Queue[HostSessionEvent | _StopSignal]
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -136,7 +141,7 @@ class _FakeHostEventIterator:
         self.closed_count = 0
         self._queue = asyncio.Queue()
 
-    def __aiter__(self) -> AsyncIterator[HostEvent]:
+    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -145,7 +150,7 @@ class _FakeHostEventIterator:
 
         return self
 
-    async def __anext__(self) -> HostEvent:
+    async def __anext__(self) -> HostSessionEvent:
         """读取下一条 Host event。
 
         :returns: HostEvent。
@@ -157,7 +162,7 @@ class _FakeHostEventIterator:
             raise StopAsyncIteration
         return item
 
-    async def push(self, event: HostEvent) -> None:
+    async def push(self, event: HostSessionEvent) -> None:
         """推入一条 Host event。
 
         :param event: 待推入事件。
@@ -272,7 +277,10 @@ class _FakeHost:
             slot = SessionSlotRef(scope=request.scope, slot_key=request.slot_key)
         return _session_snapshot(session_id="session-1", slot=slot)
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
+    def watch_session_events(
+        self,
+        session_id: str,
+    ) -> AsyncIterator[HostSessionEvent]:
         """记录 watcher attach。
 
         :param session_id: 目标 Session id。
@@ -788,10 +796,7 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
     assert prepared.runtime.host_assembly.options.wait_poller_policy is not None
     assert prepared.runtime.host_assembly.options.wait_poller_policy.enabled
     assert prepared.runtime.host_assembly.options.tooling_options is not None
-    assert (
-        prepared.runtime.host_assembly.options.tooling_options.wait_poll_adapter_registry
-        is not None
-    )
+    assert prepared.runtime.host_assembly.options.tooling_options.wait_poll_adapter_registry is not None
     fake_host = _FakeHost(
         submit_statuses=(
             HostTerminalStatus.SUCCEEDED,
@@ -2410,29 +2415,30 @@ def _activity_event(*, run_id: str) -> HostEvent:
     )
 
 
-def _thinking_event(*, run_id: str) -> HostEvent:
+def _thinking_event(*, run_id: str) -> HostTransientDelta:
     """构造 Host thinking event。
 
     :param run_id: Run id。
-    :returns: HostEvent。
+    :returns: HostTransientDelta。
     :raises Exception: 不主动抛出异常。
     """
 
-    return HostEvent(
-        event_id=f"thinking-{run_id}",
-        event_sequence=int(run_id.removeprefix("run-")),
+    runtime_sequence = int(run_id.removeprefix("run-"))
+    return HostTransientDelta(
+        runtime_id="runtime-1",
+        runtime_sequence=runtime_sequence,
         session_id="session-1",
         run_id=run_id,
-        event_class=HostEventClass.PREVIEW,
-        event_type="REASONING_DELTA",
-        kind=HostEventKind.PROGRESS,
-        activity=None,
-        thinking=HostThinkingView(text_delta="正在分析收入变化"),
+        attempt_id=f"attempt-{run_id}",
+        execution_id=f"execution-{run_id}",
+        worker_event_index=runtime_sequence,
+        observed_at=_TRANSIENT_OBSERVED_AT,
+        type=HostTransientDeltaType.REASONING_DELTA,
+        data=HostReasoningDelta(
+            iteration_id=f"iteration-{run_id}",
+            text_delta="正在分析收入变化",
+        ),
         dedupe_key=f"thinking-{run_id}",
-        terminal_status=None,
-        final_answer=None,
-        error_message=None,
-        cancel_reason=None,
     )
 
 
@@ -2451,7 +2457,8 @@ def _entrypoint_thinking(
 
     return EntrypointThinking(
         run_id="run-1",
-        event_sequence=1,
+        runtime_id="runtime-1",
+        runtime_sequence=1,
         dedupe_key=dedupe_key,
         text_delta=text_delta,
     )

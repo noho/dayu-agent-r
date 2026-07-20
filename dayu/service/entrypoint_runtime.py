@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import Final, Protocol, TypeAlias, assert_never, cast
 
 from dayu.contracts import JsonValue
 from dayu.host.api import (
@@ -27,10 +27,15 @@ from dayu.host.api import (
     HostActivitySeverity,
     HostActivityStatus,
     HostCallContext,
+    HostContentDelta,
     HostEvent,
     HostFinalAnswerView,
     HostMetadataEntry,
+    HostReasoningDelta,
+    HostSessionEvent,
     HostTerminalStatus,
+    HostToolCallDelta,
+    HostTransientDelta,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItem,
@@ -68,6 +73,9 @@ _WATCHER_FAILURE_DIAGNOSTIC_PREFIX: Final[str] = "watcher drain failed"
 _WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY: Final[str] = "entrypoint_watcher_failure"
 _WATCHER_FAILURE_ACTIVITY_TITLE: Final[str] = "运行事件流诊断"
 _WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT: Final[int] = 240
+_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY: Final[int] = 256
+
+
 class EntrypointRuntimeError(RuntimeError):
     """entrypoint runtime Service helper 观察 Host 终态失败时抛出的错误。"""
 
@@ -214,13 +222,15 @@ class EntrypointThinking:
     """entrypoint runtime 传给 UI adapter 的 running thinking 增量。
 
     :param run_id: 关联 Run id。
-    :param event_sequence: Host event sequence。
+    :param runtime_id: 当前 Host runtime 的 opaque identity。
+    :param runtime_sequence: 当前 runtime 的瞬态发布序列。
     :param dedupe_key: thinking 增量去重键。
     :param text_delta: 本次 thinking 增量文本。
     """
 
     run_id: str
-    event_sequence: int
+    runtime_id: str
+    runtime_sequence: int
     dedupe_key: str
     text_delta: str
 
@@ -228,15 +238,22 @@ class EntrypointThinking:
         """校验 thinking 增量字段。
 
         :returns: ``None``。
-        :raises ValueError: 文本字段为空或 sequence 小于零时抛出。
+        :raises TypeError: text delta 不是字符串时抛出。
+        :raises ValueError: identity 为空或 sequence 非正数时抛出。
         """
 
         _require_non_empty(self.run_id, field_name="EntrypointThinking.run_id")
-        _require_non_negative_int(
-            self.event_sequence, field_name="EntrypointThinking.event_sequence"
+        _require_non_empty(
+            self.runtime_id,
+            field_name="EntrypointThinking.runtime_id",
+        )
+        _require_positive_int(
+            self.runtime_sequence,
+            field_name="EntrypointThinking.runtime_sequence",
         )
         _require_non_empty(self.dedupe_key, field_name="EntrypointThinking.dedupe_key")
-        _require_non_empty(self.text_delta, field_name="EntrypointThinking.text_delta")
+        if not isinstance(self.text_delta, str):
+            raise TypeError("EntrypointThinking.text_delta must be str")
 
 
 EntrypointThinkingCallback = Callable[[EntrypointThinking], None]
@@ -439,22 +456,22 @@ class EntrypointStartupReconnectResult:
     seen_terminal_event_ids: frozenset[str]
 
 
-class ClosableHostEventIterator(Protocol):
-    """支持显式关闭的 HostEvent async iterator 窄协议。"""
+class ClosableHostSessionEventIterator(Protocol):
+    """支持显式关闭的 HostSessionEvent async iterator 窄协议。"""
 
-    def __aiter__(self) -> AsyncIterator[HostEvent]:
-        """返回 HostEvent async iterator。
+    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
+        """返回 HostSessionEvent async iterator。
 
-        :returns: HostEvent async iterator。
+        :returns: HostSessionEvent async iterator。
         :raises Exception: 具体实现可在不可用时抛出运行时错误。
         """
 
         ...
 
-    async def __anext__(self) -> HostEvent:
-        """读取下一条 HostEvent。
+    async def __anext__(self) -> HostSessionEvent:
+        """读取下一条 HostSessionEvent。
 
-        :returns: 下一条 HostEvent。
+        :returns: 下一条 HostSessionEvent。
         :raises StopAsyncIteration: iterator 结束时抛出。
         """
 
@@ -475,6 +492,23 @@ class _WatcherFailure:
     """watcher drain task 捕获到的异常。"""
 
     error: Exception
+
+
+_WatcherQueueItem: TypeAlias = HostSessionEvent | _WatcherFailure
+
+
+@dataclass(frozen=True, slots=True)
+class _WatchAndWaitRuntime:
+    """绑定一个 live watcher、有界 relay queue 与唯一 drain task。
+
+    :param watcher: 已 attach 的可关闭 Host Session event iterator。
+    :param queue: 容量由 Service 单一常量治理的 live relay queue。
+    :param drain_task: 顺序 relay Host items 的 drain task。
+    """
+
+    watcher: ClosableHostSessionEventIterator
+    queue: asyncio.Queue[_WatcherQueueItem]
+    drain_task: asyncio.Task[None]
 
 
 @dataclass(slots=True)
@@ -643,9 +677,7 @@ async def submit_entrypoint_turn_and_wait(
     """
 
     _require_positive_poll_interval(poll_interval_seconds)
-    watcher = _attach_watcher(host, request.session_id)
-    queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
-    drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    runtime = _create_watch_and_wait_runtime(host, request.session_id)
     state = _new_terminal_observation_state()
     try:
         submit_request = compose_submit_followup_request_with_overrides(
@@ -667,7 +699,7 @@ async def submit_entrypoint_turn_and_wait(
             host,
             session_id=request.session_id,
             run_id=followup.accepted_run_id,
-            queue=queue,
+            queue=runtime.queue,
             state=state,
             on_activity=on_activity,
             on_thinking=on_thinking,
@@ -676,7 +708,7 @@ async def submit_entrypoint_turn_and_wait(
             sleep=sleep,
         )
     finally:
-        await _close_watcher(watcher=watcher, drain_task=drain_task)
+        await _close_watch_and_wait_runtime(runtime)
 
 
 async def cancel_entrypoint_run_and_wait(
@@ -704,7 +736,7 @@ async def cancel_entrypoint_run_and_wait(
     run_snapshot = await host.get_run(request.run_id)
     state = _new_terminal_observation_state()
     if is_terminal_run_status(run_snapshot.status):
-        queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
+        queue: asyncio.Queue[_WatcherQueueItem] = asyncio.Queue()
         return await _wait_for_terminal(
             host,
             session_id=run_snapshot.session_id,
@@ -715,9 +747,7 @@ async def cancel_entrypoint_run_and_wait(
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
-    watcher = _attach_watcher(host, run_snapshot.session_id)
-    queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
-    drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    runtime = _create_watch_and_wait_runtime(host, run_snapshot.session_id)
     allow_outbox_terminal_fallback = False
     try:
         try:
@@ -739,14 +769,14 @@ async def cancel_entrypoint_run_and_wait(
             host,
             session_id=run_snapshot.session_id,
             run_id=request.run_id,
-            queue=queue,
+            queue=runtime.queue,
             state=state,
             allow_outbox_terminal_fallback=allow_outbox_terminal_fallback,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
     finally:
-        await _close_watcher(watcher=watcher, drain_task=drain_task)
+        await _close_watch_and_wait_runtime(runtime)
 
 
 async def startup_reconnect_entrypoint_session(
@@ -766,9 +796,7 @@ async def startup_reconnect_entrypoint_session(
     :raises HostApiError: Host public API 调用失败时由 Host 抛出。
     """
 
-    watcher = _attach_watcher(host, request.session_id)
-    queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
-    drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    runtime = _create_watch_and_wait_runtime(host, request.session_id)
     state = _new_terminal_observation_state(
         terminal_cursor=request.terminal_cursor,
         seen_terminal_event_ids=request.seen_terminal_event_ids,
@@ -786,12 +814,15 @@ async def startup_reconnect_entrypoint_session(
             )
         )
         terminal_results.extend(
-            _drain_available_startup_terminal_items(queue=queue, state=state)
+            _drain_available_startup_terminal_items(
+                queue=runtime.queue,
+                state=state,
+            )
         )
         await _observe_startup_active_and_queued_runs(
             host,
             request=request,
-            queue=queue,
+            queue=runtime.queue,
             state=state,
             terminal_results=terminal_results,
             sleep=sleep,
@@ -804,14 +835,14 @@ async def startup_reconnect_entrypoint_session(
             seen_terminal_event_ids=frozenset(state.seen_terminal_event_ids),
         )
     finally:
-        await _close_watcher(watcher=watcher, drain_task=drain_task)
+        await _close_watch_and_wait_runtime(runtime)
 
 
 async def _observe_startup_active_and_queued_runs(
     host: Host,
     *,
     request: EntrypointStartupReconnectRequest,
-    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    queue: asyncio.Queue[_WatcherQueueItem],
     state: _TerminalObservationState,
     terminal_results: list[EntrypointRunTerminalResult],
     sleep: Callable[[float], Awaitable[None]],
@@ -892,7 +923,7 @@ async def _close_startup_idle_tail(
     host: Host,
     *,
     request: EntrypointStartupReconnectRequest,
-    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    queue: asyncio.Queue[_WatcherQueueItem],
     state: _TerminalObservationState,
     terminal_results: list[EntrypointRunTerminalResult],
     sleep: Callable[[float], Awaitable[None]],
@@ -924,10 +955,7 @@ async def _close_startup_idle_tail(
         state=state,
     )
     terminal_results.extend(tail_live_results)
-    watcher_failed_during_tail = (
-        watcher_failure_before_drain is None
-        and state.watcher_failure_message is not None
-    )
+    watcher_failed_during_tail = watcher_failure_before_drain is None and state.watcher_failure_message is not None
     return bool(tail_outbox_results or tail_live_results or watcher_failed_during_tail)
 
 
@@ -964,25 +992,54 @@ async def _wait_for_startup_promotion(
     )
 
 
-def _attach_watcher(host: Host, session_id: str) -> ClosableHostEventIterator:
+def _attach_watcher(
+    host: Host,
+    session_id: str,
+) -> ClosableHostSessionEventIterator:
     """在 Host mutating command 前 attach live watcher。
 
     :param host: Host public Protocol handle。
     :param session_id: 目标 Session id。
-    :returns: 可关闭 HostEvent iterator。
+    :returns: 可关闭 HostSessionEvent iterator。
     :raises HostApiError: Host watch attach 失败时由 Host 抛出。
     """
 
-    return cast(ClosableHostEventIterator, host.watch_session_events(session_id))
+    return cast(
+        ClosableHostSessionEventIterator,
+        host.watch_session_events(session_id),
+    )
+
+
+def _create_watch_and_wait_runtime(
+    host: Host,
+    session_id: str,
+) -> _WatchAndWaitRuntime:
+    """唯一构造实际承接 live watcher items 的有界 relay runtime。
+
+    :param host: Host public Protocol handle。
+    :param session_id: 目标 Session 标识。
+    :returns: 已 attach watcher、有界 queue 与 drain task 的绑定 runtime。
+    :raises HostApiError: Host watch attach 失败时由 Host 抛出。
+    :raises RuntimeError: asyncio task 创建失败时透传。
+    """
+
+    watcher = _attach_watcher(host, session_id)
+    queue: asyncio.Queue[_WatcherQueueItem] = asyncio.Queue(maxsize=_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY)
+    drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    return _WatchAndWaitRuntime(
+        watcher=watcher,
+        queue=queue,
+        drain_task=drain_task,
+    )
 
 
 async def _drain_host_events(
-    watcher: ClosableHostEventIterator,
-    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    watcher: ClosableHostSessionEventIterator,
+    queue: asyncio.Queue[_WatcherQueueItem],
 ) -> None:
     """把 watcher 事件转存到本地 queue。
 
-    :param watcher: 已 attach 的 HostEvent iterator。
+    :param watcher: 已 attach 的 HostSessionEvent iterator。
     :param queue: 本地事件队列。
     :returns: ``None``。
     :raises asyncio.CancelledError: drain task 被取消时透传。
@@ -997,27 +1054,26 @@ async def _drain_host_events(
         await queue.put(_WatcherFailure(error=exc))
 
 
-async def _close_watcher(*, watcher: ClosableHostEventIterator, drain_task: asyncio.Task[None]) -> None:
-    """关闭 watcher 并回收 drain task。
+async def _close_watch_and_wait_runtime(runtime: _WatchAndWaitRuntime) -> None:
+    """关闭 live watcher runtime 并回收唯一 drain task。
 
-    :param watcher: 待关闭 watcher。
-    :param drain_task: watcher drain task。
+    :param runtime: 待关闭的 watcher/queue/task 绑定 runtime。
     :returns: ``None``。
     :raises asyncio.CancelledError: watcher ``aclose`` 或 drain task 被取消时透传。
     :raises Exception: watcher ``aclose`` 失败时向上抛出。
     """
 
     try:
-        if not drain_task.done():
-            drain_task.cancel()
+        if not runtime.drain_task.done():
+            runtime.drain_task.cancel()
         try:
-            await drain_task
+            await runtime.drain_task
         except asyncio.CancelledError:
             pass
     finally:
         # 对 async generator watcher，必须先停止正在执行的 drain task，再调用
         # aclose；否则会触发 "asynchronous generator is already running"。
-        await watcher.aclose()
+        await runtime.watcher.aclose()
 
 
 async def _wait_for_terminal(
@@ -1025,7 +1081,7 @@ async def _wait_for_terminal(
     *,
     session_id: str,
     run_id: str,
-    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    queue: asyncio.Queue[_WatcherQueueItem],
     state: _TerminalObservationState,
     on_activity: EntrypointActivityCallback | None = None,
     on_thinking: EntrypointThinkingCallback | None = None,
@@ -1100,7 +1156,7 @@ def _should_read_outbox_terminal(
 
 def _drain_available_watcher_items(
     *,
-    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    queue: asyncio.Queue[_WatcherQueueItem],
     state: _TerminalObservationState,
     run_id: str,
     on_activity: EntrypointActivityCallback | None = None,
@@ -1130,25 +1186,30 @@ def _drain_available_watcher_items(
                 on_activity=on_activity,
             )
             continue
-        terminal = _terminal_result_from_live_event(
-            item,
-            run_id=run_id,
-            state=state,
-        )
-        if terminal is not None:
-            return terminal
-        _emit_entrypoint_activity_from_host_event(
-            event=item,
-            state=state,
-            run_id=run_id,
-            on_activity=on_activity,
-        )
-        _emit_entrypoint_thinking_from_host_event(
-            event=item,
-            state=state,
-            run_id=run_id,
-            on_thinking=on_thinking,
-        )
+        if isinstance(item, HostEvent):
+            terminal = _terminal_result_from_live_event(
+                item,
+                run_id=run_id,
+                state=state,
+            )
+            if terminal is not None:
+                return terminal
+            _emit_entrypoint_activity_from_host_event(
+                event=item,
+                state=state,
+                run_id=run_id,
+                on_activity=on_activity,
+            )
+            continue
+        if isinstance(item, HostTransientDelta):
+            _emit_entrypoint_thinking_from_transient_delta(
+                event=item,
+                state=state,
+                run_id=run_id,
+                on_thinking=on_thinking,
+            )
+            continue
+        assert_never(item)
 
 
 def _emit_entrypoint_activity_from_host_event(
@@ -1204,16 +1265,16 @@ def _entrypoint_activity_from_host_event(event: HostEvent) -> EntrypointActivity
     )
 
 
-def _emit_entrypoint_thinking_from_host_event(
+def _emit_entrypoint_thinking_from_transient_delta(
     *,
-    event: HostEvent,
+    event: HostTransientDelta,
     state: _TerminalObservationState,
     run_id: str,
     on_thinking: EntrypointThinkingCallback | None,
 ) -> None:
-    """把非终态 Host public thinking 投影给 Service thinking callback。
+    """只把 Host reasoning delta 投影给 Service thinking callback。
 
-    :param event: Host public event。
+    :param event: Host public 瞬态增量。
     :param state: 本轮本地观察状态。
     :param run_id: 当前等待的目标 Run id。
     :param on_thinking: 可选 thinking 回调。
@@ -1221,34 +1282,39 @@ def _emit_entrypoint_thinking_from_host_event(
     :raises Exception: callback 抛出的异常会向调用方透传。
     """
 
-    if on_thinking is None or event.terminal_status is not None or event.thinking is None:
+    if on_thinking is None or event.run_id != run_id:
         return
-    if event.run_id != run_id:
+    data = event.data
+    if isinstance(data, HostContentDelta):
         return
+    if isinstance(data, HostToolCallDelta):
+        return
+    if not isinstance(data, HostReasoningDelta):
+        assert_never(data)
     if event.dedupe_key in state.seen_thinking_dedupe_keys:
         return
     state.seen_thinking_dedupe_keys.add(event.dedupe_key)
-    on_thinking(_entrypoint_thinking_from_host_event(event))
+    on_thinking(_entrypoint_thinking_from_transient_delta(event, data))
 
 
-def _entrypoint_thinking_from_host_event(event: HostEvent) -> EntrypointThinking:
-    """把 Host public thinking view 转为 entrypoint thinking。
+def _entrypoint_thinking_from_transient_delta(
+    event: HostTransientDelta,
+    data: HostReasoningDelta,
+) -> EntrypointThinking:
+    """把 Host public reasoning delta 转为 entrypoint thinking。
 
-    :param event: Host public event，必须携带 ``thinking`` 和 ``run_id``。
+    :param event: Host public transient envelope。
+    :param data: 已穷举分支出的 reasoning payload。
     :returns: entrypoint thinking DTO。
-    :raises ValueError: event 未携带 thinking 或 run id 时抛出。
+    :raises ValueError: public DTO identity 校验失败时抛出。
     """
 
-    thinking = event.thinking
-    if thinking is None:
-        raise ValueError("HostEvent.thinking is required")
-    if event.run_id is None:
-        raise ValueError("HostEvent.run_id is required")
     return EntrypointThinking(
         run_id=event.run_id,
-        event_sequence=event.event_sequence,
+        runtime_id=event.runtime_id,
+        runtime_sequence=event.runtime_sequence,
         dedupe_key=event.dedupe_key,
-        text_delta=thinking.text_delta,
+        text_delta=data.text_delta,
     )
 
 
@@ -1555,10 +1621,7 @@ def _scan_session_outbox_terminal_items(
             state.last_observed_event_sequence,
             item.event_sequence,
         )
-        duplicate = (
-            item.terminal_event_id in state.seen_terminal_event_ids
-            or item.dedupe_key in state.seen_dedupe_keys
-        )
+        duplicate = item.terminal_event_id in state.seen_terminal_event_ids or item.dedupe_key in state.seen_dedupe_keys
         # Outbox 是 terminal 投递真源；即使与 live dedupe，也要记录其 terminal id。
         state.seen_terminal_event_ids.add(item.terminal_event_id)
         if duplicate:
@@ -1575,7 +1638,7 @@ def _scan_session_outbox_terminal_items(
 
 def _drain_available_startup_terminal_items(
     *,
-    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    queue: asyncio.Queue[_WatcherQueueItem],
     state: _TerminalObservationState,
 ) -> tuple[EntrypointRunTerminalResult, ...]:
     """消费 startup watcher queue 中已到达的 terminal events。
@@ -1595,9 +1658,14 @@ def _drain_available_startup_terminal_items(
         if isinstance(item, _WatcherFailure):
             _record_watcher_failure(state=state, error=item.error)
             continue
-        terminal = _startup_terminal_result_from_live_event(item, state=state)
-        if terminal is not None:
-            results.append(terminal)
+        if isinstance(item, HostEvent):
+            terminal = _startup_terminal_result_from_live_event(item, state=state)
+            if terminal is not None:
+                results.append(terminal)
+            continue
+        if isinstance(item, HostTransientDelta):
+            continue
+        assert_never(item)
 
 
 def _startup_terminal_result_from_live_event(
@@ -1619,10 +1687,7 @@ def _startup_terminal_result_from_live_event(
     )
     if event.terminal_status is None or event.run_id is None:
         return None
-    duplicate = (
-        event.event_id in state.seen_terminal_event_ids
-        or event.dedupe_key in state.seen_dedupe_keys
-    )
+    duplicate = event.event_id in state.seen_terminal_event_ids or event.dedupe_key in state.seen_dedupe_keys
     state.seen_event_ids.add(event.event_id)
     state.seen_terminal_event_ids.add(event.event_id)
     if duplicate:
@@ -1853,6 +1918,22 @@ def _require_non_negative_int(value: int, *, field_name: str) -> None:
         raise TypeError(f"{field_name} must be int")
     if value < 0:
         raise ValueError(f"{field_name} must be non-negative")
+
+
+def _require_positive_int(value: int, *, field_name: str) -> None:
+    """校验值为正的严格整数。
+
+    :param value: 待校验整数。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是严格整数时抛出。
+    :raises ValueError: 值不是正数时抛出。
+    """
+
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be int")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
 
 
 def _require_positive_poll_interval(value: float) -> None:

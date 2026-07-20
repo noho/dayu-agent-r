@@ -284,6 +284,23 @@ control doc 每次更新只记录：
 - plan / implementation / accepted findings / aggregate deepreview 全部关闭后，sub-WU 才算 locally accepted。
 - 若 aggregate residual 已分类且有 destination，可进入下一个 sub-WU 或 full-repository review。
 
+## Completed Finding Fix Batch: WU-CLI-SMOKE-01-R1 Slice 1
+
+- Source reviews: `docs/reviews/code-review-20260721-005108.md` 与 `docs/reviews/code-review-20260721-005320.md`。
+- Controller adjudication: `docs/reviews/wu-cli-smoke-01-r1-slice1-code-review-controller-adjudication.md`。
+- Risk: Low Risk / `test-harness-low`；只接受 DS-F03 renderer close owner-level direct test，不修改生产代码。
+- Batch policy: 单一 test-only fix batch，不按 finding 或文件继续拆 slice。
+- Review policy: 附加总控允许单路 narrow re-review，但用户已指定 AgentMiMo / AgentDS 两路同时 review，因此本批仍执行双路 narrow re-review。
+- Validation: focused renderer test、prompt / interactive CLI regression、全量 pyright、`git diff --check`。
+- Deferred owner: DS-F02 归本 WU Slice 2 的真实 Host → Service → CLI transient / slow-consumer E2E；不得作为本低风险 batch 的 fake-only 扩 scope。
+- Rejected item: DS-F01 描述的 late delta 在下一次 `drain_nowait()` 会被 terminal set 过滤，未形成 terminal 后交付；Slice 2 barrier 继续验证既定并发 acceptance。
+- Baseline residual: none。
+- Fix artifact: `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-codex.md`；test-only fix complete。
+- Controller validation: `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-controller-validation.md`；99 tests passed、pyright 0 errors、diff check pass。
+- Re-review artifacts: `docs/reviews/code-review-20260721-011148.md` 与 `docs/reviews/code-review-20260721-010824.md`；两路均确认 DS-F03 fixed，无新增 material defect。
+- Re-review adjudication: `docs/reviews/wu-cli-smoke-01-r1-slice1-code-rereview-controller-adjudication.md`；decision=`accepted-slice1-rereview`。
+- Final batch status: completed。Next entry point 回到主 control doc 的 accepted Slice 1 commit gate；DS-F02 继续由 Slice 2 owner 收口。
+
 ## 下次使用方式
 
 用户可要求：

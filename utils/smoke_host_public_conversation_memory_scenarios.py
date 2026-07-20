@@ -80,6 +80,7 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    HostSessionEvent,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
@@ -4032,7 +4033,7 @@ def _host_context(request_id: str) -> HostCallContext:
 async def _run_round(
     *,
     host: Host,
-    watcher: AsyncIterator[HostEvent],
+    watcher: AsyncIterator[HostSessionEvent],
     session_id: str,
     spec: RoundSpec,
     client_request_id: str,
@@ -4041,7 +4042,7 @@ async def _run_round(
     """提交一轮 prompt 并等待 terminal HostEvent。
 
     :param host: public Host handle。
-    :param watcher: session-level HostEvent iterator。
+    :param watcher: session-level durable/transient 联合事件 iterator。
     :param session_id: Session id。
     :param spec: 本轮场景规格。
     :param client_request_id: 幂等请求 id。
@@ -4139,10 +4140,12 @@ def _safe_summary_text(text: str | None) -> str:
     return text[:max_length] + "..."
 
 
-async def _next_terminal_for_run(iterator: AsyncIterator[HostEvent], run_id: str) -> HostEvent:
+async def _next_terminal_for_run(
+    iterator: AsyncIterator[HostSessionEvent], run_id: str
+) -> HostEvent:
     """读取指定 Run 的 terminal HostEvent。
 
-    :param iterator: HostEvent iterator。
+    :param iterator: Host durable/transient 联合事件 iterator。
     :param run_id: Run id。
     :returns: terminal HostEvent。
     :raises TimeoutError: 超时未收到 terminal event 时抛出。
@@ -4154,6 +4157,8 @@ async def _next_terminal_for_run(iterator: AsyncIterator[HostEvent], run_id: str
             anext(iterator),
             timeout=_TERMINAL_TIMEOUT_SECONDS,
         )
+        if not isinstance(event, HostEvent):
+            continue
         if event.run_id == run_id and event.terminal_status is not None:
             return event
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
+
 import asyncio
 import json
 import sqlite3
@@ -707,6 +709,7 @@ def test_clean_eof_without_terminal_closes_failed(tmp_path: Path) -> None:
         wakeup = _WakeupSpy()
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
         )
         result = ingestor.close_clean_eof(
@@ -745,7 +748,8 @@ def test_stream_error_or_worker_crash_closes_lost(tmp_path: Path) -> None:
         seeded = _seed_active_run(store.transaction_runner)
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_worker_lost(
             _envelope(seeded),
             observed_at=_NOW,
@@ -794,7 +798,8 @@ def test_run_cancelled_after_active_cancel_closes_cancelled(tmp_path: Path) -> N
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -1092,6 +1097,7 @@ async def _open_scheduler(
 
     return await HostDispatchScheduler.open(
         transaction_runner=store.transaction_runner,
+        transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         local_execution=HostLocalExecutionOptions(
             lane_db_path=tmp_path / "lane.sqlite3",
             lane_name=_LANE_NAME,

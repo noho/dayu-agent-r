@@ -9,7 +9,6 @@ Host Attempt identity；attempt / execution / dispatch identity 只来自
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -70,7 +69,14 @@ from dayu.host.admission import (
     NoopAdmissionWakeupPort,
     PendingDispatchRecord,
 )
-from dayu.host.api import AttemptStatus, RunStatus
+from dayu.host.api import (
+    AttemptStatus,
+    HostContentDelta,
+    HostReasoningDelta,
+    HostToolCallDelta,
+    HostTransientDeltaType,
+    RunStatus,
+)
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
@@ -226,6 +232,10 @@ from dayu.host.tool_trace_signals import (
     PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE,
     PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT,
 )
+from dayu.host.transient_delta import (
+    HostTransientDeltaPublisher,
+    ValidatedTransientDeltaCandidate,
+)
 from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -254,9 +264,7 @@ _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
-_EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED = (
-    "RUNNER_CALL_INPUT_ITERATION_LINKED"
-)
+_EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED = "RUNNER_CALL_INPUT_ITERATION_LINKED"
 _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
 _REASON_FINAL_ANSWER = "final_answer"
@@ -266,26 +274,16 @@ _REASON_STREAM_ENDED_WITHOUT_TERMINAL = "stream_ended_without_terminal"
 _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
-_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED = (
-    "terminal_closeout_precondition_failed"
-)
+_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED = "terminal_closeout_precondition_failed"
 _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL = "late_terminal_after_active_cancel"
-_REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL = (
-    "host_lifecycle_after_active_cancel"
-)
+_REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL = "host_lifecycle_after_active_cancel"
 _REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
-_REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
-    "waiting_event_without_host_accepted_refs"
-)
-_REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = (
-    "run_cancelled_invalid_active_cancel_link"
-)
+_REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = "waiting_event_without_host_accepted_refs"
+_REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = "run_cancelled_invalid_active_cancel_link"
 _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
 _REASON_AMBIGUOUS_RUNNER_CALL_MANIFEST = "ambiguous_runner_call_manifest"
-_REASON_RUNNER_CALL_ITERATION_LINK_CONFLICT = (
-    "runner_call_iteration_link_conflict"
-)
+_REASON_RUNNER_CALL_ITERATION_LINK_CONFLICT = "runner_call_iteration_link_conflict"
 _REASON_RUNNER_CALL_MANIFEST_MISMATCH = "runner_call_manifest_mismatch"
 _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
 _REACTIVE_PRECONDITION_OPERATION_PREFIX = "reactive_precondition"
@@ -304,13 +302,9 @@ _RUNNER_CALL_MANIFEST_REASON_MISSING_PROJECTION = "missing_projection_artifact"
 _RUNNER_CALL_MANIFEST_REASON_MESSAGE_COUNT = "message_count_mismatch"
 _RUNNER_CALL_MANIFEST_REASON_ROLE_DIGEST = "role_sequence_digest_mismatch"
 _RUNNER_CALL_MANIFEST_REF_PREFIX = "payload-runner-call-input-manifest"
-_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
-    "sqlite-payload-runner-call-input-manifest"
-)
+_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-runner-call-input-manifest"
 _RUNNER_CALL_PROJECTION_REF_PREFIX = "payload-runner-call-input-projection"
-_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX = (
-    "sqlite-payload-runner-call-input-projection"
-)
+_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-runner-call-input-projection"
 _RUNNER_CALL_MANIFEST_ID_PREFIX = "runner-call-manifest"
 _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH = "initial_user_dispatch"
 _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH = "followup_user_dispatch"
@@ -318,9 +312,7 @@ _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH = "post_compaction_dispatch"
 _RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION = "tool_result_continuation"
 _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
 _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE = "tool_results_available"
-_RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT = (
-    "artifact_ref"
-)
+_RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT = "artifact_ref"
 _RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION = "tool_continuation_input"
 _ORDINARY_RUNNER_CALL_KINDS = frozenset(
     (
@@ -401,6 +393,8 @@ class EngineIngestResult:
     :param terminal_closeout: 本次是否完成 Run terminal closeout。
     :param promotion_triggered: terminal closeout 成功后是否触发 queue promotion wakeup。
     :param reason: 诊断 reason；无时为 ``None``。
+    :param transient_delta: 事务提交后待发布的已验证瞬态候选；其它结果为
+        ``None``。
     :param stop_worker_stream: 本次是否要求 scheduler 停止当前 worker stream。
     """
 
@@ -409,6 +403,7 @@ class EngineIngestResult:
     terminal_closeout: bool
     promotion_triggered: bool
     reason: str | None
+    transient_delta: ValidatedTransientDeltaCandidate | None
     stop_worker_stream: bool = False
 
 
@@ -677,10 +672,58 @@ class _StartReactiveRecoveryOperation:
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                transient_delta=None,
                 stop_worker_stream=True,
             ),
             pending_dispatch=pending_dispatch,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _IngestValidatedOperation:
+    """在单笔 durable transaction 内完成 identity/late 校验与 ingest。
+
+    :param ingestor: 拥有 durable primitives 的 ingestor。
+    :param candidate: 待校验 Engine event candidate。
+    """
+
+    ingestor: EngineEventIngestor
+    candidate: EngineEventCandidate
+
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> EngineIngestResult | _ReactiveRecoveryAccepted | _ReactiveCompactPending:
+        """执行 candidate durable validation 与 validated ingest。
+
+        :param transaction: 当前 Host write transaction。
+        :returns: ingest 结果、reactive recovery 摘要或待 compact 摘要。
+        :raises HostDurableError: durable 读取或写入失败时抛出。
+        """
+
+        context = self.ingestor._validate_durable_context(
+            transaction,
+            self.candidate,
+        )
+        if context is None:
+            return self.ingestor._append_rejected_diagnostic(
+                transaction,
+                candidate=self.candidate,
+                reason=_REASON_STALE_EXECUTION_ID,
+            )
+        duplicate = self.ingestor._duplicate_engine_terminal_result(
+            transaction,
+            context,
+        )
+        if duplicate is not None:
+            return duplicate
+        late = _late_engine_event_rejection_reason(context)
+        if late is not None:
+            return self.ingestor._append_rejected_diagnostic(
+                transaction,
+                candidate=self.candidate,
+                reason=late,
+            )
+        return self.ingestor._ingest_validated(transaction, context)
 
 
 class EngineEventIngestor:
@@ -690,6 +733,7 @@ class EngineEventIngestor:
         self,
         *,
         transaction_runner: HostTransactionRunner,
+        transient_delta_publisher: HostTransientDeltaPublisher,
         event_log_store: EventLogStore | None = None,
         payload_store: PayloadStore | None = None,
         wakeup_port: AdmissionWakeupPort | None = None,
@@ -705,6 +749,7 @@ class EngineEventIngestor:
         """初始化 EngineEvent ingestor。
 
         :param transaction_runner: Host durable transaction runner。
+        :param transient_delta_publisher: validation transaction 提交后的瞬态发布端口。
         :param event_log_store: EventLog primitive。
         :param payload_store: payload descriptor primitive。
         :param wakeup_port: terminal closeout 后的 queue promotion wakeup 端口。
@@ -718,27 +763,18 @@ class EngineEventIngestor:
         """
 
         self._transaction_runner = transaction_runner
-        self._event_log_store = (
-            event_log_store if event_log_store is not None else EventLogStore()
-        )
-        self._payload_store = (
-            payload_store if payload_store is not None else PayloadStore()
-        )
-        self._wakeup_port = (
-            wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort()
-        )
+        self._transient_delta_publisher = transient_delta_publisher
+        self._event_log_store = event_log_store if event_log_store is not None else EventLogStore()
+        self._payload_store = payload_store if payload_store is not None else PayloadStore()
+        self._wakeup_port = wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort()
         self._context_budget_policy = context_budget_policy
         self._context_compactor = context_compactor
         self._compact_artifact_root = compact_artifact_root
         self._compact_artifact_create_parent_dirs = compact_artifact_create_parent_dirs
         self._memory_projection_policy = (
-            memory_projection_policy
-            if memory_projection_policy is not None
-            else default_memory_projection_policy()
+            memory_projection_policy if memory_projection_policy is not None else default_memory_projection_policy()
         )
-        self._memory_projection_catchup_batch_size = (
-            memory_projection_catchup_batch_size
-        )
+        self._memory_projection_catchup_batch_size = memory_projection_catchup_batch_size
 
     def ingest(self, candidate: EngineEventCandidate) -> EngineIngestResult:
         """同步接收一个不需要 reactive compaction 的 EngineEvent candidate。
@@ -808,30 +844,8 @@ class EngineEventIngestor:
             candidate.engine_event.type.value,
         )
 
-        def _operation(
-            transaction: HostTransaction,
-        ) -> EngineIngestResult | _ReactiveRecoveryAccepted | _ReactiveCompactPending:
-            context = self._validate_durable_context(transaction, candidate)
-            if context is None:
-                return self._append_rejected_diagnostic(
-                    transaction,
-                    candidate=candidate,
-                    reason=_REASON_STALE_EXECUTION_ID,
-                )
-            duplicate = self._duplicate_engine_terminal_result(transaction, context)
-            if duplicate is not None:
-                return duplicate
-            late = _late_engine_event_rejection_reason(context)
-            if late is not None:
-                return self._append_rejected_diagnostic(
-                    transaction,
-                    candidate=candidate,
-                    reason=late,
-                )
-            return self._ingest_validated(transaction, context)
-
         try:
-            return self._transaction_runner.run_write(_operation)
+            return self._transaction_runner.run_write(_IngestValidatedOperation(ingestor=self, candidate=candidate))
         except _TerminalCloseoutRollback:
             return _terminal_closeout_precondition_failed_result()
 
@@ -854,6 +868,11 @@ class EngineEventIngestor:
             result,
             session_id=promotion_triggered_session_id,
         )
+        if promoted.transient_delta is not None:
+            _publish_transient_delta(
+                self._transient_delta_publisher,
+                promoted.transient_delta,
+            )
         _LOGGER.log(
             _engine_ingest_log_level(candidate.engine_event.type),
             (
@@ -893,16 +912,14 @@ class EngineEventIngestor:
         existing = _existing_rows(self._event_log_store, transaction, event_ids)
         if len(existing) != len(event_ids):
             return None
-        if (
-            context.candidate.engine_event.type
-            == EngineEventType.CONTEXT_COMPACTION_REQUESTED
-        ):
+        if context.candidate.engine_event.type == EngineEventType.CONTEXT_COMPACTION_REQUESTED:
             return EngineIngestResult(
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason="duplicate_candidate",
+                transient_delta=None,
                 stop_worker_stream=True,
             )
         return EngineIngestResult(
@@ -911,6 +928,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason="duplicate_candidate",
+            transient_delta=None,
         )
 
     def _duplicate_host_lifecycle_terminal_result(
@@ -936,6 +954,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason="duplicate_candidate",
+            transient_delta=None,
         )
 
     def close_clean_eof(
@@ -1019,16 +1038,9 @@ class EngineEventIngestor:
         """
 
         event = context.candidate.engine_event
-        if event.type == EngineEventType.REASONING_DELTA and isinstance(
-            event.data, ReasoningDeltaData
-        ):
-            row = self._append_preview_event(transaction, context)
-            return _single_event_result(row)
         if _is_transient_delta_event(event):
-            return _accepted_no_event_result()
-        if event.type == EngineEventType.FINAL_ANSWER and isinstance(
-            event.data, FinalAnswerData
-        ):
+            return _accepted_no_event_result(_validated_transient_delta_candidate(context, event))
+        if event.type == EngineEventType.FINAL_ANSWER and isinstance(event.data, FinalAnswerData):
             return self._close_terminal(
                 transaction,
                 context,
@@ -1247,6 +1259,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason=terminal.reason,
+                transient_delta=None,
             )
         descriptor = self._write_terminal_payload(
             transaction,
@@ -1301,6 +1314,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason=terminal.reason,
+            transient_delta=None,
         )
 
     def _close_host_lifecycle_terminal(
@@ -1335,6 +1349,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason=terminal.reason,
+                transient_delta=None,
             )
         descriptor = self._write_host_lifecycle_terminal_payload(
             transaction,
@@ -1390,6 +1405,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason=terminal.reason,
+            transient_delta=None,
         )
 
     def _close_active_cancel(
@@ -1431,6 +1447,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason=data.reason,
+                transient_delta=None,
             )
         cancel_requested = read_cancel_requested_event_from_run_link(
             transaction,
@@ -1469,6 +1486,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason="active_cancel_closeout_precondition_failed",
+                transient_delta=None,
             )
         rows = _existing_rows(
             self._event_log_store,
@@ -1481,6 +1499,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason=data.reason,
+            transient_delta=None,
         )
 
     def _start_reactive_context_recovery(
@@ -1497,7 +1516,6 @@ class EngineEventIngestor:
         :returns: ingest 结果或 compact accepted 后的待启动摘要。
         """
 
-        candidate = context.candidate
         policy = self._context_budget_policy
         if policy is None:
             return self._fail_reactive_recovery_without_request(
@@ -1575,8 +1593,7 @@ class EngineEventIngestor:
             )
         except Exception:
             _LOGGER.error(
-                "engine_ingest.reactive_compact_material_source_failed "
-                "session_id=%s run_id=%s",
+                "engine_ingest.reactive_compact_material_source_failed session_id=%s run_id=%s",
                 context.run.session_id,
                 context.run.run_id,
                 exc_info=True,
@@ -1615,6 +1632,7 @@ class EngineEventIngestor:
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                transient_delta=None,
                 stop_worker_stream=True,
             ),
             context=context,
@@ -1682,6 +1700,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+            transient_delta=None,
         )
 
     def _close_attempt_for_context_recovery(
@@ -1726,6 +1745,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                transient_delta=None,
             )
         result = close_attempt_for_context_recovery_in_transaction(
             transaction,
@@ -1752,6 +1772,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason="context_recovery_close_precondition_failed",
+                transient_delta=None,
             )
         rows = _existing_rows(
             self._event_log_store,
@@ -1764,6 +1785,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+            transient_delta=None,
         )
 
     def _committed_reactive_compact_count(
@@ -1814,11 +1836,7 @@ class EngineEventIngestor:
         """
 
         candidate = context.candidate
-        policy_ref = (
-            self._context_budget_policy.policy_ref
-            if self._context_budget_policy is not None
-            else "none"
-        )
+        policy_ref = self._context_budget_policy.policy_ref if self._context_budget_policy is not None else "none"
         return self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
@@ -1926,10 +1944,7 @@ class EngineEventIngestor:
             )
             if latest is None:
                 return pending.result_prefix
-            sequence_stale = (
-                latest.run.input_event_sequence
-                != pending.expected_input_event_sequence
-            )
+            sequence_stale = latest.run.input_event_sequence != pending.expected_input_event_sequence
             if latest.run.status is RunStatus.RECOVERING and sequence_stale:
                 stale_failed = self._append_reactive_compaction_failed_event(
                     transaction,
@@ -1949,12 +1964,10 @@ class EngineEventIngestor:
                     terminal_closeout=False,
                     promotion_triggered=False,
                     reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                    transient_delta=None,
                     stop_worker_stream=True,
                 )
-            if (
-                latest.run.status is not RunStatus.RECOVERING
-                or not is_terminal_attempt_status(latest.attempt.status)
-            ):
+            if latest.run.status is not RunStatus.RECOVERING or not is_terminal_attempt_status(latest.attempt.status):
                 return pending.result_prefix
             attempt_rows: list[EventLogRow] = []
             for rejected in operation_result.rejected_attempts:
@@ -1971,9 +1984,7 @@ class EngineEventIngestor:
                 or operation_result.quality_result is None
                 or operation_result.failure_reason is not None
             ):
-                failure_reason = (
-                    operation_result.failure_reason or "compaction_failed"
-                )
+                failure_reason = operation_result.failure_reason or "compaction_failed"
                 attempt_count = len(operation_result.rejected_attempts)
                 retry_repair_budget_exhausted = attempt_count > 0
                 fallback_decision = build_fallback_decision_input(
@@ -2020,6 +2031,7 @@ class EngineEventIngestor:
                             terminal_closeout=False,
                             promotion_triggered=False,
                             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                            transient_delta=None,
                             stop_worker_stream=True,
                         ),
                         run_id=latest.run.run_id,
@@ -2047,6 +2059,7 @@ class EngineEventIngestor:
                         terminal_closeout=False,
                         promotion_triggered=False,
                         reason=fail_result.reason,
+                        transient_delta=None,
                     )
                 return EngineIngestResult(
                     status=EngineIngestStatus.ACCEPTED,
@@ -2059,6 +2072,7 @@ class EngineEventIngestor:
                     terminal_closeout=True,
                     promotion_triggered=False,
                     reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                    transient_delta=None,
                 )
             compacted = self._append_reactive_compacted_event(
                 transaction,
@@ -2092,6 +2106,7 @@ class EngineEventIngestor:
                     terminal_closeout=False,
                     promotion_triggered=False,
                     reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                    transient_delta=None,
                     stop_worker_stream=True,
                 ),
                 run_id=latest.run.run_id,
@@ -2408,28 +2423,14 @@ class EngineEventIngestor:
                         else diagnostic_reference.diagnostic.exception_class
                     ),
                     exception_message=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.diagnostic.exception_message
+                        None if diagnostic_reference is None else diagnostic_reference.diagnostic.exception_message
                     ),
-                    offending_block_section=_diagnostic_offending_section(
-                        diagnostic_reference
-                    ),
-                    offending_block_kind=_diagnostic_offending_kind(
-                        diagnostic_reference
-                    ),
-                    offending_block_label=_diagnostic_offending_label(
-                        diagnostic_reference
-                    ),
-                    offending_block_ordinal=_diagnostic_offending_ordinal(
-                        diagnostic_reference
-                    ),
-                    offending_block_text_digest=_diagnostic_offending_text_digest(
-                        diagnostic_reference
-                    ),
-                    offending_block_text_length=_diagnostic_offending_text_length(
-                        diagnostic_reference
-                    ),
+                    offending_block_section=_diagnostic_offending_section(diagnostic_reference),
+                    offending_block_kind=_diagnostic_offending_kind(diagnostic_reference),
+                    offending_block_label=_diagnostic_offending_label(diagnostic_reference),
+                    offending_block_ordinal=_diagnostic_offending_ordinal(diagnostic_reference),
+                    offending_block_text_digest=_diagnostic_offending_text_digest(diagnostic_reference),
+                    offending_block_text_length=_diagnostic_offending_text_length(diagnostic_reference),
                     material_pack_digest=(
                         None
                         if diagnostic_reference is None
@@ -2544,6 +2545,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=False,
                 reason="recovering_run_failed_precondition_failed",
+                transient_delta=None,
             )
         rows = _existing_rows(
             self._event_log_store,
@@ -2556,6 +2558,7 @@ class EngineEventIngestor:
             terminal_closeout=True,
             promotion_triggered=False,
             reason=_REASON_CONTEXT_COMPACTION_RECOVERY_FAILED,
+            transient_delta=None,
         )
 
     def _complete_reactive_recovery(
@@ -2640,18 +2643,15 @@ class EngineEventIngestor:
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason=reason,
+                transient_delta=None,
                 stop_worker_stream=check.accepted,
             )
         diagnostic_payload: dict[str, JsonValue] = dict(payload)
         diagnostic_payload["run_status"] = context.run.status.value
         diagnostic_payload["attempt_status"] = context.attempt.status.value
         diagnostic_payload["waiting_confirmation_accepted"] = check.accepted
-        diagnostic_payload["wait_id"] = (
-            check.wait_record.wait_id if check.wait_record is not None else None
-        )
-        diagnostic_payload["waiting_confirmation_mismatch_reason"] = (
-            check.mismatch_reason
-        )
+        diagnostic_payload["wait_id"] = check.wait_record.wait_id if check.wait_record is not None else None
+        diagnostic_payload["waiting_confirmation_mismatch_reason"] = check.mismatch_reason
         row = self._append_diagnostic_event(
             transaction,
             context=context,
@@ -2666,6 +2666,7 @@ class EngineEventIngestor:
             terminal_closeout=False,
             promotion_triggered=False,
             reason=reason,
+            transient_delta=None,
             stop_worker_stream=check.accepted,
         )
 
@@ -2782,6 +2783,7 @@ class EngineEventIngestor:
                 terminal_closeout=True,
                 promotion_triggered=True,
                 reason=result.reason,
+                transient_delta=result.transient_delta,
                 stop_worker_stream=result.stop_worker_stream,
             )
         return result
@@ -3152,9 +3154,7 @@ class EngineEventIngestor:
             else _NO_CONTEXT_BUDGET_POLICY_REF
         )
         estimator_digest = estimate.estimator_digest if estimate is not None else None
-        estimated_input_tokens = (
-            estimate.estimated_input_tokens if estimate is not None else None
-        )
+        estimated_input_tokens = estimate.estimated_input_tokens if estimate is not None else None
         status = (
             USAGE_OBSERVATION_STATUS_OBSERVED
             if estimate is not None
@@ -3182,10 +3182,7 @@ class EngineEventIngestor:
             )
         except (TypeError, ValueError):
             _LOGGER.debug(
-                (
-                    "host.engine_ingest.usage_observation_invalid "
-                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s"
-                ),
+                ("host.engine_ingest.usage_observation_invalid session_id=%s run_id=%s attempt_id=%s execution_id=%s"),
                 context.run.session_id,
                 context.run.run_id,
                 context.attempt.attempt_id,
@@ -3276,12 +3273,8 @@ class EngineEventIngestor:
             raw_payload=data.raw_payload,
         )
         raw_payload_present = raw_descriptor is not None
-        raw_payload_ref = (
-            raw_descriptor.payload_ref if raw_descriptor is not None else None
-        )
-        raw_payload_digest = (
-            raw_descriptor.payload_digest if raw_descriptor is not None else None
-        )
+        raw_payload_ref = raw_descriptor.payload_ref if raw_descriptor is not None else None
+        raw_payload_digest = raw_descriptor.payload_digest if raw_descriptor is not None else None
         candidate = context.candidate
         payload: dict[str, JsonValue] = {
             "attempt_id": context.attempt.attempt_id,
@@ -3340,16 +3333,8 @@ class EngineEventIngestor:
             context=context,
             raw_payload=data.raw_payload,
         )
-        payload_ref = (
-            payload_descriptor.payload_ref
-            if payload_descriptor is not None
-            else None
-        )
-        payload_digest = (
-            payload_descriptor.payload_digest
-            if payload_descriptor is not None
-            else None
-        )
+        payload_ref = payload_descriptor.payload_ref if payload_descriptor is not None else None
+        payload_digest = payload_descriptor.payload_digest if payload_descriptor is not None else None
         candidate = context.candidate
         payload: dict[str, JsonValue] = {
             "attempt_id": context.attempt.attempt_id,
@@ -3458,9 +3443,7 @@ class EngineEventIngestor:
             "stop_worker_stream": stop_worker_stream,
         }
         if runner_call_iteration_link_event_id is not None:
-            payload["runner_call_iteration_link_event_id"] = (
-                runner_call_iteration_link_event_id
-            )
+            payload["runner_call_iteration_link_event_id"] = runner_call_iteration_link_event_id
         if runner_call_manifest_event_id is not None:
             payload["runner_call_manifest_event_id"] = runner_call_manifest_event_id
         if manifest_payload_ref is not None:
@@ -3489,6 +3472,7 @@ class EngineEventIngestor:
             terminal_closeout=False,
             promotion_triggered=False,
             reason=reason,
+            transient_delta=None,
             stop_worker_stream=stop_worker_stream,
         )
 
@@ -3593,6 +3577,7 @@ class EngineEventIngestor:
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason=reason,
+                transient_delta=None,
             )
         row = self._event_log_store.append_event(
             transaction,
@@ -3611,6 +3596,7 @@ class EngineEventIngestor:
             terminal_closeout=False,
             promotion_triggered=False,
             reason=reason,
+            transient_delta=None,
         )
 
     def _write_terminal_payload(
@@ -3752,10 +3738,7 @@ def _validate_candidate_shape(candidate: EngineEventCandidate) -> None:
         raise ValueError("worker_event_index must be positive")
     _validate_observed_at(candidate.observed_at)
     envelope = candidate.envelope
-    if (
-        envelope.session_id != candidate.engine_event.session_id
-        or envelope.run_id != candidate.engine_event.run_id
-    ):
+    if envelope.session_id != candidate.engine_event.session_id or envelope.run_id != candidate.engine_event.run_id:
         raise ValueError("EngineEvent session_id/run_id must match envelope")
     if candidate.engine_event.occurred_at.tzinfo is None:
         raise ValueError("EngineEvent.occurred_at must be timezone-aware")
@@ -3832,10 +3815,9 @@ def _late_engine_event_rejection_reason(
         context.attempt.status
     ):
         return _REASON_TERMINAL_ALREADY_CLOSED
-    if (
-        context.run.status is RunStatus.CANCELLING
-        and context.candidate.engine_event.type
-        in (EngineEventType.FINAL_ANSWER, EngineEventType.RUN_FAILED)
+    if context.run.status is RunStatus.CANCELLING and context.candidate.engine_event.type in (
+        EngineEventType.FINAL_ANSWER,
+        EngineEventType.RUN_FAILED,
     ):
         return _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL
     return None
@@ -3873,6 +3855,7 @@ def _terminal_closeout_precondition_failed_result() -> EngineIngestResult:
         terminal_closeout=True,
         promotion_triggered=False,
         reason=_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED,
+        transient_delta=None,
     )
 
 
@@ -3896,10 +3879,7 @@ def _validate_waiting_confirmation(
     :returns: confirmation 校验结果。
     """
 
-    if (
-        context.run.status is not RunStatus.WAITING
-        or context.attempt.status is not AttemptStatus.SUSPENDED
-    ):
+    if context.run.status is not RunStatus.WAITING or context.attempt.status is not AttemptStatus.SUSPENDED:
         return _waiting_confirmation_rejected("run_attempt_not_waiting")
     active_waits = tuple(
         wait_record
@@ -3988,11 +3968,7 @@ def _accepted_waiting_refs_or_none(
         run_id=context.run.run_id,
         event_type=_EVENT_TYPE_ATTEMPT_SUSPENDED,
     )
-    if (
-        tool_awaiting is None
-        or run_waiting is None
-        or attempt_suspended is None
-    ):
+    if tool_awaiting is None or run_waiting is None or attempt_suspended is None:
         return None
     if not (
         _waiting_event_row_matches_context(tool_awaiting, context)
@@ -4238,10 +4214,7 @@ def _payload_event_ref_matches(
     value = payload.get(field_name)
     if not isinstance(value, Mapping):
         return False
-    return (
-        value.get("event_id") == row.event_id
-        and value.get("event_sequence") == row.event_sequence
-    )
+    return value.get("event_id") == row.event_id and value.get("event_sequence") == row.event_sequence
 
 
 def _engine_awaiting_record_mismatch(
@@ -4272,10 +4245,7 @@ def _engine_awaiting_record_mismatch(
         return "awaiting_iteration_mismatch"
     if tool_awaiting_payload.get("iteration_id") != iteration_id:
         return "awaiting_iteration_mismatch"
-    if (
-        record.call.tool_call_id != wait_record.tool_call_id
-        or record.call.name != wait_record.tool_name
-    ):
+    if record.call.tool_call_id != wait_record.tool_call_id or record.call.name != wait_record.tool_name:
         return "awaiting_tool_identity_mismatch"
     if (
         record.await_spec.await_kind.value != wait_record.await_kind
@@ -4934,8 +4904,7 @@ def _engine_event_ref(candidate: EngineEventCandidate) -> str:
     """
 
     return (
-        f"engine:{candidate.envelope.execution_id}:"
-        f"{candidate.worker_event_index}:{candidate.engine_event.type.value}"
+        f"engine:{candidate.envelope.execution_id}:{candidate.worker_event_index}:{candidate.engine_event.type.value}"
     )
 
 
@@ -4949,10 +4918,7 @@ def _reactive_precondition_compaction_operation_id(
     :returns: 可写入 failed payload 的稳定 operation id。
     """
 
-    return (
-        f"{_REACTIVE_PRECONDITION_OPERATION_PREFIX}:"
-        f"{failure_reason}:{_engine_event_ref(context.candidate)}"
-    )
+    return f"{_REACTIVE_PRECONDITION_OPERATION_PREFIX}:{failure_reason}:{_engine_event_ref(context.candidate)}"
 
 
 def _host_event_type(event_type: EngineEventType) -> str:
@@ -5011,9 +4977,7 @@ def _run_failed_plan(data: RunFailedData) -> _EngineTerminalPlan:
 
     error_code = serialize_engine_error_code(data.error_code)
     unsupported_owner = _OWNER_PHASE10 if data.recoverable else None
-    reason = (
-        _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else error_code
-    )
+    reason = _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else error_code
     terminal = _failed_terminal_fact_plan(
         reason=reason,
         error_code=error_code,
@@ -5235,26 +5199,13 @@ def _is_preview_event(event: EngineEvent) -> bool:
     """
 
     return (
-        event.type == EngineEventType.ITERATION_STARTED
-        and isinstance(event.data, IterationStartedData)
-    ) or (
-        event.type == EngineEventType.CONTENT_COMPLETED
-        and isinstance(event.data, ContentCompleteData)
-    ) or (
-        event.type == EngineEventType.TOOL_CALLS_BATCH_READY
-        and isinstance(event.data, ToolCallsBatchReadyData)
-    ) or (
-        event.type == EngineEventType.TOOL_CALL_REQUESTED
-        and isinstance(event.data, ToolCallRequestedData)
-    ) or (
-        event.type == EngineEventType.TOOL_RESULT_ACCEPTED
-        and isinstance(event.data, ToolResultAcceptedData)
-    ) or (
-        event.type == EngineEventType.TOOL_CALLS_BATCH_DONE
-        and isinstance(event.data, ToolCallsBatchDoneData)
-    ) or (
-        event.type == EngineEventType.ITERATION_COMPLETED
-        and isinstance(event.data, IterationCompletedData)
+        (event.type == EngineEventType.ITERATION_STARTED and isinstance(event.data, IterationStartedData))
+        or (event.type == EngineEventType.CONTENT_COMPLETED and isinstance(event.data, ContentCompleteData))
+        or (event.type == EngineEventType.TOOL_CALLS_BATCH_READY and isinstance(event.data, ToolCallsBatchReadyData))
+        or (event.type == EngineEventType.TOOL_CALL_REQUESTED and isinstance(event.data, ToolCallRequestedData))
+        or (event.type == EngineEventType.TOOL_RESULT_ACCEPTED and isinstance(event.data, ToolResultAcceptedData))
+        or (event.type == EngineEventType.TOOL_CALLS_BATCH_DONE and isinstance(event.data, ToolCallsBatchDoneData))
+        or (event.type == EngineEventType.ITERATION_COMPLETED and isinstance(event.data, IterationCompletedData))
     )
 
 
@@ -5267,17 +5218,91 @@ def _is_transient_delta_event(event: EngineEvent) -> bool:
     """
 
     return (
-        event.type == EngineEventType.CONTENT_DELTA
-        and isinstance(event.data, ContentDeltaData)
-    ) or (
-        event.type == EngineEventType.TOOL_CALL_DELTA
-        and isinstance(event.data, ToolCallDeltaData)
+        (event.type == EngineEventType.CONTENT_DELTA and isinstance(event.data, ContentDeltaData))
+        or (event.type == EngineEventType.REASONING_DELTA and isinstance(event.data, ReasoningDeltaData))
+        or (event.type == EngineEventType.TOOL_CALL_DELTA and isinstance(event.data, ToolCallDeltaData))
     )
 
 
-def _preview_payload(
-    transaction: HostTransaction, context: _ValidatedCandidate
-) -> Mapping[str, JsonValue]:
+def _validated_transient_delta_candidate(
+    context: _ValidatedCandidate,
+    event: EngineEvent,
+) -> ValidatedTransientDeltaCandidate:
+    """把已通过 durable 校验的 Engine delta 映射为 Host public payload。
+
+    :param context: 已校验 durable identity 上下文。
+    :param event: 与 context candidate 相同的 Engine event。
+    :returns: 尚未分配 runtime identity 的已验证瞬态候选。
+    :raises ValueError: event 不是闭合的三类 typed delta 时抛出。
+    """
+
+    data = event.data
+    if event.type == EngineEventType.CONTENT_DELTA and isinstance(data, ContentDeltaData):
+        transient_type = HostTransientDeltaType.CONTENT_DELTA
+        public_data = HostContentDelta(
+            iteration_id=data.iteration_id,
+            text_delta=data.delta,
+        )
+    elif event.type == EngineEventType.REASONING_DELTA and isinstance(data, ReasoningDeltaData):
+        transient_type = HostTransientDeltaType.REASONING_DELTA
+        public_data = HostReasoningDelta(
+            iteration_id=data.iteration_id,
+            text_delta=data.delta,
+        )
+    elif event.type == EngineEventType.TOOL_CALL_DELTA and isinstance(data, ToolCallDeltaData):
+        transient_type = HostTransientDeltaType.TOOL_CALL_DELTA
+        public_data = HostToolCallDelta(
+            iteration_id=data.iteration_id,
+            tool_call_index=data.tool_call_index,
+            tool_call_id=data.tool_call_id,
+            name_delta=data.name_delta,
+            arguments_delta=data.arguments_delta,
+        )
+    else:
+        raise ValueError("event must be a typed transient delta")
+    candidate = context.candidate
+    return ValidatedTransientDeltaCandidate(
+        session_id=candidate.envelope.session_id,
+        run_id=candidate.envelope.run_id,
+        attempt_id=candidate.envelope.attempt_id,
+        execution_id=candidate.envelope.execution_id,
+        worker_event_index=candidate.worker_event_index,
+        observed_at=candidate.observed_at,
+        type=transient_type,
+        data=public_data,
+    )
+
+
+def _publish_transient_delta(
+    publisher: HostTransientDeltaPublisher,
+    candidate: ValidatedTransientDeltaCandidate,
+) -> None:
+    """隔离发布端口意外，不让 live delivery 污染 durable accepted 结果。
+
+    :param publisher: 显式注入的 Host 瞬态发布端口。
+    :param candidate: transaction 成功返回的已验证候选。
+    :returns: ``None``。
+    :raises Exception: publisher 异常会被本函数捕获并转为 sanitized diagnostic。
+    """
+
+    try:
+        publisher.publish(candidate)
+    except Exception as exc:
+        _LOGGER.error(
+            "host.engine_ingest.transient_publish_failed "
+            "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+            "worker_event_index=%s delta_type=%s publisher_error_type=%s",
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.worker_event_index,
+            candidate.type.value,
+            type(exc).__name__,
+        )
+
+
+def _preview_payload(transaction: HostTransaction, context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
     """构造 preview payload。
 
     :param transaction: 当前 Host transaction。
@@ -5301,9 +5326,6 @@ def _preview_payload(
         common["iteration_id"] = data.iteration_id
         common["has_content"] = data.content is not None
         common["has_reasoning_content"] = data.reasoning_content is not None
-    elif isinstance(data, ReasoningDeltaData):
-        common["iteration_id"] = data.iteration_id
-        common["delta"] = data.delta
     elif isinstance(data, ToolCallsBatchReadyData):
         common["iteration_id"] = data.iteration_id
         common["tool_call_count"] = len(data.tool_calls)
@@ -5345,10 +5367,7 @@ def _has_complete_observed_input_projection(data: IterationStartedData) -> bool:
         ``True``。
     """
 
-    return (
-        len(data.input_projection) > 0
-        and len(data.input_projection) == data.message_count
-    )
+    return len(data.input_projection) > 0 and len(data.input_projection) == data.message_count
 
 
 def _observed_runner_call_projection_body(
@@ -6976,6 +6995,7 @@ def _single_event_result(row: EventLogRow) -> EngineIngestResult:
         terminal_closeout=False,
         promotion_triggered=False,
         reason=None,
+        transient_delta=None,
     )
 
 
@@ -6992,12 +7012,16 @@ def _event_rows_result(rows: tuple[EventLogRow, ...]) -> EngineIngestResult:
         terminal_closeout=False,
         promotion_triggered=False,
         reason=None,
+        transient_delta=None,
     )
 
 
-def _accepted_no_event_result() -> EngineIngestResult:
+def _accepted_no_event_result(
+    transient_delta: ValidatedTransientDeltaCandidate,
+) -> EngineIngestResult:
     """构造无 EventLog row 的接受结果。
 
+    :param transient_delta: validation transaction 提交后待发布的瞬态候选。
     :returns: 表示已接受但无 durable Host event 的 ingest result。
     :raises Exception: 不主动抛出异常。
     """
@@ -7008,6 +7032,7 @@ def _accepted_no_event_result() -> EngineIngestResult:
         terminal_closeout=False,
         promotion_triggered=False,
         reason=None,
+        transient_delta=transient_delta,
     )
 
 
@@ -7027,6 +7052,7 @@ def _merge_diagnostic_and_closeout(
         terminal_closeout=closeout.terminal_closeout,
         promotion_triggered=closeout.promotion_triggered,
         reason=closeout.reason,
+        transient_delta=closeout.transient_delta,
         stop_worker_stream=closeout.stop_worker_stream,
     )
 

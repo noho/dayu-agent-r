@@ -14,6 +14,11 @@ from typing import NoReturn, cast
 import pytest
 
 import dayu.host.engine_ingest as engine_ingest_module
+from tests.host.transient_delta_support import (
+    FailingTransientDeltaPublisher,
+    NOOP_TRANSIENT_DELTA_PUBLISHER,
+    RecordingTransientDeltaPublisher,
+)
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
@@ -90,6 +95,10 @@ from dayu.host.api import (
     CancelMode,
     EnsureSessionRequest,
     HostCallContext,
+    HostContentDelta,
+    HostReasoningDelta,
+    HostToolCallDelta,
+    HostTransientDeltaType,
     OperationContext,
     ResolveWaitCompletedOutcome,
     ResolveWaitRequest,
@@ -214,6 +223,29 @@ from dayu.host.engine_ingest import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "engine-ingest-test"})
 _REACTIVE_POLICY_REF = "test-reactive-policy"
+_ORIGINAL_INGEST_VALIDATED_OPERATION_CALL = (
+    engine_ingest_module._IngestValidatedOperation.__call__
+)
+
+
+class _ExpectedTransientRollback(RuntimeError):
+    """测试专用的 transient ingest rollback sentinel。"""
+
+
+def _force_rollback_after_validated_ingest(
+    operation: engine_ingest_module._IngestValidatedOperation,
+    transaction: HostTransaction,
+) -> NoReturn:
+    """在 validated ingest 完成后抛错，使 durable transaction 回滚。
+
+    :param operation: 当前 ingest transaction operation。
+    :param transaction: 当前 Host write transaction。
+    :returns: 本函数不会返回。
+    :raises _ExpectedTransientRollback: validated ingest 完成后始终抛出。
+    """
+
+    _ORIGINAL_INGEST_VALIDATED_OPERATION_CALL(operation, transaction)
+    raise _ExpectedTransientRollback("forced transient ingest rollback")
 
 
 class _EngineHotTamperKind(StrEnum):
@@ -498,7 +530,8 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -634,7 +667,8 @@ def test_engine_owned_empty_final_failure_closes_failed(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -677,7 +711,8 @@ def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert [event.event_type for event in result.events] == [
@@ -713,7 +748,8 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert [event.event_class for event in result.events] == [
@@ -754,6 +790,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -858,6 +895,7 @@ async def test_reactive_memory_catch_up_failure_still_starts_recovery(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -883,6 +921,7 @@ async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=_PreparedManifestReactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -915,6 +954,7 @@ async def test_reactive_freezes_overflow_material_list_before_compaction(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -940,6 +980,7 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -990,6 +1031,7 @@ async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -1021,6 +1063,7 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -1060,6 +1103,7 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=context_budget_policy_from_threshold_tokens(
                 context_window_size=100,
                 soft_threshold_tokens=45,
@@ -1094,6 +1138,7 @@ async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=context_budget_policy_from_threshold_tokens(
                 context_window_size=100,
                 soft_threshold_tokens=45,
@@ -1137,6 +1182,7 @@ def test_context_compaction_requested_stale_identity_is_rejected(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -1172,6 +1218,7 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=42)
@@ -1225,6 +1272,7 @@ async def test_reactive_fallback_over_budget_fails_closed_without_lost(
         )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=42)
@@ -1294,6 +1342,7 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=53)
@@ -1320,6 +1369,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -1361,7 +1411,10 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         current = _steer_to_new_running_attempt(store.transaction_runner, seeded)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
 
         stale = ingestor.ingest(
             _candidate(
@@ -1403,7 +1456,11 @@ def test_stale_transient_delta_is_rejected_before_no_row_short_circuit(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         _steer_to_new_running_attempt(store.transaction_runner, seeded)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        publisher = RecordingTransientDeltaPublisher()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=publisher,
+        )
 
         result = ingestor.ingest(
             _candidate(
@@ -1418,6 +1475,7 @@ def test_stale_transient_delta_is_rejected_before_no_row_short_circuit(
         assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
         assert _payload(result.events[0])["reason"] == "stale_execution_id"
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
+        assert publisher.candidates == []
 
 
 @pytest.mark.asyncio
@@ -1437,9 +1495,8 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
-            context_budget_policy=_reactive_policy(
-                max_reactive_compactions_per_run=1
-            ),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            context_budget_policy=_reactive_policy(max_reactive_compactions_per_run=1),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
@@ -1479,9 +1536,8 @@ async def test_reactive_repeated_overflow_respects_max_reactive_compactions_per_
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
-            context_budget_policy=_reactive_policy(
-                max_reactive_compactions_per_run=1
-            ),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            context_budget_policy=_reactive_policy(max_reactive_compactions_per_run=1),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=48))
@@ -1521,6 +1577,7 @@ async def test_reactive_compact_count_allows_second_operation(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -1528,10 +1585,7 @@ async def test_reactive_compact_count_allows_second_operation(
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
-        assert (
-            _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED)
-            == 2
-        )
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED) == 2
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -1555,6 +1609,7 @@ async def test_reactive_compact_corrupt_count_fact_fails_closed(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -1594,7 +1649,10 @@ def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
             ),
             event_type=EngineEventType.RUN_SUSPENDED,
         )
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
 
         first = ingestor.ingest(candidate)
         second = ingestor.ingest(candidate)
@@ -1629,7 +1687,10 @@ def test_tool_awaiting_only_writes_diagnostic_and_duplicate_is_idempotent(
             ),
             event_type=EngineEventType.TOOL_AWAITING,
         )
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
 
         first = ingestor.ingest(candidate)
         second = ingestor.ingest(candidate)
@@ -1667,7 +1728,8 @@ def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -1707,7 +1769,8 @@ def test_run_suspended_confirms_only_matching_host_accepted_wait_refs(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -1749,7 +1812,8 @@ def test_tool_awaiting_rejects_mismatched_engine_record_without_state_change(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -1793,7 +1857,8 @@ def test_waiting_confirmation_wrong_attempt_identity_is_rejected(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -1834,7 +1899,8 @@ def test_waiting_confirmation_wrong_execution_identity_is_rejected(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -1875,7 +1941,8 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -1906,6 +1973,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
 
@@ -1973,7 +2041,8 @@ def test_usage_reported_without_policy_keeps_projection_non_failing(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -2029,6 +2098,7 @@ def test_usage_reported_missing_input_event_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
 
@@ -2074,6 +2144,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
 
@@ -2115,6 +2186,7 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
 
@@ -2160,6 +2232,7 @@ def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
         )
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
         )
 
@@ -2206,7 +2279,8 @@ def test_stale_execution_id_is_rejected_diagnostic(tmp_path: Path) -> None:
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -2239,10 +2313,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
                     "source": "provider_protocol_error",
                     "kind": "provider_error",
                     "canonical_byte_size": 128,
-                    "sha256_digest": (
-                        "0123456789abcdef0123456789abcdef"
-                        "0123456789abcdef0123456789abcdef"
-                    ),
+                    "sha256_digest": ("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                     "provider_error": {
                         "code": "raw_payload_code_must_not_win",
                         "type": "protocol_error",
@@ -2254,7 +2325,8 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.events[0].event_class == EventClass.DIAGNOSTIC
@@ -2309,7 +2381,8 @@ def test_provider_diagnostic_is_nonfatal_diagnostic_without_failure_metadata(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.terminal_closeout is False
@@ -2371,7 +2444,8 @@ def test_provider_protocol_error_serializes_partial_tool_call_signal(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         payload = _payload(result.events[0])
@@ -2441,7 +2515,10 @@ def test_tool_call_requested_and_result_accepted_are_preview(
             ),
             event_type=EngineEventType.TOOL_RESULT_ACCEPTED,
         )
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
 
         first = ingestor.ingest(requested)
         second = ingestor.ingest(accepted)
@@ -2461,14 +2538,18 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_non_reasoning_delta_events_are_accepted_without_event_log_rows(
+def test_all_transient_deltas_publish_once_without_event_log_rows(
     tmp_path: Path,
 ) -> None:
-    """Engine content 与 tool-call delta 默认不写主 EventLog。"""
+    """三类 Engine delta 共享 post-validation publish 与 zero-row contract。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        publisher = RecordingTransientDeltaPublisher()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=publisher,
+        )
         candidates = (
             _candidate(
                 seeded,
@@ -2479,6 +2560,15 @@ def test_non_reasoning_delta_events_are_accepted_without_event_log_rows(
             _candidate(
                 seeded,
                 worker_event_index=12,
+                data=ReasoningDeltaData(
+                    iteration_id="iter-delta",
+                    delta="reasoning",
+                ),
+                event_type=EngineEventType.REASONING_DELTA,
+            ),
+            _candidate(
+                seeded,
+                worker_event_index=13,
                 data=ToolCallDeltaData(
                     iteration_id="iter-tool",
                     tool_call_index=0,
@@ -2495,39 +2585,102 @@ def test_non_reasoning_delta_events_are_accepted_without_event_log_rows(
         assert [result.status for result in results] == [
             EngineIngestStatus.ACCEPTED,
             EngineIngestStatus.ACCEPTED,
+            EngineIngestStatus.ACCEPTED,
         ]
-        assert [result.events for result in results] == [(), ()]
+        assert [result.events for result in results] == [(), (), ()]
+        assert len(publisher.candidates) == 3
+        assert [candidate.type for candidate in publisher.candidates] == [
+            HostTransientDeltaType.CONTENT_DELTA,
+            HostTransientDeltaType.REASONING_DELTA,
+            HostTransientDeltaType.TOOL_CALL_DELTA,
+        ]
+        assert isinstance(publisher.candidates[0].data, HostContentDelta)
+        assert publisher.candidates[0].data.text_delta == "content"
+        assert isinstance(publisher.candidates[1].data, HostReasoningDelta)
+        assert publisher.candidates[1].data.text_delta == "reasoning"
+        assert isinstance(publisher.candidates[2].data, HostToolCallDelta)
+        assert publisher.candidates[2].data.arguments_delta == '{"ticker":"MSFT"}'
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
         assert _event_count(store.transaction_runner, "TOOL_CALL_DELTA") == 0
 
 
-def test_reasoning_delta_is_accepted_as_preview_for_live_display(
+def test_transient_publisher_failure_is_sanitized_and_does_not_change_acceptance(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Engine reasoning delta 应写 PREVIEW row 供 live thinking 展示。"""
+    """发布端口意外不得回滚 accepted ingest 或记录 delta/异常敏感正文。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
-
-        result = ingestor.ingest(
-            _candidate(
-                seeded,
-                worker_event_index=12,
-                data=ReasoningDeltaData(
-                    iteration_id="iter-delta",
-                    delta="reasoning",
-                ),
-                event_type=EngineEventType.REASONING_DELTA,
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=FailingTransientDeltaPublisher(),
+        )
+        with caplog.at_level("ERROR"):
+            result = ingestor.ingest(
+                _candidate(
+                    seeded,
+                    worker_event_index=14,
+                    data=ReasoningDeltaData(
+                        iteration_id="iter-sensitive",
+                        delta="sensitive-reasoning-text",
+                    ),
+                    event_type=EngineEventType.REASONING_DELTA,
+                )
             )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.events == ()
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
+        assert "transient_publish_failed" in caplog.text
+        assert "sensitive-reasoning-text" not in caplog.text
+        assert "sensitive-delta-publisher-message" not in caplog.text
+
+
+def test_transient_transaction_rollback_does_not_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """validation transaction 回滚时不产生瞬态发布或 durable delta row。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: rollback 后仍发布或写入 delta row 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        publisher = RecordingTransientDeltaPublisher()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=publisher,
+        )
+        monkeypatch.setattr(
+            engine_ingest_module._IngestValidatedOperation,
+            "__call__",
+            _force_rollback_after_validated_ingest,
         )
 
-        assert result.status == EngineIngestStatus.ACCEPTED
-        assert len(result.events) == 1
-        assert result.events[0].event_class is EventClass.PREVIEW
-        assert result.events[0].event_type == "REASONING_DELTA"
-        assert _payload(result.events[0])["delta"] == "reasoning"
-        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 1
+        with pytest.raises(
+            _ExpectedTransientRollback,
+            match="forced transient ingest rollback",
+        ):
+            ingestor.ingest(
+                _candidate(
+                    seeded,
+                    worker_event_index=15,
+                    data=ReasoningDeltaData(
+                        iteration_id="iter-rollback",
+                        delta="rollback-reasoning",
+                    ),
+                    event_type=EngineEventType.REASONING_DELTA,
+                )
+            )
+
+        assert publisher.candidates == []
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
 
 
 def test_tool_batch_events_stay_preview_not_canonical(
@@ -2537,7 +2690,10 @@ def test_tool_batch_events_stay_preview_not_canonical(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
         ready = _candidate(
             seeded,
             worker_event_index=14,
@@ -2585,7 +2741,10 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
         first = _candidate(
             seeded,
             worker_event_index=13,
@@ -2617,14 +2776,18 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         assert _payload(result.events[0])["reason"] == "terminal_already_closed"
 
 
-def test_late_reasoning_delta_is_rejected_before_preview_append(
+def test_late_reasoning_delta_is_rejected_before_transient_publish(
     tmp_path: Path,
 ) -> None:
     """终态后的 reasoning delta 仍先经过 late-event governance。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        publisher = RecordingTransientDeltaPublisher()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=publisher,
+        )
         first = _candidate(
             seeded,
             worker_event_index=13,
@@ -2653,6 +2816,7 @@ def test_late_reasoning_delta_is_rejected_before_preview_append(
         assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
         assert _payload(result.events[0])["reason"] == "terminal_already_closed"
         assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
+        assert publisher.candidates == []
 
 
 def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None:
@@ -2673,7 +2837,8 @@ def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -2709,7 +2874,8 @@ def test_run_cancelled_with_malformed_active_cancel_payload_uses_typed_link(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -2746,7 +2912,8 @@ def test_run_cancelled_requested_at_uses_cancel_requested_event_time(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -2777,7 +2944,8 @@ def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -2811,7 +2979,8 @@ def test_late_final_answer_after_run_cancelling_is_rejected_with_diagnostic(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -2846,7 +3015,8 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -2879,7 +3049,10 @@ def test_host_lifecycle_after_run_cancelling_is_diagnostic_only(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
         if lifecycle_source == "worker_clean_eof":
             result = ingestor.close_clean_eof(
                 _envelope(seeded),
@@ -2926,7 +3099,10 @@ def test_late_awaiting_after_cancel_does_not_move_to_waiting(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
         suspended = _candidate(
             seeded,
             worker_event_index=20,
@@ -3098,7 +3274,8 @@ def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_clean_eof(
             _envelope(seeded),
             observed_at=_NOW,
@@ -3130,8 +3307,7 @@ def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
         )
         assert terminal_payload["lifecycle_source"] == "worker_clean_eof"
         assert terminal_payload["host_lifecycle_ref"] == (
-            f"host-lifecycle:{seeded.execution_id}:1:worker_clean_eof:"
-            "stream_ended_without_terminal"
+            f"host-lifecycle:{seeded.execution_id}:1:worker_clean_eof:stream_ended_without_terminal"
         )
         assert "engine_event_type" not in terminal_payload
 
@@ -3175,7 +3351,8 @@ def test_host_lifecycle_ingress_rejects_mismatched_run_identity(
         seeded = _seed_active_run(store.transaction_runner)
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_clean_eof(
             _envelope(seeded),
             observed_at=_NOW,
@@ -3207,7 +3384,10 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        )
         envelope = _envelope(seeded)
 
         first = ingestor.close_worker_lost(
@@ -3253,8 +3433,7 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
         )
         assert terminal_payload["lifecycle_source"] == "worker_lost"
         assert terminal_payload["host_lifecycle_ref"] == (
-            f"host-lifecycle:{seeded.execution_id}:1:worker_lost:"
-            "worker_lost_before_terminal"
+            f"host-lifecycle:{seeded.execution_id}:1:worker_lost:worker_lost_before_terminal"
         )
         assert "engine_event_type" not in terminal_payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
@@ -3282,7 +3461,8 @@ def test_engine_terminal_invalid_state_rolls_back_payload_and_events(
         before = _terminal_storage_snapshot(store.transaction_runner, seeded)
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(
             _candidate(
                 seeded,
@@ -3323,7 +3503,8 @@ def test_host_lifecycle_invalid_state_rolls_back_payload_and_events(
         before = _terminal_storage_snapshot(store.transaction_runner, seeded)
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_worker_lost(
             _envelope(seeded),
             observed_at=_NOW,
@@ -3360,7 +3541,8 @@ def test_engine_terminal_cas_lost_rolls_back_real_payload_repository(
         before = _terminal_storage_snapshot(store.transaction_runner, seeded)
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(
             _candidate(
                 seeded,
@@ -3403,7 +3585,8 @@ def test_host_lifecycle_cas_lost_rolls_back_real_payload_repository(
         before = _terminal_storage_snapshot(store.transaction_runner, seeded)
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_clean_eof(
             _envelope(seeded),
             observed_at=_NOW,
@@ -3441,7 +3624,8 @@ def test_engine_run_failed_with_worker_lifecycle_reason_remains_engine_failed(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert [event.event_type for event in result.events] == [
@@ -3525,12 +3709,13 @@ def test_late_rejection_uses_status_even_when_terminal_refs_are_missing(
             ),
         )
 
-        assert engine_ingest_module._late_engine_event_rejection_reason(
-            run_terminal_context
-        ) == "terminal_already_closed"
-        assert engine_ingest_module._late_engine_event_rejection_reason(
-            attempt_terminal_context
-        ) == "terminal_already_closed"
+        assert (
+            engine_ingest_module._late_engine_event_rejection_reason(run_terminal_context) == "terminal_already_closed"
+        )
+        assert (
+            engine_ingest_module._late_engine_event_rejection_reason(attempt_terminal_context)
+            == "terminal_already_closed"
+        )
 
 
 def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
@@ -3612,7 +3797,8 @@ def test_transient_delta_event_accepts_matching_type_without_row(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -3654,7 +3840,8 @@ def test_iteration_started_links_prepared_runner_call_manifest(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -3742,10 +3929,12 @@ def test_iteration_started_mismatch_fails_closed_after_link(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
         replay = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -3781,16 +3970,15 @@ def test_iteration_started_mismatch_fails_closed_after_link(
         ]
         replay_payload = _payload(replay.events[0])
         assert replay_payload["reason"] == "runner_call_manifest_mismatch"
-        assert replay_payload["runner_call_iteration_link_event_id"] == (
-            result.events[0].event_id
+        assert replay_payload["runner_call_iteration_link_event_id"] == (result.events[0].event_id)
+        assert replay_payload["runner_call_manifest_event_id"] == (manifest_event.event_id)
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ITERATION_LINKED",
+            )
+            == 1
         )
-        assert replay_payload["runner_call_manifest_event_id"] == (
-            manifest_event.event_id
-        )
-        assert _event_count(
-            store.transaction_runner,
-            "RUNNER_CALL_INPUT_ITERATION_LINKED",
-        ) == 1
         assert _event_count(store.transaction_runner, "ENGINE_EVENT_REJECTED") == 1
         assert _event_count(store.transaction_runner, "ITERATION_STARTED") == 0
 
@@ -3818,7 +4006,8 @@ def test_iteration_started_missing_initial_manifest_fails_closed(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -3881,10 +4070,12 @@ def test_iteration_started_mismatch_link_does_not_seed_continuation(
         )
 
         mismatch_result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(mismatch)
         next_result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(next_iteration)
 
         assert mismatch_result.status == EngineIngestStatus.REJECTED
@@ -3897,10 +4088,13 @@ def test_iteration_started_mismatch_link_does_not_seed_continuation(
             "missing_runner_call_manifest"
         )
         assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
-        assert _event_count(
-            store.transaction_runner,
-            "RUNNER_CALL_INPUT_ITERATION_LINKED",
-        ) == 1
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ITERATION_LINKED",
+            )
+            == 1
+        )
         assert _event_count(store.transaction_runner, "ITERATION_STARTED") == 0
 
 
@@ -3941,10 +4135,12 @@ def test_iteration_started_rejected_event_does_not_seed_continuation(
         )
 
         first_result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(first)
         second_result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(second)
 
         assert first_result.status == EngineIngestStatus.REJECTED
@@ -3999,7 +4195,8 @@ def test_iteration_started_ambiguous_prepared_manifest_fails_closed(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -4056,10 +4253,12 @@ def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
         )
 
         accepted = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(first)
         rejected = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(second)
 
         assert accepted.status == EngineIngestStatus.ACCEPTED
@@ -4114,7 +4313,8 @@ def test_iteration_started_links_all_ordinary_dispatch_kinds(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -4158,7 +4358,8 @@ def test_iteration_started_does_not_link_compactor_manifest(tmp_path: Path) -> N
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
@@ -4217,10 +4418,12 @@ def test_iteration_started_continuation_reset_uses_limited_signal_after_link(
         )
 
         accepted = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(initial)
         continued = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(continuation)
 
         assert accepted.status == EngineIngestStatus.ACCEPTED
@@ -4274,7 +4477,8 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -4403,7 +4607,8 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -4558,7 +4763,8 @@ def test_iteration_completed_preview_includes_client_correlation_id(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -4752,28 +4958,32 @@ def _steer_to_new_running_attempt(
         :returns: 新写入的 EventLog row。
         """
 
-        return EventLogStore().append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id=event_id,
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=seeded.session_id,
-                run_id=seeded.run_id,
-                attempt_id=attempt_id,
-                execution_id=execution_id,
-                event_type=event_type,
-                occurred_at=_NOW,
-                actor="tester",
-                source="pytest",
-                client_request_id="client-ingest-steer",
-                idempotency_key=f"idem-{event_id}",
-                policy_decision=None,
-                reason=None,
-                payload_json=payload_json,
-                payload_ref=None,
-                payload_digest=None,
-            ),
-        ).row
+        return (
+            EventLogStore()
+            .append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=event_id,
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=attempt_id,
+                    execution_id=execution_id,
+                    event_type=event_type,
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id="client-ingest-steer",
+                    idempotency_key=f"idem-{event_id}",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=payload_json,
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+            .row
+        )
 
     def _operation(transaction: HostTransaction) -> None:
         timestamp = format_utc_timestamp(_NOW)
@@ -4970,10 +5180,7 @@ def _proposal_agent_request(
     """
 
     return AgentRunRequest(
-        run_id=(
-            f"compactor-run:{request.run_id}:"
-            f"{compaction_operation_id}:{compaction_attempt_number}"
-        ),
+        run_id=(f"compactor-run:{request.run_id}:{compaction_operation_id}:{compaction_attempt_number}"),
         session_id="context-compactor:test",
         attempt_id=None,
         execution_id=None,
@@ -5392,11 +5599,7 @@ def _append_prepared_runner_call_manifest(
     metadata_items: list[JsonValue] = []
     message_entries: list[JsonValue] = []
     for index, role in enumerate(roles):
-        metadata_id = (
-            f"compactor-projector:{role}"
-            if is_compactor
-            else f"projector:{index}:{role}"
-        )
+        metadata_id = f"compactor-projector:{role}" if is_compactor else f"projector:{index}:{role}"
         projector_id = (
             f"compactor_{role}_prompt"
             if is_compactor
@@ -5416,11 +5619,7 @@ def _append_prepared_runner_call_manifest(
             )
         )
         source_contract_refs = (f"event:source:{event_id}:{index}",)
-        projector_schema_version = (
-            "compactor_projector.v1"
-            if is_compactor
-            else "run_input_projector.v1"
-        )
+        projector_schema_version = "compactor_projector.v1" if is_compactor else "run_input_projector.v1"
         projector_digest = sha256_digest_json(
             {
                 "projector_id": projector_id,
@@ -5569,28 +5768,32 @@ def _append_prepared_runner_call_manifest(
                 expected_digest=manifest_digest,
             ),
         )
-        return EventLogStore().append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id=event_id,
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=seeded.session_id,
-                run_id=seeded.run_id,
-                attempt_id=seeded.attempt_id,
-                execution_id=seeded.execution_id,
-                event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-                occurred_at=_NOW,
-                actor="tester",
-                source="pytest",
-                client_request_id=None,
-                idempotency_key=None,
-                policy_decision=None,
-                reason=None,
-                payload_json=hot_payload,
-                payload_ref=descriptor.payload_ref,
-                payload_digest=descriptor.payload_digest,
-            ),
-        ).row
+        return (
+            EventLogStore()
+            .append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=event_id,
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=hot_payload,
+                    payload_ref=descriptor.payload_ref,
+                    payload_digest=descriptor.payload_digest,
+                ),
+            )
+            .row
+        )
 
     return transaction_runner.run_write(_operation)
 
@@ -5614,53 +5817,55 @@ def _append_prior_iteration_started_preview(
     """
 
     def _operation(transaction: HostTransaction) -> EventLogRow:
-        return EventLogStore().append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id=event_id,
-                event_class=EventClass.PREVIEW,
-                session_id=seeded.session_id,
-                run_id=seeded.run_id,
-                attempt_id=seeded.attempt_id,
-                execution_id=seeded.execution_id,
-                event_type="ITERATION_STARTED",
-                occurred_at=_NOW,
-                actor="tester",
-                source="pytest",
-                client_request_id=None,
-                idempotency_key=None,
-                policy_decision=None,
-                reason=None,
-                payload_json={
-                    "attempt_id": seeded.attempt_id,
-                    "execution_id": seeded.execution_id,
-                    "worker_event_index": 1,
-                    "engine_event_type": "iteration_started",
-                    "iteration_id": iteration_id,
-                    "iteration_index": iteration_index,
-                    "message_count": 1,
-                    "role_sequence_digest": runner_role_sequence_digest(("user",)),
-                    "runner_input_serializer_schema_version": (
-                        RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                    ),
-                    "runner_call_manifest_validation": {
-                        "status": "complete",
-                        "reason": None,
-                        "runner_call_iteration_link_event_id": None,
-                        "manifest_event_id": None,
-                        "manifest_payload_ref": None,
-                        "manifest_digest": None,
-                        "observed_count": 1,
-                        "expected_count": 1,
-                        "observed_digest": runner_role_sequence_digest(("user",)),
-                        "expected_digest": runner_role_sequence_digest(("user",)),
-                        "continuation_limited_signal": False,
+        return (
+            EventLogStore()
+            .append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=event_id,
+                    event_class=EventClass.PREVIEW,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    event_type="ITERATION_STARTED",
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "attempt_id": seeded.attempt_id,
+                        "execution_id": seeded.execution_id,
+                        "worker_event_index": 1,
+                        "engine_event_type": "iteration_started",
+                        "iteration_id": iteration_id,
+                        "iteration_index": iteration_index,
+                        "message_count": 1,
+                        "role_sequence_digest": runner_role_sequence_digest(("user",)),
+                        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
+                        "runner_call_manifest_validation": {
+                            "status": "complete",
+                            "reason": None,
+                            "runner_call_iteration_link_event_id": None,
+                            "manifest_event_id": None,
+                            "manifest_payload_ref": None,
+                            "manifest_digest": None,
+                            "observed_count": 1,
+                            "expected_count": 1,
+                            "observed_digest": runner_role_sequence_digest(("user",)),
+                            "expected_digest": runner_role_sequence_digest(("user",)),
+                            "continuation_limited_signal": False,
+                        },
                     },
-                },
-                payload_ref=None,
-                payload_digest=None,
-            ),
-        ).row
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+            .row
+        )
 
     return transaction_runner.run_write(_operation)
 
@@ -5856,28 +6061,32 @@ def _advance_run_input_sequence(
     def _operation(transaction: HostTransaction) -> None:
         run = read_run_by_id(transaction, run_id)
         assert run is not None
-        input_event = EventLogStore().append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id=f"event-stale-input-{run_id}",
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=run.session_id,
-                run_id=run.run_id,
-                attempt_id=None,
-                execution_id=None,
-                event_type="USER_INPUT_ACCEPTED",
-                occurred_at=_NOW,
-                actor="tester",
-                source="pytest",
-                client_request_id="client-stale-input",
-                idempotency_key=f"idem-stale-input-{run_id}",
-                policy_decision=None,
-                reason=None,
-                payload_json={"display_text": "new input while compacting"},
-                payload_ref=None,
-                payload_digest=None,
-            ),
-        ).row
+        input_event = (
+            EventLogStore()
+            .append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=f"event-stale-input-{run_id}",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=run.session_id,
+                    run_id=run.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="USER_INPUT_ACCEPTED",
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id="client-stale-input",
+                    idempotency_key=f"idem-stale-input-{run_id}",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"display_text": "new input while compacting"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+            .row
+        )
         result = transaction.execute(
             """
             UPDATE host_runs

@@ -74,6 +74,7 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    HostSessionEvent,
     HostTerminalStatus,
     HostToolingOptions,
     LocalEngineWorker,
@@ -1023,11 +1024,11 @@ def host_context(request_id: str) -> HostCallContext:
 
 
 async def next_terminal_for_run(
-    iterator: AsyncIterator[HostEvent], run_id: str
+    iterator: AsyncIterator[HostSessionEvent], run_id: str
 ) -> HostEvent:
     """读取指定 Run 的下一条 terminal HostEvent。
 
-    :param iterator: HostEvent async iterator。
+    :param iterator: Host durable/transient 联合事件 async iterator。
     :param run_id: 目标 Run id。
     :returns: terminal HostEvent。
     :raises AssertionError: 超时或读到失败 / 取消事件时由调用方断言抛出。
@@ -1254,17 +1255,19 @@ def awaiting_tooling_options() -> HostToolingOptions:
 
 
 async def _read_next_terminal_for_run(
-    iterator: AsyncIterator[HostEvent], run_id: str
+    iterator: AsyncIterator[HostSessionEvent], run_id: str
 ) -> HostEvent:
     """顺序读取指定 Run terminal 事件。
 
-    :param iterator: HostEvent async iterator。
+    :param iterator: Host durable/transient 联合事件 async iterator。
     :param run_id: 目标 Run id。
     :returns: terminal HostEvent。
     :raises AssertionError: iterator 意外结束时抛出。
     """
 
     async for event in iterator:
+        if not isinstance(event, HostEvent):
+            continue
         if event.run_id != run_id:
             continue
         if event.kind in (

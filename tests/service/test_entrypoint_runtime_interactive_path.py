@@ -19,6 +19,7 @@ from dayu.host.api import (
     HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
+    HostSessionEvent,
     HostStreamCursor,
     HostTerminalStatus,
     OperationContext,
@@ -66,7 +67,7 @@ class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostEvent | _StopSignal]
+    _queue: asyncio.Queue[HostSessionEvent | _StopSignal]
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -78,7 +79,7 @@ class _FakeHostEventIterator:
         self.closed_count = 0
         self._queue = asyncio.Queue()
 
-    def __aiter__(self) -> AsyncIterator[HostEvent]:
+    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -87,7 +88,7 @@ class _FakeHostEventIterator:
 
         return self
 
-    async def __anext__(self) -> HostEvent:
+    async def __anext__(self) -> HostSessionEvent:
         """读取下一条 Host event。
 
         :returns: HostEvent。
@@ -99,7 +100,7 @@ class _FakeHostEventIterator:
             raise StopAsyncIteration
         return item
 
-    async def push(self, event: HostEvent) -> None:
+    async def push(self, event: HostSessionEvent) -> None:
         """推入一条 Host event。
 
         :param event: 待推入事件。
@@ -142,7 +143,10 @@ class _FakeHost:
         self.read_outbox_requests = []
         self._submit_index = 0
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
+    def watch_session_events(
+        self,
+        session_id: str,
+    ) -> AsyncIterator[HostSessionEvent]:
         """记录 watcher attach。
 
         :param session_id: 目标 Session id。
@@ -249,10 +253,7 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert result.host_assembly.options.wait_poller_policy is not None
     assert result.host_assembly.options.wait_poller_policy.enabled
     assert result.host_assembly.options.tooling_options is not None
-    assert (
-        result.host_assembly.options.tooling_options.wait_poll_adapter_registry
-        is not None
-    )
+    assert result.host_assembly.options.tooling_options.wait_poll_adapter_registry is not None
     assert "财报工具指引" in result.scene_inputs.system_prompt
     assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
     assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.system_prompt

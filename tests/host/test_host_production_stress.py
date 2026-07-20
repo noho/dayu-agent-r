@@ -17,6 +17,7 @@ from dayu.host import (
     Host,
     HostEvent,
     HostEventKind,
+    HostSessionEvent,
     HostTerminalStatus,
     OutboxTerminalCursor,
     ReadOutboxTerminalItemsRequest,
@@ -2287,10 +2288,12 @@ async def _wait_run_terminal(host: Host, run_id: str) -> RunSnapshot:
     raise AssertionError(f"run {run_id} did not reach terminal status")
 
 
-async def _consume_until_cancelled(iterator: AsyncIterator[HostEvent]) -> None:
+async def _consume_until_cancelled(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> None:
     """持续消费 watcher，直到测试取消 consumer task。
 
-    :param iterator: HostEvent async iterator。
+    :param iterator: Host durable/transient 联合事件 async iterator。
     :returns: ``None``。
     :raises asyncio.CancelledError: 调用方取消任务时抛出。
     """

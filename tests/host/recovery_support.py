@@ -29,8 +29,8 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.host import (
     AttemptDispatchSnapshot,
-    HostEvent,
     HostEventKind,
+    HostSessionEvent,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
@@ -533,14 +533,17 @@ async def _run_open_probe_async(
         await asyncio.sleep(_MARKER_POLL_SECONDS)
 
 
-async def close_host_event_iterator(iterator: AsyncIterator[HostEvent]) -> None:
-    """关闭测试持有的 HostEvent async generator。
+async def close_host_event_iterator(
+    iterator: AsyncIterator[HostSessionEvent],
+) -> None:
+    """关闭测试持有的 Host 联合事件 async generator。
 
-    :param iterator: HostEvent iterator。
+    :param iterator: Host durable/transient 联合事件 iterator。
     :returns: ``None``。
+    :raises Exception: 底层 async generator close 失败时透传。
     """
 
-    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+    await cast(AsyncGenerator[HostSessionEvent, None], iterator).aclose()
 
 
 async def wait_for_run_status(
