@@ -31,7 +31,7 @@ commit 不含 product、test、README、design、workflow、GitHub Actions 或 s
 ## Accepted implementation contract
 
 只允许 AgentCodex 修改 `tests/cli/test_upload_filings_from_command.py` 的
-`test_windows_generated_cmd_real_cli_storage_round_trip` 现有 snapshot assertion block：
+`test_windows_generated_script_runs_real_cli_into_temp_storage` 现有 snapshot assertion block：
 
 1. `snapshot.primary_filename` exact-name必须恰好命中一个 public descriptor；
 2. `source_path.name` exact-name必须独立地恰好命中一个 public descriptor；
