@@ -154,13 +154,13 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CLI-SMOKE-01-R1` accepted PR review commit |
+| phase | `WU-CLI-SMOKE-01-R1` final-closeout-pass |
 | active work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
-| completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
-| gate | `accepted-PR-review-commit` |
+| completed work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；final-closeout-pass。 |
+| gate | `final-closeout-pass` |
 | prerequisite PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 已于 2026-07-20 merge；本地 `main` 已同步到 merge commit `bd1d3e94`。 |
 | selected work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
-| next gate | `accepted PR review commit` |
+| next gate | 用户 / maintainer 处理 Draft PR #180；无未授权外部动作。 |
 | goal confirmation artifact | `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`；用户已确认，decision=`pass`。 |
 | plan artifact | `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`；2 个语义闭环 slices，controller decision=`ready-for-plan-review`。 |
 | plan review artifacts | `docs/reviews/plan-review-20260720-230213.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-230039.md`（AgentDS）；均为 `pass-with-risks`。 |
@@ -191,11 +191,14 @@ git push -u github <branch>
 | PR review fix controller validation | `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-controller-validation.md`；decision=`ready-for-PR-rereview`。PR body 结构、head OID `ff5d515a`、Draft/reviewer/base/title invariants、无 closing directive、两项 Windows CI pass 与工作树边界均已直接验证。 |
 | PR re-review artifacts | `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-ds.md`（AgentDS，PASS）；两路均确认 PR180-F01 fixed、0 blocking、无新增 material finding。 |
 | PR re-review adjudication | `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-controller-adjudication.md`；controller decision=`accepted-PR-rereview`。metadata fix 期间 code head 保持 `ff5d515a`；下一步只提交/push review artifacts 与 control closeout。 |
+| accepted PR review commit | `3900b069`（`gateflow: accept PR review for WU-CLI-SMOKE-01-R1`）；已 non-force push 到 Draft PR #180。 |
+| final remote checks | accepted PR review head `3900b069`：`windows-init-transaction` pass（5m05s），`windows-upload-script` pass（4m04s）；PR merge state clean。 |
+| final closeout artifact | `docs/reviews/wu-cli-smoke-01-r1-final-closeout.md`；decision=`final-closeout-pass`。 |
 | next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
 | CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
 | next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
 | blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
-| next entry point | Controller 复核工作树与 `git diff --check`，提交并 push accepted PR review artifacts/control；等待最终远端 head 的 Windows CI checks 通过后进入 final closeout。不得 mark ready、merge、request reviewers、close issue 或 delete branch。 |
+| next entry point | 等待用户 / maintainer 处理 Draft PR #180。不得 mark ready、merge、request reviewers、close issue、发布外部 closeout comment 或 delete branch。PR #180 被处理后，从 `main` 同步最新代码，再由用户选择下一 work unit。 |
 
 
 ## 推进规则
@@ -271,7 +274,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
-| WU-CLI-SMOKE-01-R1 | PR-rereview-pass | Engine delta transient live stream remediation | Draft PR #180 | PR180-F01 已修复；MiMo/DS 双路 PR re-review 均 PASS，0 blocking / 0 new finding。当前等待 accepted PR review commit/push 与最终远端 head CI closeout。 |
+| WU-CLI-SMOKE-01-R1 | completed | Engine delta transient live stream remediation | Draft PR #180 | final-closeout-pass；accepted PR review commit `3900b069` 已 push，最终 Windows checks 均 PASS。PR180-F01 fixed，双路 PR re-review 0 blocking / 0 new finding；等待用户 / maintainer 处理 Draft PR。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
@@ -345,7 +348,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；后续不得重新收窄为只处理 thinking。PR #179 已于 2026-07-20 merge，本地 `main` 已同步到 merge commit `bd1d3e94`，当前工作分支为 `phaseflow/wu-cli-smoke-01-r1`。Goal confirmation、plan review/fix/re-review、两个 implementation slices、Slice 1 accepted finding fix/re-review 与全 WU aggregate deepreview 均已完成；accepted plan commit 为 `929691ea`，accepted Slice 1 commit 为 `70ccda60`，accepted Slice 2 commit 为 `d58014cf`，accepted aggregate deepreview commit 为 `2d38abad`。Aggregate artifacts 为 `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-mimo.md`、`docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-ds.md` 与 `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-controller-adjudication.md`；两路均 PASS，0 blocking finding，controller 裁决 0 accepted current-fix finding，residual risk reconciliation 已完成。Draft PR #180 已创建，当前进入 PR review gate；该 WU 无独立 Issue owner，PR body 未添加 `Closes` footer。除非同步后的代码或设计真源与本裁决直接矛盾，否则不得重新询问“三类还是一种”这一已裁决问题。
+用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；后续不得重新收窄为只处理 thinking。PR #179 已于 2026-07-20 merge，本地 `main` 已同步到 merge commit `bd1d3e94`，当前工作分支为 `phaseflow/wu-cli-smoke-01-r1`。Goal confirmation、plan review/fix/re-review、两个 implementation slices、Slice 1 accepted finding fix/re-review、全 WU aggregate deepreview、Draft PR、PR review/fix/re-review、accepted PR review commit、最终远端 Windows checks 与 final closeout 均已完成。Accepted commits 为 plan `929691ea`、Slice 1 `70ccda60`、Slice 2 `d58014cf`、aggregate deepreview `2d38abad` 与 PR review `3900b069`。Aggregate 与 PR review 两路均 PASS；唯一 PR metadata finding `PR180-F01` 已修复并由双路 re-review 关闭。Final closeout artifact 为 `docs/reviews/wu-cli-smoke-01-r1-final-closeout.md`。Draft PR #180 保持 open / draft，等待用户或 maintainer 处理；该 WU 无独立 Issue owner，PR body 未添加 closing directive。未经明确授权不得 mark ready、merge、request reviewers、close issue、发布外部 closeout comment 或 delete branch。
 
 ### 直接证据与动机
 
