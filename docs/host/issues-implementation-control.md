@@ -154,13 +154,13 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CLI-SMOKE-01-R1` PR review |
+| phase | `WU-CLI-SMOKE-01-R1` accepted PR review commit |
 | active work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
 | completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
-| gate | `PR-review` |
+| gate | `accepted-PR-review-commit` |
 | prerequisite PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 已于 2026-07-20 merge；本地 `main` 已同步到 merge commit `bd1d3e94`。 |
 | selected work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
-| next gate | `PR review` |
+| next gate | `accepted PR review commit` |
 | goal confirmation artifact | `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`；用户已确认，decision=`pass`。 |
 | plan artifact | `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`；2 个语义闭环 slices，controller decision=`ready-for-plan-review`。 |
 | plan review artifacts | `docs/reviews/plan-review-20260720-230213.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-230039.md`（AgentDS）；均为 `pass-with-risks`。 |
@@ -185,11 +185,17 @@ git push -u github <branch>
 | aggregate deepreview adjudication | `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-controller-adjudication.md`；controller decision=`accepted-aggregate-deepreview`。DS 的 7 个低项均经 owner/可达 schedule/变更归属直接证据裁决为 rejected-with-reason，0 个 accepted current-fix finding；无需 aggregate fix / re-review 或新增 supplemental batch。Residual risk reconciliation 已完成。 |
 | accepted aggregate deepreview commit | `2d38abad`（`gateflow: accept aggregate deepreview for WU-CLI-SMOKE-01-R1`）。 |
 | draft PR | [PR #180](https://github.com/noho/dayu-agent-r/pull/180)；Draft，base=`main`，head=`phaseflow/wu-cli-smoke-01-r1`。该 WU 无独立 Issue owner，PR body 未添加 `Closes` footer。 |
+| PR review artifacts | `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-ds.md`（AgentDS，PASS）；两路均确认远端代码/架构 0 blocking finding。 |
+| PR review adjudication | `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-controller-adjudication.md`；controller decision=`fix-required`。MiMo 的 `api.py` 格式化 note 为 non-blocking；controller direct metadata check 接受 PR180-F01：PR body 含字面量反斜杠-n，需改为真实 Markdown 换行。Supplemental batch 已记录于 `docs/phaseflow-umbrella-optimization-control.md`。 |
+| PR review fix artifact | `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`；AgentCodex 仅用 body file 把 PR #180 body 修为真实 Markdown 多行，正文、title、Draft、base/head、reviewRequests 与无 closing directive 均保持不变。 |
+| PR review fix controller validation | `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-controller-validation.md`；decision=`ready-for-PR-rereview`。PR body 结构、head OID `ff5d515a`、Draft/reviewer/base/title invariants、无 closing directive、两项 Windows CI pass 与工作树边界均已直接验证。 |
+| PR re-review artifacts | `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-ds.md`（AgentDS，PASS）；两路均确认 PR180-F01 fixed、0 blocking、无新增 material finding。 |
+| PR re-review adjudication | `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-controller-adjudication.md`；controller decision=`accepted-PR-rereview`。metadata fix 期间 code head 保持 `ff5d515a`；下一步只提交/push review artifacts 与 control closeout。 |
 | next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
 | CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
 | next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
 | blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
-| next entry point | AgentMiMo 与 AgentDS 同时对 Draft PR #180 执行 strict PR review，核对远端 head diff、PR body、完整 validation evidence、design/control/README 一致性与 draft-PR closeout 条件；只写 PR review artifact，不修改实现、control doc、PR 状态或提交。 |
+| next entry point | Controller 复核工作树与 `git diff --check`，提交并 push accepted PR review artifacts/control；等待最终远端 head 的 Windows CI checks 通过后进入 final closeout。不得 mark ready、merge、request reviewers、close issue 或 delete branch。 |
 
 
 ## 推进规则
@@ -265,7 +271,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
-| WU-CLI-SMOKE-01-R1 | PR-review | Engine delta transient live stream remediation | Draft PR #180 | Accepted plan `929691ea`、Slice 1 `70ccda60`、Slice 2 `d58014cf`、aggregate deepreview `2d38abad`。双路 aggregate deepreview 均 PASS，0 blocking / 0 accepted current-fix finding；Draft PR #180 已创建，当前执行双路 PR review。 |
+| WU-CLI-SMOKE-01-R1 | PR-rereview-pass | Engine delta transient live stream remediation | Draft PR #180 | PR180-F01 已修复；MiMo/DS 双路 PR re-review 均 PASS，0 blocking / 0 new finding。当前等待 accepted PR review commit/push 与最终远端 head CI closeout。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |

@@ -302,6 +302,23 @@ control doc 每次更新只记录：
 - Accepted Slice 1 commit: `70ccda60`。
 - Final batch status: completed。主 control doc 已进入 Slice 2 implementation；DS-F02 由 Slice 2 owner 收口。
 
+## Active Finding Fix Batch: WU-CLI-SMOKE-01-R1 Draft PR #180
+
+- Source reviews: `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-ds.md`；两路代码/架构结论均 PASS。
+- Controller adjudication: `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-controller-adjudication.md`；decision=`fix-required`。
+- Accepted finding: PR180-F01；PR body 使用字面量反斜杠-n 而非真实 Markdown 换行。文字内容正确，但 PR metadata 格式不满足 draft-PR-pass。
+- Risk: Low Risk / PR-metadata-only。
+- Batch policy: 单一外部 metadata fix，不拆 slice；不得触碰 production/test/design/README。
+- Fix owner: AgentCodex；仅允许修复 PR #180 body 换行并写 `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`。
+- Review policy: 用户指定 AgentMiMo / AgentDS 两路 review，因此 fix 后仍执行双路 PR re-review。
+- Validation: `gh pr view` 证明 body 为真实多行、无字面量反斜杠-n；Draft=true、review requests 为空、base/head 与标题不变；工作树仅包含预期 artifacts/control。
+- Baseline residual: accepted aggregate live-only、capacity 256、cross-domain ordering 与可控 worker 边界继续有效，不因 metadata fix 改变。
+- Fix artifact: `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`；PR180-F01 metadata-only fix complete，PR code head 未变。
+- Controller validation: `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-controller-validation.md`；真实 Markdown 多行、无 closing directive、Draft/head/base/title/reviewer invariants、两项 Windows CI pass 与工作树边界均已验证。
+- PR re-review artifacts: `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-ds.md`；两路均确认 PR180-F01 fixed、0 blocking、无新增 finding。
+- PR re-review adjudication: `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-controller-adjudication.md`；decision=`accepted-PR-rereview`。
+- Final batch status: completed；等待 accepted PR review commit/push 与最终远端 head CI closeout。
+
 ## 下次使用方式
 
 用户可要求：
