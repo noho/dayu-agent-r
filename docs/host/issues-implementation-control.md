@@ -162,6 +162,7 @@ git push -u github <branch>
 | selected next work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
 | next gate | `goal confirmation` |
 | next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
+| CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
 | next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
 | blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
 | next entry point | 用户手工 merge PR #179 后，从 `main` 同步最新代码，再以本文档启动 `WU-CLI-SMOKE-01-R1` goal confirmation；确认后由 AgentCodex 进入 `plan` gate。 |
@@ -333,6 +334,14 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - 明确 transient event 的运行态 identity、ordering、multi-watcher fanout、slow-consumer、detach 与 Host close 语义；不得伪造 durable `event_sequence`，不得把 transient cursor 解释为离线 replay cursor。
 - 保持 final answer、durable activity、outbox terminal、Conversation Memory、audit、Tool Trace 与 durable recovery 不消费 raw delta；断线或重启后不补放任何 token/chunk-level delta。
 
+### CLI 功能保持与切换约束
+
+- R1 不是“删掉 `REASONING_DELTA` EventLog append”这一项孤立改动；如果 CLI 仍只通过 durable `watch_session_events` 读取 thinking，直接删 row 会让实时 `--thinking` 消失，属于未完成且不可接受的实现。
+- 实现必须先具备 Host-owned transient delta delivery，并让 Service / CLI 在 Host 公共边界上消费它，再移除 reasoning durable `PREVIEW` 特例。plan 可以按依赖边界切 slice，但任何 accepted slice commit、PR head 或最终组合状态都不得存在“reasoning 已不落库、attached CLI 却收不到 live thinking”的窗口。
+- `dayu-cli prompt` 与 `dayu-cli interactive` 在 attached 运行期间继续实时展示 reasoning；`--no-thinking` 继续抑制 thinking；final answer、activity/detail、stdout/stderr 分工、Ctrl+C 取消、renderer close 和普通 durable event 补读均不得回归。
+- content/tool-call delta 接入统一 transient contract 只增加 Host-owned live delivery 能力；CLI/UI 未选择的 delta 不得被强制渲染，不得造成 final answer、tool activity 或 thinking 的重复输出。
+- 唯一有意的用户可观察变化是：断线重连、CLI 进程重启或 Host 重启后不补放此前的 content/reasoning/tool-call per-chunk delta。这是 live-only contract，不是 CLI 功能丢失；terminal final answer 与其它 durable facts 仍按既有 EventLog 路径恢复和补读。
+
 ### 非目标
 
 - 不实现任何 delta 的 durable replay、历史 token/thinking 查询、断线补放或跨 Host restart 恢复。
@@ -344,7 +353,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 ### 验收信号
 
 - 构造单个 Attempt 分别产生大量 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA`，断言 durable EventLog 中三类 delta row 均为 `0`，且 final answer / terminal canonical facts 正常提交。
-- 已 attach 的一个或多个 live watcher 能按同一 Host-defined transient contract 接收三类 delta，消费者可按 type 选择；`--thinking` 展示、`--no-thinking` 抑制、取消和 renderer close 行为保持正确。
+- 已 attach 的一个或多个 live watcher 能按同一 Host-defined transient contract 接收三类 delta，消费者可按 type 选择；CLI `prompt` / `interactive` 的 `--thinking` 实时展示、`--no-thinking` 抑制、final answer、activity/detail、stdout/stderr、取消和 renderer close 行为保持正确，且不产生重复输出。
 - 慢 watcher、提前 detach、Host close 与 worker terminal 不反压 EventLog append、不泄漏 task、不取消 Run、不产生伪 terminal fact。
 - 断线重连、Host restart 与离线 reader 不重放三类 delta；transient identity/order 不混入 durable `HostEvent.event_sequence` cursor，既有粗粒度 preview/canonical 补读不回归。
 - 受影响 Host / Service / CLI tests、单文件 coverage、pyright、`git diff --check`、README 触发检查与 EventLog source/propagation scans 通过。
