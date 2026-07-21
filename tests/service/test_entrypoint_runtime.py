@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 
+import dayu.service.entrypoint_runtime as entrypoint_runtime
 from dayu.host.api import (
     CancelMode,
     CancelRunRequest,
@@ -29,6 +30,7 @@ from dayu.host.api import (
     HostActivityStatus,
     HostActivityView,
     HostCallContext,
+    HostClosedError,
     HostContentDelta,
     HostEvent,
     HostEventClass,
@@ -62,14 +64,18 @@ from dayu.host.api import (
 )
 from dayu.service.entrypoint_runtime import (
     EntrypointActivity,
+    EntrypointActivityCallback,
     EntrypointActivityKind,
     EntrypointActivitySeverity,
     EntrypointActivityStatus,
     EntrypointThinking,
+    EntrypointThinkingCallback,
+    EntrypointCallbackExecutionPort,
     EntrypointCancelRequest,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
     EntrypointRuntimeError,
+    EntrypointRunTerminalResult,
     EntrypointStartupReconnectRequest,
     EntrypointTerminalSource,
     EntrypointTurnRequest,
@@ -78,11 +84,6 @@ from dayu.service.entrypoint_runtime import (
     prepare_entrypoint_runtime,
     startup_reconnect_entrypoint_session,
     submit_entrypoint_turn_and_wait,
-    _WatchAndWaitRuntime,
-    _WatcherFailure,
-    _close_watch_and_wait_runtime,
-    _create_watch_and_wait_runtime,
-    _drain_host_events,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 from dayu.service.scene_context import (
@@ -174,8 +175,7 @@ def test_scene_context_formats_subject_and_current_time() -> None:
         "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
     assert (
-        current_time(datetime(2026, 7, 7, 15, 8))
-        == "# 当前时间\n"
+        current_time(datetime(2026, 7, 7, 15, 8)) == "# 当前时间\n"
         "现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。\n"
         "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
@@ -199,8 +199,7 @@ def test_build_entrypoint_context_slot_values_resolves_fmp_company_name(
 
     assert values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
     assert (
-        values[CURRENT_TIME_SLOT]
-        == "# 当前时间\n"
+        values[CURRENT_TIME_SLOT] == "# 当前时间\n"
         "现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。\n"
         "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
@@ -245,59 +244,10 @@ def test_build_entrypoint_context_slot_values_falls_back_without_fmp(
 
 
 @dataclass(frozen=True, slots=True)
-class _StopSignal:
-    """测试 watcher 停止信号。"""
-
-
-@dataclass(frozen=True, slots=True)
 class _RaiseSignal:
     """测试 watcher 抛错信号。"""
 
     error: Exception
-
-
-class _GeneratorHostSessionEventIterator:
-    """把测试 async generator 投影为 public Host iterator contract。"""
-
-    def __init__(
-        self,
-        generator: AsyncGenerator[HostSessionEvent, None],
-    ) -> None:
-        """保存测试 generator。
-
-        :param generator: Host Session event async generator。
-        :returns: 无返回值。
-        :raises Exception: 本构造函数不主动抛出异常。
-        """
-
-        self._generator = generator
-
-    def __aiter__(self) -> HostSessionEventIterator:
-        """返回当前 public iterator。
-
-        :returns: 当前实例。
-        :raises Exception: 本方法不抛出异常。
-        """
-
-        return self
-
-    async def __anext__(self) -> HostSessionEvent:
-        """读取下一条测试 event。
-
-        :returns: 下一条 Host Session event。
-        :raises StopAsyncIteration: generator 结束时抛出。
-        """
-
-        return await anext(self._generator)
-
-    async def aclose(self) -> None:
-        """关闭底层 generator。
-
-        :returns: ``None``。
-        :raises Exception: generator cleanup 失败时透传。
-        """
-
-        await self._generator.aclose()
 
 
 class _FakeHostEventIterator:
@@ -305,7 +255,12 @@ class _FakeHostEventIterator:
 
     closed_count: int
     _close_error: BaseException | None
-    _queue: asyncio.Queue[HostSessionEvent | _StopSignal | _RaiseSignal]
+    _items: tuple[HostSessionEvent | _RaiseSignal, ...]
+    _item_index: int
+    _changed: asyncio.Event
+    _closed: bool
+    anext_active: bool
+    close_observed_active_anext: bool
 
     def __init__(self, *, close_error: BaseException | None = None) -> None:
         """初始化测试 watcher。
@@ -317,7 +272,12 @@ class _FakeHostEventIterator:
 
         self.closed_count = 0
         self._close_error = close_error
-        self._queue = asyncio.Queue()
+        self._items = ()
+        self._item_index = 0
+        self._changed = asyncio.Event()
+        self._closed = False
+        self.anext_active = False
+        self.close_observed_active_anext = False
 
     def __aiter__(self) -> HostSessionEventIterator:
         """返回自身作为 async iterator。
@@ -335,12 +295,20 @@ class _FakeHostEventIterator:
         :raises StopAsyncIteration: 收到停止信号时抛出。
         """
 
-        item = await self._queue.get()
-        if isinstance(item, _StopSignal):
-            raise StopAsyncIteration
-        if isinstance(item, _RaiseSignal):
-            raise item.error
-        return item
+        self.anext_active = True
+        try:
+            while self._item_index >= len(self._items):
+                if self._closed:
+                    raise StopAsyncIteration
+                self._changed.clear()
+                await self._changed.wait()
+            item = self._items[self._item_index]
+            self._item_index += 1
+            if isinstance(item, _RaiseSignal):
+                raise item.error
+            return item
+        finally:
+            self.anext_active = False
 
     async def push(self, event: HostSessionEvent) -> None:
         """向 watcher 推入测试事件。
@@ -350,7 +318,8 @@ class _FakeHostEventIterator:
         :raises Exception: 不主动抛出异常。
         """
 
-        await self._queue.put(event)
+        self._items = (*self._items, event)
+        self._changed.set()
 
     async def fail(self, error: Exception) -> None:
         """向 watcher 推入测试异常。
@@ -360,7 +329,8 @@ class _FakeHostEventIterator:
         :raises Exception: 不主动抛出异常。
         """
 
-        await self._queue.put(_RaiseSignal(error=error))
+        self._items = (*self._items, _RaiseSignal(error=error))
+        self._changed.set()
 
     async def aclose(self) -> None:
         """关闭测试 watcher。
@@ -370,9 +340,170 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count += 1
+        self.close_observed_active_anext = self.anext_active
+        self._closed = True
+        self._changed.set()
         if self._close_error is not None:
             raise self._close_error
-        await self._queue.put(_StopSignal())
+
+
+class _InlineCallbackExecutionPort(EntrypointCallbackExecutionPort):
+    """测试用 typed callback port；在当前 event-loop task 内直接调用。"""
+
+    async def invoke_activity(
+        self,
+        callback: EntrypointActivityCallback,
+        activity: EntrypointActivity,
+    ) -> None:
+        """调用 activity callback。
+
+        :param callback: 同步 activity callback。
+        :param activity: Service activity DTO。
+        :returns: ``None``。
+        :raises Exception: callback 原始异常透传。
+        """
+
+        callback(activity)
+
+    async def invoke_thinking(
+        self,
+        callback: EntrypointThinkingCallback,
+        thinking: EntrypointThinking,
+    ) -> None:
+        """调用 thinking callback。
+
+        :param callback: 同步 thinking callback。
+        :param thinking: Service thinking DTO。
+        :returns: ``None``。
+        :raises Exception: callback 原始异常透传。
+        """
+
+        callback(thinking)
+
+
+class _FailingCallbackExecutionPort(EntrypointCallbackExecutionPort):
+    """以同一原异常模拟 callback execution-domain scheduling failure。"""
+
+    def __init__(self, error: RuntimeError) -> None:
+        """初始化失败端口。
+
+        :param error: 每次 invocation 应原样抛出的异常。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        self._error = error
+
+    async def invoke_activity(
+        self,
+        callback: EntrypointActivityCallback,
+        activity: EntrypointActivity,
+    ) -> None:
+        """模拟 activity 调度失败。
+
+        :param callback: 未调用的 activity callback。
+        :param activity: 未交付的 activity DTO。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 原样抛出配置的 scheduling failure。
+        """
+
+        del callback, activity
+        raise self._error
+
+    async def invoke_thinking(
+        self,
+        callback: EntrypointThinkingCallback,
+        thinking: EntrypointThinking,
+    ) -> None:
+        """模拟 thinking 调度失败。
+
+        :param callback: 未调用的 thinking callback。
+        :param thinking: 未交付的 thinking DTO。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 原样抛出配置的 scheduling failure。
+        """
+
+        del callback, thinking
+        raise self._error
+
+
+class _BlockingCallbackExecutionPort(EntrypointCallbackExecutionPort):
+    """用 async barrier 证明 consumer 会等待当前 callback 真正完成。"""
+
+    def __init__(self) -> None:
+        """初始化 barrier。
+
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def invoke_activity(
+        self,
+        callback: EntrypointActivityCallback,
+        activity: EntrypointActivity,
+    ) -> None:
+        """阻塞 activity callback，释放后同步调用并标记完成。
+
+        :param callback: activity callback。
+        :param activity: activity DTO。
+        :returns: ``None``。
+        :raises Exception: callback 原始异常透传。
+        """
+
+        self.started.set()
+        await self.release.wait()
+        callback(activity)
+        self.finished.set()
+
+    async def invoke_thinking(
+        self,
+        callback: EntrypointThinkingCallback,
+        thinking: EntrypointThinking,
+    ) -> None:
+        """阻塞 thinking callback，释放后同步调用并标记完成。
+
+        :param callback: thinking callback。
+        :param thinking: thinking DTO。
+        :returns: ``None``。
+        :raises Exception: callback 原始异常透传。
+        """
+
+        self.started.set()
+        await self.release.wait()
+        callback(thinking)
+        self.finished.set()
+
+
+class _FailingActivityProjection:
+    """以指定原异常模拟 Host activity 到 Service DTO 的投影失败。"""
+
+    error: RuntimeError
+
+    def __init__(self, error: RuntimeError) -> None:
+        """初始化失败投影。
+
+        :param error: 投影调用必须原样抛出的异常。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.error = error
+
+    def __call__(self, event: HostEvent) -> EntrypointActivity:
+        """确认收到目标 public event 后抛出配置异常。
+
+        :param event: sole consumer 已读取的 Host activity event。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 始终抛出配置的投影异常。
+        """
+
+        if event.run_id != "run-1":
+            raise AssertionError("projection received unexpected target Run")
+        raise self.error
 
 
 class _FakeHost:
@@ -397,6 +528,7 @@ class _FakeHost:
     _outbox_index: int
     _session_snapshot_index: int
     _session_get_watcher_error_index: int
+    _watcher: _FakeHostEventIterator | None
 
     def __init__(
         self,
@@ -409,6 +541,7 @@ class _FakeHost:
         outbox_batches: tuple[OutboxTerminalItemsBatch, ...] = (),
         session_snapshots: tuple[SessionSnapshot, ...] = (),
         session_get_watcher_errors: tuple[Exception, ...] = (),
+        watcher: _FakeHostEventIterator | None = None,
     ) -> None:
         """初始化测试 Host。
 
@@ -420,6 +553,7 @@ class _FakeHost:
         :param outbox_batches: read_outbox_terminal_items 依次返回的批次。
         :param session_snapshots: get_session 依次返回的 SessionSnapshot。
         :param session_get_watcher_errors: get_session 返回后推入 startup watcher 的异常。
+        :param watcher: 可选预构造 public iterator。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -443,6 +577,7 @@ class _FakeHost:
         self._outbox_index = 0
         self._session_snapshot_index = 0
         self._session_get_watcher_error_index = 0
+        self._watcher = watcher
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 调用并返回测试 Session。
@@ -480,7 +615,7 @@ class _FakeHost:
         """
 
         self.calls.append(f"watch:{session_id}")
-        watcher = _FakeHostEventIterator()
+        watcher = _FakeHostEventIterator() if self._watcher is None else self._watcher
         self.watchers.append(watcher)
         return watcher
 
@@ -542,9 +677,7 @@ class _FakeHost:
         )
         self._session_snapshot_index += 1
         if self._session_get_watcher_error_index < len(self._session_get_watcher_errors):
-            await self.watchers[-1].fail(
-                self._session_get_watcher_errors[self._session_get_watcher_error_index]
-            )
+            await self.watchers[-1].fail(self._session_get_watcher_errors[self._session_get_watcher_error_index])
             self._session_get_watcher_error_index += 1
             await asyncio.sleep(0)
         return self._session_snapshots[snapshot_index]
@@ -592,6 +725,148 @@ class _FakeHost:
         if self._cancel_events:
             await asyncio.sleep(0)
         return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
+
+
+class _AttachFailingHost(_FakeHost):
+    """在 public watcher factory 边界原样失败的 Host fake。"""
+
+    def __init__(self, error: RuntimeError) -> None:
+        """初始化 attach failure fake。
+
+        :param error: watcher factory 应原样抛出的异常。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        super().__init__()
+        self._attach_error = error
+
+    async def watch_session_events(
+        self,
+        session_id: str,
+    ) -> HostSessionEventIterator:
+        """记录 attach 后原样抛出构造失败。
+
+        :param session_id: 目标 Session id。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 原样抛出配置的 attach failure。
+        """
+
+        self.calls.append(f"watch:{session_id}")
+        raise self._attach_error
+
+
+class _StartupReadProbeHost(_FakeHost):
+    """记录每次 startup Session probe 前 consumer 已读取的 item 数。"""
+
+    def __init__(
+        self,
+        *,
+        watcher: _FakeHostEventIterator,
+        session_snapshots: tuple[SessionSnapshot, ...],
+        outbox_batches: tuple[OutboxTerminalItemsBatch, ...],
+    ) -> None:
+        """初始化 startup generation probe。
+
+        :param watcher: 预装多 target terminal 的 public iterator fake。
+        :param session_snapshots: 依次暴露的 active target snapshots。
+        :param outbox_batches: startup 前后 durable backfill batches。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        super().__init__(
+            watcher=watcher,
+            session_snapshots=session_snapshots,
+            outbox_batches=outbox_batches,
+        )
+        self.item_indices_before_session_read: list[int] = []
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """记录 iterator progress 后转发 Session probe。
+
+        :param session_id: 目标 Session id。
+        :returns: 预设 Session snapshot。
+        :raises Exception: 基类 fake 失败时透传。
+        """
+
+        self.item_indices_before_session_read.append(self.watchers[-1]._item_index)
+        return await super().get_session(session_id)
+
+
+class _SubmitFailingHost(_FakeHost):
+    """watcher attach 成功后 submit 原样失败的 Host fake。"""
+
+    def __init__(
+        self,
+        error: RuntimeError,
+        *,
+        watcher: _FakeHostEventIterator,
+    ) -> None:
+        """初始化 submit failure fake。
+
+        :param error: submit 应原样抛出的异常。
+        :param watcher: attach 返回的 public iterator fake。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        super().__init__(watcher=watcher)
+        self._submit_error = error
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """记录 submit 后原样抛出失败。
+
+        :param session_id: 目标 Session id。
+        :param request: public follow-up 请求。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 原样抛出配置的 submit failure。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append(request)
+        raise self._submit_error
+
+
+class _RecoveryFailingHost(_FakeHost):
+    """typed delivery interruption 后 durable read 原样失败的 Host fake。"""
+
+    def __init__(
+        self,
+        error: RuntimeError,
+        *,
+        watcher: _FakeHostEventIterator,
+        delivery_error: HostApiError,
+    ) -> None:
+        """初始化 recovery failure fake。
+
+        :param error: durable ``get_run`` 应原样抛出的异常。
+        :param watcher: attach 返回的 public iterator fake。
+        :param delivery_error: submit 期间推入的 typed delivery failure。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        super().__init__(
+            watcher=watcher,
+            submit_watcher_errors=(delivery_error,),
+        )
+        self._recovery_error = error
+
+    async def get_run(self, run_id: str) -> RunSnapshot:
+        """记录 durable read 后原样失败。
+
+        :param run_id: 目标 Run id。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 原样抛出配置的 recovery failure。
+        """
+
+        self.calls.append(f"get_run:{run_id}")
+        raise self._recovery_error
 
 
 class _SleepRecorder:
@@ -813,6 +1088,139 @@ async def test_submit_entrypoint_turn_attaches_watcher_before_submit_and_returns
 
 
 @pytest.mark.asyncio
+async def test_submit_callback_port_validation_precedes_host_attach(
+    tmp_path: Path,
+) -> None:
+    """callback/port 组合非法时必须在 Host attach/submit 前失败。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: validation ordering 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    fake_host = _FakeHost()
+    activities: list[EntrypointActivity] = []
+
+    with pytest.raises(ValueError, match="callback_execution_port is required"):
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=activities.append,
+        )
+
+    assert fake_host.calls == []
+
+
+@pytest.mark.asyncio
+async def test_submit_attach_failure_prevents_submit(
+    tmp_path: Path,
+) -> None:
+    """public iterator factory 失败时不得执行 submit。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: attach ordering 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    attach_error = RuntimeError("attach failed")
+    fake_host = _AttachFailingHost(attach_error)
+
+    with pytest.raises(RuntimeError, match="attach failed") as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+        )
+
+    assert exc_info.value is attach_error
+    assert fake_host.calls == ["watch:session-1"]
+    assert fake_host.submit_requests == []
+
+
+@pytest.mark.asyncio
+async def test_consumer_task_construction_failure_preserves_primary_and_closes_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """consumer task 构造失败时仍应关闭 iterator，且 close 只能作为 cause。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises Exception: owner contract 断言失败时由 pytest 抛出。
+    """
+
+    task_error = RuntimeError("consumer task construction failed")
+    close_error = RuntimeError("consumer construction cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _FakeHost(watcher=watcher)
+
+    def fail_create_task(
+        _coroutine: Coroutine[None, None, None],
+    ) -> asyncio.Task[None]:
+        """模拟 event-loop task 构造失败。
+
+        :param _coroutine: 尚未启动的 sole-consumer coroutine。
+        :returns: 本函数不返回。
+        :raises RuntimeError: 始终抛出固定 task 构造失败。
+        """
+
+        raise task_error
+
+    monkeypatch.setattr(entrypoint_runtime.asyncio, "create_task", fail_create_task)
+
+    with pytest.raises(RuntimeError, match="consumer task construction failed") as exc_info:
+        await entrypoint_runtime._create_watch_and_wait_runtime(
+            cast(Host, fake_host),
+            "session-1",
+            observation_state=entrypoint_runtime._new_terminal_observation_state(),
+            on_activity=None,
+            on_thinking=None,
+            callback_execution_port=None,
+        )
+
+    assert exc_info.value is task_error
+    assert task_error.__cause__ is close_error
+    assert watcher.closed_count == 1
+    assert fake_host.calls == ["watch:session-1"]
+
+
+@pytest.mark.asyncio
+async def test_submit_failure_is_primary_and_closes_unbound_iterator(
+    tmp_path: Path,
+) -> None:
+    """submit 失败不得猜测 target，且 cleanup failure 只能作为 cause。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: submit cleanup 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    submit_error = RuntimeError("submit failed")
+    close_error = RuntimeError("submit cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _SubmitFailingHost(submit_error, watcher=watcher)
+
+    with pytest.raises(RuntimeError, match="submit failed") as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+        )
+
+    assert exc_info.value is submit_error
+    assert exc_info.value.__cause__ is close_error
+    assert fake_host.calls == ["watch:session-1", "submit:session-1"]
+    assert watcher.closed_count == 1
+    assert watcher.close_observed_active_anext is False
+
+
+@pytest.mark.asyncio
 async def test_submit_entrypoint_turn_filters_unrelated_terminal(
     tmp_path: Path,
 ) -> None:
@@ -862,6 +1270,7 @@ async def test_submit_entrypoint_turn_emits_host_public_activity(
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
         on_activity=activities.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
     )
 
     assert result.source is EntrypointTerminalSource.LIVE_EVENT
@@ -912,6 +1321,7 @@ async def test_submit_entrypoint_turn_preserves_provider_protocol_error_activity
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
         on_activity=activities.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
     )
 
     assert len(activities) == 1
@@ -974,6 +1384,7 @@ async def test_submit_entrypoint_turn_emits_host_public_thinking(
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
         on_thinking=thinking_events.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
     )
 
     assert result.source is EntrypointTerminalSource.LIVE_EVENT
@@ -1017,6 +1428,7 @@ async def test_submit_entrypoint_turn_deduplicates_activity_by_dedupe_key(
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
         on_activity=activities.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
     )
 
     assert result.run_id == "run-1"
@@ -1094,16 +1506,164 @@ async def test_submit_entrypoint_turn_activity_callback_exception_propagates(
             scene_inputs=runtime.scene_inputs,
             host_assembly=runtime.host_assembly,
             on_activity=raise_from_activity,
+            callback_execution_port=_InlineCallbackExecutionPort(),
         )
 
     assert fake_host.watchers[0].closed_count == 1
 
 
 @pytest.mark.asyncio
+async def test_submit_callback_failure_preserves_close_as_direct_cause(
+    tmp_path: Path,
+) -> None:
+    """callback + close 应保持 callback 原异常为 top-level。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: exception chain 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    callback_error = RuntimeError("callback failed")
+    close_error = RuntimeError("callback cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="callback-close",
+            ),
+        ),
+    )
+
+    def fail_callback(_activity: EntrypointActivity) -> None:
+        """原样抛出 callback failure。
+
+        :param _activity: Service activity DTO。
+        :returns: 本函数不返回。
+        :raises RuntimeError: 始终抛出固定 callback failure。
+        """
+
+        raise callback_error
+
+    with pytest.raises(RuntimeError, match="callback failed") as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=fail_callback,
+            callback_execution_port=_InlineCallbackExecutionPort(),
+        )
+
+    assert exc_info.value is callback_error
+    assert exc_info.value.__cause__ is close_error
+    assert watcher.closed_count == 1
+    assert watcher.close_observed_active_anext is False
+
+
+@pytest.mark.asyncio
+async def test_submit_execution_port_failure_uses_callback_failed_member(
+    tmp_path: Path,
+) -> None:
+    """execution-domain scheduling failure 应保持原 identity，不新增 outcome。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: callback outcome 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    scheduling_error = RuntimeError("display scheduling failed")
+    callback_values: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="scheduling-failure",
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="display scheduling failed") as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=callback_values.append,
+            callback_execution_port=_FailingCallbackExecutionPort(scheduling_error),
+        )
+
+    assert exc_info.value is scheduling_error
+    assert callback_values == []
+    assert fake_host.watchers[0].closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_consumer_does_not_anext_until_current_callback_finishes(
+    tmp_path: Path,
+) -> None:
+    """当前 callback 完成前 sole consumer 不得读取后续 terminal。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: callback/anext ordering 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    port = _BlockingCallbackExecutionPort()
+    activities: list[EntrypointActivity] = []
+    watcher = _FakeHostEventIterator()
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="blocking-callback",
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        ),
+    )
+
+    submit_task = asyncio.create_task(
+        submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=activities.append,
+            callback_execution_port=port,
+        )
+    )
+    await port.started.wait()
+    await asyncio.sleep(0)
+    assert watcher._item_index == 1
+    assert submit_task.done() is False
+
+    port.release.set()
+    result = await submit_task
+
+    assert port.finished.is_set()
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert watcher._item_index == 2
+    assert watcher.closed_count == 1
+
+
+@pytest.mark.asyncio
 async def test_submit_entrypoint_turn_suppresses_progress_without_activity(
     tmp_path: Path,
 ) -> None:
-    """无 Host public activity 的 progress 不得生成伪工具展示。"""
+    """无 Host public activity 的 progress 不得生成伪工具展示。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: activity projection 断言失败时由 pytest 抛出。
+    """
 
     runtime = await _prepare_runtime(tmp_path)
     activities: list[EntrypointActivity] = []
@@ -1120,6 +1680,7 @@ async def test_submit_entrypoint_turn_suppresses_progress_without_activity(
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
         on_activity=activities.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
     )
 
     assert result.run_id == "run-1"
@@ -1156,6 +1717,7 @@ async def test_submit_entrypoint_turn_filters_unrelated_activity(
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
         on_activity=activities.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
     )
 
     assert result.run_id == "run-1"
@@ -1172,6 +1734,7 @@ async def test_submit_entrypoint_turn_waits_live_terminal_when_run_snapshot_is_t
     outbox_item = _outbox_item(event_sequence=5, run_id="run-1")
     terminal_event = _terminal_event(event_sequence=6, run_id="run-1")
     fake_host = _FakeHost(
+        submit_events=(terminal_event,),
         run_statuses=(RunStatus.SUCCEEDED, RunStatus.SUCCEEDED),
         outbox_batches=(
             _outbox_batch(
@@ -1181,20 +1744,16 @@ async def test_submit_entrypoint_turn_waits_live_terminal_when_run_snapshot_is_t
             ),
         ),
     )
-    sleep = _SleepAndPushTerminal(host=fake_host, event=terminal_event)
-
     result = await submit_entrypoint_turn_and_wait(
         cast(Host, fake_host),
         request=_turn_request(),
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
-        sleep=sleep,
     )
 
     assert result.source is EntrypointTerminalSource.LIVE_EVENT
     assert result.terminal_event_id == "terminal-run-1-6"
     assert fake_host.read_outbox_requests == []
-    assert sleep.calls == [0.05]
 
 
 @pytest.mark.asyncio
@@ -1253,9 +1812,7 @@ async def test_startup_reconnect_reads_idle_tail_outbox_before_returning() -> No
     """idle snapshot 后必须补读 tail outbox，避免 terminal 在输入态前丢失。"""
 
     fake_host = _FakeHost(
-        session_snapshots=(
-            _session_snapshot(session_id="session-1", slot_key=None),
-        ),
+        session_snapshots=(_session_snapshot(session_id="session-1", slot_key=None),),
         outbox_batches=(
             _outbox_batch(
                 items=(),
@@ -1280,9 +1837,7 @@ async def test_startup_reconnect_reads_idle_tail_outbox_before_returning() -> No
         request=_startup_request(),
     )
 
-    assert [terminal.run_id for terminal in result.terminal_results] == [
-        "run-tail"
-    ]
+    assert [terminal.run_id for terminal in result.terminal_results] == ["run-tail"]
     assert result.next_terminal_cursor == OutboxTerminalCursor(event_sequence=7)
     assert [request.after for request in fake_host.read_outbox_requests] == [
         OutboxTerminalCursor(event_sequence=0),
@@ -1300,13 +1855,15 @@ async def test_startup_reconnect_reads_idle_tail_outbox_before_returning() -> No
 
 
 @pytest.mark.asyncio
-async def test_startup_reconnect_rechecks_idle_tail_after_watcher_failure() -> None:
-    """tail drain 首次发现 watcher failure 后必须再用 outbox 关闭缺口。"""
+async def test_startup_reconnect_idle_does_not_read_unbound_iterator() -> None:
+    """startup 无 target 时不得预读 iterator 或建立 live cache。
+
+    :returns: ``None``。
+    :raises Exception: unbound iterator 断言失败时由 pytest 抛出。
+    """
 
     fake_host = _FakeHost(
-        session_snapshots=(
-            _session_snapshot(session_id="session-1", slot_key=None),
-        ),
+        session_snapshots=(_session_snapshot(session_id="session-1", slot_key=None),),
         session_get_watcher_errors=(RuntimeError("startup watcher stopped"),),
         outbox_batches=(
             _outbox_batch(
@@ -1337,16 +1894,12 @@ async def test_startup_reconnect_rechecks_idle_tail_after_watcher_failure() -> N
         request=_startup_request(),
     )
 
-    assert [terminal.run_id for terminal in result.terminal_results] == [
-        "run-after-failure"
-    ]
-    assert result.terminal_results[0].watcher_failure_message is not None
-    assert "RuntimeError" in result.terminal_results[0].watcher_failure_message
+    assert result.terminal_results == ()
+    assert fake_host.watchers[0]._item_index == 0
+    assert fake_host.watchers[0].closed_count == 1
     assert [request.after for request in fake_host.read_outbox_requests] == [
         OutboxTerminalCursor(event_sequence=0),
         OutboxTerminalCursor(event_sequence=0),
-        OutboxTerminalCursor(event_sequence=0),
-        OutboxTerminalCursor(event_sequence=11),
     ]
 
 
@@ -1372,9 +1925,7 @@ async def test_startup_reconnect_deduplicates_seen_terminal_ids() -> None:
     )
 
     assert result.terminal_results == ()
-    assert fake_host.read_outbox_requests[0].seen_terminal_event_ids == (
-        "terminal-run-1-2",
-    )
+    assert fake_host.read_outbox_requests[0].seen_terminal_event_ids == ("terminal-run-1-2",)
 
 
 @pytest.mark.asyncio
@@ -1455,7 +2006,10 @@ async def test_startup_reconnect_projection_failed_fails() -> None:
 async def test_startup_reconnect_observes_existing_active_run_terminal() -> None:
     """startup 发现 active Run 时必须先观察 terminal 再进入 idle。"""
 
+    watcher = _FakeHostEventIterator()
+    await watcher.push(_terminal_event(event_sequence=8, run_id="run-active"))
     fake_host = _FakeHost(
+        watcher=watcher,
         session_snapshots=(
             _session_snapshot(
                 session_id="session-1",
@@ -1483,10 +2037,62 @@ async def test_startup_reconnect_observes_existing_active_run_terminal() -> None
         request=_startup_request(),
     )
 
+    assert [terminal.run_id for terminal in result.terminal_results] == ["run-active"]
+    assert "get_run:run-active" not in fake_host.calls
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_does_not_read_next_target_before_ack_and_rebind() -> None:
+    """A terminal ack/rebind B 之前 sole consumer 不得预读 B。
+
+    :returns: ``None``。
+    :raises Exception: generation handshake 断言失败时由 pytest 抛出。
+    """
+
+    watcher = _FakeHostEventIterator()
+    await watcher.push(_terminal_event(event_sequence=8, run_id="run-a"))
+    await watcher.push(_terminal_event(event_sequence=9, run_id="run-b"))
+    fake_host = _StartupReadProbeHost(
+        watcher=watcher,
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                active_run_id="run-a",
+            ),
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                active_run_id="run-b",
+            ),
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=9,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
     assert [terminal.run_id for terminal in result.terminal_results] == [
-        "run-active"
+        "run-a",
+        "run-b",
     ]
-    assert "get_run:run-active" in fake_host.calls
+    assert fake_host.item_indices_before_session_read == [0, 1, 2]
+    assert watcher.closed_count == 1
+    assert watcher.close_observed_active_anext is False
 
 
 @pytest.mark.asyncio
@@ -1494,7 +2100,10 @@ async def test_startup_reconnect_waits_for_queued_promotion_then_observes_termin
     """queued-only startup 应等待 promotion，promoted 后观察 terminal。"""
 
     sleep = _SleepRecorder()
+    watcher = _FakeHostEventIterator()
+    await watcher.push(_terminal_event(event_sequence=9, run_id="run-queued"))
     fake_host = _FakeHost(
+        watcher=watcher,
         session_snapshots=(
             _session_snapshot(
                 session_id="session-1",
@@ -1533,9 +2142,7 @@ async def test_startup_reconnect_waits_for_queued_promotion_then_observes_termin
         sleep=sleep,
     )
 
-    assert [terminal.run_id for terminal in result.terminal_results] == [
-        "run-queued"
-    ]
+    assert [terminal.run_id for terminal in result.terminal_results] == ["run-queued"]
     assert sleep.calls == [0.05]
 
 
@@ -1565,10 +2172,15 @@ async def test_startup_reconnect_queued_only_exhaustion_fails_before_input() -> 
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
+async def test_submit_non_delivery_iterator_failure_uses_stable_wrapper(
     tmp_path: Path,
 ) -> None:
-    """watcher 失败后必须带诊断并仍可通过 public outbox 返回终态。"""
+    """非 delivery iterator failure 不得误入 durable recovery。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: iterator disposition 断言失败时由 pytest 抛出。
+    """
 
     runtime = await _prepare_runtime(tmp_path)
     activities: list[EntrypointActivity] = []
@@ -1585,27 +2197,78 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
         ),
     )
 
-    result = await submit_entrypoint_turn_and_wait(
-        cast(Host, fake_host),
-        request=_turn_request(),
-        scene_inputs=runtime.scene_inputs,
-        host_assembly=runtime.host_assembly,
-        on_activity=activities.append,
-    )
+    with pytest.raises(
+        EntrypointRuntimeError,
+        match="session_event_iterator_failed_before_terminal",
+    ) as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=activities.append,
+            callback_execution_port=_InlineCallbackExecutionPort(),
+        )
 
-    assert result.source is EntrypointTerminalSource.OUTBOX_READ
-    assert result.terminal_event_id == "terminal-run-1-9"
-    assert result.watcher_failure_message is not None
-    assert "RuntimeError" in result.watcher_failure_message
-    assert "watch stream disconnected" in result.watcher_failure_message
-    assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(event_sequence=0)
-    assert len(activities) == 1
-    assert activities[0].kind is EntrypointActivityKind.WATCHER_DIAGNOSTIC
-    assert activities[0].severity is EntrypointActivitySeverity.WARNING
-    assert activities[0].run_id is None
-    assert activities[0].event_sequence is None
-    assert activities[0].dedupe_key == "entrypoint_watcher_failure"
-    assert activities[0].summary == "RuntimeError: watch stream disconnected"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == "watch stream disconnected"
+    assert fake_host.read_outbox_requests == []
+    assert activities == []
+
+
+@pytest.mark.asyncio
+async def test_submit_event_projection_failure_first_commits_iterator_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """event projection failure 应 fail fast 并按 ITERATOR_FAILED 精确关闭。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises Exception: exact-five disposition 或 cleanup 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    projection_error = RuntimeError("activity projection failed")
+    projection = _FailingActivityProjection(projection_error)
+    monkeypatch.setattr(
+        entrypoint_runtime,
+        "_entrypoint_activity_from_host_event",
+        projection,
+    )
+    watcher = _FakeHostEventIterator()
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="projection-failure",
+            ),
+        ),
+    )
+    activities: list[EntrypointActivity] = []
+
+    with pytest.raises(EntrypointRuntimeError) as exc_info:
+        await asyncio.wait_for(
+            submit_entrypoint_turn_and_wait(
+                cast(Host, fake_host),
+                request=_turn_request(),
+                scene_inputs=runtime.scene_inputs,
+                host_assembly=runtime.host_assembly,
+                on_activity=activities.append,
+                callback_execution_port=_InlineCallbackExecutionPort(),
+            ),
+            timeout=1.0,
+        )
+
+    assert str(exc_info.value) == "session_event_iterator_failed_before_terminal"
+    assert exc_info.value.__cause__ is projection_error
+    assert fake_host.read_outbox_requests == []
+    assert activities == []
+    assert watcher.closed_count == 1
+    assert watcher.close_observed_active_anext is False
 
 
 @pytest.mark.asyncio
@@ -1823,135 +2486,492 @@ async def test_cancel_entrypoint_run_continues_wait_when_cancel_loses_terminal_r
 
 
 @pytest.mark.asyncio
-async def test_watch_and_wait_factory_owns_bounded_live_relay_queue() -> None:
-    """唯一 live runtime factory 应 attach watcher 并创建容量 256 的 relay。"""
+async def test_submit_delivery_interruption_recovers_once_and_closes_iterator(
+    tmp_path: Path,
+) -> None:
+    """typed delivery interruption 应只做一次 durable recovery 并精确关闭。
 
-    fake_host = _FakeHost()
-    runtime = await _create_watch_and_wait_runtime(
-        cast(Host, fake_host),
-        "session-1",
-    )
-    try:
-        assert runtime.queue.maxsize == 256
-        assert len(fake_host.watchers) == 1
-        assert runtime.watcher is fake_host.watchers[0]
-    finally:
-        await _close_watch_and_wait_runtime(runtime)
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: recovery/cleanup 断言失败时由 pytest 抛出。
+    """
 
-
-@pytest.mark.asyncio
-async def test_watcher_failure_preserves_original_typed_host_error() -> None:
-    """relay drain 必须保留 public delivery interruption 错误实例。"""
-
-    error = HostApiError(
+    delivery_error = HostApiError(
         code=HostApiErrorCode.DELIVERY_INTERRUPTED,
-        message="Session event delivery was interrupted",
+        message="delivery interrupted",
         retryable=False,
         detail=HostSessionEventDeliveryDetail(
             reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
         ),
     )
-    watcher = _FakeHostEventIterator()
-    queue = asyncio.Queue()
-    await watcher.fail(error)
-
-    await _drain_host_events(watcher, queue)
-
-    item = queue.get_nowait()
-    assert isinstance(item, _WatcherFailure)
-    assert item.error is error
-
-
-@pytest.mark.asyncio
-async def test_close_watcher_cancels_and_awaits_drain_when_aclose_is_cancelled() -> None:
-    """watcher aclose 被取消时仍必须 cancel 并回收 drain task。"""
-
-    watcher = _FakeHostEventIterator(close_error=asyncio.CancelledError())
-    drain_cancel_observed = asyncio.Event()
-    drain_task = asyncio.create_task(_wait_until_cancelled(drain_cancel_observed))
-    await asyncio.sleep(0)
-
-    with pytest.raises(asyncio.CancelledError):
-        await _close_watch_and_wait_runtime(
-            _WatchAndWaitRuntime(
-                watcher=watcher,
-                queue=asyncio.Queue(),
-                drain_task=drain_task,
-            )
-        )
-
-    assert watcher.closed_count == 1
-    assert drain_cancel_observed.is_set()
-    assert drain_task.done()
-    assert drain_task.cancelled()
-
-
-@pytest.mark.asyncio
-async def test_close_watcher_cancels_drain_before_closing_async_generator() -> None:
-    """真实 async generator watcher 关闭前必须先停止 drain task。"""
-
-    generator_entered = asyncio.Event()
-    generator_closed = asyncio.Event()
-    keep_running = asyncio.Event()
-
-    async def host_event_stream() -> AsyncGenerator[HostSessionEvent, None]:
-        """模拟 Host watch_session_events 返回的 async generator。"""
-
-        try:
-            generator_entered.set()
-            await keep_running.wait()
-            yield _terminal_event(run_id="run-1", event_sequence=1)
-        finally:
-            generator_closed.set()
-
-    watcher = _GeneratorHostSessionEventIterator(host_event_stream())
-
-    async def drain() -> None:
-        """持续消费 watcher，直到被取消。"""
-
-        async for _event in watcher:
-            pass
-
-    drain_task = asyncio.create_task(drain())
-    await generator_entered.wait()
-
-    await _close_watch_and_wait_runtime(
-        _WatchAndWaitRuntime(
-            watcher=watcher,
-            queue=asyncio.Queue(),
-            drain_task=drain_task,
-        )
+    fake_host = _FakeHost(
+        submit_watcher_errors=(delivery_error,),
+        run_statuses=(RunStatus.SUCCEEDED,),
+        outbox_batches=(
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=9, run_id="run-1"),),
+                next_sequence=9,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
     )
 
-    assert generator_closed.is_set()
-    assert drain_task.done()
-    assert drain_task.cancelled()
+    runtime = await _prepare_runtime(tmp_path)
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+    )
+
+    assert result.source is EntrypointTerminalSource.OUTBOX_READ
+    assert fake_host.watchers[0].closed_count == 1
+    assert fake_host.calls.count("read_outbox:session-1") == 1
 
 
 @pytest.mark.asyncio
-async def test_close_watcher_cancels_and_awaits_drain_when_aclose_fails() -> None:
-    """watcher aclose 普通异常应透传，且 drain task 仍被回收。"""
+async def test_submit_eof_and_close_failure_preserves_stable_primary_chain(
+    tmp_path: Path,
+) -> None:
+    """EOF + close failure 应保持 stable wrapper 为 top-level。
 
-    close_error = RuntimeError("watcher close failed")
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: exception chain 断言失败时由 pytest 抛出。
+    """
+
+    close_error = RuntimeError("close failed")
     watcher = _FakeHostEventIterator(close_error=close_error)
-    drain_cancel_observed = asyncio.Event()
-    drain_task = asyncio.create_task(_wait_until_cancelled(drain_cancel_observed))
-    await asyncio.sleep(0)
+    watcher._closed = True
+    fake_host = _FakeHost(watcher=watcher)
 
-    with pytest.raises(RuntimeError, match="watcher close failed") as exc_info:
-        await _close_watch_and_wait_runtime(
-            _WatchAndWaitRuntime(
-                watcher=watcher,
-                queue=asyncio.Queue(),
-                drain_task=drain_task,
-            )
+    with pytest.raises(
+        EntrypointRuntimeError,
+        match="session_event_iterator_ended_before_terminal",
+    ) as exc_info:
+        runtime = await _prepare_runtime(tmp_path)
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
         )
 
-    assert exc_info.value is close_error
+    assert exc_info.value.__cause__ is close_error
     assert watcher.closed_count == 1
-    assert drain_cancel_observed.is_set()
-    assert drain_task.done()
-    assert drain_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_submit_public_iterator_and_close_failures_preserve_identity(
+    tmp_path: Path,
+) -> None:
+    """public iterator + close 应保持 public failure 为 top-level identity。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: public failure identity 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    iterator_error = HostClosedError("public iterator failed")
+    close_error = RuntimeError("public iterator cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_watcher_errors=(iterator_error,),
+    )
+
+    with pytest.raises(HostClosedError, match="public iterator failed") as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+        )
+
+    assert exc_info.value is iterator_error
+    assert exc_info.value.__cause__ is close_error
+    assert watcher.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_nonpublic_iterator_and_close_failures_keep_three_level_chain(
+    tmp_path: Path,
+) -> None:
+    """non-public iterator + close 应形成 wrapper→original→close 固定链。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: 三层异常链断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    iterator_error = RuntimeError("nonpublic iterator failed")
+    close_error = RuntimeError("nonpublic iterator cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_watcher_errors=(iterator_error,),
+    )
+
+    with pytest.raises(
+        EntrypointRuntimeError,
+        match="session_event_iterator_failed_before_terminal",
+    ) as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+        )
+
+    assert exc_info.value.__cause__ is iterator_error
+    assert iterator_error.__cause__ is close_error
+    assert watcher.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_terminal_close_failure_returns_terminal_and_swallows_diagnostic_failure(
+    tmp_path: Path,
+) -> None:
+    """terminal + close 应返回终态并最多输出一次固定去敏诊断。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: terminal/diagnostic 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    close_error = RuntimeError("terminal cleanup secret")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    diagnostics: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_events=(_terminal_event(event_sequence=3, run_id="run-1"),),
+    )
+
+    def fail_after_record(activity: EntrypointActivity) -> None:
+        """记录去敏诊断后模拟 diagnostic callback failure。
+
+        :param activity: Service cleanup diagnostic。
+        :returns: 本函数不返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        diagnostics.append(activity)
+        raise RuntimeError("diagnostic callback failed")
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=fail_after_record,
+        callback_execution_port=_InlineCallbackExecutionPort(),
+    )
+
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.kind is EntrypointActivityKind.WATCHER_DIAGNOSTIC
+    assert diagnostic.dedupe_key == "entrypoint_watcher_cleanup_failed"
+    assert diagnostic.title == "运行事件流清理失败"
+    assert diagnostic.summary == "已保留终态结果，但运行事件观察器清理失败。"
+    assert "secret" not in f"{diagnostic.title}{diagnostic.summary}"
+    assert watcher.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_delivery_recovery_success_ignores_close_failure(
+    tmp_path: Path,
+) -> None:
+    """delivery recovery 成功后 close failure 不得覆盖同一 durable terminal。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: terminal identity 断言失败时由 pytest 抛出。
+    """
+
+    delivery_error = HostApiError(
+        code=HostApiErrorCode.DELIVERY_INTERRUPTED,
+        message="delivery interrupted",
+        retryable=False,
+        detail=HostSessionEventDeliveryDetail(
+            reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
+        ),
+    )
+    close_error = RuntimeError("delivery cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_watcher_errors=(delivery_error,),
+        run_statuses=(RunStatus.SUCCEEDED,),
+        outbox_batches=(
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=9, run_id="run-1"),),
+                next_sequence=9,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+    runtime = await _prepare_runtime(tmp_path)
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+    )
+
+    assert result.source is EntrypointTerminalSource.OUTBOX_READ
+    assert result.terminal_event_id == "terminal-run-1-9"
+    assert watcher.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_delivery_recovery_failure_keeps_delivery_and_close_chain(
+    tmp_path: Path,
+) -> None:
+    """delivery recovery + close 应形成 recovery→delivery→close 固定链。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: recovery 异常链断言失败时由 pytest 抛出。
+    """
+
+    delivery_error = HostApiError(
+        code=HostApiErrorCode.DELIVERY_INTERRUPTED,
+        message="delivery interrupted",
+        retryable=False,
+        detail=HostSessionEventDeliveryDetail(
+            reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
+        ),
+    )
+    recovery_error = RuntimeError("durable recovery failed")
+    close_error = RuntimeError("delivery cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _RecoveryFailingHost(
+        recovery_error,
+        watcher=watcher,
+        delivery_error=delivery_error,
+    )
+    runtime = await _prepare_runtime(tmp_path)
+
+    with pytest.raises(RuntimeError, match="durable recovery failed") as exc_info:
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+        )
+
+    assert exc_info.value is recovery_error
+    assert exc_info.value.__cause__ is delivery_error
+    assert delivery_error.__cause__ is close_error
+    assert watcher.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_slot_empty_close_failure_uses_stable_cleanup_disposition() -> None:
+    """startup 空 slot + close 应使用唯一 cleanup stable wrapper。
+
+    :returns: ``None``。
+    :raises Exception: slot-empty cleanup 断言失败时由 pytest 抛出。
+    """
+
+    close_error = RuntimeError("idle cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    fake_host = _FakeHost(watcher=watcher)
+
+    with pytest.raises(
+        EntrypointRuntimeError,
+        match="session_event_iterator_cleanup_failed",
+    ) as exc_info:
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(),
+        )
+
+    assert exc_info.value.__cause__ is close_error
+    assert watcher.closed_count == 1
+    assert watcher.close_observed_active_anext is False
+
+
+@pytest.mark.asyncio
+async def test_submit_caller_cancellation_waits_callback_then_chains_close_failure(
+    tmp_path: Path,
+) -> None:
+    """caller cancellation + close 应等待当前 callback 并保留 cancellation primary。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: cancellation/cleanup 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    close_error = RuntimeError("cancel cleanup failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    port = _BlockingCallbackExecutionPort()
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        watcher=watcher,
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="cancel-blocking-callback",
+            ),
+        ),
+    )
+    submit_task = asyncio.create_task(
+        submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=activities.append,
+            callback_execution_port=port,
+        )
+    )
+    await port.started.wait()
+
+    submit_task.cancel()
+    await asyncio.sleep(0)
+    assert submit_task.done() is False
+    assert watcher.closed_count == 0
+    port.release.set()
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await submit_task
+
+    assert exc_info.value.__cause__ is close_error
+    assert port.finished.is_set()
+    assert watcher.closed_count == 1
+    assert watcher.close_observed_active_anext is False
+
+
+def test_observation_state_rejects_old_generation_and_stop_late_commits() -> None:
+    """capacity-one slot 应拒绝旧 generation 五类结果及 stop 后 late commit。
+
+    :returns: ``None``。
+    :raises Exception: generation/stop 仲裁断言失败时由 pytest 抛出。
+    """
+
+    state = entrypoint_runtime._ServiceObservationState()
+    first_generation = state.bind("run-1")
+    assert first_generation == 1
+    first_terminal = entrypoint_runtime._TargetTerminal(
+        target_generation=first_generation,
+        result=_service_terminal_result(run_id="run-1", event_sequence=1),
+    )
+    assert state.try_commit(first_terminal, target_run_id="run-1") is True
+    assert (
+        state.try_commit(
+            entrypoint_runtime._IteratorEnded(
+                target_generation=first_generation,
+            ),
+            target_run_id="run-1",
+        )
+        is False
+    )
+    assert state.ack_target_terminal(first_generation) is first_terminal
+    second_generation = state.bind("run-2")
+    delivery_error = HostApiError(
+        code=HostApiErrorCode.DELIVERY_INTERRUPTED,
+        message="old generation delivery",
+        retryable=False,
+        detail=HostSessionEventDeliveryDetail(
+            reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
+        ),
+    )
+    stale_results: tuple[entrypoint_runtime._ServiceObservationResult, ...] = (
+        entrypoint_runtime._TargetTerminal(
+            target_generation=first_generation,
+            result=_service_terminal_result(run_id="run-1", event_sequence=1),
+        ),
+        entrypoint_runtime._DeliveryInterrupted(
+            target_generation=first_generation,
+            error=delivery_error,
+        ),
+        entrypoint_runtime._IteratorEnded(target_generation=first_generation),
+        entrypoint_runtime._CallbackFailed(
+            target_generation=first_generation,
+            callback_kind=entrypoint_runtime._CallbackKind.ACTIVITY,
+            error=RuntimeError("old callback"),
+        ),
+        entrypoint_runtime._IteratorFailed(
+            target_generation=first_generation,
+            error=RuntimeError("old iterator"),
+        ),
+    )
+    for stale_result in stale_results:
+        assert state.try_commit(stale_result, target_run_id="run-1") is False
+        assert state.result is None
+
+    state.request_stop()
+    assert (
+        state.try_commit(
+            entrypoint_runtime._IteratorEnded(
+                target_generation=second_generation,
+            ),
+            target_run_id="run-2",
+        )
+        is False
+    )
+
+
+def test_observation_state_fatal_result_is_sticky_and_not_acknowledgeable() -> None:
+    """非 terminal fatal result 必须粘滞，且不能 ack/reuse generation。
+
+    :returns: ``None``。
+    :raises Exception: fatal sticky 断言失败时由 pytest 抛出。
+    """
+
+    state = entrypoint_runtime._ServiceObservationState()
+    generation = state.bind("run-1")
+    fatal = entrypoint_runtime._IteratorEnded(target_generation=generation)
+
+    assert state.try_commit(fatal, target_run_id="run-1") is True
+    assert state.result is fatal
+    with pytest.raises(RuntimeError, match="only target terminal"):
+        state.ack_target_terminal(generation)
+    with pytest.raises(RuntimeError, match="only bind while unbound"):
+        state.bind("run-2")
+
+
+def test_terminal_identity_dedupe_uses_seen_terminal_event_ids_for_both_sources() -> None:
+    """live 与 Outbox 都必须按同一 seen terminal event id 真源去重。
+
+    :returns: ``None``。
+    :raises Exception: owner contract 断言失败时由 pytest 抛出。
+    """
+
+    terminal_event_id = "terminal-run-1-2"
+    live_state = entrypoint_runtime._new_terminal_observation_state(
+        seen_terminal_event_ids=frozenset({terminal_event_id})
+    )
+    live_terminal = entrypoint_runtime._terminal_result_from_live_event(
+        _terminal_event(
+            event_sequence=2,
+            run_id="run-1",
+            dedupe_key="changed-live-dedupe-key",
+        ),
+        run_id="run-1",
+        state=live_state,
+    )
+
+    outbox_state = entrypoint_runtime._new_terminal_observation_state(
+        seen_terminal_event_ids=frozenset({terminal_event_id})
+    )
+    outbox_terminal = entrypoint_runtime._scan_outbox_terminal_items(
+        items=(_outbox_item(event_sequence=2, run_id="run-1"),),
+        run_id="run-1",
+        state=outbox_state,
+    )
+
+    assert live_terminal is None
+    assert outbox_terminal is None
+    assert live_state.last_observed_event_sequence == 2
+    assert outbox_state.last_observed_event_sequence == 2
 
 
 def test_entrypoint_runtime_does_not_import_engine_internals() -> None:
@@ -2063,6 +3083,35 @@ def _turn_request() -> EntrypointTurnRequest:
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
         run_overrides=ServiceRunOverrides(temperature=0.2),
+    )
+
+
+def _service_terminal_result(
+    *,
+    run_id: str,
+    event_sequence: int,
+) -> EntrypointRunTerminalResult:
+    """构造 observation state 测试使用的 Service terminal DTO。
+
+    :param run_id: 目标 Run id。
+    :param event_sequence: terminal event sequence。
+    :returns: 固定成功 terminal result。
+    :raises Exception: DTO contract 非法时由构造函数抛出。
+    """
+
+    terminal_event_id = f"terminal-{run_id}-{event_sequence}"
+    return EntrypointRunTerminalResult(
+        source=EntrypointTerminalSource.LIVE_EVENT,
+        session_id="session-1",
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        event_sequence=event_sequence,
+        terminal_status=HostTerminalStatus.SUCCEEDED,
+        dedupe_key=terminal_event_id,
+        final_answer=_final_answer(run_id=run_id),
+        error_message=None,
+        cancel_reason=None,
+        watcher_failure_message=None,
     )
 
 

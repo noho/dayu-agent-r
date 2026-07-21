@@ -1,19 +1,20 @@
-"""真实 Host→Service→CLI transient slow-consumer 路径测试。"""
+"""真实 Host→Service→CLI delivery interruption 路径测试。"""
 
 from __future__ import annotations
 
 import asyncio
 import io
 import pathlib
-from collections.abc import AsyncIterator
+import threading
 from dataclasses import replace
-from typing import Protocol, cast
+from typing import cast
 
 import pytest
 
 from dayu.cli.agent_entrypoint import package_config_root
 from dayu.cli.exit_codes import EXIT_SUCCESS
 from dayu.cli.output import render_prompt_terminal_result
+from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.host import (
     FollowupBehavior,
@@ -24,6 +25,7 @@ from dayu.host import (
     HostEvent,
     HostSessionEvent,
     HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryPolicy,
     HostSessionEventDeliveryReason,
     HostSessionEventIterator,
     OutboxTerminalCursor,
@@ -38,12 +40,13 @@ from dayu.service.entrypoint_runtime import (
     EntrypointActivity,
     EntrypointRuntimeRequest,
     EntrypointTerminalSource,
+    EntrypointThinking,
     EntrypointTurnRequest,
     prepare_entrypoint_runtime,
     submit_entrypoint_turn_and_wait,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
-from tests.host.public_smoke_support import ensure_request, host_context
+from tests.host.public_smoke_support import ensure_request, followup_request, host_context
 from tests.host.transient_stream_support import (
     TransientStreamCounts,
     TransientStreamWorkerFactory,
@@ -52,23 +55,9 @@ from tests.host.transient_stream_support import (
 )
 
 _DELTA_COUNT_PER_TYPE = 400
-_SERVICE_RELAY_CAPACITY = 256
-_PENDING_RELAY_ITEM_COUNT = 1
+_HOST_MAILBOX_MAX_ITEMS = 32
 _E2E_TIMEOUT_SECONDS = 30.0
-_FINAL_ANSWER = "slow-consumer-final"
-
-
-class _ClosableSessionEventIterator(Protocol):
-    """E2E probe 使用的可关闭 Session event iterator 窄协议。"""
-
-    async def aclose(self) -> None:
-        """关闭 iterator。
-
-        :returns: ``None``。
-        :raises Exception: Host iterator cleanup 失败时透传。
-        """
-
-        ...
+_FINAL_ANSWER = "delivery-interruption-final"
 
 
 class _ObservedHostSessionEventIterator:
@@ -77,7 +66,7 @@ class _ObservedHostSessionEventIterator:
     def __init__(
         self,
         *,
-        inner: AsyncIterator[HostSessionEvent],
+        inner: HostSessionEventIterator,
         owner: _SlowConsumerHostProbe,
     ) -> None:
         """初始化透明 iterator probe。
@@ -125,16 +114,11 @@ class _ObservedHostSessionEventIterator:
         :raises Exception: 真实 Host iterator cleanup 失败时透传。
         """
 
-        await cast(_ClosableSessionEventIterator, self._inner).aclose()
+        await self._inner.aclose()
 
 
 class _SlowConsumerHostProbe:
-    """阻塞 Service 首次 ``get_run``，透明转发其余真实 Host public 调用。
-
-    阻塞点位于 Service 已排空 relay、即将等待 durable 状态的位置。此后真实
-    watcher drain task 会先填满 capacity-256 relay，再停在第 257 个 item 的
-    ``await queue.put``；测试只记录该事实，不替换 Host/Service 实现。
-    """
+    """透明观测 Service 使用的真实 Host public 调用。"""
 
     def __init__(self, host: Host) -> None:
         """初始化真实 Host public probe。
@@ -145,14 +129,13 @@ class _SlowConsumerHostProbe:
         """
 
         self._host = host
-        self._release_first_get_run = asyncio.Event()
-        self.first_get_run_blocked = asyncio.Event()
         self.submit_completed = asyncio.Event()
         self.accepted_run_id: str | None = None
-        self.block_start_yielded_count: int | None = None
         self.yielded_count = 0
         self.host_errors: list[HostApiError] = []
         self.live_terminal_event_ids: list[str] = []
+        self.get_run_call_count = 0
+        self.outbox_read_call_count = 0
 
     async def watch_session_events(
         self,
@@ -189,7 +172,7 @@ class _SlowConsumerHostProbe:
         return result
 
     async def get_run(self, run_id: str) -> RunSnapshot:
-        """只阻塞 Service 的首次 get_run，恢复后转发真实读取。
+        """转发 durable Run read 并记录 recovery 调用次数。
 
         :param run_id: 目标 Run 标识。
         :returns: 真实 Run snapshot。
@@ -197,10 +180,7 @@ class _SlowConsumerHostProbe:
         :raises asyncio.CancelledError: Service task 被取消时透传。
         """
 
-        if not self.first_get_run_blocked.is_set():
-            self.block_start_yielded_count = self.yielded_count
-            self.first_get_run_blocked.set()
-            await self._release_first_get_run.wait()
+        self.get_run_call_count += 1
         return await self._host.get_run(run_id)
 
     async def read_outbox_terminal_items(
@@ -216,27 +196,90 @@ class _SlowConsumerHostProbe:
         :raises HostApiError: Host Outbox read 失败时透传。
         """
 
+        self.outbox_read_call_count += 1
         return await self._host.read_outbox_terminal_items(session_id, request)
 
-    def release_first_get_run(self) -> None:
-        """恢复 Service terminal observation 消费。
+
+class _BlockingThinkingRenderer:
+    """在首个 thinking 增量建立可控阻塞 barrier 的 CLI renderer。"""
+
+    def __init__(self, inner: CliThinkingRenderer) -> None:
+        """初始化 renderer wrapper。
+
+        :param inner: 真实 CLI thinking renderer。
+        :returns: 无返回值。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        self._inner = inner
+        self._blocked = threading.Event()
+        self._release = threading.Event()
+        self.record_call_count = 0
+        self.close_call_count = 0
+
+    @property
+    def blocked(self) -> bool:
+        """返回 callback 是否已进入阻塞点。
+
+        :returns: 已进入阻塞点时返回 ``True``。
+        :raises Exception: 本属性不主动抛出异常。
+        """
+
+        return self._blocked.is_set()
+
+    def record(self, thinking: EntrypointThinking) -> None:
+        """阻塞首个 callback，恢复后交给真实 renderer。
+
+        :param thinking: Service thinking DTO。
+        :returns: ``None``。
+        :raises AssertionError: barrier 超时未释放时抛出。
+        """
+
+        self.record_call_count += 1
+        if self.record_call_count == 1:
+            self._blocked.set()
+            if not self._release.wait(timeout=_E2E_TIMEOUT_SECONDS):
+                raise AssertionError("blocking renderer was not released")
+        self._inner.record(thinking)
+
+    def release(self) -> None:
+        """释放首个 callback barrier。
 
         :returns: ``None``。
         :raises Exception: 本方法不主动抛出异常。
         """
 
-        self._release_first_get_run.set()
+        self._release.set()
+
+    def finish_runtime_display(self) -> None:
+        """结束真实 thinking 运行态行。
+
+        :returns: ``None``。
+        :raises OSError: 真实 renderer 输出失败时透传。
+        """
+
+        self._inner.finish_runtime_display()
+
+    def close(self) -> None:
+        """关闭真实 renderer 并记录 exact-once 调用。
+
+        :returns: ``None``。
+        :raises OSError: 真实 renderer 输出失败时透传。
+        """
+
+        self.close_call_count += 1
+        self._inner.close()
 
 
 @pytest.mark.asyncio
-async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_error(
+async def test_real_delivery_interruption_recovers_once_and_renders_terminal_once(
     tmp_path: pathlib.Path,
 ) -> None:
     """真实跨层慢消费者应 overflow、Outbox 收口且 CLI 只展示一次 final。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
-    :raises AssertionError: bounded relay、typed error、fallback 或输出去重失效时抛出。
+    :raises AssertionError: Host mailbox、typed recovery 或输出去重失效时抛出。
     """
 
     runtime = await prepare_entrypoint_runtime(
@@ -249,9 +292,7 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": "# 当前时间\n现在是 2026年7月21日。",
             },
-            assembly_overrides=ServiceAssemblyOverrides(
-                model_id="deepseek-v4-flash"
-            ),
+            assembly_overrides=ServiceAssemblyOverrides(model_id="deepseek-v4-flash"),
             env={"DEEPSEEK_API_KEY": "test-provider-key"},
         )
     )
@@ -264,6 +305,7 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
         ),
         final_answer=_FINAL_ANSWER,
         release_event=worker_release,
+        terminal_release_event=asyncio.Event(),
     )
     options = replace(
         runtime.host_assembly.options,
@@ -272,28 +314,40 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
         create_parent_dirs=True,
         lane_db_path=tmp_path / "host" / "lane.sqlite3",
         worker_factory=factory,
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=_HOST_MAILBOX_MAX_ITEMS,
+            max_subscriptions_per_session=4,
+        ),
     )
     thinking_stderr = io.StringIO()
-    renderer = CliThinkingRenderer(
-        stderr=thinking_stderr,
-        options=CliThinkingRendererOptions(
-            enabled=True,
-            terminal_control=False,
+    blocking_renderer = _BlockingThinkingRenderer(
+        CliThinkingRenderer(
+            stderr=thinking_stderr,
+            options=CliThinkingRendererOptions(
+                enabled=True,
+                terminal_control=False,
+            ),
         ),
+    )
+    display_controller = RuntimeDisplayController(
+        activity_display=None,
+        thinking_display=blocking_renderer,
     )
     activities: list[EntrypointActivity] = []
 
     async with open_host(options) as real_host:
-        session = await real_host.ensure_session(ensure_request("slow-consumer-e2e"))
+        session = await real_host.ensure_session(ensure_request("delivery-interruption-e2e"))
+        independent_watcher = await real_host.watch_session_events(session.session_id)
+        independent_consumer = asyncio.create_task(_collect_terminal_event_ids(independent_watcher, expected_count=2))
         probe = _SlowConsumerHostProbe(real_host)
         service_task = asyncio.create_task(
             submit_entrypoint_turn_and_wait(
                 cast(Host, probe),
                 request=EntrypointTurnRequest(
-                    context=host_context("slow-consumer-e2e-submit"),
+                    context=host_context("delivery-interruption-e2e-submit"),
                     session_id=session.session_id,
-                    client_request_id="slow-consumer-e2e-followup",
-                    user_prompt="exercise real slow consumer path",
+                    client_request_id="delivery-interruption-e2e-followup",
+                    user_prompt="exercise real delivery interruption path",
                     tool_names=runtime.scene_inputs.tool_selection.tool_names,
                     behavior=FollowupBehavior.QUEUE,
                     target_run_id=None,
@@ -302,38 +356,57 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
                 scene_inputs=runtime.scene_inputs,
                 host_assembly=runtime.host_assembly,
                 on_activity=activities.append,
-                on_thinking=renderer.record,
+                on_thinking=blocking_renderer.record,
+                callback_execution_port=display_controller,
                 poll_interval_seconds=0.01,
             )
         )
         await asyncio.wait_for(probe.submit_completed.wait(), timeout=2.0)
-        await asyncio.wait_for(probe.first_get_run_blocked.wait(), timeout=2.0)
         run_id = probe.accepted_run_id
-        block_start = probe.block_start_yielded_count
-        if run_id is None or block_start is None:
-            raise AssertionError("Service did not expose accepted/block identities")
+        if run_id is None:
+            raise AssertionError("Service did not expose accepted Run identity")
 
         worker_release.set()
-        await asyncio.wait_for(factory.deltas_finished_event.wait(), timeout=15.0)
-        run = await _wait_for_run_succeeded(real_host, run_id)
-        blocked_yield_count = (
-            block_start + _SERVICE_RELAY_CAPACITY + _PENDING_RELAY_ITEM_COUNT
+        await _wait_for_renderer_block(blocking_renderer)
+        yielded_at_block = probe.yielded_count
+        queued = await real_host.submit_followup(
+            session.session_id,
+            followup_request(
+                session.session_id,
+                "delivery-interruption-e2e-queued",
+                "prove queue promotion survives a blocked CLI renderer",
+                tool_names=runtime.scene_inputs.tool_selection.tool_names,
+            ),
         )
-        await _wait_for_yielded_count(probe, blocked_yield_count)
-        yielded_before_probe = probe.yielded_count
+        queued_run_id = queued.accepted_run_id
+        queued_snapshot = await real_host.get_run(queued_run_id)
+        assert queued_snapshot.status is RunStatus.QUEUED
+        await asyncio.wait_for(factory.deltas_finished_event.wait(), timeout=15.0)
+        terminal_release = factory.terminal_release_event
+        if terminal_release is None:
+            raise AssertionError("terminal barrier is missing")
+        terminal_release.set()
+        run = await _wait_for_run_succeeded(real_host, run_id)
+        promoted_run = await _wait_for_run_succeeded(real_host, queued_run_id)
+        independent_terminal_ids = await asyncio.wait_for(
+            independent_consumer,
+            timeout=_E2E_TIMEOUT_SECONDS,
+        )
         await asyncio.sleep(0.05)
 
-        assert yielded_before_probe == blocked_yield_count
-        assert probe.yielded_count == yielded_before_probe
+        assert probe.yielded_count == yielded_at_block
         assert not service_task.done()
         assert run.status is RunStatus.SUCCEEDED
+        assert promoted_run.status is RunStatus.SUCCEEDED
+        assert len(independent_terminal_ids) == 2
         assert factory.cancel_reasons == []
-        assert event_log_type_count(options.db_path, "RUN_SUCCEEDED") == 1
+        assert event_log_type_count(options.db_path, "RUN_SUCCEEDED") == 2
 
-        probe.release_first_get_run()
+        blocking_renderer.release()
         terminal = await asyncio.wait_for(service_task, timeout=_E2E_TIMEOUT_SECONDS)
-        renderer.finish_runtime_display()
-        renderer.close()
+        await display_controller.finish_runtime_display()
+        await display_controller.aclose()
+        await independent_watcher.aclose()
 
         outbox = await real_host.read_outbox_terminal_items(
             session.session_id,
@@ -348,9 +421,7 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
     assert terminal.run_id == run_id
     assert terminal.final_answer is not None
     assert terminal.final_answer.content == _FINAL_ANSWER
-    assert terminal.watcher_failure_message is not None
-    assert "HostApiError" in terminal.watcher_failure_message
-    assert "delivery was interrupted" in terminal.watcher_failure_message
+    assert terminal.watcher_failure_message is None
     assert probe.live_terminal_event_ids == []
     assert len(probe.host_errors) == 1
     overflow = probe.host_errors[0]
@@ -359,10 +430,11 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
     assert overflow.detail == HostSessionEventDeliveryDetail(
         reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
     )
-    assert any(
-        activity.summary is not None and "HostApiError" in activity.summary
-        for activity in activities
-    )
+    assert probe.get_run_call_count == 1
+    assert probe.outbox_read_call_count == 1
+    assert terminal.terminal_event_id in independent_terminal_ids
+    assert blocking_renderer.close_call_count == 1
+    assert activities
 
     matching_outbox = tuple(item for item in outbox.items if item.run_id == run_id)
     assert len(matching_outbox) == 1
@@ -390,7 +462,7 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
 
 
 async def _wait_for_run_succeeded(host: Host, run_id: str) -> RunSnapshot:
-    """等待真实 Host Run 成功，证明 terminal append 未受 relay 反压阻塞。
+    """等待真实 Host Run 成功，证明 terminal/promotion 未受 renderer 阻塞。
 
     :param host: 真实 public Host。
     :param run_id: 目标 Run 标识。
@@ -409,25 +481,44 @@ async def _wait_for_run_succeeded(host: Host, run_id: str) -> RunSnapshot:
         }:
             raise AssertionError(f"Run reached unexpected status: {snapshot.status}")
         await asyncio.sleep(0.01)
-    raise AssertionError("Run did not succeed while Service relay was blocked")
+    raise AssertionError("Run did not succeed while CLI renderer was blocked")
 
 
-async def _wait_for_yielded_count(
-    probe: _SlowConsumerHostProbe,
-    expected_count: int,
-) -> None:
-    """等待透明 iterator 到达 Service relay 的确定性阻塞计数。
+async def _wait_for_renderer_block(renderer: _BlockingThinkingRenderer) -> None:
+    """等待 CLI renderer callback 进入阻塞点。
 
-    :param probe: 真实 Host iterator 观测 probe。
-    :param expected_count: relay capacity 加一个 pending put 后的精确计数。
+    :param renderer: 带可控 barrier 的 renderer。
     :returns: ``None``。
-    :raises AssertionError: timeout 内未到达精确计数或越界时抛出。
+    :raises AssertionError: timeout 内 callback 未进入阻塞点时抛出。
     """
 
     for _attempt in range(1_000):
-        if probe.yielded_count == expected_count:
+        if renderer.blocked:
             return
-        if probe.yielded_count > expected_count:
-            raise AssertionError("Service relay accepted more than its bounded capacity")
         await asyncio.sleep(0.005)
-    raise AssertionError("Service relay did not reach its bounded blocking point")
+    raise AssertionError("CLI renderer callback did not reach its blocking point")
+
+
+async def _collect_terminal_event_ids(
+    watcher: HostSessionEventIterator,
+    *,
+    expected_count: int,
+) -> tuple[str, ...]:
+    """持续消费独立 watcher，收集指定数量的 terminal identity。
+
+    :param watcher: 真实 Host public Session event iterator。
+    :param expected_count: 预期 terminal 数量。
+    :returns: 按交付顺序收集的 terminal event id。
+    :raises HostApiError: 独立 watcher 交付失败时透传。
+    :raises AssertionError: HostEvent 缺少 terminal identity 时抛出。
+    """
+
+    terminal_event_ids: list[str] = []
+    while len(terminal_event_ids) < expected_count:
+        event = await anext(watcher)
+        if not isinstance(event, HostEvent) or event.terminal_status is None:
+            continue
+        if event.event_id is None:
+            raise AssertionError("terminal HostEvent did not contain event_id")
+        terminal_event_ids.append(event.event_id)
+    return tuple(terminal_event_ids)

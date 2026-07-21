@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -58,16 +57,14 @@ _INTERACTIVE_CURRENT_TIME_TEXT = (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class _StopSignal:
-    """测试 watcher 停止信号。"""
-
-
 class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostSessionEvent | _StopSignal]
+    _items: tuple[HostSessionEvent, ...]
+    _item_index: int
+    _changed: asyncio.Event
+    _closed: bool
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -77,7 +74,10 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count = 0
-        self._queue = asyncio.Queue()
+        self._items = ()
+        self._item_index = 0
+        self._changed = asyncio.Event()
+        self._closed = False
 
     def __aiter__(self) -> HostSessionEventIterator:
         """返回自身作为 async iterator。
@@ -95,9 +95,13 @@ class _FakeHostEventIterator:
         :raises StopAsyncIteration: 收到停止信号时抛出。
         """
 
-        item = await self._queue.get()
-        if isinstance(item, _StopSignal):
-            raise StopAsyncIteration
+        while self._item_index >= len(self._items):
+            if self._closed:
+                raise StopAsyncIteration
+            self._changed.clear()
+            await self._changed.wait()
+        item = self._items[self._item_index]
+        self._item_index += 1
         return item
 
     async def push(self, event: HostSessionEvent) -> None:
@@ -108,7 +112,8 @@ class _FakeHostEventIterator:
         :raises Exception: 不主动抛出异常。
         """
 
-        await self._queue.put(event)
+        self._items = (*self._items, event)
+        self._changed.set()
 
     async def aclose(self) -> None:
         """关闭 watcher。
@@ -118,7 +123,8 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count += 1
-        await self._queue.put(_StopSignal())
+        self._closed = True
+        self._changed.set()
 
 
 class _FakeHost:

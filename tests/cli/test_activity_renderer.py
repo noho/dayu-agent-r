@@ -72,7 +72,7 @@ def test_activity_renderer_hidden_keeps_terminal_area_clean() -> None:
     )
 
     renderer.record(_activity(dedupe_key="activity-hidden", event_sequence=1))
-    renderer.toggle_visible()
+    renderer.toggle_runtime_display()
     renderer.record(_activity(dedupe_key="activity-visible", event_sequence=2))
 
     output = stderr.getvalue()
@@ -91,7 +91,7 @@ def test_activity_renderer_toggle_hidden_reports_latest_visible_activity() -> No
     )
 
     renderer.record(_activity(dedupe_key="activity-visible", event_sequence=1))
-    renderer.toggle_visible()
+    renderer.toggle_runtime_display()
 
     output = stderr.getvalue()
     assert "Activity:" in output

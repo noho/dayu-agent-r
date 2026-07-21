@@ -87,7 +87,7 @@ class InteractiveRunView(Protocol):
         """
         ...
 
-    def toggle_view(self) -> None:
+    def toggle_runtime_display(self) -> None:
         """切换 transcript/activity view。
 
         :returns: ``None``。
@@ -323,7 +323,7 @@ class TerminalInteractiveRunView:
         self._mode = self._default_mode
         return exit_code
 
-    def toggle_view(self) -> None:
+    def toggle_runtime_display(self) -> None:
         """切换 transcript/activity view 并渲染当前 buffer 快照。
 
         :returns: ``None``。

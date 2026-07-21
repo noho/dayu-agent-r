@@ -16,7 +16,6 @@ import pytest
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
-from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.runtime_display import RuntimeDisplayController
@@ -121,16 +120,14 @@ async def _raise_cli_terminal_cursor_error(
     raise CliTerminalCursorError("cursor write failed")
 
 
-@dataclass(frozen=True, slots=True)
-class _StopSignal:
-    """测试 watcher 停止信号。"""
-
-
 class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostSessionEvent | _StopSignal]
+    _items: tuple[HostSessionEvent, ...]
+    _item_index: int
+    _changed: asyncio.Event
+    _closed: bool
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -140,7 +137,10 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count = 0
-        self._queue = asyncio.Queue()
+        self._items = ()
+        self._item_index = 0
+        self._changed = asyncio.Event()
+        self._closed = False
 
     def __aiter__(self) -> HostSessionEventIterator:
         """返回自身作为 async iterator。
@@ -158,9 +158,13 @@ class _FakeHostEventIterator:
         :raises StopAsyncIteration: 收到停止信号时抛出。
         """
 
-        item = await self._queue.get()
-        if isinstance(item, _StopSignal):
-            raise StopAsyncIteration
+        while self._item_index >= len(self._items):
+            if self._closed:
+                raise StopAsyncIteration
+            self._changed.clear()
+            await self._changed.wait()
+        item = self._items[self._item_index]
+        self._item_index += 1
         return item
 
     async def push(self, event: HostSessionEvent) -> None:
@@ -171,7 +175,8 @@ class _FakeHostEventIterator:
         :raises Exception: 不主动抛出异常。
         """
 
-        await self._queue.put(event)
+        self._items = (*self._items, event)
+        self._changed.set()
 
     async def aclose(self) -> None:
         """关闭 watcher。
@@ -181,7 +186,8 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count += 1
-        await self._queue.put(_StopSignal())
+        self._closed = True
+        self._changed.set()
 
 
 class _FakeHost:
@@ -312,9 +318,7 @@ class _FakeHost:
         if status_index < len(self._submit_statuses):
             status = self._submit_statuses[status_index]
         if status is not None:
-            if status_index < len(self._submit_thinking) and self._submit_thinking[
-                status_index
-            ]:
+            if status_index < len(self._submit_thinking) and self._submit_thinking[status_index]:
                 await self.watchers[-1].push(_thinking_event(run_id=run_id))
             if status_index < len(self._submit_activities) and self._submit_activities[status_index]:
                 await self.watchers[-1].push(_activity_event(run_id=run_id))
@@ -590,7 +594,9 @@ class _FakeRunningKeyMonitor:
 
     started_count: int
     closed_count: int
-    _actions: asyncio.Queue[RunningKeyAction]
+    _actions: tuple[RunningKeyAction, ...]
+    _action_index: int
+    _closed_event: asyncio.Event
     _delay_ticks: int
 
     def __init__(
@@ -609,10 +615,10 @@ class _FakeRunningKeyMonitor:
 
         self.started_count = 0
         self.closed_count = 0
-        self._actions = asyncio.Queue()
+        self._actions = actions
+        self._action_index = 0
+        self._closed_event = asyncio.Event()
         self._delay_ticks = delay_ticks
-        for action in actions:
-            self._actions.put_nowait(action)
 
     def start(self) -> None:
         """记录 monitor 启动。
@@ -632,7 +638,12 @@ class _FakeRunningKeyMonitor:
 
         for _tick_index in range(self._delay_ticks):
             await asyncio.sleep(0)
-        return await self._actions.get()
+        if self._action_index < len(self._actions):
+            action = self._actions[self._action_index]
+            self._action_index += 1
+            return action
+        await self._closed_event.wait()
+        raise asyncio.CancelledError
 
     def close(self) -> None:
         """记录 monitor 关闭。
@@ -642,6 +653,7 @@ class _FakeRunningKeyMonitor:
         """
 
         self.closed_count += 1
+        self._closed_event.set()
 
 
 class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
@@ -749,8 +761,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
         _CURRENT_TIME_SLOT,
     )
     assert (
-        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT]
-        == "# 当前分析对象\n你正在分析的是 AAPL。"
+        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 AAPL。"
     )
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
@@ -1520,9 +1531,7 @@ def test_interactive_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppr
         ),
     )
 
-    thinking_exit = cli_main.main(
-        ("interactive", "--base", str(tmp_path), "--thinking")
-    )
+    thinking_exit = cli_main.main(("interactive", "--base", str(tmp_path), "--thinking"))
     thinking_captured = capsys.readouterr()
 
     monkeypatch.setattr(
@@ -1541,9 +1550,7 @@ def test_interactive_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppr
         ),
     )
 
-    no_thinking_exit = cli_main.main(
-        ("interactive", "--base", str(tmp_path), "--no-thinking")
-    )
+    no_thinking_exit = cli_main.main(("interactive", "--base", str(tmp_path), "--no-thinking"))
     no_thinking_captured = capsys.readouterr()
 
     assert thinking_exit == EXIT_SUCCESS
@@ -1849,6 +1856,11 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         )
     )
 
+    runtime_display = RuntimeDisplayController(
+        activity_display=run_view,
+        thinking_display=thinking_renderer,
+    )
+    await runtime_display.install_runtime_line_guard()
     result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
@@ -1860,16 +1872,16 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
         thinking_renderer=thinking_renderer,
+        runtime_display=runtime_display,
         key_monitor=key_monitor,
     )
+    await runtime_display.aclose()
 
     assert result is not None
     assert result.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert "Thinking: The user is asking\r\x1b[2KInteractive: cancel requested" in (
-        stderr.getvalue()
-    )
+    assert "Thinking: The user is asking\r\x1b[2KInteractive: cancel requested" in (stderr.getvalue())
     thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
     assert stderr.getvalue().count("Thinking:") == 1
     assert key_monitor.started_count == 1
@@ -1900,6 +1912,11 @@ async def test_interactive_ctrl_t_switches_run_view_without_cancel(
     )
     key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
 
+    runtime_display = RuntimeDisplayController(
+        activity_display=run_view,
+        thinking_display=None,
+    )
+    await runtime_display.install_runtime_line_guard()
     result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
@@ -1910,8 +1927,10 @@ async def test_interactive_ctrl_t_switches_run_view_without_cancel(
         run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
+        runtime_display=runtime_display,
         key_monitor=key_monitor,
     )
+    await runtime_display.aclose()
 
     assert result is not None
     assert result.terminal_status is HostTerminalStatus.SUCCEEDED
@@ -2167,6 +2186,10 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         options=CliThinkingRendererOptions(enabled=True),
     )
 
+    runtime_display = RuntimeDisplayController(
+        activity_display=None,
+        thinking_display=thinking_renderer,
+    )
     result = await session_execution._cancel_interactive_turn_after_first_sigint(
         host=cast(Host, _FakeHost()),
         invocation=session_execution.new_cli_invocation(
@@ -2180,11 +2203,9 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         submit_task=submit_task,
         sigint_monitor=_ImmediateSecondSigintMonitor(),
         observed_sigint_count=1,
-        runtime_display=RuntimeDisplayController(
-            activity_display=None,
-            thinking_display=thinking_renderer,
-        ),
+        runtime_display=runtime_display,
     )
+    await runtime_display.aclose()
 
     assert result is not None
     assert result.terminal_status is HostTerminalStatus.SUCCEEDED
@@ -2509,17 +2530,9 @@ def _startup_terminal_result(
         event_sequence=5,
         terminal_status=status,
         dedupe_key="terminal-startup",
-        final_answer=(
-            _final_answer(run_id="run-startup")
-            if status is HostTerminalStatus.SUCCEEDED
-            else None
-        ),
+        final_answer=(_final_answer(run_id="run-startup") if status is HostTerminalStatus.SUCCEEDED else None),
         error_message=_error_message(run_id="run-startup", status=status),
-        cancel_reason=(
-            "cancelled for run-startup"
-            if status is HostTerminalStatus.CANCELLED
-            else None
-        ),
+        cancel_reason=("cancelled for run-startup" if status is HostTerminalStatus.CANCELLED else None),
         watcher_failure_message=None,
     )
 
