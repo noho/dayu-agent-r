@@ -312,7 +312,7 @@ control doc 每次更新只记录：
 - Fix owner: AgentCodex；仅允许修复 PR #180 body 换行并写 `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`。
 - Review policy: 用户指定 AgentMiMo / AgentDS 两路 review，因此 fix 后仍执行双路 PR re-review。
 - Validation: `gh pr view` 证明 body 为真实多行、无字面量反斜杠-n；Draft=true、review requests 为空、base/head 与标题不变；工作树仅包含预期 artifacts/control。
-- Residual-risk code adjudication: live-only、cross-domain ordering 与可控 worker 经代码核对不再是 remaining risk；固定容量按不同 owner 拆为 `WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01`，CLI UX 复用 `WU-CLI-SMOKE-01-R2`。三项均进入主 control doc 的 residual 与 current WU 表。
+- Residual-risk code adjudication（历史记录，已被后续 design correction supersede）：live-only、cross-domain ordering 与可控 worker 经代码核对不再是 remaining risk；当时曾把固定容量拆为 `WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01`。后续 owner-level design review 证明该拆分会固化 Service 第二 event relay，现已统一由 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代；两个旧 WU 已从主 control doc active residual / current WU 表删除。CLI UX 继续独立归 `WU-CLI-SMOKE-01-R2`。
 - Fix artifact: `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`；PR180-F01 metadata-only fix complete，PR code head 未变。
 - Controller validation: `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-controller-validation.md`；真实 Markdown 多行、无 closing directive、Draft/head/base/title/reviewer invariants、两项 Windows CI pass 与工作树边界均已验证。
 - PR re-review artifacts: `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-ds.md`；两路均确认 PR180-F01 fixed、0 blocking、无新增 finding。
@@ -320,8 +320,23 @@ control doc 每次更新只记录：
 - Accepted PR review commit: `3900b069`；已 non-force push 到 Draft PR #180。
 - Final remote checks: accepted PR review head `3900b069` 的 `windows-init-transaction` 与 `windows-upload-script` 均 PASS。
 - Final closeout: `docs/reviews/wu-cli-smoke-01-r1-final-closeout.md`；主 control doc 已进入 `final-closeout-pass`。
-- Residual-risk WU artifacts: `docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-codex.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-review-mimo.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-review-ds.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-reconciliation-controller-adjudication.md`；双路 accepted，0 current-WU implementation fix。
-- Final batch status: completed；PR180-F01 已关闭，无未归属 finding 或 blocking residual。
+- Residual-risk WU artifacts: `docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-codex.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-review-mimo.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-review-ds.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-reconciliation-controller-adjudication.md`；其 capacity 拆分结论已由下述 post-closeout design finding batch supersede。
+- Final batch status: completed；PR180-F01 已关闭。Session Event Delivery 后续 owner correction 见下节；无未归属 finding 或 blocking residual。
+
+## Completed Design Finding Fix Batch: WU-CLI-SMOKE-01-R1 Session Event Delivery
+
+- Trigger：用户要求从第一性原理重新裁决 Host mailbox、Service relay、可配置容量与“慢 UI 无权暂停 Agent”边界，并要求三路并行 review 后把最佳设计写回主总控。
+- Design truth：`docs/host/design.md`；Engine边界只读核对 `docs/engine/design.md`。
+- Design / fix owner：AgentCodex；核心记录为 `docs/reviews/wu-transient-delivery-ownership-design-codex.md` 及各轮 `*-fix-codex.md`。
+- Review routing：AgentCodex、AgentMiMo、AgentDS 三路独立review；任一路material finding均由Controller基于代码证据裁决，不按多数票放行。
+- Accepted findings：Service observation/cleanup状态机、no-backpressure边界、typed delivery error、policy owner、single retained mailbox、multi-watcher admission、overflow primary order、A terminal→B delta fence、exact-five disposition、全terminal producer typed port、跨opener correctness与async attach线性化均已在design owner层关闭。
+- Controller adjudication：`docs/reviews/wu-transient-delivery-ownership-design-controller-adjudication.md`。
+- Final fix artifact：`docs/reviews/wu-transient-delivery-ownership-design-final-closure-fix-codex.md`。
+- Final three-way re-review：`docs/reviews/wu-transient-delivery-ownership-design-final-closure-rereview-codex.md`、`docs/reviews/wu-transient-delivery-ownership-design-final-closure-rereview-mimo.md`、`docs/reviews/wu-transient-delivery-ownership-design-final-closure-rereview-ds.md`；三路均 PASS，0 material finding，0 design residual，0 未归属 residual，0 open question。
+- Superseded residuals：`WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01` 已删除；Service relay应移除，Host delivery capacity / admission / overflow与Service sole-consumer切换必须作为单一owner correction闭环。
+- Replacement WU：`WU-HOST-SESSION-EVENT-DELIVERY-01`；所有packaged capacity、heap margin、metrics、callback非阻塞与deterministic barrier均写入同一WU acceptance，不保留residual。
+- Entry point：等待用户 / maintainer手工merge Draft PR #180；随后从`main`同步并在独立分支进入新WU plan gate。当前分支只提交design/review/control文档，不实施代码。
+- Final batch status：completed-design-closure；implementation intentionally not started。
 
 ## 下次使用方式
 
