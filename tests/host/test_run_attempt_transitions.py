@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -50,6 +50,7 @@ from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     ContextRecoveryCloseInput,
     PromoteQueuedRunInput,
+    RunTransitionResult,
     StartupOrphanCloseInput,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
@@ -61,6 +62,7 @@ from dayu.host.durable.run_transition import (
     close_startup_orphan_attempt_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
+    project_terminal_notice_from_exact_run_event,
     promote_queued_run_in_transaction,
     request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
@@ -358,16 +360,17 @@ def test_promote_queued_run_uses_earliest_accepted_sequence(
 def test_terminal_closeout_appends_concrete_terminal_events(
     tmp_path: Path,
 ) -> None:
-    """terminal helper 写具体 terminal event type 并关闭 Run/Attempt。"""
+    """terminal helper 写 exact event，并由 owner 投影同源 notice。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def closeout(transaction: HostTransaction) -> tuple[str, str]:
+        def closeout(transaction: HostTransaction) -> RunTransitionResult:
             """执行 terminal closeout。
 
             :param transaction: Host transaction。
-            :returns: Run 与 Attempt 状态。
+            :returns: 携带 stable Run ref 与 exact Run event 的 transition 结果。
+            :raises HostDurableError: terminal durable 写入失败时抛出。
             """
 
             result = terminal_closeout_in_transaction(
@@ -391,12 +394,77 @@ def test_terminal_closeout_appends_concrete_terminal_events(
             assert result.status == StateMutationStatus.UPDATED
             assert result.run is not None
             assert result.attempt is not None
-            return result.run.status.value, result.attempt.status.value
+            assert result.run_event is not None
+            return result
 
-        assert store.transaction_runner.run_write(closeout) == (
-            RunStatus.SUCCEEDED.value,
-            AttemptStatus.SUCCEEDED.value,
+        transition = store.transaction_runner.run_write(closeout)
+        assert transition.run is not None
+        assert transition.attempt is not None
+        assert transition.run_event is not None
+        assert transition.run.status is RunStatus.SUCCEEDED
+        assert transition.attempt.status is AttemptStatus.SUCCEEDED
+        notice = project_terminal_notice_from_exact_run_event(
+            transition.run,
+            transition.run_event,
+            wake_queue_promotion=True,
         )
+        assert notice.session_id == transition.run.session_id
+        assert (
+            notice.terminal_event_sequence
+            == transition.run_event.event_sequence
+            == transition.run.terminal_event_sequence
+        )
+        assert notice.wake_queue_promotion is True
+
+        with pytest.raises(
+            HostDurableError,
+            match="exact Run/Event projection is missing a row",
+        ):
+            project_terminal_notice_from_exact_run_event(
+                None,
+                transition.run_event,
+                wake_queue_promotion=True,
+            )
+        with pytest.raises(
+            HostDurableError,
+            match="exact Run/Event projection is missing a row",
+        ):
+            project_terminal_notice_from_exact_run_event(
+                transition.run,
+                None,
+                wake_queue_promotion=True,
+            )
+        inconsistent_rows = (
+            (
+                replace(transition.run, terminal_event_id="different-event"),
+                transition.run_event,
+            ),
+            (
+                replace(
+                    transition.run,
+                    terminal_event_sequence=transition.run_event.event_sequence + 1,
+                ),
+                transition.run_event,
+            ),
+            (
+                transition.run,
+                replace(transition.run_event, session_id="different-session"),
+            ),
+            (
+                transition.run,
+                replace(transition.run_event, run_id="different-run"),
+            ),
+        )
+        for inconsistent_run, inconsistent_event in inconsistent_rows:
+            with pytest.raises(
+                HostDurableError,
+                match="exact Run/Event projection rows are inconsistent",
+            ):
+                project_terminal_notice_from_exact_run_event(
+                    inconsistent_run,
+                    inconsistent_event,
+                    wake_queue_promotion=True,
+                )
 
         def verify(transaction: HostTransaction) -> tuple[str, ...]:
             """读取 event type 序列。

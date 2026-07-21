@@ -74,6 +74,7 @@ from dayu.host.recovery import (
     StartupRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 
 _NOW = datetime(2026, 5, 19, 3, 4, 5, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "recovery-scan-test"})
@@ -94,6 +95,30 @@ _COVERAGE_NEW = "new"
 _COVERAGE_NON_GOAL = "non-goal"
 
 T = TypeVar("T")
+
+
+class _RecordingTerminalPort:
+    """记录 startup recovery exact terminal notices。"""
+
+    def __init__(self) -> None:
+        """初始化空记录器。
+
+        :returns: ``None``。
+        """
+
+        self.notices: list[TerminalPostCommitNotice] = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录一次已提交 terminal notice。
+
+        :param notice: exact terminal notice。
+        :returns: ``None``。
+        """
+
+        self.notices.append(notice)
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +473,7 @@ def test_scan_running_positive_orphan_moves_to_recovering_without_projection(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -518,6 +544,7 @@ def test_scan_running_owner_heartbeat_recent_does_not_mutate_durable_rows(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -556,6 +583,7 @@ def test_scan_running_inconclusive_owner_proof_does_not_mutate_durable_rows(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=process_probe,
         ).scan(_policy())
 
@@ -576,6 +604,7 @@ def test_scan_waiting_uses_diagnostic_only_fallback(tmp_path: Path) -> None:
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -606,6 +635,7 @@ def test_scan_waiting_durable_read_state_remains_diagnostic_only(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -633,6 +663,7 @@ def test_scan_running_missing_dispatch_record_is_inconclusive_without_mutation(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -659,6 +690,7 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -716,6 +748,7 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             defer_accepted_cancel_to_watchdog=True,
@@ -747,6 +780,7 @@ def test_scan_accepted_cancel_without_scheduler_uses_recovery_fallback(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             defer_accepted_cancel_to_watchdog=True,
         ).scan(_policy())
@@ -775,6 +809,7 @@ def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             defer_accepted_cancel_to_watchdog=True,
@@ -802,6 +837,7 @@ def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             defer_accepted_cancel_to_watchdog=False,
         ).scan(_policy())
@@ -824,6 +860,7 @@ def test_scan_accepted_does_not_mutate_or_create_attempt(tmp_path: Path) -> None
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
         ).scan(_policy())
@@ -851,6 +888,7 @@ def test_scan_accepted_without_wakeup_port_logs_error(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -872,6 +910,7 @@ def test_scan_queued_does_not_mutate_or_create_attempt(tmp_path: Path) -> None:
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
         ).scan(_policy())
@@ -900,6 +939,7 @@ def test_scan_recovering_loses_when_eventlog_recovery_limit_reached_despite_proj
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -928,6 +968,7 @@ def test_scan_skips_non_terminal_run_when_session_row_is_missing(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
@@ -1011,6 +1052,7 @@ def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             dispatch_wakeup_port=_RecordingWakeup(),
             batch_size=2,
         ).scan(_policy())
@@ -1093,6 +1135,7 @@ def test_fixed_upper_watermark_defers_concurrent_higher_run_to_next_scan(
         scanner = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             dispatch_wakeup_port=_RecordingWakeup(),
             batch_size=1,
         )
@@ -1151,6 +1194,7 @@ def test_policy_now_is_fixed_across_all_batches(
         pending_dispatches: list[PendingDispatchRecord],
         queue_promotion_sessions: list[str],
         seen_queue_promotion_sessions: set[str],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> host_recovery.StartupRecoveryAction:
         """记录每行分类使用的 policy time 并委托真实 owner。
 
@@ -1161,6 +1205,7 @@ def test_policy_now_is_fixed_across_all_batches(
         :param pending_dispatches: 本批 pending dispatch accumulator。
         :param queue_promotion_sessions: 本批 promotion accumulator。
         :param seen_queue_promotion_sessions: 已提交批次 promotion 去重集合。
+        :param terminal_notices: 本批 exact terminal notice accumulator。
         :returns: 真实 recovery action。
         """
 
@@ -1173,6 +1218,7 @@ def test_policy_now_is_fixed_across_all_batches(
             pending_dispatches,
             queue_promotion_sessions,
             seen_queue_promotion_sessions,
+            terminal_notices,
         )
 
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -1200,6 +1246,7 @@ def test_policy_now_is_fixed_across_all_batches(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             batch_size=2,
         ).scan()
@@ -1236,6 +1283,7 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
         pending_dispatches: list[PendingDispatchRecord],
         queue_promotion_sessions: list[str],
         seen_queue_promotion_sessions: set[str],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> host_recovery.StartupRecoveryAction:
         """让第3行先写 mutation 后抛错，验证整批 rollback。
 
@@ -1246,6 +1294,7 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
         :param pending_dispatches: 本批 pending accumulator。
         :param queue_promotion_sessions: 本批 promotion accumulator。
         :param seen_queue_promotion_sessions: 已提交 promotion 去重集合。
+        :param terminal_notices: 本批 exact terminal notice accumulator。
         :returns: 前两行真实 action；第3行不会返回。
         :raises RuntimeError: 第3行 mutation 后固定抛出。
         """
@@ -1260,6 +1309,7 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
             pending_dispatches,
             queue_promotion_sessions,
             seen_queue_promotion_sessions,
+            terminal_notices,
         )
         if classify_count == 3:
             raise RuntimeError("injected second recovery batch failure")
@@ -1276,6 +1326,7 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
         scanner = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             recovery_owner_host_instance_id="host-instance-new",
@@ -1379,6 +1430,7 @@ def test_paginated_scan_preserves_accepted_queued_waiting_and_cancel_owners(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             defer_accepted_cancel_to_watchdog=True,

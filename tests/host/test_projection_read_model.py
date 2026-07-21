@@ -77,9 +77,29 @@ from dayu.host.read_model import (
     MinimalReadModelProjectionConsumer,
     repair_minimal_read_models,
 )
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+class _NoLocalDeliveryTerminalPostCommitPort(TerminalPostCommitPort):
+    """测试专用的 no-local-delivery terminal 最终端点。"""
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact notice，但不做任何 local delivery 动作。
+
+        :param notice: exact terminal notice。
+        :returns: ``None``。
+        """
+
+        del notice
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -139,15 +159,18 @@ def _host_with_ordinary_baseline(tmp_path: Path) -> HostCommandHandle:
         )
     )
     try:
+        terminal_post_commit_port = _NoLocalDeliveryTerminalPostCommitPort()
         return HostCommandHandle(
             host_handle_id="host-projection-read-model",
             durable_store=durable_store,
             admission_service=create_host_admission_service(
                 durable_store.transaction_runner,
+                terminal_post_commit_port=terminal_post_commit_port,
                 ordinary_run_baseline=_ordinary_run_baseline(),
                 tooling_options=None,
             ),
             active_registry=ActiveWorkerRegistry(),
+            terminal_post_commit_port=terminal_post_commit_port,
         )
     except Exception:
         durable_store.close()

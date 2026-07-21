@@ -131,6 +131,10 @@ from dayu.host.waiting import (
     ExpireWaitInput,
     ExpireWaitResult,
 )
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -167,6 +171,23 @@ class ActiveCancelWatchdogWakeupPort(Protocol):
         ...
 
 
+class _NoLocalDeliveryTerminalPostCommitPort:
+    """standalone command composition 的无本地 delivery 最终端点。"""
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact notice，但不推进不存在的 opener-local runtime。
+
+        :param notice: producer commit 后交付的精确 terminal notice。
+        :returns: ``None``。
+        :raises Exception: 本最终端点不抛出异常。
+        """
+
+        del notice
+
+
 class HostCommandHandle:
     """Host public command handle。
 
@@ -185,6 +206,7 @@ class HostCommandHandle:
         "_closed",
         "_durable_store",
         "_host_handle_id",
+        "_terminal_post_commit_port",
     )
 
     def __init__(
@@ -194,6 +216,7 @@ class HostCommandHandle:
         durable_store: HostDurableStore,
         admission_service: HostAdmissionService,
         active_registry: ActiveWorkerCancelPort,
+        terminal_post_commit_port: TerminalPostCommitPort,
         active_cancel_watchdog_wakeup_port: ActiveCancelWatchdogWakeupPort | None = None,
     ) -> None:
         """初始化 Host command handle。
@@ -202,6 +225,7 @@ class HostCommandHandle:
         :param durable_store: 已打开的 Host durable store。
         :param admission_service: 内部 admission service 依赖。
         :param active_registry: active worker cancel 传播 registry。
+        :param terminal_post_commit_port: 与 producer 装配相同的 terminal 最终端点。
         :param active_cancel_watchdog_wakeup_port: active cancel watchdog wakeup
             端口；无后台 scheduler 时为 ``None``。
         :returns: 无返回值。
@@ -214,6 +238,7 @@ class HostCommandHandle:
         self._durable_store = durable_store
         self._admission_service = admission_service
         self._active_registry = active_registry
+        self._terminal_post_commit_port = terminal_post_commit_port
         self._active_cancel_watchdog_wakeup_port = active_cancel_watchdog_wakeup_port
         self._closed = False
 
@@ -376,11 +401,16 @@ def create_host_command_handle(
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
     try:
-        admission_service = create_host_admission_service(durable_store.transaction_runner)
+        terminal_post_commit_port = _NoLocalDeliveryTerminalPostCommitPort()
+        admission_service = create_host_admission_service(
+            durable_store.transaction_runner,
+            terminal_post_commit_port=terminal_post_commit_port,
+        )
         return HostCommandHandle(
             host_handle_id=_host_handle_id_from_options(options),
             durable_store=durable_store,
             admission_service=admission_service,
+            terminal_post_commit_port=terminal_post_commit_port,
             active_registry=(active_registry if active_registry is not None else ActiveWorkerRegistry()),
         )
     except HostDurableError as exc:
@@ -779,10 +809,10 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
         transaction_runner = host._transaction_runner()
         service = DefaultHostResolveWaitService(
             transaction_runner=transaction_runner,
+            terminal_post_commit_port=host._terminal_post_commit_port,
             event_log_store=host._admission_service.event_log_store,
             idempotency_store=host._admission_service.idempotency_store,
             projection_catchup_port=(host._admission_service.projection_catchup_port),
-            queue_promotion_wakeup_port=host._admission_service.wakeup_port,
         )
         result = service.resolve_wait(wait_id, request)
     except HostDurableError as exc:
@@ -818,10 +848,10 @@ def expire_wait(host: HostCommandHandle, request: ExpireWaitInput) -> ExpireWait
     try:
         service = DefaultHostResolveWaitService(
             transaction_runner=host._transaction_runner(),
+            terminal_post_commit_port=host._terminal_post_commit_port,
             event_log_store=host._admission_service.event_log_store,
             idempotency_store=host._admission_service.idempotency_store,
             projection_catchup_port=host._admission_service.projection_catchup_port,
-            queue_promotion_wakeup_port=host._admission_service.wakeup_port,
         )
         return service.expire_wait(request)
     except HostDurableError as exc:
@@ -886,13 +916,11 @@ class HostCommandWaitCallbackPort(CallbackWaitResolvePort, WaitCallbackStateRead
             transaction_runner = self.host._transaction_runner()
             service = DefaultHostResolveWaitService(
                 transaction_runner=transaction_runner,
+                terminal_post_commit_port=self.host._terminal_post_commit_port,
                 event_log_store=self.host._admission_service.event_log_store,
                 idempotency_store=self.host._admission_service.idempotency_store,
                 projection_catchup_port=(
                     self.host._admission_service.projection_catchup_port
-                ),
-                queue_promotion_wakeup_port=(
-                    self.host._admission_service.wakeup_port
                 ),
             )
             result = service.resolve_wait(wait_id, request)

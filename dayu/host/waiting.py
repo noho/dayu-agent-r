@@ -69,9 +69,15 @@ from dayu.host.durable.run_transition import (
     ResumeRunFromWaitingInput,
     WaitResolutionTransitionResult,
     WaitingRunTerminalInput,
+    confirm_terminal_run_in_transaction,
     fail_run_from_waiting_in_transaction,
     mark_run_lost_from_waiting_in_transaction,
+    project_terminal_notice_from_exact_run_event,
     resume_run_from_waiting_in_transaction,
+)
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
 )
 from dayu.host.durable.state import (
     DispatchRecordStatus,
@@ -84,6 +90,7 @@ from dayu.host.durable.state import (
     WaitResumePolicy,
     WaitSnapshotRef,
     insert_wait_record,
+    is_terminal_run_status,
     mark_attempt_suspended_row,
     mark_run_waiting_row,
     read_attempt_by_id,
@@ -371,14 +378,13 @@ class ResolveWaitResult:
     :param run: resolve 后最新 Run row。
     :param dispatch_record: 新建 resume dispatch record；无则为 ``None``。
     :param idempotent_replay: 本次是否为幂等重放。
-    :param queue_promotion_session_id: terminal wait 释放 active slot 后需唤醒
-        queue promotion 的 Session id；无需唤醒时为 ``None``。
+    :param terminal_notice: transaction-local exact terminal notice；resume 为 ``None``。
     """
 
     run: RunRow
     dispatch_record: DispatchRecordRow | None
     idempotent_replay: bool
-    queue_promotion_session_id: str | None = None
+    terminal_notice: TerminalPostCommitNotice | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,12 +427,12 @@ class ExpireWaitResult:
     """wait expiry owner 的 transaction 结果。
 
     :param transition: waiting terminal transition 或 CAS no-op snapshot。
-    :param queue_promotion_session_id: 本次实际释放 slot 后的 Session id。
+    :param terminal_notice: 首次 expiry 或 terminal replay 的 exact notice。
     :param idempotent_replay: expiry terminal 已由同一稳定 identity 提交。
     """
 
     transition: WaitResolutionTransitionResult
-    queue_promotion_session_id: str | None
+    terminal_notice: TerminalPostCommitNotice | None
     idempotent_replay: bool
 
 
@@ -435,26 +441,11 @@ class _LateRejectResult:
     """late wait result 已完成 durable diagnostic 后的内部拒绝结果。
 
     :param message: 对外错误消息。
-    :param queue_promotion_session_id: expiry 在同一 transaction 释放 slot 后需
-        commit 后唤醒的 Session id。
+    :param terminal_notice: 同一 transaction 中 expiry 产生的 exact notice。
     """
 
     message: str
-    queue_promotion_session_id: str | None = None
-
-
-class QueuePromotionWakeupPort(Protocol):
-    """wait terminal commit 后唤醒 Session queue promotion 的最小端口。"""
-
-    def wake_queue_promotion(self, session_id: str) -> None:
-        """唤醒指定 Session 的 pre-start governance。
-
-        :param session_id: 已释放 active slot 的 Session id。
-        :returns: ``None``。
-        :raises Exception: wake bridge 失败时由调用方传播。
-        """
-
-        ...
+    terminal_notice: TerminalPostCommitNotice | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -719,23 +710,23 @@ class DefaultHostResolveWaitService:
         self,
         *,
         transaction_runner: HostTransactionRunner,
+        terminal_post_commit_port: TerminalPostCommitPort,
         event_log_store: EventLogStore | None = None,
         idempotency_store: IdempotencyStore | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
-        queue_promotion_wakeup_port: QueuePromotionWakeupPort | None = None,
     ) -> None:
         """初始化默认 resolve wait service。
 
         :param transaction_runner: Host durable transaction runner。
+        :param terminal_post_commit_port: commit 后消费 exact terminal notice 的端口。
         :param event_log_store: EventLog primitive；无则创建默认实现。
         :param idempotency_store: Idempotency primitive；无则创建默认实现。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
-        :param queue_promotion_wakeup_port: terminal wait 释放 active slot 后的
-            queue promotion wake 端口；纯 transaction owner 测试可不提供。
         :returns: ``None``。
         """
 
         self._transaction_runner = transaction_runner
+        self._terminal_post_commit_port = terminal_post_commit_port
         self._event_log_store = (
             event_log_store if event_log_store is not None else EventLogStore()
         )
@@ -745,7 +736,6 @@ class DefaultHostResolveWaitService:
             else IdempotencyStore()
         )
         self._projection_catchup_port = projection_catchup_port
-        self._queue_promotion_wakeup_port = queue_promotion_wakeup_port
 
     def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> ResolveWaitResult:
         """接收等待结果并推进 Run。
@@ -773,10 +763,11 @@ class DefaultHostResolveWaitService:
                     transaction, wait_id, request
                 )
             )
+            if result.terminal_notice is not None:
+                self._terminal_post_commit_port.notify_terminal_post_commit(
+                    result.terminal_notice
+                )
             catch_up_projection_best_effort(self._projection_catchup_port)
-            self._wake_queue_promotion_after_commit(
-                result.queue_promotion_session_id
-            )
             if isinstance(result, _LateRejectResult):
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,
@@ -822,23 +813,12 @@ class DefaultHostResolveWaitService:
                 request,
             )
         )
+        if result.terminal_notice is not None:
+            self._terminal_post_commit_port.notify_terminal_post_commit(
+                result.terminal_notice
+            )
         catch_up_projection_best_effort(self._projection_catchup_port)
-        self._wake_queue_promotion_after_commit(
-            result.queue_promotion_session_id
-        )
         return result
-
-    def _wake_queue_promotion_after_commit(self, session_id: str | None) -> None:
-        """在 transaction commit 与 projection catch-up 后执行 promotion wake。
-
-        :param session_id: 需唤醒的 Session id；无则为 ``None``。
-        :returns: ``None``。
-        :raises Exception: wake bridge 失败时透传，避免静默丢失 committed work。
-        """
-
-        if session_id is None or self._queue_promotion_wakeup_port is None:
-            return
-        self._queue_promotion_wakeup_port.wake_queue_promotion(session_id)
 
     def _resolve_in_transaction(
         self,
@@ -962,9 +942,7 @@ class DefaultHostResolveWaitService:
             )
             return _LateRejectResult(
                 message=late_result.message,
-                queue_promotion_session_id=(
-                    expiry.queue_promotion_session_id
-                ),
+                terminal_notice=expiry.terminal_notice,
             )
         if owner_run.status in (
             RunStatus.SUCCEEDED,
@@ -988,7 +966,11 @@ class DefaultHostResolveWaitService:
                     message="resolve wait idempotency conflict",
                     retryable=False,
                 )
-            return _resolve_wait_result_from_existing(transaction, wait_record)
+            return _resolve_wait_result_from_existing(
+                transaction,
+                self._event_log_store,
+                wait_record,
+            )
 
         payload_plan = _wait_resolution_payload_plan(request)
         event_plan = _resolve_wait_event_plan(resolution_digest)
@@ -1071,7 +1053,11 @@ class DefaultHostResolveWaitService:
                 message="resolve wait idempotency conflict",
                 retryable=False,
             )
-        return _resolve_wait_result_from_existing(transaction, wait_record)
+        return _resolve_wait_result_from_existing(
+            transaction,
+            self._event_log_store,
+            wait_record,
+        )
 
     def _reject_late_result(
         self,
@@ -1205,6 +1191,7 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=transition.dispatch_record,
             idempotent_replay=False,
+            terminal_notice=None,
         )
 
     def _resolve_failed(
@@ -1273,7 +1260,11 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=None,
             idempotent_replay=False,
-            queue_promotion_session_id=transition.run.session_id,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition.run,
+                transition.run_event,
+                wake_queue_promotion=True,
+            ),
         )
 
     def _resolve_lost(
@@ -1342,7 +1333,11 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=None,
             idempotent_replay=False,
-            queue_promotion_session_id=transition.run.session_id,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition.run,
+                transition.run_event,
+                wake_queue_promotion=True,
+            ),
         )
 
 
@@ -1377,6 +1372,7 @@ def _expire_wait_in_transaction(
             message="wait owner run not found",
             retryable=False,
         )
+    event_log_store = EventLogStore()
     if wait_record.status is not WaitRecordStatus.WAITING:
         expiry_replay = (
             wait_record.resolve_idempotency_key is not None
@@ -1386,10 +1382,17 @@ def _expire_wait_in_transaction(
         )
         return ExpireWaitResult(
             transition=_expiry_noop_transition(
+                transaction=transaction,
+                event_log_store=event_log_store,
                 wait_record=wait_record,
                 run=owner_run,
             ),
-            queue_promotion_session_id=None,
+            terminal_notice=_terminal_notice_from_terminal_wait_snapshot(
+                transaction,
+                event_log_store,
+                wait_record=wait_record,
+                run=owner_run,
+            ),
             idempotent_replay=expiry_replay,
         )
     decision = classify_wait_time_boundary(wait_record, observed_at=input.observed_at)
@@ -1432,10 +1435,17 @@ def _expire_wait_in_transaction(
             )
         return ExpireWaitResult(
             transition=_expiry_noop_transition(
+                transaction=transaction,
+                event_log_store=event_log_store,
                 wait_record=wait_record,
                 run=owner_run,
             ),
-            queue_promotion_session_id=None,
+            terminal_notice=_terminal_notice_from_terminal_wait_snapshot(
+                transaction,
+                event_log_store,
+                wait_record=wait_record,
+                run=owner_run,
+            ),
             idempotent_replay=True,
         )
     request = ResolveWaitRequest(
@@ -1470,7 +1480,6 @@ def _expire_wait_in_transaction(
     )
     payload_plan = _wait_resolution_payload_plan(request)
     event_plan = _resolve_wait_event_plan(expiry_digest)
-    event_log_store = EventLogStore()
     transition = fail_run_from_waiting_in_transaction(
         transaction,
         event_log_store,
@@ -1506,7 +1515,7 @@ def _expire_wait_in_transaction(
     if transition.status is not StateMutationStatus.UPDATED:
         return ExpireWaitResult(
             transition=transition,
-            queue_promotion_session_id=None,
+            terminal_notice=None,
             idempotent_replay=False,
         )
     created_event_id, created_event_sequence = _transition_created_event_ref(
@@ -1525,13 +1534,19 @@ def _expire_wait_in_transaction(
     )
     return ExpireWaitResult(
         transition=transition,
-        queue_promotion_session_id=owner_run.session_id,
+        terminal_notice=project_terminal_notice_from_exact_run_event(
+            transition.run,
+            transition.run_event,
+            wake_queue_promotion=True,
+        ),
         idempotent_replay=False,
     )
 
 
 def _expiry_noop_transition(
     *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
     wait_record: WaitRecordRow,
     run: RunRow,
 ) -> WaitResolutionTransitionResult:
@@ -1539,9 +1554,16 @@ def _expiry_noop_transition(
 
     :param wait_record: 当前 wait truth。
     :param run: 当前 owner Run truth。
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
     :returns: 不含新 event/dispatch 的 CAS_LOST transition。
     """
 
+    confirmation = (
+        confirm_terminal_run_in_transaction(transaction, event_log_store, run)
+        if is_terminal_run_status(run.status)
+        else None
+    )
     return WaitResolutionTransitionResult(
         status=StateMutationStatus.CAS_LOST,
         run=run,
@@ -1550,7 +1572,7 @@ def _expiry_noop_transition(
         wait_record=wait_record,
         resume_requested_event=None,
         tool_result_event=None,
-        run_event=None,
+        run_event=None if confirmation is None else confirmation.run_event,
         attempt_started_event=None,
     )
 
@@ -2079,11 +2101,14 @@ def _wait_late_result_rejected_event_request(
 
 
 def _resolve_wait_result_from_existing(
-    transaction: HostTransaction, wait_record: WaitRecordRow
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    wait_record: WaitRecordRow,
 ) -> ResolveWaitResult:
     """从 durable truth 重建 resolve wait 幂等重放结果。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
     :param wait_record: 已终态 wait record。
     :returns: resolve wait 结果。
     :raises HostApiError: Run row 缺失时抛出。
@@ -2105,6 +2130,45 @@ def _resolve_wait_result_from_existing(
         run=run,
         dispatch_record=dispatch_record,
         idempotent_replay=True,
+        terminal_notice=_terminal_notice_from_terminal_wait_snapshot(
+            transaction,
+            event_log_store,
+            wait_record=wait_record,
+            run=run,
+        ),
+    )
+
+
+def _terminal_notice_from_terminal_wait_snapshot(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    wait_record: WaitRecordRow,
+    run: RunRow,
+) -> TerminalPostCommitNotice | None:
+    """从 waiting result owner 的 terminal confirmation 构造 replay notice。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
+    :param wait_record: 当前 durable wait record。
+    :param run: 当前 wait owner Run。
+    :returns: terminal wait 的 flag=false exact notice；nonterminal resume 为 ``None``。
+    :raises HostDurableError: terminal wait 与 Run 状态或 stable ref 不一致时抛出。
+    """
+
+    if wait_record.status not in (WaitRecordStatus.FAILED, WaitRecordStatus.LOST):
+        return None
+    if not is_terminal_run_status(run.status):
+        raise HostDurableError("terminal wait record has nonterminal owner Run")
+    confirmation = confirm_terminal_run_in_transaction(
+        transaction,
+        event_log_store,
+        run,
+    )
+    return project_terminal_notice_from_exact_run_event(
+        confirmation.run,
+        confirmation.run_event,
+        wake_queue_promotion=False,
     )
 
 

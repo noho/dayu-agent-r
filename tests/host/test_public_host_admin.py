@@ -39,6 +39,10 @@ from dayu.host.durable.options import project_host_durable_store_options
 from dayu.host.durable.transaction import HostTransactionRunner
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 
 
 def _context(request_id: str) -> HostCallContext:
@@ -196,6 +200,22 @@ def _ordinary_baseline() -> OrdinaryRunExecutionBaseline:
     )
 
 
+class _NoLocalDeliveryTerminalPostCommitPort(TerminalPostCommitPort):
+    """测试专用的 no-local-delivery terminal 最终端点。"""
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact notice，但不做任何 local delivery 动作。
+
+        :param notice: exact terminal notice。
+        :returns: ``None``。
+        """
+
+        del notice
+
+
 def _seed_nonterminal_runs(tmp_path: Path) -> str:
     """seed ACCEPTED、QUEUED、RECOVERING 三类 Run。
 
@@ -208,14 +228,17 @@ def _seed_nonterminal_runs(tmp_path: Path) -> str:
     durable_store = open_host_durable_store(
         project_host_durable_store_options(options)
     )
+    terminal_post_commit_port = _NoLocalDeliveryTerminalPostCommitPort()
     handle = HostCommandHandle(
         host_handle_id="host-admin-seed",
         durable_store=durable_store,
         admission_service=create_host_admission_service(
             durable_store.transaction_runner,
+            terminal_post_commit_port=terminal_post_commit_port,
             ordinary_run_baseline=_ordinary_baseline(),
         ),
         active_registry=ActiveWorkerRegistry(),
+        terminal_post_commit_port=terminal_post_commit_port,
     )
     try:
         session = ensure_session(handle, _ensure_request("primary"))

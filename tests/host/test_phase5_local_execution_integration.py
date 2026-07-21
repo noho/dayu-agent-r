@@ -41,7 +41,7 @@ from dayu.host import (
     cancel_run,
     ensure_session as ensure_public_session,
 )
-from dayu.host.admission import PendingDispatchRecord
+from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import (
     HostInput,
     AttemptDispatchSnapshot,
@@ -89,6 +89,10 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_run_by_id,
 )
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
@@ -100,6 +104,57 @@ from dayu.host.engine_ingest import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "phase5-integration-test"})
 _LANE_NAME = "llm"
+
+
+class _PromotingTerminalPort(TerminalPostCommitPort):
+    """模拟 coordinator notice-to-promotion 顺序的测试端点。"""
+
+    def __init__(self, promotion_port: AdmissionWakeupPort) -> None:
+        """保存 scheduler ordinary promotion capability。
+
+        :param promotion_port: scheduler promotion capability。
+        :returns: ``None``。
+        """
+
+        self._promotion_port = promotion_port
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact terminal notice，并按 flag 唤醒 promotion。
+
+        :param notice: 已提交通知。
+        :returns: ``None``。
+        """
+
+        if notice.wake_queue_promotion:
+            self._promotion_port.wake_queue_promotion(notice.session_id)
+
+
+class _TerminalPortFactory:
+    """为 scheduler 构造显式 terminal port。"""
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """返回最终 discard 端点。
+
+        :param promotion_port: scheduler ordinary promotion capability。
+        :returns: discard port。
+        """
+
+        return _PromotingTerminalPort(promotion_port)
+
+    async def close_after_failed_scheduler_open(self) -> None:
+        """确认没有额外 coordinator 资源。
+
+        :returns: ``None``。
+        """
+
+        return None
 _WORKER_MODE_FINAL = "final"
 _WORKER_MODE_FAILED = "failed"
 _WORKER_MODE_EOF = "eof"
@@ -710,6 +765,7 @@ def test_clean_eof_without_terminal_closes_failed(tmp_path: Path) -> None:
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_PromotingTerminalPort(wakeup),
             wakeup_port=wakeup,
         )
         result = ingestor.close_clean_eof(
@@ -734,11 +790,9 @@ def test_clean_eof_without_terminal_closes_failed(tmp_path: Path) -> None:
             last_observed_worker_event_index=0,
         )
         assert duplicate.status == EngineIngestStatus.DUPLICATE
-        assert duplicate.promotion_triggered is True
-        assert wakeup.promoted_session_ids == [
-            seeded.session_id,
-            seeded.session_id,
-        ]
+        assert duplicate.terminal_notice is not None
+        assert duplicate.terminal_notice.wake_queue_promotion is False
+        assert wakeup.promoted_session_ids == [seeded.session_id]
 
 
 def test_stream_error_or_worker_crash_closes_lost(tmp_path: Path) -> None:
@@ -750,6 +804,7 @@ def test_stream_error_or_worker_crash_closes_lost(tmp_path: Path) -> None:
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_PromotingTerminalPort(_WakeupSpy()),
         ).close_worker_lost(
             _envelope(seeded),
             observed_at=_NOW,
@@ -800,6 +855,7 @@ def test_run_cancelled_after_active_cancel_closes_cancelled(tmp_path: Path) -> N
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_PromotingTerminalPort(_WakeupSpy()),
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -1098,6 +1154,7 @@ async def _open_scheduler(
     return await HostDispatchScheduler.open(
         transaction_runner=store.transaction_runner,
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        terminal_post_commit_port_factory=_TerminalPortFactory(),
         local_execution=HostLocalExecutionOptions(
             lane_db_path=tmp_path / "lane.sqlite3",
             lane_name=_LANE_NAME,

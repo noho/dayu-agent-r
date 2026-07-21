@@ -42,7 +42,7 @@ from dayu.host import (
     ensure_session,
 )
 from dayu.host._durable_actor import open_durable_actor
-from dayu.host.admission import PendingDispatchRecord
+from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import (
     HostInput,
     AttemptDispatchSnapshot,
@@ -90,11 +90,66 @@ from dayu.host.durable.transaction import (
     HostTransactionOperation,
     HostTransactionRunner,
 )
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
 T = TypeVar("T")
+
+
+class _PromotingTerminalPort(TerminalPostCommitPort):
+    """模拟 coordinator 完成 notice 后 ordinary promotion 的测试端口。"""
+
+    def __init__(self, promotion_port: AdmissionWakeupPort) -> None:
+        """保存 scheduler ordinary promotion capability。
+
+        :param promotion_port: scheduler promotion capability。
+        :returns: ``None``。
+        """
+
+        self._promotion_port = promotion_port
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact terminal notice，并按 flag 唤醒 ordinary promotion。
+
+        :param notice: 已提交的通知。
+        :returns: ``None``。
+        """
+
+        if notice.wake_queue_promotion:
+            self._promotion_port.wake_queue_promotion(notice.session_id)
+
+
+class _TerminalPortFactory:
+    """为测试 scheduler 显式创建最终 terminal port。"""
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """返回显式 discard 端点。
+
+        :param promotion_port: scheduler ordinary promotion capability。
+        :returns: discard terminal port。
+        """
+
+        return _PromotingTerminalPort(promotion_port)
+
+    async def close_after_failed_scheduler_open(self) -> None:
+        """确认当前 factory 没有独立待清理资源。
+
+        :returns: ``None``。
+        """
+
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,6 +811,7 @@ async def test_cancel_run_deferred_classification_uses_single_write_snapshot(
                         run=None,
                         attempt=None,
                         dispatch_record=None,
+                        run_event=None,
                     )
 
                 monkeypatch.setattr(
@@ -1416,6 +1472,7 @@ async def _open_scheduler(
     return await HostDispatchScheduler.open(
         transaction_runner=store.transaction_runner,
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        terminal_post_commit_port_factory=_TerminalPortFactory(),
         local_execution=HostLocalExecutionOptions(
             lane_db_path=tmp_path / "lane.sqlite3",
             lane_name=_LANE_NAME,

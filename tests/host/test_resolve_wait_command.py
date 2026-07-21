@@ -247,6 +247,7 @@ def test_resolve_wait_survives_projection_catchup_failure(
     projection = _FailingProjectionCatchup()
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
+        terminal_post_commit_port=host._terminal_post_commit_port,
         projection_catchup_port=projection,
     )
     try:
@@ -382,6 +383,7 @@ def test_resolve_wait_uses_injected_event_log_store_for_request_atom(
     event_log_store = _CountingEventLogStore()
     service = DefaultHostResolveWaitService(
         transaction_runner=host._transaction_runner(),
+        terminal_post_commit_port=host._terminal_post_commit_port,
         event_log_store=event_log_store,
     )
     try:

@@ -176,10 +176,16 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     active_cancel_closeout_in_transaction,
     close_attempt_for_context_recovery_in_transaction,
+    confirm_terminal_run_in_transaction,
     fail_recovering_run_in_transaction,
+    project_terminal_notice_from_exact_run_event,
     read_cancel_requested_event_from_run_link,
     start_recovery_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
+)
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
 )
 from dayu.host.durable.schema import (
     PayloadDescriptorKind,
@@ -391,7 +397,7 @@ class EngineIngestResult:
     :param status: 本次 ingest 状态。
     :param events: 本次接受或命中重复的 EventLog rows。
     :param terminal_closeout: 本次是否完成 Run terminal closeout。
-    :param promotion_triggered: terminal closeout 成功后是否触发 queue promotion wakeup。
+    :param terminal_notice: transaction-local exact terminal notice；非终态为 ``None``。
     :param reason: 诊断 reason；无时为 ``None``。
     :param transient_delta: 事务提交后待发布的已验证瞬态候选；其它结果为
         ``None``。
@@ -401,7 +407,7 @@ class EngineIngestResult:
     status: EngineIngestStatus
     events: tuple[EventLogRow, ...]
     terminal_closeout: bool
-    promotion_triggered: bool
+    terminal_notice: TerminalPostCommitNotice | None
     reason: str | None
     transient_delta: ValidatedTransientDeltaCandidate | None
     stop_worker_stream: bool = False
@@ -670,7 +676,7 @@ class _StartReactiveRecoveryOperation:
                 status=EngineIngestStatus.ACCEPTED,
                 events=self.accepted.result.events + rows,
                 terminal_closeout=False,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                 transient_delta=None,
                 stop_worker_stream=True,
@@ -734,6 +740,7 @@ class EngineEventIngestor:
         *,
         transaction_runner: HostTransactionRunner,
         transient_delta_publisher: HostTransientDeltaPublisher,
+        terminal_post_commit_port: TerminalPostCommitPort,
         event_log_store: EventLogStore | None = None,
         payload_store: PayloadStore | None = None,
         wakeup_port: AdmissionWakeupPort | None = None,
@@ -750,9 +757,10 @@ class EngineEventIngestor:
 
         :param transaction_runner: Host durable transaction runner。
         :param transient_delta_publisher: validation transaction 提交后的瞬态发布端口。
+        :param terminal_post_commit_port: terminal commit 后的 opener-local 最终端口。
         :param event_log_store: EventLog primitive。
         :param payload_store: payload descriptor primitive。
-        :param wakeup_port: terminal closeout 后的 queue promotion wakeup 端口。
+        :param wakeup_port: reactive recovery resume commit 后的 dispatch wake 端口。
         :param context_budget_policy: reactive context governance policy。
         :param context_compactor: reactive context compactor。
         :param compact_artifact_root: compact artifact 根目录。
@@ -764,6 +772,7 @@ class EngineEventIngestor:
 
         self._transaction_runner = transaction_runner
         self._transient_delta_publisher = transient_delta_publisher
+        self._terminal_post_commit_port = terminal_post_commit_port
         self._event_log_store = event_log_store if event_log_store is not None else EventLogStore()
         self._payload_store = payload_store if payload_store is not None else PayloadStore()
         self._wakeup_port = wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort()
@@ -794,7 +803,6 @@ class EngineEventIngestor:
         return self._finish_ingest(
             result,
             candidate=candidate,
-            promotion_triggered_session_id=candidate.envelope.session_id,
         )
 
     async def ingest_async(
@@ -816,7 +824,6 @@ class EngineEventIngestor:
         return self._finish_ingest(
             result,
             candidate=candidate,
-            promotion_triggered_session_id=candidate.envelope.session_id,
         )
 
     def _ingest_before_reactive_compaction(
@@ -854,24 +861,22 @@ class EngineEventIngestor:
         result: EngineIngestResult,
         *,
         candidate: EngineEventCandidate,
-        promotion_triggered_session_id: str,
     ) -> EngineIngestResult:
-        """完成 ingest 后的 promotion 与日志记录。
+        """完成 commit 后 terminal notice、瞬态发布与日志记录。
 
         :param result: 已完成 reactive recovery 处理的 ingest 结果。
         :param candidate: 原始 Engine event candidate。
-        :param promotion_triggered_session_id: terminal promotion 的 Session id。
         :returns: 最终 ingest 结果。
         """
 
-        promoted = self._with_terminal_promotion_retry(
-            result,
-            session_id=promotion_triggered_session_id,
-        )
-        if promoted.transient_delta is not None:
+        if result.terminal_notice is not None:
+            self._terminal_post_commit_port.notify_terminal_post_commit(
+                result.terminal_notice
+            )
+        if result.transient_delta is not None:
             _publish_transient_delta(
                 self._transient_delta_publisher,
-                promoted.transient_delta,
+                result.transient_delta,
             )
         _LOGGER.log(
             _engine_ingest_log_level(candidate.engine_event.type),
@@ -879,7 +884,7 @@ class EngineEventIngestor:
                 "host.engine_ingest.committed session_id=%s run_id=%s "
                 "attempt_id=%s execution_id=%s worker_event_index=%s "
                 "engine_event_type=%s ingest_status=%s event_count=%s "
-                "terminal_closeout=%s promotion_triggered=%s reason=%s"
+                "terminal_closeout=%s reason=%s"
             ),
             candidate.envelope.session_id,
             candidate.envelope.run_id,
@@ -887,13 +892,12 @@ class EngineEventIngestor:
             candidate.envelope.execution_id,
             candidate.worker_event_index,
             candidate.engine_event.type.value,
-            promoted.status.value,
-            len(promoted.events),
-            promoted.terminal_closeout,
-            promoted.promotion_triggered,
-            promoted.reason,
+            result.status.value,
+            len(result.events),
+            result.terminal_closeout,
+            result.reason,
         )
-        return promoted
+        return result
 
     def _duplicate_engine_terminal_result(
         self, transaction: HostTransaction, context: _ValidatedCandidate
@@ -917,16 +921,25 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=False,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason="duplicate_candidate",
                 transient_delta=None,
                 stop_worker_stream=True,
             )
+        confirmation = confirm_terminal_run_in_transaction(
+            transaction,
+            self._event_log_store,
+            context.run,
+        )
         return EngineIngestResult(
             status=EngineIngestStatus.DUPLICATE,
             events=existing,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                confirmation.run,
+                confirmation.run_event,
+                wake_queue_promotion=False,
+            ),
             reason="duplicate_candidate",
             transient_delta=None,
         )
@@ -948,11 +961,20 @@ class EngineEventIngestor:
         existing = _existing_rows(self._event_log_store, transaction, event_ids)
         if len(existing) != len(event_ids):
             return None
+        confirmation = confirm_terminal_run_in_transaction(
+            transaction,
+            self._event_log_store,
+            context.run,
+        )
         return EngineIngestResult(
             status=EngineIngestStatus.DUPLICATE,
             events=existing,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                confirmation.run,
+                confirmation.run_event,
+                wake_queue_promotion=False,
+            ),
             reason="duplicate_candidate",
             transient_delta=None,
         )
@@ -1253,11 +1275,20 @@ class EngineEventIngestor:
             (attempt_event_id, run_event_id),
         )
         if len(existing) == 2:
+            confirmation = confirm_terminal_run_in_transaction(
+                transaction,
+                self._event_log_store,
+                context.run,
+            )
             return EngineIngestResult(
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=project_terminal_notice_from_exact_run_event(
+                    confirmation.run,
+                    confirmation.run_event,
+                    wake_queue_promotion=False,
+                ),
                 reason=terminal.reason,
                 transient_delta=None,
             )
@@ -1312,7 +1343,11 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=rows,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=True,
+            ),
             reason=terminal.reason,
             transient_delta=None,
         )
@@ -1343,11 +1378,20 @@ class EngineEventIngestor:
             (attempt_event_id, run_event_id),
         )
         if len(existing) == 2:
+            confirmation = confirm_terminal_run_in_transaction(
+                transaction,
+                self._event_log_store,
+                context.run,
+            )
             return EngineIngestResult(
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=project_terminal_notice_from_exact_run_event(
+                    confirmation.run,
+                    confirmation.run_event,
+                    wake_queue_promotion=False,
+                ),
                 reason=terminal.reason,
                 transient_delta=None,
             )
@@ -1403,7 +1447,11 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=rows,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=True,
+            ),
             reason=terminal.reason,
             transient_delta=None,
         )
@@ -1441,11 +1489,20 @@ class EngineEventIngestor:
             (attempt_event_id, run_event_id),
         )
         if len(existing) == 2:
+            confirmation = confirm_terminal_run_in_transaction(
+                transaction,
+                self._event_log_store,
+                context.run,
+            )
             return EngineIngestResult(
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=project_terminal_notice_from_exact_run_event(
+                    confirmation.run,
+                    confirmation.run_event,
+                    wake_queue_promotion=False,
+                ),
                 reason=data.reason,
                 transient_delta=None,
             )
@@ -1484,7 +1541,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.REJECTED,
                 events=(),
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason="active_cancel_closeout_precondition_failed",
                 transient_delta=None,
             )
@@ -1497,7 +1554,11 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=rows,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=True,
+            ),
             reason=data.reason,
             transient_delta=None,
         )
@@ -1630,7 +1691,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.ACCEPTED,
                 events=(requested, *closeout.events),
                 terminal_closeout=False,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                 transient_delta=None,
                 stop_worker_stream=True,
@@ -1698,7 +1759,7 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=(*closeout.events, failed, *run_failed.events),
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=run_failed.terminal_notice,
             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
             transient_delta=None,
         )
@@ -1743,7 +1804,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                 transient_delta=None,
             )
@@ -1770,7 +1831,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.REJECTED,
                 events=(),
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason="context_recovery_close_precondition_failed",
                 transient_delta=None,
             )
@@ -1783,7 +1844,7 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=rows,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=None,
             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
             transient_delta=None,
         )
@@ -1962,7 +2023,7 @@ class EngineEventIngestor:
                     status=EngineIngestStatus.ACCEPTED,
                     events=(*pending.result_prefix.events, stale_failed),
                     terminal_closeout=False,
-                    promotion_triggered=False,
+                    terminal_notice=None,
                     reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                     transient_delta=None,
                     stop_worker_stream=True,
@@ -2029,7 +2090,7 @@ class EngineEventIngestor:
                                 failed,
                             ),
                             terminal_closeout=False,
-                            promotion_triggered=False,
+                            terminal_notice=None,
                             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                             transient_delta=None,
                             stop_worker_stream=True,
@@ -2057,7 +2118,7 @@ class EngineEventIngestor:
                             *fail_result.events,
                         ),
                         terminal_closeout=False,
-                        promotion_triggered=False,
+                        terminal_notice=None,
                         reason=fail_result.reason,
                         transient_delta=None,
                     )
@@ -2070,7 +2131,7 @@ class EngineEventIngestor:
                         *fail_result.events,
                     ),
                     terminal_closeout=True,
-                    promotion_triggered=False,
+                    terminal_notice=fail_result.terminal_notice,
                     reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                     transient_delta=None,
                 )
@@ -2104,7 +2165,7 @@ class EngineEventIngestor:
                         compacted,
                     ),
                     terminal_closeout=False,
-                    promotion_triggered=False,
+                    terminal_notice=None,
                     reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                     transient_delta=None,
                     stop_worker_stream=True,
@@ -2543,7 +2604,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.REJECTED,
                 events=(),
                 terminal_closeout=True,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason="recovering_run_failed_precondition_failed",
                 transient_delta=None,
             )
@@ -2556,7 +2617,11 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=rows,
             terminal_closeout=True,
-            promotion_triggered=False,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=True,
+            ),
             reason=_REASON_CONTEXT_COMPACTION_RECOVERY_FAILED,
             transient_delta=None,
         )
@@ -2641,7 +2706,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=False,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason=reason,
                 transient_delta=None,
                 stop_worker_stream=check.accepted,
@@ -2664,7 +2729,7 @@ class EngineEventIngestor:
             status=EngineIngestStatus.ACCEPTED,
             events=(row,),
             terminal_closeout=False,
-            promotion_triggered=False,
+            terminal_notice=None,
             reason=reason,
             transient_delta=None,
             stop_worker_stream=check.accepted,
@@ -2739,53 +2804,26 @@ class EngineEventIngestor:
             result = self._transaction_runner.run_write(_operation)
         except _TerminalCloseoutRollback:
             result = _terminal_closeout_precondition_failed_result()
-        promoted = self._with_terminal_promotion_retry(
-            result,
-            session_id=envelope.session_id,
-        )
+        if result.terminal_notice is not None:
+            self._terminal_post_commit_port.notify_terminal_post_commit(
+                result.terminal_notice
+            )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "host.engine_ingest.lifecycle_closeout.committed session_id=%s "
             "run_id=%s attempt_id=%s execution_id=%s event_index=%s "
             "ingest_status=%s event_count=%s terminal_closeout=%s "
-            "promotion_triggered=%s reason=%s",
+            "reason=%s",
             envelope.session_id,
             envelope.run_id,
             envelope.attempt_id,
             envelope.execution_id,
             event_index,
-            promoted.status.value,
-            len(promoted.events),
-            promoted.terminal_closeout,
-            promoted.promotion_triggered,
-            promoted.reason,
+            result.status.value,
+            len(result.events),
+            result.terminal_closeout,
+            result.reason,
         )
-        return promoted
-
-    def _with_terminal_promotion_retry(
-        self, result: EngineIngestResult, *, session_id: str
-    ) -> EngineIngestResult:
-        """对成功或重复 terminal closeout 触发 queue promotion wakeup。
-
-        :param result: transaction 内得到的 ingest 结果。
-        :param session_id: terminal Run 所属 Session id。
-        :returns: 已更新 promotion 标记的结果。
-        """
-
-        if result.terminal_closeout and result.status in (
-            EngineIngestStatus.ACCEPTED,
-            EngineIngestStatus.DUPLICATE,
-        ):
-            self._wakeup_port.wake_queue_promotion(session_id)
-            return EngineIngestResult(
-                status=result.status,
-                events=result.events,
-                terminal_closeout=True,
-                promotion_triggered=True,
-                reason=result.reason,
-                transient_delta=result.transient_delta,
-                stop_worker_stream=result.stop_worker_stream,
-            )
         return result
 
     def _append_preview_event(
@@ -3470,7 +3508,7 @@ class EngineEventIngestor:
             status=EngineIngestStatus.REJECTED,
             events=additional_events + (row,),
             terminal_closeout=False,
-            promotion_triggered=False,
+            terminal_notice=None,
             reason=reason,
             transient_delta=None,
             stop_worker_stream=stop_worker_stream,
@@ -3575,7 +3613,7 @@ class EngineEventIngestor:
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
                 terminal_closeout=False,
-                promotion_triggered=False,
+                terminal_notice=None,
                 reason=reason,
                 transient_delta=None,
             )
@@ -3594,7 +3632,7 @@ class EngineEventIngestor:
             status=EngineIngestStatus.REJECTED,
             events=(row,),
             terminal_closeout=False,
-            promotion_triggered=False,
+            terminal_notice=None,
             reason=reason,
             transient_delta=None,
         )
@@ -3853,7 +3891,7 @@ def _terminal_closeout_precondition_failed_result() -> EngineIngestResult:
         status=EngineIngestStatus.REJECTED,
         events=(),
         terminal_closeout=True,
-        promotion_triggered=False,
+        terminal_notice=None,
         reason=_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED,
         transient_delta=None,
     )
@@ -6996,7 +7034,7 @@ def _single_event_result(row: EventLogRow) -> EngineIngestResult:
         status=status,
         events=(row,),
         terminal_closeout=False,
-        promotion_triggered=False,
+        terminal_notice=None,
         reason=None,
         transient_delta=None,
     )
@@ -7013,7 +7051,7 @@ def _event_rows_result(rows: tuple[EventLogRow, ...]) -> EngineIngestResult:
         status=EngineIngestStatus.ACCEPTED,
         events=rows,
         terminal_closeout=False,
-        promotion_triggered=False,
+        terminal_notice=None,
         reason=None,
         transient_delta=None,
     )
@@ -7033,7 +7071,7 @@ def _accepted_no_event_result(
         status=EngineIngestStatus.ACCEPTED,
         events=(),
         terminal_closeout=False,
-        promotion_triggered=False,
+        terminal_notice=None,
         reason=None,
         transient_delta=transient_delta,
     )
@@ -7053,7 +7091,7 @@ def _merge_diagnostic_and_closeout(
         status=closeout.status,
         events=(diagnostic, *closeout.events),
         terminal_closeout=closeout.terminal_closeout,
-        promotion_triggered=closeout.promotion_triggered,
+        terminal_notice=closeout.terminal_notice,
         reason=closeout.reason,
         transient_delta=closeout.transient_delta,
         stop_worker_stream=closeout.stop_worker_stream,

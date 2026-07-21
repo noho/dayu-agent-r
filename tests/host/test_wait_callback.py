@@ -538,6 +538,7 @@ def _install_counting_wakeup(host: HostCommandHandle) -> _CountingWakeupPort:
     wakeup = _CountingWakeupPort()
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
+        terminal_post_commit_port=host._terminal_post_commit_port,
         wakeup_port=wakeup,
     )
     return wakeup

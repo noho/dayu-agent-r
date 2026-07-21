@@ -159,6 +159,7 @@ def test_late_result_after_cancel_writes_bounded_diagnostic(
     projection = _CountingProjectionCatchup()
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
+        terminal_post_commit_port=host._terminal_post_commit_port,
         projection_catchup_port=projection,
     )
     try:

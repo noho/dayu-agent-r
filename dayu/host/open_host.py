@@ -15,6 +15,7 @@ from concurrent.futures import Future
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -26,7 +27,7 @@ from dayu.host.audit import (
     catch_up_log_audit_sink_projection,
     default_log_audit_sink_options,
 )
-from dayu.host.admission import create_host_admission_service
+from dayu.host.admission import AdmissionWakeupPort, create_host_admission_service
 from dayu.host._durable_actor import DurableActor, open_durable_actor
 from dayu.host._execution_health import (
     HostExecutionHealthGate,
@@ -88,6 +89,7 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
     HostDispatchScheduler,
     NoActiveWorkerCancelPort,
+    _TerminalPostCommitPortFactory,
 )
 from dayu.host.durable.connection import (
     HostDurableStore,
@@ -132,6 +134,10 @@ from dayu.host.tool_trace import (
 from dayu.host.transient_delta import (
     HostTransientDeltaHub,
     HostTransientDeltaSubscription,
+)
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
 )
 from dayu.host.wait_adapter import (
     WaitPollAdapterRegistry,
@@ -334,6 +340,215 @@ class _CompositeProjectionCatchupPort(ProjectionCatchupPort):
             port.catch_up_projection()
 
 
+class _TerminalNoticeOutcome(StrEnum):
+    """terminal coordinator 低基数处理结果。"""
+
+    DELIVERY_ADVANCED = "delivery_advanced"
+    PROMOTION_WOKEN = "promotion_woken"
+    DUPLICATE = "duplicate"
+    CLOSING = "closing"
+
+
+def _log_terminal_notice(outcome: _TerminalNoticeOutcome) -> None:
+    """记录不含 identity、sequence、payload 或容量维度的 terminal 指标。
+
+    :param outcome: 封闭的 coordinator 处理结果。
+    :returns: ``None``。
+    :raises Exception: logging backend 异常由标准库自行隔离。
+    """
+
+    if outcome is _TerminalNoticeOutcome.CLOSING:
+        _LOGGER.info(
+            "host.session_event_delivery event=terminal_notice outcome=%s reason=coordinator_closing",
+            outcome.value,
+        )
+        return
+    _LOGGER.info(
+        "host.session_event_delivery event=terminal_notice outcome=%s",
+        outcome.value,
+    )
+
+
+class _TerminalPostCommitCoordinator(TerminalPostCommitPort):
+    """当前 opener 的 delivery watermark 与 promotion 顺序协调 owner。"""
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        delivery_hub: HostTransientDeltaHub,
+        promotion_port: AdmissionWakeupPort,
+    ) -> None:
+        """初始化 owner-loop coordinator。
+
+        :param loop: 当前 opener event loop。
+        :param delivery_hub: 当前 opener Session Event Delivery owner。
+        :param promotion_port: scheduler ordinary queue promotion capability。
+        :returns: ``None``。
+        :raises RuntimeError: 无主动抛出。
+        """
+
+        self._loop = loop
+        self._delivery_hub = delivery_hub
+        self._promotion_port = promotion_port
+        self._promotion_watermarks: dict[str, int] = {}
+        self._closing = False
+        self._closed = False
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """在 opener owner loop 串行处理一次 terminal notice。
+
+        :param notice: producer transaction-local exact terminal notice。
+        :returns: ``None``。
+        :raises Exception: owner-loop bridge、delivery 或 promotion 失败时透传。
+        """
+
+        if _is_current_event_loop(self._loop):
+            self._notify_on_owner_loop(notice)
+            return
+        _run_callback_on_event_loop(
+            self._loop,
+            lambda: self._notify_on_owner_loop(notice),
+        )
+
+    def _notify_on_owner_loop(self, notice: TerminalPostCommitNotice) -> None:
+        """先推进 delivery watermark，再按独立 watermark 唤醒 promotion。
+
+        :param notice: producer transaction-local exact terminal notice。
+        :returns: ``None``。
+        :raises Exception: delivery 或 ordinary promotion port 失败时透传。
+        """
+
+        if self._closing or self._closed:
+            _log_terminal_notice(_TerminalNoticeOutcome.CLOSING)
+            return
+        delivery_advanced = (
+            self._delivery_hub.advance_committed_terminal_event_sequence_high_watermark(
+                notice.session_id,
+                notice.terminal_event_sequence,
+            )
+        )
+        _log_terminal_notice(
+            _TerminalNoticeOutcome.DELIVERY_ADVANCED
+            if delivery_advanced
+            else _TerminalNoticeOutcome.DUPLICATE
+        )
+        promotion_watermark = self._promotion_watermarks.get(notice.session_id, 0)
+        if (
+            notice.wake_queue_promotion
+            and notice.terminal_event_sequence > promotion_watermark
+        ):
+            self._promotion_watermarks[notice.session_id] = (
+                notice.terminal_event_sequence
+            )
+            self._promotion_port.wake_queue_promotion(notice.session_id)
+            _log_terminal_notice(_TerminalNoticeOutcome.PROMOTION_WOKEN)
+
+    async def close(self) -> None:
+        """在 owner loop drain 已排队 notice 后关闭 coordinator。
+
+        :returns: ``None``。
+        :raises RuntimeError: 从非 owner loop 关闭时抛出。
+        """
+
+        if self._closed:
+            return
+        if not _is_current_event_loop(self._loop):
+            raise RuntimeError("terminal coordinator must close on its owner loop")
+        barrier: asyncio.Future[None] = self._loop.create_future()
+        self._loop.call_soon(barrier.set_result, None)
+        await barrier
+        self._closing = True
+        self._closed = True
+        self._promotion_watermarks.clear()
+
+
+class _OpenHostTerminalPostCommitPortFactory(_TerminalPostCommitPortFactory):
+    """解决 scheduler ordinary promotion 与 terminal coordinator 构造环。"""
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        delivery_hub: HostTransientDeltaHub,
+    ) -> None:
+        """保存构造 coordinator 所需的稳定 opener owners。
+
+        :param loop: 当前 opener event loop。
+        :param delivery_hub: 当前 opener Session Event Delivery owner。
+        :returns: ``None``。
+        """
+
+        self._loop = loop
+        self._delivery_hub = delivery_hub
+        self._coordinator: _TerminalPostCommitCoordinator | None = None
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """用不可运行 scheduler capability 创建唯一最终 coordinator。
+
+        :param promotion_port: scheduler ordinary promotion capability。
+        :returns: 当前 opener 唯一 terminal post-commit port。
+        :raises RuntimeError: 重复创建时抛出。
+        """
+
+        if self._coordinator is not None:
+            raise RuntimeError("terminal post-commit coordinator already exists")
+        coordinator = _TerminalPostCommitCoordinator(
+            loop=self._loop,
+            delivery_hub=self._delivery_hub,
+            promotion_port=promotion_port,
+        )
+        self._coordinator = coordinator
+        return coordinator
+
+    def required_coordinator(self) -> _TerminalPostCommitCoordinator:
+        """返回已由 scheduler 构造流程创建的 coordinator。
+
+        :returns: 当前 opener 唯一 coordinator。
+        :raises RuntimeError: scheduler 尚未完成 coordinator 构造时抛出。
+        """
+
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise RuntimeError("terminal post-commit coordinator is missing")
+        return coordinator
+
+    async def close_after_failed_scheduler_open(self) -> None:
+        """幂等关闭 scheduler 构造失败前已创建的 coordinator。
+
+        :returns: ``None``。
+        :raises Exception: coordinator close 失败时透传。
+        """
+
+        coordinator = self._coordinator
+        if coordinator is not None:
+            await coordinator.close()
+
+
+class _AdminNoLocalDeliveryTerminalPostCommitPort(TerminalPostCommitPort):
+    """纯 admin composition 的私有 no-local-delivery 最终端点。"""
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 admin composition 中不可投递到本地 watcher 的通知。
+
+        :param notice: 已提交的 exact terminal notice。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del notice
+
+
 @dataclass(frozen=True, slots=True)
 class _ThreadsafeSchedulerWakeupPort:
     """允许 poller thread 同步唤醒 asyncio scheduler 的端口。
@@ -426,10 +641,12 @@ class _StartupRecoveryActorOperation:
     """在 S2 durable actor connection 上执行全部 bounded recovery batches。
 
     :param wakeup_port: actor thread 到 opener loop 的 scheduler wake bridge。
+    :param terminal_post_commit_port: 当前 opener terminal coordinator port。
     :param recovery_owner_host_instance_id: 当前 scheduler Host instance id。
     """
 
     wakeup_port: _ThreadsafeSchedulerWakeupPort
+    terminal_post_commit_port: TerminalPostCommitPort
     recovery_owner_host_instance_id: str
 
     def __call__(self, handle: HostCommandHandle) -> StartupRecoveryScanResult:
@@ -444,6 +661,7 @@ class _StartupRecoveryActorOperation:
             transaction_runner=handle._transaction_runner(),
             event_log_store=EventLogStore(),
             dispatch_wakeup_port=self.wakeup_port,
+            terminal_post_commit_port=self.terminal_post_commit_port,
             recovery_owner_host_instance_id=self.recovery_owner_host_instance_id,
             defer_accepted_cancel_to_watchdog=True,
         ).scan()
@@ -553,6 +771,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
     :param adapter_registry: production poll adapter registry。
     :param active_cancel_port: 当前 open_host active worker cancel bridge。
     :param wakeup_port: 线程安全 scheduler wakeup port。
+    :param terminal_post_commit_port: 当前 opener terminal coordinator port。
     :param policy: wait poller runtime policy。
     :param owner_id: poller owner id。
     """
@@ -561,6 +780,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
     adapter_registry: WaitPollAdapterRegistry
     active_cancel_port: ActiveWorkerCancelPort
     wakeup_port: _ThreadsafeSchedulerWakeupPort
+    terminal_post_commit_port: TerminalPostCommitPort
     policy: WaitPollerRuntimePolicy
     owner_id: str
 
@@ -584,12 +804,14 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
                 wakeup_port=self.wakeup_port,
+                terminal_post_commit_port=self.terminal_post_commit_port,
             )
             command_handle = HostCommandHandle(
                 host_handle_id=self.owner_id,
                 durable_store=durable_store,
                 admission_service=admission_service,
                 active_registry=self.active_cancel_port,
+                terminal_post_commit_port=self.terminal_post_commit_port,
             )
             poller = WaitPoller(
                 transaction_runner=command_handle._transaction_runner(),
@@ -627,6 +849,7 @@ class _ExecutionCommandHandleFactory:
     :param host_handle_id: execution Host 诊断 id。
     :param wakeup_port: scheduler event-loop wake bridge。
     :param active_cancel_port: active worker event-loop cancel bridge。
+    :param terminal_post_commit_port: 当前 opener terminal coordinator port。
     :param open_options: execution opener options，用于 admission baseline/tooling。
     """
 
@@ -634,6 +857,7 @@ class _ExecutionCommandHandleFactory:
     host_handle_id: str
     wakeup_port: _ThreadsafeSchedulerWakeupPort
     active_cancel_port: _ThreadsafeActiveWorkerCancelPort
+    terminal_post_commit_port: TerminalPostCommitPort
     open_options: OpenHostOptions
 
     def __call__(self) -> HostCommandHandle:
@@ -650,6 +874,7 @@ class _ExecutionCommandHandleFactory:
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
                 wakeup_port=self.wakeup_port,
+                terminal_post_commit_port=self.terminal_post_commit_port,
                 projection_catchup_port=None,
                 ordinary_run_baseline=self.open_options.ordinary_run_baseline,
                 tooling_options=self.open_options.tooling_options,
@@ -660,6 +885,7 @@ class _ExecutionCommandHandleFactory:
                 admission_service=admission_service,
                 active_registry=self.active_cancel_port,
                 active_cancel_watchdog_wakeup_port=self.wakeup_port,
+                terminal_post_commit_port=self.terminal_post_commit_port,
             )
         except Exception:
             durable_store.close()
@@ -688,14 +914,17 @@ class _AdminCommandHandleFactory:
             project_host_durable_store_options(self.command_options)
         )
         try:
+            terminal_post_commit_port = _AdminNoLocalDeliveryTerminalPostCommitPort()
             admission_service = create_host_admission_service(
-                durable_store.transaction_runner
+                durable_store.transaction_runner,
+                terminal_post_commit_port=terminal_post_commit_port,
             )
             return HostCommandHandle(
                 host_handle_id=self.host_handle_id,
                 durable_store=durable_store,
                 admission_service=admission_service,
                 active_registry=NoActiveWorkerCancelPort(),
+                terminal_post_commit_port=terminal_post_commit_port,
             )
         except Exception:
             durable_store.close()
@@ -720,6 +949,7 @@ class _PublicHostHandle:
         "_session_event_reconciliation_waiter",
         "_scheduler",
         "_scheduler_store",
+        "_terminal_post_commit_coordinator",
         "_transient_delta_hub",
         "_wait_poller",
     )
@@ -734,6 +964,7 @@ class _PublicHostHandle:
         projection_catchup_port: ProjectionCatchupPort,
         session_event_reconciliation_waiter: _SessionEventReconciliationWaiter,
         scheduler_store: HostDurableStore,
+        terminal_post_commit_coordinator: _TerminalPostCommitCoordinator,
         transient_delta_hub: HostTransientDeltaHub,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
@@ -747,6 +978,7 @@ class _PublicHostHandle:
         :param session_event_reconciliation_waiter: 当前 opener 独占的 mailbox
             readiness / periodic reconciliation 等待端口。
         :param scheduler_store: scheduler 独占的 durable store。
+        :param terminal_post_commit_coordinator: 当前 opener terminal 协调 owner。
         :param transient_delta_hub: 当前 Host runtime 的瞬态 fanout owner。
         :param wait_poller: 可选 production wait poller supervisor。
         :returns: ``None``。
@@ -761,6 +993,7 @@ class _PublicHostHandle:
             session_event_reconciliation_waiter
         )
         self._scheduler_store = scheduler_store
+        self._terminal_post_commit_coordinator = terminal_post_commit_coordinator
         self._transient_delta_hub = transient_delta_hub
         self._wait_poller = wait_poller
         self._close_lock = asyncio.Lock()
@@ -1169,9 +1402,10 @@ class _PublicHostHandle:
     async def close(self) -> None:
         """关闭当前 Host handle lifecycle。
 
-        关闭顺序为 public gate、wait poller、actor drain、scheduler、projection
-        flush、actor handle、actor executor、scheduler store。actor drain 保证
-        after-commit wake 已在 scheduler 仍存活时收口；本方法幂等，不写
+        关闭顺序为 public gate、wait poller、actor drain、scheduler producer、
+        terminal coordinator、Session Event Delivery、projection flush、actor
+        handle、actor executor、scheduler store。actor drain 保证 after-commit
+        notice 已在 scheduler 与 coordinator 仍存活时收口；本方法幂等，不写
         cancel / failed terminal facts。
 
         :returns: ``None``。
@@ -1226,6 +1460,18 @@ class _PublicHostHandle:
             else:
                 _LOGGER.error(
                     "host.public_handle.close_scheduler_failed host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+        try:
+            await self._terminal_post_commit_coordinator.close()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_terminal_coordinator_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1589,12 +1835,24 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         close_projection_catchup_port: ProjectionCatchupPort | None = None
         wait_poller: WaitPollerSupervisor | None = None
         durable_actor: DurableActor | None = None
+        terminal_post_commit_port_factory: (
+            _OpenHostTerminalPostCommitPortFactory | None
+        ) = None
+        terminal_post_commit_coordinator: (
+            _TerminalPostCommitCoordinator | None
+        ) = None
         health_gate = HostExecutionHealthGate()
         transient_delta_hub = HostTransientDeltaHub(
             policy=self._options.session_event_delivery_policy,
         )
         try:
             loop = asyncio.get_running_loop()
+            terminal_post_commit_port_factory = (
+                _OpenHostTerminalPostCommitPortFactory(
+                    loop=loop,
+                    delivery_hub=transient_delta_hub,
+                )
+            )
             active_registry = ActiveWorkerRegistry()
             audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
                 durable_store=scheduler_store,
@@ -1622,9 +1880,15 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 local_execution=local_execution,
                 host_handle_id=host_handle_id,
                 transient_delta_publisher=transient_delta_hub,
+                terminal_post_commit_port_factory=(
+                    terminal_post_commit_port_factory
+                ),
                 active_registry=active_registry,
                 projection_catchup_port=None,
                 health_gate=health_gate,
+            )
+            terminal_post_commit_coordinator = (
+                terminal_post_commit_port_factory.required_coordinator()
             )
             scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
             wakeup_port = _ThreadsafeSchedulerWakeupPort(
@@ -1641,6 +1905,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     host_handle_id=host_handle_id,
                     wakeup_port=wakeup_port,
                     active_cancel_port=active_cancel_port,
+                    terminal_post_commit_port=(
+                        terminal_post_commit_coordinator
+                    ),
                     open_options=self._options,
                 ),
                 thread_name_prefix=(
@@ -1650,6 +1917,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             await durable_actor.call(
                 _StartupRecoveryActorOperation(
                     wakeup_port=wakeup_port,
+                    terminal_post_commit_port=(
+                        terminal_post_commit_coordinator
+                    ),
                     recovery_owner_host_instance_id=scheduler.host_instance_id,
                 )
             )
@@ -1660,6 +1930,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 scheduler=scheduler,
                 loop=loop,
                 host_handle_id=host_handle_id,
+                terminal_post_commit_port=terminal_post_commit_coordinator,
             )
             if wait_poller is not None:
                 wait_poller.open()
@@ -1673,6 +1944,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     _new_session_event_reconciliation_waiter()
                 ),
                 scheduler_store=scheduler_store,
+                terminal_post_commit_coordinator=(
+                    terminal_post_commit_coordinator
+                ),
                 transient_delta_hub=transient_delta_hub,
                 wait_poller=wait_poller,
             )
@@ -1715,6 +1989,16 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 except Exception as cleanup_exc:
                     _LOGGER.error(
                         "host.open.cleanup_scheduler_failed host_handle_id=%s error_type=%s",
+                        host_handle_id,
+                        cleanup_exc.__class__.__name__,
+                        exc_info=True,
+                    )
+            if terminal_post_commit_coordinator is not None:
+                try:
+                    await terminal_post_commit_coordinator.close()
+                except Exception as cleanup_exc:
+                    _LOGGER.error(
+                        "host.open.cleanup_terminal_coordinator_failed host_handle_id=%s error_type=%s",
                         host_handle_id,
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
@@ -1937,6 +2221,7 @@ def _wait_poller_supervisor_from_open_host_options(
     scheduler: HostDispatchScheduler,
     loop: asyncio.AbstractEventLoop,
     host_handle_id: str,
+    terminal_post_commit_port: TerminalPostCommitPort,
 ) -> WaitPollerSupervisor | None:
     """从 opener options 构造 wait poller supervisor。
 
@@ -1946,6 +2231,7 @@ def _wait_poller_supervisor_from_open_host_options(
     :param scheduler: 当前 dispatch scheduler。
     :param loop: 当前 opener event loop。
     :param host_handle_id: 当前 public Host handle id。
+    :param terminal_post_commit_port: 当前 opener terminal coordinator port。
     :returns: wait poller supervisor；未启用时返回 ``None``。
     """
 
@@ -1970,6 +2256,7 @@ def _wait_poller_supervisor_from_open_host_options(
                 loop=loop,
                 scheduler=scheduler,
             ),
+            terminal_post_commit_port=terminal_post_commit_port,
             policy=configuration.policy,
             owner_id=owner_id,
         ),

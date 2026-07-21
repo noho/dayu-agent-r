@@ -750,33 +750,48 @@ class _ReconciliationWaiterFactory:
 
 
 class _TerminalWatermarkHookCallCounter:
-    """记录 production 当前仍不应发生的 local terminal hook 调用。"""
+    """按 opener 实例记录并转发 local terminal watermark hook。"""
 
-    def __init__(self) -> None:
-        """初始化零调用计数。
+    def __init__(
+        self,
+        *,
+        target_hub: HostTransientDeltaHub,
+        hook: Callable[[HostTransientDeltaHub, str, int], bool],
+    ) -> None:
+        """初始化目标 opener 的本地 hook 计数器。
 
+        :param target_hub: 该计数器唯一允许观测的 opener-local hub。
+        :param hook: production 原始未绑定 watermark hook。
         :returns: 无返回值。
         :raises Exception: 本构造函数不抛出异常。
         """
 
+        self._target_hub = target_hub
+        self._hook = hook
         self.call_count = 0
 
-    def __call__(self, session_id: str, event_sequence: int) -> bool:
-        """记录一次意外接线调用并返回未推进。
+    def __call__(
+        self,
+        hub: HostTransientDeltaHub,
+        session_id: str,
+        event_sequence: int,
+    ) -> bool:
+        """记录目标 opener 的调用并转发给 production owner hook。
 
-        该 callable 作为 class attribute 注入，故 Python 不会额外绑定 hub
-        instance；参数形状与 instance lookup 后的 production method 相同。
-
+        :param hub: 实际收到 hook 调用的 opener-local hub。
         :param session_id: notice Session 标识。
         :param event_sequence: notice terminal sequence。
-        :returns: 固定返回 ``False``，避免测试注入推进 owner state。
-        :raises Exception: 本方法不抛出异常。
+        :returns: production hook 的 watermark 前移结果。
+        :raises AssertionError: 调用被错误路由到其它 opener 时抛出。
+        :raises Exception: production hook 失败时原样透传。
         """
 
+        if hub is not self._target_hub:
+            raise AssertionError("terminal hook routed to unexpected opener")
         if not session_id or event_sequence <= 0:
             raise AssertionError("unexpected invalid terminal watermark hook call")
         self.call_count += 1
-        return False
+        return self._hook(hub, session_id, event_sequence)
 
 
 class _SessionEventPageReadSpy:
@@ -1425,7 +1440,9 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
     waiter_a = _ControlledSessionEventReconciliationWaiter()
     waiter_c = _ControlledSessionEventReconciliationWaiter()
     waiter_factory = _ReconciliationWaiterFactory((waiter_a, waiter_c))
-    local_hook_calls = _TerminalWatermarkHookCallCounter()
+    original_terminal_watermark_hook = (
+        HostTransientDeltaHub.advance_committed_terminal_event_sequence_high_watermark
+    )
     page_read_spy = _SessionEventPageReadSpy(
         _read_session_host_events_after
     )
@@ -1439,12 +1456,6 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
         "_read_session_host_events_after",
         page_read_spy,
     )
-    monkeypatch.setattr(
-        HostTransientDeltaHub,
-        "advance_committed_terminal_event_sequence_high_watermark",
-        local_hook_calls,
-    )
-
     shared_db_path = tmp_path / "shared-host.sqlite3"
     shared_lane_db_path = tmp_path / "shared-lane.sqlite3"
     options_a = replace(
@@ -1476,23 +1487,80 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
         await asyncio.wait_for(factory_a.accepted_event.wait(), timeout=2.0)
 
         host_c = await manager_c.__aenter__()
+        assert isinstance(host_a, _PublicHostHandle)
+        assert isinstance(host_c, _PublicHostHandle)
+        hub_a = host_a._transient_delta_hub
+        hub_c = host_c._transient_delta_hub
+        hook_calls_a = _TerminalWatermarkHookCallCounter(
+            target_hub=hub_a,
+            hook=original_terminal_watermark_hook,
+        )
+        hook_calls_c = _TerminalWatermarkHookCallCounter(
+            target_hub=hub_c,
+            hook=original_terminal_watermark_hook,
+        )
+
+        def _record_instance_terminal_watermark_hook(
+            hub: HostTransientDeltaHub,
+            session_id: str,
+            event_sequence: int,
+        ) -> bool:
+            """把 class hook 调用路由到对应 opener 实例计数器。
+
+            :param hub: 实际收到调用的 opener-local hub。
+            :param session_id: notice Session 标识。
+            :param event_sequence: notice terminal sequence。
+            :returns: 对应 opener production hook 的 watermark 前移结果。
+            :raises AssertionError: 未登记 opener 收到调用时抛出。
+            :raises Exception: production hook 失败时原样透传。
+            """
+
+            if hub is hub_a:
+                return hook_calls_a(hub, session_id, event_sequence)
+            if hub is hub_c:
+                return hook_calls_c(hub, session_id, event_sequence)
+            raise AssertionError("terminal hook called for unknown opener")
+
+        monkeypatch.setattr(
+            HostTransientDeltaHub,
+            "advance_committed_terminal_event_sequence_high_watermark",
+            _record_instance_terminal_watermark_hook,
+        )
         page_read_spy.set_target_session(session.session_id)
         watcher = await host_c.watch_session_events(session.session_id)
         first_next = asyncio.create_task(anext(watcher))
         await _wait_for_wait_call_count(waiter_c, 1)
+        pre_action_a_watermark = (
+            hub_a.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+        )
+        pre_action_c_watermark = (
+            hub_c.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+        )
+        assert pre_action_a_watermark == 0
+        assert pre_action_c_watermark == 0
 
         release_a.set()
         terminal_a = await _wait_run_terminal(host_a, run_a.accepted_run_id)
         assert terminal_a.status is RunStatus.SUCCEEDED
         assert first_next.done() is False
         assert page_read_spy.cursors == []
-        assert local_hook_calls.call_count == 0
-        assert isinstance(host_c, _PublicHostHandle)
+        assert hook_calls_a.call_count >= 1
         assert (
-            host_c._transient_delta_hub.committed_terminal_event_sequence_high_watermark(
+            hub_a.committed_terminal_event_sequence_high_watermark(
                 session.session_id
             )
-            == 0
+            > pre_action_a_watermark
+        )
+        assert hook_calls_c.call_count == 0
+        assert (
+            hub_c.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+            == pre_action_c_watermark
         )
 
         run_b = await host_c.submit_followup(
@@ -1544,7 +1612,13 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
         assert len(page_read_spy.cursors) >= 3
         assert page_read_spy.cursors == sorted(set(page_read_spy.cursors))
         assert waiter_c.timeout_count == 0
-        assert local_hook_calls.call_count == 0
+        assert hook_calls_c.call_count == 0
+        assert (
+            hub_c.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+            == pre_action_c_watermark
+        )
         assert (
             b_fence
             > observed_terminal_a.event_sequence
