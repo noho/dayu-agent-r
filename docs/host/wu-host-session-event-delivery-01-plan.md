@@ -508,7 +508,7 @@ S1 Host resource/attach ownership
 - validation transaction读取的Attempt start sequence与candidate/每entry fence object value完全一致；禁止post-transaction latest/max readback。
 - head fence未达时entry不pop且仍计数；跨两个以上durable pages追到fence。
 - A same-Run prefix逐项先于A terminal；首个B entry保留到terminal后的下一次`anext()`。
-- 在`tests/host/test_watch_session_events.py`内直接构造最小concurrent dual-opener fixture：两个独立`open_host` context使用各自的Host handle、scheduler、durable actor/store、Session Event Delivery owner、worker factory与lifecycle，但`OpenHostOptions.db_path`和`lane_db_path`显式指向同一Host DB/lane DB；不共享in-memory hub、coordinator、worker handle或local notice port。opener A先进入，opener C后进入；watcher与B属于C，A terminal只由A提交。测试先在C的empty-mailbox readiness处建立“local terminal watermark未advance/本地hook调用数为零”的no-local-notice barrier，再让A commit，并保持C reconcile clock未推进，证明C没有因A的local action被唤醒；随后逐次推进可控clock跨过page boundaries，B fence迫使C多页catch-up先交付A terminal并保留B。cleanup固定为：先cancel/await未完成的`anext()`并`aclose()` C watcher，再退出opener C context，最后退出opener A context；各自worker/task/resource只能由所属context关闭。
+- 在`tests/host/test_watch_session_events.py`内直接构造最小concurrent dual-opener fixture：两个独立`open_host` context使用各自的Host handle、scheduler、durable actor/store、Session Event Delivery owner、worker factory与lifecycle，但`OpenHostOptions.db_path`和`lane_db_path`显式指向同一Host DB/lane DB；不共享in-memory hub、coordinator、worker handle或local notice port。opener A先进入，opener C后进入；watcher与B属于C，A terminal只由A提交。测试先在C的empty-mailbox readiness处建立“opener C局部terminal watermark/hook未advance且C watcher未被唤醒”的no-cross-opener barrier；该观测必须按opener C instance局部归因，允许opener A自己的local hook合法前进，不得再用跨两个opener的全局hook总调用数等于零代替C-side证据。再让A commit，并保持C reconcile clock未推进，证明C没有因A的local action被推进或唤醒；随后逐次推进可控clock跨过page boundaries，B fence迫使C多页catch-up先交付A terminal并保留B。共享DB/lane DB、multi-page catch-up、A terminal先于B、page/timeout与cleanup断言保持不变。cleanup固定为：先cancel/await未完成的`anext()`并`aclose()` C watcher，再退出opener C context，最后退出opener A context；各自worker/task/resource只能由所属context关闭。
 - mailbox空、无local notice的独立用例使用同一个可注入Host-internal clock/readiness barrier：A提交terminal后，C每次只推进一个interval并断言每轮最多读取一页，最终交付跨opener terminal；另在interval尚未推进时发起Host C close，断言close立即打断wait并按正常EOF收口。
 - ordinary durable events逐row顺序、cursor实际处理语义、read failure cleanup。
 - transient stress仍为0 EventLog rows，fast watcher完整；slow watcher只在Host item cap处中断。
@@ -571,8 +571,11 @@ S1 Host resource/attach ownership
 - `tests/host/test_phase5_local_execution_integration.py`
 - `tests/host/test_command_handle.py`
 - `tests/host/test_open_host_runtime.py`
+- `tests/host/test_watch_session_events.py`
 
 新增的`tests/host/test_projection_read_model.py`与`tests/host/test_public_host_admin.py`只授权在各自现有direct test composition root创建test-private、显式no-local-delivery terminal endpoint，并把同一实例同时传入`create_host_admission_service`与`HostCommandHandle`。不得修改测试业务场景或断言语义，不得修改production constructor或terminal flags/dataflow，不得引入optional/default/fallback、临时port或rebind。
+
+新增的`tests/host/test_watch_session_events.py`只授权修改`test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff`的barrier instrumentation与对应局部断言：把跨opener的class/global hook总调用数观测替换为opener C局部watermark/hook与no-cross-opener wake观测；允许opener A本地hook前进，必须证明A terminal action没有推进C的local watermark/hook，也没有唤醒C watcher。不得修改production，不得改变S2 durable DB/fence correctness、共享DB/lane DB、multi-page catch-up、A terminal先于B、page/timeout/retained-items/cleanup等既有业务断言，也不得修改该文件其它测试语义。
 
 **Exact changes/dataflow**
 
@@ -607,6 +610,7 @@ S1 Host resource/attach ownership
 - runtime fake逐producer证明`run_write`返回后消费exact notice，再进local coordinator；flag true也无旁路。
 - standalone `create_host_command_handle` exact-notice runtime recording fake证明其装配的admission/waiting producer在commit return后仍调用显式private no-local-delivery port并携带transaction-local exact notice；static manifest集合与完整opener装配无关，standalone不是排除理由。
 - 两个新增direct test composition root各自使用同一个test-private no-local-delivery final endpoint完成required port传播，原projection/admin业务场景与断言保持不变。
+- dual-opener目标case只把barrier观测收窄到opener C局部状态：A terminal后允许A自己的local hook推进；C的local watermark/hook必须与A动作前一致，C watcher保持pending且C reconcile clock未推进时不得发生page read或其它wake。原S2共享DB/fence、多页catch-up、A terminal先于B、page/timeout/retained-items与cleanup断言必须原样保留；禁止继续断言跨A/C的全局hook总调用数为零。
 - 完整pyright必须零错误；全测试constructor callsite scan必须归零required port错误，且不得出现第三个漏列caller；仅上述两个精确caller获得新增授权。
 - `tests/host/test_admission_multiprocess.py`现有4个旧字段断言错误与`tests/host/test_phase7_waiting_integration.py`现有1个required factory参数错误继续在原S3 allowlist内按owner contract修复，完成后恢复全部S3 validation。
 - coordinator owner-loop marshal、watermark-before-promotion、false delivery wake、ordinary promotion不推进watermark、same-sequence幂等、新er false不吞older true、新er true覆盖older true、batch不按Session丢sequence。
@@ -623,6 +627,7 @@ S1 Host resource/attach ownership
 **Completion/stop conditions**
 
 - static manifest、runtime fakes与三组local barrier全部通过，production terminal producer无直接promotion。
+- dual-opener目标case、`tests/host/test_watch_session_events.py`完整文件与`tests/host -q` affected suite全部通过；完整pyright、diff check及constructor/source/scope scans无新增缺口。若C-side局部观测仍不能证明C未被A动作推进/唤醒，或需要修改production、其它测试、S2 durable DB/fence correctness或其它业务断言，立即停止并回到plan gate。
 - 任一producer拿不到transaction-local exact terminal row时，必须回到`run_transition` owner补齐结果；禁止post-commit latest/max、日志解析或Run status推断。
 
 ### S4 — Service exact-five sole consumer、CLI执行域、全链验收与README
@@ -729,7 +734,10 @@ pytest tests/host/test_engine_ingest_mapping.py tests/host/test_local_proxy_engi
 S3：
 
 ```bash
-pytest tests/host/test_terminal_post_commit.py tests/host/test_run_attempt_transitions.py tests/host/test_admission_queue.py tests/host/test_public_cancel_session_runs.py tests/host/test_projection_read_model.py tests/host/test_public_host_admin.py tests/host/test_resolve_wait_command.py tests/host/test_wait_expiry_closeout.py tests/host/test_phase7_waiting_integration.py tests/host/test_recovery_scan.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_dispatch_scheduler.py tests/host/test_active_cancel_dispatch.py tests/host/test_command_handle.py -q
+pytest tests/host/test_watch_session_events.py::test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff -q
+pytest tests/host/test_watch_session_events.py -q
+pytest tests/host/test_terminal_post_commit.py tests/host/test_run_attempt_transitions.py tests/host/test_admission_queue.py tests/host/test_public_cancel_session_runs.py tests/host/test_projection_read_model.py tests/host/test_public_host_admin.py tests/host/test_resolve_wait_command.py tests/host/test_wait_expiry_closeout.py tests/host/test_phase7_waiting_integration.py tests/host/test_recovery_scan.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_dispatch_scheduler.py tests/host/test_active_cancel_dispatch.py tests/host/test_command_handle.py tests/host/test_watch_session_events.py -q
+pytest tests/host -q
 ```
 
 S4：
@@ -788,6 +796,8 @@ rg -n 'HostCommandHandle\(|create_host_admission_service\(|HostDispatchScheduler
 
 人工/AST判定要求：所有caller显式await；terminal producer无promotion bypass；`dayu/engine`无新delivery contract；runtime无反向依赖。全测试constructor callsite scan必须覆盖全部direct composition，required terminal port错误为零，且除`tests/host/test_projection_read_model.py`与`tests/host/test_public_host_admin.py`外不得出现第三个漏列caller。
 
+S3 second amendment另要求：`tests/host/test_watch_session_events.py`只能出现目标dual-opener barrier instrumentation与对应局部断言的新增diff；constructor/source scans不得出现新的production caller、terminal producer、fixture/support file或其它scope缺口。全局hook总调用数零断言必须由C-side局部watermark/hook与no-cross-opener wake证据替代，不得删除或削弱S2 durable DB/fence及其它业务断言。
+
 最终scope审计：
 
 ```bash
@@ -819,7 +829,7 @@ git diff --stat main
 - durable page/terminal pause：只保留一个bounded durable page与一个current terminal fence，不建立terminal set或第三sequence。
 - producer漏接：AST闭集 + runtime fake + direct promotion allowlist三重guard。
 - scheduler/coordinator lifecycle：construction-only bind先于所有critical producer；Host close先stop/await全部producer，再drain/close coordinator，禁止临时port与runtime rebind。
-- local/cross opener混淆：local notice只做latency；跨opener只由DB/fence/reconcile tests作结论。
+- local/cross opener混淆：local notice只做latency；跨opener只由DB/fence/reconcile tests作结论。dual-opener barrier按C-side局部watermark/hook与wake状态观测，允许A本地hook前进，禁止用全局hook总数把A合法动作误判为C被唤醒。
 - Service cleanup覆盖primary：capacity-one first-commit + exact exception-chain table，禁止task exception side channel。
 - renderer阻塞：UI-owned explicit single-thread executor + submit-before serial gate，一次只允许一个awaited callback/display job；与Host/runtime default executor隔离，不建event-copy relay。无限阻塞违反callback contract，不使用仍运行thread晚于cleanup的伪保证。
 - metrics基数扩散：只允许closed `event/outcome/reason`，无identity/payload/sequence value/capacity dimension。
