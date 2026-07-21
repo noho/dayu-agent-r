@@ -97,7 +97,7 @@ async def _run_provider_case(
     )
     async with open_host(options) as host:
         session = await host.ensure_session(ensure_request(f"matrix-{case.name}"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
             followup_request(

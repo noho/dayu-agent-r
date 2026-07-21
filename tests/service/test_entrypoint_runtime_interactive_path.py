@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -20,6 +19,7 @@ from dayu.host.api import (
     HostEventKind,
     HostFinalAnswerView,
     HostSessionEvent,
+    HostSessionEventIterator,
     HostStreamCursor,
     HostTerminalStatus,
     OperationContext,
@@ -79,7 +79,7 @@ class _FakeHostEventIterator:
         self.closed_count = 0
         self._queue = asyncio.Queue()
 
-    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
+    def __aiter__(self) -> HostSessionEventIterator:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -143,10 +143,10 @@ class _FakeHost:
         self.read_outbox_requests = []
         self._submit_index = 0
 
-    def watch_session_events(
+    async def watch_session_events(
         self,
         session_id: str,
-    ) -> AsyncIterator[HostSessionEvent]:
+    ) -> HostSessionEventIterator:
         """记录 watcher attach。
 
         :param session_id: 目标 Session id。

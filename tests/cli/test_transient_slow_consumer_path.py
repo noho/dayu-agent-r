@@ -23,7 +23,9 @@ from dayu.host import (
     HostApiErrorCode,
     HostEvent,
     HostSessionEvent,
-    HostUnavailableDetail,
+    HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryReason,
+    HostSessionEventIterator,
     OutboxTerminalCursor,
     OutboxTerminalItemsBatch,
     ReadOutboxTerminalItemsRequest,
@@ -152,11 +154,11 @@ class _SlowConsumerHostProbe:
         self.host_errors: list[HostApiError] = []
         self.live_terminal_event_ids: list[str] = []
 
-    def watch_session_events(
+    async def watch_session_events(
         self,
         session_id: str,
-    ) -> AsyncIterator[HostSessionEvent]:
-        """同步 attach 真实 Host watcher，并返回透明观测 wrapper。
+    ) -> HostSessionEventIterator:
+        """异步 attach 真实 Host watcher，并返回透明观测 wrapper。
 
         :param session_id: 目标 Session 标识。
         :returns: 透明包装后的真实 Host iterator。
@@ -164,7 +166,7 @@ class _SlowConsumerHostProbe:
         """
 
         return _ObservedHostSessionEventIterator(
-            inner=self._host.watch_session_events(session_id),
+            inner=await self._host.watch_session_events(session_id),
             owner=self,
         )
 
@@ -348,15 +350,14 @@ async def test_real_transient_slow_consumer_falls_back_once_with_original_typed_
     assert terminal.final_answer.content == _FINAL_ANSWER
     assert terminal.watcher_failure_message is not None
     assert "HostApiError" in terminal.watcher_failure_message
-    assert "too slow" in terminal.watcher_failure_message
+    assert "delivery was interrupted" in terminal.watcher_failure_message
     assert probe.live_terminal_event_ids == []
     assert len(probe.host_errors) == 1
     overflow = probe.host_errors[0]
-    assert overflow.code is HostApiErrorCode.UNAVAILABLE
-    assert overflow.retryable is True
-    assert overflow.detail == HostUnavailableDetail(
-        component="session_live_stream",
-        reason_code="slow_consumer",
+    assert overflow.code is HostApiErrorCode.DELIVERY_INTERRUPTED
+    assert overflow.retryable is False
+    assert overflow.detail == HostSessionEventDeliveryDetail(
+        reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
     )
     assert any(
         activity.summary is not None and "HostApiError" in activity.summary

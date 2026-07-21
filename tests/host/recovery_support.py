@@ -490,7 +490,7 @@ async def _run_blocking_owner_async(
     options = recovery_open_host_options(root_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(ensure_request(slot_key))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         try:
             followup = await host.submit_followup(
                 session.session_id,

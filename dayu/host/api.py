@@ -1078,6 +1078,44 @@ class CompactorRunnerBaseline:
 
 
 @dataclass(frozen=True, slots=True)
+class HostSessionEventDeliveryPolicy:
+    """Session Event Delivery 的 opener-wide 资源策略。
+
+    :param transient_mailbox_max_items: 单订阅 mailbox 与唯一 in-flight 合计的
+        retained item 上限。
+    :param max_subscriptions_per_session: 单个 opener 内同一 Session 的订阅
+        reservation 上限。
+    :returns: 无返回值。
+    :raises TypeError: 任一字段不是严格整数时抛出。
+    :raises ValueError: 任一字段不是正数时抛出。
+    """
+
+    transient_mailbox_max_items: int
+    max_subscriptions_per_session: int
+
+    def __post_init__(self) -> None:
+        """校验 Session Event Delivery 资源策略。
+
+        :returns: ``None``。
+        :raises TypeError: 任一字段不是严格整数时抛出。
+        :raises ValueError: 任一字段不是正数时抛出。
+        """
+
+        _require_positive_int(
+            self.transient_mailbox_max_items,
+            field_name=(
+                "HostSessionEventDeliveryPolicy.transient_mailbox_max_items"
+            ),
+        )
+        _require_positive_int(
+            self.max_subscriptions_per_session,
+            field_name=(
+                "HostSessionEventDeliveryPolicy.max_subscriptions_per_session"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OpenHostOptions:
     """``open_host`` 的普通本地多轮构造期选项。
 
@@ -1111,6 +1149,8 @@ class OpenHostOptions:
         使用的 policy。
     :param memory_projection_catchup_batch_size: memory catch-up 单批最大 row 数。
     :param enable_truncation_manager: tool-enabled dispatch 是否启用截断治理。
+    :param session_event_delivery_policy: Session Event Delivery opener-wide
+        retained item 与 per-Session subscription admission 策略。
     :param wait_poller_policy: production wait poller runtime policy；``None``
         表示不启动 background poller。
     """
@@ -1140,6 +1180,7 @@ class OpenHostOptions:
     memory_projection_policy: MemoryProjectionPolicy
     memory_projection_catchup_batch_size: int
     enable_truncation_manager: bool
+    session_event_delivery_policy: HostSessionEventDeliveryPolicy
     wait_poller_policy: WaitPollerRuntimePolicy | None = None
 
     def __post_init__(self) -> None:
@@ -1237,6 +1278,14 @@ class OpenHostOptions:
             self.enable_truncation_manager,
             field_name="OpenHostOptions.enable_truncation_manager",
         )
+        if not isinstance(
+            self.session_event_delivery_policy,
+            HostSessionEventDeliveryPolicy,
+        ):
+            raise TypeError(
+                "OpenHostOptions.session_event_delivery_policy must be "
+                "HostSessionEventDeliveryPolicy"
+            )
         if self.wait_poller_policy is not None:
             _validate_wait_poller_policy(self.wait_poller_policy)
 
@@ -1326,6 +1375,8 @@ class HostApiErrorCode(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     PERMISSION_DENIED = "permission_denied"
     UNSUPPORTED_OPERATION = "unsupported_operation"
+    DELIVERY_INTERRUPTED = "delivery_interrupted"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
     UNAVAILABLE = "unavailable"
     INTERNAL_ERROR = "internal_error"
 
@@ -1363,6 +1414,64 @@ class SteerConflictDetail:
         )
 
 
+class HostSessionEventDeliveryReason(StrEnum):
+    """Session event delivery 中断的封闭原因。"""
+
+    TRANSIENT_MAILBOX_OVERFLOW = "transient_mailbox_overflow"
+
+
+@dataclass(frozen=True, slots=True)
+class HostSessionEventDeliveryDetail:
+    """Session event delivery 中断的 typed detail。
+
+    :param reason: delivery 中断的稳定原因。
+    """
+
+    reason: HostSessionEventDeliveryReason
+
+    def __post_init__(self) -> None:
+        """校验 delivery 中断原因。
+
+        :returns: ``None``。
+        :raises TypeError: ``reason`` 不是封闭枚举成员时抛出。
+        """
+
+        if not isinstance(self.reason, HostSessionEventDeliveryReason):
+            raise TypeError(
+                "HostSessionEventDeliveryDetail.reason must be "
+                "HostSessionEventDeliveryReason"
+            )
+
+
+class HostSessionEventAdmissionReason(StrEnum):
+    """Session event subscription admission 拒绝的封闭原因。"""
+
+    SESSION_SUBSCRIPTION_LIMIT_REACHED = "session_subscription_limit_reached"
+
+
+@dataclass(frozen=True, slots=True)
+class HostSessionEventAdmissionDetail:
+    """Session event subscription admission 拒绝的 typed detail。
+
+    :param reason: admission 拒绝的稳定原因。
+    """
+
+    reason: HostSessionEventAdmissionReason
+
+    def __post_init__(self) -> None:
+        """校验 admission 拒绝原因。
+
+        :returns: ``None``。
+        :raises TypeError: ``reason`` 不是封闭枚举成员时抛出。
+        """
+
+        if not isinstance(self.reason, HostSessionEventAdmissionReason):
+            raise TypeError(
+                "HostSessionEventAdmissionDetail.reason must be "
+                "HostSessionEventAdmissionReason"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class HostUnavailableDetail:
     """execution Host 暂不可用的稳定 typed detail。
@@ -1391,7 +1500,12 @@ class HostUnavailableDetail:
         )
 
 
-HostApiErrorDetail: TypeAlias = SteerConflictDetail | HostUnavailableDetail
+HostApiErrorDetail: TypeAlias = (
+    SteerConflictDetail
+    | HostSessionEventDeliveryDetail
+    | HostSessionEventAdmissionDetail
+    | HostUnavailableDetail
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3505,6 +3619,38 @@ def _validate_host_event_terminal_payload(event: HostEvent) -> None:
 HostSessionEvent: TypeAlias = HostEvent | HostTransientDelta
 
 
+class HostSessionEventIterator(Protocol):
+    """可显式关闭的 Session durable/transient 联合事件迭代器。"""
+
+    def __aiter__(self) -> HostSessionEventIterator:
+        """返回当前异步迭代器。
+
+        :returns: 当前 iterator。
+        :raises Exception: 本方法不主动抛出异常。
+        """
+
+        ...
+
+    async def __anext__(self) -> HostSessionEvent:
+        """读取下一条 Session event。
+
+        :returns: 下一条 durable 或 transient Host event。
+        :raises StopAsyncIteration: iterator 已结束时抛出。
+        :raises HostApiError: delivery 或 durable read 失败时抛出。
+        """
+
+        ...
+
+    async def aclose(self) -> None:
+        """幂等关闭 iterator 并释放 Host-owned subscription resource。
+
+        :returns: ``None``。
+        :raises Exception: owner cleanup 失败时透传。
+        """
+
+        ...
+
+
 def _terminal_status_for_event_kind(kind: HostEventKind) -> HostTerminalStatus:
     """返回 terminal event kind 对应的 terminal status。
 
@@ -3899,7 +4045,10 @@ class Host(Protocol):
 
         ...
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostSessionEvent]:
+    async def watch_session_events(
+        self,
+        session_id: str,
+    ) -> HostSessionEventIterator:
         """创建 Session durable/transient 联合事件订阅。
 
         :param session_id: 目标 Session id。
@@ -3967,7 +4116,13 @@ __all__ = [
     "HostMetadataEntry",
     "HostPayloadRef",
     "HostReasoningDelta",
+    "HostSessionEventAdmissionDetail",
+    "HostSessionEventAdmissionReason",
     "HostSessionEvent",
+    "HostSessionEventDeliveryDetail",
+    "HostSessionEventDeliveryPolicy",
+    "HostSessionEventDeliveryReason",
+    "HostSessionEventIterator",
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostToolCallDelta",

@@ -36,6 +36,11 @@ from dayu.host import (
     HostApiErrorCode,
     HostApiErrorDetail,
     HostCallContext,
+    HostSessionEventAdmissionDetail,
+    HostSessionEventAdmissionReason,
+    HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryPolicy,
+    HostSessionEventDeliveryReason,
     HostPayloadRef,
     LocalEngineWorkerFactory,
     HostMetadataEntry,
@@ -119,6 +124,9 @@ PUBLIC_HOST_DATACLASS_TYPES: tuple[_FrozenSlotsDataclassClass, ...] = (
     cast(_FrozenSlotsDataclassClass, SessionSlotRef),
     cast(_FrozenSlotsDataclassClass, HostStreamCursor),
     cast(_FrozenSlotsDataclassClass, SteerConflictDetail),
+    cast(_FrozenSlotsDataclassClass, HostSessionEventDeliveryDetail),
+    cast(_FrozenSlotsDataclassClass, HostSessionEventAdmissionDetail),
+    cast(_FrozenSlotsDataclassClass, HostSessionEventDeliveryPolicy),
     cast(_FrozenSlotsDataclassClass, HostCommandHandleOptions),
     cast(_FrozenSlotsDataclassClass, EnsureSessionRequest),
     cast(_FrozenSlotsDataclassClass, CreateSessionRequest),
@@ -357,6 +365,8 @@ def test_status_and_error_enum_values_are_stable() -> None:
     assert issubclass(WaitResolutionSource, StrEnum)
     assert issubclass(SourceRunRelation, StrEnum)
     assert issubclass(HostApiErrorCode, StrEnum)
+    assert issubclass(HostSessionEventDeliveryReason, StrEnum)
+    assert issubclass(HostSessionEventAdmissionReason, StrEnum)
 
     assert {item.name: item.value for item in SessionStatus} == {
         "OPEN": "open",
@@ -407,8 +417,22 @@ def test_status_and_error_enum_values_are_stable() -> None:
         "IDEMPOTENCY_CONFLICT": "idempotency_conflict",
         "PERMISSION_DENIED": "permission_denied",
         "UNSUPPORTED_OPERATION": "unsupported_operation",
+        "DELIVERY_INTERRUPTED": "delivery_interrupted",
+        "RESOURCE_EXHAUSTED": "resource_exhausted",
         "UNAVAILABLE": "unavailable",
         "INTERNAL_ERROR": "internal_error",
+    }
+    assert {
+        item.name: item.value for item in HostSessionEventDeliveryReason
+    } == {
+        "TRANSIENT_MAILBOX_OVERFLOW": "transient_mailbox_overflow",
+    }
+    assert {
+        item.name: item.value for item in HostSessionEventAdmissionReason
+    } == {
+        "SESSION_SUBSCRIPTION_LIMIT_REACHED": (
+            "session_subscription_limit_reached"
+        ),
     }
 
 
@@ -456,6 +480,42 @@ def test_host_api_error_carries_structured_fields() -> None:
         "retryable": False,
         "detail": detail,
     }
+
+
+def test_session_event_delivery_public_contract_is_strict_and_item_only() -> None:
+    """delivery policy 与两个 typed detail 只暴露冻结的 item-only 字段。"""
+
+    policy = HostSessionEventDeliveryPolicy(
+        transient_mailbox_max_items=512,
+        max_subscriptions_per_session=4,
+    )
+    assert {
+        field.name for field in fields(HostSessionEventDeliveryPolicy)
+    } == {
+        "transient_mailbox_max_items",
+        "max_subscriptions_per_session",
+    }
+    assert policy.transient_mailbox_max_items == 512
+    assert policy.max_subscriptions_per_session == 4
+    with pytest.raises(TypeError, match="transient_mailbox_max_items"):
+        replace(policy, transient_mailbox_max_items=True)
+    with pytest.raises(ValueError, match="transient_mailbox_max_items"):
+        replace(policy, transient_mailbox_max_items=0)
+    with pytest.raises(TypeError, match="max_subscriptions_per_session"):
+        replace(policy, max_subscriptions_per_session=False)
+    with pytest.raises(ValueError, match="max_subscriptions_per_session"):
+        replace(policy, max_subscriptions_per_session=-1)
+
+    delivery_detail = HostSessionEventDeliveryDetail(
+        reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
+    )
+    admission_detail = HostSessionEventAdmissionDetail(
+        reason=(
+            HostSessionEventAdmissionReason.SESSION_SUBSCRIPTION_LIMIT_REACHED
+        ),
+    )
+    assert {field.name for field in fields(delivery_detail)} == {"reason"}
+    assert {field.name for field in fields(admission_detail)} == {"reason"}
 
 
 def test_event_stream_limit_constants_are_stable() -> None:

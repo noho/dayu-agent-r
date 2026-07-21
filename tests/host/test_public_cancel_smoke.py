@@ -94,7 +94,7 @@ async def test_pre_dispatch_cancel_visible_in_watch(
     factory = _SequencedWorkerFactory([_BLOCK])
     async with open_host(_options(tmp_path, factory)) as host:
         session = await host.ensure_session(_ensure_request("cancel-watch"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         active = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "cancel-watch-active"),
@@ -135,7 +135,7 @@ async def test_active_cancel_emits_public_cancel_event(
     factory = _SequencedWorkerFactory([_BLOCK])
     async with open_host(_options(tmp_path, factory)) as host:
         session = await host.ensure_session(_ensure_request("active-cancel"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         active = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "active-cancel-run"),

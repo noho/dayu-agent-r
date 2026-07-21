@@ -46,7 +46,7 @@ async def test_offline_read_and_idempotent_drain_do_not_write_eventlog(
 
     async with open_host(options) as host:
         session = await host.ensure_session(smoke.ensure_request("outbox-offline"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         try:
             followup = await host.submit_followup(
                 session.session_id,
@@ -148,7 +148,7 @@ async def test_live_first_seen_ids_filter_outbox_duplicate(
 
     async with open_host(options) as host:
         session = await host.ensure_session(smoke.ensure_request("outbox-live-first"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         try:
             followup = await host.submit_followup(
                 session.session_id,
@@ -228,7 +228,7 @@ async def test_drain_first_second_read_covers_live_attach_window(
                 drain_request_id="outbox-drain-first-drain",
             ),
         )
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         try:
             second_followup = await host.submit_followup(
                 session.session_id,

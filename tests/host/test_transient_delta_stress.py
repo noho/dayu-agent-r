@@ -77,7 +77,7 @@ async def test_three_thousand_transient_deltas_leave_zero_rows_and_durable_termi
 
     async with open_host(options) as host:
         session = await host.ensure_session(ensure_request("transient-stress"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         observation_task = asyncio.create_task(_collect_until_terminal(watcher))
         followup = await host.submit_followup(
             session.session_id,

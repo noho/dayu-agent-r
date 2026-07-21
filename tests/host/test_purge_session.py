@@ -556,13 +556,9 @@ async def _read_after_purge_in_independent_process_async(*, root_path: Path, res
                 _replay_api_request("replay-after-purge-process"),
             )
         )
-        watcher = host.watch_session_events(_SESSION_ID)
-        try:
-            await anext(watcher)
-        except HostApiError as exc:
-            observed["watch_session_events"] = exc.code.value
-        else:
-            observed["watch_session_events"] = "unexpected_success"
+        observed["watch_session_events"] = await _host_api_error_code(
+            host.watch_session_events(_SESSION_ID)
+        )
     result_marker.write_text(json.dumps(observed, sort_keys=True), encoding="utf-8")
 
 

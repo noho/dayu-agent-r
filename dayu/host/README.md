@@ -83,8 +83,8 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
-- `watch_session_events(session_id)`：同步 attach live `HostSessionEvent` 订阅，并在返回前同时注册当前 runtime 的瞬态增量订阅与 durable live cursor；订阅不 replay attach 前的瞬态增量，也不提供离线 replay cursor。
-- `close()`：关闭当前 execution runtime；停止新 public call 后先用 finite shared deadline 关闭 wait poller、撤销全部 adapter observation token，再 drain actor command / wake，随后按 scheduler、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。仍阻塞的 provider thread 不持 Host durable authority，supervisor 保持 `CLOSING`，最后一个 thread finally 后才变为 `STOPPED`。该操作不写用户 cancel / failed terminal facts。
+- `watch_session_events(session_id)`：异步 attach live `HostSessionEvent` 订阅；调用方必须 `await` factory，successful return 表示 durable cursor transaction、per-Session reservation 与当前 runtime 瞬态订阅均已生效。订阅不 replay attach 前的瞬态增量，也不提供离线 replay cursor。
+- `close()`：关闭当前 execution runtime；停止新 public call 后先用 finite shared deadline 关闭 wait poller、撤销全部 adapter observation token，再 drain actor command / wake，随后按 scheduler、Session Event Delivery owner、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。仍阻塞的 provider thread 不持 Host durable authority，supervisor 保持 `CLOSING`，最后一个 thread finally 后才变为 `STOPPED`。该操作不写用户 cancel / failed terminal facts。
 
 `HostAdmin` handle 当前提供：
 
@@ -95,7 +95,7 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
-`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关。process-backed 工具子进程 terminate / kill cleanup grace 属于 `HostToolingOptions.process_capsule_interrupt_policy`，不作为 `OpenHostOptions` 直接字段，也不改变 `AgentPolicy.tool_execution_timeout_seconds` 的业务执行 deadline 语义。
+`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size、Session Event Delivery policy 与 truncation manager 开关。process-backed 工具子进程 terminate / kill cleanup grace 属于 `HostToolingOptions.process_capsule_interrupt_policy`，不作为 `OpenHostOptions` 直接字段，也不改变 `AgentPolicy.tool_execution_timeout_seconds` 的业务执行 deadline 语义。
 
 本地执行边界由 `LocalEngineWorkerFactory`、`LocalEngineWorker` 与 `LocalWorkerHandle` 表达。Host 创建 `AttemptDispatchSnapshot` 与 `AgentRunRequest`，worker 接住后返回 handle；Host 消费 handle 的 EngineEvent stream，并在 cancel 或 shutdown 时调用 handle 的关闭 / cancel hook。
 
@@ -245,9 +245,10 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `AttemptDispatchSnapshot` / `AttemptStatus`：Host 派发给 worker 的 Attempt 执行快照。
 - request dataclass：`EnsureSessionRequest`、`CreateSessionRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`ResolveWaitRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、outbox read / drain request。
 - `HostEvent` / `HostEventClass` / `HostEventKind` / `HostActivityView` / `HostActivityKind` / `HostActivityStatus` / `HostActivitySeverity` / `HostActivityCounts` / `HostTerminalStatus` / `HostFinalAnswerView`：Host 从 committed EventLog 派生的 durable typed event view 与安全 activity view。
-- `HostTransientDelta` / `HostTransientDeltaType` / `HostContentDelta` / `HostReasoningDelta` / `HostToolCallDelta` / `HostSessionEvent`：Host 当前 runtime 内的三类 typed 瞬态增量及 durable/transient 联合订阅契约；瞬态 envelope 携带已验证的 Run / Attempt / execution identity、runtime sequence 与 opaque dedupe key。
+- `HostTransientDelta` / `HostTransientDeltaType` / `HostContentDelta` / `HostReasoningDelta` / `HostToolCallDelta` / `HostSessionEvent` / `HostSessionEventIterator`：Host 当前 runtime 内的三类 typed 瞬态增量及可显式关闭的 durable/transient 联合订阅契约；瞬态 envelope 携带已验证的 Run / Attempt / execution identity、runtime sequence 与 opaque dedupe key。
+- `HostSessionEventDeliveryPolicy`：opener construction-time 的 item-only policy，显式约束单订阅 retained item 和单 Session subscription reservation 上限；两个字段都是 required 非 bool 正整数。
 - `OutboxTerminalItem` / `OutboxTerminalItemsBatch` / `OutboxTerminalCursor` / `OutboxProjectionStatus` / `OutboxTerminalItemState`：离线 terminal notification 读取与 drain 契约。
-- `HostApiError` / `HostApiErrorCode` / `HostApiErrorDetail`：public API 错误；错误码包括 `NOT_FOUND`、`INVALID_STATE`、`CONFLICT`、`IDEMPOTENCY_CONFLICT`、`PERMISSION_DENIED`、`UNSUPPORTED_OPERATION`、`INTERNAL_ERROR`。
+- `HostApiError` / `HostApiErrorCode` / `HostApiErrorDetail`：public API 错误；Session delivery overflow 使用 non-retryable `DELIVERY_INTERRUPTED` 与 `HostSessionEventDeliveryDetail`，subscription cap 拒绝使用 retryable `RESOURCE_EXHAUSTED` 与 `HostSessionEventAdmissionDetail`；真实 Host availability 仍使用 `UNAVAILABLE`。
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
 - `HostToolingOptions` / `FrameworkToolName` / `FrameworkToolPolicyView` / `ProcessCapsuleInterruptPolicy`：业务 ToolBundle、Host framework tool 与 process-backed capsule cleanup interrupt policy 的 construction-time 输入边界。
 - `ContextBudgetPolicy` / `MemoryProjectionPolicy`：context governance 与 conversation memory projection 的 typed policy。
@@ -334,7 +335,7 @@ dayu.host
 
 ## 稳定边界
 
-Host 稳定边界是 durable command、typed request / snapshot、`HostSessionEvent` live view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostSessionEvent` 是 durable `HostEvent` 与当前 runtime `HostTransientDelta` 的联合；只有前者来自 committed facts。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
+Host 稳定边界是 durable command、typed request / snapshot、async attach 后返回的 `HostSessionEventIterator` live view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostSessionEvent` 是 durable `HostEvent` 与当前 runtime `HostTransientDelta` 的联合；只有前者来自 committed facts。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
 
 Host 不负责：
 
@@ -565,7 +566,9 @@ Host EventLog event class 包括：
 
 Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing durable typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`RUN_LOST` 是 Host terminal / read API 的 `lost` 事实，但 public outbox terminal item 只覆盖 succeeded / failed / cancelled，不把 lost 伪装成可投递 terminal item。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；三类 raw delta 不投影为 activity。
 
-`HostTransientDelta` 是与 `HostEvent` 分离的 live-only typed envelope。每个 watcher 拥有容量 256 的独立队列；发布是 non-blocking fanout，单个慢 watcher 溢出后只让该订阅以 `HostApiError(code=UNAVAILABLE, retryable=True, detail=HostUnavailableDetail(component="session_live_stream", reason_code="slow_consumer"))` 结束，不阻塞快 watcher、terminal append 或 Run。durable terminal 在同一 watcher 上建立 Run-local fence：先交付已接受的 delta 前缀，再交付 terminal，terminal 后不再交付该 Run 的迟到 delta。关闭、显式 `aclose()` 或迭代取消只 detach watcher，不取消 Run，也不伪造 terminal fact。
+`HostTransientDelta` 是与 `HostEvent` 分离的 live-only typed envelope。Session Event Delivery owner 在 durable cursor transaction 前先占用 per-Session reservation，达到上限时以 retryable `RESOURCE_EXHAUSTED` 拒绝且不分配 mailbox、cursor transaction、iterator 或 task；successful async factory return 才表示 subscription 已 attach。每个 subscription 使用 item-bound mailbox 与唯一 in-flight 引用，二者合计为 retained item；pop 只转移单项，不用 batch drain，也不降低 retained count。包内 composition policy 为单订阅 `512` items、单 Session `4` subscriptions；该 policy 不承诺 logical bytes 或 resident heap 上界。
+
+发布是 non-blocking fanout。prospective retained item 超过 policy 时，owner 立即把该 subscription 移出 fanout，保留已经接受的有序前缀；前缀耗尽后 iterator 抛出 non-retryable `DELIVERY_INTERRUPTED`，detail reason 为 `TRANSIENT_MAILBOX_OVERFLOW`。该错误只表示当前订阅连续性交付中断，不是 Host availability，也不阻塞其它 watcher、terminal append 或 Run。durable terminal 在同一 watcher 上建立 Run-local fence：先交付已接受的 delta 前缀，再交付 terminal，terminal 后不再交付该 Run 的迟到 delta。Host close、显式 `aclose()`、迭代取消或错误终止都会清空 retained state 并释放 reservation；这些动作不取消 Run，也不伪造 terminal fact。
 
 EngineEvent ingest、transient publish 与 HostEvent projection 是三条边界：
 

@@ -228,6 +228,14 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
+    assert (
+        result.options.session_event_delivery_policy.transient_mailbox_max_items
+        == 37
+    )
+    assert (
+        result.options.session_event_delivery_policy.max_subscriptions_per_session
+        == 6
+    )
     policy = result.options.wait_poller_policy
     assert policy is not None
     assert policy.poll_interval_seconds == 0.4
@@ -2717,6 +2725,10 @@ def _write_host_runtime_overlay(workspace_root: Path) -> None:
                     "payload_inline_threshold_bytes": 2048,
                     "worker_startup_timeout_seconds": 4.5,
                     "memory_projection_catch_up_batch_size": 100,
+                    "session_event_delivery_policy": {
+                        "transient_mailbox_max_items": 37,
+                        "max_subscriptions_per_session": 6,
+                    },
                     "wait_poller_policy": {
                         "enabled": True,
                         "poll_interval_seconds": 0.4,

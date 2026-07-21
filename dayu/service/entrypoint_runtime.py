@@ -7,11 +7,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Protocol, TypeAlias, assert_never, cast
+from typing import Final, TypeAlias, assert_never
 
 from dayu.contracts import JsonValue
 from dayu.host.api import (
@@ -33,6 +33,7 @@ from dayu.host.api import (
     HostMetadataEntry,
     HostReasoningDelta,
     HostSessionEvent,
+    HostSessionEventIterator,
     HostTerminalStatus,
     HostToolCallDelta,
     HostTransientDelta,
@@ -456,37 +457,6 @@ class EntrypointStartupReconnectResult:
     seen_terminal_event_ids: frozenset[str]
 
 
-class ClosableHostSessionEventIterator(Protocol):
-    """支持显式关闭的 HostSessionEvent async iterator 窄协议。"""
-
-    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
-        """返回 HostSessionEvent async iterator。
-
-        :returns: HostSessionEvent async iterator。
-        :raises Exception: 具体实现可在不可用时抛出运行时错误。
-        """
-
-        ...
-
-    async def __anext__(self) -> HostSessionEvent:
-        """读取下一条 HostSessionEvent。
-
-        :returns: 下一条 HostSessionEvent。
-        :raises StopAsyncIteration: iterator 结束时抛出。
-        """
-
-        ...
-
-    async def aclose(self) -> None:
-        """关闭 HostEvent iterator。
-
-        :returns: ``None``。
-        :raises Exception: 具体实现可在关闭失败时抛出运行时错误。
-        """
-
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class _WatcherFailure:
     """watcher drain task 捕获到的异常。"""
@@ -506,7 +476,7 @@ class _WatchAndWaitRuntime:
     :param drain_task: 顺序 relay Host items 的 drain task。
     """
 
-    watcher: ClosableHostSessionEventIterator
+    watcher: HostSessionEventIterator
     queue: asyncio.Queue[_WatcherQueueItem]
     drain_task: asyncio.Task[None]
 
@@ -677,7 +647,7 @@ async def submit_entrypoint_turn_and_wait(
     """
 
     _require_positive_poll_interval(poll_interval_seconds)
-    runtime = _create_watch_and_wait_runtime(host, request.session_id)
+    runtime = await _create_watch_and_wait_runtime(host, request.session_id)
     state = _new_terminal_observation_state()
     try:
         submit_request = compose_submit_followup_request_with_overrides(
@@ -747,7 +717,7 @@ async def cancel_entrypoint_run_and_wait(
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
-    runtime = _create_watch_and_wait_runtime(host, run_snapshot.session_id)
+    runtime = await _create_watch_and_wait_runtime(host, run_snapshot.session_id)
     allow_outbox_terminal_fallback = False
     try:
         try:
@@ -796,7 +766,7 @@ async def startup_reconnect_entrypoint_session(
     :raises HostApiError: Host public API 调用失败时由 Host 抛出。
     """
 
-    runtime = _create_watch_and_wait_runtime(host, request.session_id)
+    runtime = await _create_watch_and_wait_runtime(host, request.session_id)
     state = _new_terminal_observation_state(
         terminal_cursor=request.terminal_cursor,
         seen_terminal_event_ids=request.seen_terminal_event_ids,
@@ -992,10 +962,10 @@ async def _wait_for_startup_promotion(
     )
 
 
-def _attach_watcher(
+async def _attach_watcher(
     host: Host,
     session_id: str,
-) -> ClosableHostSessionEventIterator:
+) -> HostSessionEventIterator:
     """在 Host mutating command 前 attach live watcher。
 
     :param host: Host public Protocol handle。
@@ -1004,13 +974,10 @@ def _attach_watcher(
     :raises HostApiError: Host watch attach 失败时由 Host 抛出。
     """
 
-    return cast(
-        ClosableHostSessionEventIterator,
-        host.watch_session_events(session_id),
-    )
+    return await host.watch_session_events(session_id)
 
 
-def _create_watch_and_wait_runtime(
+async def _create_watch_and_wait_runtime(
     host: Host,
     session_id: str,
 ) -> _WatchAndWaitRuntime:
@@ -1023,7 +990,7 @@ def _create_watch_and_wait_runtime(
     :raises RuntimeError: asyncio task 创建失败时透传。
     """
 
-    watcher = _attach_watcher(host, session_id)
+    watcher = await _attach_watcher(host, session_id)
     queue: asyncio.Queue[_WatcherQueueItem] = asyncio.Queue(maxsize=_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY)
     drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
     return _WatchAndWaitRuntime(
@@ -1034,7 +1001,7 @@ def _create_watch_and_wait_runtime(
 
 
 async def _drain_host_events(
-    watcher: ClosableHostSessionEventIterator,
+    watcher: HostSessionEventIterator,
     queue: asyncio.Queue[_WatcherQueueItem],
 ) -> None:
     """把 watcher 事件转存到本地 queue。

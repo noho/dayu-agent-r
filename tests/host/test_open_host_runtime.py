@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import ModuleType
-from typing import Protocol, TypeVar, cast
+from typing import TypeVar, cast
 
 import pytest
 
@@ -42,6 +42,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostSessionEvent,
+    HostSessionEventIterator,
     HostTerminalStatus,
     HostToolingOptions,
     LocalEngineWorker,
@@ -49,6 +50,7 @@ from dayu.host import (
     LocalWorkerHandle,
     OpenHostAdminOptions,
     OpenHostOptions,
+    HostSessionEventDeliveryPolicy,
     OperationContext,
     OrdinaryRunExecutionBaseline,
     PurgeSessionRequest,
@@ -121,19 +123,6 @@ from tests.host.public_smoke_support import awaiting_tooling_options
 from tests.host.test_resolve_wait_command import _seed_waiting_run
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
-
-
-class _ClosableSessionEventIterator(Protocol):
-    """测试使用的可关闭 Host Session iterator 窄协议。"""
-
-    async def aclose(self) -> None:
-        """关闭 iterator。
-
-        :returns: ``None``。
-        :raises Exception: 具体 Host iterator cleanup 失败时透传。
-        """
-
-        ...
 
 
 class _FinalAnswerHandle:
@@ -696,9 +685,9 @@ async def test_public_ensure_submit_read_and_watch_share_actor_thread(
             session.session_id,
             _followup_request(session.session_id, "actor-thread-contract"),
         )
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         await host.get_run(followup.accepted_run_id)
-        await cast(_ClosableSessionEventIterator, watcher).aclose()
+        await watcher.aclose()
 
     assert set(operation_threads) == {"ensure", "submit", "read", "watch"}
     assert len(set(operation_threads.values())) == 1
@@ -762,7 +751,7 @@ async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_o
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:
-        watcher = host.watch_session_events(session_id)
+        watcher = await host.watch_session_events(session_id)
         await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
         terminal_task = asyncio.create_task(_next_terminal(watcher))
         recovery_factory.release_event.set()
@@ -801,7 +790,7 @@ async def test_open_host_startup_recovery_dispatches_gracefully_closed_run(
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:
-        watcher = host.watch_session_events(session_id)
+        watcher = await host.watch_session_events(session_id)
         await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
         terminal_task = asyncio.create_task(_next_terminal(watcher))
         recovery_factory.release_event.set()
@@ -893,7 +882,7 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
             _followup_request(session.session_id, "followup-active-cancel-watchdog"),
         )
         await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         terminal_task = asyncio.create_task(_next_terminal(watcher))
         await asyncio.sleep(0)
         await host.get_run(followup.accepted_run_id)
@@ -993,6 +982,7 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
     wake_on_loop = asyncio.Event()
     order: list[str] = []
     original_scheduler_close = HostDispatchScheduler.close
+    original_delivery_close = HostTransientDeltaHub.close
     original_wake_queue = HostDispatchScheduler.wake_queue_promotion
     original_projection_catchup = _CompositeProjectionCatchupPort.catch_up_projection
     original_handle_close = HostCommandHandle.close
@@ -1009,6 +999,17 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
 
         order.append("scheduler")
         await original_scheduler_close(self)
+
+    def record_delivery_close(self: HostTransientDeltaHub) -> None:
+        """记录 delivery owner close 并委托真实实现。
+
+        :param self: transient delivery hub。
+        :returns: ``None``。
+        :raises Exception: 原始 close 失败时透传。
+        """
+
+        order.append("delivery")
+        original_delivery_close(self)
 
     def record_wake_queue(
         self: HostDispatchScheduler,
@@ -1086,6 +1087,7 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
         original_store_close(self)
 
     monkeypatch.setattr(HostDispatchScheduler, "close", record_scheduler_close)
+    monkeypatch.setattr(HostTransientDeltaHub, "close", record_delivery_close)
     monkeypatch.setattr(
         HostDispatchScheduler,
         "wake_queue_promotion",
@@ -1132,6 +1134,7 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
 
     assert order == [
         "scheduler",
+        "delivery",
         "projection",
         "actor_handle",
         "actor_store",
@@ -1924,14 +1927,14 @@ async def _next_terminal(watcher: AsyncIterator[HostSessionEvent]) -> HostEvent:
     raise AssertionError("watcher ended before terminal event")
 
 
-async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
+async def _close_iterator(iterator: HostSessionEventIterator) -> None:
     """关闭测试中持有的 async generator iterator。
 
     :param iterator: HostSessionEvent async iterator。
     :returns: ``None``。
     """
 
-    await cast(_ClosableSessionEventIterator, iterator).aclose()
+    await iterator.aclose()
 
 
 def _mark_current_dispatch_owner_as_stale_running(
@@ -2081,6 +2084,10 @@ def _options(
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=512,
+            max_subscriptions_per_session=4,
+        ),
     )
 
 

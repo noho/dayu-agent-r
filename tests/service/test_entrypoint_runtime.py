@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,12 +36,14 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostReasoningDelta,
     HostSessionEvent,
+    HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryReason,
+    HostSessionEventIterator,
     HostStreamCursor,
     HostTerminalStatus,
     HostToolCallDelta,
     HostTransientDelta,
     HostTransientDeltaType,
-    HostUnavailableDetail,
     OperationContext,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -59,7 +61,6 @@ from dayu.host.api import (
     is_terminal_run_status,
 )
 from dayu.service.entrypoint_runtime import (
-    ClosableHostSessionEventIterator,
     EntrypointActivity,
     EntrypointActivityKind,
     EntrypointActivitySeverity,
@@ -255,6 +256,50 @@ class _RaiseSignal:
     error: Exception
 
 
+class _GeneratorHostSessionEventIterator:
+    """把测试 async generator 投影为 public Host iterator contract。"""
+
+    def __init__(
+        self,
+        generator: AsyncGenerator[HostSessionEvent, None],
+    ) -> None:
+        """保存测试 generator。
+
+        :param generator: Host Session event async generator。
+        :returns: 无返回值。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        self._generator = generator
+
+    def __aiter__(self) -> HostSessionEventIterator:
+        """返回当前 public iterator。
+
+        :returns: 当前实例。
+        :raises Exception: 本方法不抛出异常。
+        """
+
+        return self
+
+    async def __anext__(self) -> HostSessionEvent:
+        """读取下一条测试 event。
+
+        :returns: 下一条 Host Session event。
+        :raises StopAsyncIteration: generator 结束时抛出。
+        """
+
+        return await anext(self._generator)
+
+    async def aclose(self) -> None:
+        """关闭底层 generator。
+
+        :returns: ``None``。
+        :raises Exception: generator cleanup 失败时透传。
+        """
+
+        await self._generator.aclose()
+
+
 class _FakeHostEventIterator:
     """测试用可关闭 HostEvent iterator。"""
 
@@ -274,7 +319,7 @@ class _FakeHostEventIterator:
         self._close_error = close_error
         self._queue = asyncio.Queue()
 
-    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
+    def __aiter__(self) -> HostSessionEventIterator:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -423,10 +468,10 @@ class _FakeHost:
         self.create_requests.append(request)
         return _session_snapshot(session_id="session-created", slot_key=request.slot_key)
 
-    def watch_session_events(
+    async def watch_session_events(
         self,
         session_id: str,
-    ) -> AsyncIterator[HostSessionEvent]:
+    ) -> HostSessionEventIterator:
         """记录 watcher attach 并返回测试 iterator。
 
         :param session_id: 目标 Session id。
@@ -1782,7 +1827,10 @@ async def test_watch_and_wait_factory_owns_bounded_live_relay_queue() -> None:
     """唯一 live runtime factory 应 attach watcher 并创建容量 256 的 relay。"""
 
     fake_host = _FakeHost()
-    runtime = _create_watch_and_wait_runtime(cast(Host, fake_host), "session-1")
+    runtime = await _create_watch_and_wait_runtime(
+        cast(Host, fake_host),
+        "session-1",
+    )
     try:
         assert runtime.queue.maxsize == 256
         assert len(fake_host.watchers) == 1
@@ -1793,15 +1841,14 @@ async def test_watch_and_wait_factory_owns_bounded_live_relay_queue() -> None:
 
 @pytest.mark.asyncio
 async def test_watcher_failure_preserves_original_typed_host_error() -> None:
-    """relay drain 必须把原 Host slow-consumer 错误实例放入 failure item。"""
+    """relay drain 必须保留 public delivery interruption 错误实例。"""
 
     error = HostApiError(
-        code=HostApiErrorCode.UNAVAILABLE,
-        message="Session live stream consumer is too slow",
-        retryable=True,
-        detail=HostUnavailableDetail(
-            component="session_live_stream",
-            reason_code="slow_consumer",
+        code=HostApiErrorCode.DELIVERY_INTERRUPTED,
+        message="Session event delivery was interrupted",
+        retryable=False,
+        detail=HostSessionEventDeliveryDetail(
+            reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
         ),
     )
     watcher = _FakeHostEventIterator()
@@ -1847,7 +1894,7 @@ async def test_close_watcher_cancels_drain_before_closing_async_generator() -> N
     generator_closed = asyncio.Event()
     keep_running = asyncio.Event()
 
-    async def host_event_stream() -> AsyncIterator[HostEvent]:
+    async def host_event_stream() -> AsyncGenerator[HostSessionEvent, None]:
         """模拟 Host watch_session_events 返回的 async generator。"""
 
         try:
@@ -1857,7 +1904,7 @@ async def test_close_watcher_cancels_drain_before_closing_async_generator() -> N
         finally:
             generator_closed.set()
 
-    watcher = host_event_stream()
+    watcher = _GeneratorHostSessionEventIterator(host_event_stream())
 
     async def drain() -> None:
         """持续消费 watcher，直到被取消。"""
@@ -1870,7 +1917,7 @@ async def test_close_watcher_cancels_drain_before_closing_async_generator() -> N
 
     await _close_watch_and_wait_runtime(
         _WatchAndWaitRuntime(
-            watcher=cast(ClosableHostSessionEventIterator, watcher),
+            watcher=watcher,
             queue=asyncio.Queue(),
             drain_task=drain_task,
         )

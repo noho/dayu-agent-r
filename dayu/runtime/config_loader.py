@@ -518,6 +518,18 @@ class WaitPollerRuntimePolicyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionEventDeliveryPolicyConfig:
+    """层中立的 Session Event Delivery 资源策略配置。
+
+    :param transient_mailbox_max_items: 单订阅 retained item 上限。
+    :param max_subscriptions_per_session: 单 opener、单 Session reservation 上限。
+    """
+
+    transient_mailbox_max_items: int
+    max_subscriptions_per_session: int
+
+
+@dataclass(frozen=True, slots=True)
 class HostRuntimeProfileConfig:
     """Host opener 部署默认值配置。
 
@@ -531,6 +543,8 @@ class HostRuntimeProfileConfig:
     :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
     :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param memory_projection_catch_up_batch_size: memory catch-up 批次大小。
+    :param session_event_delivery_policy: Session Event Delivery item-bound
+        mailbox 与 per-Session subscription admission 策略。
     :param wait_poller_policy: 完整且必填的 wait poller runtime policy snapshot。
     :param process_capsule_interrupt_policy: process-backed capsule cleanup
         interrupt 配置；缺省时由 Host typed policy 默认值决定。
@@ -546,6 +560,7 @@ class HostRuntimeProfileConfig:
     payload_inline_threshold_bytes: int
     worker_startup_timeout_seconds: float
     memory_projection_catch_up_batch_size: int
+    session_event_delivery_policy: SessionEventDeliveryPolicyConfig
     wait_poller_policy: WaitPollerRuntimePolicyConfig
     process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicyConfig | None
 
@@ -1929,6 +1944,7 @@ def _parse_host_runtime_profile(
                 "payload_inline_threshold_bytes",
                 "worker_startup_timeout_seconds",
                 "memory_projection_catch_up_batch_size",
+                "session_event_delivery_policy",
                 "wait_poller_policy",
             }
         ),
@@ -1953,6 +1969,14 @@ def _parse_host_runtime_profile(
         payload_inline_threshold_bytes=_require_positive_int_field(record, field_name="payload_inline_threshold_bytes", context=context),
         worker_startup_timeout_seconds=_require_positive_float_field(record, field_name="worker_startup_timeout_seconds", context=context),
         memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=context),
+        session_event_delivery_policy=_parse_session_event_delivery_policy(
+            _require_mapping_field(
+                record,
+                field_name="session_event_delivery_policy",
+                context=context,
+            ),
+            context=f"{context}.session_event_delivery_policy",
+        ),
         wait_poller_policy=_parse_wait_poller_runtime_policy(
             _require_mapping_field(
                 record,
@@ -1964,6 +1988,43 @@ def _parse_host_runtime_profile(
         process_capsule_interrupt_policy=_optional_process_capsule_interrupt_policy(
             record,
             field_name="process_capsule_interrupt_policy",
+            context=context,
+        ),
+    )
+
+
+def _parse_session_event_delivery_policy(
+    record: JsonObject,
+    *,
+    context: str,
+) -> SessionEventDeliveryPolicyConfig:
+    """解析完整且严格的 Session Event Delivery policy。
+
+    :param record: policy JSON object。
+    :param context: 错误消息上下文。
+    :returns: 层中立 typed policy 配置。
+    :raises ConfigFieldError: 字段缺失、多余、非严格整数或非正时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset(
+            {
+                "transient_mailbox_max_items",
+                "max_subscriptions_per_session",
+            }
+        ),
+        context=context,
+    )
+    return SessionEventDeliveryPolicyConfig(
+        transient_mailbox_max_items=_require_positive_int_field(
+            record,
+            field_name="transient_mailbox_max_items",
+            context=context,
+        ),
+        max_subscriptions_per_session=_require_positive_int_field(
+            record,
+            field_name="max_subscriptions_per_session",
             context=context,
         ),
     )

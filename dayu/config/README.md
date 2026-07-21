@@ -168,6 +168,8 @@ dayu/config/
 - `payload_inline_threshold_bytes`，包内默认值为 `65535` bytes。
 - `worker_startup_timeout_seconds`。
 - `memory_projection_catch_up_batch_size`。
+- 必填 `session_event_delivery_policy`：完整保存 Host Session Event Delivery 的
+  item-only resource policy，并由 Service 一对一装配到 `OpenHostOptions`。
 - 必填 `wait_poller_policy`：完整保存 production wait poller 的部署 snapshot；
   ConfigLoader 只做层中立 typed projection，不解释 provider 或 Fins 语义。
 - 可选 `process_capsule_interrupt_policy`：process-backed 工具子进程取消 / 超时后的 cleanup interrupt 策略，只包含 `terminate_grace_seconds` 与 `kill_grace_seconds`。字段缺省时由 Host typed 默认值决定；显式配置必须是有限非负数，不能使用 boolean、NaN 或正负无穷。该策略只约束 cleanup grace，不是单次工具业务执行 deadline，不能替代 execution profile 中的 `agent_policy.tool_execution_timeout_seconds`。
@@ -181,6 +183,13 @@ dayu/config/
 `claim_batch_size`、`max_outstanding_adapter_calls` 显式拒绝 JSON boolean。
 缺字段、多余字段、`null`、零、负数或非有限值都会加载失败。包内 snapshot 固定为
 `true, 1, 60, 100, 30, 2, 300, 1, 5, 30, 5, 8`，顺序与上述字段一致。
+
+`session_event_delivery_policy` 必须且只能提供
+`transient_mailbox_max_items` 与 `max_subscriptions_per_session`。两者都是严格正整数，
+显式拒绝 JSON boolean、零、负数、浮点数、字符串、缺字段和多余字段。包内 snapshot
+固定为 `512` 与 `4`：前者约束单订阅 mailbox 与唯一 in-flight 合计的 retained item，
+后者约束同一 opener 内单 Session 的 subscription reservation；该配置不提供 byte 或
+resident-heap 上界字段。
 
 这些配置都是 `open_host(options)` construction-time assembly inputs 的来源，不是单个 Run 的 override。prompt asset root 与 scene manifest root 不在 `host_runtime.json` 中配置，由 runtime location resolver 解析。
 

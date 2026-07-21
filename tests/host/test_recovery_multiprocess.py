@@ -111,7 +111,7 @@ async def test_crashed_owner_reopens_and_final_answer_is_public_streamed(
 
     recovery_factory = AsyncControlledFinalAnswerWorkerFactory("recovered-final")
     async with open_host(recovery_open_host_options(tmp_path, recovery_factory)) as host:
-        watcher = host.watch_session_events(accepted.session_id)
+        watcher = await host.watch_session_events(accepted.session_id)
         await asyncio.wait_for(
             recovery_factory.accepted_event.wait(),
             timeout=_PROCESS_START_TIMEOUT_SECONDS,
@@ -157,7 +157,7 @@ async def test_projection_lag_does_not_block_durable_recovery(
 
     recovery_factory = AsyncControlledFinalAnswerWorkerFactory("lag-recovered-final")
     async with open_host(recovery_open_host_options(tmp_path, recovery_factory)) as host:
-        watcher = host.watch_session_events(accepted.session_id)
+        watcher = await host.watch_session_events(accepted.session_id)
         await asyncio.wait_for(
             recovery_factory.accepted_event.wait(),
             timeout=_PROCESS_START_TIMEOUT_SECONDS,

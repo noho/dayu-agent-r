@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import Future
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
@@ -46,9 +46,11 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostClosedError,
     HostCommandHandleOptions,
+    HostEvent,
     HostEventKind,
     HostLocalExecutionOptions,
     HostSessionEvent,
+    HostSessionEventIterator,
     HostCallContext,
     ListSessionsResult,
     OperationContext,
@@ -141,7 +143,6 @@ from dayu.host.wait_adapter import (
     WaitPollerSupervisor,
 )
 from dayu.host._wait_observation import WaitObservationRunner
-from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 if TYPE_CHECKING:
     from dayu.host.admission import PendingDispatchRecord
@@ -902,56 +903,60 @@ class _PublicHostHandle:
             lambda handle: _close_session(handle, session_id, request)
         )
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostSessionEvent]:
-        """同步 attach Session durable/transient 联合事件订阅。
+    async def watch_session_events(
+        self,
+        session_id: str,
+    ) -> HostSessionEventIterator:
+        """异步 attach Session durable/transient 联合事件订阅。
 
         :param session_id: 目标 Session id。
-        :returns: attach-before-return 且可显式关闭的 Host typed iterator。
+        :returns: durable cursor transaction 已完成且已注册的 public iterator。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: Session 不存在或不可 watch 时抛出。
+        :raises asyncio.CancelledError: factory caller 被取消时抛出并释放 reservation。
         """
 
         self._raise_if_closed()
-        subscription = self._transient_delta_hub.subscribe(session_id)
+        reservation = self._transient_delta_hub.reserve(session_id)
         try:
-            cursor_future = self._durable_actor.submit(
+            cursor = await self._durable_actor.call(
                 lambda handle: _session_live_event_start_cursor(handle, session_id)
             )
+            # cursor transaction 与 public lifecycle 之间不得出现 await；recheck、
+            # mailbox allocation、fanout registration 与 iterator allocation 在同一
+            # owner-loop critical segment 内完成。
+            self._raise_if_closed()
+            subscription = self._transient_delta_hub.attach(reservation)
+            try:
+                return _HostSessionEventIterator(
+                    owner=self,
+                    session_id=session_id,
+                    cursor=cursor,
+                    subscription=subscription,
+                )
+            except BaseException:
+                subscription.close()
+                raise
         except BaseException:
-            subscription.close()
+            reservation.release()
             raise
-        cursor_future.add_done_callback(_observe_watch_cursor_future)
-        return _ClosableHostSessionEventIterator(
-            owner=self,
-            session_id=session_id,
-            cursor_future=cursor_future,
-            subscription=subscription,
-        )
 
     async def _watch_session_events(
         self,
         session_id: str,
-        cursor_future: asyncio.Future[int],
+        cursor: int,
         subscription: HostTransientDeltaSubscription,
     ) -> AsyncGenerator[HostSessionEvent, None]:
-        """在 actor cursor attach 后持续合流 durable/transient event。
+        """持续合流已完成 cursor attach 的 durable/transient event。
 
         :param session_id: 目标 Session id。
-        :param cursor_future: watch 调用时已同步排队的 actor cursor attach future。
-        :param subscription: watch 返回前已同步注册的瞬态订阅。
+        :param cursor: factory 内已完成 transaction 读取的起始 cursor。
+        :param subscription: factory 返回前已注册的瞬态订阅。
         :returns: Host-owned typed durable/transient async generator。
-        :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
+        :raises HostApiError: durable 读取或 delivery continuity 失败时抛出。
         """
 
         try:
-            cursor = await asyncio.shield(cursor_future)
-            _LOGGER.log(
-                VERBOSE_LOG_LEVEL,
-                "host.public_handle.watch_attached host_handle_id=%s session_id=%s cursor=%s",
-                self._host_handle_id,
-                session_id,
-                cursor,
-            )
             async for event in self._watch_session_events_after(
                 session_id,
                 cursor,
@@ -978,17 +983,41 @@ class _PublicHostHandle:
         """
 
         next_cursor = cursor
-        while self._health_gate.state not in (
-            HostExecutionHealthState.CLOSING,
-            HostExecutionHealthState.CLOSED,
-        ):
-            for transient in subscription.drain_nowait():
+        pending_durable_events: tuple[HostEvent, ...] = ()
+        pending_durable_index = 0
+        while True:
+            # generator 从上一轮 transient yield 恢复时，才释放 Host 持有的
+            # 唯一 in-flight 引用；mailbox -> in-flight transfer 不减 retained count。
+            subscription.release_in_flight()
+            transient = subscription.pop_next_nowait()
+            if transient is not None:
                 yield transient
+                continue
             overflow_error = subscription.overflow_error()
             if overflow_error is not None:
                 raise overflow_error
             if subscription.is_closed:
                 return
+            if pending_durable_index < len(pending_durable_events):
+                event = pending_durable_events[pending_durable_index]
+                pending_durable_index += 1
+                if event.kind is not HostEventKind.PROGRESS and event.run_id is not None:
+                    subscription.mark_run_terminal(event.run_id)
+                yield event
+                continue
+            pending_durable_events = ()
+            pending_durable_index = 0
+            if self._health_gate.state in (
+                HostExecutionHealthState.CLOSING,
+                HostExecutionHealthState.CLOSED,
+            ):
+                # public close 已拒绝新 attach，但 delivery owner 只会在 poller、
+                # actor 与 scheduler producer 停止后关闭；这里等待同一个 level
+                # readiness，避免 actor stop 后把 Host close 投影成 read failure。
+                await subscription.wait_ready(
+                    _SESSION_WATCH_POLL_INTERVAL_SECONDS
+                )
+                continue
             batch = await self._durable_actor.call(
                 lambda handle: _read_session_host_events_after(
                     handle,
@@ -997,27 +1026,9 @@ class _PublicHostHandle:
                 )
             )
             next_cursor = batch.next_cursor
-            for transient in subscription.drain_nowait():
-                yield transient
-            overflow_error = subscription.overflow_error()
-            if overflow_error is not None:
-                raise overflow_error
-            if subscription.is_closed:
-                return
+            pending_durable_events = batch.events
             if len(batch.events) == 0:
                 await subscription.wait_ready(_SESSION_WATCH_POLL_INTERVAL_SECONDS)
-                continue
-            for event in batch.events:
-                if event.kind is not HostEventKind.PROGRESS and event.run_id is not None:
-                    for transient in subscription.drain_nowait():
-                        yield transient
-                    overflow_error = subscription.overflow_error()
-                    if overflow_error is not None:
-                        raise overflow_error
-                    if subscription.is_closed:
-                        return
-                    subscription.mark_run_terminal(event.run_id)
-                yield event
 
     async def close(self) -> None:
         """关闭当前 Host handle lifecycle。
@@ -1043,7 +1054,6 @@ class _PublicHostHandle:
         """
 
         await self._health_gate.begin_closing()
-        self._transient_delta_hub.close()
         _LOGGER.info(
             "host.public_handle.close_start host_handle_id=%s",
             self._host_handle_id,
@@ -1080,6 +1090,18 @@ class _PublicHostHandle:
             else:
                 _LOGGER.error(
                     "host.public_handle.close_scheduler_failed host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+        try:
+            self._transient_delta_hub.close()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_delivery_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1175,37 +1197,18 @@ class _PublicHostHandle:
         self._health_gate.raise_if_public_closed()
 
 
-def _observe_watch_cursor_future(future: asyncio.Future[int]) -> None:
-    """消费未开始迭代的 watch cursor future 异常，避免后台告警。
-
-    调用 ``future.exception()`` 只标记异常已被观察；后续 async iterator await
-    同一 future 时仍会得到原异常，不改变 fail-closed 语义。
-
-    :param future: watch 调用时同步排队的 cursor future。
-    :returns: ``None``。
-    :raises Exception: 不向 event loop 抛出 future 中的业务异常。
-    """
-
-    if future.cancelled():
-        return
-    future.exception()
-
-
-class _ClosableHostSessionEventIterator:
-    """共同拥有 cursor future、瞬态 subscription 与 merge generator 的 iterator。
+class _HostSessionEventIterator:
+    """共同拥有已附着 cursor、subscription 与 merge generator 的 iterator。
 
     :param owner: public Host handle。
     :param session_id: 目标 Session 标识。
-    :param cursor_future: watch 同步调用时已提交的 durable cursor future。
-    :param subscription: watch 返回前已注册的瞬态订阅。
+    :param cursor: factory 内已完成 transaction 读取的 durable cursor。
+    :param subscription: factory 返回前已注册的瞬态订阅。
     """
 
     __slots__ = (
         "_closed",
-        "_cursor_future",
         "_iterator",
-        "_owner",
-        "_session_id",
         "_subscription",
     )
 
@@ -1214,27 +1217,28 @@ class _ClosableHostSessionEventIterator:
         *,
         owner: _PublicHostHandle,
         session_id: str,
-        cursor_future: asyncio.Future[int],
+        cursor: int,
         subscription: HostTransientDeltaSubscription,
     ) -> None:
         """初始化可关闭的 Host Session event iterator。
 
         :param owner: public Host handle。
         :param session_id: 目标 Session 标识。
-        :param cursor_future: 已提交的 durable cursor future。
+        :param cursor: 已完成 transaction 读取的 durable cursor。
         :param subscription: 已注册的瞬态订阅。
         :returns: 无返回值。
         :raises ValueError: 构造参数由 owner 边界预先校验，本方法不额外抛出。
         """
 
-        self._owner = owner
-        self._session_id = session_id
-        self._cursor_future = cursor_future
         self._subscription = subscription
-        self._iterator: AsyncGenerator[HostSessionEvent, None] | None = None
+        self._iterator = owner._watch_session_events(
+            session_id,
+            cursor,
+            subscription,
+        )
         self._closed = False
 
-    def __aiter__(self) -> _ClosableHostSessionEventIterator:
+    def __aiter__(self) -> _HostSessionEventIterator:
         """返回当前 async iterator。
 
         :returns: 当前实例。
@@ -1254,12 +1258,6 @@ class _ClosableHostSessionEventIterator:
 
         if self._closed:
             raise StopAsyncIteration
-        if self._iterator is None:
-            self._iterator = self._owner._watch_session_events(
-                self._session_id,
-                self._cursor_future,
-                self._subscription,
-            )
         try:
             return await anext(self._iterator)
         except BaseException:
@@ -1277,8 +1275,7 @@ class _ClosableHostSessionEventIterator:
             return
         self._closed = True
         try:
-            if self._iterator is not None:
-                await self._iterator.aclose()
+            await self._iterator.aclose()
         finally:
             self._subscription.close()
 
@@ -1457,7 +1454,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         wait_poller: WaitPollerSupervisor | None = None
         durable_actor: DurableActor | None = None
         health_gate = HostExecutionHealthGate()
-        transient_delta_hub = HostTransientDeltaHub()
+        transient_delta_hub = HostTransientDeltaHub(
+            policy=self._options.session_event_delivery_policy,
+        )
         try:
             loop = asyncio.get_running_loop()
             active_registry = ActiveWorkerRegistry()
@@ -1546,7 +1545,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             return self._host
         except Exception:
-            transient_delta_hub.close()
             _LOGGER.error(
                 "host.open.failed host_handle_id=%s",
                 host_handle_id,
@@ -1582,6 +1580,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
                     )
+            transient_delta_hub.close()
             _best_effort_catch_up_projection_on_open_failure(
                 close_projection_catchup_port,
                 host_handle_id=host_handle_id,

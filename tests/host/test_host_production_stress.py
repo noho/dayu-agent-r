@@ -1121,7 +1121,12 @@ async def test_mixed_host_stress_deterministic_fault_injection(
             last_primary_terminal_counts = [
                 len(read_session_terminal_sequences(tmp_path, session_id)) for session_id in session_ids
             ]
-            primary_watchers = tuple(host.watch_session_events(session_id) for session_id in session_ids)
+            primary_watchers = tuple(
+                [
+                    await host.watch_session_events(session_id)
+                    for session_id in session_ids
+                ]
+            )
             primary_watchers_closed = [False for _index in range(scenario.session_count)]
             primary_observed_events = tuple(asyncio.Queue[HostEvent]() for _index in range(scenario.session_count))
             primary_tasks = tuple(
@@ -1136,7 +1141,9 @@ async def test_mixed_host_stress_deterministic_fault_injection(
                 )
                 for index, watcher in enumerate(primary_watchers)
             )
-            secondary_watcher = host.watch_session_events(sessions[0].session_id)
+            secondary_watcher = await host.watch_session_events(
+                sessions[0].session_id
+            )
             secondary_watcher_closed = False
             secondary_first_task = asyncio.create_task(
                 consume_terminals(
@@ -1196,7 +1203,9 @@ async def test_mixed_host_stress_deterministic_fault_injection(
                     watch_lag_samples_by_session,
                 )
 
-                secondary_reconnect_watcher = host.watch_session_events(sessions[0].session_id)
+                secondary_reconnect_watcher = await host.watch_session_events(
+                    sessions[0].session_id
+                )
                 secondary_reconnect_task = asyncio.create_task(
                     consume_terminals(
                         secondary_reconnect_watcher,
@@ -1663,7 +1672,7 @@ async def test_repeated_startup_recovery_crash_stress(
         )
         recovery_factory = AsyncControlledFinalAnswerWorkerFactory(f"stress-recovered-final-{cycle_index}")
         async with open_host(recovery_open_host_options(tmp_path, recovery_factory)) as host:
-            watcher = host.watch_session_events(accepted.session_id)
+            watcher = await host.watch_session_events(accepted.session_id)
             try:
                 await asyncio.wait_for(
                     recovery_factory.accepted_event.wait(),
@@ -1786,7 +1795,12 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
             session_list.append(await host.ensure_session(ensure_request(f"wu-stress-s3-{index}")))
         sessions = tuple(session_list)
         session_ids = tuple(session.session_id for session in sessions)
-        primary_watchers = tuple(host.watch_session_events(session.session_id) for session in sessions)
+        primary_watchers = tuple(
+            [
+                await host.watch_session_events(session.session_id)
+                for session in sessions
+            ]
+        )
         primary_watchers_closed = [False for _index in range(_SLICE3_SESSION_COUNT)]
         primary_observed_events = tuple(asyncio.Queue[HostEvent]() for _index in range(_SLICE3_SESSION_COUNT))
         primary_tasks = tuple(
@@ -1801,7 +1815,9 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
             )
             for index, watcher in enumerate(primary_watchers)
         )
-        secondary_watcher = host.watch_session_events(sessions[0].session_id)
+        secondary_watcher = await host.watch_session_events(
+            sessions[0].session_id
+        )
         secondary_first_task = asyncio.create_task(
             consume_terminals(
                 secondary_watcher,
@@ -1810,7 +1826,9 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
                 timeout_seconds=_SLICE3_CONSUME_TIMEOUT_SECONDS,
             )
         )
-        cancel_probe_watcher = host.watch_session_events(sessions[0].session_id)
+        cancel_probe_watcher = await host.watch_session_events(
+            sessions[0].session_id
+        )
         cancel_probe_consumer = asyncio.create_task(_consume_until_cancelled(cancel_probe_watcher))
 
         try:
@@ -1997,7 +2015,9 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
                 watch_lag_samples_by_session,
             )
 
-            secondary_reconnect_watcher = host.watch_session_events(sessions[0].session_id)
+            secondary_reconnect_watcher = await host.watch_session_events(
+                sessions[0].session_id
+            )
             secondary_reconnect_task = asyncio.create_task(
                 consume_terminals(
                     secondary_reconnect_watcher,

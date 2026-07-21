@@ -402,7 +402,7 @@ async def run_smoke(args: SmokeArgs, *, env: Mapping[str, str]) -> int:
             )
         )
         session_id = session.session_id
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         round_specs = _round_specs(args)
         for ordinal, (label, prompt, tool_names) in enumerate(round_specs, start=1):
             round_result = await _run_round(
