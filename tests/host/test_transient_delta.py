@@ -151,7 +151,7 @@ def test_durable_and_transient_public_envelopes_have_separate_identity_fields() 
 
 
 def test_hub_fanout_reuses_envelope_and_late_attach_has_no_replay() -> None:
-    """hub 每次 publish 只分配一次 identity，且 attach 前增量不 replay。"""
+    """fanout 每订阅独立 entry，且共享 event、原样 fence、不 replay。"""
 
     hub = _hub()
     first = _attach(hub, "session-1")
@@ -159,39 +159,51 @@ def test_hub_fanout_reuses_envelope_and_late_attach_has_no_replay() -> None:
     second = _attach(hub, "session-1")
     hub.publish(_candidate(worker_event_index=2))
 
-    first_event = first.pop_next_nowait()
+    first_entry = first.pop_next_nowait()
     first.release_in_flight()
-    shared_first_event = first.pop_next_nowait()
-    shared_second_event = second.pop_next_nowait()
+    shared_first_entry = first.pop_next_nowait()
+    shared_second_entry = second.pop_next_nowait()
 
-    assert first_event is not None
-    assert shared_first_event is not None
-    assert shared_second_event is not None
-    assert [first_event.runtime_sequence, shared_first_event.runtime_sequence] == [1, 2]
-    assert shared_second_event.runtime_sequence == 2
-    assert shared_first_event is shared_second_event
-    assert first_event.runtime_id == hub.runtime_id
-    assert first_event.dedupe_key != shared_first_event.dedupe_key
+    assert first_entry is not None
+    assert shared_first_entry is not None
+    assert shared_second_entry is not None
+    assert [
+        first_entry.event.runtime_sequence,
+        shared_first_entry.event.runtime_sequence,
+    ] == [1, 2]
+    assert shared_second_entry.event.runtime_sequence == 2
+    assert shared_first_entry is not shared_second_entry
+    assert shared_first_entry.event is shared_second_entry.event
+    assert (
+        shared_first_entry.durable_causal_fence_event_sequence
+        == shared_second_entry.durable_causal_fence_event_sequence
+        == 1
+    )
+    assert first_entry.event.runtime_id == hub.runtime_id
+    assert (
+        first_entry.event.dedupe_key
+        != shared_first_entry.event.dedupe_key
+    )
 
     other_runtime = _hub()
     other_subscription = _attach(other_runtime, "session-1")
     other_runtime.publish(_candidate(worker_event_index=1))
-    other_event = other_subscription.pop_next_nowait()
-    assert other_event is not None
-    assert other_event.runtime_sequence == 1
-    assert other_event.dedupe_key != first_event.dedupe_key
+    other_entry = other_subscription.pop_next_nowait()
+    assert other_entry is not None
+    assert other_entry.event.runtime_sequence == 1
+    assert other_entry.event.dedupe_key != first_entry.event.dedupe_key
 
     unwatched_runtime = _hub()
     unwatched_runtime.publish(_candidate(worker_event_index=1))
     attached_after_publish = _attach(unwatched_runtime, "session-1")
     unwatched_runtime.publish(_candidate(worker_event_index=2))
-    late_event = attached_after_publish.pop_next_nowait()
-    assert late_event is not None
-    assert late_event.runtime_sequence == 2
+    late_entry = attached_after_publish.pop_next_nowait()
+    assert late_entry is not None
+    assert late_entry.event.runtime_sequence == 2
 
 
-def test_subscription_terminal_fence_detach_and_hub_close_are_local() -> None:
-    """terminal fence、detach 与 hub close 只改变各自 owner state。"""
+def test_subscription_detach_and_hub_close_are_local() -> None:
+    """detach 与 hub close 只改变各自 resource owner state。"""
 
     hub = _hub()
     detached = _attach(hub, "session-1")
@@ -200,12 +212,15 @@ def test_subscription_terminal_fence_detach_and_hub_close_are_local() -> None:
     assert hub.subscription_count("session-1") == 1
     assert hub.reservation_count("session-1") == 1
 
-    active.mark_run_terminal("run-1")
     hub.publish(_candidate(worker_event_index=1, run_id="run-1"))
     hub.publish(_candidate(worker_event_index=2, run_id="run-2"))
-    event = active.pop_next_nowait()
-    assert event is not None
-    assert event.run_id == "run-2"
+    first_entry = active.pop_next_nowait()
+    assert first_entry is not None
+    assert first_entry.event.run_id == "run-1"
+    active.release_in_flight()
+    second_entry = active.pop_next_nowait()
+    assert second_entry is not None
+    assert second_entry.event.run_id == "run-2"
 
     hub.publish(_candidate(worker_event_index=3, run_id="run-2"))
     hub.close()
@@ -216,45 +231,45 @@ def test_subscription_terminal_fence_detach_and_hub_close_are_local() -> None:
     hub.publish(_candidate(worker_event_index=4, run_id="run-2"))
 
 
-def test_single_pop_filters_prequeued_terminal_stale_item() -> None:
-    """single-pop 跳过预存 terminal stale item 并维持 retained/readiness。
+@pytest.mark.asyncio
+async def test_local_terminal_watermark_is_scalar_and_tracks_durable_cursor() -> None:
+    """未接线 local hook 只维护单一 watermark 并驱动 level readiness。
 
     :returns: ``None``。
-    :raises AssertionError: stale 进入 in-flight 或 owner accounting 漂移时抛出。
+    :raises AssertionError: watermark、cursor 或 readiness owner 漂移时抛出。
     """
 
     hub = _hub()
-    with_followup = _attach(hub, "session-1")
-    hub.publish(_candidate(worker_event_index=1, run_id="run-1"))
-    hub.publish(_candidate(worker_event_index=2, run_id="run-2"))
-    assert with_followup.retained_items == 2
+    subscription = _attach(hub, "session-1", durable_cursor=10)
 
-    with_followup.mark_run_terminal("run-1")
-    assert with_followup._ready.is_set() is True
-    followup = with_followup.pop_next_nowait()
+    assert hub.committed_terminal_event_sequence_high_watermark("session-1") == 0
+    assert subscription.needs_durable_reconciliation is False
+    assert hub.advance_committed_terminal_event_sequence_high_watermark(
+        "session-1",
+        12,
+    ) is True
+    assert hub.advance_committed_terminal_event_sequence_high_watermark(
+        "session-1",
+        12,
+    ) is False
+    assert hub.advance_committed_terminal_event_sequence_high_watermark(
+        "session-1",
+        11,
+    ) is False
+    assert hub.committed_terminal_event_sequence_high_watermark("session-1") == 12
+    assert subscription.needs_durable_reconciliation is True
+    assert await subscription.wait_ready(0.1) is True
 
-    assert followup is not None
-    assert followup.run_id == "run-2"
-    assert with_followup.retained_items == 1
-    assert with_followup._ready.is_set() is False
-    with_followup.release_in_flight()
-    assert with_followup.retained_items == 0
+    subscription.advance_durable_cursor(11)
+    assert subscription.needs_durable_reconciliation is True
+    subscription.advance_durable_cursor(12)
+    assert subscription.needs_durable_reconciliation is False
+    assert await subscription.wait_ready(0.001) is False
 
-    stale_only = _attach(hub, "session-2")
-    hub.publish(
-        _candidate(
-            worker_event_index=3,
-            session_id="session-2",
-            run_id="run-3",
-        )
-    )
-    assert stale_only.retained_items == 1
-
-    stale_only.mark_run_terminal("run-3")
-    assert stale_only._ready.is_set() is True
-    assert stale_only.pop_next_nowait() is None
-    assert stale_only.retained_items == 0
-    assert stale_only._ready.is_set() is False
+    attached_after_notice = _attach(hub, "session-1", durable_cursor=11)
+    assert attached_after_notice.needs_durable_reconciliation is True
+    attached_after_notice.advance_durable_cursor(12)
+    assert attached_after_notice.needs_durable_reconciliation is False
 
 
 @pytest.mark.asyncio
@@ -286,7 +301,7 @@ async def test_subscription_wait_before_publish_wakes_at_barrier() -> None:
     assert await asyncio.wait_for(waiter, timeout=0.5) is True
     event = subscription.pop_next_nowait()
     assert event is not None
-    assert event.worker_event_index == 1
+    assert event.event.worker_event_index == 1
 
 
 @pytest.mark.asyncio
@@ -305,12 +320,12 @@ async def test_single_pop_clear_publish_intersection_rechecks_owner_state() -> N
 
     first = subscription.pop_next_nowait()
     assert first is not None
-    assert first.worker_event_index == 1
+    assert first.event.worker_event_index == 1
     subscription.release_in_flight()
     assert await subscription.wait_ready(0.1) is True
     second = subscription.pop_next_nowait()
     assert second is not None
-    assert second.worker_event_index == 2
+    assert second.event.worker_event_index == 2
 
 
 @pytest.mark.asyncio
@@ -373,14 +388,14 @@ def test_slow_subscription_overflow_preserves_prefix_and_fast_watcher() -> None:
         hub.publish(_candidate(worker_event_index=worker_event_index))
         fast_event = fast.pop_next_nowait()
         assert fast_event is not None
-        fast_events.append(fast_event)
+        fast_events.append(fast_event.event)
         fast.release_in_flight()
 
     slow_prefix: list[HostTransientDelta] = []
     for _index in range(3):
         slow_event = slow.pop_next_nowait()
         assert slow_event is not None
-        slow_prefix.append(slow_event)
+        slow_prefix.append(slow_event.event)
         slow.release_in_flight()
     overflow = slow.overflow_error()
     assert [event.runtime_sequence for event in slow_prefix] == [1, 2, 3]
@@ -393,7 +408,7 @@ def test_slow_subscription_overflow_preserves_prefix_and_fast_watcher() -> None:
     hub.publish(_candidate(worker_event_index=5))
     fast_event = fast.pop_next_nowait()
     assert fast_event is not None
-    assert fast_event.worker_event_index == 5
+    assert fast_event.event.worker_event_index == 5
     assert slow.pop_next_nowait() is None
     slow.close()
     assert hub.reservation_count("session-1") == 1
@@ -423,11 +438,11 @@ def test_session_reservation_cap_rejects_before_subscription_and_readmits() -> N
 
     other_session = hub.reserve("session-2")
     assert hub.reservation_count("session-2") == 1
-    first = hub.attach(first_reservation)
-    second = hub.attach(second_reservation)
+    first = hub.attach(first_reservation, durable_cursor=0)
+    second = hub.attach(second_reservation, durable_cursor=0)
     first.close()
     replacement = hub.reserve("session-1")
-    replacement_subscription = hub.attach(replacement)
+    replacement_subscription = hub.attach(replacement, durable_cursor=0)
     assert hub.subscription_count("session-1") == 2
     assert second.is_closed is False
 
@@ -439,14 +454,27 @@ def test_session_reservation_cap_rejects_before_subscription_and_readmits() -> N
 
 
 def test_owner_exposes_no_batch_pop_or_byte_accounting_shape() -> None:
-    """subscription owner 只提供单项 transfer，且没有 byte 容量维度。"""
+    """owner 只提供 entry 单项 transfer，且无 terminal set/byte 维度。"""
 
     source = inspect.getsource(HostTransientDeltaSubscription)
     assert not hasattr(HostTransientDeltaSubscription, "drain_nowait")
+    assert "mark_run_terminal" not in vars(HostTransientDeltaSubscription)
+    assert "_terminal_run_ids" not in source
     assert "list[HostTransientDelta]" not in source
     assert "tuple[HostTransientDelta" not in source
     assert "max_bytes" not in source
     assert "size_bytes" not in source
+
+    with pytest.raises(TypeError, match="must be int"):
+        _candidate(
+            worker_event_index=1,
+            durable_causal_fence_event_sequence=True,
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        _candidate(
+            worker_event_index=1,
+            durable_causal_fence_event_sequence=0,
+        )
 
 
 def test_delivery_observability_is_low_cardinality(
@@ -520,16 +548,22 @@ def _hub(
 def _attach(
     hub: HostTransientDeltaHub,
     session_id: str,
+    *,
+    durable_cursor: int = 0,
 ) -> HostTransientDeltaSubscription:
     """在线性化 reservation 后 attach 测试 subscription。
 
     :param hub: transient hub。
     :param session_id: 目标 Session 标识。
+    :param durable_cursor: attach transaction 已读取的 cursor。
     :returns: attached subscription。
     :raises HostApiError: admission cap 满时抛出。
     """
 
-    return hub.attach(hub.reserve(session_id))
+    return hub.attach(
+        hub.reserve(session_id),
+        durable_cursor=durable_cursor,
+    )
 
 
 def _assert_delivery_overflow(error: HostApiError) -> None:
@@ -552,12 +586,14 @@ def _candidate(
     worker_event_index: int,
     session_id: str = "session-1",
     run_id: str = "run-1",
+    durable_causal_fence_event_sequence: int = 1,
 ) -> ValidatedTransientDeltaCandidate:
     """构造有效 reasoning 瞬态候选。
 
     :param worker_event_index: execution 内事件序号。
     :param session_id: 关联 Session 标识。
     :param run_id: 关联 Run 标识。
+    :param durable_causal_fence_event_sequence: Attempt start durable fence。
     :returns: 有效候选。
     :raises ValueError: 输入违反 candidate contract 时抛出。
     """
@@ -568,6 +604,9 @@ def _candidate(
         attempt_id="attempt-1",
         execution_id="execution-1",
         worker_event_index=worker_event_index,
+        durable_causal_fence_event_sequence=(
+            durable_causal_fence_event_sequence
+        ),
         observed_at=_OBSERVED_AT,
         type=HostTransientDeltaType.REASONING_DELTA,
         data=HostReasoningDelta(

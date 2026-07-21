@@ -271,6 +271,43 @@ class _SeededRun:
     dispatch_record_id: str
 
 
+class _AttemptFenceReadSpy:
+    """把 validation transaction 读取的 Attempt fence 替换为唯一 sentinel。"""
+
+    def __init__(self, *, started_event_sequence: int) -> None:
+        """初始化 transaction read spy。
+
+        :param started_event_sequence: 注入 current Attempt row 的正整数 fence。
+        :returns: 无返回值。
+        :raises ValueError: 本测试 helper 不主动校验 sentinel。
+        """
+
+        self._started_event_sequence = started_event_sequence
+        self.call_count = 0
+
+    def __call__(
+        self,
+        transaction: HostTransaction,
+        attempt_id: str,
+    ) -> AttemptRow | None:
+        """读取真实 current Attempt，并只替换 transaction-local fence。
+
+        :param transaction: 当前 validation write transaction。
+        :param attempt_id: candidate Attempt 标识。
+        :returns: 缺失时返回 ``None``；否则返回携带 sentinel fence 的 row。
+        :raises HostDurableError: durable row 解码失败时抛出。
+        """
+
+        self.call_count += 1
+        attempt = read_attempt_by_id(transaction, attempt_id)
+        if attempt is None:
+            return None
+        return replace(
+            attempt,
+            started_event_sequence=self._started_event_sequence,
+        )
+
+
 def _cas_lost_terminal_closeout(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -2603,6 +2640,57 @@ def test_all_transient_deltas_publish_once_without_event_log_rows(
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
         assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
         assert _event_count(store.transaction_runner, "TOOL_CALL_DELTA") == 0
+
+
+def test_transient_fence_comes_from_same_validation_transaction_attempt_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """candidate fence 必须原样来自 validation transaction 的 current Attempt。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: transaction read owner 注入工具。
+    :returns: ``None``。
+    :raises AssertionError: ingest 另行回读或重算 fence 时抛出。
+    """
+
+    sentinel_fence = 987_654_321
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        publisher = RecordingTransientDeltaPublisher()
+        attempt_read_spy = _AttemptFenceReadSpy(
+            started_event_sequence=sentinel_fence,
+        )
+        monkeypatch.setattr(
+            engine_ingest_module,
+            "read_attempt_by_id",
+            attempt_read_spy,
+        )
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=publisher,
+        )
+
+        result = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=14,
+                data=ReasoningDeltaData(
+                    iteration_id="iter-fence",
+                    delta="fenced",
+                ),
+                event_type=EngineEventType.REASONING_DELTA,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.events == ()
+        assert attempt_read_spy.call_count == 1
+        assert len(publisher.candidates) == 1
+        assert (
+            publisher.candidates[0].durable_causal_fence_event_sequence
+            == sentinel_fence
+        )
 
 
 def test_transient_publisher_failure_is_sanitized_and_does_not_change_acceptance(

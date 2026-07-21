@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 from uuid import uuid4
 
 from dayu.host.audit import (
@@ -158,8 +158,8 @@ _INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE = 8192
 _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS = 1024
 """``context_budget_policy=None`` 时内部 command options 使用的兜底输出预留。"""
 
-_SESSION_WATCH_POLL_INTERVAL_SECONDS = 0.02
-"""session live watch 未读取到新事件时的轻量轮询间隔。"""
+_SESSION_EVENT_RECONCILIATION_INTERVAL_SECONDS = 0.02
+"""mailbox-empty session watch 的 bounded durable reconcile 间隔。"""
 
 _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME = "tool-trace"
 """artifact_root 下 Tool Trace artifact 目录名。"""
@@ -175,6 +175,55 @@ _WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX = "wait-poller"
 
 _DURABLE_ACTOR_THREAD_NAME_SUFFIX = "durable-actor"
 """public durable actor worker thread 名称后缀。"""
+
+
+class _SessionEventReconciliationWaiter(Protocol):
+    """单个 opener 拥有的 mailbox readiness / periodic timeout 等待端口。"""
+
+    async def wait_for_readiness(
+        self,
+        subscription: HostTransientDeltaSubscription,
+    ) -> bool:
+        """等待 subscription ready 或一个 reconciliation interval。
+
+        :param subscription: 当前 iterator 的 delivery subscription。
+        :returns: owner readiness 唤醒时返回 ``True``；interval timeout 时返回
+            ``False``。
+        :raises asyncio.CancelledError: iterator 等待被取消时抛出。
+        """
+
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class _TimedSessionEventReconciliationWaiter:
+    """使用 Host-internal 固定 interval 的 production 等待实现。"""
+
+    async def wait_for_readiness(
+        self,
+        subscription: HostTransientDeltaSubscription,
+    ) -> bool:
+        """等待 level readiness 或固定 reconciliation timeout。
+
+        :param subscription: 当前 iterator 的 delivery subscription。
+        :returns: owner readiness 唤醒时返回 ``True``；timeout 时返回
+            ``False``。
+        :raises asyncio.CancelledError: iterator 等待被取消时抛出。
+        """
+
+        return await subscription.wait_ready(
+            _SESSION_EVENT_RECONCILIATION_INTERVAL_SECONDS
+        )
+
+
+def _new_session_event_reconciliation_waiter() -> _SessionEventReconciliationWaiter:
+    """为一个 opener 创建独立的 reconciliation waiter。
+
+    :returns: 不保存 watcher event 的 production waiter。
+    :raises Exception: 本函数不主动抛出异常。
+    """
+
+    return _TimedSessionEventReconciliationWaiter()
 
 
 @dataclass(frozen=True, slots=True)
@@ -668,6 +717,7 @@ class _PublicHostHandle:
         "_health_gate",
         "_host_handle_id",
         "_projection_catchup_port",
+        "_session_event_reconciliation_waiter",
         "_scheduler",
         "_scheduler_store",
         "_transient_delta_hub",
@@ -682,6 +732,7 @@ class _PublicHostHandle:
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
+        session_event_reconciliation_waiter: _SessionEventReconciliationWaiter,
         scheduler_store: HostDurableStore,
         transient_delta_hub: HostTransientDeltaHub,
         wait_poller: WaitPollerSupervisor | None,
@@ -693,6 +744,8 @@ class _PublicHostHandle:
         :param host_handle_id: 当前 Host handle 诊断 id。
         :param scheduler: 内部 dispatch scheduler。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
+        :param session_event_reconciliation_waiter: 当前 opener 独占的 mailbox
+            readiness / periodic reconciliation 等待端口。
         :param scheduler_store: scheduler 独占的 durable store。
         :param transient_delta_hub: 当前 Host runtime 的瞬态 fanout owner。
         :param wait_poller: 可选 production wait poller supervisor。
@@ -704,6 +757,9 @@ class _PublicHostHandle:
         self._host_handle_id = host_handle_id
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
+        self._session_event_reconciliation_waiter = (
+            session_event_reconciliation_waiter
+        )
         self._scheduler_store = scheduler_store
         self._transient_delta_hub = transient_delta_hub
         self._wait_poller = wait_poller
@@ -926,7 +982,10 @@ class _PublicHostHandle:
             # mailbox allocation、fanout registration 与 iterator allocation 在同一
             # owner-loop critical segment 内完成。
             self._raise_if_closed()
-            subscription = self._transient_delta_hub.attach(reservation)
+            subscription = self._transient_delta_hub.attach(
+                reservation,
+                durable_cursor=cursor,
+            )
             try:
                 return _HostSessionEventIterator(
                     owner=self,
@@ -985,38 +1044,113 @@ class _PublicHostHandle:
         next_cursor = cursor
         pending_durable_events: tuple[HostEvent, ...] = ()
         pending_durable_index = 0
+        pending_durable_page_next_cursor = cursor
+        current_terminal_event: HostEvent | None = None
         while True:
             # generator 从上一轮 transient yield 恢复时，才释放 Host 持有的
             # 唯一 in-flight 引用；mailbox -> in-flight transfer 不减 retained count。
             subscription.release_in_flight()
-            transient = subscription.pop_next_nowait()
-            if transient is not None:
-                yield transient
-                continue
-            overflow_error = subscription.overflow_error()
-            if overflow_error is not None:
-                raise overflow_error
             if subscription.is_closed:
                 return
+
+            # OVERFLOWED subscription 只交付已经接受的完整 mailbox prefix；
+            # prefix 耗尽后的下一次 anext 必须立即抛 delivery error。即使
+            # durable page 已读出 terminal，也不得插入该 prefix 与 error 之间。
+            overflow_error = subscription.overflow_error()
+            if overflow_error is not None:
+                entry = subscription.pop_next_nowait()
+                if entry is not None:
+                    yield entry.event
+                    continue
+                raise overflow_error
+
+            # durable terminal 已读出但尚未 yield 时，只交付 mailbox head 中
+            # 同 Run 的连续 prefix；首个 different-Run entry 原位保留。
+            if current_terminal_event is not None:
+                head = subscription.peek_next_nowait()
+                if (
+                    head is not None
+                    and current_terminal_event.run_id is not None
+                    and head.event.run_id == current_terminal_event.run_id
+                ):
+                    entry = subscription.pop_next_nowait()
+                    if entry is None:
+                        raise RuntimeError(
+                            "subscription mailbox head disappeared before pop"
+                        )
+                    yield entry.event
+                    continue
+                terminal_event = current_terminal_event
+                current_terminal_event = None
+                next_cursor = terminal_event.event_sequence
+                subscription.advance_durable_cursor(next_cursor)
+                yield terminal_event
+                continue
+
+            # 已读取 page 始终优先逐 event 处理；terminal cursor 只在 terminal
+            # 实际 yield 时推进，不能越过尚未交付的 terminal。
             if pending_durable_index < len(pending_durable_events):
                 event = pending_durable_events[pending_durable_index]
                 pending_durable_index += 1
-                if event.kind is not HostEventKind.PROGRESS and event.run_id is not None:
-                    subscription.mark_run_terminal(event.run_id)
+                if event.kind is not HostEventKind.PROGRESS:
+                    current_terminal_event = event
+                    continue
+                next_cursor = event.event_sequence
+                subscription.advance_durable_cursor(next_cursor)
                 yield event
                 continue
-            pending_durable_events = ()
-            pending_durable_index = 0
+
+            if pending_durable_events:
+                next_cursor = pending_durable_page_next_cursor
+                subscription.advance_durable_cursor(next_cursor)
+                pending_durable_events = ()
+                pending_durable_index = 0
+
+            should_read_durable_page = False
+            head = subscription.peek_next_nowait()
+            if head is not None:
+                if (
+                    next_cursor
+                    < head.durable_causal_fence_event_sequence
+                ):
+                    # head 原位保留并继续计入 retained item；page size 只限制
+                    # 单次 read，不是追 fence 的 correctness 停止预算。
+                    should_read_durable_page = True
+                else:
+                    entry = subscription.pop_next_nowait()
+                    if entry is None:
+                        raise RuntimeError(
+                            "subscription mailbox head disappeared before pop"
+                        )
+                    yield entry.event
+                    continue
+            else:
+                if subscription.needs_durable_reconciliation:
+                    should_read_durable_page = True
+                else:
+                    ready = await (
+                        self._session_event_reconciliation_waiter.wait_for_readiness(
+                            subscription
+                        )
+                    )
+                    if ready:
+                        continue
+                    # mailbox-empty periodic timeout 每次只授权下方一次 page read。
+                    should_read_durable_page = True
+
             if self._health_gate.state in (
                 HostExecutionHealthState.CLOSING,
                 HostExecutionHealthState.CLOSED,
             ):
-                # public close 已拒绝新 attach，但 delivery owner 只会在 poller、
-                # actor 与 scheduler producer 停止后关闭；这里等待同一个 level
-                # readiness，避免 actor stop 后把 Host close 投影成 read failure。
-                await subscription.wait_ready(
-                    _SESSION_WATCH_POLL_INTERVAL_SECONDS
+                # actor intake 已开始关闭时不再提交新 read；delivery hub close
+                # 会设置同一个 readiness 并立即把等待收口为正常 EOF。
+                await (
+                    self._session_event_reconciliation_waiter.wait_for_readiness(
+                        subscription
+                    )
                 )
+                continue
+            if not should_read_durable_page:
                 continue
             batch = await self._durable_actor.call(
                 lambda handle: _read_session_host_events_after(
@@ -1025,10 +1159,12 @@ class _PublicHostHandle:
                     next_cursor,
                 )
             )
-            next_cursor = batch.next_cursor
             pending_durable_events = batch.events
+            pending_durable_page_next_cursor = batch.next_cursor
+            pending_durable_index = 0
             if len(batch.events) == 0:
-                await subscription.wait_ready(_SESSION_WATCH_POLL_INTERVAL_SECONDS)
+                next_cursor = batch.next_cursor
+                subscription.advance_durable_cursor(next_cursor)
 
     async def close(self) -> None:
         """关闭当前 Host handle lifecycle。
@@ -1533,6 +1669,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 host_handle_id=host_handle_id,
                 scheduler=scheduler,
                 projection_catchup_port=close_projection_catchup_port,
+                session_event_reconciliation_waiter=(
+                    _new_session_event_reconciliation_waiter()
+                ),
                 scheduler_store=scheduler_store,
                 transient_delta_hub=transient_delta_hub,
                 wait_poller=wait_poller,

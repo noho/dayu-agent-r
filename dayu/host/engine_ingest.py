@@ -5267,6 +5267,9 @@ def _validated_transient_delta_candidate(
         attempt_id=candidate.envelope.attempt_id,
         execution_id=candidate.envelope.execution_id,
         worker_event_index=candidate.worker_event_index,
+        durable_causal_fence_event_sequence=(
+            context.attempt.started_event_sequence
+        ),
         observed_at=candidate.observed_at,
         type=transient_type,
         data=public_data,

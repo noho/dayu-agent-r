@@ -88,6 +88,7 @@ from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
     _CompositeProjectionCatchupPort,
     _PublicHostHandle,
+    _SessionEventReconciliationWaiter,
     _ThreadsafeSchedulerWakeupPort,
     _ensure_session as _actor_ensure_session,
     _get_run as _actor_get_run,
@@ -1615,6 +1616,9 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
+        session_event_reconciliation_waiter: (
+            _SessionEventReconciliationWaiter
+        ),
         scheduler_store: HostDurableStore,
         transient_delta_hub: HostTransientDeltaHub,
         wait_poller: WaitPollerSupervisor | None,
@@ -1627,6 +1631,8 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         :param host_handle_id: Host handle id。
         :param scheduler: scheduler。
         :param projection_catchup_port: projection catch-up port。
+        :param session_event_reconciliation_waiter: opener-local session
+            event reconciliation waiter。
         :param scheduler_store: scheduler durable store。
         :param transient_delta_hub: 当前 Host runtime 瞬态 hub。
         :param wait_poller: wait poller。
@@ -1636,6 +1642,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
 
         del self, durable_actor, health_gate, host_handle_id, scheduler
         del projection_catchup_port
+        del session_event_reconciliation_waiter
         del scheduler_store
         del transient_delta_hub
         assert wait_poller is not None
