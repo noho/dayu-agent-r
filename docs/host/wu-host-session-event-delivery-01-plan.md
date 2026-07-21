@@ -292,6 +292,13 @@ Host integration/smoke callsites，全部改为显式 `await`：
 - `tests/host/test_transient_delta_stress.py`
 - `tests/host/test_watch_session_events.py`
 
+Utils public smoke direct callsites，全部调用都必须显式 `await`：
+
+- `utils/smoke_host_public_r03_semantic_ownership.py`
+- `utils/smoke_host_public_conversation_memory.py`
+- `utils/smoke_host_public_conversation_memory_scenarios.py`
+- `utils/smoke_host_public_multiturn.py`
+
 Service/CLI fake definitions，全部改成 async factory并返回public `HostSessionEventIterator` contract，不自建旧queue语义：
 
 - `tests/service/test_entrypoint_runtime.py`
@@ -398,7 +405,15 @@ S1 Host resource/attach ownership
 
 - public/config/owner：`tests/host/test_public_contracts.py`、`tests/host/test_package_exports.py`、`tests/host/test_public_open_host_options.py`、`tests/host/test_transient_delta.py`、`tests/host/test_watch_session_events.py`、`tests/host/test_open_host_runtime.py`、`tests/runtime/test_config_loader.py`、`tests/service/test_host_assembly.py`、`tests/service/test_host_admin.py`。
 - 5.1列出的全部`OpenHostOptions` construction files。
-- 5.2列出的全部Host direct watch call files与Service/CLI fake files，仅做async/public iterator contract机械传播；旧relay行为测试不在本slice固化。
+- 5.2列出的全部Host direct watch call files与Service/CLI fake files，仅做async/public iterator contract机械传播；旧relay行为测试不在本slice固化。已授权Service/CLI fake的`__aiter__`返回类型精确修复属于原S1机械传播范围，无需扩大scope。
+
+**Allowed utils public smoke callers**
+
+- `utils/smoke_host_public_r03_semantic_ownership.py`
+- `utils/smoke_host_public_conversation_memory.py`
+- `utils/smoke_host_public_conversation_memory_scenarios.py`
+- `utils/smoke_host_public_multiturn.py`
+- 上述4个文件只允许把async factory/public iterator contract机械传播到现有direct callsites并显式`await`；不得修改smoke场景、断言、数据流、Service relay或任何其它行为。
 
 **Exact changes/dataflow**
 
@@ -409,7 +424,7 @@ S1 Host resource/attach ownership
 5. overflow时先从fanout移除，保留已接受prefix与in-flight；prefix耗尽后下一次`anext()`抛同一个typed nonretryable delivery error。其它watcher和publisher继续。
 6. `open_host.py`实现4.4 async attach；删除pending cursor future、done callback、lazy generator attach和private closable protocol。iterator implementation精确满足public protocol并幂等close。
 7. Host close先关闭public new-work/attach gate，再停止并drain可能publish/commit的既有producer owner，之后关闭delivery owner并正常唤醒/结束iterators；factory/close race由reservation token幂等收口。S1测试只冻结“producer停止后才close delivery”与reservation release；S3在二者之间插入coordinator in-flight drain/port close，不得把delivery close重新提前。
-8. 所有真实watch调用和fake改为`await`，fake返回实现public `__aiter__/__anext__/aclose`的iterator；禁止`cast`到Service私有closable protocol。对`entrypoint_runtime.py`，S1只允许：导入/传播public `HostSessionEventIterator`类型；删除被public类型取代的private closable Protocol与`cast`；把`_attach_watcher`、`_create_watch_and_wait_runtime`及其直接caller机械改为async/`await`；为public iterator传播所必需的`watcher` annotation可机械替换。除这几处外不得改控制流、错误处理、queue或task lifecycle。
+8. 所有真实watch调用和fake改为`await`，fake返回实现public `__aiter__/__anext__/aclose`的iterator；禁止`cast`到Service私有closable protocol。4个utils direct callers只执行上一段授权的机械传播。对`entrypoint_runtime.py`，S1只允许：导入/传播public `HostSessionEventIterator`类型；删除被public类型取代的private closable Protocol与`cast`；把`_attach_watcher`、`_create_watch_and_wait_runtime`及其直接caller机械改为async/`await`；为public iterator传播所必需的`watcher` annotation可机械替换。除这几处外不得改控制流、错误处理、queue或task lifecycle。
 9. `entrypoint_runtime.py` 的S1冻结清单如下，全部留到S4：不得删除、改写或重构`_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY`、`_WatcherFailure`、`_WatcherQueueItem`、`_WatchAndWaitRuntime.queue`、`_WatchAndWaitRuntime.drain_task`、`_drain_host_events`、`_close_watch_and_wait_runtime`、`_drain_available_watcher_items`、`_drain_available_startup_terminal_items`；`asyncio.Queue(maxsize=_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY)` allocation与`asyncio.create_task(_drain_host_events(...))`创建语句必须保持原relay语义。S1测试只断言async/public iterator传播与类型正确，不新增或固化relay行为断言。
 10. Host owner发出结构化low-card observability记录：`event`只允许`attach/detach/overflow`，`outcome/reason`只允许closed enum值；不记录payload、Session/Run identity、item count、capacity dimension或byte字段。
 
@@ -435,6 +450,7 @@ S1 Host resource/attach ownership
 - 本slice不实现causal fence/multi-page merge、不接terminal producer port、不重写Service exact-five。
 - 本slice不删除、不简化、不“顺手迁移”Service relay；S4是上述冻结symbols及queue/drain consumer的唯一语义修改slice。
 - 不暂存旧error alias或同步factory compatibility branch。
+- 禁止同步compatibility、lazy attach、下游识别或兼容coroutine，以及`cast`/`getattr` shim；caller必须直接消费async factory/public iterator contract。
 
 **Completion/stop conditions**
 
@@ -694,6 +710,7 @@ S1：
 
 ```bash
 pytest tests/host/test_public_contracts.py tests/host/test_package_exports.py tests/host/test_public_open_host_options.py tests/host/test_transient_delta.py tests/host/test_watch_session_events.py tests/host/test_open_host_runtime.py tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/service/test_host_admin.py -q
+python -m py_compile utils/smoke_host_public_r03_semantic_ownership.py utils/smoke_host_public_conversation_memory.py utils/smoke_host_public_conversation_memory_scenarios.py utils/smoke_host_public_multiturn.py
 ```
 
 S2：
@@ -735,6 +752,8 @@ pytest tests/service/test_entrypoint_runtime.py --cov=dayu.service.entrypoint_ru
 
 其余modified production files从affected suite coverage报告逐行检查；低于目标就补owner-contract tests，不以`pragma: no cover`、排除配置或宽泛mock绕过。
 
+上述4个`utils/` public smoke脚本按仓库`AGENTS.md`默认无需新增测试或单文件coverage，但仍必须纳入S1 `py_compile`、完整pyright和source propagation scan。该豁免不降低任何新增/修改production或test文件的coverage acceptance。
+
 ### 8.4 Type、diff与source scans
 
 ```bash
@@ -753,7 +772,7 @@ rg -n '_TRANSIENT_WATCH_BUFFER_CAPACITY|_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY|s
 source propagation和boundary由tests中的AST manifest做硬gate，并辅以：
 
 ```bash
-rg -n 'watch_session_events\(' dayu tests
+rg -n 'watch_session_events\(' dayu tests utils
 rg -n '\.wake_queue_promotion\(' dayu/host
 rg -n 'TerminalPostCommit|session_event_delivery' dayu/engine
 rg -n 'from dayu\.(engine|host|service|ui|fins)|import dayu\.(engine|host|service|ui|fins)' dayu/runtime

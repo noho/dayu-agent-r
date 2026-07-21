@@ -154,13 +154,13 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-HOST-SESSION-EVENT-DELIVERY-01` active；双路 plan re-review 均已通过，进入 Slice 1 implementation。 |
+| phase | `WU-HOST-SESSION-EVENT-DELIVERY-01` active；Slice 1 stop condition 的 plan amendment 已通过双路复审，恢复 Slice 1 implementation。 |
 | active work unit | `WU-HOST-SESSION-EVENT-DELIVERY-01` Host Session Event Delivery Ownership and Bounded Mailbox；architecture-sensitive public contract / ownership correction。 |
 | completed work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；final-closeout-pass。 |
 | gate | `implementation-slice-1` |
 | prerequisite PR | [PR #180](https://github.com/noho/dayu-agent-r/pull/180) 已于 2026-07-21 merge；本地 `main` 已 fast-forward 同步到 merge commit `2c02079a82c049b49914be412178006ccd354049`，并创建独立分支 `phaseflow/wu-host-session-event-delivery-01`。 |
 | selected work unit | `WU-HOST-SESSION-EVENT-DELIVERY-01` Host Session Event Delivery Ownership and Bounded Mailbox；用户已确认 goal confirmation；当前无独立 GitHub Issue，owner / destination 为用户明确裁决。 |
-| next gate | AgentCodex 按 accepted plan 实施 Slice 1；完成后由 AgentMiMo 与 AgentDS 独立并行 `$deepreview` code review。 |
+| next gate | AgentCodex 按 accepted amendment 恢复并完成 Slice 1；随后 AgentMiMo 与 AgentDS 独立并行 `$deepreview` code review。 |
 | goal confirmation artifact | `docs/reviews/wu-host-session-event-delivery-01-goal-confirmation.md`；用户已确认，decision=`pass`。 |
 | plan artifact | `docs/host/wu-host-session-event-delivery-01-plan.md`；4 个语义闭环 slices，AgentCodex status=`PASS`，blocking open questions=`None`。 |
 | plan review artifacts | `docs/reviews/plan-review-20260721-185410.md`（AgentMiMo，pass）与 `docs/reviews/plan-review-20260721-185406.md`（AgentDS，pass-with-risks）。 |
@@ -168,13 +168,18 @@ git push -u github <branch>
 | plan fix artifact | `docs/reviews/wu-host-session-event-delivery-01-plan-fix-codex.md`；AgentCodex status=`completed`，accepted findings 已写回 plan，rejected boundaries保持。 |
 | plan re-review artifacts | `docs/reviews/plan-review-20260721-191912.md`（AgentMiMo，pass）与 `docs/reviews/plan-review-20260721-192031.md`（AgentDS，pass）；全部 accepted findings 已关闭，无新 material finding。 |
 | plan re-review adjudication | `docs/reviews/wu-host-session-event-delivery-01-plan-rereview-controller-adjudication.md`；decision=`accepted-plan`。 |
+| accepted plan commit | `8b29462c`。 |
+| Slice 1 stop-condition adjudication | `docs/reviews/wu-host-session-event-delivery-01-slice1-stop-condition-controller-adjudication.md`；4 个真实 `utils/` public watch callers 被 accepted plan §5.2 漏列，decision=`return-to-plan-fix`。 |
+| Slice 1 stop plan fix | `docs/reviews/wu-host-session-event-delivery-01-slice1-stop-plan-fix-codex.md`；只补齐 caller manifest、机械传播 scope 与 validation。 |
+| Slice 1 stop plan re-review | `docs/reviews/plan-review-20260721-200106.md`（AgentMiMo，pass）与 `docs/reviews/plan-review-20260721-200058.md`（AgentDS，pass）；无新 material finding。 |
+| Slice 1 stop plan re-review adjudication | `docs/reviews/wu-host-session-event-delivery-01-slice1-stop-plan-rereview-controller-adjudication.md`；decision=`accepted-plan-amendment`。 |
 | residual-risk WU reconciliation | 先前的 `WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01` 已经代码与设计 owner 裁决证明不能正确分拆：Service relay 应删除，capacity、admission、overflow 与 iterator lifecycle 必须由同一个 Host Session Event Delivery contract 收口。两条旧 residual WU 已由 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代；item capacity、admission、低基数 metrics 与 callback 执行域约束均为本 WU acceptance。byte / resident-heap bound 已由用户明确裁决为非 contract，并接受相应 residual risk。CLI R2 仍独立。 |
 | post-closeout design correction | 设计真源已更新为 async attach、单 Host item-bound mailbox、跨 opener durable causal fence、本地 terminal post-commit coordinator 与 exact-five Service observation contract。此前三路设计 re-review 均 PASS；用户随后删除 byte dimension，并冻结 packaged defaults `transient_mailbox_max_items=512`、`max_subscriptions_per_session=4`。该修订由本 WU plan review 重新验证。 |
 | next goal | 实施 `WU-HOST-SESSION-EVENT-DELIVERY-01`：保留统一可关闭 iterator 外观，将 factory 改为 async；删除 Service event-copy relay；由 Host 以每订阅唯一 item-bound mailbox、per-Session admission、typed overflow/admission error、durable causal fence与本地 terminal coordinator负责 delivery correctness。 |
 | CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
 | next non-goals | 不持久化或重放 delta，不建立跨域总序/第三 sequence domain/跨进程 terminal 广播，不让慢 UI 暂停 Agent/Engine，不增加 Host-global 跨 Session quota，不实施 `WU-CLI-SMOKE-01-R2` thinking UI。 |
 | blocking open questions | None；packaged defaults 已冻结为 items=`512`、subscriptions=`4`。本 WU 不提供 logical-byte 或 resident-heap bound；该 residual risk 已由用户明确接受。 |
-| next entry point | Controller 提交 accepted plan 基线后，派发 AgentCodex 实施 `docs/host/wu-host-session-event-delivery-01-plan.md` Slice 1。不得提前实施 Slice 2-4，不得 push、创建 PR、mark ready、merge、request reviewers、关闭外部 Issue 或 delete branch，直到对应 Gateflow gate 允许。 |
+| next entry point | Controller 提交 accepted plan amendment 后，AgentCodex 恢复 Slice 1，只完成 4 个 `utils/` mechanical await、已授权 fake typing fix 与剩余 S1 validation/README audit。不得实施 Slice 2-4，不得 push、创建 PR、mark ready、merge、request reviewers、关闭外部 Issue 或 delete branch。 |
 
 
 ## 推进规则
@@ -251,7 +256,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R1 | completed | Engine delta transient live stream remediation | Draft PR #180 | final-closeout-pass；accepted PR review commit `3900b069` 已 push，最终 Windows checks 均 PASS。PR180-F01 fixed。Post-closeout delivery ownership design 已完成三路最终 re-review；旧的两个 capacity WU 被 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代。等待用户 / maintainer 手工 merge Draft PR。 |
-| WU-HOST-SESSION-EVENT-DELIVERY-01 | active-implementation-slice-1 | Host Session Event Delivery ownership、bounded mailbox 与跨 opener ordering | 用户明确裁决；无 GitHub Issue | PR #180 已 merge；goal confirmation 与 accepted plan gate 已完成，当前从最新 `main` 的独立分支实施 Slice 1。 |
+| WU-HOST-SESSION-EVENT-DELIVERY-01 | active-implementation-slice-1 | Host Session Event Delivery ownership、bounded mailbox 与跨 opener ordering | 用户明确裁决；无 GitHub Issue | Accepted plan commit=`8b29462c`；Slice 1 stop amendment 已通过原 reviewers 双路复审与 Controller accepted，恢复 S1。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
@@ -374,7 +379,7 @@ Post-closeout 代码裁决最初把 Host 与 Service 固定容量拆成两个 ev
 
 ### 状态与进入条件
 
-`active-implementation-slice-1`。PR #180 已 merge；本地 `main` 已 fast-forward 到 merge commit `2c02079a82c049b49914be412178006ccd354049`，独立分支为 `phaseflow/wu-host-session-event-delivery-01`。用户已确认 goal confirmation；当前无独立 GitHub Issue，owner / destination 为用户明确裁决。goal confirmation artifact 为 `docs/reviews/wu-host-session-event-delivery-01-goal-confirmation.md`；plan artifact 为 `docs/host/wu-host-session-event-delivery-01-plan.md`，共4个语义闭环slices。初始双路 plan review、Controller逐项裁决、AgentCodex fix 与原 reviewers 双路 re-review 已闭环；re-review artifacts 为 `docs/reviews/plan-review-20260721-191912.md`、`docs/reviews/plan-review-20260721-192031.md`，Controller adjudication 为 `docs/reviews/wu-host-session-event-delivery-01-plan-rereview-controller-adjudication.md`，decision=`accepted-plan`。当前 gate=`implementation-slice-1`，blocking open questions=`None`。
+`active-implementation-slice-1`。PR #180 已 merge；本地 `main` 已 fast-forward 到 merge commit `2c02079a82c049b49914be412178006ccd354049`，独立分支为 `phaseflow/wu-host-session-event-delivery-01`。用户已确认 goal confirmation；当前无独立 GitHub Issue，owner / destination 为用户明确裁决。goal confirmation artifact 为 `docs/reviews/wu-host-session-event-delivery-01-goal-confirmation.md`；plan artifact 为 `docs/host/wu-host-session-event-delivery-01-plan.md`，共4个语义闭环slices；accepted plan commit=`8b29462c`。Slice 1 完整 pyright 发现 §5.2 漏列 4 个真实 `utils/` public watch callers；stop adjudication、AgentCodex plan fix、原 reviewers 双路 re-review 与 Controller amendment adjudication 已闭环，artifact 分别为 `docs/reviews/wu-host-session-event-delivery-01-slice1-stop-condition-controller-adjudication.md`、`docs/reviews/wu-host-session-event-delivery-01-slice1-stop-plan-fix-codex.md`、`docs/reviews/plan-review-20260721-200106.md`、`docs/reviews/plan-review-20260721-200058.md`、`docs/reviews/wu-host-session-event-delivery-01-slice1-stop-plan-rereview-controller-adjudication.md`；decision=`accepted-plan-amendment`。现有未提交 S1 implementation changes 恢复实施；当前 gate=`implementation-slice-1`，blocking open questions=`None`。
 
 进入条件已全部满足。设计真源 `docs/host/design.md` 的 async attach、Host-only delivery ownership、durable causal fence、terminal coordinator 与 exact-five contract沿用此前三路设计 re-review 结论；用户随后删除 byte dimension，并冻结 packaged defaults items=`512`、subscriptions=`4`。修订后的完整 contract 必须由本 WU 双路独立 plan review 验证，不得把旧的两个 capacity WU 恢复为独立入口。
 
