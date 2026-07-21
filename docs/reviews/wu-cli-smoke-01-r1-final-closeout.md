@@ -47,6 +47,7 @@ Draft PR gate record `5bd27be7` 与 PR review entry record `ff5d515a` 只记录 
 - Draft PR #180 双路完整 review 均确认代码与架构 PASS。Controller 直接检查接受唯一 finding `PR180-F01`：PR body 使用了字面量反斜杠-n。
 - AgentCodex 仅修复 PR metadata；Controller 验证后，AgentMiMo / AgentDS 双路 narrow re-review 均确认 `PR180-F01` fixed、0 blocking、0 new finding。
 - Supplemental finding-fix batch 已在 `docs/phaseflow-umbrella-optimization-control.md` 标记 completed。
+- 用户要求所有 remaining risk 经代码裁决后以 WU 进入主总控。AgentCodex proposal 与 AgentMiMo/AgentDS 双路对抗复核均完成；Controller adjudication 为 `docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-reconciliation-controller-adjudication.md`，decision=`accepted-residual-risk-WU-reconciliation`。
 
 ## Validation
 
@@ -61,6 +62,7 @@ Draft PR gate record `5bd27be7` 与 PR review entry record `ff5d515a` 只记录 
   - `windows-init-transaction`: pass，5m05s。
   - `windows-upload-script`: pass，4m04s。
 - PR invariants：Draft=true、base=`main`、head branch=`phaseflow/wu-cli-smoke-01-r1`、review requests 为空、body 为真实 Markdown 多行且无 closing directive。
+- Residual-risk owner/path regression：75 passed，3 个第三方 deprecation warnings；独立 transient stress 1 passed；全量 pyright 0 errors；双路 proposal review accepted。
 
 ## README Decision
 
@@ -68,15 +70,25 @@ Draft PR gate record `5bd27be7` 与 PR review entry record `ff5d515a` 只记录 
 
 ## Residual Risk Reconciliation
 
-| 边界 | 状态 | Owner / Destination | 接受理由或重开条件 |
-|---|---|---|---|
-| overflow、detach、断线、Host close / crash / restart 后不补放 delta | accepted live-only boundary | Host transient runtime contract / `docs/host/design.md` | per-chunk delta 不是 durable fact；需要 replay 时必须以新的 durable product requirement 重新设计，不能给当前 contract 加 fallback。 |
-| watcher 与 Service relay 容量固定为 256，尚无真实负载调优数据 | accepted internal bound | Host transient hub 与 Service relay owner | 当前有 bounded slow-consumer failure contract；仅在生产负载证据表明容量不合适后重开 tuning，不提前暴露 public knob。 |
-| durable 与 transient 不承诺跨域可重放总序 | accepted ordering boundary | Host public event contracts | 两个域各自有序，并由同 Run terminal fence 防止 terminal 后交付；全局 replay order 会混淆不同语义 owner。 |
-| E2E 以可控 worker 替代外部 LLM provider | accepted test boundary | Future provider integration smoke / user decision | worker 之后的 Host、Service、SQLite / Outbox 与 CLI 均为生产路径；真实 provider 波动不应成为 owner-level deterministic contract test 的真源。 |
-| CLI thinking 仍为 160 字符单行展示 | deferred-with-owner | `WU-CLI-SMOKE-01-R2` / future CLI UI enhancement | 仅在用户要求可展开 thinking panel 时进入独立 UI work unit。 |
+### Remaining Risks Entered As Work Units
 
-没有未归属或阻塞 `final-closeout-pass` 的 residual risk。
+| Work Unit | 状态 | Owner / Destination | 触发条件与下一步 |
+|---|---|---|---|
+| `WU-HOST-TRANSIENT-CAPACITY-01` | deferred-with-owner / needs-more-evidence | Host transient hub performance-validation lane / user decision | 有代表性 workload/watcher SLO 或实际 slow-consumer、内存、交付延迟证据后，先做 owner-level profile/benchmark，再决定是否调整私有容量；不修改 Service、不增加 public knob/unbounded queue/replay。 |
+| `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01` | deferred-with-owner / needs-more-evidence | Service entrypoint live relay performance-validation lane / user decision | 有代表性消费 workload/terminal SLO 或实际 relay backlog、fallback、终态延迟证据后，单独 profile Service relay，再决定是否调整；不修改 Host、不共享跨层常量、不 silent drop。 |
+| `WU-CLI-SMOKE-01-R2` | deferred-with-owner | CLI UI adapter lane / user decision | 当前是每个 delta 单行化并按 160 字符截断后累计追加，累计行无明确上限/panel/history；用户明确 UX、累计缓冲、TTY/非 TTY 与历史保留要求后进入 goal confirmation。 |
+
+以上三项均已同时进入 `docs/host/issues-implementation-control.md` 的 Residual Risk Reconciliation 表和 Current Work Units 表。
+
+### Removed After Code Adjudication
+
+| 原条目 | 最终裁决 | 删除理由 |
+|---|---|---|
+| live-only 不补放 | rejected-with-reason as remaining risk | `docs/host/design.md`、Host typed envelope/runtime 与 owner tests 共同证明这是已接受 contract，不是遗漏；修复会引入新的 durable replay 产品协议。 |
+| durable/transient 无跨域可重放总序 | rejected-with-reason as remaining risk | 两个 sequence domain 是防止 live presentation 冒充 durable fact 的设计；统一可重放序列需要新的 persistence/query contract。 |
+| R1 E2E 使用可控 worker | rejected-with-reason as remaining risk | 可控 worker 是稳定构造三类 delta/overflow/terminal 的正确 oracle；其后的 Host、Service、SQLite/Outbox、CLI 均走生产路径，真实 provider 不能替代该确定性 failure matrix。 |
+
+五项均经过 AgentCodex 代码核对、AgentMiMo/AgentDS 双路复核与 Controller 裁决。没有可在当前 R1 WU 通过最小正确实现关闭的事项，也没有未归属或阻塞 `final-closeout-pass` 的 remaining risk。
 
 ## Final Status And Next Entry Point
 
