@@ -553,6 +553,8 @@ S1 Host resource/attach ownership
 - `tests/host/test_admission_queue.py`
 - `tests/host/test_admission_multiprocess.py`
 - `tests/host/test_public_cancel_session_runs.py`
+- `tests/host/test_projection_read_model.py`
+- `tests/host/test_public_host_admin.py`
 - `tests/host/test_resolve_wait_command.py`
 - `tests/host/test_wait_expiry_closeout.py`
 - `tests/host/test_wait_cancel_late_result.py`
@@ -569,6 +571,8 @@ S1 Host resource/attach ownership
 - `tests/host/test_phase5_local_execution_integration.py`
 - `tests/host/test_command_handle.py`
 - `tests/host/test_open_host_runtime.py`
+
+新增的`tests/host/test_projection_read_model.py`与`tests/host/test_public_host_admin.py`只授权在各自现有direct test composition root创建test-private、显式no-local-delivery terminal endpoint，并把同一实例同时传入`create_host_admission_service`与`HostCommandHandle`。不得修改测试业务场景或断言语义，不得修改production constructor或terminal flags/dataflow，不得引入optional/default/fallback、临时port或rebind。
 
 **Exact changes/dataflow**
 
@@ -601,7 +605,10 @@ S1 Host resource/attach ownership
 - AST qualified-callsite manifest与5.3闭集精确相等；新增terminal writer未登记即失败。
 - 第二manifest冻结ordinary direct promotion allowlist；terminal producer内出现直接promotion立即失败。
 - runtime fake逐producer证明`run_write`返回后消费exact notice，再进local coordinator；flag true也无旁路。
-- standalone `create_host_command_handle` runtime recording fake证明其装配的admission/waiting producer仍调用显式private no-local-delivery port；static manifest集合与完整opener装配无关，standalone不是排除理由。
+- standalone `create_host_command_handle` exact-notice runtime recording fake证明其装配的admission/waiting producer在commit return后仍调用显式private no-local-delivery port并携带transaction-local exact notice；static manifest集合与完整opener装配无关，standalone不是排除理由。
+- 两个新增direct test composition root各自使用同一个test-private no-local-delivery final endpoint完成required port传播，原projection/admin业务场景与断言保持不变。
+- 完整pyright必须零错误；全测试constructor callsite scan必须归零required port错误，且不得出现第三个漏列caller；仅上述两个精确caller获得新增授权。
+- `tests/host/test_admission_multiprocess.py`现有4个旧字段断言错误与`tests/host/test_phase7_waiting_integration.py`现有1个required factory参数错误继续在原S3 allowlist内按owner contract修复，完成后恢复全部S3 validation。
 - coordinator owner-loop marshal、watermark-before-promotion、false delivery wake、ordinary promotion不推进watermark、same-sequence幂等、新er false不吞older true、新er true覆盖older true、batch不按Session丢sequence。
 - scheduler factory/bind failure barrier断言heartbeat/watchdog/dispatch/promotion/worker/ingestor task从未启动、coordinator与lane/instance资源各关闭一次、未绑定scheduler从未return；source/AST断言不存在临时no-op过渡、runtime setter或rebind路径。
 - Host close ordering recorder断言wait-poller/actor intake停止后，scheduler-owned heartbeat/watchdog/drain/active worker/ingestor全部stop并await，随后才调用coordinator close与delivery owner close；用owner-loop barrier冻结一条已接纳notice，close必须等待其正常幂等完成，另覆盖closing race固定diagnostic且不产生subscription/promotion/rollback。
@@ -722,7 +729,7 @@ pytest tests/host/test_engine_ingest_mapping.py tests/host/test_local_proxy_engi
 S3：
 
 ```bash
-pytest tests/host/test_terminal_post_commit.py tests/host/test_run_attempt_transitions.py tests/host/test_admission_queue.py tests/host/test_public_cancel_session_runs.py tests/host/test_resolve_wait_command.py tests/host/test_wait_expiry_closeout.py tests/host/test_phase7_waiting_integration.py tests/host/test_recovery_scan.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_dispatch_scheduler.py tests/host/test_active_cancel_dispatch.py tests/host/test_command_handle.py -q
+pytest tests/host/test_terminal_post_commit.py tests/host/test_run_attempt_transitions.py tests/host/test_admission_queue.py tests/host/test_public_cancel_session_runs.py tests/host/test_projection_read_model.py tests/host/test_public_host_admin.py tests/host/test_resolve_wait_command.py tests/host/test_wait_expiry_closeout.py tests/host/test_phase7_waiting_integration.py tests/host/test_recovery_scan.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_dispatch_scheduler.py tests/host/test_active_cancel_dispatch.py tests/host/test_command_handle.py -q
 ```
 
 S4：
@@ -757,7 +764,7 @@ pytest tests/service/test_entrypoint_runtime.py --cov=dayu.service.entrypoint_ru
 ### 8.4 Type、diff与source scans
 
 ```bash
-python -m pyright dayu/ tests/ utils/
+pyright
 git diff --check
 ```
 
@@ -776,9 +783,10 @@ rg -n 'watch_session_events\(' dayu tests utils
 rg -n '\.wake_queue_promotion\(' dayu/host
 rg -n 'TerminalPostCommit|session_event_delivery' dayu/engine
 rg -n 'from dayu\.(engine|host|service|ui|fins)|import dayu\.(engine|host|service|ui|fins)' dayu/runtime
+rg -n 'HostCommandHandle\(|create_host_admission_service\(|HostDispatchScheduler\.open\(' tests --glob '*.py'
 ```
 
-人工/AST判定要求：所有caller显式await；terminal producer无promotion bypass；`dayu/engine`无新delivery contract；runtime无反向依赖。
+人工/AST判定要求：所有caller显式await；terminal producer无promotion bypass；`dayu/engine`无新delivery contract；runtime无反向依赖。全测试constructor callsite scan必须覆盖全部direct composition，required terminal port错误为零，且除`tests/host/test_projection_read_model.py`与`tests/host/test_public_host_admin.py`外不得出现第三个漏列caller。
 
 最终scope审计：
 
