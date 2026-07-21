@@ -50,7 +50,8 @@ class CliThinkingRenderer:
     _terminal_columns: int
     _line_text: str
     _seen_dedupe_keys: set[str]
-    _last_event_sequence: int | None
+    _last_runtime_id: str | None
+    _last_runtime_sequence: int | None
 
     def __init__(
         self,
@@ -80,7 +81,8 @@ class CliThinkingRenderer:
         self._terminal_columns = resolve_terminal_columns(options.terminal_columns)
         self._line_text = ""
         self._seen_dedupe_keys = set()
-        self._last_event_sequence = None
+        self._last_runtime_id = None
+        self._last_runtime_sequence = None
 
     def record(self, thinking: EntrypointThinking) -> None:
         """记录并输出一条 thinking 增量。
@@ -94,13 +96,13 @@ class CliThinkingRenderer:
             return
         if thinking.dedupe_key in self._seen_dedupe_keys:
             return
-        if (
-            self._last_event_sequence is not None
-            and thinking.event_sequence < self._last_event_sequence
-        ):
+        if thinking.runtime_id != self._last_runtime_id:
+            self._last_runtime_id = thinking.runtime_id
+            self._last_runtime_sequence = None
+        if self._last_runtime_sequence is not None and (thinking.runtime_sequence <= self._last_runtime_sequence):
             return
         self._seen_dedupe_keys.add(thinking.dedupe_key)
-        self._last_event_sequence = thinking.event_sequence
+        self._last_runtime_sequence = thinking.runtime_sequence
         if self._line_open:
             delta_text = _single_line_delta_text(
                 thinking.text_delta,

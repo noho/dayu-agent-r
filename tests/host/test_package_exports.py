@@ -25,6 +25,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "EnsureSessionRequest",
         "FollowupBehavior",
         "FollowupSnapshot",
+        "HOST_TRANSIENT_DELTA_TYPE_TO_DATA",
         "HOST_EVENT_STREAM_DEFAULT_LIMIT",
         "HOST_EVENT_STREAM_MAX_LIMIT",
         "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
@@ -51,15 +52,21 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostActivityView",
         "HostCallContext",
         "HostClosedError",
+        "HostContentDelta",
         "HostEvent",
         "HostEventClass",
         "HostEventKind",
         "HostFinalAnswerView",
         "HostMetadataEntry",
         "HostPayloadRef",
+        "HostReasoningDelta",
+        "HostSessionEvent",
         "HostStreamCursor",
         "HostTerminalStatus",
-        "HostThinkingView",
+        "HostToolCallDelta",
+        "HostTransientDelta",
+        "HostTransientDeltaData",
+        "HostTransientDeltaType",
         "HostUnavailableDetail",
         "ListSessionsResult",
         "LocalEngineWorker",
@@ -365,9 +372,9 @@ def test_host_all_matches_current_public_contracts() -> None:
     """``dayu.host.__all__`` 匹配当前 public contract。"""
 
     actual = frozenset(host.__all__)
-    assert (
-        actual == EXPECTED_HOST_EXPORTS
-    ), f"missing={EXPECTED_HOST_EXPORTS - actual}; extra={actual - EXPECTED_HOST_EXPORTS}"
+    assert actual == EXPECTED_HOST_EXPORTS, (
+        f"missing={EXPECTED_HOST_EXPORTS - actual}; extra={actual - EXPECTED_HOST_EXPORTS}"
+    )
 
 
 def test_memory_module_all_matches_typed_contract_boundary() -> None:

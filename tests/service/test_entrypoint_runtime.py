@@ -29,13 +29,19 @@ from dayu.host.api import (
     HostActivityStatus,
     HostActivityView,
     HostCallContext,
+    HostContentDelta,
     HostEvent,
     HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
+    HostReasoningDelta,
+    HostSessionEvent,
     HostStreamCursor,
     HostTerminalStatus,
-    HostThinkingView,
+    HostToolCallDelta,
+    HostTransientDelta,
+    HostTransientDeltaType,
+    HostUnavailableDetail,
     OperationContext,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -53,7 +59,7 @@ from dayu.host.api import (
     is_terminal_run_status,
 )
 from dayu.service.entrypoint_runtime import (
-    ClosableHostEventIterator,
+    ClosableHostSessionEventIterator,
     EntrypointActivity,
     EntrypointActivityKind,
     EntrypointActivitySeverity,
@@ -71,7 +77,11 @@ from dayu.service.entrypoint_runtime import (
     prepare_entrypoint_runtime,
     startup_reconnect_entrypoint_session,
     submit_entrypoint_turn_and_wait,
-    _close_watcher,
+    _WatchAndWaitRuntime,
+    _WatcherFailure,
+    _close_watch_and_wait_runtime,
+    _create_watch_and_wait_runtime,
+    _drain_host_events,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 from dayu.service.scene_context import (
@@ -156,13 +166,9 @@ def test_scene_context_formats_subject_and_current_time() -> None:
 
     assert fins_default_subject(None) == ""
     assert fins_default_subject(" v ") == "# 当前分析对象\n你正在分析的是 V。"
+    assert fins_default_subject("V", company_name="Visa Inc.") == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
     assert (
-        fins_default_subject("V", company_name="Visa Inc.")
-        == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
-    )
-    assert (
-        current_time(datetime(2026, 7, 7, 15, 8, tzinfo=UTC))
-        == "# 当前时间\n"
+        current_time(datetime(2026, 7, 7, 15, 8, tzinfo=UTC)) == "# 当前时间\n"
         "现在是 2026年7月7日 23:08（Asia/Shanghai，星期二）。\n"
         "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
@@ -254,7 +260,7 @@ class _FakeHostEventIterator:
 
     closed_count: int
     _close_error: BaseException | None
-    _queue: asyncio.Queue[HostEvent | _StopSignal | _RaiseSignal]
+    _queue: asyncio.Queue[HostSessionEvent | _StopSignal | _RaiseSignal]
 
     def __init__(self, *, close_error: BaseException | None = None) -> None:
         """初始化测试 watcher。
@@ -268,7 +274,7 @@ class _FakeHostEventIterator:
         self._close_error = close_error
         self._queue = asyncio.Queue()
 
-    def __aiter__(self) -> AsyncIterator[HostEvent]:
+    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -277,7 +283,7 @@ class _FakeHostEventIterator:
 
         return self
 
-    async def __anext__(self) -> HostEvent:
+    async def __anext__(self) -> HostSessionEvent:
         """读取下一条测试事件。
 
         :returns: 下一条 HostEvent。
@@ -291,7 +297,7 @@ class _FakeHostEventIterator:
             raise item.error
         return item
 
-    async def push(self, event: HostEvent) -> None:
+    async def push(self, event: HostSessionEvent) -> None:
         """向 watcher 推入测试事件。
 
         :param event: 待推入事件。
@@ -334,9 +340,9 @@ class _FakeHost:
     ensure_requests: list[EnsureSessionRequest]
     create_requests: list[CreateSessionRequest]
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
-    _submit_events: tuple[HostEvent, ...]
+    _submit_events: tuple[HostSessionEvent, ...]
     _submit_watcher_errors: tuple[Exception, ...]
-    _cancel_events: tuple[HostEvent, ...]
+    _cancel_events: tuple[HostSessionEvent, ...]
     _cancel_error: HostApiError | None
     _run_statuses: tuple[RunStatus, ...]
     _outbox_batches: tuple[OutboxTerminalItemsBatch, ...]
@@ -350,9 +356,9 @@ class _FakeHost:
     def __init__(
         self,
         *,
-        submit_events: tuple[HostEvent, ...] = (),
+        submit_events: tuple[HostSessionEvent, ...] = (),
         submit_watcher_errors: tuple[Exception, ...] = (),
-        cancel_events: tuple[HostEvent, ...] = (),
+        cancel_events: tuple[HostSessionEvent, ...] = (),
         cancel_error: HostApiError | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         outbox_batches: tuple[OutboxTerminalItemsBatch, ...] = (),
@@ -417,11 +423,14 @@ class _FakeHost:
         self.create_requests.append(request)
         return _session_snapshot(session_id="session-created", slot_key=request.slot_key)
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
+    def watch_session_events(
+        self,
+        session_id: str,
+    ) -> AsyncIterator[HostSessionEvent]:
         """记录 watcher attach 并返回测试 iterator。
 
         :param session_id: 目标 Session id。
-        :returns: HostEvent async iterator。
+        :returns: HostSessionEvent async iterator。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -877,12 +886,40 @@ async def test_submit_entrypoint_turn_emits_host_public_thinking(
     thinking_events: list[EntrypointThinking] = []
     fake_host = _FakeHost(
         submit_events=(
-            _thinking_event(
-                event_sequence=2,
+            _transient_delta(
+                runtime_sequence=1,
+                run_id="run-1",
+                dedupe_key="content-run-1",
+                transient_type=HostTransientDeltaType.CONTENT_DELTA,
+                data=HostContentDelta(
+                    iteration_id="iteration-1",
+                    text_delta="content",
+                ),
+            ),
+            _transient_delta(
+                runtime_sequence=2,
                 run_id="run-1",
                 dedupe_key="thinking-run-1",
+                transient_type=HostTransientDeltaType.REASONING_DELTA,
+                data=HostReasoningDelta(
+                    iteration_id="iteration-1",
+                    text_delta="正在分析收入变化",
+                ),
             ),
-            _terminal_event(event_sequence=3, run_id="run-1"),
+            _transient_delta(
+                runtime_sequence=3,
+                run_id="run-1",
+                dedupe_key="tool-run-1",
+                transient_type=HostTransientDeltaType.TOOL_CALL_DELTA,
+                data=HostToolCallDelta(
+                    iteration_id="iteration-1",
+                    tool_call_index=0,
+                    tool_call_id="tool-call-1",
+                    name_delta="lookup",
+                    arguments_delta=None,
+                ),
+            ),
+            _terminal_event(event_sequence=4, run_id="run-1"),
         )
     )
 
@@ -895,11 +932,12 @@ async def test_submit_entrypoint_turn_emits_host_public_thinking(
     )
 
     assert result.source is EntrypointTerminalSource.LIVE_EVENT
-    assert result.terminal_event_id == "terminal-run-1-3"
+    assert result.terminal_event_id == "terminal-run-1-4"
     assert len(thinking_events) == 1
     thinking = thinking_events[0]
     assert thinking.run_id == "run-1"
-    assert thinking.event_sequence == 2
+    assert thinking.runtime_id == "runtime-1"
+    assert thinking.runtime_sequence == 2
     assert thinking.dedupe_key == "thinking-run-1"
     assert thinking.text_delta == "正在分析收入变化"
 
@@ -1740,6 +1778,44 @@ async def test_cancel_entrypoint_run_continues_wait_when_cancel_loses_terminal_r
 
 
 @pytest.mark.asyncio
+async def test_watch_and_wait_factory_owns_bounded_live_relay_queue() -> None:
+    """唯一 live runtime factory 应 attach watcher 并创建容量 256 的 relay。"""
+
+    fake_host = _FakeHost()
+    runtime = _create_watch_and_wait_runtime(cast(Host, fake_host), "session-1")
+    try:
+        assert runtime.queue.maxsize == 256
+        assert len(fake_host.watchers) == 1
+        assert runtime.watcher is fake_host.watchers[0]
+    finally:
+        await _close_watch_and_wait_runtime(runtime)
+
+
+@pytest.mark.asyncio
+async def test_watcher_failure_preserves_original_typed_host_error() -> None:
+    """relay drain 必须把原 Host slow-consumer 错误实例放入 failure item。"""
+
+    error = HostApiError(
+        code=HostApiErrorCode.UNAVAILABLE,
+        message="Session live stream consumer is too slow",
+        retryable=True,
+        detail=HostUnavailableDetail(
+            component="session_live_stream",
+            reason_code="slow_consumer",
+        ),
+    )
+    watcher = _FakeHostEventIterator()
+    queue = asyncio.Queue()
+    await watcher.fail(error)
+
+    await _drain_host_events(watcher, queue)
+
+    item = queue.get_nowait()
+    assert isinstance(item, _WatcherFailure)
+    assert item.error is error
+
+
+@pytest.mark.asyncio
 async def test_close_watcher_cancels_and_awaits_drain_when_aclose_is_cancelled() -> None:
     """watcher aclose 被取消时仍必须 cancel 并回收 drain task。"""
 
@@ -1749,7 +1825,13 @@ async def test_close_watcher_cancels_and_awaits_drain_when_aclose_is_cancelled()
     await asyncio.sleep(0)
 
     with pytest.raises(asyncio.CancelledError):
-        await _close_watcher(watcher=watcher, drain_task=drain_task)
+        await _close_watch_and_wait_runtime(
+            _WatchAndWaitRuntime(
+                watcher=watcher,
+                queue=asyncio.Queue(),
+                drain_task=drain_task,
+            )
+        )
 
     assert watcher.closed_count == 1
     assert drain_cancel_observed.is_set()
@@ -1786,7 +1868,13 @@ async def test_close_watcher_cancels_drain_before_closing_async_generator() -> N
     drain_task = asyncio.create_task(drain())
     await generator_entered.wait()
 
-    await _close_watcher(watcher=cast(ClosableHostEventIterator, watcher), drain_task=drain_task)
+    await _close_watch_and_wait_runtime(
+        _WatchAndWaitRuntime(
+            watcher=cast(ClosableHostSessionEventIterator, watcher),
+            queue=asyncio.Queue(),
+            drain_task=drain_task,
+        )
+    )
 
     assert generator_closed.is_set()
     assert drain_task.done()
@@ -1804,7 +1892,13 @@ async def test_close_watcher_cancels_and_awaits_drain_when_aclose_fails() -> Non
     await asyncio.sleep(0)
 
     with pytest.raises(RuntimeError, match="watcher close failed") as exc_info:
-        await _close_watcher(watcher=watcher, drain_task=drain_task)
+        await _close_watch_and_wait_runtime(
+            _WatchAndWaitRuntime(
+                watcher=watcher,
+                queue=asyncio.Queue(),
+                drain_task=drain_task,
+            )
+        )
 
     assert exc_info.value is close_error
     assert watcher.closed_count == 1
@@ -2140,36 +2234,37 @@ def _activity_event(
     )
 
 
-def _thinking_event(
+def _transient_delta(
     *,
-    event_sequence: int,
+    runtime_sequence: int,
     run_id: str,
     dedupe_key: str,
-) -> HostEvent:
-    """构造带 Host public thinking 的 progress HostEvent。
+    transient_type: HostTransientDeltaType,
+    data: HostContentDelta | HostReasoningDelta | HostToolCallDelta,
+) -> HostTransientDelta:
+    """构造 Host public transient delta。
 
-    :param event_sequence: event sequence。
+    :param runtime_sequence: 当前 Host runtime 瞬态序列。
     :param run_id: Run id。
     :param dedupe_key: Host public dedupe key。
-    :returns: HostEvent。
-    :raises Exception: 不主动抛出异常。
+    :param transient_type: Host public delta discriminator。
+    :param data: 与 discriminator 对应的 public payload。
+    :returns: HostTransientDelta。
+    :raises ValueError: public envelope contract 校验失败时抛出。
     """
 
-    return HostEvent(
-        event_id=f"thinking-{run_id}-{event_sequence}",
-        event_sequence=event_sequence,
+    return HostTransientDelta(
+        runtime_id="runtime-1",
+        runtime_sequence=runtime_sequence,
         session_id="session-1",
         run_id=run_id,
-        event_class=HostEventClass.PREVIEW,
-        event_type="REASONING_DELTA",
-        kind=HostEventKind.PROGRESS,
-        activity=None,
-        thinking=HostThinkingView(text_delta="正在分析收入变化"),
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        worker_event_index=runtime_sequence,
+        observed_at=_NOW,
+        type=transient_type,
+        data=data,
         dedupe_key=dedupe_key,
-        terminal_status=None,
-        final_answer=None,
-        error_message=None,
-        cancel_reason=None,
     )
 
 

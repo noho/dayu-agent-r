@@ -83,7 +83,7 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
-- `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
+- `watch_session_events(session_id)`：同步 attach live `HostSessionEvent` 订阅，并在返回前同时注册当前 runtime 的瞬态增量订阅与 durable live cursor；订阅不 replay attach 前的瞬态增量，也不提供离线 replay cursor。
 - `close()`：关闭当前 execution runtime；停止新 public call 后先用 finite shared deadline 关闭 wait poller、撤销全部 adapter observation token，再 drain actor command / wake，随后按 scheduler、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。仍阻塞的 provider thread 不持 Host durable authority，supervisor 保持 `CLOSING`，最后一个 thread finally 后才变为 `STOPPED`。该操作不写用户 cancel / failed terminal facts。
 
 `HostAdmin` handle 当前提供：
@@ -244,7 +244,8 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `RunSnapshot` / `RunStatus` / `FollowupSnapshot` / `SourceRunRelation`：用户可见 Run 生命周期与 retry / replay 来源关系。
 - `AttemptDispatchSnapshot` / `AttemptStatus`：Host 派发给 worker 的 Attempt 执行快照。
 - request dataclass：`EnsureSessionRequest`、`CreateSessionRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`ResolveWaitRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、outbox read / drain request。
-- `HostEvent` / `HostEventClass` / `HostEventKind` / `HostActivityView` / `HostActivityKind` / `HostActivityStatus` / `HostActivitySeverity` / `HostActivityCounts` / `HostThinkingView` / `HostTerminalStatus` / `HostFinalAnswerView`：Host 对 UI / Service 暴露的 typed event view、安全 activity view 与运行态 thinking view。
+- `HostEvent` / `HostEventClass` / `HostEventKind` / `HostActivityView` / `HostActivityKind` / `HostActivityStatus` / `HostActivitySeverity` / `HostActivityCounts` / `HostTerminalStatus` / `HostFinalAnswerView`：Host 从 committed EventLog 派生的 durable typed event view 与安全 activity view。
+- `HostTransientDelta` / `HostTransientDeltaType` / `HostContentDelta` / `HostReasoningDelta` / `HostToolCallDelta` / `HostSessionEvent`：Host 当前 runtime 内的三类 typed 瞬态增量及 durable/transient 联合订阅契约；瞬态 envelope 携带已验证的 Run / Attempt / execution identity、runtime sequence 与 opaque dedupe key。
 - `OutboxTerminalItem` / `OutboxTerminalItemsBatch` / `OutboxTerminalCursor` / `OutboxProjectionStatus` / `OutboxTerminalItemState`：离线 terminal notification 读取与 drain 契约。
 - `HostApiError` / `HostApiErrorCode` / `HostApiErrorDetail`：public API 错误；错误码包括 `NOT_FOUND`、`INVALID_STATE`、`CONFLICT`、`IDEMPOTENCY_CONFLICT`、`PERMISSION_DENIED`、`UNSUPPORTED_OPERATION`、`INTERNAL_ERROR`。
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
@@ -320,6 +321,7 @@ dayu.host
 ├── durable / event_log         # EventLog、state index、payload、projection、audit、purge truth
 ├── dispatch / local_proxy      # scheduler、lane、worker accept、active cancel、recovery closeout
 ├── engine_ingest               # EngineEvent -> Host facts / preview / diagnostic
+├── transient_delta             # 当前 runtime 瞬态 delta fanout、overflow、terminal fence
 ├── run_input                   # EventLog / memory / compact / tool schemas -> AgentRunRequest
 ├── tool_runtime                # governed ToolExecutor、accept barrier、truncation、fetch_more
 ├── waiting / wait_adapter      # awaiting accept、wait record、resolve / resume
@@ -332,7 +334,7 @@ dayu.host
 
 ## 稳定边界
 
-Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
+Host 稳定边界是 durable command、typed request / snapshot、`HostSessionEvent` live view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostSessionEvent` 是 durable `HostEvent` 与当前 runtime `HostTransientDelta` 的联合；只有前者来自 committed facts。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
 
 Host 不负责：
 
@@ -345,8 +347,10 @@ Host 不负责：
 Stream 术语固定如下：
 
 - `EngineEvent stream`：Engine / worker 产出的单次 run 事件流，是 Host ingest 的输入。
-- `Host event stream`：Host 从 committed EventLog 派生的 typed event view。
-- `preview event`：面向 UI 流式体验的非真源事件；不能作为恢复、memory、terminal result 或 audit 的唯一依据。
+- `Host durable event stream`：Host 从 committed EventLog 派生的 typed `HostEvent` view。
+- `Host transient delta stream`：当前 Host runtime 内从已通过 identity / state 校验的 content、reasoning 与 tool-call delta 发布的 typed `HostTransientDelta`；不写 EventLog、不 replay、没有 durable cursor，也不参与恢复、memory、outbox 或 audit。
+- `Host session live stream`：`watch_session_events(...)` 对 durable event 与 transient delta 的联合观察；只保证两个来源各自有序，不承诺跨来源的单一总序。
+- `preview event`：EventLog 内面向 UI 流式体验的非真源事件；不能作为恢复、memory、terminal result 或 audit 的唯一依据。
 - `outbox terminal items`：从 Host terminal facts 派生的离线通知队列；drain 只表示 Host outbox projection 状态，不表示外部 channel 投递成功。
 
 ## 主要组件
@@ -373,7 +377,7 @@ RunInputBuilder 只从 durable providers 读取当前 Run facts、Session contin
 
 ### EngineEvent ingest
 
-EngineEvent ingest 校验 run / attempt / execution identity、当前 durable state 与 event type，再把 EngineEvent 转成 Host facts、preview 或 diagnostic。`EngineEvent` 本身不是 truth；final answer、failure、cancel、lost、usage、iteration_started、context compaction request 和 awaiting confirmation 都必须经 Host ingest 才能影响 Host 状态。
+EngineEvent ingest 校验 run / attempt / execution identity、当前 durable state 与 event type，再把 EngineEvent 转成 Host facts、preview、diagnostic 或当前 runtime 的 transient delta。`EngineEvent` 本身不是 truth；final answer、failure、cancel、lost、usage、iteration_started、context compaction request 和 awaiting confirmation 都必须经 Host ingest 才能影响 Host 状态。content、reasoning 与 tool-call delta 通过相同 identity / late-state 校验后只交给瞬态发布 owner，不创建 EventLog row。
 
 worker clean EOF、stream error 与 worker crash 不是 EngineEvent。它们通过独立的 Host lifecycle closeout candidate、Host lifecycle event identity 与 source 进入同一个 durable terminal transaction；该路径不合成 `run_failed` EngineEvent，也不把 Host lifecycle source ref 写成 Engine event ref。
 
@@ -555,16 +559,19 @@ Attempt 是一次执行生命周期。旧 Attempt 永不 resume；wait resolve�
 Host EventLog event class 包括：
 
 - `CANONICAL_FACT`：恢复、状态索引、memory、outbox、audit 和 Run terminal truth 的事实来源。
-- `PREVIEW`：面向 UI 流式体验的展示事件，例如 iteration preview、reasoning delta、content completed、tool batch ready / done、tool request / result accepted preview。content / tool-call delta 默认只作为 transient ingest 信号接受，不写入主 EventLog，也不参与 durable replay；reasoning delta 写入 PREVIEW row 只用于 live thinking 展示。
+- `PREVIEW`：EventLog 内面向 UI 流式体验的展示事件，例如 iteration preview、content completed、tool batch ready / done、tool request / result accepted preview。content、reasoning 与 tool-call delta 都只作为当前 runtime 的 transient ingest 信号接受，三者均不写 EventLog，也不参与 durable replay。
 - `DIAGNOSTIC`：诊断、拒绝、非致命 provider diagnostic、provider protocol、closeout、projection 或 recovery 观察。
 - `PROJECTION_SIGNAL`：projection catch-up 与派生视图状态信号。
 
-Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、可选 `HostThinkingView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`RUN_LOST` 是 Host terminal / read API 的 `lost` 事实，但 public outbox terminal item 只覆盖 succeeded / failed / cancelled，不把 lost 伪装成可投递 terminal item。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity，其中 reasoning delta 通过独立 `HostThinkingView` 暴露给 UI / Service。
+Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing durable typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`RUN_LOST` 是 Host terminal / read API 的 `lost` 事实，但 public outbox terminal item 只覆盖 succeeded / failed / cancelled，不把 lost 伪装成可投递 terminal item。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；三类 raw delta 不投影为 activity。
 
-EngineEvent ingest 与 HostEvent projection 是两条边界：
+`HostTransientDelta` 是与 `HostEvent` 分离的 live-only typed envelope。每个 watcher 拥有容量 256 的独立队列；发布是 non-blocking fanout，单个慢 watcher 溢出后只让该订阅以 `HostApiError(code=UNAVAILABLE, retryable=True, detail=HostUnavailableDetail(component="session_live_stream", reason_code="slow_consumer"))` 结束，不阻塞快 watcher、terminal append 或 Run。durable terminal 在同一 watcher 上建立 Run-local fence：先交付已接受的 delta 前缀，再交付 terminal，terminal 后不再交付该 Run 的迟到 delta。关闭、显式 `aclose()` 或迭代取消只 detach watcher，不取消 Run，也不伪造 terminal fact。
+
+EngineEvent ingest、transient publish 与 HostEvent projection 是三条边界：
 
 - EngineEvent 进入 Host 前只是 worker 输入；Host 必须校验 identity 与 durable state。
-- HostEvent 是 EventLog 派生 view；watch 只订阅 live events，离线 terminal 通知走 outbox terminal read / drain。
+- 三类 delta 校验通过后进入当前 runtime transient hub；它们不写 EventLog，订阅只观察 attach 后的增量。
+- HostEvent 是 EventLog 派生 view；watch 只观察 attach 后的 durable events，离线 terminal 通知走 outbox terminal read / drain。
 - failed terminal public projection 可在原始错误消息后追加 `provider_request_id` / `client_correlation_id` 诊断后缀；后缀只来自 terminal payload 已有字段，不改写 EventLog payload message 或 payload digest。
 
 Runner call manifest 由 Host 在 RunInputBuilder 装配普通 runner input 时写入 `RUNNER_CALL_INPUT_ASSEMBLED`。Engine `iteration_started` 到达后，Host ingest 将未关联 manifest 显式链接为 `RUNNER_CALL_INPUT_ITERATION_LINKED`；missing、ambiguous、mismatch 或 link conflict 都 fail closed 为 `ENGINE_EVENT_REJECTED`。工具结果进入下一轮时，Engine `iteration_started.input_projection` 提供本轮真实 messages 的中性投影，Host ingest 将其保存为 runner-call projection payload 并写 complete continuation manifest；旧事件缺少 projection 时才降级为 `limited_signal(missing_projection_artifact)`。

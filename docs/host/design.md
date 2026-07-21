@@ -48,7 +48,8 @@ Host 内部模块边界：
 - Admission / Queue：唯一负责 Session active Run 判定、queued Run promotion 与 CAS-style admission。
 - EventLog / State Transition：唯一负责 EventLog append、`event_sequence` 分配，以及 `canonical_fact` 对 Run / Attempt 索引的原子更新。
 - Attempt Dispatch：只消费已提交的 dispatch record / attempt snapshot，负责 LocalProxy / RemoteProxy 派发与 cancel 传播；不得生成治理事实。
-- EngineEvent Ingest：唯一负责把 Engine / Worker / ToolRuntime 回传事件验证、分类并转成 Host event。
+- EngineEvent Ingest：唯一负责把 Engine / Worker / ToolRuntime 回传事件验证、分类并转成 typed Host event candidate；对 live-only delta 只在 durable identity / late-state validation 成功后执行 non-blocking handoff，不拥有订阅 mailbox、容量、overflow 或展示降级策略。
+- Session Event Delivery：拥有当前 runtime 的 transient identity / publication sequence、多 watcher fanout、每订阅 mailbox + 唯一 in-flight retained accounting、session-scoped attach reservation、delivery overflow、detach / disconnect 与 iterator facade 合流；它不写 EventLog，不改变 Run / Attempt。它对外承诺 Host publish 不等待被动消费者或 mailbox capacity，单订阅 overflow 只隔离该订阅；同一 event loop 上的阻塞 callback、CPU starvation 与同步 fanout 成本不属于物理隔离承诺。其每订阅容量与每 Session subscription cap 由 runtime composer / operator 在 Host construction-time 传入 typed runtime policy，不由实现私有常量决定。
 - RunInputBuilder：唯一负责通过 typed input provider protocols 聚合 EventLog、memory snapshot、compact artifact、tool schema snapshot 与场景约束，构造 `AgentRunRequest.messages`。
 - Conversation Memory：只消费 committed canonical EventLog facts 与 accepted compact projection，维护 session memory snapshot 的五类会话语义视图；它是可重建 projection / read model，不是事实真源，不直接写 EventLog，也不由 Context Governance 直接写入。
 - Context Governance：唯一负责上下文预算、compact 编排与 compact 事件收口；它是治理 orchestrator，不直接写 memory、audit、trace 或其它 projection。
@@ -98,7 +99,7 @@ usage 是 provider capability 驱动的治理观测信号，不是 scene / Servi
 
 `tool_truncation_policy` 只配置默认治理参数，不配置 per-tool strategy / target。它至少包含 `enabled`、`default_cursor_ttl_seconds` 与 `default_limits`，其中 `default_limits` 覆盖 `text_chars.max_chars`、`text_lines.max_lines`、`list_items.max_items` 与 `binary_bytes.max_bytes`。工具声明负责提供 `ToolTruncateSpec.strategy`、`target_field` / `field_path` 与是否启用截断；如果工具声明启用截断但未提供 limit 或 ttl，Service / composition root 用 policy default 补齐成 effective truncate spec。`fetch_more` 名称由 `FrameworkToolName.FETCH_MORE` 固定，不作为配置项。
 
-`host_runtime.json` 表达 Host opener 的部署默认值：store / artifact roots、SQLite、`host_execution_lane_name`、worker backend、dispatch poll interval 与 memory projection catch-up page size 等。这些都是 `open_host(options)` construction-time assembly inputs，不是 per-run override。`memory_projection_catchup_batch_size` 只表示 required catch-up / rebuild 的内部读取页大小和单批 transaction 粒度，不表示“本次最多追多少事件”的语义预算，也不能作为 correctness 停止条件。顶层 selector 使用 `default_host_runtime_id`；host runtime record 不重复内部 id。`worker_backend` 当前支持 `local`，未来可扩展 `remote`；ConfigLoader 只读取该值，Service / composition root 负责映射为 `OpenHostOptions.worker_factory`。`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog；`host_runtime.json.host_execution_lane_name` 引用该 lane catalog，Service / composition root 再映射到 `OpenHostOptions` 的 lane fields。`tool_discovery.json` 表达 ToolsDiscovery provider 配置：provider id、import path 或 entry point、source kind、source id、enabled 与 provider config；ConfigLoader 只读出 typed provider specs，ToolsDiscovery 才负责 import provider、聚合 `ToolBundle` 与计算 digest。
+`host_runtime.json` 表达 Host opener 的部署默认值：store / artifact roots、SQLite、`host_execution_lane_name`、worker backend、dispatch poll interval、memory projection catch-up page size 与 `session_event_delivery_policy` 等。这些都是 `open_host(options)` construction-time assembly inputs，不是 per-run override。`session_event_delivery_policy` 必须由 Service / composition root 映射为完整 typed `HostSessionEventDeliveryPolicy`，并显式提供三个非 bool 正整数 `transient_mailbox_max_items`、`transient_mailbox_max_bytes` 与 `max_subscriptions_per_session`；Host 不提供隐藏 fallback，也不在代码中保留私有容量或 subscription cap 真源。`memory_projection_catchup_batch_size` 只表示 required catch-up / rebuild 的内部读取页大小和单批 transaction 粒度，不表示“本次最多追多少事件”的语义预算，也不能作为 correctness 停止条件。顶层 selector 使用 `default_host_runtime_id`；host runtime record 不重复内部 id。`worker_backend` 当前支持 `local`，未来可扩展 `remote`；ConfigLoader 只读取该值，Service / composition root 负责映射为 `OpenHostOptions.worker_factory`。`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog；`host_runtime.json.host_execution_lane_name` 引用该 lane catalog，Service / composition root 再映射到 `OpenHostOptions` 的 lane fields。`tool_discovery.json` 表达 ToolsDiscovery provider 配置：provider id、import path 或 entry point、source kind、source id、enabled 与 provider config；ConfigLoader 只读出 typed provider specs，ToolsDiscovery 才负责 import provider、聚合 `ToolBundle` 与计算 digest。
 
 wait resolution 配置不得写入 scene manifest。具体 awaiting provider 选择 `poll`、`callback` 或 `manual` 的恢复策略属于该 provider / adapter binding 的工具级事实，写在 `tool_discovery.json` 对应 provider config，并由 provider assembly 校验所选策略确实可用；当前 product runtime 尚未装配真实 authenticated callback transport 时，选择 `callback` 必须在 Host 打开前 fail fast。wait poller 的启停、poll / idle cadence、retry / backoff、单次 adapter observation budget、close drain budget、claim 与 outstanding invocation 上限属于 Host opener runtime policy，写在 `host_runtime.json`，不得放进 per-Run `execution_profiles.json`。Service 只能在 effective Host runtime policy 已启用、当前工具集合至少包含一个选择 `poll` 的 awaiting provider、且匹配 poll adapter registry 存在时启动 poller；scene tool selection 只用于筛选本次实际暴露的工具，不拥有后台 runtime authority。
 
@@ -118,9 +119,9 @@ Service / composition root 是三者输出进入 Host 的唯一映射方。Servi
 
 运行时 override 合并由 Service / composition root 执行，优先级固定为未来 UI 显式输入 > scene manifest hints > ConfigLoader typed config view > 代码默认值。该优先级只适用于 Host 外部装配阶段，Host 接收的仍然是最终 typed inputs，不解释 override provenance。当前 Host public contract 允许的 per-run override 仅限 `SubmitFollowupRequest` 的 `system_prompt`、`tool_names`、`runner_spec`、`runner_options` 与 `agent_policy`：`system_prompt` 承接 `ScenePrepare` 已装配的 system messages；`tool_names` 只在已发现业务 `ToolBundle` 内选择子集，`None` 表示使用全量业务工具，空集合表示禁用业务工具，非空集合表示显式白名单；`runner_spec`、`runner_options` 与 `agent_policy` 必须由 Service 映射为完整 typed value，不接受 patch dict、profile lookup、extra payload 或 raw config fragment。`SubmitFollowupRequest.user_prompt` 是调用方本次输入，不来自 scene / config；`behavior` 与 `target_run_id` 属于 Service / UI 请求控制，不属于 scene manifest 的稳定职责。
 
-`open_host(options)` 的 construction-time inputs 也由 Service / composition root 从 ConfigLoader、ToolsDiscovery、代码默认值以及部署环境组装，但它们不是当前 per-run override。包括 durable store / artifact roots、SQLite 与 lane 参数、worker factory、ordinary run baseline、`HostToolingOptions`、context budget policy、compactor runner baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关在内的 Host opener 参数，在 Host handle 打开后不由 scene 或单个 Run 改写。Scene 可以表达 model / tool selection hints 与 typed agent policy override，ConfigLoader 可以表达 execution profile 与部署默认值，最终是否转化为 opener baseline 或 per-run override 由 Service 根据现有 Host typed contract 决定；若发现需要新增 per-run override 字段，必须回到 Host public interface design gate，不能通过 runtime assembly 旁路扩展。
+`open_host(options)` 的 construction-time inputs 也由 Service / composition root 从 ConfigLoader、ToolsDiscovery、代码默认值以及部署环境组装，但它们不是当前 per-run override。包括 durable store / artifact roots、SQLite 与 lane 参数、worker factory、ordinary run baseline、`HostToolingOptions`、context budget policy、compactor runner baseline、memory projection policy、memory catch-up page size、`HostSessionEventDeliveryPolicy` 与 truncation manager 开关在内的 Host opener 参数，在 Host handle 打开后不由 scene 或单个 Run 改写。Scene 可以表达 model / tool selection hints 与 typed agent policy override，ConfigLoader 可以表达 execution profile 与部署默认值，最终是否转化为 opener baseline 或 per-run override 由 Service 根据现有 Host typed contract 决定；若发现需要新增 per-run override 字段，必须回到 Host public interface design gate，不能通过 runtime assembly 旁路扩展。
 
-Host 不知道 scene manifest、config 文件或 tool provider，不扫描业务工具，不拼 prompt，不解释 workflow，也不接收 raw `ToolBundle` 作为 per-run request。runtime assembly 可以修正 Host public policy dataclass 或 tool truncate declaration 的 typed shape，但不得改变 Host public command、Host handle method、`open_host(options)` 字段、public request / response dataclass 字段或 `dayu.host` public exports；runtime assembly 结果只能通过现有 `open_host` construction-time inputs 与 per-run typed request inputs 交给 Host。
+Host 不知道 scene manifest、config 文件或 tool provider，不扫描业务工具，不拼 prompt，不解释 workflow，也不接收 raw `ToolBundle` 作为 per-run request。未经对应 public interface design gate，runtime assembly 不得自行漂移 Host public command、Host handle method、`open_host(options)` 字段、public request / response dataclass 字段或 `dayu.host` public exports；runtime assembly 结果只能通过已经冻结的 `open_host` construction-time inputs 与 per-run typed request inputs 交给 Host。本次 Session Event Delivery 设计 gate 已明确授权未来实施 WU 新增 `OpenHostOptions.session_event_delivery_policy`，并公开 `HostSessionEventIterator`、delivery-specific error code / detail / enum 与相应 `dayu.host` exports；这些变更不是绕过 gate 的 assembly 漂移。除此之外若再增加字段、别名或兼容入口，仍须进入新的设计 gate。
 
 `utils/smoke_host_public_multiturn.py` 的最终验证职责是模拟真实 Service-like assembly，而不是脚本内手写生产替身。它必须使用 dedicated ordinary scene asset（`smoke_host_public_multiturn`）作为默认 scene，通过 runtime location resolver、ConfigLoader、ToolsDiscovery、ScenePrepare 与 adapter/helper 组装 `open_host(options)` 和 per-run submit input。smoke scene 是普通 scene manifest，不得在 ScenePrepare 或 smoke 中写 special case；它只表达 system prompt fragments、context slots、tool selection、可选 `model.default_model_id`、`model.runner_option_hint_id` 与白名单内 `agent_policy` override。smoke 脚本不得用业务默认值遮住 schema 或 public contract 缺口；如果 config 到 contracts 的映射需要猜测、adapter 过厚或缺 helper，必须输出装配诊断并在调用 Host 前 fail fast。
 
@@ -335,12 +336,229 @@ EventLog
 文档与实现不得把不同层的流式概念混称为 “stream”。固定术语如下：
 
 - `EngineEvent stream`：EngineWorker 执行 Engine 时产出的事件流，是 Host ingest 的输入来源之一，不是 Host 事实真源。
-- `Host event stream`：Host 对 UI / CLI / Web / GUI 暴露的订阅与补读事件流，只能由 EventLog `event_sequence` cursor 派生，不触发执行。
-- `preview event`：面向 UI 流式体验的临时事件，可以进入 Host event stream，但不能作为恢复、投递、RunResult、memory 或 audit 的唯一事实来源。
-- `preview delta`：模型 content / reasoning / tool-call 的增量片段，只服务展示体验，默认不是 canonical fact。
-- `stream fanout`：把已提交 Host events 分发给多个客户端的 projection / sink。慢客户端必须通过 `event_sequence` cursor 补读，不能反压 EventLog append。
+- durable `HostEvent`：只由 committed EventLog row 投影，携带 durable `event_id` / `event_sequence`；它服务在线观察和可补读事实，不承载 per-chunk delta。
+- `HostTransientDelta`：Host 在当前 `open_host` runtime 内发布的 typed live-only delta；只包含 `content_delta`、`reasoning_delta`、`tool_call_delta` 三类，不写 EventLog，也不进入 projection、outbox、memory、audit、Tool Trace 或恢复输入。
+- `HostSessionEvent`：`HostEvent | HostTransientDelta` 的封闭联合，是 `watch_session_events(...)` 的元素类型；调用方必须按具体类型分支，不能从可选字段、字符串或 sequence 范围猜事件平面。
+- session live watch：同一 `open_host` runtime 内的多订阅者 fanout；对外统一表现为 `await watch_session_events(session_id) -> HostSessionEventIterator`，其中 public `HostSessionEventIterator` 是 `AsyncIterator[HostSessionEvent]` 的可关闭子协议并显式提供 `aclose()`；successful await return 是订阅生效边界，它不接收 cursor、不承担离线补读，return 前的 transient 仍是 live-only 且不承诺重放。
+- internal EventLog stream：按 durable `event_sequence` cursor 补读 EventLog row 的内部 diagnostic / detail 路径。
+- `preview event`：已经写入 EventLog、但不属于 canonical fact 的粗粒度展示或诊断事件；`PREVIEW` event class 继续存在，但不包含三类 per-chunk delta。
 
-Host 默认不把 `content_delta` 与 `tool_call_delta` 写入 EventLog；`reasoning_delta` 只为 live thinking display 写入 `PREVIEW` row。Host 可以接受这些事件并把它们用于本次运行的即时展示路径，但 durable replay、Host event stream 补读、memory、audit 与 RunResult 不能承诺 token-level delta replay；可恢复真源仍是 terminal final answer、工具接受事实、compact canonical fact、usage / diagnostic / projection signal 等已提交 EventLog facts。若未来需要多客户端 live token fanout，必须另行设计 transient fanout 能力，不能把主 EventLog 的 durable replay 语义改成 token-level 保真。
+三类 delta 的 owner 固定如下：Engine 只拥有单个异步生成器内的产生顺序；Host EngineEvent ingest 拥有 candidate shape、Session / Run / Attempt / execution identity 与 late-state 校验，并只把已验证 typed candidate non-blocking handoff 给 Session Event Delivery；Session Event Delivery 拥有当前 runtime identity、publication sequence、多 watcher fanout、每订阅 mailbox + 唯一 in-flight retained accounting、per-Session attach reservation、overflow、detach / disconnect 与 close；runtime composer / operator 拥有整个 `open_host` opener 的统一 delivery policy 选择；Service / UI / CLI 只拥有展示选择、快速 callback 适配、唯一 observation-result slot 与本地 degraded recovery，不得逐订阅覆盖 policy，也不得绕过 Host 读取 raw `EngineEvent`。三类 delta 任意数量都不得追加 `PREVIEW`、canonical、diagnostic 或其它替代 EventLog row；可恢复真源仍是 terminal final answer、工具接受事实、compact canonical fact、usage / diagnostic / projection signal 等 committed EventLog facts。
+
+`HostTransientDelta` 的 public envelope 固定携带：
+
+- `runtime_id`：当前 `open_host` runtime 的 opaque identity；只用于区分不同 live generation，不是 Host instance durable identity、授权凭据或业务事实。
+- `runtime_sequence`：Session Event Delivery publisher 在该 runtime 内分配的正整数单调 publication sequence；同一 Session 的 watcher 观察到它的有序子序列。它不是 `HostEvent.event_sequence`，不能作为 EventLog / outbox / offline cursor。
+- `session_id`、`run_id`、`attempt_id`、`execution_id`：通过 durable identity governance 的来源身份。
+- `worker_event_index`：dispatch 为该 execution 的 EngineEvent stream 分配的正整数来源顺序；它不替代 runtime publication order。
+- `observed_at`：Host 观察到 candidate 的 UTC 时间。
+- `type` 与 `data`：唯一 discriminator/data mapping。`content_delta` 对应 `{iteration_id, text_delta}`；`reasoning_delta` 对应 `{iteration_id, text_delta}`；`tool_call_delta` 对应 `{iteration_id, tool_call_index, tool_call_id?, name_delta?, arguments_delta?}`。payload 是 Host public dataclass 闭集，不暴露 raw `EngineEvent` 或其 metadata。
+- `dedupe_key`：由 Session Event Delivery publisher 从 `runtime_id + execution_id + worker_event_index` 生成的 opaque identity；消费者只做等值去重，不解析其格式。
+
+发布线性化边界是 Engine ingest 的 durable validation transaction：candidate shape、Session / Run / current Attempt / execution / dispatch identity 和 late-state checks 全部通过且 transaction 成功结束后，才能把已验证的 Host transient candidate 交给 Session Event Delivery publisher。该 transaction 已读取并确认的当前 `Attempt.started_event_sequence` 是本 candidate 的 `durable_causal_fence_event_sequence` 唯一真源；它必须是非 bool 正整数，并作为 Host-internal typed metadata 随 candidate 交给 publisher。`REJECTED`、stale、wrong identity、terminal-after-late 或 transaction rollback 都不得 fanout。ingest 端口只承诺同步、non-blocking、non-throwing handoff，不读取 watcher 状态，不选择 mailbox 容量或 overflow 动作，也不等待任何 UI / Service consumer。Session Event Delivery 对各 subscription 的 offer 不得 await consumer，也不得等待 mailbox capacity；超限只 detach 当前 subscription，不能改变 ingest result、EventLog append、Run / Attempt 状态、terminal closeout、worker cancellation 或其它 subscription。这个 no-backpressure contract 只排除“被动消费者未读取或异步读取慢”造成的容量等待，不承诺同一 event loop 上的阻塞 callback、CPU 饥饿或同步 O(N) fanout 具有线程 / 进程级物理隔离；Service / UI callback 必须快速、同步、非阻塞返回，慢 I/O、重 CPU 与 renderer 隔离适配由 Service / UI owner 完成。ingest/publisher seam 必须隔离 delivery 内部异常：live delta 可以在 delivery 故障时丢失并记录不含正文的 operator diagnostic，但不得把异常回抛为 durable ingest 失败。
+
+durable 与 transient 是两个 sequence domain，不定义可比较的全局 sequence。terminal handoff 只增加 runtime control barrier，不增加第三类 event、跨域总序或可持久化 cursor。EventLog / durable transition 仍拥有 Session-visible Run terminal 事实；transaction 之外的 owner 不得从 latest Run、latest EventLog row、Session id、日志、时间戳或 promotion 顺序反推 terminal cutoff。
+
+Host internal terminal after-commit contract 固定为不可扩展字段的 typed value：
+
+```text
+TerminalPostCommitNotice(
+  session_id: str,
+  terminal_event_sequence: int,
+  wake_queue_promotion: bool,
+)
+
+TerminalPostCommitPort.notify_terminal_post_commit(
+  notice: TerminalPostCommitNotice,
+) -> None
+```
+
+`TerminalPostCommitNotice` 不是 public schema、durable event 或业务事实副本；`session_id` 必须非空，`terminal_event_sequence` 必须是非 bool 正整数，`wake_queue_promotion` 必须是 bool，禁止 extra payload、可选 sequence、reason 字符串或兼容 alias。任何 write transaction 新提交或在同一幂等 scope 内确认一个 Session-visible Run terminal 时，其 immutable transaction result 必须携带由该 transaction 新 append 的 exact Run terminal EventLog row，或由同一 transaction 按稳定 idempotency result ref 读取并确认的 exact terminal Run row所给出的 `terminal_event_sequence`，并由 terminal producer构造同一 exact notice。commit 后不得再做 latest-row / max-sequence readback，也不得用 Attempt terminal sequence、cancel request sequence、Session最新 Run、事件类型猜测或新开 transaction补取。单个 transaction若提交或确认多个 terminal，result 必须按各自 exact `terminal_event_sequence` 携带 `tuple[TerminalPostCommitNotice, ...]`；不得先按 Session id去重，普通 action / snapshot 也不得代替 notices。
+
+`wake_queue_promotion=true` 只表示这次 committed transaction 新释放 Session active slot且需要一次 queue-promotion reconciliation；queued Run cancel、仅确认既有 terminal、session-scope cancel已经在同一 transaction关闭全部目标、以及其它不释放 active slot的 terminal使用 `false`。该 flag不是 durable terminal事实，不能从 commit 后状态重算。幂等确认仍必须重新携带 exact sequence；是否需要 promotion只按本次 transaction result的显式 flag决定。
+
+`TerminalPostCommitPort` 的实现 owner 是 producer 所属 `open_host` opener 内的 terminal post-commit coordinator；它只负责该 opener 的本地 terminal-ready 低延迟 wake 与 optional queue-promotion coordination，不是其它 opener / 进程 watcher 的 correctness source。任一 producer在 `run_write(...)` 成功返回后必须同步调用所属 opener 的该 port；非 owner thread先 marshal到 opener owner loop并等待本次同步协调完成，owner-loop caller直接进入同一调用栈。coordinator 对每个 notice在同一无 `await` critical sequence中固定执行：第一，对本地 Session Event Delivery 的 `committed_terminal_event_sequence_high_watermark` hint 做 max-advance；第二，若本地 watermark前移则 level-trigger该 opener 中该 Session所有 attached subscriptions 的 terminal-ready wake；第三，仅当 `wake_queue_promotion=true` 且该 sequence大于本地 per-Session O(1) `queue_promotion_terminal_event_sequence_high_watermark` 时，先推进这个 promotion-dedupe scalar再调用原 queue-promotion wake。三个本地动作之间不得让本 opener 的 attach、transient publish或另一个 promotion穿过。delivery watermark与 promotion-dedupe watermark都是 opener-local runtime control scalar，不持久化、不投影给 LLM / Service，也不是 terminal marker collection；跨 opener correctness只能来自 EventLog与下述 candidate causal fence。
+
+同一 `(session_id, terminal_event_sequence)` notice重复到达时，上述两个 max-advance均保证幂等：delivery不重复产生新 cutoff，`true` promotion最多 enqueue一次；先到的 `false` 不推进 promotion-dedupe scalar，因此同 sequence稍后到达的首次 `true` 仍可补发必需 reconciliation。较新 `false` notice也不能吞掉较旧尚未处理的 `true`，因为 promotion-dedupe scalar只由实际处理过的 `true` sequence推进。不同 terminal sequence不是 duplicate：按commit顺序到达的每个新`true`都推进promotion scalar并reconcile；若较新`true`已先reconcile，随后到达的较旧`true`由该较新queue check涵盖而无需重复enqueue。禁止为此保存 terminal sequence set、notice queue历史或按 Run id累积 marker。
+
+在 producer 与 watcher 同属一个 opener 时，本地 terminal closeout 的低延迟顺序固定为：EventLog terminal transaction commit成功；producer把 exact notice交给所属 opener coordinator；coordinator同步完成本地 watermark max-advance + subscription terminal-ready wake；仅在 notice flag为 true时再完成本地 queue-promotion wake；由该 wake推进的 B promotion、dispatch 与 transient publish位于其后。本地 watermark不等待 watcher，不暂停 promotion、Agent或 Engine；B仍可运行并把 delta发布到同一个 Host subscription mailbox。若 terminal producer、watcher 与后继 B 分属不同 opener / 进程，该 notice不跨 opener传播，也不承担交付顺序正确性；B entry携带的 durable causal fence与周期性 EventLog reconcile才是共享 DB 上的 correctness机制。
+
+public attach 必须是 async factory。`await watch_session_events(session_id)` 先在 opener owner loop reserve目标 Session 的 subscription slot，再 await `DurableActor` 完成实际 start-cursor read transaction；回到 owner loop后，必须在同一无 `await` 段创建并注册 mailbox subscription、记录当时的本地 terminal watermark baseline并返回 iterator。successful await return是调用方可依赖的订阅生效边界：调用方在该 return 后提交给同一 actor 的 command必定位于已完成 cursor transaction之后；cursor snapshot与return之间由任意连接提交的 durable rows可从这个较早 cursor读到。该间隙内的 transient属于 pre-return live-only数据，不承诺重放；successful return之后由本 opener publisher发布的 transient不得因 attach尚未完成而丢失。禁止同步 factory、pending cursor future、首次`anext()`解析cursor、lazy attach或把“cursor request已排队”描述成生效点。
+
+publisher 必须把 candidate 的同一个 `durable_causal_fence_event_sequence` 原样复制到每个目标 subscription entry；禁止 per-subscription重算、latest/max EventLog readback、从 `run_id` /时间戳 / publication顺序猜测，或新建第三套 sequence domain。该正整数只是引用现有 durable `Attempt.started_event_sequence` 的 Host-internal、固定大小 accounting metadata；它与 entry 的 size一起计入固定开销边界，但不加入 logical UTF-8 byte算法，也绝不进入 public `HostTransientDelta`、extra payload、日志或 LLM-facing material。
+
+iterator merge每次准备 pop mailbox头部 entry前必须先读取该 entry 的 causal fence；若 subscription durable cursor小于 fence，entry必须原位保留并继续计入 mailbox + in-flight budget，merge按 bounded EventLog pages补读，直到 cursor达到fence、遇到public durable read failure，或因当前 terminal `yield`暂停。page size只限制单页，不得成为未追到fence时提前pop的correctness预算。补读期间沿既有terminal fence逐个交付durable terminal：遇到terminal A时只从counted mailbox头部逐项pop / yield `run_id=A`的pre-terminal transient prefix；首个不同Run entry原位保留，A prefix结束后`yield` A terminal并暂停，只有Service first-commit、ack / clear / rebind后的下一次`anext()`才可继续。admission的单active Run不变量保证任一前序Run A terminal event sequence严格小于后继Run B当前Attempt的`started_event_sequence`，因此B entry的fence必然跨过A terminal；即使A producer、watcher与B execution分属不同opener /进程，也不能先pop B。
+
+mailbox为空时iterator仍必须按bounded periodic durable reconciliation读取EventLog；每轮读取页数与等待间隔有界，持续watch最终必须发现其它opener提交的terminal，不能依赖本地notice才唤醒或永不poll。本地terminal watermark只可使本opener提前reconcile并约束本地promotion；它不能替代entry causal fence或空mailbox的periodic reconciliation。merge不保存terminal id set / marker queue；durable cursor只推进到实际处理的row，不越过尚未交付terminal。
+
+session live watch 因而维持各自 domain 内顺序，并保证同一 Run / execution 中已接受且已进入该 subscription mailbox 的 delta 在该 Run 的 durable terminal `HostEvent` 之前交付。terminal durable commit 之后的 post-terminal late-state validation 继续由 Host EngineEvent ingest 作为唯一事实 owner，后续 candidate 必须在 ingest 被拒绝，subscription 不以 watermark 或历史集合重做 durable state validation。其它 durable progress 与 transient delta 之间不承诺可离线重建的总序；消费者不得把迭代器到达顺序或 watermark 持久化成跨平面 cursor。若 subscription 因 overflow 断开，当前 iterator 不再承诺观察随后的 durable terminal，但 terminal fact、Run / Attempt 状态与 Outbox terminal owner 均保持不变，调用方按既有 Outbox / `get_run` 恢复路径观察终态。断线、detach、Host close、进程退出或新 `open_host` runtime 均不补放 transient delta。
+
+### 4.2 Public iterator、policy 与单 mailbox
+
+`watch_session_events(session_id)` 保持统一可关闭 async iterator外观，但factory本身冻结为async：`await host.watch_session_events(session_id) -> HostSessionEventIterator`。`HostSessionEventIterator` Protocol必须显式包含`__aiter__`、`__anext__`与幂等`aclose()`；`Host` Protocol、public implementation、`dayu.host.api`与`dayu.host` package exports必须使用同一async factory签名与精确返回类型。Service不得再定义私有closable Protocol、`cast`、`hasattr/getattr`或“若支持则关闭”的兼容分支，所有Service / CLI adapter调用点都必须显式`await`。
+
+owner loop先线性化per-Session reservation；cap拒绝发生在mailbox、cursor transaction或iterator allocation之前。reservation成功后await durable owner实际完成Session existence与start cursor transaction；返回owner loop后，在同一无`await`段分配/注册subscription、记录本地watermark baseline并返回iterator。successful return是唯一生效边界，首次`anext()`只消费已经attach的iterator，不执行cursor/attach/allocate。cursor transaction、subscription attach或iterator allocation失败，factory cancellation，以及该过程中的Host close都必须精确一次释放reservation与已经创建的资源；成功返回后的`aclose()`、consumer cancellation、iterator error / EOF、overflow detach与Host close继续由iterator/subscription owner精确一次释放。禁止pending cursor future与never-started future观察/补偿路径。
+
+每次 attach 创建一个 Session Event Delivery subscription，并快照本 `open_host` runtime 的 `HostSessionEventDeliveryPolicy`。iterator facade 内部合流两个 owner：durable EventLog reader 按 `event_sequence` cursor 有界分页拉取并投影 `HostEvent`，不把 durable rows 复制进 transient mailbox；Session Event Delivery subscription 只为 live-only `HostTransientDelta` 持有一个有界 mailbox 与至多一个当前 in-flight event。transient 读取接口必须是单项 pop / transfer；禁止 `drain_nowait()` 或任何返回 `list` / `tuple` / `deque` batch 的 API，也禁止 iterator generator 在逐项 `yield` 期间持有一批已从 mailbox 扣账的前缀。Service / UI adapter 必须直接消费该 iterator，不得再建立第二个保留 `HostSessionEvent` 的 relay queue。readiness、停止信号、target binding 与唯一 observation-result slot 可以存在，但这些 primitive 不得保存任意事件副本或形成第二条事件序列。
+
+`HostSessionEventDeliveryPolicy` 是 `dayu.host` public typed construction-time policy，required 字段固定为 `transient_mailbox_max_items: int`、`transient_mailbox_max_bytes: int` 与 `max_subscriptions_per_session: int`，三者都必须是非 bool 正整数。runtime composer / operator 从 `host_runtime.json.session_event_delivery_policy` 或 opener 级显式部署 override 构造一份完整 policy，并通过新字段 `OpenHostOptions.session_event_delivery_policy` 传入；同一 opener 的所有 subscription 统一使用该 policy snapshot。`watch_session_events(...)` 不增加 policy 参数，UI / CLI、单个 Run 与单个 subscription 都不能覆盖它；per-subscription override 是明确 non-goal，未来确需异构 consumer budget 时必须进入新的 public contract design gate。设计只把三个 packaged 数值、低基数 metrics 与 Python heap safety margin 留给未来实施 WU 基于 workload、consumer latency SLO、峰值 delta rate、watcher 数量与内存预算测量；字段、校验、reservation 算法与 public rejection contract 已在本设计冻结。Host 内部不得保留隐藏容量 / cap fallback，这些测量项不阻塞本设计成立。
+
+### 4.3 Byte accounting 与发布顺序
+
+`max_items` 单独不足以形成内存边界。当前 `HostContentDelta.text_delta`、`HostReasoningDelta.text_delta` 与 `HostToolCallDelta` 的字符串字段没有 Host public contract byte bound，EngineEvent delta contract 也没有跨 Runner 的单事件 byte bound；特定 OpenAI SSE parser 的行数 / 字符数保护不能提升为 Engine contract。因此 mailbox 必须同时执行 item 与 byte accounting。
+
+单个 `HostTransientDelta` 的 `delivery_size_bytes` 由 Session Event Delivery 唯一 deterministic helper 计算。遍历边界固定为 public envelope 的 `runtime_id`、`session_id`、`run_id`、`attempt_id`、`execution_id`、`dedupe_key`，以及 typed payload 的全部 string fields：content / reasoning 的 `iteration_id`、`text_delta`，tool-call 的 `iteration_id`、可选 `tool_call_id`、`name_delta`、`arguments_delta`。每个 string occurrence 计 `len(value.encode("utf-8"))`，optional `None` 计零；`runtime_sequence`、`worker_event_index`、`tool_call_index` 等整数、`observed_at`、enum 值、字段名、序列化标点与 Python 对象头不计入。不得从日志文本、对象 `repr`、下游 renderer 或 adapter 序列化结果估算。
+
+publisher 对每个 public event 只构造并计算一次 `(event, delivery_size_bytes)`，并接收candidate已有的同一个`durable_causal_fence_event_sequence`，随后把三者原样fanout给订阅快照；禁止每个subscription重算size或fence。publisher 具有 opener event-loop affinity；runtime sequence 分配、event 构造、size 计算、subscription snapshot 与每个 `_offer` 在同一无 `await` 同步调用栈内按 publication 顺序完成，跨线程调用必须先 marshal 回 owner loop，不需要额外 lock。每个 subscription 的 prospective item / byte 检查、入队与 retained totals 更新也在同一 `_offer` 调用栈内线性化。单项 pop 只把 entry 从 mailbox 转移为该 subscription 唯一的 in-flight event，不扣减 retained items / bytes；iterator 把该 event `yield` 给 caller 后，在 generator 下次恢复或 iterator cleanup 前，Host 仍持有该 in-flight 引用并继续把它计入同一 budget。只有 yield 恢复 / cleanup 清除 Host 引用时才按 entry 保存的 size 精确扣减；caller 已接收并在 generator 外继续持有的引用不属于 Host retention。publisher 的 prospective accounting 始终使用 mailbox + in-flight 的 retained totals，因此 Host owner 内单 subscription 的 retained items / bytes 永不超过 policy。`max_items` 约束对象数量以及entry size与causal fence等固定大小metadata，`max_bytes` 约束 public 字符串逻辑负载；该 budget 不宣称等于 Python heap resident bytes。
+
+prospective offer 会让任一 retained 累计值超过 policy 时即判定 overflow；不得截断、拆分或把半个 delta 交给消费者。public `limit_dimension` 的唯一 primary-dimension 顺序固定为：第一，若新 event 自身 `delivery_size_bytes > transient_mailbox_max_bytes`，报告 `PAYLOAD_BYTES`；第二，若 `retained_items + 1 > transient_mailbox_max_items`，报告 `ITEM_COUNT`；第三，若 `retained_bytes + delivery_size_bytes > transient_mailbox_max_bytes`，报告 `PAYLOAD_BYTES`。因此 item-full + oversized event 固定报告 `PAYLOAD_BYTES`。operator metrics 可以由实施 WU 用低基数设计记录同一 offer 命中的全部维度，但 public detail 只能携带上述算法选出的一个 primary dimension。只有未来 Engine public contract 对所有 Runner 冻结并验证严格的 per-event byte bound 后，才可通过新的设计 gate 重新评估是否移除 mailbox byte bound。
+
+### 4.4 Delivery error、资源边界与 fence
+
+当前 public 联合事件 contract 的 overflow 动作固定为 typed disconnect：超限事件不入队，subscription 原子标记 `OVERFLOWED` 并从后续 fanout snapshot 排除；iterator 可以先交付已经接受且仍纳入 retained accounting 的连续前缀，随后抛出 delivery-specific public error并完成 cleanup。`OVERFLOWED` subscription 在 prefix / in-flight 尚未释放时继续占用原 session admission reservation；只有 iterator 抛错后的 cleanup 或 caller 提前 `aclose()` 完成、retained state 清零并转为 `DETACHED` 时，才释放 reservation，避免新 watcher admission 让 per-Session retained budget 短暂超过 cap 推导值：
+
+```text
+HostApiError(
+  code=HostApiErrorCode.DELIVERY_INTERRUPTED,
+  retryable=false,
+  detail=HostSessionEventDeliveryDetail(
+    reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
+    limit_dimension=<one primary enum selected by the fixed §4.3 algorithm>,
+  ),
+)
+```
+
+public string values 固定为 `HostApiErrorCode.DELIVERY_INTERRUPTED = "delivery_interrupted"`、`HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW = "transient_mailbox_overflow"`、`HostSessionEventDeliveryLimitDimension.ITEM_COUNT = "item_count"` 与 `PAYLOAD_BYTES = "payload_bytes"`。两个 delivery enum 都是 public closed enum，`HostSessionEventDeliveryDetail` 是 `HostApiErrorDetail` 的 delivery 专属成员。该错误只说明本 subscription 已 detach、transient live continuity 已丢失；它不是 Host availability、Run failure 或可通过立即 reattach 自动恢复的事实，因此 `retryable=false`，不得再复用 `HostUnavailableDetail`、`UNAVAILABLE`、`session_live_stream`、`slow_consumer` 或字符串 reason parsing。Service 收到该 typed error 后只进入本地 `degraded` 状态并使用既有 `get_run` / Outbox durable recovery；不得把它映射为 Host outage、重启 Host、全局退避或改变 Run terminal。
+
+attach capacity rejection 使用另一条专属 public contract，不得复用 delivery interruption 或 availability：`HostApiErrorCode.RESOURCE_EXHAUSTED = "resource_exhausted"`，`retryable=true`，detail 固定为 `HostSessionEventAdmissionDetail(reason=HostSessionEventAdmissionReason.SESSION_SUBSCRIPTION_LIMIT_REACHED)`，其中 `SESSION_SUBSCRIPTION_LIMIT_REACHED = "session_subscription_limit_reached"`。该 error 的 owner 是 Session Event Delivery admission，只表示目标 Session 当前 watcher reservation 已满；`retryable=true` 只表示既有 watcher 释放 reservation 后重试可能成功，不授权 tight-loop retry，也不表示 Host execution unavailable。`HostSessionEventAdmissionDetail` 与 `HostSessionEventAdmissionReason` 是 public closed contract，message 不作为分支依据。
+
+禁止 silent drop-and-continue；若未来要支持 drop-oldest、drop-newest 或继续交付，必须先为 `HostSessionEvent` 增加 typed gap / degraded notice 并经过 public contract design gate，不能让消费者误以为 delta 连续。overflow、drop、degraded 与 disconnect 都只属于 Session Event Delivery / subscription 的展示投递状态，不写 EventLog，不改变 Run / Attempt / terminal，不调用 Run cancel API，也不影响其它 watcher。
+
+当前 topology 已由生产代码的 Session -> `set[subscription]` 与双 watcher public contract tests 裁决为 multi-watcher；实施 WU 不得重新论证为单 watcher 或保留条件分支。Session Event Delivery 对每个 Session 维护 `max_subscriptions_per_session` 个 reservation。attach-time check + reserve 必须在 opener owner loop 内线性化，并发生在任何 subscription mailbox、durable cursor transaction或iterator / per-watcher task allocation之前；若 prospective reservation count 超限，`await watch_session_events(...)` 按上述 `RESOURCE_EXHAUSTED` contract fail closed，被拒绝 attach 不分配任何 watcher resource。拒绝不得驱逐、detach、缩容或改变既有 watcher，也不得影响其它 Session。
+
+reservation 与 subscription retention 生命周期一致：成功 reserve 后覆盖 mailbox、唯一 in-flight 与 iterator facade；partial attach failure、`aclose()`、never-started close、overflow prefix/error cleanup 后的 `DETACHED`、其它 iterator error / normal EOF cleanup 与 Host close 都必须在 owner loop 幂等释放。overflow 从 fanout 排除到最终 detach 之间仍占 reservation；不同 Session 分别计数、互不借用。由此目标 Session 的 transient retained logical upper bound 可推导为 `max_subscriptions_per_session × transient_mailbox_max_items` 与 `max_subscriptions_per_session × transient_mailbox_max_bytes`，同步 fanout 的 watcher upper bound 为 `max_subscriptions_per_session`。这些是 Host owner 内 retained event / logical byte 与 per-Session fanout contract；generator 外 caller 自己保留的对象、Python 对象头精确 heap、Host 全局 Session 数量及跨 Session 总内存不在该乘积承诺内，也不因此引入 Host-global quota、跨 Session quota或独立消息系统。
+
+subscription readiness 必须是 level-triggered：mailbox 非空、overflow、closed 或本地 terminal watermark提示durable cursor可能落后任一状态成立时，等待都必须立即返回；single-pop / durable catch-up 与 readiness clear 的交界必须重新检查 owner state，不能让本地 publish / watermark advance恰好发生在通知切换窗口时丢失唤醒。producer与watcher同opener时，本地低延迟顺序是 terminal EventLog commit -> exact `TerminalPostCommitNotice` -> 所属 opener `TerminalPostCommitPort` -> 本地 watermark / terminal-ready wake -> optional local promotion；普通 initial admission、startup accepted/queued reconciliation与其它 non-terminal promotion继续走原只含`session_id`的promotion port，不能推进本地terminal watermark，terminal producer也不得绕过typed port直接promotion。跨opener correctness顺序则固定为读取mailbox头部entry fence -> 必要时bounded-page EventLog catch-up到fence -> 遇terminal时只交付mailbox头部同Run prefix -> terminal `yield` -> 下一次`anext()`再重新检查cursor / entry；mailbox为空仍periodic bounded reconcile。本地notice / watermark只是低延迟hint，不能替代causal fence。Host ingest的late-state validation仍是post-terminal拒绝的唯一事实owner。
+
+### 4.5 Service 无 event-copy relay 的可执行状态机
+
+Service 删除 event-copy relay queue 后仍允许一个消费 task；task 本身不是 mailbox。每个 active watch runtime 恰好有一个 consumer task，且它是该 `HostSessionEventIterator` 唯一的 `__anext__` owner。consumer 顺序读取 iterator，只对当前已绑定 target 在自身调用栈内直接执行快速、同步、非阻塞的 activity / thinking callback；其它 Run event 不缓存、不改写 target。command task、`get_run` probe、Outbox durable recovery 与 startup snapshot probe 都不得调用 `anext()`、遍历 iterator 或从 raw event 重建 terminal；它们只调用各自 public command / durable read API，并等待 observation signal、poll timer 或自身 command future。
+
+Service observation result 是唯一容量一、带 target generation 的封闭联合。它恰好只有以下五个 members，不得新增隐式 member、catch-all outcome 或兼容别名；每个 member 都携带单调正整数 `target_generation`：
+
+```text
+TARGET_TERMINAL(target_generation, terminal identity + result)
+DELIVERY_INTERRUPTED(target_generation, typed Host delivery error)
+ITERATOR_ENDED(target_generation)
+CALLBACK_FAILED(target_generation, callback kind + original failure)
+ITERATOR_FAILED(target_generation, typed/public iterator failure)
+```
+
+唯一 consumer 是所有 observation outcome 的唯一 first-commit owner：terminal event、`DELIVERY_INTERRUPTED`、正常 `StopAsyncIteration` / Host close、callback exception 与其它 iterator exception 都必须由 consumer 转成上述 union 的一个 member，尝试写入同一个 slot 后 signal。consumer task handle 只用于 lifecycle await，不得让 `task.exception()`、额外 `Future`、queue item、exception callback 或 task-done callback 成为第二条业务语义通道；由 coordinator 发出的 stop / task cancellation 只是控制信号，也不得写另一个 outcome。iterator 正常 EOF（包括 Host close）必须 first-commit `ITERATOR_ENDED`，禁止静默 task return 让 helper 永久等待。`DELIVERY_INTERRUPTED`、`ITERATOR_ENDED`、`CALLBACK_FAILED` 与 `ITERATOR_FAILED` 都是 watcher-fatal outcome：一旦 commit 即 sticky，consumer 终止，coordinator 不得 ack-clear 后复用 watcher；只有 `TARGET_TERMINAL` 可以按 startup handshake ack 后复用同一 watcher。
+
+五个 member 在 watcher cleanup 后的 caller disposition 是唯一且穷举的：
+
+| Member | 唯一 caller disposition |
+|---|---|
+| `TARGET_TERMINAL` | cleanup 后返回该 member 携带的 terminal result；不再读取 `get_run` / Outbox 重算同一 terminal。 |
+| `DELIVERY_INTERRUPTED` | cleanup 后只进入既有 `get_run` / Outbox durable recovery；成功则返回 recovery 得到的 terminal；recovery failure 保持原异常为 top-level，并以 first-committed delivery error 作为直接 context，即 `raise recovery_error from delivery_error`。不得 reattach、读取 task exception或改走其它 recovery。 |
+| `ITERATOR_ENDED` | cleanup 后固定抛 `EntrypointRuntimeError("session_event_iterator_ended_before_terminal")`；该完整 exception message就是 stable reason，不得尝试 `get_run` / Outbox recovery。 |
+| `CALLBACK_FAILED` | cleanup 后原样重抛 callback original exception；不得 wrap 成 Host error、delivery error 或 `EntrypointRuntimeError`。 |
+| `ITERATOR_FAILED` | cleanup 后若 original exception 是 Host public contract 声明的 `HostApiError` 或 `HostClosedError`，原样抛出；其它 exception 固定 wrap 为 `EntrypointRuntimeError("session_event_iterator_failed_before_terminal")`，该完整 message就是 stable reason，并 `raise ... from original_exception`。 |
+
+cleanup precedence 同样属于 Service watch-runtime contract。slot first-commit 一旦成功就是 primary，任何 `aclose()` failure、stop、迟到 callback、late iterator completion 或 task completion都不得覆盖；caller cancellation 或 coordinator stop 在 slot 仍为空时先取得仲裁权后，后续 slot commit 必须失败。coordinator 必须先停止并 await sole consumer、确认没有 active `anext()`，再恰好一次调用 public iterator `aclose()`；Host subscription reservation 的释放仍由 Host iterator / subscription `finally` 幂等保证，Service 不重算、不补偿。
+
+- 若 caller-visible primary 是 exception 或 caller cancellation，且 `aclose()` 也失败，primary 保持 top-level，并以 cleanup error 为 cause：callback / public Host iterator failure / EOF synthetic error / cancellation 使用 `raise primary from cleanup_error`。non-public iterator failure仍必须保持“`EntrypointRuntimeError` from original iterator exception”；double failure 时 exception chain 固定为 top-level `EntrypointRuntimeError` -> original iterator exception -> cleanup error。`DELIVERY_INTERRUPTED` recovery 又失败时 top-level 仍是 recovery error、直接 cause 仍是 delivery error；若 cleanup 同时失败，则 cleanup error 只作为 delivery error 的 nested cause，不得取代前两者。
+- 若 `TARGET_TERMINAL` 已取得 terminal，或 `DELIVERY_INTERRUPTED` 的 durable recovery 已成功取得 terminal，而 `aclose()` 失败，helper 仍返回 terminal。Service 通过现有 `on_activity` 最多输出一次 best-effort secondary diagnostic：`kind=WATCHER_DIAGNOSTIC`、`status=FAILED`、`severity=WARNING`、`run_id=None`、`event_sequence=None`、`dedupe_key="entrypoint_watcher_cleanup_failed"`、title=`运行事件流清理失败`、summary=`已保留终态结果，但运行事件观察器清理失败。`，tool / counts字段均为 `None`；不得包含 cleanup exception 类型、message、payload、Session / Run identity或 traceback。diagnostic callback 自身失败必须被吞掉，不能改变 terminal primary、再占 slot 或形成 task-exception side channel。
+- 若 slot 为空、没有 caller cancellation，且唯一失败是 `aclose()` failure，`HostApiError` / `HostClosedError` 原样抛出；其它 cleanup exception 固定 wrap 为 `EntrypointRuntimeError("session_event_iterator_cleanup_failed")`，该完整 message就是 stable reason，并 `raise ... from cleanup_error`。若 cleanup 成功，则按原 stop / local-exit contract正常结束，不制造 observation outcome。
+
+exact acceptance 固定如下，未来 tests 不得用宽泛“抛任意异常”替代：
+
+| Race / double failure | Exact acceptance |
+|---|---|
+| callback + close failure | callback original exception 是 top-level，cleanup error 是 direct cause；不做 durable recovery，不发 terminal-success cleanup diagnostic。 |
+| EOF + close failure | top-level 是 reason=`session_event_iterator_ended_before_terminal` 的 `EntrypointRuntimeError`，cleanup error 是 direct cause；不做 durable recovery。 |
+| iterator + close failure | public `HostApiError` / `HostClosedError` 原样为 top-level并以 cleanup error 为 cause；non-public failure 的 top-level wrapper、original、cleanup 按上述三层 chain，不能把 close failure 提升为 top-level。 |
+| terminal + close failure | 返回原 terminal；恰好尝试一次去敏 `WATCHER_DIAGNOSTIC/FAILED`，即使 diagnostic callback 抛错也仍返回同一 terminal。 |
+| delivery recovery success + close failure | 返回 recovery terminal；使用与 terminal 路径相同且最多一次的 cleanup diagnostic，不 reattach。 |
+| slot empty + close failure | cleanup error 是唯一 caller failure；public Host exception原样抛，其它异常按 stable cleanup reason wrap。 |
+| caller cancellation + close failure | 原 `CancelledError` 保持 top-level并以 cleanup error 为 cause；late terminal / failure commit无效，不做 recovery、不伪造用户 Run cancel。 |
+
+Service watch runtime 状态固定为以下显式循环；`DEGRADED` 是 watcher 已关闭后由 helper 进入的 durable recovery mode，不是继续读取 live iterator 的 consumer state：
+
+```text
+DETACHED -> ATTACHED_UNBOUND
+
+ATTACHED_UNBOUND
+  -- bind(target_generation=g, target_run_id) + resume --> CONSUMING(g)
+CONSUMING(g)
+  -- sole-consumer first-commit --> RESULT_READY(g)
+RESULT_READY(g)
+  -- coordinator consume/ack TARGET_TERMINAL(g), clear slot --> ATTACHED_UNBOUND
+ATTACHED_UNBOUND
+  -- bind(g+1, next_target_run_id) + resume --> CONSUMING(g+1)
+
+RESULT_READY(g) -- fatal outcome or helper completion --> STOPPING -> CLOSED
+ATTACHED_UNBOUND / CONSUMING(g) -- stop observed before result commit --> STOPPING -> CLOSED
+CLOSED -- DELIVERY_INTERRUPTED only --> DEGRADED durable recovery
+```
+
+`CONSUMING(g)` first-commit 任一 result 后必须立即进入 `RESULT_READY(g)`，并在再次调用 `anext()` 前暂停。startup coordinator 必须先消费并 ack 同一个 generation `g` 的 `TARGET_TERMINAL`、清空 slot、回到 `ATTACHED_UNBOUND`，再绑定唯一新 target 为 `g+1`，最后才允许 consumer 恢复；禁止先恢复再换绑。consumer commit 时必须同时校验当前 binding generation 与 target id，旧 generation 的迟到 callback、terminal、iterator completion 或 failure 都不得写入已清空的新 slot。未绑定期间 consumer 不调用 `anext()`；这段时间到达的 B event只保留在 Host counted mailbox，Service 不缓存、转存或预读。Host terminal handoff barrier保证 A terminal `yield` 后必须等到这个下一次 `anext()` 才可能 pop B，因此 Service 不需要也不得缓存 B。无 target 的 startup transient display 不读取也不缓存，直到 coordinator 绑定 active / promoted target；startup idle 则直接 stop / cleanup。
+
+slot first-commit 是 stop / terminal / failure 同拍的唯一仲裁点：若 consumer 已取得 terminal / failure 且 slot 为空，它先 commit，随后看到的 stop 只驱动 cleanup，不能覆盖结果；若 consumer 先观察到 stop 且尚未取得 result，则不再发起 / 完成新的 `anext()`，正常退出且不制造 observation outcome；slot 已占用时保持原 result，任何 cleanup、迟到 signal 或 task completion都不得覆盖。consumer 在 `RESULT_READY(g)` 已暂停，因此正常路径不会产生第二个 outcome；fatal result 在 caller 读取与 cleanup 完成前保持 sticky。live terminal 与 Outbox terminal 仍按 `terminal_event_id` / `event_sequence` / `run_id` 在同一个 Service observation state 去重；first accepted semantic terminal 结束当前 target，迟到的另一来源只更新 seen watermark，不重复展示。
+
+- submit：先`await watch_session_events(...)`成功取得已生效iterator，再创建sole consumer task，最后才发`submit_followup`；该同actor command必定位于已完成的cursor transaction之后。`target_run_id` 尚未由 command 返回时保持 `ATTACHED_UNBOUND`；consumer 在首次 `anext` 前等待 target binding，Host subscription mailbox 是这段窗口唯一的 event buffer。submit 成功后把 `accepted_run_id` 绑定为 generation `g` 并进入 `CONSUMING(g)`，随后才通知 `on_run_accepted`。不得从 session event、日志、队列顺序或 optional field 猜 target id。
+- submit failure：若 command 明确失败且没有 typed `accepted_run_id`，设置 stop，等待 consumer 正常退出，再 `aclose()` iterator并原样传播 command error；不得把 attach 后看到的其它 Run terminal 猜成目标。若 caller cancellation 发生在 command commit / response race，是否已接受由 command idempotency / `client_request_id` owner 重新查询或重放，watcher 不反推。
+- cancel：目标 Run id 已知。已由 `get_run` 证明 terminal 时不创建无意义 watcher，直接走 durable result recovery；非终态时必须先成功`await watch_session_events(...)`、创建sole consumer、绑定generation后才发`cancel_run`。cancel command 与 terminal race 时，live slot、最新 `get_run` 与 Outbox 通过 terminal identity 去重；cancel command error 只有在再次读取仍非终态时才传播，已终态则转 durable recovery。
+- watcher failure：`DELIVERY_INTERRUPTED + TRANSIENT_MAILBOX_OVERFLOW` first-commit 后终止 watcher，完成 `STOPPING -> CLOSED`，Service 才进入本地 `DEGRADED` 并只用 `get_run` / Outbox 等待目标 terminal；不 reattach 循环、不标记 Host outage。`ITERATOR_ENDED` cleanup 后固定抛 stable `EntrypointRuntimeError` 且不 recovery；`ITERATOR_FAILED` cleanup 后按 public Host exception 原样传播 / 非 public exception stable wrap 的唯一规则处理；不允许从 task exception 猜原因。
+- startup reconnect：先成功`await watch_session_events(...)`并启动同一个sole consumer，再执行Outbox backfill、Session snapshot、active / queued promotion与idle-tail durable probes。当前 active / promoted Run 按上述 generation handshake 逐个绑定；每个 terminal commit 后 consumer 必须暂停，coordinator ack / clear / rebind 后才读取下一项。probe 只消费 slot signal 并用 terminal identity 与 Outbox 去重，不建立 startup live event cache。watcher degraded 后只继续 durable backfill / snapshot closure，不能把 transient continuity 当作可恢复事实。
+- terminal race：consumer 只能提交与当前 generation / target id 同时匹配的 live terminal；durable path 只能从 Outbox / public snapshot owner 取得 terminal。slot first-commit 与 seen identity 共同保证只返回 / 展示一次。普通单目标 helper 在 terminal commit 后进入 `STOPPING`；只有 startup 明确 ack 并绑定下一 generation 时才复用。
+- caller cancellation / local exit：先让 caller cancellation 或 stop 在空 slot 上取得仲裁权，再发出 consumer stop / task cancellation，await task 完成并确认没有 active `anext()`，再调用 public `HostSessionEventIterator.aclose()`。不得在 `anext()` 仍运行时并发 `aclose()`，不得通过读取 task exception取得业务结果，也不得把 helper cancellation 自动解释为用户 Run cancel；用户取消必须另发 typed Host cancel command。仲裁后迟到的 slot commit无效，cancellation + close double failure按上述 primary/cause规则传播。
+- never-started / early failure：successful await return后若consumer尚未执行首次`anext()`，同样先收口未启动task，再调用public`aclose()`；cursor transaction已在factory return前完成，不存在pending cursor future。若factory在return前失败或被取消，factory owner精确一次释放reservation / partial allocation；return后的detach与reservation释放由iterator owner精确一次完成。
+- normal terminal / fatal observation / degraded recovery / startup idle close：统一执行 `STOPPING -> CLOSED`；停止并 await sole consumer、确认无 active `anext()`、调用 iterator `aclose()`，最后才释放 slot / signal。slot 已占用时 cleanup 必须保留 first-committed result，直至 helper 已按五成员 disposition返回或向 caller 传播；fatal result 不得为了复用而 clear。`aclose()` failure 只能按本节 precedence成为 cause、secondary diagnostic或 slot-empty unique failure，不能覆盖 primary。Service helper 只拥有 watcher runtime，不拥有 CLI/Web renderer；renderer / runtime display 仍由 caller 的 `finally` 幂等关闭。
+
+Host subscription 自身不创建 per-watcher background task。iterator 主动 `aclose()` / consumer task cancel 只 cleanup 并 detach 当前 subscription，清除 mailbox / in-flight retained state并释放对应 admission reservation。Run terminal 不结束 session watcher，也不由 delivery owner 合成 terminal；Host close 会关闭 Session Event Delivery、清空订阅与 in-flight owner reference、释放全部 reservation并使 iterator 正常结束，Service consumer 必须把该 EOF 投影为 `ITERATOR_ENDED`。关闭后新 watch 仍由 public lifecycle gate 抛 `HostClosedError`。Host close 仍可按既有 handle lifecycle 停止本 handle worker task，但这不是用户 Run cancel，不得提交取消语义。
+
+### 4.6 Future implementation WU scope 与 acceptance
+
+本设计只授权未来实施 WU 修改下列 owner / consumer 面，不授权当前设计 gate 实施代码：
+
+- `dayu/host/api.py`：新增 `HostSessionEventIterator` Protocol、含三个 required 正整数字段的 `HostSessionEventDeliveryPolicy`、`OpenHostOptions.session_event_delivery_policy`、`HostApiErrorCode.DELIVERY_INTERRUPTED` / `RESOURCE_EXHAUSTED`、`HostSessionEventDeliveryDetail` / `HostSessionEventAdmissionDetail` 及对应 closed enum；把 `Host.watch_session_events` 更新为返回`Coroutine[..., HostSessionEventIterator]`的async method并同步 public `__all__` / Protocol类型断言。
+- `dayu/host/__init__.py`：导出同一 iterator、policy、error detail / enum，禁止兼容 re-export 或旧名字并存。
+- `dayu/host/transient_delta.py`：删除固定 256 item 常量和旧 slow-consumer / live-stream error owner；删除 batch `drain_nowait()` 及所有 `list` / `tuple` / `deque` drain shape，改为单项 pop / transfer；实现 mailbox + 唯一 in-flight 统一 retained accounting、一次 size 计算后 fanout 复用、固定 primary-dimension 算法、typed overflow、candidate fence到每subscription entry的原样复制、pop前causal-fence检查、本地per-Session terminal-ready watermark hint、current-terminal fence、per-Session attach reservation / cap 与全部释放路径。`durable_causal_fence_event_sequence`必须是固定大小Host-internal metadata，不进入public delta或logical-byte traversal。
+- `dayu/host/terminal_post_commit.py`：作为唯一 Host-internal contract owner定义且只定义 `TerminalPostCommitNotice(session_id, terminal_event_sequence, wake_queue_promotion)`、同步 `TerminalPostCommitPort.notify_terminal_post_commit(...)` Protocol及严格 constructor validation；不 public export、不依赖 Service / UI、不保存 durable state，也不提供只含 `session_id` 的 terminal overload。
+- `dayu/host/open_host.py`：把 opener policy 注入 Session Event Delivery并实现async `watch_session_events(...)` factory。owner loop先reserve，await `DurableActor`完成实际start cursor transaction，回owner loop后在同一无`await`段创建/注册subscription、记录本地watermark baseline并return；删除同步factory、pending cursor future、done callback与首次`anext()` cursor attach。每次准备pop entry前按其causal fence执行bounded-page catch-up，mailbox为空仍执行bounded periodic durable reconciliation，并按same-Run prefix -> terminal yield -> next-`anext`闭合cleanup / reservation释放。这里同时装配producer所属opener的`TerminalPostCommitPort`本地coordinator：复用opener loop bridge按§4.1无`await`顺序协调local delivery wake / optional promotion并维护两个本地O(1) scalars；普通scheduler wakeup port继续只承载non-terminal promotion。该coordinator不负责跨opener watcher correctness。
+- `dayu/host/durable/run_transition.py` 及 producer-local immutable transaction result types：所有成功写入 Run terminal 的 transition必须直接返回含 exact terminal EventLog row / terminal Run row的 typed结果；所有幂等 replay / terminal ack必须在同一 transaction沿稳定 result ref确认 exact `terminal_event_sequence`。admission、waiting、recovery、engine ingest与dispatch的 operation result分别携带一个 notice、可选 notice或按 sequence排列的 notice tuple；禁止 `None` sequence、post-commit readback、只返回 `session_id`或把 batch notices折叠成 Session集合。
+- `dayu/host/admission.py`：为 queued / pre-dispatch / waiting / recovering cancel、terminal cancel ack、session-scope cancel与 `closeout_attempt_terminal(...)` 的全部 Session-visible terminal transaction产出 exact notice，并在 commit返回后只调用 `TerminalPostCommitPort`。单 Run pre-dispatch / waiting / recovering cancel与通用 active closeout新释放 slot时 flag为 true；queued cancel、terminal ack与已在同一 transaction关闭全部目标的 session-scope cancel为 false。active cancel request本身不是 terminal，继续只唤醒 watchdog；initial accepted/queued governance是 non-terminal，继续走普通 promotion port。
+- `dayu/host/waiting.py`：以 `TerminalPostCommitNotice | None` 取代 `queue_promotion_session_id` 作为 resolve / expiry transaction handoff；failed、lost、expiry及其幂等确认携带 exact Run terminal sequence，首次释放 WAITING active slot时 flag为 true，幂等确认不重放 release side effect但仍携带 exact sequence且 flag为 false。completed / cancelled wait若创建 resume Attempt而非 Run terminal则不产生 notice；WAITING cancel的 durable writer虽位于 admission，也必须沿同一 port接线。
+- `dayu/host/recovery.py`：startup recovery batch result除 ordinary accepted/queued reconciliation所需的 Session promotion集合外，另按 exact sequence保留每个 terminal notice。`lose_recovering_run_in_transaction(...)`、unrecoverable positive-orphan lost / cancelling closeout及其 CAS / replay结果必须显式分类是否产生 notice；任何真实 Run terminal都通过 terminal port，recovering / dispatch-ready等非-terminal action不得伪造 watermark。terminal notices不得复用 `seen_queue_promotion_sessions` 去重。
+- `dayu/host/engine_ingest.py`：保留 Engine candidate / identity / late-state validation owner；validation transaction从已读取并确认的当前Attempt取得非bool正整数`started_event_sequence`，原样写入typed transient candidate的`durable_causal_fence_event_sequence`，禁止transaction后latest/max readback、猜测、public/extra payload。Engine `RUN_SUCCEEDED` / `RUN_FAILED` / `RUN_CANCELLED`、worker lost与其它 lifecycle terminal的 transaction result必须携带 exact notice。现有 `_with_terminal_promotion_retry(...)` 只含 `session_id` 的 terminal路径必须删除，成功或 duplicate terminal commit后统一调用producer所属opener的terminal port；新释放 active slot时 flag为 true，duplicate / precondition-failed不得猜 promotion。除 typed notice / causal fence外不得注入 delivery policy、callback或 subscription state。
+- `dayu/host/dispatch.py`：active-cancel watchdog batch、attempt-free pre-start failure、worker startup failure与通过 ingest完成的 worker lost / closeout都必须把 transaction-local exact terminal结果接入同一 port；watchdog批量 closeout返回逐 terminal notices而不是 `closed_session_ids`。普通 `_promotion_queue` / initial governance仍是 non-terminal port consumer。terminal producer函数不得直接调用 `wake_queue_promotion(session_id)`。
+- `dayu/host/command.py`：构造 admission / waiting command service时显式注入 `TerminalPostCommitPort`，让 public resolve、callback resolve、expiry、cancel与 closeout调用沿 transaction result完成 terminal coordination；command adapter只投影 public result，不读 latest Run / EventLog补序号，也不在 terminal返回后直接调用普通 promotion wake。
+- `dayu/runtime/config_loader.py`：增加层中立、严格 typed `session_event_delivery_policy` config view / parser，missing、extra、bool、zero、negative 与 non-integer 全部 fail closed；不得 import `dayu.host`。
+- `dayu/config/host_runtime.json`：提供 packaged policy 的 items / bytes / max-subscriptions 三个完整字段；三个默认数值由实施 WU 的 workload / SLO / watcher topology / memory 测量选择，不沿用 256 或任何隐藏 cap 作为无证据真理。
+- `dayu/service/host_assembly.py`：由 runtime composer / operator 把 config view 一对一映射为完整 Host policy；不允许 scene、Run、UI 或单订阅 override，也不提供 Service fallback。
+- `dayu/service/entrypoint_runtime.py`：所有watch调用点显式`await host.watch_session_events(...)`并仅在successful return后创建sole consumer /提交同actor command；删除 `_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY`、Service 私有 closable Protocol / `cast`、`_WatchAndWaitRuntime.queue`、event-copy drain task、`_WatcherFailure` relay item 与 queue-drain consumers；落地 sole consumer + 恰好五成员的唯一 generation-tagged `ServiceObservationResult` slot、`ATTACHED_UNBOUND -> CONSUMING(g) -> RESULT_READY(g) -> ATTACHED_UNBOUND` ack/rebind 循环、fatal sticky、五类 exact caller disposition、delivery-only durable recovery、stop / cancellation first arbitration、cleanup precedence与 best-effort sanitized cleanup diagnostic；禁止读取 task exception 或增加第二 outcome Future。
+- `dayu/cli/session_execution.py`、`dayu/cli/runtime_display.py` 及其它实际 callback / watch adapter：更新async factory的`await`调用与类型测试，核对callback快速非阻塞contract、caller `finally` renderer close、取消与local-exit顺序；不得把UI queue伪装成Service事件relay。
+- owner-level / E2E tests：更新 `tests/host/test_public_contracts.py`、`tests/host/test_package_exports.py`、`tests/host/test_transient_delta.py`、`tests/host/test_watch_session_events.py`、`tests/host/test_transient_delta_stress.py`、`tests/host/test_open_host_runtime.py`、`tests/host/test_host_production_stress.py`、`tests/host/test_admission_queue.py`、`tests/host/test_resolve_wait_command.py`、`tests/host/test_phase7_waiting_integration.py`、`tests/host/test_recovery_scan.py`、`tests/host/test_recovery_dispatch.py`、`tests/host/test_engine_ingest_mapping.py`、`tests/host/test_local_proxy_engine_ingest.py`、`tests/host/test_dispatch_scheduler.py`、`tests/host/test_active_cancel_dispatch.py`、`tests/host/test_command_handle.py`，并新增 `tests/host/test_terminal_post_commit.py`；同时更新 `tests/runtime/test_config_loader.py`、`tests/service/test_host_assembly.py`、`tests/service/test_entrypoint_runtime.py`、`tests/service/test_entrypoint_runtime_prompt_path.py`、`tests/service/test_entrypoint_runtime_interactive_path.py`、`tests/cli/test_transient_slow_consumer_path.py`、`tests/cli/test_prompt_command.py`、`tests/cli/test_interactive_command.py`、`tests/cli/test_runtime_display.py`、`tests/cli/test_thinking_renderer.py` 与相关 fake / fixtures。新增 required `OpenHostOptions` field 还必须机械更新所有 construction sites：`tests/host/public_smoke_support.py`、`tests/host/test_effective_execution_config.py`、`tests/host/test_host_activity_event_projection.py`、`tests/host/test_per_run_tool_selection.py`、`tests/host/test_public_lifecycle_smoke.py`、`tests/host/test_public_open_host_options.py`、`tests/host/test_public_retry_replay.py`、`tests/host/test_public_session_api.py`、`tests/host/test_storage_maintenance.py`、`tests/host/test_storage_usage_report.py`、`tests/host/test_submit_followup_public_contract.py` 与 `tests/host/test_watch_session_events.py`；这些 fixture 必须显式构造 typed policy，不能用默认值掩盖 contract。Host / Service / CLI类型测试必须断言`Host.watch_session_events`是async factory、所有真实调用点显式`await`且返回值精确为public closable iterator。Host tests必须用deterministic barrier证明batch drain已删除、yield后唯一in-flight仍占同一items / bytes budget、publisher refill不越界，并覆盖cap-1 / cap / cap+1、并发attach、拒绝前零mailbox/cursor transaction/task allocation、既有watcher不受影响、detach后再admission、不同Session隔离与全部reservation release path。delayed-cursor barriers必须分别覆盖cursor transaction被阻塞期间factory尚未return、cursor snapshot完成后到successful return之间的durable commit、factory cancellation / Host close / allocation failure，并断言successful return后的同actor command位于cursor之后且所有reservation /资源精确一次释放。overflow primary dimension必须有四组exact fixtures：空mailbox + oversized event=`PAYLOAD_BYTES`、item-full + small event=`ITEM_COUNT`、item尚有余量但prospective cumulative bytes超限=`PAYLOAD_BYTES`、item-full + oversized event=`PAYLOAD_BYTES`；metrics即使记录全部命中，public detail仍只断言一个primary dimension。terminal coordinator owner tests必须逐项断言exact notice validation、owner-loop marshal、本地watermark先于promotion、flag=false仍产生本地delivery wake但不promotion、ordinary promotion不推进watermark、同sequence duplicate幂等、较新false不吞较旧true，以及batch notices不按Session丢序号。non-Engine本地integrated barriers至少分别覆盖pre-dispatch cancel A + queued B、wait failed A + queued B、wait expiry A + queued B；每组冻结watcher并记录transaction-local exact terminal sequence，断言本地notice先wake、merge bounded catch-up发现A、只交付mailbox头部A prefix并保留首个B entry，A terminal first-commit / ack / clear / rebind后的下一次`anext()`才向generation B交付该entry。另必须增加双opener共享同一DB barrier：watcher与B在opener C、A terminal由opener A提交且C收不到本地notice；B entry携带same-validation-transaction读取的Attempt start fence，C用多页catch-up先交付A terminal并保留B entry。还要覆盖mailbox为空、无本地notice时periodic bounded reconciliation最终发现跨opener terminal。Engine terminal barrier、同事务candidate fence来源、publisher原样复制、多terminal EventLog顺序与无Service buffer / marker set / promotion pause仍必须覆盖。Service exact tests继续覆盖callback+close、EOF+close、public / non-public iterator+close、terminal+close、delivery-recovery-success+close、slot-empty+close、cancellation+close，逐项断言top-level exception / cause chain、stable reason、terminal return、最多一次sanitized diagnostic、diagnostic callback failure不改primary、late commit无效和Host reservation finally release；fake不得自建无界事件队列或task-exception side channel掩盖owner时序。
+
+当前可达 producer / callsite 闭集必须作为静态 acceptance，而不是 implementation 前再 audit：
+
+| producer owner | 当前 Session-visible terminal source | terminal notice / promotion 规则 |
+|---|---|---|
+| admission | queued、pre-dispatch、WAITING、RECOVERING cancel；terminal cancel ack；session-scope cancel；通用 `closeout_attempt_terminal` | 每个 terminal返回 exact notice；仅本 transaction新释放 active slot且仍需 promotion reconciliation时为 true。 |
+| waiting | failed / lost resolution、deadline expiry及同 scope幂等确认；WAITING cancel由 admission writer接线 | terminal result携带 exact Run terminal sequence；resume-only completion不产生 notice。 |
+| engine ingest | Engine succeeded / failed / cancelled、worker lost与 lifecycle terminal；accepted duplicate | commit / duplicate result携带 exact notice；terminal continuation不得再直接 promotion。 |
+| dispatch | active-cancel watchdog、attempt-free pre-start failure、worker-startup terminal closeout；worker lost交给 ingest owner | batch保留逐 terminal notices；ordinary accepted / queued promotion与dispatch wake仍走原 port。 |
+| startup recovery | recovering dispatch limit lost、unrecoverable orphan / cancelling lost closeout；其余 recovery action非 terminal | terminal action逐 notice保留；accepted / queued reconciliation继续是 ordinary promotion且不推进watermark。 |
+
+`tests/host/test_terminal_post_commit.py` 必须用 AST / qualified-callsite manifest 对仓库 production call graph做闭集比较：枚举所有调用 Run-terminal transition helpers或直接写入 Session-visible terminal row的 `(module, qualified producer, transition)`；上表当前 callsite必须全匹配，新增未登记 callsite立即失败。第二个 manifest只允许明确的 ordinary non-terminal owner与 `open_host` coordinator调用只含 `session_id` 的 `wake_queue_promotion(...)`；上述 terminal producer qualified functions内出现该调用必须失败。runtime fake port tests再逐 producer证明 `run_write` 返回后先消费 transaction result中的 exact notice、再进入所属opener的本地coordinator，且 promotion flag为 true也没有绕过 port。静态 manifest + runtime dataflow +三组non-Engine barrier只证明“每个producer接入其本地terminal wake / promotion coordinator且本地promotion无bypass”；不得声称AST或本地port单独证明跨opener delivery完备。跨openercorrectness必须由双opener共享DB、无本地notice、candidate / entry causal fence与多页catch-up barriers证明。未来任何新增 Session-visible terminal writer必须先扩展同一 typed result、producer manifest与 owner tests，否则不能合并。
+
+旧术语迁移是同一实施 WU 的显式 acceptance，而不是兼容范围：删除 `_TRANSIENT_WATCH_BUFFER_CAPACITY`、`_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY`、`_LIVE_STREAM_COMPONENT`、`_SLOW_CONSUMER_REASON_CODE`、`_SLOW_CONSUMER_MESSAGE`、`_slow_consumer_error()` 及 consumer / test / doc 中的 `slow_consumer`、`session_live_stream`、`UNAVAILABLE + HostUnavailableDetail` overflow 语义；不得保留别名、wrapper、双写 metric 或字符串兼容分支。
+
+README 触发面必须按各文件自身更新约束逐项检查：Host public contract / delivery 实现命中 `dayu/host/README.md`；Service relay 与状态机命中 `dayu/service/README.md`；runtime config schema / packaged JSON 命中 `dayu/config/README.md`；跨层装配、public iterator 与 `UI -> Service -> Host` 消费边界命中 `dayu/README.md`；测试分层与命令命中 `tests/README.md`。根 `README.md` 只有在 CLI / Web 用户可见工作流、配置步骤、输出或排障发生变化时才更新；本设计不预设一定命中。`docs/engine/design.md` 与 `dayu/engine/README.md` 在 Engine contract 未变化时不得机械更新。
+
+watcher topology 已裁决为 multi-watcher contract，实施 WU 必须按本节实现 per-Session attach reservation、cap、typed rejection 与 release contract，不得以单 watcher 假设重开。实施完成后必须运行受影响测试、单文件覆盖率检查、完整 pyright 与 README trigger audit。packaged items / bytes / max-subscriptions 三个数值、logical-byte 到 Python heap 的 safety margin与低基数metrics字段必须由同一implementation WU测量并写入验收证据；Service / UI callback快速同步非阻塞、慢I/O / CPU / renderer显式解耦也必须由同一WU实现并验收。它们均是该WU acceptance，不是design residual、独立future风险或重新打开字段/算法/error owner/topology的理由。本设计design residual=0、未归属residual=0，没有blocking open question，也不保留control-doc登记、producer reachability、terminal port接线、cross-opener fence或async attach residual、fallback或兼容分支。
 
 ## 5. Session 生命周期
 
@@ -713,7 +931,7 @@ Host durable store 是本地治理真源。第一版使用 SQLite 承载以下 d
 
 事务不变量：
 
-- EventLog event append 必须分配全局单调 `event_sequence`；`event_sequence` 是 Host event stream cursor、projection checkpoint、outbox dispatch、audit replay 与恢复扫描的主 cursor。
+- EventLog event append 必须分配全局单调 `event_sequence`；`event_sequence` 是 durable HostEvent / internal EventLog stream cursor、projection checkpoint、outbox dispatch、audit replay 与恢复扫描的主 cursor，不适用于 `HostTransientDelta`。
 - EventLog append 与必要 Run / Attempt 状态索引更新必须在同一 SQLite transaction 内完成，或具备等价原子性。
 - Run terminal fact 提交与 Run 终态更新必须原子。
 - Attempt terminal fact 提交与 Attempt 终态更新必须原子。
@@ -937,13 +1155,13 @@ Host Service-facing opener 固定为 capability-separated `open_host(options)` �
 
 Host opener close 是 handle lifecycle 语义，不是 Session / Run 治理事实。execution `Host` 与 `HostAdmin` 的 `close()` / context exit 都必须幂等；close 完成后，调用同一 handle 能力面上的任一方法必须 fail-fast 抛出 typed `HostClosedError` 或等价 lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经提交给 durable actor 的调用按正常事务与 after-commit wake 语义完成；close gate 之后的新调用统一抛 closed-handle exception。
 
-Host opener close 会终止当前 handle 持有的本地运行环境，但不得伪装成用户取消。close 流程必须停止 scheduler / promotion / background supervisor，不再启动新的 Attempt；必须向 active worker registry 传播 lifecycle cancel，使 Host 注入 Engine 的 cancellation token 可见，并通知 `LocalWorkerHandle.on_cancel(reason)` 这个 best-effort hook；随后关闭或取消当前 handle 持有的 active worker task、lane wait、stream fanout task 与本地 runtime resource，避免进程内任务泄漏。若 close 过程中 active worker 已经产出可确认 terminal event，Host 按正常 ingest / terminal closeout 追加事实。若 active worker 没有可确认 terminal，Host close 不得写 `CANCEL_REQUESTED`、`RUN_CANCELLED`、`RUN_FAILED` 或其它伪装用户意图 / 确认失败的 canonical fact；未收口 active Attempt 后续必须通过 Host lifecycle / Recovery 的 positive orphan proof 路径进入 `ATTEMPT_LOST`，再按 policy 进入 `RUN_RECOVERING` 或 `RUN_LOST`。调用方若要表达用户明确停止，应在 close 前显式调用 `cancel_run(...)` 或 `cancel_session_runs(...)`。
+Host opener close 会终止当前 handle 持有的本地运行环境，但不得伪装成用户取消。close 流程必须停止 scheduler / promotion / background supervisor，不再启动新的 Attempt；必须向 active worker registry 传播 lifecycle cancel，使 Host 注入 Engine 的 cancellation token 可见，并通知 `LocalWorkerHandle.on_cancel(reason)` 这个 best-effort hook；随后关闭或取消当前 handle 持有的 active worker task、lane wait、session delivery subscription 与本地 runtime resource，避免进程内任务泄漏。若 close 过程中 active worker 已经产出可确认 terminal event，Host 按正常 ingest / terminal closeout 追加事实。若 active worker 没有可确认 terminal，Host close 不得写 `CANCEL_REQUESTED`、`RUN_CANCELLED`、`RUN_FAILED` 或其它伪装用户意图 / 确认失败的 canonical fact；未收口 active Attempt 后续必须通过 Host lifecycle / Recovery 的 positive orphan proof 路径进入 `ATTEMPT_LOST`，再按 policy 进入 `RUN_RECOVERING` 或 `RUN_LOST`。调用方若要表达用户明确停止，应在 close 前显式调用 `cancel_run(...)` 或 `cancel_session_runs(...)`。
 
-P10.5 的 Host opener close shutdown order 是 implementation requirement，不是新的 public API 设计点。推荐顺序是：先关闭 public gate 并拒绝新进入 API；停止 scheduler / promotion / background supervisor，避免启动新 Attempt；关闭 session live watch fanout，让 watcher 正常结束或收到 Host lifecycle termination；取消或关闭当前 handle 持有的 active worker task、lane wait、worker stream consumer task；flush / close projection catch-up 与本地 runtime resources；最后关闭 durable store。全程不得写 `RUN_CANCELLED` / `RUN_FAILED` 或其它 terminal fact 来伪装用户意图；已经在 close 过程中确认的真实 terminal event 仍按正常 ingest / terminal closeout 处理。
+P10.5 的 Host opener close shutdown order 是 implementation requirement，不是新的 public API 设计点。推荐顺序是：先关闭 public gate 并拒绝新进入 API；立即关闭 Session Event Delivery publisher / subscriptions 并唤醒、清空 session live watchers；停止 scheduler / promotion / background supervisor，避免启动新 Attempt；取消或关闭当前 handle 持有的 active worker task、lane wait 与 worker stream consumer task；flush / close projection catch-up 与本地 runtime resources；最后关闭 durable store。全程不得写 `RUN_CANCELLED` / `RUN_FAILED` 或其它 terminal fact 来伪装用户意图；已经在 close 过程中确认的真实 terminal event 仍按正常 ingest / terminal closeout 处理。
 
 P10.5 冻结的是后续真实生产系统 Service 使用的普通多轮生产接线，不是 smoke 专用接线。P10.5 自身必须把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 在 P11-P15 实施完毕后会通过 Service 使用这里冻结的 Host public interface / contract 接入，不能等到真实入口接入时再补一条新接线。后续 phase 可以扩展 Recovery、ToolsDiscovery / ScenePrepare、Audit / Tool Trace / Outbox、RemoteProxy 与 Retention / Purge 能力，但不得要求真实入口绕过、替换或重写普通多轮会话的 Host 生产接线。
 
-`open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、compactor runner / storage config、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。scheduler、wakeup、active worker registry、dispatch control 等 Host 内部接线由 `open_host` composition root 自行创建或连接，不作为 Service-facing 参数暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
+`open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、compactor runner / storage config、context budget policy、memory catch-up、`HostSessionEventDeliveryPolicy`、background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。Session Event Delivery publisher / subscriptions、scheduler、wakeup、active worker registry 与 dispatch control 都由 `open_host` composition root 自行创建或连接；mailbox items / bytes 与 per-Session subscription cap 作为同一完整 typed runtime policy 由 Service-facing construction boundary 显式提供，内部 publisher、subscription、queue 或 callback 不对 Service 暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
 
 一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。override 是按字段 partial merge，不是 all-or-nothing profile：例如只传 `runner_options` 时，`RunnerSpec` 与 `AgentPolicy` 仍取 opener baseline；只传 `runner_spec` 时，runner call options 与 agent policy 仍取 opener baseline。每个出现的 override 对象本身必须是完整 typed value，不能是 patch dict、增量字段包或 extra payload。Host 不接收 raw provider client、callable、无结构 dict override、extra payload 或 `policy_overrides`；它可以接收 Service 已解析并封装进 typed `RunnerSpec.headers` 的 provider API key。`RunnerSpec.api_key_ref` 是 secret 来源引用名，不要求 `headers` 仍保持未解析。Host admission / dispatch 必须校验并把每个 Run 的 effective runner spec / runner options / agent policy 冻结到内部 durable canonical fact 或等价可恢复 snapshot，保证 retry / replay / recovery 使用并解释当时的准确执行配置；其中 resolved headers / API key 只属于受信任 Host internal durable state，不能进入 public / LLM-facing / log projection。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
 
@@ -960,7 +1178,7 @@ async with open_host(options) as host:
     session = await host.ensure_session(...)
     session_id = session.session_id
 
-    events = host.watch_session_events(session_id)
+    events = await host.watch_session_events(session_id)
     event_task = asyncio.create_task(consume_session_events(events))
 
     await host.submit_followup(
@@ -978,27 +1196,36 @@ async with open_host(options) as host:
 async with open_host(options) as host:
     session = await host.get_session(session_id)
 
-    events = host.watch_session_events(session.session_id)
+    events = await host.watch_session_events(session.session_id)
     await host.submit_followup(session.session_id, request)
 
     async for event in events:
-        render_once_by_terminal_identity(event)
+        if isinstance(event, HostTransientDelta):
+            render_selected_live_delta(event)
+            continue
+        render_durable_activity_or_terminal_once(event)
 ```
 
-这两个形态都以 `watch_session_events(session_id) -> AsyncIterator[HostEvent]` 为普通聊天主事件入口；`watch_session_events` 是 live watch，不接收 cursor，不负责离线补读。该 async iterator 在 session live watch 路径中产出 Host-owned typed `HostEvent`，不是 raw `EngineEvent`，也不是当前内部 EventLog 补读使用的薄 `HostEventView`。它对齐 Engine `run_agent_messages(...)` 的朴素 async generator 形态：调用方正常用 `async for` 消费；提前停止消费时，由调用方 cancel consumer task 或在返回对象支持 `aclose()` 时显式 `aclose()`，这只关闭本次 watch 订阅，不写 EventLog、不 cancel Run、不影响其它 watcher。terminal `HostEvent` 只是 iterator 中的一个事件，不让 iterator 自动结束；同一 Session 后续 queue / retry / replay / follow-up 事件仍可继续出现。Host handle 已 close 时打开 watch 必须抛 typed `HostClosedError` 或等价 lifecycle exception；session 不存在 / 已 purge 时抛 typed not-found / gone；Session `CLOSED` 仍允许 watch，因为它只拒绝新输入，不禁止读取事件。Host close 时已打开的 iterator 结束或抛 Host lifecycle termination，但不得写 EventLog 或 cancel Run。Service 拿到 `session_id` 后必须把 Outbox terminal 增量补读与 session live watch attach 视为同一个 attach / reconnect 协议：用客户端保存的 `last_seen_terminal_event_sequence` / `seen_terminal_event_ids` 读取 Outbox 中离线 terminal / final answer 增量，同时或随后打开 `watch_session_events(session_id)`，并用 `terminal_event_id` / `event_sequence` / `run_id` 去重，避免离线补读与 live watch 之间漏投或重复展示 terminal answer。一个 Run 的 terminal `HostEvent`，包括 final answer typed view，可在该 Session 的 async event iterator 中观察到。P10.5 不实现 Outbox read / drain API，不把离线 terminal 补读计入 smoke coverage；P10.5 只冻结 attach / reconnect recipe、terminal identity 与去重要求，Outbox concrete projection / read API / delivery queue 继续归 Phase 13。P10.5 不定义 `wait_final_answer(...)` public API；普通 Service 必须从 `watch_session_events(session_id)` 的 terminal HostEvent 取得在线 final answer，smoke 也不得用等待 helper 替代 live watch 主路径。
+这两个形态都以 `await watch_session_events(session_id) -> HostSessionEventIterator` 为普通聊天主事件入口，其中 `HostSessionEvent = HostEvent | HostTransientDelta`，`HostSessionEventIterator` 是 public 可关闭 async iterator Protocol。`watch_session_events` 是 async factory，不接收 cursor、不负责离线补读；它既不是 raw `EngineEvent` stream，也不是当前内部 EventLog 补读使用的薄 `HostEventView`。factory先reserve，await durable start cursor transaction，再在owner loop同一无`await`段attach并return；successful return是生效边界，cap+1在任何watcher mailbox / cursor transaction / task allocation前fail closed，首次`anext()`不得承担lazy attach。调用方必须用 union member type做 exhaustive branch：`HostEvent` 继续携带 durable identity、activity 与 terminal view，`HostTransientDelta` 只携带 live delta envelope。调用方正常用 `async for` 直接消费，不得在 Service 再复制进第二个事件 mailbox；提前停止消费时，调用方必须先停止并 await 唯一 consumer、确认无 active `anext()`，再调用 public `aclose()`。这只关闭本次 watch 订阅，不写 EventLog、不 cancel Run、不影响其它 watcher。terminal `HostEvent` 只是 iterator 中的一个事件，不让 iterator 自动结束；同一 Session 后续 queue / retry / replay / follow-up 事件仍可继续出现。
+
+watch attach 的 public failure timing 与 cleanup 固定如下：`await watch_session_events(...)`先执行public lifecycle gate；handle已关闭时抛`HostClosedError`且不reserve。打开状态下，owner loop先reserve，再await durable owner完成Session existence / start cursor transaction；Session missing / purged与durable read failure都在factory await中按public typed error返回，不推迟到首次`__anext__`，也不泄漏`HostDurableError`或private exception。durable transaction成功后回owner loop，在同一无`await`段注册transient subscription、记录本地watermark baseline并return；cursor snapshot到return间的committed durable rows从较早cursor读取，pre-return transient不承诺重放。cursor / attach / allocation failure、factory cancellation或Host close都由factory精确一次回滚reservation与partial resource；successful return后的首次/后续`__anext__` cancellation、iterator error、显式`aclose()`、never-started immediate `aclose()`与Host close由iterator owner精确一次detach / release。不存在pending cursor future、done callback或unhandled-future cleanup。调用方不得在active `__anext__`上并发调用`aclose()`；Service必须先停止并await sole consumer task。
+
+Session `CLOSED` 仍允许 watch，因为它只拒绝新输入，不禁止读取事件。Host close 时已打开的 iterator 正常结束，不写 EventLog、不 cancel Run。Service 拿到 `session_id` 后必须把 Outbox terminal 增量补读与 session live watch attach 视为同一个 attach / reconnect 协议：用客户端保存的 `last_seen_terminal_event_sequence` / `seen_terminal_event_ids` 读取 Outbox 中离线 terminal / final answer 增量，同时或随后打开 `watch_session_events(session_id)`，并只对 durable terminal 使用 `terminal_event_id` / `event_sequence` / `run_id` 去重；Outbox 不理解也不补放 `HostTransientDelta`。一个 Run 的 terminal `HostEvent`，包括 final answer typed view，可在该 Session 的 async iterator 中观察到。P10.5 不定义 `wait_final_answer(...)` public API；普通 Service 必须从 `watch_session_events(session_id)` 的 terminal `HostEvent` 取得在线 final answer，不得用等待 helper 替代 live watch 主路径。
 
 `HostEvent` 的边界：
 
-- `HostEvent` 是 Host ingest / 校验 / governance / EventLog commit 后形成的 Service-facing typed event。它可以引用原始 EngineEvent provenance，但不得把 raw `EngineEvent` 或 Host internal envelope 原样暴露给 Service。
+- `HostEvent` 是 EventLog commit 后形成的 durable Service-facing typed event。它可以引用原始 EngineEvent provenance，但不得把 raw `EngineEvent` 或 Host internal envelope 原样暴露给 Service。
 - 第一版 `HostEvent` 固定携带 `event_id`、`event_sequence`、`session_id`、`run_id?`、typed kind、dedupe identity 和 display payload。terminal HostEvent 必须包含 typed terminal view；`SUCCEEDED` terminal 必须 inline 可展示的 final answer view，字段固定为 `content`、`filtered`、`degraded`、`finish_reason` 与 terminal status。
-- tool event、thinking delta、content delta 是否展示由 UI 决定；Host 只负责把它们作为 typed HostEvent 暴露为可选择显示的事件，不在 Host 内部决定 UI 展示策略。
+- `HostEvent` 不包含 thinking / content / tool-call delta 可选字段；三类 delta 只能由 `HostTransientDelta` 表达。粗粒度 durable tool activity 是否展示仍由 UI 决定。
+- `HostTransientDelta` 是 Host ingest 完成 durable identity / late-state validation 后形成的 live-only public event；它使用 Host-owned typed payload，不暴露 raw `EngineEvent`，不携带 `event_id`、`event_sequence`、`event_class`、terminal status 或 offline cursor。
+- `HostSessionEvent` 只是上述两个 public 类型的封闭联合，不新建第三套 payload bag，也不改变任一 member 的 owner。
 - `HostEventView` 是 EventLog row 的 Host 内部薄读模型 / diagnostic DTO，可服务内部 run-scoped EventLog 补读、debug、diagnostic、drill-down 和局部断言；它不作为普通聊天主事件流的元素类型，也不从 `dayu.host` Service-facing public namespace 导出。
-- Phase 13 的 Audit / Tool Trace / Outbox 与 `watch_session_events` 一样消费 committed EventLog / typed projection input view；它们不需要也不得依赖 `HostEventView`、`watch_session_events` 或 Service-facing `HostEvent` display view，也不得从 raw EngineEvent 直接派生 truth。
+- Audit / Tool Trace / Outbox 只消费 committed EventLog / typed projection input view；它们不得依赖 `HostEventView`、`watch_session_events`、`HostEvent` display view 或 `HostTransientDelta`，也不得从 raw EngineEvent 直接派生 truth。
 
 类型归属规则：
 
 - `dayu.contracts` 只承载 Host 与 Engine / ToolRuntime 边界都必须理解的层间协作契约，例如现有 `ToolBundle`、`ToolDefinition`、`ToolSchema`、`ToolExecutor`、批式工具调用 / outcome、取消观察 token 与严格 JSON 值。
-- Host 公共 API 类型放在 `dayu.host` 的公共命名空间，而不是放进 `dayu.contracts`。这些类型包括 Host handle / command facet、`HostCallContext`、`OperationContext`、各 mutating request、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventStream`、Session / Run / Attempt status enum、Host API error code 与 stream cursor 类型。Service / UI 可以按向下依赖关系 import `dayu.host` 公共类型；Engine 不得 import 这些类型。
+- Host 公共 API 类型放在 `dayu.host` 的公共命名空间，而不是放进 `dayu.contracts`。这些类型包括 Host handle / command facet、`HostCallContext`、`OperationContext`、各 mutating request、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、durable `HostEvent`、`HostTransientDelta` payload 闭集、`HostSessionEvent` 联合、可关闭 `HostSessionEventIterator` Protocol、`HostSessionEventDeliveryPolicy`、delivery-specific error detail / reason / limit-dimension enum、session-event admission detail / reason enum、Session / Run / Attempt status enum、Host API error code 与 durable stream cursor 类型。Service / UI 可以按向下依赖关系 import `dayu.host` 公共类型；Engine 不得 import 这些类型。
 - Host 内部类型留在 `dayu.host` 内部模块，不从公共命名空间导出。这些类型包括 durable EventLog row、状态索引 row、dispatch record、idempotency record、transaction object、policy provider set、ToolRuntime snapshot、accept barrier 内部 candidate、projection checkpoint row、recovery scan record 与 background supervisor 私有状态。
 - 如果某个类型同时被多层读写，必须先审视边界是否过宽；不能因为多个调用方想复用 dataclass 就把 Host 私有治理状态提前提升到 `dayu.contracts`。
 
@@ -1013,7 +1240,7 @@ close_session(host, session_id, request) -> SessionSnapshot
 purge_session(host, session_id, request) -> PurgeSessionResult
 
 get_run(host, run_id) -> RunSnapshot
-watch_session_events(host, session_id) -> AsyncIterator[HostEvent]
+await watch_session_events(host, session_id) -> HostSessionEventIterator
 report_storage_usage(host) -> HostStorageUsageReport
 run_storage_maintenance(host, request) -> HostStorageMaintenanceResult
 cancel_run(host, run_id, request) -> RunSnapshot
@@ -1215,7 +1442,7 @@ Run 接口语义：
 
 - `submit_followup(queue)` 是 Service / UI 发送普通 prompt 的统一入口，包括同一 Session 的第一条 prompt。调用方取得 Session 后不需要判断“首轮调用 `start_run`、后续调用 `submit_followup`”；Host 在 admission transaction 内决定该输入是直接成为可启动 Run，还是排到当前 active Run 后面。
 - `get_run`：读取 RunSnapshot；不触发执行、不触发 queue promotion、不改变 Run / Attempt 状态。
-- `watch_session_events` / session-level Host event stream：Service / UI 观察 agent session 的主事件流。在线 / 已 attach 客户端通过 live watch 接收目标 Session 的事件，适合多客户端打开同一 Session、排队 Run、steer、retry / replay 链路和 final answer 展示。调用方可以先打开 session event stream，再并发提交 `submit_followup(...)` / `retry_run(...)` / `replay_run(...)` 等 mutation；事件观察与命令提交是两条并行通道，不要求 `submit_followup` 后才开始读某个 run stream。`watch_session_events` 不接收 cursor，不承担离线补读；Service 取得 Session 后进入 attach / reconnect 流程：先按客户端已保存的 terminal watermark / seen ids 补读 Outbox terminal 增量，再进入或保持 session live watch；实现上必须用 `terminal_event_id` / `event_sequence` / `run_id` 去重，避免 Outbox drain 与 live watch attach 之间出现漏消息窗口。断线后的在线 terminal/final answer 补读由 Outbox terminal delivery queue 承接；未 attach / 离线渠道不靠 live watch 接收中间过程。
+- `watch_session_events` / session-level Host event stream：Service / UI 观察 agent session 的主事件流。在线 / 已 attach 客户端通过 public `HostSessionEventIterator` 接收目标 Session 的 `HostSessionEvent` 封闭联合，适合多客户端打开同一 Session、观察三类 live-only delta、排队 Run、steer、retry / replay 链路和 final answer 展示。调用必须`await watch_session_events(...)`；successful return后iterator已生效，调用方此后才可提交`submit_followup(...)` / `retry_run(...)` / `replay_run(...)`等同actor mutation，首次`anext()`不能补做attach。iterator facade 直接合流 EventLog reader 与唯一 transient mailbox / in-flight retained state，Service 不得为同一 subscription 再建事件 relay buffer；每个 watch runtime 恰好一个 consumer task 是 sole `anext` 和唯一 observation-result first-commit owner，command / durable probe 只等待容量一、generation-tagged closed union slot。`watch_session_events` 不接收 cursor，不承担离线补读；Service 取得 Session 后进入 attach / reconnect 流程：先await live watch并建立sole consumer，再按客户端已保存的 terminal watermark / seen ids 补读 Outbox terminal 增量并用 durable terminal 的 `terminal_event_id` / `event_sequence` / `run_id` 去重，避免 Outbox drain 与 live watch attach 之间出现漏消息窗口。断线后的 terminal/final answer 补读由 Outbox terminal delivery queue 承接；pre-return、未 attach / 离线渠道不接收也不补放 transient delta。
 - 普通 Service 的官方事件入口只有 `watch_session_events(session_id)`。普通多轮 recipe、thin Service proof、P10.5 no-tool / mock-tool / real-runner smoke 都必须走 session-level live watch，不能用内部 run-level EventLog 补读绕过 session live watch 来证明多轮闭环。
 - 内部 `stream_run_events` / run-scoped EventLog 补读：从全局 `event_sequence` cursor 补读目标 Run 的事件。它是 Host 内部 diagnostic / detail / debug / drill-down helper，只服务内部测试、排查某次 retry / replay source run 或运维诊断；不得和 `watch_session_events` 并列成为 Service-facing 聊天入口。若未来要公开给 Run detail 页面，必须先定义 public diagnostic event DTO，不得直接暴露内部 `HostEventView`。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
@@ -1230,7 +1457,7 @@ Run 接口语义：
   failed / cancelled / lost。外部结果引用或 payload ref 只能作为 `outcome` envelope 的受限字段，不能替代显式 outcome
   类型与 Host 状态机含义。`resolve_wait(host, wait_id, request)` 成功返回当前 `RunSnapshot`。
 
-第一版公共 API 不暴露开放式 policy knobs。Host policy 可以有默认值，但 request 不能携带无结构 `policy_overrides`。`CancelRunRequest.mode` 第一版唯一值为 `graceful`；不支持 `force` / `immediate`。`retry_run` 是否复用 accepted tool facts、重试次数和退避由 Host retry policy 决定。`replay_run` 固定复用源 Run accepted tool facts / evidence anchors，固定 no tools，固定只做结构修复。
+第一版公共 command request 不暴露开放式 policy knobs。Host policy 可以有 typed construction-time 输入，但 request 不能携带无结构 `policy_overrides`；`HostSessionEventDeliveryPolicy` 是 `open_host` runtime policy，不是 per-Run request knob。`CancelRunRequest.mode` 第一版唯一值为 `graceful`；不支持 `force` / `immediate`。`retry_run` 是否复用 accepted tool facts、重试次数和退避由 Host retry policy 决定。`replay_run` 固定复用源 Run accepted tool facts / evidence anchors，固定 no tools，固定只做结构修复。
 
 Run 读取与结果边界：
 
@@ -1260,9 +1487,13 @@ Snapshot 最小语义：
 - `RunSnapshot`：`run_id`、`session_id`、status、current attempt、terminal result summary、event_sequence cursor、source_run_id?、source_run_relation?、outbox summary。
 - `FollowupSnapshot`：accepted input ref、behavior、`accepted_run_id`、`accepted_run_status`、command commit event sequence / durable read watermark。`accepted_run_status` 使用公共 `RunStatus`，表达 command commit 后该 Run 的 durable 状态；该 watermark 不得被解释为 `watch_session_events` 的 cursor，因为 session live watch 不接收 cursor。`submit_followup(queue)` 有 active / start-blocking Run 时通常为 `QUEUED`，无 active / start-blocking Run 时为 `ACCEPTED`，随后由 scheduler / pre-start governance 推进到 `RUNNING` 或 terminal。`queued_run_id` 不进入普通 Service-facing 主 contract；如内部或 diagnostic view 保留，只能作为派生可选字段表达真正处于 `QUEUED` 的 Run，不能承载 accepted / running Run id，也不能替代 `accepted_run_id`。steer 分支可携带 `target_run_id?`，但 Phase 4 steer 返回 `unsupported_operation`，不会产生 accepted steer snapshot。
 - `PurgeSessionResult`：`session_id`、purged marker、purge tombstone ref、deleted counts / digest。
-- `HostEvent`：session live watch 的 Service-facing typed event。它由 committed EventLog / Host ingest result 派生，不能是 raw `EngineEvent` passthrough；terminal HostEvent 必须 inline typed terminal / final answer display view。
+- `HostEvent`：session live watch 的 durable Service-facing typed event。它只由 committed EventLog row 派生，不能是 raw `EngineEvent` passthrough；terminal HostEvent 必须 inline typed terminal / final answer display view。
+- `HostTransientDelta`：session live watch 的 live-only Service-facing typed event。它只在 ingest durable validation pass 后由当前 runtime Session Event Delivery publisher 发布，payload 闭集固定为 content / reasoning / tool-call delta，不进入 EventLog。
+- `HostSessionEvent`：`HostEvent | HostTransientDelta` 的 public 封闭联合。
+- `HostSessionEventIterator`：`AsyncIterator[HostSessionEvent]` 的 public 可关闭 Protocol，显式提供幂等 `aclose()`；Service 直接依赖该 contract，不定义私有 cast seam。
+- `HostSessionEventDeliveryPolicy`：runtime composer / operator 显式传给 `OpenHostOptions.session_event_delivery_policy` 的 typed opener-wide policy；required 字段为非 bool 正整数 `transient_mailbox_max_items`、`transient_mailbox_max_bytes`、`max_subscriptions_per_session`，共同表达每订阅 retained item / byte budget 与每 Session multi-watcher admission cap；不改变 durable EventLog reader、Run / Attempt 或 terminal policy，不允许 per-subscription override。
 - `HostEventView`：EventLog row 的 Host 内部薄读模型 / diagnostic DTO，主要用于内部 run-scoped EventLog 补读、diagnostic / detail / debug / drill-down、测试局部断言，字段只包含 event identity、class/type、scope 与 payload ref / digest；不从 `dayu.host` Service-facing public namespace 导出。
-- session live watch：`watch_session_events(session_id) -> AsyncIterator[HostEvent]`，返回 typed `HostEvent` 异步流，必须保留全局 `event_sequence` ordering truth。只有内部 run-level EventLog 补读接收 cursor；普通 Service-facing live watch 不接收 cursor。`HostEventStream` 若在代码中保留，只能作为内部实现或类型别名表达 async event iterator，不得成为需要 Service 理解的 context manager / subscription handle。
+- session live watch：`await watch_session_events(session_id) -> HostSessionEventIterator`。successful return是subscription生效边界；durable member保留全局`event_sequence` ordering truth，transient member保留当前runtime的`runtime_sequence` ordering truth，两者不可比较。iterator facade内的durable reader与transient subscription是不同owner；前者有界分页拉取EventLog，后者持有本subscription唯一的有界mailbox，每个entry还携带引用既有`Attempt.started_event_sequence`的Host-internal causal fence。只有内部run-level EventLog补读接收cursor；普通Service-facing live watch不接收cursor。`HostEventStream`若在代码中保留，只能表示内部EventLog补读结果，不得成为需要Service理解的context manager / subscription handle。
 
 公共错误分类至少包括：
 
@@ -1272,6 +1503,8 @@ Snapshot 最小语义：
 - `idempotency_conflict`
 - `permission_denied`
 - `unsupported_operation`
+- `delivery_interrupted`
+- `resource_exhausted`
 - `unavailable`
 - `internal_error`
 
@@ -1282,6 +1515,8 @@ Snapshot 最小语义：
 - `invalid_state`：目标对象存在，但该状态下不允许此操作。
 - `permission_denied`：上层传入的 authorization claims 不满足 Host policy。
 - `unsupported_operation`：public request / response envelope 已冻结，但完整语义由后续 phase 落地；它不表达目标对象状态错误，也不能伪装成 `invalid_state`。
+- `delivery_interrupted`：当前调用方的 live delivery continuity 已中断，但 Host execution、Run 与 durable truth 仍可用；固定为 non-retryable，调用方只能降级到对应 durable recovery path，不能把它当作 Host outage 或立即重订阅提示。
+- `resource_exhausted`：目标 owner 的公开资源 reservation 当前已满；Session event watch attach 只允许以 `HostSessionEventAdmissionDetail(reason=SESSION_SUBSCRIPTION_LIMIT_REACHED)` 使用该 code，固定 `retryable=true`，表示既有 watcher 释放后可重试，不表示 Host execution unavailable，也不授权驱逐既有 watcher。
 - `unavailable`：execution scheduler 已报告 fatal 或 Host 尚未完成 startup；固定为 retryable，detail 只包含稳定 component / reason code，不泄漏原始异常文本。
 
 `HostApiError` 必须是受限 typed contract：`code`、`message`、`retryable` 与 `detail?`。`detail` 只能是 Host 公共 API 中显式定义的 detail union 成员，禁止无结构 `extra` / `payload` / `metadata` god bag。第一版至少包含：
@@ -1296,9 +1531,20 @@ SteerConflictDetail:
 HostUnavailableDetail:
   component
   reason_code
+
+HostSessionEventDeliveryDetail:
+  reason: HostSessionEventDeliveryReason
+    - TRANSIENT_MAILBOX_OVERFLOW
+  limit_dimension: HostSessionEventDeliveryLimitDimension
+    - ITEM_COUNT
+    - PAYLOAD_BYTES
+
+HostSessionEventAdmissionDetail:
+  reason: HostSessionEventAdmissionReason
+    - SESSION_SUBSCRIPTION_LIMIT_REACHED
 ```
 
-`SteerConflictDetail` 只携带足以解释 steer precondition 失败的 Run id 与状态摘要，不嵌入完整 `RunSnapshot`，不暴露 Host durable row。后续新增错误 detail 时必须新增具体 typed detail，不得把显式参数塞进无结构 payload。
+`SteerConflictDetail` 只携带足以解释 steer precondition 失败的 Run id 与状态摘要，不嵌入完整 `RunSnapshot`，不暴露 Host durable row。`HostSessionEventDeliveryDetail` 只表达当前 subscription 的 live continuity failure 和命中维度，不携带 delta 正文、Host availability、Run failure reason 或可变错误文本；`TRANSIENT_MAILBOX_OVERFLOW` 必须与 `HostApiErrorCode.DELIVERY_INTERRUPTED`、`retryable=false` 一起使用。`HostSessionEventAdmissionDetail` 只表达 Session Event Delivery attach reservation 已达到 session cap；`SESSION_SUBSCRIPTION_LIMIT_REACHED = "session_subscription_limit_reached"` 必须与 `HostApiErrorCode.RESOURCE_EXHAUSTED = "resource_exhausted"`、`retryable=true` 一起使用，不携带 mailbox 内容、既有 watcher identity 或 Host availability。后续新增错误 detail 时必须新增具体 typed detail，不得把显式参数塞进无结构 payload。
 
 内部 run-scoped EventLog 补读从 EventLog `event_sequence` cursor 读取，不触发新执行。Phase 4 既有 cursor contract 在 P10.5 后降为内部 diagnostic / detail read path：
 
@@ -1307,7 +1553,7 @@ HostUnavailableDetail:
 - 内部 run-scoped EventLog 补读只返回与目标 `run_id` 相关的 `HostEventView`；需要 Service-facing session timeline 时走 `get_session` snapshot、`watch_session_events` 或后续 read-model API，不把 session projection 当作本接口真源。
 - filtering 发生在 EventLog read path 上，`next_cursor` 以本次已经扫描过的最大全局 `event_sequence` 为准；即使过滤后结果为空，只要扫描推进，`next_cursor` 也必须前进，避免重连时重复扫描同一窗口。
 - 如果没有扫描到任何大于 cursor 的 EventLog row，返回空 events，`next_cursor` 等于输入 cursor。
-- `HostEventView` 是 EventLog row 的内部视图映射：携带 `event_id`、`event_sequence`、event type / class、`run_id`、`session_id?`、payload ref / digest 与必要 summary；不得暴露 durable row 私有列，也不得从 projection 派生新的事实。`HostEventView` 不承担 Service-facing live watch display payload；session live watch 必须产出 typed `HostEvent`。
+- `HostEventView` 是 EventLog row 的内部视图映射：携带 `event_id`、`event_sequence`、event type / class、`run_id`、`session_id?`、payload ref / digest 与必要 summary；不得暴露 durable row 私有列，也不得从 projection 派生新的事实。`HostEventView` 不承担 Service-facing live watch display payload；session live watch 必须产出 typed `HostSessionEvent`。
 - Phase 4 不引入 projection truth；Phase 8 可以基于同一 cursor contract 建 projection / read model，但不能改变内部补读路径的 truth 来源。
 
 ## 12. Follow-up 与 Steer
@@ -1403,7 +1649,7 @@ terminal / steer 竞态规则：
 
 ## 13. EventLog
 
-EventLog 是 Host 的 append-only event ledger。`event_class=canonical_fact` 的子集是 Host canonical fact source；preview / diagnostic / projection signal 可以为了 Host event stream 或诊断进入同一 cursor 空间，但不能成为治理真源。
+EventLog 是 Host 的 append-only event ledger。`event_class=canonical_fact` 的子集是 Host canonical fact source；粗粒度 preview / diagnostic / projection signal 可以为了 durable HostEvent 或诊断进入同一 cursor 空间，但不能成为治理真源。三类 per-chunk delta 不属于该 ledger。
 
 EventLog 不变量：
 
@@ -1412,7 +1658,7 @@ EventLog 不变量：
 - 是否挂载 Observer / Sink 不能改变 EventLog 行为。
 - 同一输入在同一 Host 状态下，append 成功条件、事件顺序、状态迁移、恢复语义和调用方可见结果必须一致。
 - Projection / audit / memory / timeline / usage / tool trace 不得 append 或 update EventLog。
-- preview / reasoning / display-only event 可以用于 Host event stream，但不能成为 memory / audit / resume 真源。
+- 粗粒度 preview / display-only EventLog row 可以用于 durable HostEvent，但不能成为 memory / audit / resume 真源；reasoning per-chunk delta 只能走 transient contract。
 - 每条 event 必须显式标注 `event_class`；缺省不得被解释为 canonical fact。
 - 只有 `canonical_fact` 可以驱动 Run / Attempt 状态迁移、recovery、resume、memory verified inputs、audit 责任主链和 outbox terminal delivery intent。
 - `preview` 可以按 `event_sequence` 补读以恢复 UI 体验，但 preview 丢失、压缩或清理不得影响 Run terminal、messages rebuild 或 memory。
@@ -1445,7 +1691,7 @@ event_log
 
 排序与幂等：
 
-- `event_sequence` 是 SQLite 分配的全局单调 INTEGER 序列，是所有 Host event stream cursor、projection checkpoint、outbox dispatch、audit replay 和 recovery scan 的主 cursor。它只能由 Host durable store 在 append transaction 中分配；远端 sequence、client request order、projection checkpoint 或内存 counter 都不能替代它。
+- `event_sequence` 是 SQLite 分配的全局单调 INTEGER 序列，是所有 durable HostEvent / internal EventLog stream cursor、projection checkpoint、outbox dispatch、audit replay 和 recovery scan 的主 cursor。它只能由 Host durable store 在 append transaction 中分配；远端 sequence、client request order、projection checkpoint 或内存 `runtime_sequence` 都不能替代它。
 - `event_id` 是 Host ledger event identity，使用 TEXT 存储并全局唯一。所有 `event_class` 都必须有 ledger identity；`canonical_fact` 的 `event_id` 同时是 canonical event identity。重复 ingest 同一 canonical `event_id` 必须返回已接受结果，不得 append 第二条 canonical event。
 - EventLog schema 必须显式约束 `event_id` 全局唯一、`event_sequence` 全局单调唯一、`event_class` 必填、`event_type` 必填。`payload_json` 为 canonical JSON TEXT；大 payload 只通过 `payload_ref` / descriptor 与 `payload_digest` 引用。
 - client operation id、remote event identity、canonical event identity 必须分层。`client_request_id` 标识客户端 API 操作幂等；remote event identity 标识 Proxy / Stub / EngineWorker 回传来源事件；canonical `event_id` 标识 Host EventLog 中单条 canonical fact。
@@ -1467,6 +1713,7 @@ Event ingest semantic contract：
 event source
   -> validate source identity
   -> validate run_id / attempt_id / execution_id when attempt-scoped
+  -> if content/reasoning/tool-call delta: build typed transient candidate, commit validation transaction, publish non-blocking, stop
   -> derive canonical event identity
   -> check idempotency
   -> classify as canonical / preview / projection input / diagnostic / rejected
@@ -1481,7 +1728,7 @@ canonical ingest 必须满足：
 - duplicate canonical identity 返回既有 accepted event，不追加第二条。
 - out-of-order remote event 只能在不破坏 Host 状态机时被接受；否则进入 diagnostic 或 rejected。
 - terminal event 一旦 accepted，同一 Run 的后续 steer / cancel / late terminal 不能改写 terminal fact。
-- preview event 可以进入 Host event stream，但不能让 RunResult、memory、audit 或 recovery 依赖它。
+- 粗粒度 preview event 可以进入 durable HostEvent stream，但不能让 RunResult、memory、audit 或 recovery 依赖它；per-chunk delta 不得走该分支。
 
 ### 13.1 Payload 存储
 
@@ -1646,7 +1893,7 @@ Host LLM-facing 参数文本不做独立 normalized/safe-args 层。LLM-facing �
 EngineEvent 到 Host EventLog 的映射原则：
 
 - 参与恢复、resume、memory、audit、governance 的 EngineEvent 映射为 canonical event。
-- 只服务 UI 流式体验的 per-delta EngineEvent 默认被 Host 接受但不写入主 EventLog；它们不进入 canonical projection，也不承诺 durable replay。当前 transient delta 子集是 `content_delta` 与 `tool_call_delta`。`reasoning_delta` 因 live thinking 展示需要写入 `PREVIEW` row，但仅供运行态 Host event stream 投影，不成为 memory、audit、resume、outbox terminal 或 canonical replay 真源。
+- 只服务 UI 流式体验的 `content_delta`、`reasoning_delta`、`tool_call_delta` 必须先经过 Host EngineEvent ingest 的 durable identity / late-state validation，再投影为 typed transient candidate，并 non-blocking handoff 给当前 runtime Session Event Delivery publisher 形成 `HostTransientDelta`；ingest 不读取或决定任何 per-consumer mailbox policy。三者均不写主 EventLog，不进入 canonical projection，也不承诺 durable replay。
 - Host 可以把多个 EngineEvent 聚合成一个 canonical fact，但不得丢失恢复必须的信息。
 - 工具事实 canonical owner 是 ToolRuntime Host accept path。EngineEvent ingest 不得为同一工具 outcome 追加第二条工具 canonical fact；描述已 accepted 工具结果的 EngineEvent 必须携带 accepted event refs / accepted tool fact ids，并只能映射为 preview、diagnostic、trace 或 idempotent no-op。
 
@@ -1654,10 +1901,10 @@ EngineEvent 到 Host EventLog 的映射原则：
 
 ```text
 iteration_started              -> preview
-content_delta                  -> accepted non-durable delta; no EventLog row by default
-reasoning_delta                -> preview (live thinking display only; not canonical replay truth)
+content_delta                  -> accepted HostTransientDelta; no EventLog row
+reasoning_delta                -> accepted HostTransientDelta; no EventLog row
 content_completed              -> preview
-tool_call_delta                -> accepted non-durable delta; no EventLog row by default
+tool_call_delta                -> accepted HostTransientDelta; no EventLog row
 tool_calls_batch_ready         -> preview or diagnostic
 tool_call_requested            -> TOOL_CALL_REQUESTED
 ToolRuntime policy decision     -> TOOL_CALL_GOVERNED when decision affects execution / guidance / audit / duplicate handling
@@ -1851,7 +2098,7 @@ audit projection 可以为了查询重组，但不能反向成为恢复、resume
 
 ## 16. Read Model / Host Event Stream / Outbox
 
-EventLog 是真源；Run result、Session timeline、Host event stream、audit、usage、tool trace、memory snapshot、outbox 都是 read model 或 projection。public HostEvent / read API、outbox、memory / compact / evidence 与任何 LLM-facing material 只能输出各自 typed owner 明确选择的业务字段，不得透传内部 effective execution snapshot、provider headers 或 API key；Host / Service / Engine operator logs 同样不得记录这些 secret 明文。
+EventLog 是 durable 真源；Run result、Session timeline、durable `HostEvent`、audit、usage、tool trace、memory snapshot、outbox 都是 read model 或 projection。`HostTransientDelta` 是 Session Event Delivery 拥有的 runtime live delivery，不是 read model 或事实真源。public HostEvent / read API、outbox、memory / compact / evidence 与任何 LLM-facing material 只能输出各自 typed owner 明确选择的业务字段，不得透传内部 effective execution snapshot、provider headers 或 API key；transient payload 同样只能使用显式 Host public dataclass 字段，不能透传 raw Engine metadata。Host / Service / Engine operator logs 不得记录这些 secret 明文。
 
 公共读取语义：
 
@@ -1859,8 +2106,10 @@ EventLog 是真源；Run result、Session timeline、Host event stream、audit�
 get_run(run_id)
   -> RunSnapshot(status, terminal summary, active attempt, cursors)
 
-watch_session_events(session_id)
-  -> live Host event stream for a Session, ordered by EventLog event_sequence
+await watch_session_events(session_id)
+  -> public closable HostSessionEventIterator for a Session
+     HostEvent ordered by durable event_sequence
+     HostTransientDelta ordered by runtime_sequence
 
 internal stream_run_events(run_id, cursor, limit?)
   -> internal run-scoped diagnostic / detail / debug stream from EventLog event_sequence cursor
@@ -1874,7 +2123,9 @@ get_session(session_id)
 - `RunResult` 是 Run 终态投影，不是事实真源。
 - `Session timeline` 是 UI / read model，不是事实真源。
 - Session timeline 必须能表达“已取消的用户输入”和后续新输入是两条不同 `USER_INPUT_ACCEPTED`。聊天 UI 可以折叠或弱化 cancelled input，但不能把新输入建模为旧输入的 edit。
-- `watch_session_events` 是普通 Service-facing 官方事件入口：在线 / 已 attach 客户端通过 live watch 接收 attach 之后的 Session 事件；它不接收 cursor，不承担离线补读。
+- `watch_session_events` 是普通 Service-facing async factory与官方事件入口：在线客户端只在successful await return后成为已attach；它不接收cursor、不承担离线补读，pre-return transient不承诺重放。
+- `watch_session_events` 对 durable / transient 两个 member 只承诺各自 sequence domain 和同 Run terminal fence，不承诺可持久化的跨 domain 总序；离线 reader、Outbox、restart / reconnect path 只能恢复 durable member。
+- `watch_session_events` 的 public 可关闭 iterator facade 在内部合流 EventLog reader 与一个 opener-wide policy 配置、items / bytes 双有界的 transient subscription mailbox + 唯一 in-flight retained state；只允许单项 pop / transfer，不允许 batch drain。每个entry携带同事务Attempt start causal fence，pop前cursor必须追到fence；mailbox为空仍periodic bounded reconcile，使跨opener terminal不依赖本地notice最终可见。普通 Service / UI adapter 不再建立第二个事件 relay buffer。Host publish 不等待被动 consumer 或 mailbox capacity，overflow 只隔离当前 subscription；同 event loop 的阻塞 callback、CPU starvation 与 O(N) fanout 不属于物理隔离承诺，callback 快速非阻塞约束及其执行域适配由 Service / UI owner 负责。multi-watcher 是已冻结 public contract；Session Event Delivery 以 required `max_subscriptions_per_session` 做 attach-time reservation，使每 Session retained logical budget 与 fanout 上界可由 cap × per-subscription budget 推导。cap+1 使用专属 `resource_exhausted` admission error，不驱逐既有 watcher；Host 全局 Session 数量与跨 Session 总内存仍不由该 per-Session contract 承诺。
 - internal `stream_run_events` 不触发新执行，只提供 Host 内部 run-scoped diagnostic / detail / debug / drill-down 读取，不进入普通 Service 多轮 recipe、public contract 或 smoke 主路径。
 - 投影损坏或缺失时应能从 EventLog 重建。
 - resume、memory、audit 责任链必须读取 EventLog canonical facts。
@@ -1886,11 +2137,11 @@ Outbox：
 - Outbox 不是客户端阅读 final answer 的通用接口，也不是 UI read model。
 - Outbox 是离线 / 外部投递路径的 durable terminal delivery queue，表达 terminal result 可投递 / 可通知的 durable item。
 - Outbox 解决的问题是：离线客户端或外部渠道不需要回放中间过程，也不能丢 final answer / terminal notification。
-- Outbox 不包含完整 run timeline，不补 preview / progress / reasoning / streaming content。
+- Outbox 不包含完整 run timeline，不补 preview / progress / content / reasoning / tool-call delta。
 - 在线阅读路径和 Outbox 离线投递路径必须指向同一个 terminal identity。UI / Service 应使用 `terminal_event_id` / `event_sequence` / `run_id` 去重，不得用 final answer 文本内容去重。
 - UI 本地聊天记录应保存已展示 terminal answer 的 terminal watermark，例如 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids`。客户端重连时，Service / channel adapter 按该 watermark 从 Outbox 读取 terminal 增量；已展示过的 terminal item 不得作为新消息重复投递。
-- Service 取得或重新打开 Session 后，必须把 Outbox terminal 增量补读和 session live watch attach 视为一个 attach / reconnect 协议。业务语义上先补离线 terminal，再接入 live watch；实现上可以先建立 `watch_session_events(session_id)` 再 drain Outbox，也可以先 drain Outbox 再打开 live watch，但必须依靠 `terminal_event_id` / `event_sequence` / `run_id` 去重，并证明两步之间没有漏投 terminal 的窗口。
-- Outbox 只补未 attach / 离线期间的 terminal/final answer 通知，不补完整中间过程；reasoning delta、content delta、tool progress、preview 等在线过程事件只属于 session live watch / read model。
+- Service 取得或重新打开 Session 后，必须把 Outbox terminal 增量补读和 session live watch attach 视为一个 attach / reconnect 协议。业务语义上先补离线 terminal，再接入 live watch；实现上可以先成功`await watch_session_events(session_id)`再drain Outbox，也可以先drain Outbox再await live watch，但必须依靠`terminal_event_id` / `event_sequence` / `run_id`去重，并证明两步之间没有漏投terminal的窗口。
+- Outbox 只补未 attach / 离线期间的 terminal/final answer 通知，不补完整中间过程；content / reasoning / tool-call delta 只属于当前 runtime 的 session live watch，不属于 read model，粗粒度 tool progress / preview 仍按各自 EventLog contract 进入在线 watch 或内部读取。
 - Host 不负责 deliver to UI，不判断哪些客户端应该收到，不记录 GUI / CLI / WeChat / Web 的 channel 投递成功状态。
 - Session 不持有唯一 default delivery target；HostCallContext 不包含 delivery target / delivery hint。
 - 具体投递目标、投递成功状态、channel retry、WeChat / Web / notification binding 属于 Service / UI / channel adapter。

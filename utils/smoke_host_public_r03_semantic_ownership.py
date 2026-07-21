@@ -38,6 +38,7 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    HostSessionEvent,
     OpenHostOptions,
     OperationContext,
     open_host,
@@ -689,7 +690,7 @@ def _exact_tool_prompt(
 async def _run_round(
     *,
     host: Host,
-    watcher: AsyncIterator[HostEvent],
+    watcher: AsyncIterator[HostSessionEvent],
     session_id: str,
     label: str,
     client_request_id: str,
@@ -700,7 +701,7 @@ async def _run_round(
     """提交一轮 public follow-up 并等待 terminal。
 
     :param host: public Host handle。
-    :param watcher: session event iterator。
+    :param watcher: durable/transient 联合 session event iterator。
     :param session_id: public Session id。
     :param label: 轮次标签。
     :param client_request_id: 调用方幂等 id。
@@ -739,12 +740,12 @@ async def _run_round(
 
 
 async def _next_terminal(
-    watcher: AsyncIterator[HostEvent],
+    watcher: AsyncIterator[HostSessionEvent],
     run_id: str,
 ) -> HostEvent:
     """等待指定 public Run terminal event。
 
-    :param watcher: session event iterator。
+    :param watcher: durable/transient 联合 session event iterator。
     :param run_id: 目标 Run id。
     :returns: terminal HostEvent。
     :raises TimeoutError: 超过 smoke timeout 时抛出。
@@ -759,6 +760,8 @@ async def _next_terminal(
         """
 
         async for event in watcher:
+            if not isinstance(event, HostEvent):
+                continue
             if event.run_id == run_id and event.terminal_status is not None:
                 return event
         raise RuntimeError("Host event iterator ended before terminal event")

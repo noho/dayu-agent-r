@@ -116,6 +116,7 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.transient_delta import HostTransientDeltaPublisher
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
     DurableCompactArtifactProvider,
@@ -957,6 +958,7 @@ class HostDispatchScheduler:
         local_execution: HostLocalExecutionOptions,
         lane_controller: LaneController,
         host_handle_id: str,
+        transient_delta_publisher: HostTransientDeltaPublisher,
         host_instance_identity: HostInstanceIdentity | None = None,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
@@ -969,6 +971,7 @@ class HostDispatchScheduler:
         :param local_execution: 本地执行配置。
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
+        :param transient_delta_publisher: 已验证 Engine delta 的 Host 瞬态发布端口。
         :param host_instance_identity: 当前 scheduler 的 Host instance 身份；
             不传时创建仅供测试直接构造使用的身份。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
@@ -986,6 +989,7 @@ class HostDispatchScheduler:
         self._local_execution = local_execution
         self._lane_controller = lane_controller
         self._host_handle_id = host_handle_id
+        self._transient_delta_publisher = transient_delta_publisher
         self._host_instance_identity = (
             host_instance_identity
             if host_instance_identity is not None
@@ -1016,6 +1020,7 @@ class HostDispatchScheduler:
         transaction_runner: HostTransactionRunner,
         local_execution: HostLocalExecutionOptions,
         host_handle_id: str,
+        transient_delta_publisher: HostTransientDeltaPublisher,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
         health_gate: HostExecutionHealthGate | None = None,
@@ -1025,6 +1030,7 @@ class HostDispatchScheduler:
         :param transaction_runner: Host durable transaction runner。
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle 诊断 id。
+        :param transient_delta_publisher: 已验证 Engine delta 的 Host 瞬态发布端口。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :param health_gate: execution opener 持有的共享 health gate。
@@ -1065,6 +1071,7 @@ class HostDispatchScheduler:
             local_execution=local_execution,
             lane_controller=lane_controller,
             host_handle_id=host_handle_id,
+            transient_delta_publisher=transient_delta_publisher,
             host_instance_identity=host_identity,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
@@ -3911,6 +3918,7 @@ class HostDispatchScheduler:
             local_worker_id = envelope.local_worker_id
             ingestor = EngineEventIngestor(
                 transaction_runner=self._transaction_runner,
+                transient_delta_publisher=self._transient_delta_publisher,
                 wakeup_port=self,
                 context_budget_policy=self._local_execution.context_budget_policy,
                 context_compactor=self._local_execution.context_compactor,

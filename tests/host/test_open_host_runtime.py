@@ -7,12 +7,12 @@ import pathlib
 import sqlite3
 import sys
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import ModuleType
-from typing import TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 import pytest
 
@@ -41,6 +41,7 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    HostSessionEvent,
     HostTerminalStatus,
     HostToolingOptions,
     LocalEngineWorker,
@@ -100,6 +101,10 @@ from dayu.host.recovery import (
     StartupRecoveryScanner,
     StartupRecoveryScanResult,
 )
+from dayu.host.transient_delta import (
+    HostTransientDeltaHub,
+    HostTransientDeltaPublisher,
+)
 from dayu.host.wait_adapter import (
     WaitAdapterSnapshot,
     WaitExternalJobLifecycleResult,
@@ -116,6 +121,21 @@ from tests.host.public_smoke_support import awaiting_tooling_options
 from tests.host.test_resolve_wait_command import _seed_waiting_run
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
+
+
+class _ClosableSessionEventIterator(Protocol):
+    """测试使用的可关闭 Host Session iterator 窄协议。"""
+
+    async def aclose(self) -> None:
+        """关闭 iterator。
+
+        :returns: ``None``。
+        :raises Exception: 具体 Host iterator cleanup 失败时透传。
+        """
+
+        ...
+
+
 class _FinalAnswerHandle:
     """测试用立即产出 final answer 的 worker handle。"""
 
@@ -678,7 +698,7 @@ async def test_public_ensure_submit_read_and_watch_share_actor_thread(
         )
         watcher = host.watch_session_events(session.session_id)
         await host.get_run(followup.accepted_run_id)
-        await cast(AsyncGenerator[HostEvent, None], watcher).aclose()
+        await cast(_ClosableSessionEventIterator, watcher).aclose()
 
     assert set(operation_threads) == {"ensure", "submit", "read", "watch"}
     assert len(set(operation_threads.values())) == 1
@@ -1593,6 +1613,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
         scheduler_store: HostDurableStore,
+        transient_delta_hub: HostTransientDeltaHub,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
         """模拟 public handle 构造失败。
@@ -1604,6 +1625,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         :param scheduler: scheduler。
         :param projection_catchup_port: projection catch-up port。
         :param scheduler_store: scheduler durable store。
+        :param transient_delta_hub: 当前 Host runtime 瞬态 hub。
         :param wait_poller: wait poller。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出测试错误。
@@ -1612,6 +1634,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         del self, durable_actor, health_gate, host_handle_id, scheduler
         del projection_catchup_port
         del scheduler_store
+        del transient_delta_hub
         assert wait_poller is not None
         raise RuntimeError("forced public handle init failure")
 
@@ -1675,6 +1698,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         transaction_runner: HostTransactionRunner,
         local_execution: HostLocalExecutionOptions,
         host_handle_id: str,
+        transient_delta_publisher: HostTransientDeltaPublisher,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
         health_gate: HostExecutionHealthGate | None = None,
@@ -1685,6 +1709,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         :param transaction_runner: Host transaction runner。
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle id。
+        :param transient_delta_publisher: Host 瞬态增量 publisher。
         :param active_registry: active worker registry。
         :param projection_catchup_port: commit 后 projection catch-up port。
         :param health_gate: shared execution health gate。
@@ -1697,6 +1722,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
             transaction_runner=transaction_runner,
             local_execution=local_execution,
             host_handle_id=host_handle_id,
+            transient_delta_publisher=transient_delta_publisher,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
             health_gate=health_gate,
@@ -1879,7 +1905,7 @@ async def _wait_for_run_status(
     raise AssertionError(f"run {run_id} did not reach {expected_status.value}")
 
 
-async def _next_terminal(watcher: AsyncIterator[HostEvent]) -> HostEvent:
+async def _next_terminal(watcher: AsyncIterator[HostSessionEvent]) -> HostEvent:
     """读取下一个 terminal HostEvent。
 
     :param watcher: session event watcher。
@@ -1888,7 +1914,7 @@ async def _next_terminal(watcher: AsyncIterator[HostEvent]) -> HostEvent:
     """
 
     async for event in watcher:
-        if event.kind in (
+        if isinstance(event, HostEvent) and event.kind in (
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
             HostEventKind.CANCELLED,
@@ -1898,14 +1924,14 @@ async def _next_terminal(watcher: AsyncIterator[HostEvent]) -> HostEvent:
     raise AssertionError("watcher ended before terminal event")
 
 
-async def _close_iterator(iterator: AsyncIterator[HostEvent]) -> None:
+async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
     """关闭测试中持有的 async generator iterator。
 
-    :param iterator: HostEvent async iterator。
+    :param iterator: HostSessionEvent async iterator。
     :returns: ``None``。
     """
 
-    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+    await cast(_ClosableSessionEventIterator, iterator).aclose()
 
 
 def _mark_current_dispatch_owner_as_stale_running(

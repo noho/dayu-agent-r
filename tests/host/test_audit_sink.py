@@ -62,7 +62,7 @@ from dayu.host.projection import ProjectionRunner
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_PREVIEW_DELTA = serialize_host_event_type(
-    HostPreviewEventType.REASONING_DELTA
+    HostPreviewEventType.ITERATION_STARTED
 )
 _FIXED_NOW = datetime(2026, 5, 29, 1, 2, 3, tzinfo=UTC)
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

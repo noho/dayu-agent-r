@@ -13,8 +13,8 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.host import (
     DrainOutboxTerminalItemsRequest,
-    HostEvent,
     HostEventKind,
+    HostSessionEvent,
     HostTerminalStatus,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -262,14 +262,15 @@ async def test_drain_first_second_read_covers_live_attach_window(
     assert second_read.projection_status is OutboxProjectionStatus.CAUGHT_UP
 
 
-async def _close_iterator(iterator: AsyncIterator[HostEvent]) -> None:
-    """关闭 public HostEvent async iterator。
+async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
+    """关闭 public Host 联合事件 async iterator。
 
-    :param iterator: HostEvent async iterator。
+    :param iterator: Host durable/transient 联合事件 async iterator。
     :returns: ``None``。
+    :raises Exception: 底层 async generator close 失败时透传。
     """
 
-    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+    await cast(AsyncGenerator[HostSessionEvent, None], iterator).aclose()
 
 
 def _eventlog_count(db_path: pathlib.Path) -> int:

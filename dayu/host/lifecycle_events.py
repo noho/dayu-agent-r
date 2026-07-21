@@ -107,7 +107,6 @@ class HostPreviewEventType(StrEnum):
     ITERATION_STARTED = "ITERATION_STARTED"
     CONTENT_COMPLETED = "CONTENT_COMPLETED"
     ITERATION_COMPLETED = "ITERATION_COMPLETED"
-    REASONING_DELTA = "REASONING_DELTA"
 
 
 HostEventType: TypeAlias = (
@@ -234,7 +233,6 @@ HOST_PREVIEW_EVENT_TYPES: tuple[HostPreviewEventType, ...] = (
     HostPreviewEventType.ITERATION_STARTED,
     HostPreviewEventType.CONTENT_COMPLETED,
     HostPreviewEventType.ITERATION_COMPLETED,
-    HostPreviewEventType.REASONING_DELTA,
 )
 """Host preview-only Engine 事件集合。"""
 

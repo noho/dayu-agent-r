@@ -284,6 +284,45 @@ control doc 每次更新只记录：
 - plan / implementation / accepted findings / aggregate deepreview 全部关闭后，sub-WU 才算 locally accepted。
 - 若 aggregate residual 已分类且有 destination，可进入下一个 sub-WU 或 full-repository review。
 
+## Completed Finding Fix Batch: WU-CLI-SMOKE-01-R1 Slice 1
+
+- Source reviews: `docs/reviews/code-review-20260721-005108.md` 与 `docs/reviews/code-review-20260721-005320.md`。
+- Controller adjudication: `docs/reviews/wu-cli-smoke-01-r1-slice1-code-review-controller-adjudication.md`。
+- Risk: Low Risk / `test-harness-low`；只接受 DS-F03 renderer close owner-level direct test，不修改生产代码。
+- Batch policy: 单一 test-only fix batch，不按 finding 或文件继续拆 slice。
+- Review policy: 附加总控允许单路 narrow re-review，但用户已指定 AgentMiMo / AgentDS 两路同时 review，因此本批仍执行双路 narrow re-review。
+- Validation: focused renderer test、prompt / interactive CLI regression、全量 pyright、`git diff --check`。
+- Deferred owner: DS-F02 归本 WU Slice 2 的真实 Host → Service → CLI transient / slow-consumer E2E；不得作为本低风险 batch 的 fake-only 扩 scope。
+- Rejected item: DS-F01 描述的 late delta 在下一次 `drain_nowait()` 会被 terminal set 过滤，未形成 terminal 后交付；Slice 2 barrier 继续验证既定并发 acceptance。
+- Baseline residual: none。
+- Fix artifact: `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-codex.md`；test-only fix complete。
+- Controller validation: `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-controller-validation.md`；99 tests passed、pyright 0 errors、diff check pass。
+- Re-review artifacts: `docs/reviews/code-review-20260721-011148.md` 与 `docs/reviews/code-review-20260721-010824.md`；两路均确认 DS-F03 fixed，无新增 material defect。
+- Re-review adjudication: `docs/reviews/wu-cli-smoke-01-r1-slice1-code-rereview-controller-adjudication.md`；decision=`accepted-slice1-rereview`。
+- Accepted Slice 1 commit: `70ccda60`。
+- Final batch status: completed。主 control doc 已进入 Slice 2 implementation；DS-F02 由 Slice 2 owner 收口。
+
+## Completed Finding Fix Batch: WU-CLI-SMOKE-01-R1 Draft PR #180
+
+- Source reviews: `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-ds.md`；两路代码/架构结论均 PASS。
+- Controller adjudication: `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-controller-adjudication.md`；decision=`fix-required`。
+- Accepted finding: PR180-F01；PR body 使用字面量反斜杠-n 而非真实 Markdown 换行。文字内容正确，但 PR metadata 格式不满足 draft-PR-pass。
+- Risk: Low Risk / PR-metadata-only。
+- Batch policy: 单一外部 metadata fix，不拆 slice；不得触碰 production/test/design/README。
+- Fix owner: AgentCodex；仅允许修复 PR #180 body 换行并写 `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`。
+- Review policy: 用户指定 AgentMiMo / AgentDS 两路 review，因此 fix 后仍执行双路 PR re-review。
+- Validation: `gh pr view` 证明 body 为真实多行、无字面量反斜杠-n；Draft=true、review requests 为空、base/head 与标题不变；工作树仅包含预期 artifacts/control。
+- Residual-risk code adjudication: live-only、cross-domain ordering 与可控 worker 经代码核对不再是 remaining risk；固定容量按不同 owner 拆为 `WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01`，CLI UX 复用 `WU-CLI-SMOKE-01-R2`。三项均进入主 control doc 的 residual 与 current WU 表。
+- Fix artifact: `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`；PR180-F01 metadata-only fix complete，PR code head 未变。
+- Controller validation: `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-controller-validation.md`；真实 Markdown 多行、无 closing directive、Draft/head/base/title/reviewer invariants、两项 Windows CI pass 与工作树边界均已验证。
+- PR re-review artifacts: `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-ds.md`；两路均确认 PR180-F01 fixed、0 blocking、无新增 finding。
+- PR re-review adjudication: `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-controller-adjudication.md`；decision=`accepted-PR-rereview`。
+- Accepted PR review commit: `3900b069`；已 non-force push 到 Draft PR #180。
+- Final remote checks: accepted PR review head `3900b069` 的 `windows-init-transaction` 与 `windows-upload-script` 均 PASS。
+- Final closeout: `docs/reviews/wu-cli-smoke-01-r1-final-closeout.md`；主 control doc 已进入 `final-closeout-pass`。
+- Residual-risk WU artifacts: `docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-codex.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-review-mimo.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-proposal-review-ds.md`、`docs/reviews/wu-cli-smoke-01-r1-residual-risk-wu-reconciliation-controller-adjudication.md`；双路 accepted，0 current-WU implementation fix。
+- Final batch status: completed；PR180-F01 已关闭，无未归属 finding 或 blocking residual。
+
 ## 下次使用方式
 
 用户可要求：

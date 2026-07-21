@@ -138,7 +138,6 @@ def test_all_host_event_type_values_preserves_owner_categories() -> None:
         HostPreviewEventType.ITERATION_STARTED,
         HostPreviewEventType.CONTENT_COMPLETED,
         HostPreviewEventType.ITERATION_COMPLETED,
-        HostPreviewEventType.REASONING_DELTA,
     )
     assert all_host_event_type_values() == tuple(
         event_type.value
@@ -161,7 +160,6 @@ def test_parse_and_serialize_host_event_type_round_trip_full_legal_set() -> None
         "ITERATION_STARTED",
         "CONTENT_COMPLETED",
         "ITERATION_COMPLETED",
-        "REASONING_DELTA",
     )
 
 

@@ -90,6 +90,7 @@ from dayu.host.durable.transaction import (
     HostTransactionOperation,
     HostTransactionRunner,
 )
+from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
@@ -1414,6 +1415,7 @@ async def _open_scheduler(
 
     return await HostDispatchScheduler.open(
         transaction_runner=store.transaction_runner,
+        transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         local_execution=HostLocalExecutionOptions(
             lane_db_path=tmp_path / "lane.sqlite3",
             lane_name=_LANE_NAME,

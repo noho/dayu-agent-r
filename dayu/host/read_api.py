@@ -33,7 +33,6 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
-    HostThinkingView,
     ListSessionsResult,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -110,7 +109,6 @@ _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 _EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
-_EVENT_TYPE_REASONING_DELTA = "REASONING_DELTA"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_FINISH_REASON = "finish_reason"
 _PAYLOAD_FIELD_FILTERED = "filtered"
@@ -122,7 +120,6 @@ _PAYLOAD_FIELD_REASON = "reason"
 _PAYLOAD_FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
 _PAYLOAD_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _PAYLOAD_FIELD_TERMINAL_STATUS = "terminal_status"
-_PAYLOAD_FIELD_DELTA = "delta"
 _PAYLOAD_FIELD_EFFECTIVE_TOOL_SET = "effective_tool_set"
 _PAYLOAD_FIELD_EFFECTIVE_TOOL_DISPLAY_NAMES = "effective_tool_display_names"
 _PAYLOAD_FIELD_TOOL_NAME = "tool_name"
@@ -899,7 +896,6 @@ def _host_event_from_row(transaction: HostTransaction, row: EventLogRow) -> Host
         event_type=row.event_type,
         kind=HostEventKind.PROGRESS,
         activity=_activity_from_row(transaction, row),
-        thinking=_thinking_from_row(row),
         dedupe_key=row.event_id,
         terminal_status=None,
         final_answer=None,
@@ -1098,23 +1094,6 @@ def _activity_from_row(
     if row.event_type == _EVENT_TYPE_PROVIDER_DIAGNOSTIC:
         return _provider_diagnostic_activity(row)
     return None
-
-
-def _thinking_from_row(row: EventLogRow) -> HostThinkingView | None:
-    """把 reasoning delta row 投影为运行态 thinking 展示视图。
-
-    :param row: EventLog durable row。
-    :returns: thinking 展示视图；非 reasoning delta 或 payload 非法时返回 ``None``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if row.event_type != _EVENT_TYPE_REASONING_DELTA:
-        return None
-    payload = _activity_payload_without_descriptor(row)
-    delta = payload.get(_PAYLOAD_FIELD_DELTA)
-    if not isinstance(delta, str) or delta.strip() == "":
-        return None
-    return HostThinkingView(text_delta=delta)
 
 
 def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
@@ -1350,12 +1329,8 @@ def _tool_awaiting_activity(
     """
 
     payload = _activity_payload(transaction, row)
-    tool_name = (
-        None if payload is None else _payload_text(payload, _PAYLOAD_FIELD_TOOL_NAME)
-    )
-    display_name = (
-        None if tool_name is None else _tool_display_name(transaction, row, tool_name)
-    )
+    tool_name = None if payload is None else _payload_text(payload, _PAYLOAD_FIELD_TOOL_NAME)
+    display_name = None if tool_name is None else _tool_display_name(transaction, row, tool_name)
     title = "等待工具完成" if display_name is None else f"等待工具完成：{display_name}"
     return HostActivityView(
         kind=HostActivityKind.TOOL_AWAITING,
@@ -1425,9 +1400,7 @@ def _provider_protocol_error_activity(row: EventLogRow) -> HostActivityView | No
             cast(Mapping[str, JsonValue], failure_metadata),
             _PAYLOAD_FIELD_PROVIDER_ERROR_CODE,
         )
-    error_code = (
-        _payload_text(payload, _PAYLOAD_FIELD_ERROR_CODE) or provider_error_code
-    )
+    error_code = _payload_text(payload, _PAYLOAD_FIELD_ERROR_CODE) or provider_error_code
     message = _bounded_summary(_payload_text(payload, _PAYLOAD_FIELD_MESSAGE))
     summary = _join_summary_parts(error_code, message)
     return HostActivityView(

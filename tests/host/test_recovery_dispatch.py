@@ -59,6 +59,7 @@ from dayu.host.recovery import (
     StartupRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
+from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
 
 _NOW = datetime(2026, 5, 19, 4, 5, 6, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "recovery-dispatch-test"})
@@ -208,7 +209,8 @@ def test_late_old_execution_event_after_recovery_dispatch_is_rejected(
         ).scan(_policy())
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(_old_final_answer_candidate(old))
 
         assert result.status is EngineIngestStatus.REJECTED

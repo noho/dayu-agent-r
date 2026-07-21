@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from concurrent.futures import Future
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
@@ -46,8 +46,9 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostClosedError,
     HostCommandHandleOptions,
-    HostEvent,
+    HostEventKind,
     HostLocalExecutionOptions,
+    HostSessionEvent,
     HostCallContext,
     ListSessionsResult,
     OperationContext,
@@ -126,6 +127,10 @@ from dayu.host.tool_trace import (
     ToolTraceSinkOptions,
     catch_up_tool_trace_projection,
 )
+from dayu.host.transient_delta import (
+    HostTransientDeltaHub,
+    HostTransientDeltaSubscription,
+)
 from dayu.host.wait_adapter import (
     WaitPollAdapterRegistry,
     WaitPollLifecycleGate,
@@ -169,6 +174,7 @@ _WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX = "wait-poller"
 
 _DURABLE_ACTOR_THREAD_NAME_SUFFIX = "durable-actor"
 """public durable actor worker thread 名称后缀。"""
+
 
 @dataclass(frozen=True, slots=True)
 class _CommandContextBudgetFields:
@@ -663,6 +669,7 @@ class _PublicHostHandle:
         "_projection_catchup_port",
         "_scheduler",
         "_scheduler_store",
+        "_transient_delta_hub",
         "_wait_poller",
     )
 
@@ -675,6 +682,7 @@ class _PublicHostHandle:
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
         scheduler_store: HostDurableStore,
+        transient_delta_hub: HostTransientDeltaHub,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
         """初始化 public Host handle。
@@ -685,6 +693,7 @@ class _PublicHostHandle:
         :param scheduler: 内部 dispatch scheduler。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
         :param scheduler_store: scheduler 独占的 durable store。
+        :param transient_delta_hub: 当前 Host runtime 的瞬态 fanout owner。
         :param wait_poller: 可选 production wait poller supervisor。
         :returns: ``None``。
         """
@@ -695,6 +704,7 @@ class _PublicHostHandle:
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
         self._scheduler_store = scheduler_store
+        self._transient_delta_hub = transient_delta_hub
         self._wait_poller = wait_poller
         self._close_lock = asyncio.Lock()
 
@@ -892,53 +902,77 @@ class _PublicHostHandle:
             lambda handle: _close_session(handle, session_id, request)
         )
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
-        """创建 Session live HostEvent 订阅。
+    def watch_session_events(self, session_id: str) -> AsyncIterator[HostSessionEvent]:
+        """同步 attach Session durable/transient 联合事件订阅。
 
         :param session_id: 目标 Session id。
-        :returns: Host-owned typed event async iterator。
+        :returns: attach-before-return 且可显式关闭的 Host typed iterator。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: Session 不存在或不可 watch 时抛出。
         """
 
         self._raise_if_closed()
-        cursor_future = self._durable_actor.submit(
-            lambda handle: _session_live_event_start_cursor(handle, session_id)
-        )
+        subscription = self._transient_delta_hub.subscribe(session_id)
+        try:
+            cursor_future = self._durable_actor.submit(
+                lambda handle: _session_live_event_start_cursor(handle, session_id)
+            )
+        except BaseException:
+            subscription.close()
+            raise
         cursor_future.add_done_callback(_observe_watch_cursor_future)
-        return self._watch_session_events(session_id, cursor_future)
+        return _ClosableHostSessionEventIterator(
+            owner=self,
+            session_id=session_id,
+            cursor_future=cursor_future,
+            subscription=subscription,
+        )
 
     async def _watch_session_events(
         self,
         session_id: str,
         cursor_future: asyncio.Future[int],
-    ) -> AsyncIterator[HostEvent]:
-        """在 actor 中 attach cursor 后持续产出 Session live event。
+        subscription: HostTransientDeltaSubscription,
+    ) -> AsyncGenerator[HostSessionEvent, None]:
+        """在 actor cursor attach 后持续合流 durable/transient event。
 
         :param session_id: 目标 Session id。
         :param cursor_future: watch 调用时已同步排队的 actor cursor attach future。
-        :returns: Host-owned typed event async iterator。
+        :param subscription: watch 返回前已同步注册的瞬态订阅。
+        :returns: Host-owned typed durable/transient async generator。
         :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
         """
 
-        cursor = await asyncio.shield(cursor_future)
-        _LOGGER.log(
-            VERBOSE_LOG_LEVEL,
-            "host.public_handle.watch_attached host_handle_id=%s "
-            "session_id=%s cursor=%s",
-            self._host_handle_id,
-            session_id,
-            cursor,
-        )
-        async for event in self._watch_session_events_after(session_id, cursor):
-            yield event
+        try:
+            cursor = await asyncio.shield(cursor_future)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.public_handle.watch_attached host_handle_id=%s session_id=%s cursor=%s",
+                self._host_handle_id,
+                session_id,
+                cursor,
+            )
+            async for event in self._watch_session_events_after(
+                session_id,
+                cursor,
+                subscription,
+            ):
+                yield event
+        finally:
+            subscription.close()
 
-    async def _watch_session_events_after(self, session_id: str, cursor: int) -> AsyncIterator[HostEvent]:
-        """从指定 cursor 后持续产出 Session live HostEvent。
+    async def _watch_session_events_after(
+        self,
+        session_id: str,
+        cursor: int,
+        subscription: HostTransientDeltaSubscription,
+    ) -> AsyncGenerator[HostSessionEvent, None]:
+        """从 cursor 后合流 durable rows 与当前 runtime 瞬态增量。
 
         :param session_id: 目标 Session id。
         :param cursor: live watch attach 时的 EventLog 全局序号。
-        :returns: Host-owned typed event async iterator。
+        :param subscription: 当前 watcher 的 Host 瞬态订阅。
+        :returns: 保持双域各自内序并实施同 Run terminal fence 的 async generator。
         :raises HostApiError: Session 在 watch 期间消失时抛出。
         :raises HostDurableError: EventLog 或 payload 投影失败时抛出。
         """
@@ -948,6 +982,13 @@ class _PublicHostHandle:
             HostExecutionHealthState.CLOSING,
             HostExecutionHealthState.CLOSED,
         ):
+            for transient in subscription.drain_nowait():
+                yield transient
+            overflow_error = subscription.overflow_error()
+            if overflow_error is not None:
+                raise overflow_error
+            if subscription.is_closed:
+                return
             batch = await self._durable_actor.call(
                 lambda handle: _read_session_host_events_after(
                     handle,
@@ -956,10 +997,26 @@ class _PublicHostHandle:
                 )
             )
             next_cursor = batch.next_cursor
+            for transient in subscription.drain_nowait():
+                yield transient
+            overflow_error = subscription.overflow_error()
+            if overflow_error is not None:
+                raise overflow_error
+            if subscription.is_closed:
+                return
             if len(batch.events) == 0:
-                await asyncio.sleep(_SESSION_WATCH_POLL_INTERVAL_SECONDS)
+                await subscription.wait_ready(_SESSION_WATCH_POLL_INTERVAL_SECONDS)
                 continue
             for event in batch.events:
+                if event.kind is not HostEventKind.PROGRESS and event.run_id is not None:
+                    for transient in subscription.drain_nowait():
+                        yield transient
+                    overflow_error = subscription.overflow_error()
+                    if overflow_error is not None:
+                        raise overflow_error
+                    if subscription.is_closed:
+                        return
+                    subscription.mark_run_terminal(event.run_id)
                 yield event
 
     async def close(self) -> None:
@@ -986,6 +1043,7 @@ class _PublicHostHandle:
         """
 
         await self._health_gate.begin_closing()
+        self._transient_delta_hub.close()
         _LOGGER.info(
             "host.public_handle.close_start host_handle_id=%s",
             self._host_handle_id,
@@ -997,8 +1055,7 @@ class _PublicHostHandle:
         except Exception as exc:
             close_error = exc
             _LOGGER.error(
-                "host.public_handle.close_wait_poller_failed "
-                "host_handle_id=%s error_type=%s",
+                "host.public_handle.close_wait_poller_failed host_handle_id=%s error_type=%s",
                 self._host_handle_id,
                 exc.__class__.__name__,
                 exc_info=True,
@@ -1010,8 +1067,7 @@ class _PublicHostHandle:
                 close_error = exc
             else:
                 _LOGGER.error(
-                    "host.public_handle.close_actor_drain_failed "
-                    "host_handle_id=%s error_type=%s",
+                    "host.public_handle.close_actor_drain_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1023,8 +1079,7 @@ class _PublicHostHandle:
                 close_error = exc
             else:
                 _LOGGER.error(
-                    "host.public_handle.close_scheduler_failed "
-                    "host_handle_id=%s error_type=%s",
+                    "host.public_handle.close_scheduler_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1036,8 +1091,7 @@ class _PublicHostHandle:
                 close_error = exc
             else:
                 _LOGGER.error(
-                    "host.public_handle.close_projection_failed "
-                    "host_handle_id=%s error_type=%s",
+                    "host.public_handle.close_projection_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1049,8 +1103,7 @@ class _PublicHostHandle:
                 close_error = exc
             else:
                 _LOGGER.error(
-                    "host.public_handle.close_actor_handle_failed "
-                    "host_handle_id=%s error_type=%s",
+                    "host.public_handle.close_actor_handle_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1062,8 +1115,7 @@ class _PublicHostHandle:
                 close_error = exc
             else:
                 _LOGGER.error(
-                    "host.public_handle.close_actor_executor_failed "
-                    "host_handle_id=%s error_type=%s",
+                    "host.public_handle.close_actor_executor_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1075,8 +1127,7 @@ class _PublicHostHandle:
                 close_error = exc
             else:
                 _LOGGER.error(
-                    "host.public_handle.close_scheduler_store_failed "
-                    "host_handle_id=%s error_type=%s",
+                    "host.public_handle.close_scheduler_store_failed host_handle_id=%s error_type=%s",
                     self._host_handle_id,
                     exc.__class__.__name__,
                     exc_info=True,
@@ -1138,6 +1189,98 @@ def _observe_watch_cursor_future(future: asyncio.Future[int]) -> None:
     if future.cancelled():
         return
     future.exception()
+
+
+class _ClosableHostSessionEventIterator:
+    """共同拥有 cursor future、瞬态 subscription 与 merge generator 的 iterator。
+
+    :param owner: public Host handle。
+    :param session_id: 目标 Session 标识。
+    :param cursor_future: watch 同步调用时已提交的 durable cursor future。
+    :param subscription: watch 返回前已注册的瞬态订阅。
+    """
+
+    __slots__ = (
+        "_closed",
+        "_cursor_future",
+        "_iterator",
+        "_owner",
+        "_session_id",
+        "_subscription",
+    )
+
+    def __init__(
+        self,
+        *,
+        owner: _PublicHostHandle,
+        session_id: str,
+        cursor_future: asyncio.Future[int],
+        subscription: HostTransientDeltaSubscription,
+    ) -> None:
+        """初始化可关闭的 Host Session event iterator。
+
+        :param owner: public Host handle。
+        :param session_id: 目标 Session 标识。
+        :param cursor_future: 已提交的 durable cursor future。
+        :param subscription: 已注册的瞬态订阅。
+        :returns: 无返回值。
+        :raises ValueError: 构造参数由 owner 边界预先校验，本方法不额外抛出。
+        """
+
+        self._owner = owner
+        self._session_id = session_id
+        self._cursor_future = cursor_future
+        self._subscription = subscription
+        self._iterator: AsyncGenerator[HostSessionEvent, None] | None = None
+        self._closed = False
+
+    def __aiter__(self) -> _ClosableHostSessionEventIterator:
+        """返回当前 async iterator。
+
+        :returns: 当前实例。
+        :raises RuntimeError: 本方法不抛出异常。
+        """
+
+        return self
+
+    async def __anext__(self) -> HostSessionEvent:
+        """读取下一项，并让所有终止路径共享幂等 cleanup。
+
+        :returns: 下一项 durable 或 transient Host event。
+        :raises StopAsyncIteration: iterator 已关闭或 Host close 正常结束时抛出。
+        :raises HostApiError: cursor/read/slow-consumer public error 时抛出。
+        :raises asyncio.CancelledError: 调用方取消 iteration 时抛出。
+        """
+
+        if self._closed:
+            raise StopAsyncIteration
+        if self._iterator is None:
+            self._iterator = self._owner._watch_session_events(
+                self._session_id,
+                self._cursor_future,
+                self._subscription,
+            )
+        try:
+            return await anext(self._iterator)
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        """幂等关闭 started 或 never-started iterator 并 detach subscription。
+
+        :returns: ``None``。
+        :raises BaseException: merge generator cleanup 异常时透传。
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._iterator is not None:
+                await self._iterator.aclose()
+        finally:
+            self._subscription.close()
 
 
 class _PublicHostAdminHandle:
@@ -1314,6 +1457,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         wait_poller: WaitPollerSupervisor | None = None
         durable_actor: DurableActor | None = None
         health_gate = HostExecutionHealthGate()
+        transient_delta_hub = HostTransientDeltaHub()
         try:
             loop = asyncio.get_running_loop()
             active_registry = ActiveWorkerRegistry()
@@ -1342,6 +1486,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 transaction_runner=scheduler_store.transaction_runner,
                 local_execution=local_execution,
                 host_handle_id=host_handle_id,
+                transient_delta_publisher=transient_delta_hub,
                 active_registry=active_registry,
                 projection_catchup_port=None,
                 health_gate=health_gate,
@@ -1390,6 +1535,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 scheduler=scheduler,
                 projection_catchup_port=close_projection_catchup_port,
                 scheduler_store=scheduler_store,
+                transient_delta_hub=transient_delta_hub,
                 wait_poller=wait_poller,
             )
             health_gate.mark_ready()
@@ -1400,6 +1546,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             return self._host
         except Exception:
+            transient_delta_hub.close()
             _LOGGER.error(
                 "host.open.failed host_handle_id=%s",
                 host_handle_id,
@@ -1410,8 +1557,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     await asyncio.to_thread(wait_poller.close)
                 except Exception as cleanup_exc:
                     _LOGGER.error(
-                        "host.open.cleanup_wait_poller_failed "
-                        "host_handle_id=%s error_type=%s",
+                        "host.open.cleanup_wait_poller_failed host_handle_id=%s error_type=%s",
                         host_handle_id,
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
@@ -1421,8 +1567,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     await durable_actor.stop_and_drain()
                 except Exception as cleanup_exc:
                     _LOGGER.error(
-                        "host.open.cleanup_durable_actor_drain_failed "
-                        "host_handle_id=%s error_type=%s",
+                        "host.open.cleanup_durable_actor_drain_failed host_handle_id=%s error_type=%s",
                         host_handle_id,
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
@@ -1432,7 +1577,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     await scheduler.close()
                 except Exception as cleanup_exc:
                     _LOGGER.error(
-                        "host.open.cleanup_scheduler_failed host_handle_id=%s " "error_type=%s",
+                        "host.open.cleanup_scheduler_failed host_handle_id=%s error_type=%s",
                         host_handle_id,
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
@@ -1447,8 +1592,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     durable_actor.shutdown_executor()
                 except Exception as cleanup_exc:
                     _LOGGER.error(
-                        "host.open.cleanup_durable_actor_failed "
-                        "host_handle_id=%s error_type=%s",
+                        "host.open.cleanup_durable_actor_failed host_handle_id=%s error_type=%s",
                         host_handle_id,
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
@@ -1457,7 +1601,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 scheduler_store.close()
             except Exception as cleanup_exc:
                 _LOGGER.error(
-                    "host.open.cleanup_durable_store_failed host_handle_id=%s " "error_type=%s",
+                    "host.open.cleanup_durable_store_failed host_handle_id=%s error_type=%s",
                     host_handle_id,
                     cleanup_exc.__class__.__name__,
                     exc_info=True,
@@ -1598,8 +1742,7 @@ def _best_effort_catch_up_projection_on_open_failure(
         projection_catchup_port.catch_up_projection()
     except Exception as cleanup_exc:
         _LOGGER.warning(
-            "host.open.cleanup_projection_catchup_failed host_handle_id=%s "
-            "error_type=%s",
+            "host.open.cleanup_projection_catchup_failed host_handle_id=%s error_type=%s",
             host_handle_id,
             cleanup_exc.__class__.__name__,
             exc_info=True,
@@ -1638,10 +1781,7 @@ def _enabled_wait_poller_configuration(
     if tooling_options is None or tooling_options.wait_poll_adapter_registry is None:
         raise HostApiError(
             code=HostApiErrorCode.INVALID_STATE,
-            message=(
-                "OpenHostOptions.wait_poller_policy requires "
-                "HostToolingOptions.wait_poll_adapter_registry"
-            ),
+            message=("OpenHostOptions.wait_poller_policy requires HostToolingOptions.wait_poll_adapter_registry"),
             retryable=False,
         )
     adapter_registry = tooling_options.wait_poll_adapter_registry
@@ -1758,9 +1898,15 @@ def _command_options_from_open_host_options(
         create_parent_dirs=options.create_parent_dirs,
         sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
         sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
-        sqlite_write_retry_initial_delay_seconds=(options.sqlite_write_retry_initial_delay_seconds),
-        sqlite_write_retry_backoff_multiplier=(options.sqlite_write_retry_backoff_multiplier),
-        sqlite_write_retry_max_delay_seconds=(options.sqlite_write_retry_max_delay_seconds),
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
         payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
         context_window_size=context_budget_fields.context_window_size,
         reserved_output_tokens=context_budget_fields.reserved_output_tokens,
@@ -1793,15 +1939,9 @@ def _command_options_from_open_host_admin_options(
         create_parent_dirs=options.create_parent_dirs,
         sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
         sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
-        sqlite_write_retry_initial_delay_seconds=(
-            options.sqlite_write_retry_initial_delay_seconds
-        ),
-        sqlite_write_retry_backoff_multiplier=(
-            options.sqlite_write_retry_backoff_multiplier
-        ),
-        sqlite_write_retry_max_delay_seconds=(
-            options.sqlite_write_retry_max_delay_seconds
-        ),
+        sqlite_write_retry_initial_delay_seconds=(options.sqlite_write_retry_initial_delay_seconds),
+        sqlite_write_retry_backoff_multiplier=(options.sqlite_write_retry_backoff_multiplier),
+        sqlite_write_retry_max_delay_seconds=(options.sqlite_write_retry_max_delay_seconds),
         payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
         context_window_size=_INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE,
         reserved_output_tokens=_INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS,

@@ -51,9 +51,12 @@ from dayu.host.api import (
     HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
+    HostReasoningDelta,
+    HostSessionEvent,
     HostStreamCursor,
     HostTerminalStatus,
-    HostThinkingView,
+    HostTransientDelta,
+    HostTransientDeltaType,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItem,
@@ -190,7 +193,7 @@ class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostEvent | _StopSignal | _RaiseSignal]
+    _queue: asyncio.Queue[HostSessionEvent | _StopSignal | _RaiseSignal]
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -202,7 +205,7 @@ class _FakeHostEventIterator:
         self.closed_count = 0
         self._queue = asyncio.Queue()
 
-    def __aiter__(self) -> AsyncIterator[HostEvent]:
+    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -211,7 +214,7 @@ class _FakeHostEventIterator:
 
         return self
 
-    async def __anext__(self) -> HostEvent:
+    async def __anext__(self) -> HostSessionEvent:
         """读取下一条 Host event。
 
         :returns: HostEvent。
@@ -225,7 +228,7 @@ class _FakeHostEventIterator:
             raise item.error
         return item
 
-    async def push(self, event: HostEvent) -> None:
+    async def push(self, event: HostSessionEvent) -> None:
         """推入一条 Host event。
 
         :param event: 待推入事件。
@@ -267,7 +270,7 @@ class _FakeHost:
     cancel_requests: list[CancelRunRequest]
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
     _submit_terminal: HostEvent | None
-    _submit_events: tuple[HostEvent, ...]
+    _submit_events: tuple[HostSessionEvent, ...]
     _submit_watcher_errors: tuple[Exception, ...]
     _cancel_terminal: HostEvent | None
     _outbox_item: OutboxTerminalItem | None
@@ -280,7 +283,7 @@ class _FakeHost:
         self,
         *,
         submit_terminal: HostEvent | None,
-        submit_events: tuple[HostEvent, ...] = (),
+        submit_events: tuple[HostSessionEvent, ...] = (),
         submit_watcher_errors: tuple[Exception, ...] = (),
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         outbox_item: OutboxTerminalItem | None = None,
@@ -352,7 +355,10 @@ class _FakeHost:
             slot = SessionSlotRef(scope=request.scope, slot_key=request.slot_key)
         return _session_snapshot(session_id="session-1", slot=slot)
 
-    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
+    def watch_session_events(
+        self,
+        session_id: str,
+    ) -> AsyncIterator[HostSessionEvent]:
         """记录 watcher attach。
 
         :param session_id: 目标 Session id。
@@ -848,10 +854,7 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert "Activity:" in captured.err
     assert "工具批次完成" in captured.err
     assert captured_requests[0].scene_id == "prompt"
-    assert (
-        captured_requests[0].context_slot_values["fins_default_subject"]
-        == "# 当前分析对象\n你正在分析的是 AAPL。"
-    )
+    assert captured_requests[0].context_slot_values["fins_default_subject"] == "# 当前分析对象\n你正在分析的是 AAPL。"
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert fake_host.ensure_requests[0].scope == "cli.prompt"
@@ -1531,7 +1534,7 @@ async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_fi
                 summary="这一条 activity 故意足够长，用于覆盖终端软换行后的多屏幕行清理。",
             ),
             _thinking_event_with_sequence(
-                event_sequence=2,
+                runtime_sequence=2,
                 dedupe_key="thinking-1",
                 text_delta="The user is asking",
             ),
@@ -2391,15 +2394,15 @@ def _activity_event_with_sequence(
     )
 
 
-def _thinking_event() -> HostEvent:
+def _thinking_event() -> HostTransientDelta:
     """构造 Host thinking event。
 
-    :returns: HostEvent。
+    :returns: HostTransientDelta。
     :raises Exception: 不主动抛出异常。
     """
 
     return _thinking_event_with_sequence(
-        event_sequence=1,
+        runtime_sequence=1,
         dedupe_key="thinking-run-1-1",
         text_delta="正在分析收入变化",
     )
@@ -2407,34 +2410,34 @@ def _thinking_event() -> HostEvent:
 
 def _thinking_event_with_sequence(
     *,
-    event_sequence: int,
+    runtime_sequence: int,
     dedupe_key: str,
     text_delta: str,
-) -> HostEvent:
+) -> HostTransientDelta:
     """构造可指定 sequence 的 Host thinking event。
 
-    :param event_sequence: Host event sequence。
+    :param runtime_sequence: 当前 Host runtime 瞬态序列。
     :param dedupe_key: thinking dedupe key。
     :param text_delta: thinking 文本增量。
-    :returns: HostEvent。
+    :returns: HostTransientDelta。
     :raises Exception: 不主动抛出异常。
     """
 
-    return HostEvent(
-        event_id=dedupe_key,
-        event_sequence=event_sequence,
+    return HostTransientDelta(
+        runtime_id="runtime-1",
+        runtime_sequence=runtime_sequence,
         session_id="session-1",
         run_id="run-1",
-        event_class=HostEventClass.PREVIEW,
-        event_type="REASONING_DELTA",
-        kind=HostEventKind.PROGRESS,
-        activity=None,
-        thinking=HostThinkingView(text_delta=text_delta),
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        worker_event_index=runtime_sequence,
+        observed_at=_NOW,
+        type=HostTransientDeltaType.REASONING_DELTA,
+        data=HostReasoningDelta(
+            iteration_id="iteration-1",
+            text_delta=text_delta,
+        ),
         dedupe_key=dedupe_key,
-        terminal_status=None,
-        final_answer=None,
-        error_message=None,
-        cancel_reason=None,
     )
 
 
@@ -2453,7 +2456,8 @@ def _entrypoint_thinking(
 
     return EntrypointThinking(
         run_id="run-1",
-        event_sequence=1,
+        runtime_id="runtime-1",
+        runtime_sequence=1,
         dedupe_key=dedupe_key,
         text_delta=text_delta,
     )

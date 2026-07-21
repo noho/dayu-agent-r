@@ -154,18 +154,53 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-SEMANTIC-OWNERSHIP-01` final-closeout transition |
-| active work unit | None；当前不在 PR #179 合并前提前启动独立 backlog WU。 |
-| completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
+| phase | `WU-CLI-SMOKE-01-R1` final-closeout-pass；next=`WU-HOST-SESSION-EVENT-DELIVERY-01` confirmed-after-PR-180-merge。 |
+| active work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
+| completed work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；final-closeout-pass。 |
 | gate | `final-closeout-pass` |
-| draft PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 为 draft/open；用户将手工 merge。 |
-| selected next work unit | `WU-CLI-SMOKE-01-R1` Engine Delta Transient Live Stream Remediation；bug fix。 |
-| next gate | `goal confirmation` |
-| next goal | 让 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 统一走 Host-owned transient live stream，三者均不写 EventLog；删除 `REASONING_DELTA` 当前 durable `PREVIEW` 持久化，同时让已 attach UI / Service / CLI 按需实时消费三类 delta。 |
+| prerequisite PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 已于 2026-07-20 merge；本地 `main` 已同步到 merge commit `bd1d3e94`。 |
+| selected work unit | `WU-HOST-SESSION-EVENT-DELIVERY-01` Host Session Event Delivery Ownership and Bounded Mailbox；用户已确认在 PR #180 手工 merge 后作为下一个实施 WU。 |
+| next gate | 用户 / maintainer 手工 merge Draft PR #180；随后从 `main` 同步最新代码、创建独立分支并进入 `WU-HOST-SESSION-EVENT-DELIVERY-01` plan gate。当前分支不得提前实施。 |
+| goal confirmation artifact | `docs/reviews/wu-cli-smoke-01-r1-goal-confirmation.md`；用户已确认，decision=`pass`。 |
+| plan artifact | `docs/host/wu-cli-smoke-01-r1-engine-delta-transient-live-stream-plan.md`；2 个语义闭环 slices，controller decision=`ready-for-plan-review`。 |
+| plan review artifacts | `docs/reviews/plan-review-20260720-230213.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-230039.md`（AgentDS）；均为 `pass-with-risks`。 |
+| plan review adjudication | `docs/reviews/wu-cli-smoke-01-r1-plan-review-controller-adjudication.md`；controller decision=`fix-required`。 |
+| plan fix artifact | `docs/reviews/wu-cli-smoke-01-r1-plan-fix-codex.md`；AgentCodex status=`completed`，accepted findings 已按 controller handoff 修复，待原 reviewers re-review。 |
+| plan re-review artifacts | `docs/reviews/plan-review-20260720-233342.md`（AgentMiMo）与 `docs/reviews/plan-review-20260720-233259.md`（AgentDS）；两路均为 `pass`，A-E 全部 fixed。 |
+| plan re-review adjudication | `docs/reviews/wu-cli-smoke-01-r1-plan-rereview-controller-adjudication.md`；controller decision=`accepted-plan`。 |
+| accepted plan commit | `929691ea`（`gateflow: accept plan for WU-CLI-SMOKE-01-R1`）。 |
+| Slice 1 implementation artifact | `docs/reviews/wu-cli-smoke-01-r1-slice1-implementation-codex.md`；AgentCodex status=`completed`。Reported validation：Host focused 290 passed，direct Host regressions 38 passed，public smoke 45 passed / 1 skipped，Service 51 passed，CLI 107 passed，`dayu/host/transient_delta.py` coverage 89.36%，pyright 0 errors，static boundary grep 与 `git diff --check` pass。 |
+| Slice 1 code review artifacts | `docs/reviews/code-review-20260721-005108.md`（AgentMiMo，pass）与 `docs/reviews/code-review-20260721-005320.md`（AgentDS，conditional pass）。 |
+| Slice 1 code review adjudication | `docs/reviews/wu-cli-smoke-01-r1-slice1-code-review-controller-adjudication.md`；DS-F03 accepted 为 test-only direct coverage fix，DS-F02 deferred-with-owner 到 Slice 2，DS-F01 与 terminal-only queue open question rejected-with-reason。 |
+| Slice 1 fix artifact | `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-codex.md`；DS-F03 direct owner-level test 已完成，生产代码未修改。 |
+| Slice 1 fix controller validation | `docs/reviews/wu-cli-smoke-01-r1-slice1-fix-controller-validation.md`；CLI focused 99 passed，pyright 0 errors，`git diff --check` pass，decision=`ready-for-code-rereview`。 |
+| Slice 1 code re-review artifacts | `docs/reviews/code-review-20260721-011148.md`（AgentMiMo）与 `docs/reviews/code-review-20260721-010824.md`（AgentDS）；两路均确认 DS-F03 fixed，无新增 material defect。 |
+| Slice 1 code re-review adjudication | `docs/reviews/wu-cli-smoke-01-r1-slice1-code-rereview-controller-adjudication.md`；decision=`accepted-slice1-rereview`。 |
+| accepted Slice 1 commit | `70ccda60`（`gateflow: accept Slice 1 for WU-CLI-SMOKE-01-R1`）。 |
+| Slice 2 implementation artifact | `docs/reviews/wu-cli-smoke-01-r1-slice2-implementation-codex.md`；AgentCodex status=`completed`。生产 Python 零修改；新增 adversarial lifecycle/scale、真实 Host→Service→CLI slow-consumer E2E 与 3×1000 stress，DS-F02 已由真实 mixed stream 路径收口。Reported validation：transient owner coverage 90.96%，Host focused 295 passed，Service 51 passed，CLI 109 passed，最终 Host/Service/CLI 2816 passed / 8 skipped / 6 deselected，独立 stress 1 passed，pyright 0 errors，static boundary grep 与 `git diff --check` pass。Controller 已核对改动边界与 artifact，当前进入双路 code review。 |
+| Slice 2 code review artifacts | `docs/reviews/wu-cli-smoke-01-r1-slice2-code-review-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-slice2-code-review-ds.md`（AgentDS，PASS）；两路均为 0 blocking finding。 |
+| Slice 2 code review adjudication | `docs/reviews/wu-cli-smoke-01-r1-slice2-code-review-controller-adjudication.md`；controller decision=`accepted-slice2-review`。MiMo/DS 的 private barrier、bounded polling、局部 Host probe 与默认排除 stress 项均经直接 owner-state 证据裁决为 rejected-with-reason 或 accepted-as-designed，0 个 accepted current-fix finding；无需 fix / code re-review 或新增 supplemental batch。Controller validation：新增闭环 21 passed，相关文件 pyright 0 errors，独立 stress 1 passed，`git diff --check` pass。 |
+| accepted Slice 2 commit | `d58014cf`（`gateflow: accept Slice 2 for WU-CLI-SMOKE-01-R1`）。 |
+| aggregate deepreview artifacts | `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-ds.md`（AgentDS，PASS）；两路均为 0 blocking finding。MiMo 独立复跑 Host/Service/CLI 2816 passed / 8 skipped、owner coverage 90.96%、pyright 0 errors 与静态边界检查。 |
+| aggregate deepreview adjudication | `docs/reviews/wu-cli-smoke-01-r1-aggregate-deepreview-controller-adjudication.md`；controller decision=`accepted-aggregate-deepreview`。DS 的 7 个低项均经 owner/可达 schedule/变更归属直接证据裁决为 rejected-with-reason，0 个 accepted current-fix finding；无需 aggregate fix / re-review 或新增 supplemental batch。Residual risk reconciliation 已完成。 |
+| accepted aggregate deepreview commit | `2d38abad`（`gateflow: accept aggregate deepreview for WU-CLI-SMOKE-01-R1`）。 |
+| draft PR | [PR #180](https://github.com/noho/dayu-agent-r/pull/180)；Draft，base=`main`，head=`phaseflow/wu-cli-smoke-01-r1`。该 WU 无独立 Issue owner，PR body 未添加 `Closes` footer。 |
+| PR review artifacts | `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-ds.md`（AgentDS，PASS）；两路均确认远端代码/架构 0 blocking finding。 |
+| PR review adjudication | `docs/reviews/wu-cli-smoke-01-r1-pr-180-review-controller-adjudication.md`；controller decision=`fix-required`。MiMo 的 `api.py` 格式化 note 为 non-blocking；controller direct metadata check 接受 PR180-F01：PR body 含字面量反斜杠-n，需改为真实 Markdown 换行。Supplemental batch 已记录于 `docs/phaseflow-umbrella-optimization-control.md`。 |
+| PR review fix artifact | `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-codex.md`；AgentCodex 仅用 body file 把 PR #180 body 修为真实 Markdown 多行，正文、title、Draft、base/head、reviewRequests 与无 closing directive 均保持不变。 |
+| PR review fix controller validation | `docs/reviews/wu-cli-smoke-01-r1-pr-review-fix-controller-validation.md`；decision=`ready-for-PR-rereview`。PR body 结构、head OID `ff5d515a`、Draft/reviewer/base/title invariants、无 closing directive、两项 Windows CI pass 与工作树边界均已直接验证。 |
+| PR re-review artifacts | `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-mimo.md`（AgentMiMo，PASS）与 `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-ds.md`（AgentDS，PASS）；两路均确认 PR180-F01 fixed、0 blocking、无新增 material finding。 |
+| PR re-review adjudication | `docs/reviews/wu-cli-smoke-01-r1-pr-180-rereview-controller-adjudication.md`；controller decision=`accepted-PR-rereview`。metadata fix 期间 code head 保持 `ff5d515a`；下一步只提交/push review artifacts 与 control closeout。 |
+| accepted PR review commit | `3900b069`（`gateflow: accept PR review for WU-CLI-SMOKE-01-R1`）；已 non-force push 到 Draft PR #180。 |
+| final remote checks | accepted PR review head `3900b069`：`windows-init-transaction` pass（5m05s），`windows-upload-script` pass（4m04s）；PR merge state clean。 |
+| final closeout artifact | `docs/reviews/wu-cli-smoke-01-r1-final-closeout.md`；decision=`final-closeout-pass`。 |
+| residual-risk WU reconciliation | 先前的 `WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01` 已经代码与设计 owner 裁决证明不能正确分拆：Service relay 应删除，容量、admission、overflow 与 iterator lifecycle 必须由同一个 Host Session Event Delivery contract 收口。两条旧 residual WU 已从 active residual 表删除并由 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代；capacity/heap/metrics/callback 等全部成为该 WU acceptance，不留 design residual。CLI R2 仍独立。 |
+| post-closeout design correction | 设计真源已更新为 async attach、单 Host mailbox、三维容量、跨 opener durable causal fence、本地 terminal post-commit coordinator 与 exact-five Service observation contract。Controller 裁决：`docs/reviews/wu-transient-delivery-ownership-design-controller-adjudication.md`。最终三路 re-review：`docs/reviews/wu-transient-delivery-ownership-design-final-closure-rereview-codex.md`、`docs/reviews/wu-transient-delivery-ownership-design-final-closure-rereview-mimo.md`、`docs/reviews/wu-transient-delivery-ownership-design-final-closure-rereview-ds.md`；均 PASS，0 material finding，0 design residual，0 未归属 residual，0 open question。 |
+| next goal | 实施 `WU-HOST-SESSION-EVENT-DELIVERY-01`：保留统一可关闭 iterator 外观，将 factory 改为 async；删除 Service event-copy relay；由 Host 以每订阅唯一 items/bytes 双有界 mailbox、per-Session admission、typed overflow/admission error、durable causal fence与本地 terminal coordinator负责 delivery correctness。 |
 | CLI compatibility invariant | 不得以删除 EventLog row 为单独完成条件。R1 完成时 `dayu-cli prompt` / `interactive` 的实时 `--thinking`、`--no-thinking` 抑制、final answer、activity/detail、取消和 renderer close 行为必须保持；content/tool-call 接入公共 transient path 不得造成 CLI 重复输出或改变既有默认展示。唯一有意变化是断线、CLI/Host 重启后不补放历史 per-chunk delta。 |
-| next non-goals | 不承诺任何 delta 的 durable/offline replay、断线补放或跨 Host restart 恢复；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement；不删除用于粗粒度展示事实的 `PREVIEW` event class。 |
-| blocking open questions | None；用户已裁决三类 delta 共用 transient live contract 且全部不进 EventLog。R1 的 transient ordering / identity 与现有 durable `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛，不得把 transient identity 伪装成 EventLog cursor。 |
-| next entry point | 用户手工 merge PR #179 后，从 `main` 同步最新代码，再以本文档启动 `WU-CLI-SMOKE-01-R1` goal confirmation；确认后由 AgentCodex 进入 `plan` gate。 |
+| next non-goals | 不持久化或重放 delta，不建立跨域总序/第三 sequence domain/跨进程 terminal 广播，不让慢 UI 暂停 Agent/Engine，不增加 Host-global 跨 Session quota，不实施 `WU-CLI-SMOKE-01-R2` thinking UI。 |
+| blocking open questions | None；最新设计已由三路最终 re-review 独立确认可实施。三个 packaged capacity 数值、heap safety margin 与低基数 metrics 必须在同一 implementation WU 内测量并验收，不是 residual 或 plan 前开放问题。 |
+| next entry point | 等待用户 / maintainer 手工 merge Draft PR #180。不得 mark ready、merge、request reviewers、close issue、发布外部 closeout comment 或 delete branch。PR #180 merge 后，从 `main` 同步最新代码并直接进入 `WU-HOST-SESSION-EVENT-DELIVERY-01` plan gate；不得改选旧的两个 capacity WU。 |
 
 
 ## 推进规则
@@ -217,8 +252,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
-| WU-CLI-SMOKE-01-R1 | deferred-with-owner | PR #179 merge 后的 selected next WU；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU并裁决完整目标：`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 共用 Host-owned transient live contract，全部不写 EventLog。当前 content/tool-call 已 accepted-without-row，但缺少公共 transient live delivery；`c1b546ac` 仅因 `watch_session_events` 轮询 EventLog，把 reasoning 改成每 delta 一条 durable `PREVIEW` row。R1 必须撤销该持久化并补齐三类 delta 的统一 live path；retention 只能清理结果、不能修复 owner drift。PR #179 merge 并同步 `main` 后进入 goal confirmation。 |
-| WU-CLI-SMOKE-01-R2 | deferred-with-owner | Future CLI UI enhancement / user decision | `CliThinkingRenderer` 当前保留 160 字符单行运行态展示；如后续用户要求 Codex / Claude Code 风格可展开 thinking panel，再在 CLI UI adapter lane 设计，不阻塞 WU-CLI-SMOKE-01 draft PR。 |
+| WU-CLI-SMOKE-01-R2 | deferred-with-owner | CLI UI adapter lane / user decision；无 GitHub Issue | `CliThinkingRenderer` 当前把每个 delta 单行化并按 160 字符截断后持续追加到同一运行态行；累计行并非 160 字符总上限，也没有可展开 panel/history。仅在用户提出明确 thinking UX、累计缓冲上限与终端交互要求后进入 goal confirmation。不得修改 Host transient/durable contract、持久化 thinking、增加 replay，或改变 provider reasoning 开关。 |
 
 ## 当前 Work Units
 
@@ -242,7 +276,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
-| WU-CLI-SMOKE-01-R1 | selected-next | Engine delta transient live stream remediation | PR #179 merge 后启动 | 高严重度 EventLog amplification bug：三类 per-chunk delta 统一走 Host-owned transient live stream 且全部不写 EventLog；直接持久化修复点是恢复 `REASONING_DELTA` non-durable ingest，content/tool-call 则从当前 accepted-without-row 接入同一 live contract。当前不在 PR #179 merge 前提前进入 plan。 |
+| WU-CLI-SMOKE-01-R1 | completed | Engine delta transient live stream remediation | Draft PR #180 | final-closeout-pass；accepted PR review commit `3900b069` 已 push，最终 Windows checks 均 PASS。PR180-F01 fixed。Post-closeout delivery ownership design 已完成三路最终 re-review；旧的两个 capacity WU 被 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代。等待用户 / maintainer 手工 merge Draft PR。 |
+| WU-HOST-SESSION-EVENT-DELIVERY-01 | confirmed-next-after-pr-180-merge | Host Session Event Delivery ownership、bounded mailbox 与跨 opener ordering | 用户明确裁决；无 GitHub Issue | PR #180 手工 merge 后的唯一 next implementation WU。设计真源与三路 review 已闭环；merge 后从 `main` 创建独立分支进入 plan gate。不得提前在当前 PR 分支实施。 |
+| WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
 | WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
@@ -310,13 +346,15 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - Accepted review findings 已修复：`--thinking` dead param、README/help 与实现不符、thinking on/off 缺测试、`REASONING_DELTA` 双重分类、interactive `--no-detail` 冗余 run view、interactive / prompt cancel path thinking renderer lifecycle，以及 prompt cancel caller wiring integration coverage。
 - AgentCodex reported validation：`tests/cli` `225 passed, 3 warnings`，Host / Service focused suite `126 passed, 3 warnings`，prompt / interactive / thinking renderer focused suite `66 passed, 3 warnings`，pyright `0 errors, 0 warnings, 0 informations`，`git diff --check` pass。
 - Controller reran final validation：`source .venv/bin/activate && pytest tests/cli -q` -> `225 passed, 3 warnings`；`source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py tests/host/test_engine_ingest_mapping.py tests/host/test_host_activity_event_projection.py -q` -> `126 passed, 3 warnings`；`source .venv/bin/activate && pyright` -> `0 errors, 0 warnings, 0 informations`；`git diff --check` pass。
-- Remaining display semantics residual risks are classified below：R1 调查已证明实时 thinking 不要求 durable `PREVIEW` row；当前持久化只是在 `watch_session_events` 轮询 EventLog 的架构下复用既有 watcher，因此 owner 已纠正为 future Host transient live fanout / watcher contract remediation，不再归 retention / purge。R2 的 `CliThinkingRenderer` 160-character single-line truncation 继续归 future CLI UI enhancement。
+- Display semantics follow-up 已按 owner 收敛：R1 以 Host-owned transient live contract 取代 EventLog watcher 对 per-chunk delta 的持久化；原先分拆的 Host / Service capacity 条目已由统一 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代，Service relay删除、Host mailbox容量与全部measurement在同一WU闭环。CLI当前是“每个delta单行化并按160字符截断后累计追加”，其可展开面板、历史与累计上限仍由 `WU-CLI-SMOKE-01-R2` 在明确UX要求后进入goal confirmation。
 
 ## WU-CLI-SMOKE-01-R1 Engine Delta Transient Live Stream Remediation
 
 ### 状态
 
-用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；下一会话不得重新收窄为只处理 thinking。当前不提前启动：PR #179 仍为 draft/open，用户将手工 merge；merge 后必须先从 `main` 同步，再进入本项 `goal confirmation`。除非同步后的代码或设计真源与本裁决直接矛盾，否则 goal confirmation 不再询问“三类还是一种”这一已裁决问题。
+用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。用户随后明确裁决完整目标不是 reasoning 专用旁路，而是 `CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA` 三类 per-chunk delta 共用 Host-owned transient live contract，全部不写 EventLog；后续不得重新收窄为只处理 thinking。PR #179 已于 2026-07-20 merge，本地 `main` 已同步到 merge commit `bd1d3e94`，当前工作分支为 `phaseflow/wu-cli-smoke-01-r1`。Goal confirmation、plan review/fix/re-review、两个 implementation slices、Slice 1 accepted finding fix/re-review、全 WU aggregate deepreview、Draft PR、PR review/fix/re-review、accepted PR review commit、最终远端 Windows checks 与 final closeout 均已完成。Accepted commits 为 plan `929691ea`、Slice 1 `70ccda60`、Slice 2 `d58014cf`、aggregate deepreview `2d38abad` 与 PR review `3900b069`。Aggregate 与 PR review 两路均 PASS；唯一 PR metadata finding `PR180-F01` 已修复并由双路 re-review 关闭。Final closeout artifact 为 `docs/reviews/wu-cli-smoke-01-r1-final-closeout.md`。
+
+Post-closeout 代码裁决最初把 Host 与 Service 固定容量拆成两个 evidence-gated WU；用户随后从第一性原理指出：慢 UI 无权暂停 Agent，Service 不应拥有第二个 event-copy relay，mailbox / capacity / overflow / iterator lifecycle 应由 Host Session Event Delivery 统一拥有。`docs/host/design.md` 已据此完成多轮 design review/fix/re-review，并进一步关闭单 opener terminal notice 无法覆盖跨进程 watcher、同步 factory pending cursor 无真实线性化点等高严重度反例。Controller 最终裁决 artifact 为 `docs/reviews/wu-transient-delivery-ownership-design-controller-adjudication.md`；最终 AgentCodex / AgentMiMo / AgentDS 三路 re-review 均 PASS，0 material finding、0 design residual、0 未归属 residual、0 open question。旧 `WU-HOST-TRANSIENT-CAPACITY-01` 与 `WU-SVC-ENTRYPOINT-RELAY-CAPACITY-01` 已被统一的 `WU-HOST-SESSION-EVENT-DELIVERY-01` 取代并从 active residual 表删除；所有可实施项和测量项均进入新 WU acceptance。Draft PR #180 保持 open / draft，等待用户或 maintainer 手工处理；该 WU 无独立 Issue owner，PR body 未添加 closing directive。未经明确授权不得 mark ready、merge、request reviewers、close issue、发布外部 closeout comment或 delete branch。
 
 ### 直接证据与动机
 
@@ -357,6 +395,44 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - 慢 watcher、提前 detach、Host close 与 worker terminal 不反压 EventLog append、不泄漏 task、不取消 Run、不产生伪 terminal fact。
 - 断线重连、Host restart 与离线 reader 不重放三类 delta；transient identity/order 不混入 durable `HostEvent.event_sequence` cursor，既有粗粒度 preview/canonical 补读不回归。
 - 受影响 Host / Service / CLI tests、单文件 coverage、pyright、`git diff --check`、README 触发检查与 EventLog source/propagation scans 通过。
+
+## WU-HOST-SESSION-EVENT-DELIVERY-01 Host Session Event Delivery Ownership and Bounded Mailbox
+
+### 状态与进入条件
+
+`confirmed-next-after-pr-180-merge`。用户已明确选择本 WU 作为 Draft PR #180 手工 merge 后的下一个实施 WU；当前无独立 GitHub Issue，owner / destination 为用户明确裁决。设计真源 `docs/host/design.md` 已完成多轮 AgentCodex 修订、AgentCodex / AgentMiMo / AgentDS 独立 review 与最终三路 re-review。Controller adjudication 为 `docs/reviews/wu-transient-delivery-ownership-design-controller-adjudication.md`；最终三路结论均为 PASS，material findings=`0`、design residual=`0`、未归属 residual=`0`、open question=`0`。
+
+进入条件固定为：用户 / maintainer 手工 merge PR #180；从 `main` 同步最新代码；创建独立 work branch；恢复 `$phaseflow` 并进入 plan gate。不得在 PR #180 当前分支提前实现，也不得把旧的两个 capacity WU 恢复为独立入口。
+
+### 语义 owner 与实施目标
+
+- 对外保留统一可关闭 iterator 外观，但 factory 改为 `await host.watch_session_events(session_id) -> HostSessionEventIterator`。successful return 是调用方可依赖的生效边界；Host 先 reserve、await 实际 durable start cursor transaction，再在 owner loop 无 `await` 注册 subscription并返回。
+- Session Event Delivery 是 live fanout、每订阅唯一 mailbox、唯一 in-flight retained accounting、per-Session subscription admission、overflow / detach、readiness、durable/transient merge与 iterator lifecycle 的唯一 owner。Service 删除 `_WatchAndWaitRuntime.queue` / drain relay，不得保留第二份 event queue、event list或 task-exception side channel。
+- runtime composer / operator 显式提供 `transient_mailbox_max_items`、`transient_mailbox_max_bytes`、`max_subscriptions_per_session`；每个 subscription 使用同一 policy snapshot。packaged 值必须在本 WU 内通过 workload / SLO / memory evidence裁决，不得继续写成 residual或私有魔法常量。
+- EngineEvent ingest 仍只拥有 durable identity / late-state validation与 non-blocking typed handoff；同一 validation transaction 已读取并确认的当前 `Attempt.started_event_sequence` 是 `durable_causal_fence_event_sequence` 的唯一真源。publisher只把该 Host-internal fence 原样复制到每个 mailbox entry；不得暴露为 public payload、第三 sequence domain或 post-commit latest/max readback。
+- iterator在 pop transient entry 前必须按 bounded pages把 durable cursor追到该 entry fence；遇前序 Run terminal 时先交付同 Run prefix与 durable terminal，并把后继 Run entry保留在同一 counted Host mailbox。mailbox为空时仍执行 bounded periodic durable reconciliation，使跨 opener / 跨进程 terminal correctness不依赖本地 notice。
+- `TerminalPostCommitNotice(session_id, terminal_event_sequence, wake_queue_promotion)` 与单一 `TerminalPostCommitPort` 只负责 producer所属 opener的本地 terminal-ready低延迟 wake和optional queue-promotion协调。所有当前 terminal producer必须从同一 transaction result携带 exact sequence并走该 port；它不承担跨 opener广播或全局 correctness。
+- Service仅保留 sole `anext()` consumer与容量一、generation-tagged、exact-five `ServiceObservationResult` slot；五类 caller disposition、fatal sticky、ack / clear / rebind、stop / cancellation仲裁和 cleanup exception precedence按设计真源实施。
+
+### 实施授权与验收
+
+- 实施范围至少覆盖 Host public Protocol / exports、`transient_delta.py`、新 terminal post-commit contract、`open_host.py`、`engine_ingest.py`、`admission.py`、`waiting.py`、`recovery.py`、`dispatch.py`、`command.py`、必要 durable transition/result types、runtime config / assembly、Service entrypoint runtime、受影响 CLI adapters、README 与对应 tests；不得以文件清单为理由拆成互不闭环的 Host/Service capacity WU。
+- owner tests冻结 items / bytes / subscriptions三维校验、先 reserve 后 allocation、所有 release路径、mailbox + in-flight统一 retained accounting、single-event oversized、item-full、cumulative-byte-full与 primary dimension固定顺序。overflow / admission必须使用各自 typed public error，不能复用 Host availability错误。
+- static qualified-callsite manifest + runtime fake port +本地 A/B barriers证明所有 terminal producer接入本地 port且无 session-id-only terminal promotion旁路；AST manifest不宣称证明跨 opener correctness。
+- 双 opener共享同一 DB 的 deterministic barrier必须覆盖：watcher与后继 B在 opener C，前序 A terminal由 opener A提交且 C无本地notice，B entry经多页catch-up仍先交付A terminal、保留B，Service ack / rebind后的下一次`anext()`才交付B。另测 mailbox空时 periodic reconciliation。
+- delayed-cursor deterministic barriers必须覆盖 cursor transaction被阻塞、并发 terminal、cursor完成后到subscription attach / return之间的 durable提交、factory cancellation、Host close与partial allocation failure；每条路径精确一次释放reservation和资源，successful return后不得因attach未完成丢失本地transient。
+- 删除 Host batch `drain_nowait()` tuple retention与Service event-copy relay；复用唯一 `delivery_size_bytes` helper。测量 logical UTF-8 budget到Python resident heap的safety margin并形成packaged defaults；metrics只使用低基数维度，不记录payload正文或Session/Run identity。
+- Service / UI activity / thinking callback必须快速、同步、非阻塞返回；慢 I/O、重 CPU与renderer由Service/UI owner显式解耦，不能依赖Host mailbox吸收callback延迟，也不能建立新的event-copy relay。
+- 运行全部受影响测试、单文件覆盖率检查（目标 `>=80%`）、完整pyright、`git diff --check`、旧术语/source propagation scans与README trigger audit。measurement、callback约束与所有上述测试均是本 WU acceptance，不得降级为 residual。
+
+### 非目标与 residual 裁决
+
+- 不持久化、重放、断线补放或跨 Host restart恢复任何 delta；不建立 durable/transient跨域总序、第三 sequence domain、terminal marker history或跨进程 terminal广播。
+- 不修改 Engine public contract，不让Service/UI绕过Host消费 raw `EngineEvent`，不让慢 UI / Service暂停Agent、Engine、promotion或其它watcher。
+- 不增加Host-global跨Session总内存quota；当前需求与威胁模型只要求per-subscription items/bytes及per-Session subscription cap。若未来出现独立的全局SLO/租户隔离需求，必须重新走design gate，不能把它伪装成本 WU residual。
+- 不实施 `WU-CLI-SMOKE-01-R2` thinking panel / history / expandable UI。
+
+本 WU 的 design residual=`0`、未归属 residual=`0`。所有当前已知可实施项和测量项已进入上述 acceptance；完成前不得把其中任一项重新标记为 deferred residual。
 
 ## WU-WAIT-03 External Job Physical Cancel / Revoke / Abandon
 
