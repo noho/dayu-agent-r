@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeAlias, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -1381,6 +1381,118 @@ class HostApiErrorCode(StrEnum):
     INTERNAL_ERROR = "internal_error"
 
 
+class HostSessionAccessMode(StrEnum):
+    """Session attachment 生命周期内不可变的访问模式。"""
+
+    READ_WRITE = "read_write"
+    READ_ONLY = "read_only"
+
+
+class HostSessionMutationRejectionReason(StrEnum):
+    """用户发起 Session mutation 被 access owner 拒绝的封闭原因。"""
+
+    ATTACHMENT_REQUIRED = "attachment_required"
+    READ_ONLY = "read_only"
+    ATTACHMENT_CLOSING = "attachment_closing"
+
+
+class HostSessionAttachmentConflictReason(StrEnum):
+    """同一 Host handle 创建 Session attachment 冲突的封闭原因。"""
+
+    ALREADY_ATTACHED = "already_attached"
+
+
+@dataclass(frozen=True, slots=True)
+class HostSessionMutationErrorDetail:
+    """Session mutation access 拒绝的结构化详情。
+
+    :param kind: 固定为 ``session_mutation_access`` 的 detail 判别字段。
+    :param session_id: 被拒绝 mutation 对应的 Session id。
+    :param reason: registry access owner 产生的稳定拒绝原因。
+    :param required_mode: mutation 所需访问模式。
+    :param actual_mode: 当前 live attachment mode；无 ACTIVE attachment 时为
+        ``None``。
+    """
+
+    kind: Literal["session_mutation_access"]
+    session_id: str
+    reason: HostSessionMutationRejectionReason
+    required_mode: HostSessionAccessMode
+    actual_mode: HostSessionAccessMode | None
+
+    def __post_init__(self) -> None:
+        """校验 mutation access detail 的封闭字段。
+
+        :returns: ``None``。
+        :raises ValueError: kind 非法或 Session id 为空时抛出。
+        :raises TypeError: reason、required_mode 或 actual_mode 类型非法时抛出。
+        """
+
+        if self.kind != "session_mutation_access":
+            raise ValueError(
+                "HostSessionMutationErrorDetail.kind must be session_mutation_access"
+            )
+        _require_non_empty(
+            self.session_id,
+            field_name="HostSessionMutationErrorDetail.session_id",
+        )
+        if not isinstance(self.reason, HostSessionMutationRejectionReason):
+            raise TypeError(
+                "HostSessionMutationErrorDetail.reason must be "
+                "HostSessionMutationRejectionReason"
+            )
+        if not isinstance(self.required_mode, HostSessionAccessMode):
+            raise TypeError(
+                "HostSessionMutationErrorDetail.required_mode must be "
+                "HostSessionAccessMode"
+            )
+        if self.actual_mode is not None and not isinstance(
+            self.actual_mode,
+            HostSessionAccessMode,
+        ):
+            raise TypeError(
+                "HostSessionMutationErrorDetail.actual_mode must be "
+                "HostSessionAccessMode or None"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class HostSessionAttachmentConflictDetail:
+    """同一 Host handle 重复 attachment 的结构化冲突详情。
+
+    :param kind: 固定为 ``session_attachment_conflict`` 的 detail 判别字段。
+    :param session_id: 已存在 live attachment 的 Session id。
+    :param reason: registry uniqueness owner 产生的稳定冲突原因。
+    """
+
+    kind: Literal["session_attachment_conflict"]
+    session_id: str
+    reason: HostSessionAttachmentConflictReason
+
+    def __post_init__(self) -> None:
+        """校验 attachment conflict detail 的封闭字段。
+
+        :returns: ``None``。
+        :raises ValueError: kind 非法或 Session id 为空时抛出。
+        :raises TypeError: reason 类型非法时抛出。
+        """
+
+        if self.kind != "session_attachment_conflict":
+            raise ValueError(
+                "HostSessionAttachmentConflictDetail.kind must be "
+                "session_attachment_conflict"
+            )
+        _require_non_empty(
+            self.session_id,
+            field_name="HostSessionAttachmentConflictDetail.session_id",
+        )
+        if not isinstance(self.reason, HostSessionAttachmentConflictReason):
+            raise TypeError(
+                "HostSessionAttachmentConflictDetail.reason must be "
+                "HostSessionAttachmentConflictReason"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class SteerConflictDetail:
     """steer 前置条件冲突的结构化错误详情。
@@ -1502,6 +1614,8 @@ class HostUnavailableDetail:
 
 HostApiErrorDetail: TypeAlias = (
     SteerConflictDetail
+    | HostSessionMutationErrorDetail
+    | HostSessionAttachmentConflictDetail
     | HostSessionEventDeliveryDetail
     | HostSessionEventAdmissionDetail
     | HostUnavailableDetail
