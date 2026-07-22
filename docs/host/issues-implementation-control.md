@@ -154,11 +154,11 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CTX-04` draft PR readiness。 |
+| phase | `WU-CTX-04` final closeout。 |
 | active work unit | `WU-CTX-04`；类型为 GitHub Issue #112 对应的 architecture-sensitive issue work unit。 |
-| gate | `aggregate-deepreview-pass` |
+| gate | `final-closeout-pass` |
 | blocking open questions | None。 |
-| next entry point | Controller完成最终diff/验证/residual-risk reconciliation，提交aggregate deepreview artifacts并准备draft PR；不得自动ready、merge、请求reviewer或关闭Issue。 |
+| next entry point | Draft PR #182已交付；等待用户GitHub review / CI处置与手工merge，不自动ready、merge、请求reviewer或关闭Issue。 |
 
 ## 推进规则
 
@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
-| WU-CTX-04 | aggregate-deepreview-pass | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | accepted plan=`1f032b5e`；accepted Slice 1=`eda1d70e`；accepted Slice 2=`4ca0810b`；accepted Slice 3=`24dfcf37`；两路aggregate deepreview均PASS，Controller接受0项finding。 |
+| WU-CTX-04 | draft-pr-open / final-closeout-pass | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 / draft PR #182 | accepted plan=`1f032b5e`；accepted Slice 1=`eda1d70e`；accepted Slice 2=`4ca0810b`；accepted Slice 3=`24dfcf37`；aggregate deepreview PASS；等待用户review/merge。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
@@ -688,7 +688,7 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 
 ### 状态
 
-GitHub Issue #112 当前为 OPEN；本条状态为 `aggregate-deepreview-pass`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；Slice 1 contract-only实现及review loop已通过，受保护本地commit为`eda1d70e`。Slice 2联合implementation、initial review、review fix与双路re-review均已闭环，Controller最终acceptance decision=`pass`；zero-request orphan/unknown proactive history现由projection owner严格fail closed，recovery nested work-lease contract与Host close mandatory/best-effort文档已同步。Slice 3 implementation、initial双路review、Controller adjudication、review fix与双路re-review均已完成；3项accepted findings全部fixed，两路均为`pass`且0个新actionable findings，Controller最终acceptance decision=`pass`，accepted Slice 3保护提交为`24dfcf37`。三个implementation slices均已保护。AgentMiMo与AgentDS相对main baseline执行aggregate deepreview后均判定PASS；Controller逐项裁决9个reviewer finding编号，接受0项、驳回9项，没有deferred/needs-more-evidence/blocking question，当前进入draft PR readiness。
+GitHub Issue #112 当前为 OPEN；本条状态为 `draft-pr-open / final-closeout-pass`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；Slice 1 contract-only实现及review loop已通过，受保护本地commit为`eda1d70e`。Slice 2联合implementation、initial review、review fix与双路re-review均已闭环，Controller最终acceptance decision=`pass`；zero-request orphan/unknown proactive history现由projection owner严格fail closed，recovery nested work-lease contract与Host close mandatory/best-effort文档已同步。Slice 3 implementation、initial双路review、Controller adjudication、review fix与双路re-review均已完成；3项accepted findings全部fixed，两路均为`pass`且0个新actionable findings，Controller最终acceptance decision=`pass`，accepted Slice 3保护提交为`24dfcf37`。三个implementation slices均已保护。AgentMiMo与AgentDS相对main baseline执行aggregate deepreview后均判定PASS；Controller逐项裁决9个reviewer finding编号，接受0项、驳回9项，没有deferred/needs-more-evidence/blocking question。branch-wide diff、full pyright与publish preflight通过，feature branch已推送；draft PR #182为OPEN/draft，base=`main`、head=`feat/wu-ctx-04`。final closeout=`pass`，等待用户review/merge。
 
 ### Gate artifacts
 
@@ -790,6 +790,14 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `aggregate-deepreview-pass`�
   mutex release fail-closed contract冲突、无当前lease泄漏producer、typed/private调用图不可达、
   already-done Future正确完成语义或纯未来假设。接受=0、deferred=0、needs-more-evidence=0、
   blocking questions=None。
+- aggregate deepreview commit：`e7da8ed5`（`gateflow: pass WU-CTX-04 aggregate deepreview`）。
+- publish preflight：`github/main == main == 974f9e16`，full pyright=`0 errors`，整分支
+  `git diff --check`通过，工作树干净且不存在同head既有PR。review artifact纯机械whitespace
+  cleanup commit=`e421e4b0`。
+- draft PR：`https://github.com/noho/dayu-agent-r/pull/182`；state=`OPEN`、draft=`true`、
+  base=`main`、head=`feat/wu-ctx-04`。未ready、merge、请求reviewer、评论或修改Issue #112。
+- final closeout：`docs/reviews/wu-ctx-04-final-closeout-controller.md`；decision=
+  `final-closeout-pass`，所有residual risk已分类，blocking questions=None。
 
 ### 已确认问题与直接代码证据
 
