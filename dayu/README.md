@@ -70,8 +70,8 @@ flowchart TD
 ## 稳定边界
 
 - `UI` 当前主要是外部调用者角色；本手册只把已经实现并发布的 package 作为稳定边界。当前 CLI 通过 Service / Host public view 发起动作和订阅结果，不写 Host truth。
-- `dayu.service` 是 Host 外部 composition boundary。execution assembly 把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`；admin assembly 只从 Host runtime storage config 映射 `OpenHostAdminOptions`，不加载 scene、tool、model 或 secret。Service 还提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up terminal observation、cancel request 构造和 watcher failure 诊断；Fins direct 命令入口通过 `dayu.service.fins_direct` 暴露 `AsyncIterator[FinsEvent]`，不伪装成 Host Run，也不把 CLI 操作建模为 durable job。
-- `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
+- `dayu.service` 是 Host 外部 composition boundary。execution assembly 把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`；admin assembly 只从 Host runtime storage config 映射 `OpenHostAdminOptions`，不加载 scene、tool、model 或 secret。Service 还提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up sole-consumer terminal observation、typed delivery interruption durable recovery 与 cancel request 构造；Fins direct 命令入口通过 `dayu.service.fins_direct` 暴露 `AsyncIterator[FinsEvent]`，不伪装成 Host Run，也不把 CLI 操作建模为 durable job。
+- `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、Session Event Delivery、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
 - `dayu.engine` 是单次 run 执行边界。它不导入 Host，不读取 Host durable store，不管理 Session / Run / Attempt，不发现工具，不持有工具权限或财报业务语义。
 - `dayu.contracts` 是 Dayu Agent 公共契约包。它承载层中立数据与协议，不承载 Host / Engine 状态机、Service 流程、UI 展示语义或 Fins 业务事实。
 - `dayu.runtime` 是层中立运行期基础设施包。它不得 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`，也不承载任何层的状态机或业务语义。
@@ -97,7 +97,7 @@ flowchart TD
 
 ### Service 装配
 
-Service 从 `dayu.runtime.workspace_paths` 与 `dayu.runtime.location` 解析 workspace 本地路径和包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。需要 production wait poller 时，Service / composition root 在 construction time 显式提供 wait poll adapter registry 与 wait poller policy；product entrypoint helper 会在 scene 实际选择 Fins download / preprocess / upload awaiting 长事务工具时补齐该 policy，未选择长事务工具的 scene 保持 no-poller。Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 attach `watch_session_events(session_id)`，通过有界 relay 消费 durable `HostEvent` 与 live-only `HostTransientDelta`；cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前 attach watcher；terminal fallback 只使用 `get_run(...)` 与 `read_outbox_terminal_items(...)`。
+Service 从 `dayu.runtime.workspace_paths` 与 `dayu.runtime.location` 解析 workspace 本地路径和包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。需要 production wait poller 时，Service / composition root 在 construction time 显式提供 wait poll adapter registry 与 wait poller policy；product entrypoint helper 会在 scene 实际选择 Fins download / preprocess / upload awaiting 长事务工具时补齐该 policy，未选择长事务工具的 scene 保持 no-poller。Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 await `watch_session_events(session_id)` 完成真实 Host attach，并由唯一 consumer 顺序读取 durable `HostEvent` 与 live-only `HostTransientDelta`；Service 不建立 event-copy relay，terminal observation 只写入一个 capacity-one generation slot。typed delivery interruption 关闭当前 watcher 后只通过 `get_run(...)` 与 `read_outbox_terminal_items(...)` 做 durable recovery。CLI 在 UI 层为每个 display lifecycle 持有独立单线程 execution domain，串行执行 activity / thinking callback 和 renderer 操作；该执行域不进入 Host 或 Service observation owner。cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前完成同一 async attach。
 
 ### 普通 follow-up
 
@@ -145,6 +145,7 @@ HostEvent、outbox、Conversation Memory、tool trace、audit、diagnostic 和 p
 - `HostEvent`：Host 面向 UI / Service 的 durable typed event view，来自 committed Host facts。
 - `HostTransientDelta`：Host 当前 runtime 内的 live-only typed content、reasoning 或 tool-call 增量；不属于 durable truth。
 - `HostSessionEvent`：`watch_session_events(...)` 交付的 `HostEvent | HostTransientDelta` 联合。
+- `HostSessionEventIterator`：successful async attach 后返回的 public closable iterator；Host 拥有 per-Session reservation、item-bound mailbox、唯一 in-flight、overflow 与 detach。
 - `ToolBundle`：业务工具声明集合，定义真源在 `dayu.contracts`，由 Service / discovery 装配后交给 Host。
 - `ToolRuntime`：Host-owned 工具治理模块，包装业务工具为受治理 `ToolExecutor`。
 - `Fins runtime`：`DefaultFinsRuntime` 装配的财报共享业务底座，包含 read runtime、ingestion runtime、仓储和处理器注册表。
@@ -193,7 +194,7 @@ Engine 契约只描述一次 run 的执行输入、Runner 调用、工具批次�
 
 ### Host public contract
 
-Host public contract 分为两个无继承关系的入口：`open_host(options)` 返回 execution `Host`，`open_host_admin(options)` 返回纯 durable `HostAdmin`。execution handle 不暴露 list / purge / storage admin；admin handle 不暴露 execution / cancel / watch。核心类型包括 `OpenHostOptions`、`OpenHostAdminOptions`、`OrdinaryRunExecutionBaseline`、`CompactorRunnerBaseline`、`HostToolingOptions`、Session / Run request 与 snapshot、Session 列表读取结果、`FollowupBehavior`、`CancelMode`、wait resolution request / outcome、outbox read / drain request、`HostEvent`、`HostTransientDelta`、`HostSessionEvent`、`HostFinalAnswerView`、`HostApiError`、`OperationContext` 和本地 worker typed boundary。
+Host public contract 分为两个无继承关系的入口：`open_host(options)` 返回 execution `Host`，`open_host_admin(options)` 返回纯 durable `HostAdmin`。execution handle 不暴露 list / purge / storage admin；admin handle 不暴露 execution / cancel / watch。核心类型包括 `OpenHostOptions`、`OpenHostAdminOptions`、`HostSessionEventDeliveryPolicy`、`OrdinaryRunExecutionBaseline`、`CompactorRunnerBaseline`、`HostToolingOptions`、Session / Run request 与 snapshot、Session 列表读取结果、`FollowupBehavior`、`CancelMode`、wait resolution request / outcome、outbox read / drain request、`HostEvent`、`HostTransientDelta`、`HostSessionEvent`、`HostSessionEventIterator`、`HostFinalAnswerView`、`HostApiError`、`OperationContext` 和本地 worker typed boundary。
 
 Host contract 的稳定语义是 durable command 和 typed read view。两种 public handle 的 SQLite command / read 统一进入各自 single-worker durable actor；execution scheduler 持有独立 store，actor after-commit wake 与 active worker cancel 桥回 opener event loop。`submit_followup`、`cancel_run`、`resolve_wait`、`retry_run`、`replay_run`、`close_session`、`purge_session` 等 command 都先进入 Host admission 或对应治理入口；`get_session`、`list_sessions`、`get_run`、outbox read 和 storage usage report 等读取入口只返回 Host durable truth 或明确的派生 read view。低层 durable store、command handle factory、scheduler、projection runner、ToolRuntime factory 和 state mutator 不是普通 Service-facing contract。
 

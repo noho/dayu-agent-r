@@ -6,7 +6,8 @@ import asyncio
 import builtins
 import getpass
 import io
-from collections.abc import AsyncIterator
+import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
@@ -53,6 +54,9 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostReasoningDelta,
     HostSessionEvent,
+    HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryReason,
+    HostSessionEventIterator,
     HostStreamCursor,
     HostTerminalStatus,
     HostTransientDelta,
@@ -78,10 +82,18 @@ from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverr
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.output import render_prompt_terminal_result
 from dayu.cli.run_keys import RunningKeyAction
-from dayu.cli.runtime_display import RuntimeDisplayController
+from dayu.cli.runtime_display import (
+    RuntimeActivityDisplay,
+    RuntimeDisplayController,
+    RuntimeThinkingDisplay,
+)
 from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
-from dayu.service.entrypoint_runtime import EntrypointRunTerminalResult, EntrypointThinking
+from dayu.service.entrypoint_runtime import (
+    EntrypointRunTerminalResult,
+    EntrypointTerminalSource,
+    EntrypointThinking,
+)
 from dayu.fins.resolver import FmpCompanyInfo
 
 _REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
@@ -102,6 +114,7 @@ _PROMPT_CURRENT_TIME_TEXT = (
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+_TEST_ASYNC_TIMEOUT_SECONDS = 2.0
 
 
 class _TtySecretInput(io.StringIO):
@@ -149,11 +162,6 @@ async def _raise_cli_terminal_cursor_error(
 
 
 @dataclass(frozen=True, slots=True)
-class _StopSignal:
-    """测试 watcher 停止信号。"""
-
-
-@dataclass(frozen=True, slots=True)
 class _RaiseSignal:
     """测试 watcher 异常信号。"""
 
@@ -189,11 +197,87 @@ class _FakePromptFmpResolver:
         )
 
 
+class _BlockingFinishThinkingDisplay:
+    """用线程 barrier 冻结 prompt finish-thinking 窗口。"""
+
+    finish_started: threading.Event
+    release_finish: threading.Event
+    close_count: int
+
+    def __init__(self) -> None:
+        """初始化 finish 与 close 观测状态。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.finish_started = threading.Event()
+        self.release_finish = threading.Event()
+        self.close_count = 0
+
+    def finish_runtime_display(self) -> None:
+        """阻塞 finish，直到测试允许 helper 继续取消仲裁。
+
+        :returns: ``None``。
+        :raises AssertionError: 测试未在时限内释放 barrier 时抛出。
+        """
+
+        self.finish_started.set()
+        released = self.release_finish.wait(timeout=_TEST_ASYNC_TIMEOUT_SECONDS)
+        if not released:
+            raise AssertionError("finish-thinking barrier was not released")
+
+    def close(self) -> None:
+        """记录 thinking display 关闭次数。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+
+class _CloseFailingActivityRenderer(CliActivityRenderer):
+    """在真实 prompt renderer contract 上注入 caller-close failure。"""
+
+    close_count: int
+    _close_error: RuntimeError
+
+    def __init__(self, close_error: RuntimeError) -> None:
+        """初始化关闭失败 renderer。
+
+        :param close_error: ``close`` 必须原样抛出的异常。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(
+            stderr=io.StringIO(),
+            options=CliActivityRendererOptions(visible=True, enabled=False),
+        )
+        self.close_count = 0
+        self._close_error = close_error
+
+    def close(self) -> None:
+        """关闭 renderer 后原样抛出配置的 lifecycle failure。
+
+        :returns: 本方法不返回。
+        :raises RuntimeError: 始终抛出配置的关闭异常。
+        """
+
+        self.close_count += 1
+        super().close()
+        raise self._close_error
+
+
 class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostSessionEvent | _StopSignal | _RaiseSignal]
+    _items: tuple[HostSessionEvent | _RaiseSignal, ...]
+    _item_index: int
+    _changed: asyncio.Event
+    _closed: bool
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -203,9 +287,12 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count = 0
-        self._queue = asyncio.Queue()
+        self._items = ()
+        self._item_index = 0
+        self._changed = asyncio.Event()
+        self._closed = False
 
-    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
+    def __aiter__(self) -> HostSessionEventIterator:
         """返回自身作为 async iterator。
 
         :returns: HostEvent async iterator。
@@ -221,9 +308,13 @@ class _FakeHostEventIterator:
         :raises StopAsyncIteration: 收到停止信号时抛出。
         """
 
-        item = await self._queue.get()
-        if isinstance(item, _StopSignal):
-            raise StopAsyncIteration
+        while self._item_index >= len(self._items):
+            if self._closed:
+                raise StopAsyncIteration
+            self._changed.clear()
+            await self._changed.wait()
+        item = self._items[self._item_index]
+        self._item_index += 1
         if isinstance(item, _RaiseSignal):
             raise item.error
         return item
@@ -236,7 +327,8 @@ class _FakeHostEventIterator:
         :raises Exception: 不主动抛出异常。
         """
 
-        await self._queue.put(event)
+        self._items = (*self._items, event)
+        self._changed.set()
 
     async def fail(self, error: Exception) -> None:
         """推入 watcher drain 应观察到的异常。
@@ -246,7 +338,8 @@ class _FakeHostEventIterator:
         :raises Exception: 不主动抛出异常。
         """
 
-        await self._queue.put(_RaiseSignal(error=error))
+        self._items = (*self._items, _RaiseSignal(error=error))
+        self._changed.set()
 
     async def aclose(self) -> None:
         """关闭 watcher。
@@ -256,7 +349,8 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count += 1
-        await self._queue.put(_StopSignal())
+        self._closed = True
+        self._changed.set()
 
 
 class _FakeHost:
@@ -355,10 +449,10 @@ class _FakeHost:
             slot = SessionSlotRef(scope=request.scope, slot_key=request.slot_key)
         return _session_snapshot(session_id="session-1", slot=slot)
 
-    def watch_session_events(
+    async def watch_session_events(
         self,
         session_id: str,
-    ) -> AsyncIterator[HostSessionEvent]:
+    ) -> HostSessionEventIterator:
         """记录 watcher attach。
 
         :param session_id: 目标 Session id。
@@ -745,7 +839,9 @@ class _FakeRunningKeyMonitor:
 
     started_count: int
     closed_count: int
-    _actions: asyncio.Queue[RunningKeyAction]
+    _actions: tuple[RunningKeyAction, ...]
+    _action_index: int
+    _closed_event: asyncio.Event
     _delay_ticks: int
 
     def __init__(
@@ -764,10 +860,10 @@ class _FakeRunningKeyMonitor:
 
         self.started_count = 0
         self.closed_count = 0
-        self._actions = asyncio.Queue()
+        self._actions = actions
+        self._action_index = 0
+        self._closed_event = asyncio.Event()
         self._delay_ticks = delay_ticks
-        for action in actions:
-            self._actions.put_nowait(action)
 
     def start(self) -> None:
         """记录 monitor 启动。
@@ -787,7 +883,12 @@ class _FakeRunningKeyMonitor:
 
         for _tick_index in range(self._delay_ticks):
             await asyncio.sleep(0)
-        return await self._actions.get()
+        if self._action_index < len(self._actions):
+            action = self._actions[self._action_index]
+            self._action_index += 1
+            return action
+        await self._closed_event.wait()
+        raise asyncio.CancelledError
 
     def close(self) -> None:
         """记录 monitor 关闭。
@@ -797,6 +898,7 @@ class _FakeRunningKeyMonitor:
         """
 
         self.closed_count += 1
+        self._closed_event.set()
 
 
 def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
@@ -1299,7 +1401,16 @@ def test_prompt_command_uses_outbox_fallback_when_watcher_fails(
     workspace_root = tmp_path
     fake_host = _FakeHost(
         submit_terminal=None,
-        submit_watcher_errors=(RuntimeError("watch stream disconnected"),),
+        submit_watcher_errors=(
+            HostApiError(
+                code=HostApiErrorCode.DELIVERY_INTERRUPTED,
+                message="delivery interrupted",
+                retryable=False,
+                detail=HostSessionEventDeliveryDetail(
+                    reason=(HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW)
+                ),
+            ),
+        ),
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_item=_outbox_item(),
     )
@@ -1580,6 +1691,75 @@ async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_fi
 
 
 @pytest.mark.asyncio
+async def test_prompt_display_domain_construction_failure_precedes_host_attach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """私有 execution domain 构造失败必须在 Host attach/submit 前原样传播。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises Exception: construction ordering 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    domain_error = RuntimeError("display domain construction failed")
+    fake_host = _FakeHost(submit_terminal=None)
+
+    def fail_domain_construction(
+        *,
+        activity_display: RuntimeActivityDisplay | None,
+        thinking_display: RuntimeThinkingDisplay | None,
+    ) -> RuntimeDisplayController:
+        """模拟私有 executor 构造失败。
+
+        :param activity_display: caller 已构造的 activity renderer。
+        :param thinking_display: caller 已构造的 thinking renderer。
+        :returns: 本函数不返回。
+        :raises RuntimeError: 原样抛出固定构造失败。
+        """
+
+        del activity_display, thinking_display
+        raise domain_error
+
+    monkeypatch.setattr(
+        session_execution,
+        "RuntimeDisplayController",
+        fail_domain_construction,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="display domain construction failed",
+    ) as exc_info:
+        await session_execution._submit_prompt_turn_handling_sigint(
+            host=cast(Host, fake_host),
+            runtime=runtime,
+            invocation=session_execution.new_cli_invocation(
+                command_name="prompt",
+                scenario="prompt",
+                display_user="本地 CLI 用户",
+                ticker="AAPL",
+            ),
+            session_id="session-1",
+            user_prompt="请总结收入变化",
+            run_overrides=ServiceRunOverrides(),
+            sigint_monitor=_NoopSigintMonitor(),
+            activity_renderer=CliActivityRenderer(
+                stderr=io.StringIO(),
+                options=CliActivityRendererOptions(
+                    visible=True,
+                    enabled=True,
+                ),
+            ),
+        )
+
+    assert exc_info.value is domain_error
+    assert fake_host.calls == []
+
+
+@pytest.mark.asyncio
 async def test_prompt_sigint_after_run_id_cancels_host_run(
     tmp_path: Path,
 ) -> None:
@@ -1596,7 +1776,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
-                assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -1636,7 +1816,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
 
 @pytest.mark.asyncio
 async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
-    """prompt 本地取消 helper 应先收尾再关闭 thinking renderer。"""
+    """prompt 本地取消 helper 应先收尾，并由 caller 关闭 thinking renderer。"""
 
     accepted_run = session_execution._PromptAcceptedRunState()
     submit_task = asyncio.create_task(_never_finishes_prompt_terminal())
@@ -1654,6 +1834,10 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
     fake_host = _FakeHost(
         submit_terminal=None,
     )
+    runtime_display = RuntimeDisplayController(
+        activity_display=None,
+        thinking_display=thinking_renderer,
+    )
 
     result = await session_execution._cancel_prompt_turn_after_local_request(
         host=cast(Host, fake_host),
@@ -1667,10 +1851,7 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
         submit_task=submit_task,
         sigint_monitor=_NoopSigintMonitor(),
         observed_sigint_count=0,
-        runtime_display=RuntimeDisplayController(
-            activity_display=None,
-            thinking_display=thinking_renderer,
-        ),
+        runtime_display=runtime_display,
     )
 
     assert result is None
@@ -1678,6 +1859,119 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
     assert stderr.getvalue() == "Thinking: The user is asking\n"
     thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-cancel"))
     assert stderr.getvalue() == "Thinking: The user is asking\n"
+    await runtime_display.aclose()
+
+
+@pytest.mark.asyncio
+async def test_prompt_cancel_returns_submit_terminal_completed_during_finish() -> None:
+    """finish-thinking 窗口自然完成时应保留 live terminal 且不发 Host cancel。
+
+    :returns: ``None``。
+    :raises Exception: prompt cancel 仲裁、identity 或 cleanup 断言失败时抛出。
+    """
+
+    accepted_run = session_execution._PromptAcceptedRunState()
+    accepted_run.record("run-1")
+    terminal = _entrypoint_terminal_result()
+    submit_release = asyncio.Event()
+    submit_task = asyncio.create_task(
+        _complete_prompt_terminal_after_release(submit_release, terminal)
+    )
+    thinking_display = _BlockingFinishThinkingDisplay()
+    runtime_display = RuntimeDisplayController(
+        activity_display=None,
+        thinking_display=thinking_display,
+    )
+    fake_host = _FakeHost(submit_terminal=None)
+    cancel_task = asyncio.create_task(
+        session_execution._cancel_prompt_turn_after_local_request(
+            host=cast(Host, fake_host),
+            invocation=session_execution.new_cli_invocation(
+                command_name="prompt",
+                scenario="prompt",
+                display_user="本地 CLI 用户",
+                ticker="AAPL",
+            ),
+            accepted_run=accepted_run,
+            submit_task=submit_task,
+            sigint_monitor=_NoopSigintMonitor(),
+            observed_sigint_count=0,
+            runtime_display=runtime_display,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(
+            _wait_for_thread_event(thinking_display.finish_started),
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+        assert submit_task.done() is False
+        submit_release.set()
+        observed_terminal = await asyncio.wait_for(
+            asyncio.shield(submit_task),
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+        assert observed_terminal is terminal
+        thinking_display.release_finish.set()
+        result = await asyncio.wait_for(
+            cancel_task,
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+    finally:
+        thinking_display.release_finish.set()
+        if not cancel_task.done():
+            cancel_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancel_task
+        await runtime_display.aclose()
+
+    assert result is terminal
+    assert result is not None
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.terminal_event_id == "terminal-run-1-finish-race"
+    assert fake_host.cancel_requests == []
+    assert thinking_display.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_terminal_surfaces_display_close_failure_from_caller_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """无业务 primary 时 prompt caller 必须原样传播 display close failure。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: caller lifecycle owner contract 断言失败时由 pytest 抛出。
+    """
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    close_error = RuntimeError("prompt display close failed")
+    renderer = _CloseFailingActivityRenderer(close_error)
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+    )
+
+    with pytest.raises(RuntimeError, match="prompt display close failed") as exc_info:
+        await session_execution._submit_prompt_turn_handling_sigint(
+            host=cast(Host, fake_host),
+            runtime=runtime,
+            invocation=session_execution.new_cli_invocation(
+                command_name="prompt",
+                scenario="prompt",
+                display_user="本地 CLI 用户",
+                ticker="AAPL",
+            ),
+            session_id="session-1",
+            user_prompt="请总结收入变化",
+            run_overrides=ServiceRunOverrides(),
+            sigint_monitor=_NoopSigintMonitor(),
+            activity_renderer=renderer,
+        )
+
+    assert exc_info.value is close_error
+    assert renderer.close_count == 1
+    assert fake_host.cancel_requests == []
+    assert fake_host.watchers[0].closed_count == 1
 
 
 @pytest.mark.asyncio
@@ -2099,7 +2393,7 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
-                assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -2271,6 +2565,56 @@ async def _never_finishes_prompt_terminal() -> EntrypointRunTerminalResult:
 
     await asyncio.Event().wait()
     raise RuntimeError("unreachable prompt terminal")
+
+
+async def _complete_prompt_terminal_after_release(
+    release: asyncio.Event,
+    terminal: EntrypointRunTerminalResult,
+) -> EntrypointRunTerminalResult:
+    """等待 event-loop barrier 后返回指定 prompt terminal。
+
+    :param release: 允许 submit task 自然完成的 barrier。
+    :param terminal: 必须原 identity 返回的 terminal。
+    :returns: ``terminal`` 原对象。
+    :raises asyncio.CancelledError: 等待期间 task 被取消时透传。
+    """
+
+    await release.wait()
+    return terminal
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    """在不占用 default executor 的情况下等待线程侧测试事件。
+
+    :param event: renderer worker 设置的同步事件。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: 等待 task 被取消时透传。
+    """
+
+    while not event.is_set():
+        await asyncio.sleep(0)
+
+
+def _entrypoint_terminal_result() -> EntrypointRunTerminalResult:
+    """构造 prompt finish-thinking race 使用的 live terminal。
+
+    :returns: 固定 successful live terminal。
+    :raises Exception: DTO 字段非法时由构造函数抛出。
+    """
+
+    return EntrypointRunTerminalResult(
+        source=EntrypointTerminalSource.LIVE_EVENT,
+        session_id="session-1",
+        run_id="run-1",
+        terminal_event_id="terminal-run-1-finish-race",
+        event_sequence=7,
+        terminal_status=HostTerminalStatus.SUCCEEDED,
+        dedupe_key="terminal-run-1-finish-race",
+        final_answer=_final_answer(),
+        error_message=None,
+        cancel_reason=None,
+        watcher_failure_message=None,
+    )
 
 
 def _run_snapshot(*, run_id: str, status: RunStatus) -> RunSnapshot:

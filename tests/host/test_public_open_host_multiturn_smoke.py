@@ -45,7 +45,7 @@ async def test_real_runner_no_tool_two_turn_public_path(
     )
     async with open_host(options) as host:
         session = await host.ensure_session(ensure_request("real-two-turn"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -102,8 +102,8 @@ async def test_two_watchers_observe_same_terminal_event(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("two-watchers"))
-        first_watcher = host.watch_session_events(session.session_id)
-        second_watcher = host.watch_session_events(session.session_id)
+        first_watcher = await host.watch_session_events(session.session_id)
+        second_watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             followup_request(session.session_id, "watch-run", "hello"),

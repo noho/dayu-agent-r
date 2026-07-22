@@ -42,6 +42,10 @@ def _write_host_runtime(config_root: Path) -> None:
                         "payload_inline_threshold_bytes": 4096,
                         "worker_startup_timeout_seconds": 1.0,
                         "memory_projection_catch_up_batch_size": 50,
+                        "session_event_delivery_policy": {
+                            "transient_mailbox_max_items": 512,
+                            "max_subscriptions_per_session": 4,
+                        },
                         "wait_poller_policy": {
                             "enabled": True,
                             "poll_interval_seconds": 1.0,

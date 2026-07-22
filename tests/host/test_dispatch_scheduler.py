@@ -47,7 +47,7 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
-from dayu.host.admission import PendingDispatchRecord
+from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host._execution_health import HostExecutionHealthState
 from dayu.host.api import (
     AttemptDispatchSnapshot,
@@ -122,6 +122,10 @@ from tests.host._context_compaction_assertions import assert_failed_payload_no_f
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
+)
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
@@ -236,6 +240,105 @@ from dayu.runtime.lane import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
 _LANE_NAME = "llm"
+
+
+class _RecordingTerminalPort(TerminalPostCommitPort):
+    """记录 scheduler producer 的 exact terminal notices。"""
+
+    def __init__(self) -> None:
+        """初始化空记录器。
+
+        :returns: ``None``。
+        """
+
+        self.notices: list[TerminalPostCommitNotice] = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录一次 terminal notice。
+
+        :param notice: exact terminal notice。
+        :returns: ``None``。
+        """
+
+        self.notices.append(notice)
+
+
+class _RecordingTerminalPortFactory:
+    """记录 scheduler construction/bind 使用的 terminal port factory。"""
+
+    def __init__(self, port: _RecordingTerminalPort | None = None) -> None:
+        """初始化 factory。
+
+        :param port: 可选预建 recording port。
+        :returns: ``None``。
+        """
+
+        self.port = port if port is not None else _RecordingTerminalPort()
+        self.create_calls = 0
+        self.close_calls = 0
+        self.promotion_port: AdmissionWakeupPort | None = None
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """记录稳定 promotion capability 并返回最终 port。
+
+        :param promotion_port: 不可运行 scheduler promotion capability。
+        :returns: recording terminal port。
+        """
+
+        self.create_calls += 1
+        self.promotion_port = promotion_port
+        return self.port
+
+    async def close_after_failed_scheduler_open(self) -> None:
+        """记录 construction failure cleanup 调用。
+
+        :returns: ``None``。
+        """
+
+        self.close_calls += 1
+
+
+class _FailingTerminalPortFactory(_RecordingTerminalPortFactory):
+    """可在 coordinator construction 阶段失败的 recording factory。"""
+
+    def __init__(self, *, fail_create: bool) -> None:
+        """初始化失败模式。
+
+        :param fail_create: ``True`` 时在 create 调用内失败。
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self._fail_create = fail_create
+        self.scheduler: HostDispatchScheduler | None = None
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """记录未启动 scheduler，并按配置注入 construction failure。
+
+        :param promotion_port: 不可运行 scheduler promotion capability。
+        :returns: recording terminal port。
+        :raises RuntimeError: ``fail_create=True`` 时固定抛出。
+        """
+
+        if not isinstance(promotion_port, HostDispatchScheduler):
+            raise AssertionError("promotion capability must be scheduler")
+        self.scheduler = promotion_port
+        self.create_calls += 1
+        self.promotion_port = promotion_port
+        if self._fail_create:
+            raise RuntimeError("injected terminal coordinator construction failure")
+        return self.port
 _SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
 _HARD_THRESHOLD_PROMPT_CHAR_COUNT = 240
 _SOFT_CONTEXT_WINDOW_SIZE = 110
@@ -2068,6 +2171,85 @@ class _FailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
         raise RuntimeError("active cancel watchdog private failure")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ("factory", "bind"))
+async def test_scheduler_terminal_port_failure_closes_each_owner_once_without_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """factory/bind failure 在零 critical task 状态各清理 coordinator 与 lane 一次。"""
+
+    terminal_factory = _FailingTerminalPortFactory(
+        fail_create=failure_stage == "factory"
+    )
+    lane_close_calls = 0
+    original_lane_close = LaneController.close
+
+    async def record_lane_close(
+        self: LaneController,
+        reason: str | None = None,
+    ) -> None:
+        """记录 lane owner cleanup。
+
+        :param self: lane controller。
+        :param reason: close reason。
+        :returns: ``None``。
+        :raises Exception: 原始 lane close 失败时透传。
+        """
+
+        nonlocal lane_close_calls
+        lane_close_calls += 1
+        await original_lane_close(self, reason=reason)
+
+    if failure_stage == "bind":
+
+        def fail_bind(
+            self: HostDispatchScheduler,
+            terminal_post_commit_port: TerminalPostCommitPort,
+        ) -> None:
+            """在 construction-only bind 阶段注入失败。
+
+            :param self: 尚未启动 scheduler。
+            :param terminal_post_commit_port: factory 已创建的最终 port。
+            :returns: 不会返回。
+            :raises RuntimeError: 始终抛出。
+            """
+
+            del self, terminal_post_commit_port
+            raise RuntimeError("injected terminal port bind failure")
+
+        monkeypatch.setattr(
+            HostDispatchScheduler,
+            "_bind_terminal_post_commit_port",
+            fail_bind,
+        )
+    monkeypatch.setattr(LaneController, "close", record_lane_close)
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        with pytest.raises(RuntimeError, match="terminal"):
+            await _open_scheduler(
+                tmp_path,
+                store,
+                _FakeWorkerFactory(),
+                terminal_port_factory=terminal_factory,
+            )
+
+    scheduler = terminal_factory.scheduler
+    assert scheduler is not None
+    assert terminal_factory.create_calls == 1
+    assert terminal_factory.close_calls == 1
+    assert lane_close_calls == 1
+    assert scheduler._heartbeat_task is None
+    assert scheduler._active_cancel_watchdog_task is None
+    assert scheduler._drain_task is None
+    assert scheduler._promotion_drain_task is None
+    assert scheduler._active_tasks == set()
+    assert scheduler._active_handles == set()
+    assert scheduler._closed is True
+    assert scheduler._close_cleanup_done is True
+
+
 async def _open_watchdog_probe_scheduler(
     tmp_path: Path,
     store: HostDurableStore,
@@ -2101,6 +2283,7 @@ async def _open_watchdog_probe_scheduler(
     return scheduler_type(
         transaction_runner=store.transaction_runner,
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        terminal_post_commit_port=_RecordingTerminalPort(),
         event_log_store=EventLogStore(),
         local_execution=HostLocalExecutionOptions(
             lane_db_path=lane_db_path,
@@ -2758,6 +2941,7 @@ async def test_drain_loop_unexpected_exception_reports_fatal(
         scheduler = _FailingDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_RecordingTerminalPort(),
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
                 lane_db_path=tmp_path / "lane-drain-loop.sqlite3",
@@ -2831,6 +3015,7 @@ async def test_drain_loop_retries_durable_retry_exhausted_without_self_close(
         scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_RecordingTerminalPort(),
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
                 lane_db_path=tmp_path / "lane-drain-loop-retry-exhausted.sqlite3",
@@ -3019,6 +3204,7 @@ async def test_drain_loop_retry_exhausted_preserves_pending_durable_truth(
         scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_RecordingTerminalPort(),
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
                 lane_db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3",
@@ -6714,6 +6900,7 @@ async def _open_scheduler(
     memory_projection_policy: MemoryProjectionPolicy | None = None,
     host_handle_id: str = "host-test",
     host_instance_identity: HostInstanceIdentity | None = None,
+    terminal_port_factory: _RecordingTerminalPortFactory | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -6734,6 +6921,7 @@ async def _open_scheduler(
     :param host_handle_id: scheduler 使用的 Host handle id。
     :param host_instance_identity: 可选 Host instance 身份；用于测试 handle
         与 instance id 不同的 owner 写入路径。
+    :param terminal_port_factory: 可选 construction/bind recording factory。
     :returns: scheduler。
     :raises Exception: lane controller 或 durable host instance 注册失败时透传。
     """
@@ -6765,6 +6953,11 @@ async def _open_scheduler(
         return await HostDispatchScheduler.open(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port_factory=(
+                terminal_port_factory
+                if terminal_port_factory is not None
+                else _RecordingTerminalPortFactory()
+            ),
             local_execution=local_execution,
             host_handle_id=host_handle_id,
             active_registry=active_registry,
@@ -6791,6 +6984,7 @@ async def _open_scheduler(
     return HostDispatchScheduler(
         transaction_runner=store.transaction_runner,
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        terminal_post_commit_port=_RecordingTerminalPort(),
         event_log_store=EventLogStore(),
         local_execution=local_execution,
         lane_controller=lane_controller,

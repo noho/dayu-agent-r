@@ -149,7 +149,7 @@ class CliActivityRenderer:
             return
         self._render_runtime_line(_activity_line(_ACTIVITY_PREFIX, activity))
 
-    def toggle_visible(self) -> None:
+    def toggle_runtime_display(self) -> None:
         """切换 activity 可见性。
 
         :returns: ``None``。

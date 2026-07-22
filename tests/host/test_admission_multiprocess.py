@@ -92,6 +92,23 @@ from dayu.host.durable.transaction import (
     HostTransactionOperation,
     HostTransactionRunner,
 )
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
+
+
+class _DiscardTerminalPort:
+    """多进程 durable 测试的显式 no-local-delivery 最终端点。"""
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact terminal notice。
+
+        :param notice: 已提交通知。
+        :returns: ``None``。
+        """
+
+        del notice
 
 _PROCESS_COUNT = 4
 _START_GATE_TIMEOUT_SECONDS = 5.0
@@ -463,9 +480,8 @@ def test_multiprocess_queued_followups_promote_by_accepted_sequence(
             )
         )
 
-        promotion = result.promotion
-        if promotion.promoted_run is None:
-            promotion = service.promote_next_queued_run(session_id)
+        assert result.terminal_notice.wake_queue_promotion is True
+        promotion = service.promote_next_queued_run(session_id)
 
         assert promotion.promoted_run is not None
         assert promotion.promoted_run.run_id == first_queued.run_id
@@ -679,6 +695,7 @@ def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
         wakeup = _RecordingAdmissionWakeupPort()
         service = create_host_admission_service(
             store.transaction_runner,
+            terminal_post_commit_port=_DiscardTerminalPort(),
             ordinary_run_baseline=_ordinary_run_baseline(),
             wakeup_port=wakeup,
         )
@@ -742,8 +759,8 @@ def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
             cancel_request,
             caller_semantic_digest=cancel_digest,
         )
-        assert first_cancel.released_active_slot is True
-        assert wakeup.promotions == [session_id]
+        assert first_cancel.terminal_notice is not None
+        assert first_cancel.terminal_notice.wake_queue_promotion is True
 
         wakeup.clear()
         cancel_replay = service.cancel_run(
@@ -752,7 +769,8 @@ def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
             caller_semantic_digest=cancel_digest,
         )
         assert cancel_replay.idempotent_replay is True
-        assert cancel_replay.released_active_slot is False
+        assert cancel_replay.terminal_notice is not None
+        assert cancel_replay.terminal_notice.wake_queue_promotion is False
         assert wakeup.promotions == []
 
         terminal_loser = service.cancel_run(
@@ -768,7 +786,8 @@ def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
             ),
         )
         assert terminal_loser.run.status is RunStatus.CANCELLED
-        assert terminal_loser.released_active_slot is False
+        assert terminal_loser.terminal_notice is not None
+        assert terminal_loser.terminal_notice.wake_queue_promotion is False
         assert wakeup.promotions == []
 
         wakeup.clear()
@@ -814,6 +833,7 @@ def _admission_service(
 
     return create_host_admission_service(
         transaction_runner,
+        terminal_post_commit_port=_DiscardTerminalPort(),
         ordinary_run_baseline=_ordinary_run_baseline(),
     )
 

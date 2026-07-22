@@ -93,6 +93,7 @@ from dayu.host.lifecycle_events import (
     closeout_attempt_terminal_event_type_for_status,
     run_terminal_event_type_for_status,
 )
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
@@ -911,12 +912,51 @@ class RunTransitionResult:
     :param run: 最新 Run row。
     :param attempt: 最新 Attempt row；无 Attempt 时为 ``None``。
     :param dispatch_record: 最新 dispatch record row；无 dispatch 时为 ``None``。
+    :param run_event: 本 transition 写入或稳定确认的精确 Run EventLog row；
+        没有 Run event 时为 ``None``。
     """
 
     status: StateMutationStatus
     run: RunRow | None
     attempt: AttemptRow | None
     dispatch_record: DispatchRecordRow | None
+    run_event: EventLogRow | None
+
+
+def project_terminal_notice_from_exact_run_event(
+    run: RunRow | None,
+    exact_run_event: EventLogRow | None,
+    *,
+    wake_queue_promotion: bool,
+) -> TerminalPostCommitNotice:
+    """从 exact Run/Event rows 投影精确 terminal notice。
+
+    本函数只消费 transition owner 返回的 stable Run row 与 exact Run event row，
+    不读取 durable store，也不允许调用方在 commit 后按 latest/max 补取事实。
+
+    :param run: 同一 transaction 返回或确认的 stable Run row。
+    :param exact_run_event: 同一 transaction 写入或确认的 exact Run event row。
+    :param wake_queue_promotion: 本次提交是否首次释放 active slot并需要唤醒
+        queued promotion。
+    :returns: 与 Run stable terminal ref 完全一致的 Host-private terminal notice。
+    :raises HostDurableError: 输入缺少 Run/exact event，或 stable ref、
+        Session、Run identity 任一不一致时抛出。
+    """
+
+    if run is None or exact_run_event is None:
+        raise HostDurableError("exact Run/Event projection is missing a row")
+    if (
+        run.terminal_event_id != exact_run_event.event_id
+        or run.terminal_event_sequence != exact_run_event.event_sequence
+        or run.session_id != exact_run_event.session_id
+        or run.run_id != exact_run_event.run_id
+    ):
+        raise HostDurableError("exact Run/Event projection rows are inconsistent")
+    return TerminalPostCommitNotice(
+        session_id=run.session_id,
+        terminal_event_sequence=exact_run_event.event_sequence,
+        wake_queue_promotion=wake_queue_promotion,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1013,6 +1053,7 @@ def create_accepted_run_in_transaction(
         run=read_run_by_id(transaction, request.run_id),
         attempt=None,
         dispatch_record=None,
+        run_event=accepted_event,
     )
 
 
@@ -1074,6 +1115,7 @@ def create_queued_run_in_transaction(
         run=read_run_by_id(transaction, request.run_id),
         attempt=None,
         dispatch_record=None,
+        run_event=queued_event,
     )
 
 
@@ -1154,6 +1196,7 @@ def create_running_run_with_starting_attempt_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, request.attempt_id
         ),
+        run_event=started_event,
     )
 
 
@@ -1179,6 +1222,7 @@ def start_governed_run_with_starting_attempt_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status != request.expected_status or run.current_attempt_id is not None:
         return RunTransitionResult(
@@ -1186,6 +1230,7 @@ def start_governed_run_with_starting_attempt_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     started_event = event_log_store.append_event(
         transaction, _governed_run_started_event_request(request, run)
@@ -1230,6 +1275,7 @@ def start_governed_run_with_starting_attempt_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, request.attempt_id
         ),
+        run_event=started_event,
     )
 
 
@@ -1255,6 +1301,7 @@ def fail_unstarted_run_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status != request.expected_status or run.current_attempt_id is not None:
         return RunTransitionResult(
@@ -1262,6 +1309,7 @@ def fail_unstarted_run_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     failed_event = event_log_store.append_event(
         transaction, _unstarted_run_failed_event_request(request, run)
@@ -1284,6 +1332,7 @@ def fail_unstarted_run_in_transaction(
         run=run_result.row,
         attempt=None,
         dispatch_record=None,
+        run_event=failed_event,
     )
 
 
@@ -1361,6 +1410,7 @@ def close_attempt_for_context_recovery_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+        run_event=recovering_event,
     )
 
 
@@ -1462,6 +1512,7 @@ def close_startup_orphan_attempt_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+        run_event=run_event,
     )
 
 
@@ -1488,6 +1539,7 @@ def lose_recovering_run_in_transaction(
             run=None,
             attempt=source_attempt,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         source_attempt is None
@@ -1499,6 +1551,7 @@ def lose_recovering_run_in_transaction(
             run=run,
             attempt=source_attempt,
             dispatch_record=None,
+            run_event=None,
         )
     run_lost_event = event_log_store.append_event(
         transaction, _startup_recovering_run_lost_event_request(request, run)
@@ -1523,6 +1576,7 @@ def lose_recovering_run_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, request.source_attempt_id
         ),
+        run_event=run_lost_event,
     )
 
 
@@ -1549,6 +1603,7 @@ def start_recovery_run_with_starting_attempt_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         source_attempt is None
@@ -1560,6 +1615,7 @@ def start_recovery_run_with_starting_attempt_in_transaction(
             run=run,
             attempt=source_attempt,
             dispatch_record=None,
+            run_event=None,
         )
     started_event = event_log_store.append_event(
         transaction, _recovery_run_started_event_request(request, run)
@@ -1605,6 +1661,7 @@ def start_recovery_run_with_starting_attempt_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, request.attempt_id
         ),
+        run_event=started_event,
     )
 
 
@@ -1631,6 +1688,7 @@ def fail_recovering_run_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         source_attempt is None
@@ -1642,6 +1700,7 @@ def fail_recovering_run_in_transaction(
             run=run,
             attempt=source_attempt,
             dispatch_record=None,
+            run_event=None,
         )
     failed_event = event_log_store.append_event(
         transaction, _recovering_run_failed_event_request(request, run)
@@ -1666,6 +1725,7 @@ def fail_recovering_run_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, request.source_attempt_id
         ),
+        run_event=failed_event,
     )
 
 
@@ -2035,6 +2095,8 @@ def terminal_closeout_in_transaction(
         transaction, request.attempt_id
     )
     replay_result = _terminal_closeout_replay_result(
+        transaction=transaction,
+        event_log_store=event_log_store,
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
@@ -2095,6 +2157,7 @@ def terminal_closeout_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+        run_event=run_event,
     )
 
 
@@ -2209,6 +2272,7 @@ def active_cancel_closeout_in_transaction(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
 
     attempt_event = event_log_store.append_event(
@@ -2259,6 +2323,7 @@ def active_cancel_closeout_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+        run_event=run_event,
     )
 
 
@@ -2292,6 +2357,69 @@ def read_cancel_requested_event_from_run_link(
     return cancel_requested
 
 
+def read_terminal_run_event_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    run: RunRow,
+) -> EventLogRow:
+    """按 Run 的 stable terminal ref 读取并校验精确 terminal EventLog row。
+
+    本 helper 只允许在持有当前 Run snapshot 的同一 transaction 中使用；它不按
+    latest/max/status 推断 terminal fact，也不提供 commit 后 readback。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
+    :param run: 已确认终态且携带 stable terminal ref 的 Run row。
+    :returns: 与 Run terminal id、sequence、Session、Run identity 全部一致的 row。
+    :raises HostDurableError: terminal ref 缺失、row 缺失或 identity 不一致时抛出。
+    """
+
+    if run.terminal_event_id is None or run.terminal_event_sequence is None:
+        raise HostDurableError("terminal Run stable event ref is missing")
+    event = event_log_store.read_event_by_id(transaction, run.terminal_event_id)
+    if (
+        event is None
+        or event.event_sequence != run.terminal_event_sequence
+        or event.session_id != run.session_id
+        or event.run_id != run.run_id
+    ):
+        raise HostDurableError("terminal Run stable event ref is inconsistent")
+    return event
+
+
+def confirm_terminal_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    run: RunRow,
+) -> RunTransitionResult:
+    """在同一 transaction 中返回 terminal replay/ack 的完整 typed result。
+
+    本函数不写事件、不推断状态；调用方必须传入已经读取的 terminal Run，结果
+    中的 ``run_event`` 只沿该 Run stable terminal ref 精确读取。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
+    :param run: 当前 transaction 读取的 terminal Run row。
+    :returns: 携带 current Attempt、dispatch 与 exact terminal Run event 的结果。
+    :raises HostDurableError: Run 非终态或 stable terminal ref 不一致时抛出。
+    """
+
+    if run.status not in TERMINAL_RUN_STATUSES:
+        raise HostDurableError("terminal Run confirmation requires terminal status")
+    attempt = _read_current_attempt_if_present(transaction, run)
+    return RunTransitionResult(
+        status=StateMutationStatus.UPDATED,
+        run=run,
+        attempt=attempt,
+        dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+        run_event=read_terminal_run_event_in_transaction(
+            transaction,
+            event_log_store,
+            run,
+        ),
+    )
+
+
 def active_cancel_watchdog_closeout_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -2313,6 +2441,8 @@ def active_cancel_watchdog_closeout_in_transaction(
         transaction, request.attempt_id
     )
     replay_result = _active_cancel_watchdog_replay_result(
+        transaction=transaction,
+        event_log_store=event_log_store,
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
@@ -2342,6 +2472,7 @@ def active_cancel_watchdog_closeout_in_transaction(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if run is None or attempt is None or dispatch_record is None:
         raise HostDurableError("active cancel watchdog closeout narrowing failed")
@@ -2398,6 +2529,7 @@ def active_cancel_watchdog_closeout_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+        run_event=run_event,
     )
 
 
@@ -2467,6 +2599,7 @@ def accept_worker_running_in_transaction(
         run=read_run_by_id(transaction, run.run_id),
         attempt=attempt_result.row,
         dispatch_record=dispatch_result.row,
+        run_event=None,
     )
 
 
@@ -2492,6 +2625,7 @@ def cancel_waiting_run_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status != RunStatus.WAITING or run.current_attempt_id is None:
         return RunTransitionResult(
@@ -2499,6 +2633,7 @@ def cancel_waiting_run_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
     active_waits = read_active_wait_records_for_run(transaction, run.run_id)
@@ -2508,6 +2643,7 @@ def cancel_waiting_run_in_transaction(
             run=run,
             attempt=attempt,
             dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+            run_event=None,
         )
 
     cancel_request_event = event_log_store.append_event(
@@ -2558,6 +2694,7 @@ def cancel_waiting_run_in_transaction(
         run=run_result.row,
         attempt=attempt,
         dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+        run_event=run_cancelled_event,
     )
 
 
@@ -2583,6 +2720,7 @@ def cancel_recovering_run_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status != RunStatus.RECOVERING:
         return RunTransitionResult(
@@ -2592,6 +2730,7 @@ def cancel_recovering_run_in_transaction(
             dispatch_record=_read_current_dispatch_record_if_present(
                 transaction, run
             ),
+            run_event=None,
         )
     if run.current_attempt_id is None:
         return RunTransitionResult(
@@ -2599,6 +2738,7 @@ def cancel_recovering_run_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
 
     cancel_request_event = event_log_store.append_event(
@@ -2633,6 +2773,7 @@ def cancel_recovering_run_in_transaction(
         run=run_result.row,
         attempt=_read_current_attempt_if_present(transaction, run),
         dispatch_record=_read_current_dispatch_record_if_present(transaction, run),
+        run_event=run_cancelled_event,
     )
 
 
@@ -2658,6 +2799,7 @@ def cancel_queued_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
         return RunTransitionResult(
@@ -2665,6 +2807,7 @@ def cancel_queued_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     cancel_request_event = event_log_store.append_event(
         transaction, _cancel_requested_event_request(request, run)
@@ -2698,6 +2841,7 @@ def cancel_queued_in_transaction(
         run=run_result.row,
         attempt=None,
         dispatch_record=None,
+        run_event=run_cancelled_event,
     )
 
 
@@ -2723,6 +2867,7 @@ def cancel_predispatch_starting_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status != RunStatus.RUNNING or run.current_attempt_id is None:
         return RunTransitionResult(
@@ -2730,6 +2875,7 @@ def cancel_predispatch_starting_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
     dispatch_record = read_dispatch_record_by_attempt_id(
@@ -2746,6 +2892,7 @@ def cancel_predispatch_starting_in_transaction(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
 
     cancel_request_event = event_log_store.append_event(
@@ -2812,6 +2959,7 @@ def cancel_predispatch_starting_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_result.row,
+        run_event=run_cancelled_event,
     )
 
 
@@ -2837,6 +2985,7 @@ def request_active_attempt_cancel_in_transaction(
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if run.status == RunStatus.CANCELLING and run.current_attempt_id is not None:
         attempt = read_attempt_by_id(transaction, run.current_attempt_id)
@@ -2845,6 +2994,7 @@ def request_active_attempt_cancel_in_transaction(
             run=run,
             attempt=attempt,
             dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+            run_event=None,
         )
     if run.status != RunStatus.RUNNING or run.current_attempt_id is None:
         return RunTransitionResult(
@@ -2852,6 +3002,7 @@ def request_active_attempt_cancel_in_transaction(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
     dispatch_record = _read_dispatch_for_attempt(transaction, attempt)
@@ -2877,12 +3028,13 @@ def request_active_attempt_cancel_in_transaction(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
 
     cancel_request_event = event_log_store.append_event(
         transaction, _cancel_requested_event_request(request, run)
     ).row
-    event_log_store.append_event(
+    run_cancelling_event = event_log_store.append_event(
         transaction,
         _run_cancelling_event_request(
             request=request,
@@ -2909,6 +3061,7 @@ def request_active_attempt_cancel_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, attempt.attempt_id
         ),
+        run_event=run_cancelling_event.row,
     )
 
 
@@ -5063,6 +5216,7 @@ def _invalid_terminal_precondition(
             run=None,
             attempt=attempt,
             dispatch_record=None,
+            run_event=None,
         )
     if attempt is None:
         return RunTransitionResult(
@@ -5070,6 +5224,7 @@ def _invalid_terminal_precondition(
             run=run,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         run.status != RunStatus.RUNNING
@@ -5082,12 +5237,15 @@ def _invalid_terminal_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+            run_event=None,
         )
     return None
 
 
 def _terminal_closeout_replay_result(
     *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
     run: RunRow | None,
     attempt: AttemptRow | None,
     dispatch_record: DispatchRecordRow | None,
@@ -5095,6 +5253,8 @@ def _terminal_closeout_replay_result(
 ) -> RunTransitionResult | None:
     """识别同种 terminal closeout replay 并在写事件前幂等吸收。
 
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
     :param run: 最新 Run row。
     :param attempt: 最新 Attempt row。
     :param dispatch_record: 最新 dispatch record row；缺失时为 ``None``。
@@ -5116,12 +5276,19 @@ def _terminal_closeout_replay_result(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=read_terminal_run_event_in_transaction(
+                transaction,
+                event_log_store,
+                run,
+            ),
         )
     return None
 
 
 def _active_cancel_watchdog_replay_result(
     *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
     run: RunRow | None,
     attempt: AttemptRow | None,
     dispatch_record: DispatchRecordRow | None,
@@ -5129,6 +5296,8 @@ def _active_cancel_watchdog_replay_result(
 ) -> RunTransitionResult | None:
     """识别 accepted cancel watchdog closeout 的同终态 replay。
 
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
     :param run: 最新 Run row。
     :param attempt: 最新 Attempt row。
     :param dispatch_record: 最新 dispatch record row；缺失时为 ``None``。
@@ -5149,6 +5318,11 @@ def _active_cancel_watchdog_replay_result(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=read_terminal_run_event_in_transaction(
+                transaction,
+                event_log_store,
+                run,
+            ),
         )
     return None
 
@@ -5175,6 +5349,7 @@ def _invalid_active_cancel_watchdog_closeout_precondition(
             run=None,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if attempt is None:
         return RunTransitionResult(
@@ -5182,6 +5357,7 @@ def _invalid_active_cancel_watchdog_closeout_precondition(
             run=run,
             attempt=None,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if dispatch_record is None:
         return RunTransitionResult(
@@ -5189,6 +5365,7 @@ def _invalid_active_cancel_watchdog_closeout_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         run.status is not RunStatus.CANCELLING
@@ -5209,6 +5386,7 @@ def _invalid_active_cancel_watchdog_closeout_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     return None
 
@@ -5237,6 +5415,7 @@ def _invalid_startup_orphan_precondition(
             run=None,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if attempt is None:
         return RunTransitionResult(
@@ -5244,6 +5423,7 @@ def _invalid_startup_orphan_precondition(
             run=run,
             attempt=None,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if dispatch_record is None:
         return RunTransitionResult(
@@ -5251,6 +5431,7 @@ def _invalid_startup_orphan_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+            run_event=None,
         )
     owner = read_host_instance(transaction, request.owner_host_instance_id)
     if owner is None:
@@ -5259,6 +5440,7 @@ def _invalid_startup_orphan_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     try:
         heartbeat_at = parse_utc_timestamp(owner.heartbeat_at)
@@ -5268,6 +5450,7 @@ def _invalid_startup_orphan_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     heartbeat_stale = request.occurred_at - heartbeat_at > request.stale_after
     owner_closed = owner.status is HostInstanceStatus.STOPPED
@@ -5304,6 +5487,7 @@ def _invalid_startup_orphan_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     return None
 
@@ -5404,6 +5588,7 @@ def _invalid_active_cancel_closeout_precondition(
             run=None,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if attempt is None:
         return RunTransitionResult(
@@ -5411,6 +5596,7 @@ def _invalid_active_cancel_closeout_precondition(
             run=run,
             attempt=None,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if dispatch_record is None:
         return RunTransitionResult(
@@ -5418,6 +5604,7 @@ def _invalid_active_cancel_closeout_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         run.status != RunStatus.CANCELLING
@@ -5431,6 +5618,7 @@ def _invalid_active_cancel_closeout_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     return None
 
@@ -5457,6 +5645,7 @@ def _invalid_accept_worker_precondition(
             run=None,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if attempt is None:
         return RunTransitionResult(
@@ -5464,6 +5653,7 @@ def _invalid_accept_worker_precondition(
             run=run,
             attempt=None,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     if dispatch_record is None:
         return RunTransitionResult(
@@ -5471,6 +5661,7 @@ def _invalid_accept_worker_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+            run_event=None,
         )
     if (
         run.status != RunStatus.RUNNING
@@ -5499,6 +5690,7 @@ def _invalid_accept_worker_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            run_event=None,
         )
     return None
 

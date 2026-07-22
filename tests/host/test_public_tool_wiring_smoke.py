@@ -45,7 +45,7 @@ async def test_mock_tool_result_feeds_same_run_and_later_run_continuity(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("tool-memory"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
             followup_request(

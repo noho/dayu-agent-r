@@ -53,6 +53,7 @@ from dayu.host import (
     resolve_wait,
 )
 from dayu.host.admission import PendingDispatchRecord
+from dayu.host.admission import AdmissionWakeupPort
 from dayu.host.api import (
     HostInput,
     AttemptDispatchSnapshot,
@@ -97,6 +98,10 @@ from dayu.host.wait_adapter import (
     WaitExternalJobRefSource,
 )
 from dayu.host.waiting import DefaultHostToolAwaitingAcceptPort
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from tests.host.test_resolve_wait_command import (
     _SeededWaitingRun,
     _build_resume_request,
@@ -282,6 +287,48 @@ class _CapturingWorkerFactory:
 
         del snapshot
         return _CapturingWorker(self)
+
+
+class _NoLocalDeliveryTerminalPostCommitPort(TerminalPostCommitPort):
+    """测试用 no-local-delivery terminal 最终端点。"""
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """消费 exact notice，但不触发 local delivery 动作。
+
+        :param notice: exact terminal notice。
+        :returns: ``None``。
+        """
+
+        del notice
+
+
+class _TerminalPortFactory:
+    """测试 scheduler 显式创建 terminal final port 的工厂。"""
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """返回 test-private no-local-delivery 端点。
+
+        :param promotion_port: scheduler ordinary promotion capability。
+        :returns: terminal port。
+        """
+
+        del promotion_port
+        return _NoLocalDeliveryTerminalPostCommitPort()
+
+    async def close_after_failed_scheduler_open(self) -> None:
+        """测试工厂无额外资源需要关闭。
+
+        :returns: ``None``。
+        """
+
+        return None
 
 
 def test_phase7_resolve_wait_public_entry_is_importable() -> None:
@@ -473,6 +520,7 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         local_execution=_local_execution_options(tmp_path, factory, tool),
         host_handle_id="phase7-awaiting-production",
+        terminal_post_commit_port_factory=_TerminalPortFactory(),
     )
     try:
         session = ensure_public_session(

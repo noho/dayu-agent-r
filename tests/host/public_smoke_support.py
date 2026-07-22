@@ -81,6 +81,7 @@ from dayu.host import (
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
     OpenHostOptions,
+    HostSessionEventDeliveryPolicy,
     OperationContext,
     OrdinaryRunExecutionBaseline,
     ResolveWaitCompletedOutcome,
@@ -922,6 +923,10 @@ def open_host_options(
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=512,
+            max_subscriptions_per_session=4,
+        ),
     )
 
 

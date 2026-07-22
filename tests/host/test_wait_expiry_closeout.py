@@ -25,6 +25,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 from dayu.host.waiting import ExpireWaitInput, _expire_wait_in_transaction
 from tests.host.test_command_handle import _start_request
 from tests.host.test_resolve_wait_command import (
@@ -108,6 +109,33 @@ class _RecordingWakeup:
         self.queue_sessions.append(session_id)
 
 
+class _RecordingTerminalPort:
+    """记录 wait expiry terminal notice 与调用顺序。"""
+
+    def __init__(self, order: list[str]) -> None:
+        """初始化记录端口。
+
+        :param order: 顺序记录列表。
+        :returns: ``None``。
+        """
+
+        self._order = order
+        self.notices: list[TerminalPostCommitNotice] = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录 exact terminal notice。
+
+        :param notice: 已提交的精确通知。
+        :returns: ``None``。
+        """
+
+        self._order.append("notice")
+        self.notices.append(notice)
+
+
 def test_expiry_helper_owns_failed_terminal_and_stable_replay(
     tmp_path: Path,
 ) -> None:
@@ -159,11 +187,17 @@ def test_expiry_helper_owns_failed_terminal_and_stable_replay(
         )
         payload = json.loads(tool_result.payload_json)
         assert first.transition.status is StateMutationStatus.UPDATED
-        assert first.queue_promotion_session_id == seeded.session_id
+        assert first.terminal_notice is not None
+        assert first.terminal_notice.wake_queue_promotion is True
         assert not first.idempotent_replay
         assert replay.transition.status is StateMutationStatus.CAS_LOST
         assert replay.idempotent_replay
-        assert replay.queue_promotion_session_id is None
+        assert replay.terminal_notice is not None
+        assert replay.terminal_notice.wake_queue_promotion is False
+        assert (
+            replay.terminal_notice.terminal_event_sequence
+            == first.terminal_notice.terminal_event_sequence
+        )
         assert _events(host._transaction_runner()) == events_after_first
         assert wait.status is WaitRecordStatus.FAILED
         assert run.status is RunStatus.FAILED
@@ -179,14 +213,17 @@ def test_expiry_helper_owns_failed_terminal_and_stable_replay(
 def test_expiry_wakes_queue_only_after_commit_and_projection(
     tmp_path: Path,
 ) -> None:
-    """expiry terminal commit 后才 projection，再 wake queued promotion。"""
+    """expiry terminal commit 后先交付 exact notice，再执行 projection。"""
 
     host = create_host_command_handle(_options(tmp_path))
     order: list[str] = []
     wakeup = _RecordingWakeup(order)
     projection = _RecordingProjection(order)
+    terminal_port = _RecordingTerminalPort(order)
+    host._terminal_post_commit_port = terminal_port
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
+        terminal_post_commit_port=terminal_port,
         wakeup_port=wakeup,
         projection_catchup_port=projection,
     )
@@ -216,8 +253,9 @@ def test_expiry_wakes_queue_only_after_commit_and_projection(
         )
 
         assert result.transition.status is StateMutationStatus.UPDATED
-        assert order == ["projection", "wake"]
-        assert wakeup.queue_sessions == [seeded.session_id]
+        assert order == ["notice", "projection"]
+        assert wakeup.queue_sessions == []
+        assert terminal_port.notices == [result.terminal_notice]
         assert _read_wait(host._transaction_runner(), seeded.wait_id).status is WaitRecordStatus.FAILED
     finally:
         host.close()

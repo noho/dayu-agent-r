@@ -385,7 +385,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
     async with open_host(assembly.options) as host:
         session = await host.ensure_session(_ensure_request(args, smoke_run_id))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         print(f"SMOKE SESSION session_id={session.session_id}")
 
         first = await _run_round(

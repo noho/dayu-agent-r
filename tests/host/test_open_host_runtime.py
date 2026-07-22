@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import ModuleType
-from typing import Protocol, TypeVar, cast
+from typing import TypeVar, cast
 
 import pytest
 
@@ -23,6 +23,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    ReasoningDeltaData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
@@ -42,6 +43,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostSessionEvent,
+    HostSessionEventIterator,
     HostTerminalStatus,
     HostToolingOptions,
     LocalEngineWorker,
@@ -49,6 +51,7 @@ from dayu.host import (
     LocalWorkerHandle,
     OpenHostAdminOptions,
     OpenHostOptions,
+    HostSessionEventDeliveryPolicy,
     OperationContext,
     OrdinaryRunExecutionBaseline,
     PurgeSessionRequest,
@@ -58,11 +61,17 @@ from dayu.host import (
     SessionSnapshot,
     SubmitFollowupRequest,
     WaitAdapterKey,
+    WaitResolutionSource,
     open_host,
     open_host_admin,
 )
 from dayu.host.api import AuthorizationClaim, HostLocalExecutionOptions
-from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host.command import (
+    HostCommandHandle,
+    create_host_command_handle,
+    expire_wait,
+    start_run,
+)
 from dayu.host._durable_actor import DurableActor
 from dayu.host._execution_health import (
     HostExecutionHealthGate,
@@ -73,6 +82,7 @@ from dayu.host.dispatch import (
     HostDispatchScheduler,
     _HostCancellationToken,
 )
+from dayu.host.admission import PendingDispatchRecord
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -86,14 +96,18 @@ from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
     _CompositeProjectionCatchupPort,
     _PublicHostHandle,
+    _SessionEventReconciliationWaiter,
     _ThreadsafeSchedulerWakeupPort,
+    _TerminalPostCommitCoordinator,
     _ensure_session as _actor_ensure_session,
     _get_run as _actor_get_run,
+    _read_session_host_events_after as _actor_read_session_host_events_after,
     _session_live_event_start_cursor as _actor_watch_cursor,
     _submit_followup as _actor_submit_followup,
     _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
+from dayu.host.dispatch import _TerminalPostCommitPortFactory
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import (
@@ -115,25 +129,19 @@ from dayu.host.wait_adapter import (
     WaitPollerRuntimePolicy,
     WaitPollerSupervisor,
 )
+from dayu.host.waiting import ExpireWaitInput
 
 T = TypeVar("T")
 from tests.host.public_smoke_support import awaiting_tooling_options
-from tests.host.test_resolve_wait_command import _seed_waiting_run
+from tests.host.test_command_handle import _start_request
+from tests.host.test_resolve_wait_command import (
+    _failed_request,
+    _seed_waiting_run,
+    _set_wait_deadline_text,
+)
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
-
-
-class _ClosableSessionEventIterator(Protocol):
-    """测试使用的可关闭 Host Session iterator 窄协议。"""
-
-    async def aclose(self) -> None:
-        """关闭 iterator。
-
-        :returns: ``None``。
-        :raises Exception: 具体 Host iterator cleanup 失败时透传。
-        """
-
-        ...
+_PROMOTION_BARRIER_EXPIRED_AT = datetime(2026, 5, 18, 3, 0, 0, tzinfo=UTC)
 
 
 class _FinalAnswerHandle:
@@ -372,6 +380,282 @@ class _ControlledFinalAnswerWorkerFactory:
 
         del snapshot
         return _ControlledFinalAnswerWorker(self)
+
+
+class _TransientThenFinalHandle:
+    """先产出 reasoning transient、再由 barrier 释放 terminal 的 handle。"""
+
+    def __init__(
+        self,
+        *,
+        snapshot: AttemptDispatchSnapshot,
+        release_event: asyncio.Event,
+        index: int,
+    ) -> None:
+        """初始化确定性两阶段 worker handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param release_event: terminal 释放 barrier。
+        :param index: factory 分配的 worker 序号。
+        :returns: ``None``。
+        """
+
+        self._snapshot = snapshot
+        self._release_event = release_event
+        self._index = index
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回稳定测试 worker id。
+
+        :returns: 本 worker id。
+        """
+
+        return f"transient-terminal-worker-{self._index}"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """依次产出 transient candidate 与 terminal candidate。
+
+        :returns: Engine event 异步迭代器。
+        """
+
+        yield EngineEvent(
+            occurred_at=datetime(2026, 5, 18, 2, 0, self._index, tzinfo=UTC),
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.REASONING_DELTA,
+            data=ReasoningDeltaData(
+                iteration_id=f"iteration-{self._index}",
+                delta=f"delta-{self._index}",
+            ),
+            metadata=None,
+        )
+        await self._release_event.wait()
+        yield EngineEvent(
+            occurred_at=datetime(2026, 5, 18, 2, 1, self._index, tzinfo=UTC),
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.FINAL_ANSWER,
+            data=FinalAnswerData(
+                content=f"answer-{self._index}",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """关闭测试 handle。
+
+        :returns: ``None``。
+        """
+
+        return None
+
+    def on_cancel(self, reason: str) -> None:
+        """消费本测试不使用的 cancel hook。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+
+class _TransientThenFinalWorker:
+    """为单次 dispatch 创建两阶段 handle 的 worker。"""
+
+    def __init__(
+        self,
+        *,
+        factory: "_TransientThenFinalWorkerFactory",
+        index: int,
+    ) -> None:
+        """保存 factory 与 worker 序号。
+
+        :param factory: 所属 factory。
+        :param index: worker 序号。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+        self._index = index
+
+    async def accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> LocalWorkerHandle:
+        """接受 dispatch 并发布 accepted barrier。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param request: Engine run request。
+        :returns: 两阶段 worker handle。
+        """
+
+        del request
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_queue.put_nowait(self._index)
+        return _TransientThenFinalHandle(
+            snapshot=snapshot,
+            release_event=self._factory.release_events[self._index],
+            index=self._index,
+        )
+
+
+class _TransientThenFinalWorkerFactory:
+    """按 dispatch 序号提供独立 terminal barrier 的 deterministic factory。"""
+
+    def __init__(self) -> None:
+        """初始化两个 worker barrier。
+
+        :returns: ``None``。
+        """
+
+        self.accepted_queue: asyncio.Queue[int] = asyncio.Queue()
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.release_events = (asyncio.Event(), asyncio.Event())
+        self._next_index = 0
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """为下一条 dispatch 创建 worker。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :returns: 序号确定的测试 worker。
+        :raises AssertionError: 测试意外创建第三个 worker 时抛出。
+        """
+
+        del snapshot
+        index = self._next_index
+        if index >= len(self.release_events):
+            raise AssertionError("unexpected third worker")
+        self._next_index += 1
+        return _TransientThenFinalWorker(factory=self, index=index)
+
+
+def _ignore_dispatch_wake(
+    scheduler: HostDispatchScheduler,
+    record: PendingDispatchRecord,
+) -> None:
+    """冻结测试中的 worker dispatch，但保留 admission durable transition。
+
+    :param scheduler: 当前真实 scheduler。
+    :param record: 已提交的 pending dispatch record。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    del scheduler
+    del record
+
+
+def _seed_waiting_run_with_queued_successor(
+    options: OpenHostOptions,
+    *,
+    deadline_text: str | None,
+) -> tuple[str, str, str]:
+    """在 opener 启动前创建 waiting A 与同 Session queued B。
+
+    :param options: 后续真实 opener 使用的同源 durable options。
+    :param deadline_text: 可选 wait deadline 文本。
+    :returns: ``(wait_id, run_a_id, run_b_id)``。
+    :raises Exception: durable seed 或 queued admission 失败时透传。
+    """
+
+    command_options = replace(
+        _command_options_from_open_host_options(
+            options,
+            host_handle_id="host-open-runtime-terminal-barrier-seed",
+        ),
+        local_execution=None,
+    )
+    seed_host = create_host_command_handle(command_options)
+    try:
+        seeded = _seed_waiting_run(seed_host)
+        if deadline_text is not None:
+            _set_wait_deadline_text(
+                seed_host._transaction_runner(),
+                seeded.wait_id,
+                deadline_text,
+            )
+        queued = start_run(
+            seed_host,
+            _start_request(
+                seeded.session_id,
+                "terminal-promotion-barrier-queued-b",
+            ),
+        )
+        assert queued.status is RunStatus.QUEUED
+        return seeded.wait_id, seeded.run_id, queued.run_id
+    finally:
+        seed_host.close()
+
+
+async def _assert_terminal_before_promoted_start(
+    *,
+    watcher: HostSessionEventIterator,
+    frozen_next: asyncio.Task[HostSessionEvent],
+    host: _PublicHostHandle,
+    run_a: RunSnapshot,
+    run_b_id: str,
+) -> None:
+    """断言 A exact terminal 先于 promotion 后 B ``RUN_STARTED``。
+
+    :param watcher: action 前已 attach 的真实 watcher。
+    :param frozen_next: action 前已进入 pending 状态的首个 ``anext``。
+    :param host: 当前 opener public handle。
+    :param run_a: action 返回的 terminal A snapshot。
+    :param run_b_id: 等待 promotion 的 queued B id。
+    :returns: ``None``。
+    :raises AssertionError: watermark、terminal handoff 或 B promotion 顺序漂移时抛出。
+    """
+
+    event = await asyncio.wait_for(frozen_next, timeout=1.0)
+    while not (
+        isinstance(event, HostEvent)
+        and event.run_id == run_a.run_id
+        and event.terminal_status is not None
+    ):
+        assert not (
+            isinstance(event, HostEvent)
+            and event.run_id == run_b_id
+            and event.event_type == "RUN_STARTED"
+        )
+        event = await asyncio.wait_for(anext(watcher), timeout=1.0)
+    assert (
+        host._transient_delta_hub.committed_terminal_event_sequence_high_watermark(
+            run_a.session_id
+        )
+        == event.event_sequence
+    )
+
+    promoted = await asyncio.wait_for(anext(watcher), timeout=1.0)
+    assert isinstance(promoted, HostEvent)
+    assert promoted.run_id == run_b_id
+    assert promoted.event_type == "RUN_STARTED"
+
+
+async def _close_terminal_barrier_watcher(
+    watcher: HostSessionEventIterator | None,
+    frozen_next: asyncio.Task[HostSessionEvent] | None,
+) -> None:
+    """取消未完成的 barrier read 后幂等关闭 watcher。
+
+    :param watcher: 可选已创建 watcher。
+    :param frozen_next: 可选首个 ``anext`` task。
+    :returns: ``None``。
+    :raises BaseException: watcher 自身 cleanup 失败时透传。
+    """
+
+    if frozen_next is not None and not frozen_next.done():
+        frozen_next.cancel()
+        try:
+            await frozen_next
+        except asyncio.CancelledError:
+            pass
+    if watcher is not None:
+        await watcher.aclose()
 
 
 class _RaisingSchedulerClose:
@@ -696,9 +980,9 @@ async def test_public_ensure_submit_read_and_watch_share_actor_thread(
             session.session_id,
             _followup_request(session.session_id, "actor-thread-contract"),
         )
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         await host.get_run(followup.accepted_run_id)
-        await cast(_ClosableSessionEventIterator, watcher).aclose()
+        await watcher.aclose()
 
     assert set(operation_threads) == {"ensure", "submit", "read", "watch"}
     assert len(set(operation_threads.values())) == 1
@@ -762,7 +1046,7 @@ async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_o
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:
-        watcher = host.watch_session_events(session_id)
+        watcher = await host.watch_session_events(session_id)
         await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
         terminal_task = asyncio.create_task(_next_terminal(watcher))
         recovery_factory.release_event.set()
@@ -779,6 +1063,251 @@ async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_o
     assert recovery_factory.accepted_snapshots[0].attempt_id != (
         interrupted_factory.accepted_snapshots[0].attempt_id
     )
+
+
+@pytest.mark.asyncio
+async def test_same_durable_page_two_terminals_each_preserve_transient_handoff(
+    tmp_path: pathlib.Path,
+) -> None:
+    """同页两个 terminal 前分别交付同 Run transient，且 B 不越过 A terminal。"""
+
+    factory = _TransientThenFinalWorkerFactory()
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request())
+        watcher = await host.watch_session_events(session.session_id)
+        public_host = cast(_PublicHostHandle, host)
+        attached_cursor = await public_host._durable_actor.call(
+            lambda handle: _actor_watch_cursor(handle, session.session_id)
+        )
+        first = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "same-page-first"),
+        )
+        assert await asyncio.wait_for(factory.accepted_queue.get(), timeout=1) == 0
+        second = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "same-page-second"),
+        )
+        factory.release_events[0].set()
+        assert await asyncio.wait_for(factory.accepted_queue.get(), timeout=1) == 1
+        factory.release_events[1].set()
+        await _wait_for_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
+        await _wait_for_run_status(host, second.accepted_run_id, RunStatus.SUCCEEDED)
+        durable_page = await public_host._durable_actor.call(
+            lambda handle: _actor_read_session_host_events_after(
+                handle,
+                session.session_id,
+                attached_cursor,
+            )
+        )
+        durable_page_terminals = tuple(
+            event
+            for event in durable_page.events
+            if event.terminal_status is not None
+        )
+        assert tuple(event.run_id for event in durable_page_terminals) == (
+            first.accepted_run_id,
+            second.accepted_run_id,
+        )
+        collected = await asyncio.wait_for(
+            _collect_until_two_terminals(watcher),
+            timeout=2,
+        )
+        await watcher.aclose()
+
+    terminal_events = tuple(
+        event
+        for event in collected
+        if isinstance(event, HostEvent)
+        and event.kind is not HostEventKind.PROGRESS
+    )
+    transient_events = tuple(
+        event for event in collected if not isinstance(event, HostEvent)
+    )
+    assert tuple(event.run_id for event in terminal_events) == (
+        first.accepted_run_id,
+        second.accepted_run_id,
+    )
+    assert tuple(event.run_id for event in transient_events) == (
+        first.accepted_run_id,
+        second.accepted_run_id,
+    )
+    positions = {
+        ("terminal" if isinstance(event, HostEvent) else "transient", event.run_id): index
+        for index, event in enumerate(collected)
+        if (
+            not isinstance(event, HostEvent)
+            or event.kind is not HostEventKind.PROGRESS
+        )
+    }
+    assert positions[("transient", first.accepted_run_id)] < positions[
+        ("terminal", first.accepted_run_id)
+    ]
+    assert positions[("terminal", first.accepted_run_id)] < positions[
+        ("transient", second.accepted_run_id)
+    ]
+    assert positions[("transient", second.accepted_run_id)] < positions[
+        ("terminal", second.accepted_run_id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_cancel_terminal_precedes_queued_promotion_entry(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pre-dispatch A cancel 的 exact terminal 先于 promotion 后 B start。"""
+
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "wake_dispatch",
+        _ignore_dispatch_wake,
+    )
+    manager = open_host(_options(tmp_path, _ControlledFinalAnswerWorkerFactory()))
+    host = cast(_PublicHostHandle, await manager.__aenter__())
+    watcher: HostSessionEventIterator | None = None
+    frozen_next: asyncio.Task[HostSessionEvent] | None = None
+    try:
+        session = await host.ensure_session(_ensure_request())
+        run_a = await host.submit_followup(
+            session.session_id,
+            _followup_request(
+                session.session_id,
+                "terminal-barrier-pre-dispatch-a",
+            ),
+        )
+        run_b = await host.submit_followup(
+            session.session_id,
+            _followup_request(
+                session.session_id,
+                "terminal-barrier-pre-dispatch-b",
+            ),
+        )
+        assert (await host.get_run(run_a.accepted_run_id)).status is RunStatus.RUNNING
+        assert (await host.get_run(run_b.accepted_run_id)).status is RunStatus.QUEUED
+        watcher = await host.watch_session_events(session.session_id)
+        frozen_next = asyncio.create_task(anext(watcher))
+        await asyncio.sleep(0)
+        assert not frozen_next.done()
+
+        terminal_a = await host.cancel_run(
+            run_a.accepted_run_id,
+            _cancel_request("terminal-barrier-pre-dispatch-cancel"),
+        )
+        await _assert_terminal_before_promoted_start(
+            watcher=watcher,
+            frozen_next=frozen_next,
+            host=host,
+            run_a=terminal_a,
+            run_b_id=run_b.accepted_run_id,
+        )
+    finally:
+        await _close_terminal_barrier_watcher(watcher, frozen_next)
+        await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_wait_failed_terminal_precedes_queued_promotion_entry(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wait failed A 的 exact terminal 先于 promotion 后 B start。"""
+
+    factory = _ControlledFinalAnswerWorkerFactory()
+    options = _options(tmp_path, factory)
+    wait_id, run_a_id, run_b_id = _seed_waiting_run_with_queued_successor(
+        options,
+        deadline_text=None,
+    )
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "wake_dispatch",
+        _ignore_dispatch_wake,
+    )
+    manager = open_host(options)
+    host = cast(_PublicHostHandle, await manager.__aenter__())
+    watcher: HostSessionEventIterator | None = None
+    frozen_next: asyncio.Task[HostSessionEvent] | None = None
+    try:
+        waiting_a = await host.get_run(run_a_id)
+        queued_b = await host.get_run(run_b_id)
+        assert waiting_a.status is RunStatus.WAITING
+        assert queued_b.status is RunStatus.QUEUED
+        watcher = await host.watch_session_events(waiting_a.session_id)
+        frozen_next = asyncio.create_task(anext(watcher))
+        await asyncio.sleep(0)
+        assert not frozen_next.done()
+
+        terminal_a = await host.resolve_wait(
+            wait_id,
+            _failed_request("terminal-barrier-wait-failed"),
+        )
+        await _assert_terminal_before_promoted_start(
+            watcher=watcher,
+            frozen_next=frozen_next,
+            host=host,
+            run_a=terminal_a,
+            run_b_id=run_b_id,
+        )
+    finally:
+        await _close_terminal_barrier_watcher(watcher, frozen_next)
+        await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_wait_expiry_terminal_precedes_queued_promotion_entry(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wait expiry A 的 exact terminal 先于 promotion 后 B start。"""
+
+    factory = _ControlledFinalAnswerWorkerFactory()
+    options = _options(tmp_path, factory)
+    wait_id, run_a_id, run_b_id = _seed_waiting_run_with_queued_successor(
+        options,
+        deadline_text="2026-05-18T02:59:59.000000Z",
+    )
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "wake_dispatch",
+        _ignore_dispatch_wake,
+    )
+    manager = open_host(options)
+    host = cast(_PublicHostHandle, await manager.__aenter__())
+    watcher: HostSessionEventIterator | None = None
+    frozen_next: asyncio.Task[HostSessionEvent] | None = None
+    try:
+        waiting_a = await host.get_run(run_a_id)
+        queued_b = await host.get_run(run_b_id)
+        assert waiting_a.status is RunStatus.WAITING
+        assert queued_b.status is RunStatus.QUEUED
+        watcher = await host.watch_session_events(waiting_a.session_id)
+        frozen_next = asyncio.create_task(anext(watcher))
+        await asyncio.sleep(0)
+        assert not frozen_next.done()
+
+        await host._durable_actor.call(
+            lambda handle: expire_wait(
+                handle,
+                ExpireWaitInput(
+                    wait_id=wait_id,
+                    observed_at=_PROMOTION_BARRIER_EXPIRED_AT,
+                    actor="expiry-owner-barrier",
+                    source=WaitResolutionSource.POLL,
+                ),
+            )
+        )
+        terminal_a = await host.get_run(run_a_id)
+        await _assert_terminal_before_promoted_start(
+            watcher=watcher,
+            frozen_next=frozen_next,
+            host=host,
+            run_a=terminal_a,
+            run_b_id=run_b_id,
+        )
+    finally:
+        await _close_terminal_barrier_watcher(watcher, frozen_next)
+        await manager.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio
@@ -801,7 +1330,7 @@ async def test_open_host_startup_recovery_dispatches_gracefully_closed_run(
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:
-        watcher = host.watch_session_events(session_id)
+        watcher = await host.watch_session_events(session_id)
         await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
         terminal_task = asyncio.create_task(_next_terminal(watcher))
         recovery_factory.release_event.set()
@@ -893,7 +1422,7 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
             _followup_request(session.session_id, "followup-active-cancel-watchdog"),
         )
         await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         terminal_task = asyncio.create_task(_next_terminal(watcher))
         await asyncio.sleep(0)
         await host.get_run(followup.accepted_run_id)
@@ -982,7 +1511,7 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """阻塞 actor wake 收口后才按 scheduler→projection→actor→store 关闭。"""
+    """阻塞 actor 后按 producer→coordinator→delivery→projection 顺序关闭。"""
 
     manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
     public_host = cast(_PublicHostHandle, await manager.__aenter__())
@@ -993,6 +1522,8 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
     wake_on_loop = asyncio.Event()
     order: list[str] = []
     original_scheduler_close = HostDispatchScheduler.close
+    original_coordinator_close = _TerminalPostCommitCoordinator.close
+    original_delivery_close = HostTransientDeltaHub.close
     original_wake_queue = HostDispatchScheduler.wake_queue_promotion
     original_projection_catchup = _CompositeProjectionCatchupPort.catch_up_projection
     original_handle_close = HostCommandHandle.close
@@ -1009,6 +1540,30 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
 
         order.append("scheduler")
         await original_scheduler_close(self)
+
+    async def record_coordinator_close(
+        self: _TerminalPostCommitCoordinator,
+    ) -> None:
+        """记录 terminal coordinator drain/close。
+
+        :param self: terminal coordinator。
+        :returns: ``None``。
+        :raises Exception: 原始 close 失败时透传。
+        """
+
+        order.append("coordinator")
+        await original_coordinator_close(self)
+
+    def record_delivery_close(self: HostTransientDeltaHub) -> None:
+        """记录 delivery owner close 并委托真实实现。
+
+        :param self: transient delivery hub。
+        :returns: ``None``。
+        :raises Exception: 原始 close 失败时透传。
+        """
+
+        order.append("delivery")
+        original_delivery_close(self)
 
     def record_wake_queue(
         self: HostDispatchScheduler,
@@ -1087,6 +1642,12 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
 
     monkeypatch.setattr(HostDispatchScheduler, "close", record_scheduler_close)
     monkeypatch.setattr(
+        _TerminalPostCommitCoordinator,
+        "close",
+        record_coordinator_close,
+    )
+    monkeypatch.setattr(HostTransientDeltaHub, "close", record_delivery_close)
+    monkeypatch.setattr(
         HostDispatchScheduler,
         "wake_queue_promotion",
         record_wake_queue,
@@ -1132,6 +1693,8 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
 
     assert order == [
         "scheduler",
+        "coordinator",
+        "delivery",
         "projection",
         "actor_handle",
         "actor_store",
@@ -1612,7 +2175,11 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
+        session_event_reconciliation_waiter: (
+            _SessionEventReconciliationWaiter
+        ),
         scheduler_store: HostDurableStore,
+        terminal_post_commit_coordinator: _TerminalPostCommitCoordinator,
         transient_delta_hub: HostTransientDeltaHub,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
@@ -1624,7 +2191,10 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         :param host_handle_id: Host handle id。
         :param scheduler: scheduler。
         :param projection_catchup_port: projection catch-up port。
+        :param session_event_reconciliation_waiter: opener-local session
+            event reconciliation waiter。
         :param scheduler_store: scheduler durable store。
+        :param terminal_post_commit_coordinator: opener terminal coordinator。
         :param transient_delta_hub: 当前 Host runtime 瞬态 hub。
         :param wait_poller: wait poller。
         :returns: 不会返回。
@@ -1633,7 +2203,9 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
 
         del self, durable_actor, health_gate, host_handle_id, scheduler
         del projection_catchup_port
+        del session_event_reconciliation_waiter
         del scheduler_store
+        del terminal_post_commit_coordinator
         del transient_delta_hub
         assert wait_poller is not None
         raise RuntimeError("forced public handle init failure")
@@ -1699,6 +2271,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         local_execution: HostLocalExecutionOptions,
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
+        terminal_post_commit_port_factory: _TerminalPostCommitPortFactory,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
         health_gate: HostExecutionHealthGate | None = None,
@@ -1710,6 +2283,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle id。
         :param transient_delta_publisher: Host 瞬态增量 publisher。
+        :param terminal_post_commit_port_factory: terminal port 构造期工厂。
         :param active_registry: active worker registry。
         :param projection_catchup_port: commit 后 projection catch-up port。
         :param health_gate: shared execution health gate。
@@ -1723,6 +2297,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
             local_execution=local_execution,
             host_handle_id=host_handle_id,
             transient_delta_publisher=transient_delta_publisher,
+            terminal_post_commit_port_factory=terminal_post_commit_port_factory,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
             health_gate=health_gate,
@@ -1924,14 +2499,35 @@ async def _next_terminal(watcher: AsyncIterator[HostSessionEvent]) -> HostEvent:
     raise AssertionError("watcher ended before terminal event")
 
 
-async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
+async def _collect_until_two_terminals(
+    watcher: HostSessionEventIterator,
+) -> tuple[HostSessionEvent, ...]:
+    """收集 watcher events，直到观察到两个 non-PROGRESS terminal。
+
+    :param watcher: Session event iterator。
+    :returns: 包含第二个 terminal 的有序事件前缀。
+    :raises AssertionError: watcher 提前结束时抛出。
+    """
+
+    collected: list[HostSessionEvent] = []
+    terminal_count = 0
+    async for event in watcher:
+        collected.append(event)
+        if isinstance(event, HostEvent) and event.kind is not HostEventKind.PROGRESS:
+            terminal_count += 1
+            if terminal_count == 2:
+                return tuple(collected)
+    raise AssertionError("watcher ended before two terminal events")
+
+
+async def _close_iterator(iterator: HostSessionEventIterator) -> None:
     """关闭测试中持有的 async generator iterator。
 
     :param iterator: HostSessionEvent async iterator。
     :returns: ``None``。
     """
 
-    await cast(_ClosableSessionEventIterator, iterator).aclose()
+    await iterator.aclose()
 
 
 def _mark_current_dispatch_owner_as_stale_running(
@@ -2081,6 +2677,10 @@ def _options(
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=512,
+            max_subscriptions_per_session=4,
+        ),
     )
 
 

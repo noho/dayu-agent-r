@@ -90,9 +90,11 @@ from dayu.host.durable.run_transition import (
     cancel_queued_in_transaction,
     cancel_recovering_run_in_transaction,
     cancel_waiting_run_in_transaction,
+    confirm_terminal_run_in_transaction,
     create_accepted_run_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
+    project_terminal_notice_from_exact_run_event,
     promote_queued_run_in_transaction,
     request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
@@ -148,6 +150,10 @@ from dayu.host.tool_runtime_schema_projection import (
     tool_schemas_digest as _tool_schemas_digest,
 )
 from dayu.host.tooling import HostToolingOptions
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -412,20 +418,19 @@ class CancelRunResult:
     :param run: cancel 后或幂等重放读取到的 Run。
     :param attempt: Run 当前 Attempt；queued cancel 时为 ``None``。
     :param dispatch_record: 当前 Attempt 对应 dispatch record；无 Attempt 时为 ``None``。
-    :param promotion: active slot 被释放后触发的 promotion 结果；未释放时为 ``None``。
+    :param terminal_notice: transaction commit 后消费的精确 terminal notice；
+        nonterminal active cancel request 时为 ``None``。
     :param active_cancel_target: commit 后需要 best-effort 传播的 active worker
         cancel 目标；无 active worker 时为 ``None``。
     :param idempotent_replay: 是否命中既有 cancel 幂等记录。
-    :param released_active_slot: 本次 cancel 是否释放 active slot。
     """
 
     run: RunRow
     attempt: AttemptRow | None
     dispatch_record: DispatchRecordRow | None
-    promotion: PromotionResult | None
+    terminal_notice: TerminalPostCommitNotice | None
     active_cancel_target: ActiveCancelTarget | None
     idempotent_replay: bool
-    released_active_slot: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,12 +442,14 @@ class SessionCancelResult:
         cancel 目标集合。
     :param idempotent_replay: 是否命中既有 session-scope cancel 幂等记录。
     :param cancelled_run_count: 本次新取消的 Run 数；幂等重放时为 0。
+    :param terminal_notices: 按 terminal EventLog sequence 排序的精确 notices。
     """
 
     snapshot: SessionSnapshot
     active_cancel_targets: tuple[ActiveCancelTarget, ...]
     idempotent_replay: bool
     cancelled_run_count: int
+    terminal_notices: tuple[TerminalPostCommitNotice, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,13 +459,13 @@ class TerminalCloseoutResult:
     :param run: terminal closeout 后的 Run。
     :param attempt: terminal closeout 后的 Attempt。
     :param dispatch_record: Attempt 对应 dispatch record；缺失时为 ``None``。
-    :param promotion: active slot 释放后触发的 promotion 结果。
+    :param terminal_notice: transaction commit 后消费的精确 terminal notice。
     """
 
     run: RunRow
     attempt: AttemptRow
     dispatch_record: DispatchRecordRow | None
-    promotion: PromotionResult
+    terminal_notice: TerminalPostCommitNotice
 
 
 class NoopAdmissionWakeupPort:
@@ -524,6 +531,7 @@ class HostAdmissionService:
     :param clock: admission 事件时间来源。
     :param id_factory: admission id 生成端口。
     :param wakeup_port: commit 后 no-op/测试 wakeup 端口。
+    :param terminal_post_commit_port: commit 后消费精确 terminal notice 的本地端口。
     :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
     """
 
@@ -533,6 +541,7 @@ class HostAdmissionService:
     clock: AdmissionClock
     id_factory: AdmissionIdFactory
     wakeup_port: AdmissionWakeupPort
+    terminal_post_commit_port: TerminalPostCommitPort
     projection_catchup_port: ProjectionCatchupPort
     ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None
     tooling_options: HostToolingOptions | None = None
@@ -780,19 +789,9 @@ class HostAdmissionService:
                 message="Cancel transaction classification is missing its result",
                 retryable=False,
             )
-        if result.released_active_slot:
-            promotion = _promote_after_release(
-                service=self,
-                session_id=result.run.session_id,
-            )
-            return CancelRunResult(
-                run=result.run,
-                attempt=result.attempt,
-                dispatch_record=result.dispatch_record,
-                promotion=promotion,
-                active_cancel_target=result.active_cancel_target,
-                idempotent_replay=result.idempotent_replay,
-                released_active_slot=True,
+        if result.terminal_notice is not None:
+            self.terminal_post_commit_port.notify_terminal_post_commit(
+                result.terminal_notice
             )
         return result
 
@@ -821,7 +820,7 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
-        return self.transaction_runner.run_write(
+        result = self.transaction_runner.run_write(
             _CancelSessionRunsOperation(
                 session_id=session_id,
                 request=request,
@@ -832,6 +831,9 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        for notice in result.terminal_notices:
+            self.terminal_post_commit_port.notify_terminal_post_commit(notice)
+        return result
 
     def closeout_attempt_terminal(
         self, closeout_input: CloseoutAttemptTerminalInput
@@ -839,7 +841,7 @@ class HostAdmissionService:
         """关闭 active Attempt / Run 到 succeeded、failed 或 lost 终态。
 
         :param closeout_input: internal terminal closeout 输入。
-        :returns: terminal closeout 结果，包含 commit 后 promotion 结果。
+        :returns: terminal closeout 结果，包含 commit 后 exact notice。
         :raises ValueError: 输入为空、终态不匹配或使用 cancellation terminal 时抛出。
         :raises HostApiError: Run/Attempt 缺失或 Phase 3 不支持状态时抛出。
         :raises HostDurableError: durable 写入失败时由底层抛出。
@@ -854,16 +856,15 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
-        catch_up_projection_best_effort(self.projection_catchup_port)
-        promotion = _promote_after_release(
-            service=self,
-            session_id=result.run.session_id,
+        self.terminal_post_commit_port.notify_terminal_post_commit(
+            result.terminal_notice
         )
+        catch_up_projection_best_effort(self.projection_catchup_port)
         return TerminalCloseoutResult(
             run=result.run,
             attempt=result.attempt,
             dispatch_record=result.dispatch_record,
-            promotion=promotion,
+            terminal_notice=result.terminal_notice,
         )
 
     def promote_next_queued_run(self, session_id: str) -> PromotionResult:
@@ -906,6 +907,7 @@ class HostAdmissionService:
 def create_host_admission_service(
     transaction_runner: HostTransactionRunner,
     *,
+    terminal_post_commit_port: TerminalPostCommitPort,
     event_log_store: EventLogStore | None = None,
     idempotency_store: IdempotencyStore | None = None,
     clock: AdmissionClock | None = None,
@@ -923,6 +925,7 @@ def create_host_admission_service(
     :param clock: 可选 clock 端口。
     :param id_factory: 可选 id factory 端口。
     :param wakeup_port: 可选 wakeup 端口。
+    :param terminal_post_commit_port: terminal commit 后本地 notice 的显式最终端点。
     :param projection_catchup_port: 可选 projection catch-up 端口。
     :returns: Host admission service。
     """
@@ -940,6 +943,7 @@ def create_host_admission_service(
         wakeup_port=(
             wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort()
         ),
+        terminal_post_commit_port=terminal_post_commit_port,
         projection_catchup_port=(
             projection_catchup_port
             if projection_catchup_port is not None
@@ -1565,7 +1569,11 @@ class _CancelRunOperation:
         existing = self.idempotency_store.read_idempotency_record(transaction, scope)
         if existing is not None:
             _raise_if_digest_conflict(existing, semantic_digest)
-            result = _idempotent_cancel_result(transaction, existing)
+            result = _idempotent_cancel_result(
+                transaction,
+                existing,
+                event_log_store=self.event_log_store,
+            )
             return _classified_cancel_result(
                 _CancelRunClassification.TERMINAL
                 if is_terminal_run_status(result.run.status)
@@ -1701,10 +1709,13 @@ class _CancelRunOperation:
             run=run,
             attempt=None,
             dispatch_record=None,
-            promotion=None,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition_result.run,
+                transition_result.run_event,
+                wake_queue_promotion=False,
+            ),
             active_cancel_target=None,
             idempotent_replay=False,
-            released_active_slot=False,
         )
 
     def _cancel_predispatch_starting_or_none(
@@ -1767,10 +1778,13 @@ class _CancelRunOperation:
             run=run,
             attempt=transition_result.attempt,
             dispatch_record=transition_result.dispatch_record,
-            promotion=None,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition_result.run,
+                transition_result.run_event,
+                wake_queue_promotion=True,
+            ),
             active_cancel_target=None,
             idempotent_replay=False,
-            released_active_slot=True,
         )
 
     def _cancel_recovering(
@@ -1830,11 +1844,13 @@ class _CancelRunOperation:
             run=run,
             attempt=transition_result.attempt,
             dispatch_record=transition_result.dispatch_record,
-            promotion=None,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition_result.run,
+                transition_result.run_event,
+                wake_queue_promotion=True,
+            ),
             active_cancel_target=None,
             idempotent_replay=False,
-            # 这里释放的是 session active slot / queue promotion 资格，不是 active worker cancel。
-            released_active_slot=True,
         )
 
     def _cancel_active_attempt(
@@ -1914,14 +1930,13 @@ class _CancelRunOperation:
                 run=run,
                 attempt=transition_result.attempt,
                 dispatch_record=transition_result.dispatch_record,
-                promotion=None,
+                terminal_notice=None,
                 active_cancel_target=_active_cancel_target_from_transition(
                     run=run,
                     attempt=transition_result.attempt,
                     reason=self.request.reason,
                 ),
                 idempotent_replay=False,
-                released_active_slot=False,
             ),
         )
 
@@ -1982,10 +1997,13 @@ class _CancelRunOperation:
             run=run,
             attempt=transition_result.attempt,
             dispatch_record=transition_result.dispatch_record,
-            promotion=None,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition_result.run,
+                transition_result.run_event,
+                wake_queue_promotion=True,
+            ),
             active_cancel_target=None,
             idempotent_replay=False,
-            released_active_slot=True,
         )
 
     def _record_terminal_cancel_ack(
@@ -2016,14 +2034,22 @@ class _CancelRunOperation:
                 created_event_sequence=None,
             ),
         )
+        confirmation = confirm_terminal_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            run,
+        )
         return CancelRunResult(
             run=run,
             attempt=_read_current_attempt(transaction, run),
             dispatch_record=_read_current_dispatch_record(transaction, run),
-            promotion=None,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                confirmation.run,
+                confirmation.run_event,
+                wake_queue_promotion=False,
+            ),
             active_cancel_target=None,
             idempotent_replay=False,
-            released_active_slot=False,
         )
 
 
@@ -2037,6 +2063,18 @@ class _SupportedSessionCancelTarget:
     active_worker: bool
     waiting: bool
     recovering: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionCancelTargetResult:
+    """单个 session-scope cancel target 的 transaction-local 结果。
+
+    :param cancel_request_event_id: 本目标首次 cancel request event id。
+    :param terminal_notice: terminal target 的 exact notice；active request 为 ``None``。
+    """
+
+    cancel_request_event_id: str
+    terminal_notice: TerminalPostCommitNotice | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2086,8 +2124,10 @@ class _CancelSessionRunsOperation:
         first_active_cancel_event_id: str | None = None
         first_active_cancel_event_sequence: int | None = None
         active_cancel_targets: list[ActiveCancelTarget] = []
+        terminal_notices: list[TerminalPostCommitNotice] = []
         for target in targets:
-            cancel_event_id = self._cancel_target(transaction, target)
+            target_result = self._cancel_target(transaction, target)
+            cancel_event_id = target_result.cancel_request_event_id
             cancel_event_sequence = _require_event_sequence_if_present(
                 transaction,
                 self.event_log_store,
@@ -2109,6 +2149,8 @@ class _CancelSessionRunsOperation:
             )
             if active_cancel_target is not None:
                 active_cancel_targets.append(active_cancel_target)
+            if target_result.terminal_notice is not None:
+                terminal_notices.append(target_result.terminal_notice)
         self.idempotency_store.record_idempotent_result(
             transaction,
             scope,
@@ -2137,6 +2179,12 @@ class _CancelSessionRunsOperation:
             active_cancel_targets=tuple(active_cancel_targets),
             idempotent_replay=False,
             cancelled_run_count=len(targets),
+            terminal_notices=tuple(
+                sorted(
+                    terminal_notices,
+                    key=lambda notice: notice.terminal_event_sequence,
+                )
+            ),
         )
 
     def _read_supported_targets_or_raise(
@@ -2167,12 +2215,12 @@ class _CancelSessionRunsOperation:
 
     def _cancel_target(
         self, transaction: HostTransaction, target: _SupportedSessionCancelTarget
-    ) -> str:
+    ) -> _SessionCancelTargetResult:
         """取消一个已校验支持的 session-scope cancel 目标。
 
         :param transaction: 当前 Host transaction。
         :param target: 已校验的取消目标。
-        :returns: 本目标 ``CANCEL_REQUESTED`` event id。
+        :returns: 本目标 cancel request id 与可选 exact terminal notice。
         :raises HostApiError: 低层 transition 失败时抛出。
         """
 
@@ -2186,12 +2234,16 @@ class _CancelSessionRunsOperation:
             return self._cancel_active_target(transaction, target.run)
         return self._cancel_predispatch_target(transaction, target.run)
 
-    def _cancel_queued_target(self, transaction: HostTransaction, run: RunRow) -> str:
+    def _cancel_queued_target(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+    ) -> _SessionCancelTargetResult:
         """取消一个 queued Run。
 
         :param transaction: 当前 Host transaction。
         :param run: 已校验为 queued 的 Run。
-        :returns: ``CANCEL_REQUESTED`` event id。
+        :returns: cancel request id 与 flag=false terminal notice。
         :raises HostApiError: transition 失败时抛出。
         """
 
@@ -2215,16 +2267,23 @@ class _CancelSessionRunsOperation:
             ),
         )
         _raise_for_session_cancel_transition_status(result)
-        return cancel_request_event_id
+        return _SessionCancelTargetResult(
+            cancel_request_event_id=cancel_request_event_id,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=False,
+            ),
+        )
 
     def _cancel_predispatch_target(
         self, transaction: HostTransaction, run: RunRow
-    ) -> str:
+    ) -> _SessionCancelTargetResult:
         """取消一个 pre-dispatch STARTING Run。
 
         :param transaction: 当前 Host transaction。
         :param run: 已校验为 pre-dispatch STARTING 的 Run。
-        :returns: ``CANCEL_REQUESTED`` event id。
+        :returns: cancel request id 与 flag=false terminal notice。
         :raises HostApiError: transition 失败时抛出。
         """
 
@@ -2249,14 +2308,25 @@ class _CancelSessionRunsOperation:
             ),
         )
         _raise_for_session_cancel_transition_status(result)
-        return cancel_request_event_id
+        return _SessionCancelTargetResult(
+            cancel_request_event_id=cancel_request_event_id,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=False,
+            ),
+        )
 
-    def _cancel_active_target(self, transaction: HostTransaction, run: RunRow) -> str:
+    def _cancel_active_target(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+    ) -> _SessionCancelTargetResult:
         """请求取消一个 active worker Run。
 
         :param transaction: 当前 Host transaction。
         :param run: 已校验为 active worker 的 Run。
-        :returns: ``CANCEL_REQUESTED`` event id；已 CANCELLING 时返回未写入的候选 id。
+        :returns: cancel request id；active request 不产生 terminal notice。
         :raises HostApiError: transition 失败时抛出。
         """
 
@@ -2280,14 +2350,21 @@ class _CancelSessionRunsOperation:
             ),
         )
         _raise_for_session_cancel_transition_status(result)
-        return cancel_request_event_id
+        return _SessionCancelTargetResult(
+            cancel_request_event_id=cancel_request_event_id,
+            terminal_notice=None,
+        )
 
-    def _cancel_waiting_target(self, transaction: HostTransaction, run: RunRow) -> str:
+    def _cancel_waiting_target(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+    ) -> _SessionCancelTargetResult:
         """取消一个 WAITING Run。
 
         :param transaction: 当前 Host transaction。
         :param run: 已校验为 WAITING 的 Run。
-        :returns: ``CANCEL_REQUESTED`` event id。
+        :returns: cancel request id 与 flag=false terminal notice。
         :raises HostApiError: transition 失败时抛出。
         """
 
@@ -2311,16 +2388,23 @@ class _CancelSessionRunsOperation:
             ),
         )
         _raise_for_session_cancel_transition_status(result)
-        return cancel_request_event_id
+        return _SessionCancelTargetResult(
+            cancel_request_event_id=cancel_request_event_id,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=False,
+            ),
+        )
 
     def _cancel_recovering_target(
         self, transaction: HostTransaction, run: RunRow
-    ) -> str:
+    ) -> _SessionCancelTargetResult:
         """取消一个 RECOVERING Run。
 
         :param transaction: 当前 Host transaction。
         :param run: 已校验为 RECOVERING 的 Run。
-        :returns: ``CANCEL_REQUESTED`` event id。
+        :returns: cancel request id 与 flag=false terminal notice。
         :raises HostApiError: transition 失败时抛出。
         """
 
@@ -2344,16 +2428,30 @@ class _CancelSessionRunsOperation:
             ),
         )
         _raise_for_session_cancel_transition_status(result)
-        return cancel_request_event_id
+        return _SessionCancelTargetResult(
+            cancel_request_event_id=cancel_request_event_id,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=False,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class _TerminalCloseoutTransactionResult:
-    """terminal closeout transaction 内部结果。"""
+    """terminal closeout transaction 内部结果。
+
+    :param run: 已提交终态 Run row。
+    :param attempt: 已提交终态 Attempt row。
+    :param dispatch_record: 当前 Attempt dispatch row。
+    :param terminal_notice: exact terminal row 派生的 commit 后 notice。
+    """
 
     run: RunRow
     attempt: AttemptRow
     dispatch_record: DispatchRecordRow | None
+    terminal_notice: TerminalPostCommitNotice
 
 
 @dataclass(frozen=True, slots=True)
@@ -2405,6 +2503,11 @@ class _CloseoutAttemptTerminalOperation:
             run=run,
             attempt=transition_result.attempt,
             dispatch_record=transition_result.dispatch_record,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                transition_result.run,
+                transition_result.run_event,
+                wake_queue_promotion=True,
+            ),
         )
 
 
@@ -4165,12 +4268,16 @@ def _classified_cancel_result(
 
 
 def _idempotent_cancel_result(
-    transaction: HostTransaction, record: IdempotencyRecord
+    transaction: HostTransaction,
+    record: IdempotencyRecord,
+    *,
+    event_log_store: EventLogStore,
 ) -> CancelRunResult:
     """从幂等记录恢复 cancel_run 结果。
 
     :param transaction: 当前 Host transaction。
     :param record: 已持久化 cancel 幂等记录。
+    :param event_log_store: EventLog 读取 primitive。
     :returns: cancel 结果；幂等重放不再次触发 promotion。
     :raises HostApiError: 结果类型错误或 Run 缺失时抛出。
     """
@@ -4188,14 +4295,25 @@ def _idempotent_cancel_result(
             message="Cancel idempotency record points to missing Run",
             retryable=False,
         )
+    terminal_notice = None
+    if is_terminal_run_status(run.status):
+        confirmation = confirm_terminal_run_in_transaction(
+            transaction,
+            event_log_store,
+            run,
+        )
+        terminal_notice = project_terminal_notice_from_exact_run_event(
+            confirmation.run,
+            confirmation.run_event,
+            wake_queue_promotion=False,
+        )
     return CancelRunResult(
         run=run,
         attempt=_read_current_attempt(transaction, run),
         dispatch_record=_read_current_dispatch_record(transaction, run),
-        promotion=None,
+        terminal_notice=terminal_notice,
         active_cancel_target=None,
         idempotent_replay=True,
-        released_active_slot=False,
     )
 
 
@@ -4244,6 +4362,7 @@ def _idempotent_session_cancel_result(
         ),
         idempotent_replay=True,
         cancelled_run_count=0,
+        terminal_notices=(),
     )
 
 
@@ -4571,35 +4690,6 @@ def _wake_start_governance_if_needed(
 
     if run.status == RunStatus.ACCEPTED:
         wakeup_port.wake_queue_promotion(run.session_id)
-
-
-def _promote_after_release(
-    *, service: HostAdmissionService, session_id: str
-) -> PromotionResult:
-    """active slot 释放后唤醒 pre-start governance。
-
-    :param service: admission service。
-    :param session_id: 释放 active slot 的 Session id。
-    :returns: skipped promotion 结果，实际启动由 scheduler governance gate 完成。
-    """
-
-    try:
-        service.wakeup_port.wake_queue_promotion(session_id)
-    except RuntimeError as exc:
-        _LOGGER.warning(
-            "host.admission.queue_promotion_wakeup_failed "
-            "session_id=%s error_type=%s",
-            session_id,
-            type(exc).__name__,
-        )
-    return PromotionResult(
-        promoted_run=None,
-        attempt=None,
-        dispatch_record=None,
-        pending_dispatch=None,
-        skipped=True,
-        skip_reason=PromotionSkipReason.DELEGATED_TO_GOVERNANCE,
-    )
 
 
 def _require_transition_run(run: RunRow | None) -> RunRow:

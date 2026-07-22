@@ -60,7 +60,13 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostMetadataEntry",
         "HostPayloadRef",
         "HostReasoningDelta",
+        "HostSessionEventAdmissionDetail",
+        "HostSessionEventAdmissionReason",
         "HostSessionEvent",
+        "HostSessionEventDeliveryDetail",
+        "HostSessionEventDeliveryPolicy",
+        "HostSessionEventDeliveryReason",
+        "HostSessionEventIterator",
         "HostStreamCursor",
         "HostTerminalStatus",
         "HostToolCallDelta",
@@ -427,6 +433,7 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
             "resolve_wait",
             "retry_run",
             "submit_followup",
+            "watch_session_events",
         }
     )
     actual_async_methods = frozenset(
@@ -436,7 +443,6 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
     )
 
     assert actual_async_methods == expected_async_methods
-    assert callable(getattr(api.Host, "watch_session_events", None))
 
 
 def test_host_admin_protocol_is_independent_capability_boundary() -> None:

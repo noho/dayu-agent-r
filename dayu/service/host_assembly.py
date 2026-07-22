@@ -49,6 +49,7 @@ from dayu.host.api import (
     CompactorRunnerBaseline,
     FollowupBehavior,
     HostCallContext,
+    HostSessionEventDeliveryPolicy,
     OpenHostOptions,
     OrdinaryRunExecutionBaseline,
     SubmitFollowupRequest,
@@ -881,6 +882,14 @@ def _compose_options(
         ),
         memory_projection_catchup_batch_size=(host_runtime.memory_projection_catch_up_batch_size),
         enable_truncation_manager=(execution_profile.tool_truncation_policy.enabled),
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=(
+                host_runtime.session_event_delivery_policy.transient_mailbox_max_items
+            ),
+            max_subscriptions_per_session=(
+                host_runtime.session_event_delivery_policy.max_subscriptions_per_session
+            ),
+        ),
         wait_poller_policy=wait_poller_policy,
     )
 

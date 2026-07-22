@@ -96,8 +96,8 @@ def test_run_view_toggle_switches_activity_and_transcript_snapshots() -> None:
     view.activity_sink().record_activity(_activity())
     view.render_terminal_result(_terminal_answer("answer"))
 
-    view.toggle_view()
-    view.toggle_view()
+    view.toggle_runtime_display()
+    view.toggle_runtime_display()
 
     assert view.mode is InteractiveRunViewMode.TRANSCRIPT
     stderr_text = stderr.getvalue()
@@ -119,7 +119,7 @@ def test_run_view_activity_mode_outputs_terminal_and_returns_to_default_mode() -
         options=InteractiveRunViewOptions(enabled=True),
     )
 
-    view.toggle_view()
+    view.toggle_runtime_display()
     exit_code = view.render_terminal_result(_terminal_answer("answer"))
 
     assert exit_code == EXIT_SUCCESS

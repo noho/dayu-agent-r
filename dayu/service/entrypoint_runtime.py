@@ -7,11 +7,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Protocol, TypeAlias, assert_never, cast
+from typing import Final, Never, Protocol, TypeAlias, assert_never
 
 from dayu.contracts import JsonValue
 from dayu.host.api import (
@@ -22,6 +22,7 @@ from dayu.host.api import (
     FollowupBehavior,
     Host,
     HostApiError,
+    HostApiErrorCode,
     HostActivityCounts,
     HostActivityKind,
     HostActivitySeverity,
@@ -33,9 +34,13 @@ from dayu.host.api import (
     HostMetadataEntry,
     HostReasoningDelta,
     HostSessionEvent,
+    HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryReason,
+    HostSessionEventIterator,
     HostTerminalStatus,
     HostToolCallDelta,
     HostTransientDelta,
+    HostClosedError,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItem,
@@ -69,11 +74,9 @@ DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 ENTRYPOINT_STARTUP_OUTBOX_LAGGED_MAX_ATTEMPTS: Final[int] = 3
 ENTRYPOINT_STARTUP_PROMOTION_MAX_ATTEMPTS: Final[int] = 20
 _OUTBOX_TERMINAL_READ_LIMIT: Final[int] = 50
-_WATCHER_FAILURE_DIAGNOSTIC_PREFIX: Final[str] = "watcher drain failed"
-_WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY: Final[str] = "entrypoint_watcher_failure"
-_WATCHER_FAILURE_ACTIVITY_TITLE: Final[str] = "运行事件流诊断"
-_WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT: Final[int] = 240
-_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY: Final[int] = 256
+_WATCHER_CLEANUP_ACTIVITY_DEDUPE_KEY: Final[str] = "entrypoint_watcher_cleanup_failed"
+_WATCHER_CLEANUP_ACTIVITY_TITLE: Final[str] = "运行事件流清理失败"
+_WATCHER_CLEANUP_ACTIVITY_SUMMARY: Final[str] = "已保留终态结果，但运行事件观察器清理失败。"
 
 
 class EntrypointRuntimeError(RuntimeError):
@@ -260,6 +263,44 @@ EntrypointThinkingCallback = Callable[[EntrypointThinking], None]
 """entrypoint runtime thinking 通知回调类型。"""
 
 
+class EntrypointCallbackExecutionPort(Protocol):
+    """Service 调用 activity/thinking 同步回调的异步执行端口。
+
+    端口只表达两类精确 invocation。执行域、串行化和线程生命周期由 UI
+    adapter 拥有；Service 不持有 executor，也不把 Host event 交给端口。
+    """
+
+    async def invoke_activity(
+        self,
+        callback: EntrypointActivityCallback,
+        activity: EntrypointActivity,
+    ) -> None:
+        """在调用方执行域中调用 activity callback。
+
+        :param callback: 待调用的同步 activity callback。
+        :param activity: Service 已投影的 activity DTO。
+        :returns: ``None``。
+        :raises Exception: callback 或执行域调度失败时透传原异常。
+        """
+
+        ...
+
+    async def invoke_thinking(
+        self,
+        callback: EntrypointThinkingCallback,
+        thinking: EntrypointThinking,
+    ) -> None:
+        """在调用方执行域中调用 thinking callback。
+
+        :param callback: 待调用的同步 thinking callback。
+        :param thinking: Service 已投影的 thinking DTO。
+        :returns: ``None``。
+        :raises Exception: callback 或执行域调度失败时透传原异常。
+        """
+
+        ...
+
+
 class EntrypointTerminalSource(StrEnum):
     """entrypoint runtime 观察到 Run 终态的来源。
 
@@ -370,8 +411,9 @@ class EntrypointRunTerminalResult:
     :param final_answer: 成功终态的最终回答；其它终态为 ``None``。
     :param error_message: 失败终态展示消息。
     :param cancel_reason: 取消终态原因。
-    :param watcher_failure_message: live watcher drain 失败后的首个诊断消息；
-        ``None`` 表示本次观察未发现 watcher drain 失败。
+    :param watcher_failure_message: 观察器诊断摘要。精确 delivery interruption
+        只保留 typed Host error identity，不把异常文本投影到 terminal，因此
+        当前固定为 ``None``。
     """
 
     source: EntrypointTerminalSource
@@ -456,59 +498,252 @@ class EntrypointStartupReconnectResult:
     seen_terminal_event_ids: frozenset[str]
 
 
-class ClosableHostSessionEventIterator(Protocol):
-    """支持显式关闭的 HostSessionEvent async iterator 窄协议。"""
+class _ObservationPhase(StrEnum):
+    """Service watcher runtime 的封闭生命周期阶段。"""
 
-    def __aiter__(self) -> AsyncIterator[HostSessionEvent]:
-        """返回 HostSessionEvent async iterator。
+    ATTACHED_UNBOUND = "attached_unbound"
+    CONSUMING = "consuming"
+    RESULT_READY = "result_ready"
+    STOPPING = "stopping"
+    CLOSED = "closed"
 
-        :returns: HostSessionEvent async iterator。
-        :raises Exception: 具体实现可在不可用时抛出运行时错误。
-        """
 
-        ...
+class _CallbackKind(StrEnum):
+    """callback failure 所属的封闭回调类别。"""
 
-    async def __anext__(self) -> HostSessionEvent:
-        """读取下一条 HostSessionEvent。
-
-        :returns: 下一条 HostSessionEvent。
-        :raises StopAsyncIteration: iterator 结束时抛出。
-        """
-
-        ...
-
-    async def aclose(self) -> None:
-        """关闭 HostEvent iterator。
-
-        :returns: ``None``。
-        :raises Exception: 具体实现可在关闭失败时抛出运行时错误。
-        """
-
-        ...
+    ACTIVITY = "activity"
+    THINKING = "thinking"
 
 
 @dataclass(frozen=True, slots=True)
-class _WatcherFailure:
-    """watcher drain task 捕获到的异常。"""
+class _TargetTerminal:
+    """sole consumer 观察到目标 Run 终态。"""
 
+    target_generation: int
+    result: EntrypointRunTerminalResult
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveryInterrupted:
+    """sole consumer 观察到 typed delivery interruption。"""
+
+    target_generation: int
+    error: HostApiError
+
+
+@dataclass(frozen=True, slots=True)
+class _IteratorEnded:
+    """sole consumer 在目标终态前观察到 iterator EOF。"""
+
+    target_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CallbackFailed:
+    """sole consumer 调用 UI callback 时观察到原始失败。"""
+
+    target_generation: int
+    callback_kind: _CallbackKind
     error: Exception
 
 
-_WatcherQueueItem: TypeAlias = HostSessionEvent | _WatcherFailure
-
-
 @dataclass(frozen=True, slots=True)
+class _IteratorFailed:
+    """sole consumer 观察到非 delivery iterator failure。"""
+
+    target_generation: int
+    error: Exception
+
+
+_ServiceObservationResult: TypeAlias = (
+    _TargetTerminal | _DeliveryInterrupted | _IteratorEnded | _CallbackFailed | _IteratorFailed
+)
+
+
+class _ServiceObservationState:
+    """唯一 generation binding 与 capacity-one observation slot owner。"""
+
+    _phase: _ObservationPhase
+    _target_generation: int
+    _target_run_id: str | None
+    _result: _ServiceObservationResult | None
+    _state_changed: asyncio.Event
+    _result_ready: asyncio.Event
+    _stop_requested: bool
+
+    def __init__(self) -> None:
+        """创建已 attach、尚未绑定 target 的状态。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._phase = _ObservationPhase.ATTACHED_UNBOUND
+        self._target_generation = 0
+        self._target_run_id = None
+        self._result = None
+        self._state_changed = asyncio.Event()
+        self._result_ready = asyncio.Event()
+        self._stop_requested = False
+
+    @property
+    def result(self) -> _ServiceObservationResult | None:
+        """返回 capacity-one slot 当前成员。
+
+        :returns: 当前 result；slot 为空时返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._result
+
+    def bind(self, target_run_id: str) -> int:
+        """绑定唯一 target 并开始下一 generation。
+
+        :param target_run_id: 当前唯一目标 Run id。
+        :returns: 新的单调正整数 generation。
+        :raises RuntimeError: 当前状态不可绑定时抛出。
+        """
+
+        if self._phase is not _ObservationPhase.ATTACHED_UNBOUND:
+            raise RuntimeError("observation target can only bind while unbound")
+        if self._stop_requested or self._result is not None:
+            raise RuntimeError("observation target cannot bind after stop or result")
+        _require_non_empty(target_run_id, field_name="target_run_id")
+        self._target_generation += 1
+        self._target_run_id = target_run_id
+        self._phase = _ObservationPhase.CONSUMING
+        self._state_changed.set()
+        return self._target_generation
+
+    async def wait_for_binding(self) -> tuple[int, str] | None:
+        """等待可消费 target binding 或 stop。
+
+        :returns: ``(generation, run_id)``；stop 已赢得仲裁时返回 ``None``。
+        :raises asyncio.CancelledError: consumer task 被取消时透传。
+        """
+
+        while True:
+            if self._stop_requested:
+                return None
+            if self._phase is _ObservationPhase.CONSUMING:
+                target_run_id = self._target_run_id
+                if target_run_id is None:
+                    raise RuntimeError("consuming observation missing target_run_id")
+                return self._target_generation, target_run_id
+            self._state_changed.clear()
+            await self._state_changed.wait()
+
+    def try_commit(
+        self,
+        result: _ServiceObservationResult,
+        *,
+        target_run_id: str,
+    ) -> bool:
+        """由 sole consumer 尝试 first-commit 唯一 slot。
+
+        :param result: exact-five observation member。
+        :param target_run_id: consumer 读取事件时快照的 target Run id。
+        :returns: 本 generation 成功 first-commit 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self._stop_requested or self._phase is not _ObservationPhase.CONSUMING:
+            return False
+        if self._result is not None:
+            return False
+        if result.target_generation != self._target_generation:
+            return False
+        if target_run_id != self._target_run_id:
+            return False
+        self._result = result
+        self._phase = _ObservationPhase.RESULT_READY
+        self._result_ready.set()
+        self._state_changed.set()
+        return True
+
+    async def wait_for_result(self) -> _ServiceObservationResult:
+        """等待并返回当前 capacity-one slot member。
+
+        :returns: first-committed exact-five member。
+        :raises asyncio.CancelledError: caller 被取消时透传。
+        :raises RuntimeError: signal 与 slot invariant 不一致时抛出。
+        """
+
+        await self._result_ready.wait()
+        result = self._result
+        if result is None:
+            raise RuntimeError("observation result signal set without result")
+        return result
+
+    def ack_target_terminal(self, target_generation: int) -> _TargetTerminal:
+        """消费并清除同 generation 的 terminal slot 以便 startup 复用。
+
+        :param target_generation: coordinator 已消费的 generation。
+        :returns: 已消费的 terminal member。
+        :raises RuntimeError: slot 不是目标 generation terminal 时抛出。
+        """
+
+        result = self._result
+        if not isinstance(result, _TargetTerminal):
+            raise RuntimeError("only target terminal can be acknowledged")
+        if result.target_generation != target_generation:
+            raise RuntimeError("target terminal generation does not match")
+        self._result = None
+        self._target_run_id = None
+        self._phase = _ObservationPhase.ATTACHED_UNBOUND
+        self._result_ready.clear()
+        self._state_changed.set()
+        return result
+
+    async def wait_for_rebind_or_stop(self, target_generation: int) -> None:
+        """在 terminal commit 后暂停，直到 ack/rebind 或 stop。
+
+        :param target_generation: 已提交 terminal 的 generation。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: consumer task 被取消时透传。
+        """
+
+        while True:
+            if self._stop_requested:
+                return
+            if self._phase is _ObservationPhase.CONSUMING and self._target_generation > target_generation:
+                return
+            self._state_changed.clear()
+            await self._state_changed.wait()
+
+    def request_stop(self) -> None:
+        """让 stop 在空 slot 上赢得仲裁并拒绝后续 late commit。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self._phase is _ObservationPhase.CLOSED:
+            return
+        self._stop_requested = True
+        self._phase = _ObservationPhase.STOPPING
+        self._state_changed.set()
+
+    def mark_closed(self) -> None:
+        """标记 watcher runtime 已完成唯一 cleanup。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._stop_requested = True
+        self._phase = _ObservationPhase.CLOSED
+        self._state_changed.set()
+
+
+@dataclass(slots=True)
 class _WatchAndWaitRuntime:
-    """绑定一个 live watcher、有界 relay queue 与唯一 drain task。
+    """绑定 public iterator、sole consumer 与唯一 observation slot。"""
 
-    :param watcher: 已 attach 的可关闭 Host Session event iterator。
-    :param queue: 容量由 Service 单一常量治理的 live relay queue。
-    :param drain_task: 顺序 relay Host items 的 drain task。
-    """
-
-    watcher: ClosableHostSessionEventIterator
-    queue: asyncio.Queue[_WatcherQueueItem]
-    drain_task: asyncio.Task[None]
+    watcher: HostSessionEventIterator
+    state: _ServiceObservationState
+    consumer_task: asyncio.Task[None]
+    closed: bool = False
 
 
 @dataclass(slots=True)
@@ -516,13 +751,11 @@ class _TerminalObservationState:
     """单次 terminal observation 的本地去重与 outbox 游标状态。"""
 
     last_observed_event_sequence: int
-    seen_event_ids: set[str]
     seen_terminal_event_ids: set[str]
     seen_dedupe_keys: set[str]
     seen_activity_dedupe_keys: set[str]
     seen_thinking_dedupe_keys: set[str]
     outbox_cursor: OutboxTerminalCursor | None
-    watcher_failure_message: str | None
 
 
 async def prepare_entrypoint_runtime(
@@ -652,6 +885,7 @@ async def submit_entrypoint_turn_and_wait(
     on_run_accepted: RunAcceptedCallback | None = None,
     on_activity: EntrypointActivityCallback | None = None,
     on_thinking: EntrypointThinkingCallback | None = None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None = None,
     poll_interval_seconds: float = DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> EntrypointRunTerminalResult:
@@ -666,6 +900,8 @@ async def submit_entrypoint_turn_and_wait(
     :param on_activity: 可选 activity 回调；只接收 Host public activity 投影和
         Service 本地有界诊断。
     :param on_thinking: 可选 thinking 回调；只接收 Host public thinking 增量。
+    :param callback_execution_port: activity/thinking callback 的异步执行端口；
+        存在任一 callback 时必填，无 callback 时必须为 ``None``。
     :param poll_interval_seconds: watcher 暂无 terminal 时的 public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine，便于测试。
     :returns: Run terminal 观察结果。
@@ -677,8 +913,20 @@ async def submit_entrypoint_turn_and_wait(
     """
 
     _require_positive_poll_interval(poll_interval_seconds)
-    runtime = _create_watch_and_wait_runtime(host, request.session_id)
+    _validate_callback_execution_port(
+        on_activity=on_activity,
+        on_thinking=on_thinking,
+        callback_execution_port=callback_execution_port,
+    )
     state = _new_terminal_observation_state()
+    runtime = await _create_watch_and_wait_runtime(
+        host,
+        request.session_id,
+        observation_state=state,
+        on_activity=on_activity,
+        on_thinking=on_thinking,
+        callback_execution_port=callback_execution_port,
+    )
     try:
         submit_request = compose_submit_followup_request_with_overrides(
             context=request.context,
@@ -693,22 +941,23 @@ async def submit_entrypoint_turn_and_wait(
             run_overrides=request.run_overrides,
         )
         followup = await host.submit_followup(request.session_id, submit_request)
+        runtime.state.bind(followup.accepted_run_id)
         if on_run_accepted is not None:
             on_run_accepted(followup.accepted_run_id)
-        return await _wait_for_terminal(
-            host,
-            session_id=request.session_id,
-            run_id=followup.accepted_run_id,
-            queue=runtime.queue,
-            state=state,
-            on_activity=on_activity,
-            on_thinking=on_thinking,
-            allow_outbox_terminal_fallback=False,
-            poll_interval_seconds=poll_interval_seconds,
-            sleep=sleep,
-        )
-    finally:
-        await _close_watch_and_wait_runtime(runtime)
+    except BaseException as error:
+        cleanup_error = await _close_watch_and_wait_runtime(runtime)
+        _raise_primary_with_cleanup(error, cleanup_error)
+    return await _wait_for_single_target_result(
+        runtime,
+        host=host,
+        session_id=request.session_id,
+        run_id=followup.accepted_run_id,
+        state=state,
+        on_activity=on_activity,
+        callback_execution_port=callback_execution_port,
+        poll_interval_seconds=poll_interval_seconds,
+        sleep=sleep,
+    )
 
 
 async def cancel_entrypoint_run_and_wait(
@@ -722,61 +971,92 @@ async def cancel_entrypoint_run_and_wait(
 
     :param host: Host public Protocol handle。
     :param request: entrypoint cancel 请求。
-    :param poll_interval_seconds: watcher 暂无 terminal 时的 public read 轮询间隔。
+    :param poll_interval_seconds: durable recovery 的 public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine，便于测试。
     :returns: Run terminal 观察结果。
-    :raises EntrypointRuntimeError: Host outbox projection 失败或终态投影缺失时抛出。
+    :raises EntrypointRuntimeError: iterator、cleanup、Outbox projection 或终态
+        投影失败时抛出。
     :raises HostApiError: Host public API 调用失败时由 Host 抛出。
-
-    本 helper 不持有内部 timeout。调用方必须通过外层 task cancellation、
-    ``asyncio.wait_for(...)`` 或显式 cancel 请求控制等待生命周期。
+    :raises HostClosedError: Host public iterator 失败时原样透传。
     """
 
     _require_positive_poll_interval(poll_interval_seconds)
     run_snapshot = await host.get_run(request.run_id)
     state = _new_terminal_observation_state()
     if is_terminal_run_status(run_snapshot.status):
-        queue: asyncio.Queue[_WatcherQueueItem] = asyncio.Queue()
-        return await _wait_for_terminal(
+        return await _wait_for_durable_terminal(
             host,
             session_id=run_snapshot.session_id,
             run_id=request.run_id,
-            queue=queue,
             state=state,
-            allow_outbox_terminal_fallback=True,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
-    runtime = _create_watch_and_wait_runtime(host, run_snapshot.session_id)
-    allow_outbox_terminal_fallback = False
+    runtime = await _create_watch_and_wait_runtime(
+        host,
+        run_snapshot.session_id,
+        observation_state=state,
+        on_activity=None,
+        on_thinking=None,
+        callback_execution_port=None,
+    )
+    runtime.state.bind(request.run_id)
     try:
-        try:
-            await host.cancel_run(
-                request.run_id,
-                CancelRunRequest(
-                    context=request.context,
-                    client_request_id=request.client_request_id,
-                    reason=request.reason,
-                    mode=request.mode,
-                ),
-            )
-        except HostApiError:
-            latest_run_snapshot = await host.get_run(request.run_id)
-            if not is_terminal_run_status(latest_run_snapshot.status):
-                raise
-            allow_outbox_terminal_fallback = True
-        return await _wait_for_terminal(
-            host,
-            session_id=run_snapshot.session_id,
-            run_id=request.run_id,
-            queue=runtime.queue,
-            state=state,
-            allow_outbox_terminal_fallback=allow_outbox_terminal_fallback,
-            poll_interval_seconds=poll_interval_seconds,
-            sleep=sleep,
+        await host.cancel_run(
+            request.run_id,
+            CancelRunRequest(
+                context=request.context,
+                client_request_id=request.client_request_id,
+                reason=request.reason,
+                mode=request.mode,
+            ),
         )
-    finally:
-        await _close_watch_and_wait_runtime(runtime)
+    except asyncio.CancelledError as error:
+        cleanup_error = await _close_watch_and_wait_runtime(runtime)
+        _raise_primary_with_cleanup(error, cleanup_error)
+    except HostApiError as error:
+        latest_run_snapshot = await host.get_run(request.run_id)
+        if not is_terminal_run_status(latest_run_snapshot.status):
+            cleanup_error = await _close_watch_and_wait_runtime(runtime)
+            _raise_primary_with_cleanup(error, cleanup_error)
+        ready_result = runtime.state.result
+        if ready_result is not None:
+            return await _finish_observation_result(
+                ready_result,
+                runtime=runtime,
+                host=host,
+                session_id=run_snapshot.session_id,
+                run_id=request.run_id,
+                state=state,
+                on_activity=None,
+                callback_execution_port=None,
+                poll_interval_seconds=poll_interval_seconds,
+                sleep=sleep,
+            )
+        cleanup_error = await _close_watch_and_wait_runtime(runtime)
+        try:
+            recovered = await _wait_for_durable_terminal(
+                host,
+                session_id=run_snapshot.session_id,
+                run_id=request.run_id,
+                state=state,
+                poll_interval_seconds=poll_interval_seconds,
+                sleep=sleep,
+            )
+        except BaseException as recovery_error:
+            _raise_primary_with_cleanup(recovery_error, cleanup_error)
+        return recovered
+    return await _wait_for_single_target_result(
+        runtime,
+        host=host,
+        session_id=run_snapshot.session_id,
+        run_id=request.run_id,
+        state=state,
+        on_activity=None,
+        callback_execution_port=None,
+        poll_interval_seconds=poll_interval_seconds,
+        sleep=sleep,
+    )
 
 
 async def startup_reconnect_entrypoint_session(
@@ -796,12 +1076,21 @@ async def startup_reconnect_entrypoint_session(
     :raises HostApiError: Host public API 调用失败时由 Host 抛出。
     """
 
-    runtime = _create_watch_and_wait_runtime(host, request.session_id)
     state = _new_terminal_observation_state(
         terminal_cursor=request.terminal_cursor,
         seen_terminal_event_ids=request.seen_terminal_event_ids,
     )
+    runtime = await _create_watch_and_wait_runtime(
+        host,
+        request.session_id,
+        observation_state=state,
+        on_activity=None,
+        on_thinking=None,
+        callback_execution_port=None,
+    )
     terminal_results: list[EntrypointRunTerminalResult] = []
+    degraded = False
+    cleanup_error: BaseException | None = None
     try:
         terminal_results.extend(
             await _read_session_outbox_terminal_backfill(
@@ -813,150 +1102,88 @@ async def startup_reconnect_entrypoint_session(
                 sleep=sleep,
             )
         )
-        terminal_results.extend(
-            _drain_available_startup_terminal_items(
-                queue=runtime.queue,
-                state=state,
-            )
-        )
-        await _observe_startup_active_and_queued_runs(
-            host,
-            request=request,
-            queue=runtime.queue,
-            state=state,
-            terminal_results=terminal_results,
-            sleep=sleep,
-        )
-        return EntrypointStartupReconnectResult(
-            terminal_results=tuple(terminal_results),
-            next_terminal_cursor=OutboxTerminalCursor(
-                event_sequence=state.last_observed_event_sequence
-            ),
-            seen_terminal_event_ids=frozenset(state.seen_terminal_event_ids),
-        )
-    finally:
-        await _close_watch_and_wait_runtime(runtime)
-
-
-async def _observe_startup_active_and_queued_runs(
-    host: Host,
-    *,
-    request: EntrypointStartupReconnectRequest,
-    queue: asyncio.Queue[_WatcherQueueItem],
-    state: _TerminalObservationState,
-    terminal_results: list[EntrypointRunTerminalResult],
-    sleep: Callable[[float], Awaitable[None]],
-) -> None:
-    """观察 startup barrier 中的 active / queued Run 直到 Session idle。
-
-    :param host: Host public Protocol handle。
-    :param request: startup reconnect 请求。
-    :param queue: watcher drain queue。
-    :param state: 本轮本地观察状态。
-    :param terminal_results: 已收集 terminal 结果列表。
-    :param sleep: 可注入 sleep coroutine。
-    :returns: ``None``。
-    :raises EntrypointRuntimeError: queued-only promotion 等待耗尽时抛出。
-    """
-
-    while True:
-        terminal_results.extend(
-            _drain_available_startup_terminal_items(queue=queue, state=state)
-        )
-        snapshot = await host.get_session(request.session_id)
-        if snapshot.active_run_id is not None:
-            terminal_results.append(
-                await _wait_for_terminal(
+        while True:
+            snapshot = await host.get_session(request.session_id)
+            if snapshot.active_run_id is not None:
+                if degraded:
+                    terminal_results.append(
+                        await _wait_for_durable_terminal(
+                            host,
+                            session_id=request.session_id,
+                            run_id=snapshot.active_run_id,
+                            state=state,
+                            poll_interval_seconds=request.poll_interval_seconds,
+                            sleep=sleep,
+                        )
+                    )
+                    continue
+                generation = runtime.state.bind(snapshot.active_run_id)
+                result = await runtime.state.wait_for_result()
+                if isinstance(result, _TargetTerminal):
+                    terminal_results.append(runtime.state.ack_target_terminal(generation).result)
+                    continue
+                cleanup_error = await _close_watch_and_wait_runtime(runtime)
+                if isinstance(result, _DeliveryInterrupted):
+                    degraded = True
+                    try:
+                        terminal_results.append(
+                            await _wait_for_durable_terminal(
+                                host,
+                                session_id=request.session_id,
+                                run_id=snapshot.active_run_id,
+                                state=state,
+                                poll_interval_seconds=request.poll_interval_seconds,
+                                sleep=sleep,
+                            )
+                        )
+                    except BaseException as recovery_error:
+                        _raise_delivery_recovery_failure(
+                            recovery_error,
+                            delivery_error=result.error,
+                            cleanup_error=cleanup_error,
+                        )
+                    continue
+                _raise_observation_failure(result, cleanup_error=cleanup_error)
+            if snapshot.queued_run_ids:
+                promoted = await _wait_for_startup_promotion(
                     host,
                     session_id=request.session_id,
-                    run_id=snapshot.active_run_id,
-                    queue=queue,
-                    state=state,
-                    allow_outbox_terminal_fallback=True,
-                    poll_interval_seconds=request.poll_interval_seconds,
+                    promotion_max_attempts=request.promotion_max_attempts,
+                    promotion_poll_interval_seconds=(request.promotion_poll_interval_seconds),
                     sleep=sleep,
                 )
-            )
-            continue
-        if snapshot.queued_run_ids:
-            promoted = await _wait_for_startup_promotion(
+                if promoted.active_run_id is None:
+                    raise EntrypointRuntimeError(
+                        "Session 仍有未开始的 queued Run，未进入输入态: "
+                        f"session_id={request.session_id}, "
+                        f"queued_run_count={len(promoted.queued_run_ids)}"
+                    )
+                continue
+            tail_results = await _read_session_outbox_terminal_backfill(
                 host,
                 session_id=request.session_id,
-                promotion_max_attempts=request.promotion_max_attempts,
-                promotion_poll_interval_seconds=request.promotion_poll_interval_seconds,
+                state=state,
+                outbox_lagged_max_attempts=request.outbox_lagged_max_attempts,
+                poll_interval_seconds=request.poll_interval_seconds,
                 sleep=sleep,
             )
-            terminal_results.extend(
-                _drain_available_startup_terminal_items(queue=queue, state=state)
-            )
-            if promoted.active_run_id is None:
-                raise EntrypointRuntimeError(
-                    "Session 仍有未开始的 queued Run，未进入输入态: "
-                    f"session_id={request.session_id}, queued_run_count={len(promoted.queued_run_ids)}"
-                )
-            terminal_results.append(
-                await _wait_for_terminal(
-                    host,
-                    session_id=request.session_id,
-                    run_id=promoted.active_run_id,
-                    queue=queue,
-                    state=state,
-                    allow_outbox_terminal_fallback=True,
-                    poll_interval_seconds=request.poll_interval_seconds,
-                    sleep=sleep,
-                )
-            )
-            continue
-        if await _close_startup_idle_tail(
-            host,
-            request=request,
-            queue=queue,
-            state=state,
-            terminal_results=terminal_results,
-            sleep=sleep,
-        ):
-            continue
-        return
-
-
-async def _close_startup_idle_tail(
-    host: Host,
-    *,
-    request: EntrypointStartupReconnectRequest,
-    queue: asyncio.Queue[_WatcherQueueItem],
-    state: _TerminalObservationState,
-    terminal_results: list[EntrypointRunTerminalResult],
-    sleep: Callable[[float], Awaitable[None]],
-) -> bool:
-    """在 idle snapshot 后关闭 startup terminal tail。
-
-    :param host: Host public Protocol handle。
-    :param request: startup reconnect 请求。
-    :param queue: watcher drain queue。
-    :param state: 本轮本地观察状态。
-    :param terminal_results: 已收集 terminal 结果列表。
-    :param sleep: 可注入 sleep coroutine。
-    :returns: 发现 terminal 或首次 watcher failure、需要重新读取 Session snapshot 时返回 ``True``。
-    :raises EntrypointRuntimeError: Outbox projection 失败或 LAGGED 重试耗尽时抛出。
-    """
-
-    tail_outbox_results = await _read_session_outbox_terminal_backfill(
-        host,
-        session_id=request.session_id,
-        state=state,
-        outbox_lagged_max_attempts=request.outbox_lagged_max_attempts,
-        poll_interval_seconds=request.poll_interval_seconds,
-        sleep=sleep,
+            terminal_results.extend(tail_results)
+            if tail_results:
+                continue
+            break
+    except BaseException as error:
+        if not runtime.closed:
+            cleanup_error = await _close_watch_and_wait_runtime(runtime)
+        _raise_primary_with_cleanup(error, cleanup_error)
+    if not runtime.closed:
+        cleanup_error = await _close_watch_and_wait_runtime(runtime)
+    if cleanup_error is not None and not terminal_results:
+        _raise_cleanup_failure(cleanup_error)
+    return EntrypointStartupReconnectResult(
+        terminal_results=tuple(terminal_results),
+        next_terminal_cursor=OutboxTerminalCursor(event_sequence=state.last_observed_event_sequence),
+        seen_terminal_event_ids=frozenset(state.seen_terminal_event_ids),
     )
-    terminal_results.extend(tail_outbox_results)
-    watcher_failure_before_drain = state.watcher_failure_message
-    tail_live_results = _drain_available_startup_terminal_items(
-        queue=queue,
-        state=state,
-    )
-    terminal_results.extend(tail_live_results)
-    watcher_failed_during_tail = watcher_failure_before_drain is None and state.watcher_failure_message is not None
-    return bool(tail_outbox_results or tail_live_results or watcher_failed_during_tail)
 
 
 async def _wait_for_startup_promotion(
@@ -992,251 +1219,720 @@ async def _wait_for_startup_promotion(
     )
 
 
-def _attach_watcher(
+def _validate_callback_execution_port(
+    *,
+    on_activity: EntrypointActivityCallback | None,
+    on_thinking: EntrypointThinkingCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
+) -> None:
+    """校验 callback 与 execution port 的精确组合。
+
+    :param on_activity: 可选 activity callback。
+    :param on_thinking: 可选 thinking callback。
+    :param callback_execution_port: 可选异步执行端口。
+    :returns: ``None``。
+    :raises ValueError: callback 与执行端口组合不满足 owner contract 时抛出。
+    """
+
+    callbacks_present = on_activity is not None or on_thinking is not None
+    if callbacks_present and callback_execution_port is None:
+        raise ValueError("callback_execution_port is required when callbacks are set")
+    if not callbacks_present and callback_execution_port is not None:
+        raise ValueError("callback_execution_port requires an activity or thinking callback")
+
+
+async def _attach_watcher(
     host: Host,
     session_id: str,
-) -> ClosableHostSessionEventIterator:
-    """在 Host mutating command 前 attach live watcher。
+) -> HostSessionEventIterator:
+    """在 Host mutating command 前 attach public live watcher。
 
     :param host: Host public Protocol handle。
     :param session_id: 目标 Session id。
     :returns: 可关闭 HostSessionEvent iterator。
     :raises HostApiError: Host watch attach 失败时由 Host 抛出。
+    :raises HostClosedError: Host 已关闭时由 Host 抛出。
     """
 
-    return cast(
-        ClosableHostSessionEventIterator,
-        host.watch_session_events(session_id),
-    )
+    return await host.watch_session_events(session_id)
 
 
-def _create_watch_and_wait_runtime(
+async def _create_watch_and_wait_runtime(
     host: Host,
     session_id: str,
+    *,
+    observation_state: _TerminalObservationState,
+    on_activity: EntrypointActivityCallback | None,
+    on_thinking: EntrypointThinkingCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
 ) -> _WatchAndWaitRuntime:
-    """唯一构造实际承接 live watcher items 的有界 relay runtime。
+    """attach public iterator 并创建唯一 sole-consumer runtime。
 
     :param host: Host public Protocol handle。
     :param session_id: 目标 Session 标识。
-    :returns: 已 attach watcher、有界 queue 与 drain task 的绑定 runtime。
+    :param observation_state: live/outbox 共用的 terminal identity 状态。
+    :param on_activity: 可选 activity callback。
+    :param on_thinking: 可选 thinking callback。
+    :param callback_execution_port: callback 的异步执行端口。
+    :returns: public iterator、sole consumer 与 capacity-one slot runtime。
     :raises HostApiError: Host watch attach 失败时由 Host 抛出。
-    :raises RuntimeError: asyncio task 创建失败时透传。
+    :raises RuntimeError: sole consumer task 创建失败时透传。
     """
 
-    watcher = _attach_watcher(host, session_id)
-    queue: asyncio.Queue[_WatcherQueueItem] = asyncio.Queue(maxsize=_ENTRYPOINT_LIVE_EVENT_BUFFER_CAPACITY)
-    drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    watcher = await _attach_watcher(host, session_id)
+    state = _ServiceObservationState()
+    consumer_coroutine = _consume_host_events(
+        watcher,
+        runtime_state=state,
+        observation_state=observation_state,
+        on_activity=on_activity,
+        on_thinking=on_thinking,
+        callback_execution_port=callback_execution_port,
+    )
+    try:
+        consumer_task = asyncio.create_task(consumer_coroutine)
+    except BaseException as error:
+        consumer_coroutine.close()
+        cleanup_error: BaseException | None = None
+        try:
+            await watcher.aclose()
+        except BaseException as close_error:
+            cleanup_error = close_error
+        _raise_primary_with_cleanup(error, cleanup_error)
     return _WatchAndWaitRuntime(
         watcher=watcher,
-        queue=queue,
-        drain_task=drain_task,
+        state=state,
+        consumer_task=consumer_task,
     )
 
 
-async def _drain_host_events(
-    watcher: ClosableHostSessionEventIterator,
-    queue: asyncio.Queue[_WatcherQueueItem],
-) -> None:
-    """把 watcher 事件转存到本地 queue。
-
-    :param watcher: 已 attach 的 HostSessionEvent iterator。
-    :param queue: 本地事件队列。
-    :returns: ``None``。
-    :raises asyncio.CancelledError: drain task 被取消时透传。
-    """
-
-    try:
-        async for event in watcher:
-            await queue.put(event)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        await queue.put(_WatcherFailure(error=exc))
-
-
-async def _close_watch_and_wait_runtime(runtime: _WatchAndWaitRuntime) -> None:
-    """关闭 live watcher runtime 并回收唯一 drain task。
-
-    :param runtime: 待关闭的 watcher/queue/task 绑定 runtime。
-    :returns: ``None``。
-    :raises asyncio.CancelledError: watcher ``aclose`` 或 drain task 被取消时透传。
-    :raises Exception: watcher ``aclose`` 失败时向上抛出。
-    """
-
-    try:
-        if not runtime.drain_task.done():
-            runtime.drain_task.cancel()
-        try:
-            await runtime.drain_task
-        except asyncio.CancelledError:
-            pass
-    finally:
-        # 对 async generator watcher，必须先停止正在执行的 drain task，再调用
-        # aclose；否则会触发 "asynchronous generator is already running"。
-        await runtime.watcher.aclose()
-
-
-async def _wait_for_terminal(
-    host: Host,
+async def _consume_host_events(
+    watcher: HostSessionEventIterator,
     *,
-    session_id: str,
-    run_id: str,
-    queue: asyncio.Queue[_WatcherQueueItem],
-    state: _TerminalObservationState,
-    on_activity: EntrypointActivityCallback | None = None,
-    on_thinking: EntrypointThinkingCallback | None = None,
-    allow_outbox_terminal_fallback: bool,
-    poll_interval_seconds: float,
-    sleep: Callable[[float], Awaitable[None]],
-) -> EntrypointRunTerminalResult:
-    """等待指定 Run 的 live 或 outbox terminal。
+    runtime_state: _ServiceObservationState,
+    observation_state: _TerminalObservationState,
+    on_activity: EntrypointActivityCallback | None,
+    on_thinking: EntrypointThinkingCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
+) -> None:
+    """作为 iterator 唯一 ``anext`` owner 顺序产生 exact-five outcome。
 
-    :param host: Host public Protocol handle。
-    :param session_id: 目标 Session id。
-    :param run_id: 目标 Run id。
-    :param queue: watcher drain queue。
-    :param state: 本轮本地观察状态。
-    :param on_activity: 可选 activity 回调。
-    :param on_thinking: 可选 thinking 回调。
-    :param allow_outbox_terminal_fallback: 是否允许在未观察到 live terminal 时读取
-        Outbox terminal。该路径只用于可能错过 terminal 的补读场景；已 attach
-        submit 路径不得把 Outbox 当作通用 final answer 读取接口。
-    :param poll_interval_seconds: public read 轮询间隔。
-    :param sleep: 可注入 sleep coroutine。
-    :returns: Run terminal 观察结果。
-    :raises EntrypointRuntimeError: outbox projection 失败或终态缺失时抛出。
-
-    本 helper 不持有内部 timeout。调用方必须通过外层 task cancellation、
-    ``asyncio.wait_for(...)`` 或显式 cancel 请求控制等待生命周期。
+    :param watcher: Host public Session event iterator。
+    :param runtime_state: generation binding 与唯一 result slot owner。
+    :param observation_state: live/outbox identity 去重状态。
+    :param on_activity: 可选 activity callback。
+    :param on_thinking: 可选 thinking callback。
+    :param callback_execution_port: callback 的异步执行端口。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: runtime cleanup 取消 consumer 时透传。
     """
 
     while True:
-        live_terminal = _drain_available_watcher_items(
-            queue=queue,
+        binding = await runtime_state.wait_for_binding()
+        if binding is None:
+            return
+        target_generation, target_run_id = binding
+        try:
+            event = await anext(watcher)
+        except asyncio.CancelledError:
+            raise
+        except StopAsyncIteration:
+            runtime_state.try_commit(
+                _IteratorEnded(target_generation=target_generation),
+                target_run_id=target_run_id,
+            )
+            return
+        except HostApiError as error:
+            if (
+                error.code is HostApiErrorCode.DELIVERY_INTERRUPTED
+                and isinstance(error.detail, HostSessionEventDeliveryDetail)
+                and error.detail.reason is HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW
+            ):
+                runtime_state.try_commit(
+                    _DeliveryInterrupted(
+                        target_generation=target_generation,
+                        error=error,
+                    ),
+                    target_run_id=target_run_id,
+                )
+            else:
+                runtime_state.try_commit(
+                    _IteratorFailed(
+                        target_generation=target_generation,
+                        error=error,
+                    ),
+                    target_run_id=target_run_id,
+                )
+            return
+        except Exception as error:
+            runtime_state.try_commit(
+                _IteratorFailed(
+                    target_generation=target_generation,
+                    error=error,
+                ),
+                target_run_id=target_run_id,
+            )
+            return
+        try:
+            result = await _observation_result_from_event(
+                event,
+                target_generation=target_generation,
+                target_run_id=target_run_id,
+                state=observation_state,
+                on_activity=on_activity,
+                on_thinking=on_thinking,
+                callback_execution_port=callback_execution_port,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            runtime_state.try_commit(
+                _IteratorFailed(
+                    target_generation=target_generation,
+                    error=error,
+                ),
+                target_run_id=target_run_id,
+            )
+            return
+        if result is None:
+            continue
+        committed = runtime_state.try_commit(
+            result,
+            target_run_id=target_run_id,
+        )
+        if not committed:
+            return
+        if isinstance(result, _TargetTerminal):
+            await runtime_state.wait_for_rebind_or_stop(target_generation)
+            continue
+        return
+
+
+async def _observation_result_from_event(
+    event: HostSessionEvent,
+    *,
+    target_generation: int,
+    target_run_id: str,
+    state: _TerminalObservationState,
+    on_activity: EntrypointActivityCallback | None,
+    on_thinking: EntrypointThinkingCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
+) -> _ServiceObservationResult | None:
+    """在 consumer 调用栈内投影单个 Host event。
+
+    :param event: 当前唯一 ``anext`` 返回的 public event。
+    :param target_generation: 当前 target generation。
+    :param target_run_id: 当前 target Run id。
+    :param state: terminal/activity/thinking identity 状态。
+    :param on_activity: 可选 activity callback。
+    :param on_thinking: 可选 thinking callback。
+    :param callback_execution_port: callback 的异步执行端口。
+    :returns: exact-five member；普通/无关 event 返回 ``None``。
+    :raises asyncio.CancelledError: consumer cleanup 取消时透传。
+    """
+
+    if isinstance(event, HostEvent):
+        terminal = _terminal_result_from_live_event(
+            event,
+            run_id=target_run_id,
             state=state,
-            run_id=run_id,
+        )
+        if terminal is not None:
+            return _TargetTerminal(
+                target_generation=target_generation,
+                result=terminal,
+            )
+        activity = _activity_from_live_event(
+            event=event,
+            state=state,
+            run_id=target_run_id,
             on_activity=on_activity,
+        )
+        if activity is None or on_activity is None:
+            return None
+        if callback_execution_port is None:
+            raise RuntimeError("activity callback execution port missing")
+        try:
+            await _invoke_activity_callback(
+                callback_execution_port,
+                on_activity,
+                activity,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return _CallbackFailed(
+                target_generation=target_generation,
+                callback_kind=_CallbackKind.ACTIVITY,
+                error=error,
+            )
+        return None
+    if isinstance(event, HostTransientDelta):
+        thinking = _thinking_from_live_event(
+            event=event,
+            state=state,
+            run_id=target_run_id,
             on_thinking=on_thinking,
         )
-        if live_terminal is not None:
-            return live_terminal
-        run_snapshot = await host.get_run(run_id)
-        if is_terminal_run_status(
-            run_snapshot.status
-        ) and _should_read_outbox_terminal(
-            state=state,
-            allow_outbox_terminal_fallback=allow_outbox_terminal_fallback,
-        ):
-            outbox_terminal = await _read_outbox_terminal(
-                host,
-                session_id=session_id,
-                run_id=run_id,
-                state=state,
-            )
-            if outbox_terminal is not None:
-                return outbox_terminal
-        await sleep(poll_interval_seconds)
-
-
-def _should_read_outbox_terminal(
-    *,
-    state: _TerminalObservationState,
-    allow_outbox_terminal_fallback: bool,
-) -> bool:
-    """判断当前等待路径是否允许读取 Outbox terminal。
-
-    :param state: 本轮本地观察状态。
-    :param allow_outbox_terminal_fallback: 调用路径是否显式允许 Outbox 补读。
-    :returns: 允许读取 Outbox terminal 时返回 ``True``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return allow_outbox_terminal_fallback or state.watcher_failure_message is not None
-
-
-def _drain_available_watcher_items(
-    *,
-    queue: asyncio.Queue[_WatcherQueueItem],
-    state: _TerminalObservationState,
-    run_id: str,
-    on_activity: EntrypointActivityCallback | None = None,
-    on_thinking: EntrypointThinkingCallback | None = None,
-) -> EntrypointRunTerminalResult | None:
-    """消费当前 queue 中已到达的 watcher item。
-
-    :param queue: watcher drain queue。
-    :param state: 本轮本地观察状态。
-    :param run_id: 目标 Run id。
-    :param on_activity: 可选 activity 回调。
-    :param on_thinking: 可选 thinking 回调。
-    :returns: 命中的 terminal result；没有命中时返回 ``None``。
-    :raises Exception: ``on_activity`` callback 抛出的异常会向调用方透传。
-    """
-
-    while True:
-        try:
-            item = queue.get_nowait()
-        except asyncio.QueueEmpty:
+        if thinking is None or on_thinking is None:
             return None
-        if isinstance(item, _WatcherFailure):
-            _record_watcher_failure(state=state, error=item.error)
-            _emit_watcher_failure_activity(
-                state=state,
-                error=item.error,
-                on_activity=on_activity,
+        if callback_execution_port is None:
+            raise RuntimeError("thinking callback execution port missing")
+        try:
+            await _invoke_thinking_callback(
+                callback_execution_port,
+                on_thinking,
+                thinking,
             )
-            continue
-        if isinstance(item, HostEvent):
-            terminal = _terminal_result_from_live_event(
-                item,
-                run_id=run_id,
-                state=state,
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return _CallbackFailed(
+                target_generation=target_generation,
+                callback_kind=_CallbackKind.THINKING,
+                error=error,
             )
-            if terminal is not None:
-                return terminal
-            _emit_entrypoint_activity_from_host_event(
-                event=item,
-                state=state,
-                run_id=run_id,
-                on_activity=on_activity,
-            )
-            continue
-        if isinstance(item, HostTransientDelta):
-            _emit_entrypoint_thinking_from_transient_delta(
-                event=item,
-                state=state,
-                run_id=run_id,
-                on_thinking=on_thinking,
-            )
-            continue
-        assert_never(item)
+        return None
+    assert_never(event)
 
 
-def _emit_entrypoint_activity_from_host_event(
+def _activity_from_live_event(
     *,
     event: HostEvent,
     state: _TerminalObservationState,
     run_id: str,
     on_activity: EntrypointActivityCallback | None,
-) -> None:
-    """把非终态 Host public activity 投影给 Service activity callback。
+) -> EntrypointActivity | None:
+    """选择并投影当前 target 的未重复 activity。
 
     :param event: Host public event。
-    :param state: 本轮本地观察状态。
-    :param run_id: 当前等待的目标 Run id。
-    :param on_activity: 可选 activity 回调。
-    :returns: ``None``。
-    :raises Exception: callback 抛出的异常会向调用方透传。
+    :param state: activity identity 状态。
+    :param run_id: 当前 target Run id。
+    :param on_activity: 可选 activity callback。
+    :returns: 待调用 DTO；不应调用 callback 时返回 ``None``。
+    :raises ValueError: Host activity payload 不完整时抛出。
     """
 
     if on_activity is None or event.terminal_status is not None or event.activity is None:
-        return
+        return None
     if event.run_id != run_id:
-        return
+        return None
     if event.dedupe_key in state.seen_activity_dedupe_keys:
-        return
+        return None
     state.seen_activity_dedupe_keys.add(event.dedupe_key)
-    on_activity(_entrypoint_activity_from_host_event(event))
+    return _entrypoint_activity_from_host_event(event)
+
+
+def _thinking_from_live_event(
+    *,
+    event: HostTransientDelta,
+    state: _TerminalObservationState,
+    run_id: str,
+    on_thinking: EntrypointThinkingCallback | None,
+) -> EntrypointThinking | None:
+    """选择并投影当前 target 的未重复 reasoning delta。
+
+    :param event: Host public transient delta。
+    :param state: thinking identity 状态。
+    :param run_id: 当前 target Run id。
+    :param on_thinking: 可选 thinking callback。
+    :returns: 待调用 DTO；不应调用 callback 时返回 ``None``。
+    :raises AssertionError: Host transient union 出现未知成员时抛出。
+    """
+
+    if on_thinking is None or event.run_id != run_id:
+        return None
+    data = event.data
+    if isinstance(data, HostContentDelta | HostToolCallDelta):
+        return None
+    if not isinstance(data, HostReasoningDelta):
+        assert_never(data)
+    if event.dedupe_key in state.seen_thinking_dedupe_keys:
+        return None
+    state.seen_thinking_dedupe_keys.add(event.dedupe_key)
+    return _entrypoint_thinking_from_transient_delta(event, data)
+
+
+async def _invoke_activity_callback(
+    execution_port: EntrypointCallbackExecutionPort,
+    callback: EntrypointActivityCallback,
+    activity: EntrypointActivity,
+) -> None:
+    """shield 并等待当前 activity callback job 完整收口。
+
+    :param execution_port: UI-owned callback 执行端口。
+    :param callback: 同步 activity callback。
+    :param activity: Service activity DTO。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: consumer 被取消且 job 已真实结束后透传。
+    :raises Exception: callback 或调度失败时透传原异常。
+    """
+
+    job = asyncio.create_task(execution_port.invoke_activity(callback, activity))
+    await _await_shielded_callback_job(job)
+
+
+async def _invoke_thinking_callback(
+    execution_port: EntrypointCallbackExecutionPort,
+    callback: EntrypointThinkingCallback,
+    thinking: EntrypointThinking,
+) -> None:
+    """shield 并等待当前 thinking callback job 完整收口。
+
+    :param execution_port: UI-owned callback 执行端口。
+    :param callback: 同步 thinking callback。
+    :param thinking: Service thinking DTO。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: consumer 被取消且 job 已真实结束后透传。
+    :raises Exception: callback 或调度失败时透传原异常。
+    """
+
+    job = asyncio.create_task(execution_port.invoke_thinking(callback, thinking))
+    await _await_shielded_callback_job(job)
+
+
+async def _await_shielded_callback_job(job: asyncio.Task[None]) -> None:
+    """在 consumer cancellation 下仍等待已创建 callback job。
+
+    :param job: 当前唯一 submitted/in-flight callback job。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: caller cancellation 在 job 收口后透传。
+    :raises Exception: callback job 失败时透传原异常。
+    """
+
+    try:
+        await asyncio.shield(job)
+    except asyncio.CancelledError:
+        while not job.done():
+            try:
+                await asyncio.shield(job)
+            except asyncio.CancelledError:
+                continue
+        try:
+            await job
+        except Exception:
+            pass
+        raise
+
+
+async def _wait_for_single_target_result(
+    runtime: _WatchAndWaitRuntime,
+    *,
+    host: Host,
+    session_id: str,
+    run_id: str,
+    state: _TerminalObservationState,
+    on_activity: EntrypointActivityCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
+    poll_interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]],
+) -> EntrypointRunTerminalResult:
+    """等待单目标 slot 并执行唯一 exact-five disposition。
+
+    :param runtime: 当前 watcher runtime。
+    :param host: Host public handle。
+    :param session_id: 目标 Session id。
+    :param run_id: 唯一目标 Run id。
+    :param state: durable/live identity 状态。
+    :param on_activity: 可选 cleanup diagnostic callback。
+    :param callback_execution_port: callback 的异步执行端口。
+    :param poll_interval_seconds: durable recovery 轮询间隔。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: terminal result。
+    :raises BaseException: exact disposition 或 caller cancellation 原样传播。
+    """
+
+    try:
+        result = await runtime.state.wait_for_result()
+    except asyncio.CancelledError as error:
+        cleanup_error = await _close_watch_and_wait_runtime(runtime)
+        _raise_primary_with_cleanup(error, cleanup_error)
+    return await _finish_observation_result(
+        result,
+        runtime=runtime,
+        host=host,
+        session_id=session_id,
+        run_id=run_id,
+        state=state,
+        on_activity=on_activity,
+        callback_execution_port=callback_execution_port,
+        poll_interval_seconds=poll_interval_seconds,
+        sleep=sleep,
+    )
+
+
+async def _finish_observation_result(
+    result: _ServiceObservationResult,
+    *,
+    runtime: _WatchAndWaitRuntime,
+    host: Host,
+    session_id: str,
+    run_id: str,
+    state: _TerminalObservationState,
+    on_activity: EntrypointActivityCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
+    poll_interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]],
+) -> EntrypointRunTerminalResult:
+    """cleanup watcher 后执行一个 exact-five member 的 caller disposition。
+
+    :param result: first-committed exact-five member。
+    :param runtime: 当前 watcher runtime。
+    :param host: Host public handle。
+    :param session_id: 目标 Session id。
+    :param run_id: 目标 Run id。
+    :param state: durable/live identity 状态。
+    :param on_activity: 可选 cleanup diagnostic callback。
+    :param callback_execution_port: callback 的异步执行端口。
+    :param poll_interval_seconds: durable recovery 轮询间隔。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: live terminal 或 delivery recovery terminal。
+    :raises BaseException: member 对应的唯一失败 disposition。
+    """
+
+    cleanup_error = await _close_watch_and_wait_runtime(runtime)
+    if isinstance(result, _TargetTerminal):
+        if cleanup_error is not None:
+            await _emit_cleanup_diagnostic(
+                on_activity=on_activity,
+                callback_execution_port=callback_execution_port,
+            )
+        return result.result
+    if isinstance(result, _DeliveryInterrupted):
+        try:
+            recovered = await _wait_for_durable_terminal(
+                host,
+                session_id=session_id,
+                run_id=run_id,
+                state=state,
+                poll_interval_seconds=poll_interval_seconds,
+                sleep=sleep,
+            )
+        except BaseException as recovery_error:
+            _raise_delivery_recovery_failure(
+                recovery_error,
+                delivery_error=result.error,
+                cleanup_error=cleanup_error,
+            )
+        if cleanup_error is not None:
+            await _emit_cleanup_diagnostic(
+                on_activity=on_activity,
+                callback_execution_port=callback_execution_port,
+            )
+        return recovered
+    _raise_observation_failure(result, cleanup_error=cleanup_error)
+
+
+def _raise_observation_failure(
+    result: _ServiceObservationResult,
+    *,
+    cleanup_error: BaseException | None,
+) -> Never:
+    """按 exact-five 表抛出非成功 member，并保留 cleanup chain。
+
+    :param result: first-committed exact-five member。
+    :param cleanup_error: watcher ``aclose`` failure；无失败时为 ``None``。
+    :returns: 本函数不返回。
+    :raises BaseException: member 对应的唯一 caller failure。
+    """
+
+    if isinstance(result, _IteratorEnded):
+        _raise_primary_with_cleanup(
+            EntrypointRuntimeError("session_event_iterator_ended_before_terminal"),
+            cleanup_error,
+        )
+    if isinstance(result, _CallbackFailed):
+        _raise_primary_with_cleanup(result.error, cleanup_error)
+    if isinstance(result, _IteratorFailed):
+        if isinstance(result.error, HostApiError | HostClosedError):
+            _raise_primary_with_cleanup(result.error, cleanup_error)
+        _raise_wrapped_iterator_failure(result.error, cleanup_error=cleanup_error)
+    if isinstance(result, _DeliveryInterrupted):
+        raise RuntimeError("delivery interruption requires durable disposition")
+    if isinstance(result, _TargetTerminal):
+        raise RuntimeError("target terminal requires success disposition")
+    assert_never(result)
+
+
+def _raise_wrapped_iterator_failure(
+    original_error: Exception,
+    *,
+    cleanup_error: BaseException | None,
+) -> Never:
+    """抛出 non-public iterator failure 的固定 wrapper/chain。
+
+    :param original_error: iterator 原始异常。
+    :param cleanup_error: watcher cleanup 异常；无失败时为 ``None``。
+    :returns: 本函数不返回。
+    :raises EntrypointRuntimeError: 始终抛出固定 stable reason。
+    """
+
+    wrapper = EntrypointRuntimeError("session_event_iterator_failed_before_terminal")
+    if cleanup_error is None:
+        raise wrapper from original_error
+    try:
+        raise original_error from cleanup_error
+    except Exception as chained_original:
+        raise wrapper from chained_original
+
+
+def _raise_delivery_recovery_failure(
+    recovery_error: BaseException,
+    *,
+    delivery_error: HostApiError,
+    cleanup_error: BaseException | None,
+) -> Never:
+    """抛出 recovery -> delivery -> optional cleanup 固定异常链。
+
+    :param recovery_error: durable recovery 原始失败。
+    :param delivery_error: first-committed typed delivery error。
+    :param cleanup_error: watcher cleanup 失败；无失败时为 ``None``。
+    :returns: 本函数不返回。
+    :raises BaseException: recovery error 保持 top-level 原样抛出。
+    """
+
+    if cleanup_error is None:
+        raise recovery_error from delivery_error
+    try:
+        raise delivery_error from cleanup_error
+    except HostApiError as chained_delivery:
+        raise recovery_error from chained_delivery
+
+
+def _raise_primary_with_cleanup(
+    primary_error: BaseException,
+    cleanup_error: BaseException | None,
+) -> Never:
+    """保持 caller primary identity，并把 cleanup error 设为直接 cause。
+
+    :param primary_error: caller-visible primary。
+    :param cleanup_error: cleanup failure；无失败时为 ``None``。
+    :returns: 本函数不返回。
+    :raises BaseException: 原样抛出 ``primary_error``。
+    """
+
+    if cleanup_error is None:
+        raise primary_error
+    raise primary_error from cleanup_error
+
+
+def _raise_cleanup_failure(cleanup_error: BaseException) -> Never:
+    """投影 slot-empty cleanup failure 的唯一 stable disposition。
+
+    :param cleanup_error: watcher ``aclose`` 原始失败。
+    :returns: 本函数不返回。
+    :raises HostApiError: public Host cleanup error 原样抛出。
+    :raises HostClosedError: public Host closed error 原样抛出。
+    :raises EntrypointRuntimeError: 非 public cleanup error 使用固定 wrapper。
+    """
+
+    if isinstance(cleanup_error, HostApiError | HostClosedError):
+        raise cleanup_error
+    raise EntrypointRuntimeError("session_event_iterator_cleanup_failed") from cleanup_error
+
+
+async def _close_watch_and_wait_runtime(
+    runtime: _WatchAndWaitRuntime,
+) -> BaseException | None:
+    """停止并 await sole consumer 后恰好一次关闭 public iterator。
+
+    :param runtime: 待关闭的 watcher runtime。
+    :returns: iterator cleanup failure；成功或已经关闭时返回 ``None``。
+    :raises Exception: consumer invariant 失败时透传实现错误。
+    """
+
+    if runtime.closed:
+        return None
+    runtime.closed = True
+    runtime.state.request_stop()
+    if not runtime.consumer_task.done():
+        runtime.consumer_task.cancel()
+    try:
+        await runtime.consumer_task
+    except asyncio.CancelledError:
+        pass
+    cleanup_error: BaseException | None = None
+    try:
+        await runtime.watcher.aclose()
+    except BaseException as error:
+        cleanup_error = error
+    finally:
+        runtime.state.mark_closed()
+    return cleanup_error
+
+
+async def _wait_for_durable_terminal(
+    host: Host,
+    *,
+    session_id: str,
+    run_id: str,
+    state: _TerminalObservationState,
+    poll_interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]],
+) -> EntrypointRunTerminalResult:
+    """只用 ``get_run`` / Outbox 等待 durable terminal projection。
+
+    :param host: Host public handle。
+    :param session_id: 目标 Session id。
+    :param run_id: 目标 Run id。
+    :param state: durable/live identity 与 cursor 状态。
+    :param poll_interval_seconds: public read 轮询间隔。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: Outbox terminal result。
+    :raises EntrypointRuntimeError: projection 失败或 caught-up 缺 target 时抛出。
+    :raises HostApiError: public durable read 失败时原样透传。
+    """
+
+    while True:
+        run_snapshot = await host.get_run(run_id)
+        if is_terminal_run_status(run_snapshot.status):
+            terminal = await _read_outbox_terminal(
+                host,
+                session_id=session_id,
+                run_id=run_id,
+                state=state,
+            )
+            if terminal is not None:
+                return terminal
+        await sleep(poll_interval_seconds)
+
+
+async def _emit_cleanup_diagnostic(
+    *,
+    on_activity: EntrypointActivityCallback | None,
+    callback_execution_port: EntrypointCallbackExecutionPort | None,
+) -> None:
+    """best-effort 输出一次固定去敏 watcher cleanup diagnostic。
+
+    :param on_activity: 可选 activity callback。
+    :param callback_execution_port: callback 的 UI-owned 执行端口。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: caller cancellation 透传。
+    """
+
+    if on_activity is None or callback_execution_port is None:
+        return
+    diagnostic = EntrypointActivity(
+        kind=EntrypointActivityKind.WATCHER_DIAGNOSTIC,
+        status=EntrypointActivityStatus.FAILED,
+        run_id=None,
+        event_sequence=None,
+        dedupe_key=_WATCHER_CLEANUP_ACTIVITY_DEDUPE_KEY,
+        title=_WATCHER_CLEANUP_ACTIVITY_TITLE,
+        summary=_WATCHER_CLEANUP_ACTIVITY_SUMMARY,
+        severity=EntrypointActivitySeverity.WARNING,
+        tool_name=None,
+        tool_display_name=None,
+        counts=None,
+    )
+    try:
+        await _invoke_activity_callback(
+            callback_execution_port,
+            on_activity,
+            diagnostic,
+        )
+    except Exception:
+        return
 
 
 def _entrypoint_activity_from_host_event(event: HostEvent) -> EntrypointActivity:
@@ -1263,38 +1959,6 @@ def _entrypoint_activity_from_host_event(event: HostEvent) -> EntrypointActivity
         tool_display_name=activity.tool_display_name,
         counts=_entrypoint_activity_counts_from_host(activity.counts),
     )
-
-
-def _emit_entrypoint_thinking_from_transient_delta(
-    *,
-    event: HostTransientDelta,
-    state: _TerminalObservationState,
-    run_id: str,
-    on_thinking: EntrypointThinkingCallback | None,
-) -> None:
-    """只把 Host reasoning delta 投影给 Service thinking callback。
-
-    :param event: Host public 瞬态增量。
-    :param state: 本轮本地观察状态。
-    :param run_id: 当前等待的目标 Run id。
-    :param on_thinking: 可选 thinking 回调。
-    :returns: ``None``。
-    :raises Exception: callback 抛出的异常会向调用方透传。
-    """
-
-    if on_thinking is None or event.run_id != run_id:
-        return
-    data = event.data
-    if isinstance(data, HostContentDelta):
-        return
-    if isinstance(data, HostToolCallDelta):
-        return
-    if not isinstance(data, HostReasoningDelta):
-        assert_never(data)
-    if event.dedupe_key in state.seen_thinking_dedupe_keys:
-        return
-    state.seen_thinking_dedupe_keys.add(event.dedupe_key)
-    on_thinking(_entrypoint_thinking_from_transient_delta(event, data))
 
 
 def _entrypoint_thinking_from_transient_delta(
@@ -1411,62 +2075,6 @@ def _entrypoint_activity_counts_from_host(
     )
 
 
-def _emit_watcher_failure_activity(
-    *,
-    state: _TerminalObservationState,
-    error: Exception,
-    on_activity: EntrypointActivityCallback | None,
-) -> None:
-    """把 watcher failure 转为有界本地诊断 activity。
-
-    :param state: 本轮本地观察状态。
-    :param error: watcher drain 捕获的异常。
-    :param on_activity: 可选 activity 回调。
-    :returns: ``None``。
-    :raises Exception: callback 抛出的异常会向调用方透传。
-    """
-
-    if on_activity is None:
-        return
-    if _WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY in state.seen_activity_dedupe_keys:
-        return
-    state.seen_activity_dedupe_keys.add(_WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY)
-    on_activity(
-        EntrypointActivity(
-            kind=EntrypointActivityKind.WATCHER_DIAGNOSTIC,
-            status=EntrypointActivityStatus.INFO,
-            run_id=None,
-            event_sequence=None,
-            dedupe_key=_WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY,
-            title=_WATCHER_FAILURE_ACTIVITY_TITLE,
-            summary=_bounded_watcher_failure_activity_summary(error),
-            severity=EntrypointActivitySeverity.WARNING,
-            tool_name=None,
-            tool_display_name=None,
-            counts=None,
-        )
-    )
-
-
-def _bounded_watcher_failure_activity_summary(error: Exception) -> str:
-    """生成有界 watcher failure activity 摘要。
-
-    :param error: watcher drain 捕获的异常。
-    :returns: 有界诊断摘要。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    message = str(error)
-    error_type = type(error).__name__
-    if message:
-        summary = f"{error_type}: {message}"
-    else:
-        summary = error_type
-    if len(summary) <= _WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT:
-        return summary
-    return summary[: _WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT - 3] + "..."
-
-
 def _terminal_result_from_live_event(
     event: HostEvent,
     *,
@@ -1488,8 +2096,7 @@ def _terminal_result_from_live_event(
     )
     if event.terminal_status is None:
         return None
-    duplicate = event.event_id in state.seen_event_ids or event.dedupe_key in state.seen_dedupe_keys
-    state.seen_event_ids.add(event.event_id)
+    duplicate = event.event_id in state.seen_terminal_event_ids or event.dedupe_key in state.seen_dedupe_keys
     state.seen_terminal_event_ids.add(event.event_id)
     if duplicate:
         return None
@@ -1507,27 +2114,8 @@ def _terminal_result_from_live_event(
         final_answer=event.final_answer,
         error_message=event.error_message,
         cancel_reason=event.cancel_reason,
-        watcher_failure_message=state.watcher_failure_message,
+        watcher_failure_message=None,
     )
-
-
-def _record_watcher_failure(*, state: _TerminalObservationState, error: Exception) -> None:
-    """记录 watcher drain 失败的首个可诊断消息。
-
-    :param state: 本轮本地观察状态。
-    :param error: watcher drain 捕获的异常。
-    :returns: ``None``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if state.watcher_failure_message is not None:
-        return
-    message = str(error)
-    error_type = type(error).__name__
-    if message:
-        state.watcher_failure_message = f"{_WATCHER_FAILURE_DIAGNOSTIC_PREFIX}: {error_type}: {message}"
-    else:
-        state.watcher_failure_message = f"{_WATCHER_FAILURE_DIAGNOSTIC_PREFIX}: {error_type}"
 
 
 async def _read_session_outbox_terminal_backfill(
@@ -1555,9 +2143,7 @@ async def _read_session_outbox_terminal_backfill(
     results: list[EntrypointRunTerminalResult] = []
     while True:
         if state.outbox_cursor is None:
-            state.outbox_cursor = OutboxTerminalCursor(
-                event_sequence=state.last_observed_event_sequence
-            )
+            state.outbox_cursor = OutboxTerminalCursor(event_sequence=state.last_observed_event_sequence)
         batch = await host.read_outbox_terminal_items(
             session_id,
             ReadOutboxTerminalItemsRequest(
@@ -1568,14 +2154,9 @@ async def _read_session_outbox_terminal_backfill(
         )
         if batch.projection_status is OutboxProjectionStatus.FAILED:
             raise EntrypointRuntimeError(
-                _observation_error_message(
-                    state=state,
-                    message=(
-                        "outbox terminal projection failed during startup: "
-                        f"{batch.projection_error_code}: "
-                        f"{batch.projection_error_message}"
-                    ),
-                )
+                "outbox terminal projection failed during startup: "
+                f"{batch.projection_error_code}: "
+                f"{batch.projection_error_message}"
             )
         results.extend(
             _scan_session_outbox_terminal_items(
@@ -1590,13 +2171,8 @@ async def _read_session_outbox_terminal_backfill(
             return tuple(results)
         if lagged_attempts >= outbox_lagged_max_attempts:
             raise EntrypointRuntimeError(
-                _observation_error_message(
-                    state=state,
-                    message=(
-                        "outbox terminal projection lagged during startup: "
-                        f"session_id={session_id}, attempts={lagged_attempts}"
-                    ),
-                )
+                "outbox terminal projection lagged during startup: "
+                f"session_id={session_id}, attempts={lagged_attempts}"
             )
         lagged_attempts += 1
         await sleep(poll_interval_seconds)
@@ -1627,85 +2203,8 @@ def _scan_session_outbox_terminal_items(
         if duplicate:
             continue
         state.seen_dedupe_keys.add(item.dedupe_key)
-        results.append(
-            _terminal_result_from_outbox_item(
-                item,
-                watcher_failure_message=state.watcher_failure_message,
-            )
-        )
+        results.append(_terminal_result_from_outbox_item(item))
     return tuple(results)
-
-
-def _drain_available_startup_terminal_items(
-    *,
-    queue: asyncio.Queue[_WatcherQueueItem],
-    state: _TerminalObservationState,
-) -> tuple[EntrypointRunTerminalResult, ...]:
-    """消费 startup watcher queue 中已到达的 terminal events。
-
-    :param queue: watcher drain queue。
-    :param state: 本轮本地观察状态。
-    :returns: 未重复的 terminal 结果。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    results: list[EntrypointRunTerminalResult] = []
-    while True:
-        try:
-            item = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return tuple(results)
-        if isinstance(item, _WatcherFailure):
-            _record_watcher_failure(state=state, error=item.error)
-            continue
-        if isinstance(item, HostEvent):
-            terminal = _startup_terminal_result_from_live_event(item, state=state)
-            if terminal is not None:
-                results.append(terminal)
-            continue
-        if isinstance(item, HostTransientDelta):
-            continue
-        assert_never(item)
-
-
-def _startup_terminal_result_from_live_event(
-    event: HostEvent,
-    *,
-    state: _TerminalObservationState,
-) -> EntrypointRunTerminalResult | None:
-    """把 startup live HostEvent 转为 session-scoped terminal result。
-
-    :param event: Host public event。
-    :param state: 本轮本地观察状态。
-    :returns: 未重复 terminal result；非 terminal 或重复时返回 ``None``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    state.last_observed_event_sequence = max(
-        state.last_observed_event_sequence,
-        event.event_sequence,
-    )
-    if event.terminal_status is None or event.run_id is None:
-        return None
-    duplicate = event.event_id in state.seen_terminal_event_ids or event.dedupe_key in state.seen_dedupe_keys
-    state.seen_event_ids.add(event.event_id)
-    state.seen_terminal_event_ids.add(event.event_id)
-    if duplicate:
-        return None
-    state.seen_dedupe_keys.add(event.dedupe_key)
-    return EntrypointRunTerminalResult(
-        source=EntrypointTerminalSource.LIVE_EVENT,
-        session_id=event.session_id,
-        run_id=event.run_id,
-        terminal_event_id=event.event_id,
-        event_sequence=event.event_sequence,
-        terminal_status=event.terminal_status,
-        dedupe_key=event.dedupe_key,
-        final_answer=event.final_answer,
-        error_message=event.error_message,
-        cancel_reason=event.cancel_reason,
-        watcher_failure_message=state.watcher_failure_message,
-    )
 
 
 async def _read_outbox_terminal(
@@ -1739,14 +2238,9 @@ async def _read_outbox_terminal(
         )
         if batch.projection_status is OutboxProjectionStatus.FAILED:
             raise EntrypointRuntimeError(
-                _observation_error_message(
-                    state=state,
-                    message=(
-                        "outbox terminal projection failed: "
-                        f"{batch.projection_error_code}: "
-                        f"{batch.projection_error_message}"
-                    ),
-                )
+                "outbox terminal projection failed: "
+                f"{batch.projection_error_code}: "
+                f"{batch.projection_error_message}"
             )
         terminal = _scan_outbox_terminal_items(
             items=batch.items,
@@ -1760,13 +2254,8 @@ async def _read_outbox_terminal(
             continue
         if batch.projection_status is OutboxProjectionStatus.CAUGHT_UP:
             raise EntrypointRuntimeError(
-                _observation_error_message(
-                    state=state,
-                    message=(
-                        "outbox terminal caught up without matching terminal item: "
-                        f"run_id={run_id}, cursor={batch.scanned_watermark.event_sequence}"
-                    ),
-                )
+                "outbox terminal caught up without matching terminal item: "
+                f"run_id={run_id}, cursor={batch.scanned_watermark.event_sequence}"
             )
         return None
 
@@ -1791,28 +2280,22 @@ def _scan_outbox_terminal_items(
             state.last_observed_event_sequence,
             item.event_sequence,
         )
-        duplicate = item.dedupe_key in state.seen_dedupe_keys
+        duplicate = item.terminal_event_id in state.seen_terminal_event_ids or item.dedupe_key in state.seen_dedupe_keys
         state.seen_terminal_event_ids.add(item.terminal_event_id)
         if duplicate:
             continue
         state.seen_dedupe_keys.add(item.dedupe_key)
         if item.run_id == run_id:
-            return _terminal_result_from_outbox_item(
-                item,
-                watcher_failure_message=state.watcher_failure_message,
-            )
+            return _terminal_result_from_outbox_item(item)
     return None
 
 
 def _terminal_result_from_outbox_item(
     item: OutboxTerminalItem,
-    *,
-    watcher_failure_message: str | None,
 ) -> EntrypointRunTerminalResult:
     """把 outbox terminal item 转为 entrypoint terminal result。
 
     :param item: Host public outbox terminal item。
-    :param watcher_failure_message: watcher drain 失败诊断消息。
     :returns: entrypoint terminal result。
     :raises Exception: 不主动抛出异常。
     """
@@ -1828,22 +2311,8 @@ def _terminal_result_from_outbox_item(
         final_answer=item.final_answer,
         error_message=item.error_message,
         cancel_reason=item.cancel_reason,
-        watcher_failure_message=watcher_failure_message,
+        watcher_failure_message=None,
     )
-
-
-def _observation_error_message(*, state: _TerminalObservationState, message: str) -> str:
-    """把 watcher failure 诊断附加到 terminal observation 错误消息。
-
-    :param state: 本轮本地观察状态。
-    :param message: 原始错误消息。
-    :returns: 可能包含 watcher failure 诊断的错误消息。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if state.watcher_failure_message is None:
-        return message
-    return f"{message}; {state.watcher_failure_message}"
 
 
 def _new_terminal_observation_state(
@@ -1863,13 +2332,11 @@ def _new_terminal_observation_state(
     initial_sequence = 0 if terminal_cursor is None else terminal_cursor.event_sequence
     return _TerminalObservationState(
         last_observed_event_sequence=initial_sequence,
-        seen_event_ids=set(),
         seen_terminal_event_ids=set(seen_terminal_event_ids),
         seen_dedupe_keys=set(),
         seen_activity_dedupe_keys=set(),
         seen_thinking_dedupe_keys=set(),
         outbox_cursor=terminal_cursor,
-        watcher_failure_message=None,
     )
 
 

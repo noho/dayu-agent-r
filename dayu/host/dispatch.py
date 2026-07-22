@@ -30,6 +30,7 @@ from dayu.engine.contracts.engine_events import (
     runner_role_sequence_digest,
 )
 from dayu.host.admission import (
+    AdmissionWakeupPort,
     PendingDispatchRecord,
     create_host_admission_service,
 )
@@ -70,6 +71,7 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     active_cancel_watchdog_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
+    project_terminal_notice_from_exact_run_event,
     read_cancel_requested_event_from_run_link,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
@@ -117,6 +119,10 @@ from dayu.host.projection import (
     catch_up_projection_best_effort,
 )
 from dayu.host.transient_delta import HostTransientDeltaPublisher
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
     DurableCompactArtifactProvider,
@@ -437,13 +443,13 @@ class _ActiveCancelWatchdogOperationResult:
 
     :param scanned: 本轮扫描到的 ``CANCELLING`` Run 数。
     :param eligible: 本轮满足 accepted-cancel 收口前置条件的 Run 数。
-    :param closed_session_ids: 本轮成功 watchdog closeout 的 Session id。
+    :param terminal_notices: 本轮按 terminal event sequence 排序的通知。
     :param ignored: 本轮跳过的 Run 数。
     """
 
     scanned: int
     eligible: int
-    closed_session_ids: tuple[str, ...]
+    terminal_notices: tuple[TerminalPostCommitNotice, ...]
     ignored: int
 
 
@@ -523,6 +529,33 @@ class NoActiveWorkerCancelPort:
         return False
 
 
+class _TerminalPostCommitPortFactory(Protocol):
+    """scheduler 构造期创建 terminal post-commit port 的内部工厂。"""
+
+    def create_terminal_post_commit_port(
+        self,
+        *,
+        promotion_port: AdmissionWakeupPort,
+    ) -> TerminalPostCommitPort:
+        """以稳定 ordinary promotion capability 创建最终端口。
+
+        :param promotion_port: 已构造但尚未启动的 scheduler promotion capability。
+        :returns: 本 opener 唯一 terminal post-commit port。
+        :raises Exception: coordinator 或 port 构造失败时透传。
+        """
+
+        ...
+
+    async def close_after_failed_scheduler_open(self) -> None:
+        """清理 scheduler 构造失败前已创建的 coordinator 资源。
+
+        :returns: ``None``。
+        :raises Exception: coordinator 清理失败时透传。
+        """
+
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class _GovernanceCompactAccepted:
     """pre-start compact accepted 后待启动摘要。
@@ -588,11 +621,13 @@ class _GovernanceStageResult:
     :param pending_dispatch: 已直接启动时的 pending dispatch。
     :param compact_accepted: compact accepted 但尚未 memory catch-up/start 的摘要。
     :param compact_pending: 已写 request fact、待事务外执行的 compact。
+    :param terminal_notice: attempt-free terminal commit 的精确通知。
     """
 
     pending_dispatch: PendingDispatchRecord | None
     compact_accepted: _GovernanceCompactAccepted | None
     compact_pending: _GovernanceCompactPending | None = None
+    terminal_notice: TerminalPostCommitNotice | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,10 +636,12 @@ class _ProactiveCompactionExecutionResult:
 
     :param compacted_event_sequence: accepted compact event sequence。
     :param pending_dispatch: fallback dispatch 已启动时的 pending dispatch。
+    :param terminal_notice: attempt-free terminal commit 的精确通知。
     """
 
     compacted_event_sequence: int | None
     pending_dispatch: PendingDispatchRecord | None
+    terminal_notice: TerminalPostCommitNotice | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -959,6 +996,7 @@ class HostDispatchScheduler:
         lane_controller: LaneController,
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
+        terminal_post_commit_port: TerminalPostCommitPort,
         host_instance_identity: HostInstanceIdentity | None = None,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
@@ -972,12 +1010,57 @@ class HostDispatchScheduler:
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
         :param transient_delta_publisher: 已验证 Engine delta 的 Host 瞬态发布端口。
+        :param terminal_post_commit_port: terminal commit 后的本地最终通知端口。
         :param host_instance_identity: 当前 scheduler 的 Host instance 身份；
             不传时创建仅供测试直接构造使用的身份。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :param health_gate: execution opener 与 scheduler critical task 共享的 health
             gate；直接测试未传时创建并立即置为 READY。
+        :returns: ``None``。
+        :raises ValueError: ``host_handle_id`` 为空时抛出。
+        """
+
+        self._initialize_inert(
+            transaction_runner=transaction_runner,
+            event_log_store=event_log_store,
+            local_execution=local_execution,
+            lane_controller=lane_controller,
+            host_handle_id=host_handle_id,
+            transient_delta_publisher=transient_delta_publisher,
+            host_instance_identity=host_instance_identity,
+            active_registry=active_registry,
+            projection_catchup_port=projection_catchup_port,
+            health_gate=health_gate,
+        )
+        self._bind_terminal_post_commit_port(terminal_post_commit_port)
+
+    def _initialize_inert(
+        self,
+        *,
+        transaction_runner: HostTransactionRunner,
+        event_log_store: EventLogStore,
+        local_execution: HostLocalExecutionOptions,
+        lane_controller: LaneController,
+        host_handle_id: str,
+        transient_delta_publisher: HostTransientDeltaPublisher,
+        host_instance_identity: HostInstanceIdentity | None,
+        active_registry: ActiveWorkerRegistry | None,
+        projection_catchup_port: ProjectionCatchupPort | None,
+        health_gate: HostExecutionHealthGate | None,
+    ) -> None:
+        """初始化不可运行且未绑定 terminal port 的 scheduler。
+
+        :param transaction_runner: Host durable transaction runner。
+        :param event_log_store: EventLog primitive。
+        :param local_execution: 本地执行配置。
+        :param lane_controller: 已打开的 runtime lane controller。
+        :param host_handle_id: Host handle 诊断 id。
+        :param transient_delta_publisher: Host 瞬态发布端口。
+        :param host_instance_identity: Host instance 身份。
+        :param active_registry: active worker registry。
+        :param projection_catchup_port: projection catch-up 端口。
+        :param health_gate: execution health gate。
         :returns: ``None``。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -997,6 +1080,7 @@ class HostDispatchScheduler:
         )
         self._active_registry = active_registry if active_registry is not None else ActiveWorkerRegistry()
         self._projection_catchup_port = projection_catchup_port
+        self._terminal_post_commit_port: TerminalPostCommitPort | None = None
         if health_gate is None:
             health_gate = HostExecutionHealthGate()
             health_gate.mark_ready()
@@ -1013,6 +1097,47 @@ class HostDispatchScheduler:
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
 
+    def _bind_terminal_post_commit_port(
+        self,
+        terminal_post_commit_port: TerminalPostCommitPort,
+    ) -> None:
+        """构造期一次性绑定 terminal post-commit port。
+
+        :param terminal_post_commit_port: 本 opener 唯一最终端口。
+        :returns: ``None``。
+        :raises RuntimeError: 重复绑定时抛出。
+        """
+
+        if self._terminal_post_commit_port is not None:
+            raise RuntimeError("terminal post-commit port is already bound")
+        self._terminal_post_commit_port = terminal_post_commit_port
+
+    def _notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """向已绑定的最终端口发送 terminal commit 通知。
+
+        :param notice: transaction-local exact terminal 通知。
+        :returns: ``None``。
+        :raises RuntimeError: 构造期尚未绑定时抛出。
+        :raises Exception: 最终端口失败时透传。
+        """
+
+        self._required_terminal_post_commit_port().notify_terminal_post_commit(notice)
+
+    def _required_terminal_post_commit_port(self) -> TerminalPostCommitPort:
+        """返回构造期已绑定的 terminal post-commit port。
+
+        :returns: 本 opener 唯一最终端口。
+        :raises RuntimeError: 构造期尚未绑定时抛出。
+        """
+
+        terminal_post_commit_port = self._terminal_post_commit_port
+        if terminal_post_commit_port is None:
+            raise RuntimeError("terminal post-commit port is not bound")
+        return terminal_post_commit_port
+
     @classmethod
     async def open(
         cls,
@@ -1021,6 +1146,7 @@ class HostDispatchScheduler:
         local_execution: HostLocalExecutionOptions,
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
+        terminal_post_commit_port_factory: _TerminalPostCommitPortFactory,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
         health_gate: HostExecutionHealthGate | None = None,
@@ -1031,12 +1157,15 @@ class HostDispatchScheduler:
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle 诊断 id。
         :param transient_delta_publisher: 已验证 Engine delta 的 Host 瞬态发布端口。
+        :param terminal_post_commit_port_factory: 构造最终 terminal port 的内部工厂。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :param health_gate: execution opener 持有的共享 health gate。
         :returns: 已打开 scheduler。
         """
 
+        if host_handle_id.strip() == "":
+            raise ValueError("host_handle_id must be non-empty")
         host_identity = _new_dispatch_host_instance_identity(host_handle_id)
         lane_controller = await LaneController.open(
             [
@@ -1065,7 +1194,8 @@ class HostDispatchScheduler:
             local_execution.lane_name,
             local_execution.lane_capacity,
         )
-        scheduler = cls(
+        scheduler = cls.__new__(cls)
+        scheduler._initialize_inert(
             transaction_runner=transaction_runner,
             event_log_store=EventLogStore(),
             local_execution=local_execution,
@@ -1077,9 +1207,22 @@ class HostDispatchScheduler:
             projection_catchup_port=projection_catchup_port,
             health_gate=health_gate,
         )
-        scheduler._start_host_instance_heartbeat()
-        scheduler._start_active_cancel_watchdog_loop()
-        return scheduler
+        try:
+            terminal_post_commit_port = (
+                terminal_post_commit_port_factory.create_terminal_post_commit_port(
+                    promotion_port=scheduler,
+                )
+            )
+            scheduler._bind_terminal_post_commit_port(terminal_post_commit_port)
+            scheduler._start_host_instance_heartbeat()
+            scheduler._start_active_cancel_watchdog_loop()
+            return scheduler
+        except BaseException:
+            try:
+                await terminal_post_commit_port_factory.close_after_failed_scheduler_open()
+            finally:
+                await scheduler.close()
+            raise
 
     @property
     def host_instance_id(self) -> str:
@@ -1171,9 +1314,12 @@ class HostDispatchScheduler:
                 self._event_log_store,
             )
             eligible = 0
-            closed_session_ids: list[str] = []
+            terminal_notices: list[TerminalPostCommitNotice] = []
             for candidate in candidates:
                 eligible += 1
+                run_cancelled_event_id = _new_event_id(
+                    _EVENT_ID_RUN_CANCELLED_WATCHDOG_PREFIX
+                )
                 result = active_cancel_watchdog_closeout_in_transaction(
                     transaction,
                     self._event_log_store,
@@ -1183,9 +1329,7 @@ class HostDispatchScheduler:
                         attempt_cancelled_event_id=_new_event_id(
                             _EVENT_ID_ATTEMPT_CANCELLED_WATCHDOG_PREFIX
                         ),
-                        run_cancelled_event_id=_new_event_id(
-                            _EVENT_ID_RUN_CANCELLED_WATCHDOG_PREFIX
-                        ),
+                        run_cancelled_event_id=run_cancelled_event_id,
                         occurred_at=now,
                         actor=_ACTIVE_CANCEL_WATCHDOG_ACTOR,
                         source=_ACTIVE_CANCEL_WATCHDOG_SOURCE,
@@ -1203,25 +1347,40 @@ class HostDispatchScheduler:
                     result.status is StateMutationStatus.UPDATED
                     and result.run is not None
                 ):
-                    closed_session_ids.append(candidate.session_id)
+                    terminal_notices.append(
+                        project_terminal_notice_from_exact_run_event(
+                            result.run,
+                            result.run_event,
+                            wake_queue_promotion=(
+                                result.run_event is not None
+                                and result.run_event.event_id
+                                == run_cancelled_event_id
+                            ),
+                        )
+                    )
                 else:
                     ignored += 1
             return _ActiveCancelWatchdogOperationResult(
                 scanned=scanned,
                 eligible=eligible,
-                closed_session_ids=tuple(closed_session_ids),
+                terminal_notices=tuple(
+                    sorted(
+                        terminal_notices,
+                        key=lambda notice: notice.terminal_event_sequence,
+                    )
+                ),
                 ignored=ignored,
             )
 
         operation_result = self._transaction_runner.run_write(_operation)
-        if operation_result.closed_session_ids:
+        if operation_result.terminal_notices:
+            for notice in operation_result.terminal_notices:
+                self._notify_terminal_post_commit(notice)
             catch_up_projection_best_effort(self._projection_catchup_port)
-            for session_id in operation_result.closed_session_ids:
-                self.wake_queue_promotion(session_id)
         return ActiveCancelWatchdogTickResult(
             scanned=operation_result.scanned,
             eligible=operation_result.eligible,
-            closed=len(operation_result.closed_session_ids),
+            closed=len(operation_result.terminal_notices),
             ignored=operation_result.ignored,
         )
 
@@ -1300,14 +1459,15 @@ class HostDispatchScheduler:
                     run.input_event_id,
                 )
                 return _GovernanceStageResult(
-                    pending_dispatch=self._fail_unstarted_in_transaction(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
                         transaction,
                         run,
                         reason="input_event_missing",
                         error_code="context_governance_input_missing",
                         message="Input event is missing before dispatch",
                     ),
-                    compact_accepted=None,
                 )
             display_text = _display_text_from_input_event(transaction, input_event)
             try:
@@ -1353,14 +1513,17 @@ class HostDispatchScheduler:
                     attempt_count=0,
                     retry_repair_budget_exhausted=False,
                 )
-                self._fail_unstarted_in_transaction(
-                    transaction,
-                    run,
-                    reason=_GOVERNANCE_FAILURE_REASON,
-                    error_code="context_compaction_failed",
-                    message="Context compaction material source failed before dispatch",
+                return _GovernanceStageResult(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="context_compaction_failed",
+                        message="Context compaction material source failed before dispatch",
+                    ),
                 )
-                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
             estimate = estimate_context_budget(
                 policy,
                 BudgetEstimateInput(
@@ -1421,14 +1584,17 @@ class HostDispatchScheduler:
                     attempt_count=0,
                     retry_repair_budget_exhausted=False,
                 )
-                self._fail_unstarted_in_transaction(
-                    transaction,
-                    run,
-                    reason=_GOVERNANCE_FAILURE_REASON,
-                    error_code="context_hard_threshold_before_dispatch",
-                    message="Context estimate exceeds hard threshold before dispatch",
+                return _GovernanceStageResult(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="context_hard_threshold_before_dispatch",
+                        message="Context estimate exceeds hard threshold before dispatch",
+                    ),
                 )
-                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
             try:
                 compact_count = self._committed_proactive_compact_count(transaction, run)
             except Exception:
@@ -1452,14 +1618,15 @@ class HostDispatchScheduler:
                     retry_repair_budget_exhausted=False,
                 )
                 return _GovernanceStageResult(
-                    pending_dispatch=self._fail_unstarted_in_transaction(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
                         transaction,
                         run,
                         reason=_GOVERNANCE_FAILURE_REASON,
                         error_code="proactive_compact_count_unreadable",
                         message="Committed proactive compact facts are unreadable",
                     ),
-                    compact_accepted=None,
                 )
             if compact_count >= policy.max_proactive_compactions_per_run:
                 _LOGGER.error(
@@ -1488,14 +1655,15 @@ class HostDispatchScheduler:
                     retry_repair_budget_exhausted=False,
                 )
                 return _GovernanceStageResult(
-                    pending_dispatch=self._fail_unstarted_in_transaction(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
                         transaction,
                         run,
                         reason=_GOVERNANCE_FAILURE_REASON,
                         error_code="proactive_compact_limit_reached",
                         message="Run already used its proactive compaction budget",
                     ),
-                    compact_accepted=None,
                 )
             prepared = self._prepare_compact_before_dispatch(
                 transaction,
@@ -1507,6 +1675,8 @@ class HostDispatchScheduler:
             return prepared
 
         stage = self._transaction_runner.run_write(_operation)
+        if stage.terminal_notice is not None:
+            self._notify_terminal_post_commit(stage.terminal_notice)
         if stage.compact_pending is None:
             return stage
         compacted = await self._execute_proactive_compaction(stage.compact_pending)
@@ -1689,16 +1859,16 @@ class HostDispatchScheduler:
                         compacted_event_sequence=None,
                         pending_dispatch=fallback_dispatch,
                     )
-                self._fail_unstarted_in_transaction(
-                    transaction,
-                    run,
-                    reason=_GOVERNANCE_FAILURE_REASON,
-                    error_code="context_compaction_failed",
-                    message="Context compaction failed before dispatch",
-                )
                 return _ProactiveCompactionExecutionResult(
                     compacted_event_sequence=None,
                     pending_dispatch=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="context_compaction_failed",
+                        message="Context compaction failed before dispatch",
+                    ),
                 )
             if (
                 accepted_result.accepted_candidate is None
@@ -1732,7 +1902,10 @@ class HostDispatchScheduler:
                 pending_dispatch=None,
             )
 
-        return self._transaction_runner.run_write(_operation)
+        operation_result = self._transaction_runner.run_write(_operation)
+        if operation_result.terminal_notice is not None:
+            self._notify_terminal_post_commit(operation_result.terminal_notice)
+        return operation_result
 
     def _proactive_compaction_recovery_attempts(
         self, pending: _GovernanceCompactPending
@@ -1867,7 +2040,7 @@ class HostDispatchScheduler:
         reason: str,
         error_code: str,
         message: str,
-    ) -> None:
+    ) -> TerminalPostCommitNotice | None:
         """在当前事务内 attempt-free 失败收口 Run。
 
         :param transaction: 当前 Host transaction。
@@ -1875,10 +2048,10 @@ class HostDispatchScheduler:
         :param reason: 失败原因。
         :param error_code: 错误码。
         :param message: 失败消息。
-        :returns: ``None``。
+        :returns: transition 成功时返回不唤醒 promotion 的精确 terminal notice。
         """
 
-        fail_unstarted_run_in_transaction(
+        result = fail_unstarted_run_in_transaction(
             transaction,
             self._event_log_store,
             FailUnstartedRunInput(
@@ -1892,6 +2065,13 @@ class HostDispatchScheduler:
                 error_code=error_code,
                 message=message,
             ),
+        )
+        if result.status is not StateMutationStatus.UPDATED or result.run is None:
+            return None
+        return project_terminal_notice_from_exact_run_event(
+            result.run,
+            result.run_event,
+            wake_queue_promotion=False,
         )
 
     def _committed_proactive_compact_count(self, transaction: HostTransaction, run: RunRow) -> int:
@@ -1981,14 +2161,17 @@ class HostDispatchScheduler:
                     pending_dispatch=fallback_dispatch,
                     compact_accepted=None,
                 )
-            self._fail_unstarted_in_transaction(
-                transaction,
-                run,
-                reason=_GOVERNANCE_FAILURE_REASON,
-                error_code="context_compactor_missing",
-                message="Context compactor or artifact store is not configured",
+            return _GovernanceStageResult(
+                pending_dispatch=None,
+                compact_accepted=None,
+                terminal_notice=self._fail_unstarted_in_transaction(
+                    transaction,
+                    run,
+                    reason=_GOVERNANCE_FAILURE_REASON,
+                    error_code="context_compactor_missing",
+                    message="Context compactor or artifact store is not configured",
+                ),
             )
-            return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
         source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
             run=run,
@@ -3750,8 +3933,11 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
-        def _operation(transaction: HostTransaction) -> None:
+        def _operation(
+            transaction: HostTransaction,
+        ) -> TerminalPostCommitNotice | None:
             attempt_event_id = _new_event_id(_EVENT_ID_ATTEMPT_FAILED_PREFIX)
+            run_event_id = _new_event_id(_EVENT_ID_RUN_FAILED_PREFIX)
             result = terminal_closeout_in_transaction(
                 transaction,
                 self._event_log_store,
@@ -3759,7 +3945,7 @@ class HostDispatchScheduler:
                     run_id=record.run_id,
                     attempt_id=record.attempt_id,
                     attempt_terminal_event_id=attempt_event_id,
-                    run_terminal_event_id=_new_event_id(_EVENT_ID_RUN_FAILED_PREFIX),
+                    run_terminal_event_id=run_event_id,
                     attempt_terminal_status=AttemptStatus.FAILED,
                     run_terminal_status=RunStatus.FAILED,
                     occurred_at=datetime.now(UTC),
@@ -3770,14 +3956,22 @@ class HostDispatchScheduler:
                     terminal_summary_digest=None,
                 ),
             )
-            if result.status != StateMutationStatus.UPDATED:
-                return
+            if result.status != StateMutationStatus.UPDATED or result.run is None:
+                return None
+            notice = project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=(
+                    result.run_event is not None
+                    and result.run_event.event_id == run_event_id
+                ),
+            )
             event = self._event_log_store.read_event_by_id(
                 transaction,
                 attempt_event_id,
             )
             if event is None:
-                return
+                return notice
             cancel_starting_dispatch_record_row(
                 transaction,
                 attempt_id=record.attempt_id,
@@ -3785,8 +3979,11 @@ class HostDispatchScheduler:
                 cancelled_event_sequence=event.event_sequence,
                 cancelled_at=format_utc_timestamp(datetime.now(UTC)),
             )
+            return notice
 
-        self._transaction_runner.run_write(_operation)
+        terminal_notice = self._transaction_runner.run_write(_operation)
+        if terminal_notice is not None:
+            self._notify_terminal_post_commit(terminal_notice)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "dispatch.worker_startup.closeout_committed run_id=%s " "attempt_id=%s execution_id=%s reason=%s",
@@ -3919,6 +4116,7 @@ class HostDispatchScheduler:
             ingestor = EngineEventIngestor(
                 transaction_runner=self._transaction_runner,
                 transient_delta_publisher=self._transient_delta_publisher,
+                terminal_post_commit_port=self._required_terminal_post_commit_port(),
                 wakeup_port=self,
                 context_budget_policy=self._local_execution.context_budget_policy,
                 context_compactor=self._local_execution.context_compactor,

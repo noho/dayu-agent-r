@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import dayu.host as host_package
+import dayu.host.command as host_command
 import pytest
 
 from dayu.host import (
@@ -25,6 +26,7 @@ from dayu.host import (
     HostStreamCursor,
     LocalEngineWorkerFactory,
     OperationContext,
+    OrdinaryRunExecutionBaseline,
     PurgeSessionRequest,
     ReplayRunRequest,
     RetryRunRequest,
@@ -51,6 +53,10 @@ from dayu.host.api import (
 )
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.read_api import stream_run_events
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "dayu.fins",
@@ -65,6 +71,48 @@ class _WorkerFactoryToken:
     public sync command handle 不消费该结构协议；真实 scheduler 装配由
     HostDispatchScheduler.open 与 pyright 保障。
     """
+
+
+class _RecordingTerminalPostCommitPort(TerminalPostCommitPort):
+    """standalone command factory 使用的 runtime recording fake。"""
+
+    def __init__(self, db_path: Path) -> None:
+        """初始化记录器与独立 committed-row 观察连接路径。
+
+        :param db_path: standalone command handle 使用的 durable DB。
+        :returns: ``None``。
+        """
+
+        self._db_path = db_path
+        self.notices: list[TerminalPostCommitNotice] = []
+        self.committed_rows: list[tuple[int, str, str]] = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录 exact terminal notice。
+
+        :param notice: producer commit 后交付的精确 terminal notice。
+        :returns: ``None``。
+        :raises AssertionError: notice 对应 exact row 尚未提交或 identity 不一致时抛出。
+        :raises sqlite3.Error: 独立 committed-row 查询失败时抛出。
+        """
+
+        with sqlite3.connect(self._db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT event_sequence, session_id, event_type
+                FROM event_log
+                WHERE event_sequence = ?
+                """,
+                (notice.terminal_event_sequence,),
+            ).fetchone()
+        assert row is not None
+        committed_row = (int(row[0]), str(row[1]), str(row[2]))
+        assert committed_row[1] == notice.session_id
+        self.committed_rows.append(committed_row)
+        self.notices.append(notice)
 
 
 def _options(tmp_path: Path, host_handle_id: str | None = "host-test") -> HostCommandHandleOptions:
@@ -88,6 +136,46 @@ def _options(tmp_path: Path, host_handle_id: str | None = "host-test") -> HostCo
         payload_inline_threshold_bytes=4096,
         context_window_size=8192,
         reserved_output_tokens=1024,
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造 standalone command handle 使用的 ordinary Run 执行基线。
+
+    :returns: OrdinaryRunExecutionBaseline。
+    :raises TypeError: baseline typed 字段类型非法时抛出。
+    :raises ValueError: baseline 字段语义非法时抛出。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="command-baseline-model",
+            endpoint="https://example.invalid",
+            api_key_ref="secret:command-baseline",
+            headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
+        ),
     )
 
 
@@ -567,6 +655,50 @@ def test_factory_translates_durable_config_error_to_public_error(
 
     assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
     assert exc_info.value.retryable is False
+
+
+def test_standalone_factory_delivers_exact_terminal_notice_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """standalone command factory 在 commit return 后仍调用 private terminal port。"""
+
+    options = _options(tmp_path)
+    terminal_port = _RecordingTerminalPostCommitPort(options.db_path)
+    monkeypatch.setattr(
+        host_command,
+        "_NoLocalDeliveryTerminalPostCommitPort",
+        lambda: terminal_port,
+    )
+    command_handle = create_host_command_handle(options)
+    try:
+        session = ensure_session(command_handle, _ensure_request())
+        started = start_run(
+            command_handle,
+            _start_request(session.session_id, "exact-notice"),
+        )
+        assert terminal_port.notices == []
+
+        result = cancel_run(
+            command_handle,
+            started.run_id,
+            _cancel_run_request("exact-notice-cancel"),
+        )
+
+        assert result.run_id == started.run_id
+        assert len(terminal_port.notices) == 1
+        notice = terminal_port.notices[0]
+        assert notice.session_id == session.session_id
+        assert notice.wake_queue_promotion is False
+        assert terminal_port.committed_rows == [
+            (
+                notice.terminal_event_sequence,
+                session.session_id,
+                "RUN_CANCELLED",
+            )
+        ]
+    finally:
+        command_handle.close()
 
 
 def test_generated_handle_id_is_stable_for_handle_lifetime(

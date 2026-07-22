@@ -30,6 +30,7 @@ from dayu.host import (
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
+    HostSessionEventDeliveryPolicy,
     OrdinaryRunExecutionBaseline,
     open_host,
 )
@@ -251,6 +252,10 @@ def _options(tmp_path: pathlib.Path) -> OpenHostOptions:
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=512,
+            max_subscriptions_per_session=4,
+        ),
     )
 
 
@@ -260,6 +265,7 @@ def test_open_host_option_types_are_frozen_slots_dataclasses() -> None:
     for dataclass_type in (
         cast(_FrozenSlotsDataclassClass, OrdinaryRunExecutionBaseline),
         cast(_FrozenSlotsDataclassClass, CompactorRunnerBaseline),
+        cast(_FrozenSlotsDataclassClass, HostSessionEventDeliveryPolicy),
         cast(_FrozenSlotsDataclassClass, OpenHostOptions),
         cast(_FrozenSlotsDataclassClass, HostFinalAnswerView),
         cast(_FrozenSlotsDataclassClass, HostEvent),
@@ -298,6 +304,30 @@ def test_open_host_options_type_hints_resolve_wait_poller_policy() -> None:
     hints = get_type_hints(OpenHostOptions)
 
     assert hints["wait_poller_policy"] == WaitPollerRuntimePolicy | None
+    assert (
+        hints["session_event_delivery_policy"]
+        is HostSessionEventDeliveryPolicy
+    )
+
+
+def test_session_event_delivery_policy_is_required_and_strict(
+    tmp_path: pathlib.Path,
+) -> None:
+    """OpenHostOptions 必须显式接收双字段 typed delivery policy。"""
+
+    parameter = inspect.signature(OpenHostOptions).parameters[
+        "session_event_delivery_policy"
+    ]
+    assert parameter.default is inspect.Parameter.empty
+    valid = _options(tmp_path)
+    with pytest.raises(TypeError, match="session_event_delivery_policy"):
+        replace(
+            valid,
+            session_event_delivery_policy=cast(
+                HostSessionEventDeliveryPolicy,
+                "bad",
+            ),
+        )
 
 
 def test_open_host_options_reject_invalid_wait_poller_policy(

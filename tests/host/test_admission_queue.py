@@ -66,7 +66,6 @@ from dayu.host.durable.options import (
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CreateRunningRunInput,
-    PromotionSkipReason,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
@@ -97,6 +96,7 @@ from dayu.host.memory import (
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 
 _NOW = datetime(2026, 5, 14, 9, 30, 0, tzinfo=UTC)
 _CALLER_DIGEST = sha256_digest_json({"caller": "admission-test"})
@@ -170,6 +170,25 @@ class _WakeupSpy(AdmissionWakeupPort):
         """
 
         self.promotions.append(session_id)
+
+
+@dataclass(slots=True)
+class _TerminalNoticeRecorder:
+    """记录 admission commit 后的 exact terminal notices。"""
+
+    notices: list[TerminalPostCommitNotice] = field(default_factory=list)
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录一次 terminal notice。
+
+        :param notice: 已提交的精确通知。
+        :returns: ``None``。
+        """
+
+        self.notices.append(notice)
 
 
 @dataclass(slots=True)
@@ -811,7 +830,8 @@ def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        service = _service(store.transaction_runner)
+        terminal_port = _TerminalNoticeRecorder()
+        service = _service(store.transaction_runner, terminal_port=terminal_port)
         service.start_run(
             _start_request(session_id=session_id, client_request_id="start-active"),
             caller_semantic_digest=_CALLER_DIGEST,
@@ -849,7 +869,8 @@ def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
         assert first.run.status == RunStatus.CANCELLED
         assert first.attempt is None
         assert first.dispatch_record is None
-        assert first.promotion is None
+        assert first.terminal_notice is not None
+        assert first.terminal_notice.wake_queue_promotion is False
         assert second.idempotent_replay is True
         assert second.run.run_id == queued.run.run_id
         assert _event_count(store.transaction_runner) == before_retry
@@ -862,17 +883,23 @@ def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
             "RUN_CANCELLED",
         )
         assert _text(record, "created_event_id") is not None
+        assert terminal_port.notices == [first.terminal_notice, second.terminal_notice]
 
 
 def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
     tmp_path: Path,
 ) -> None:
-    """active pre-dispatch cancel 取消 dispatch/Attempt/Run 后新事务 promotion 一条队列。"""
+    """active pre-dispatch cancel 只交付 exact terminal notice，不直接 promotion。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _WakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
+        terminal_port = _TerminalNoticeRecorder()
+        service = _service(
+            store.transaction_runner,
+            spy=spy,
+            terminal_port=terminal_port,
+        )
         active = _seed_active_run(store.transaction_runner, session_id=session_id)
         first_queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
@@ -919,28 +946,33 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
         assert result.dispatch_record.status == DispatchRecordStatus.CANCELLED
         assert active_attempt.status == AttemptStatus.CANCELLED
         assert active_dispatch.status == DispatchRecordStatus.CANCELLED
-        assert result.promotion is not None
-        assert result.promotion.skipped is True
-        assert result.promotion.promoted_run is None
+        assert result.terminal_notice is not None
+        assert result.terminal_notice.wake_queue_promotion is True
+        assert terminal_port.notices == [result.terminal_notice]
         assert _read_run(store.transaction_runner, first_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
         assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
-        assert spy.promotions == [session_id]
+        assert spy.promotions == []
         assert spy.dispatches == []
 
 
 def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """active cancel 后 queue wakeup 失败不掩盖已完成 promotion。"""
+    """active cancel 不触碰 ordinary promotion port，仍交付 exact notice。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _ToggleFailingWakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
+        terminal_port = _TerminalNoticeRecorder()
+        service = _service(
+            store.transaction_runner,
+            spy=spy,
+            terminal_port=terminal_port,
+        )
         active = _seed_active_run(store.transaction_runner, session_id=session_id)
         queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
@@ -962,15 +994,14 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
             )
 
         assert result.run.status == RunStatus.CANCELLED
-        assert result.promotion is not None
-        assert result.promotion.skipped is True
-        assert result.promotion.promoted_run is None
+        assert result.terminal_notice is not None
+        assert result.terminal_notice.wake_queue_promotion is True
+        assert terminal_port.notices == [result.terminal_notice]
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
             RunStatus.QUEUED
         )
-        assert spy.promotions == [session_id]
-        assert "host.admission.queue_promotion_wakeup_failed" in caplog.text
-        assert session_id in caplog.text
+        assert spy.promotions == []
+        assert "queue_promotion_wakeup_failed" not in caplog.text
 
 
 def test_promote_after_release_reports_delegated_to_governance(
@@ -982,19 +1013,8 @@ def test_promote_after_release_reports_delegated_to_governance(
     :returns: ``None``。
     """
 
-    with open_host_durable_store(_options(tmp_path)) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-        spy = _WakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
-
-        result = admission_module._promote_after_release(
-            service=service,
-            session_id=session_id,
-        )
-
-        assert result.skipped is True
-        assert result.skip_reason is PromotionSkipReason.DELEGATED_TO_GOVERNANCE
-        assert spy.promotions == [session_id]
+    assert tmp_path.exists()
+    assert not hasattr(admission_module, "_promote_after_release")
 
 
 def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
@@ -1103,12 +1123,17 @@ def test_start_run_then_direct_memory_catchup_projects_user_input(
 def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
     tmp_path: Path,
 ) -> None:
-    """terminal closeout 释放 active slot 后在新事务中 promotion 一条 queued Run。"""
+    """terminal closeout 交付 exact notice，并保持 queued Run 等待 coordinator。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _WakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
+        terminal_port = _TerminalNoticeRecorder()
+        service = _service(
+            store.transaction_runner,
+            spy=spy,
+            terminal_port=terminal_port,
+        )
         active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         first_queued = service.submit_followup_queue(
@@ -1145,29 +1170,31 @@ def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
 
         assert result.run.status == RunStatus.SUCCEEDED
         assert result.attempt.status == AttemptStatus.SUCCEEDED
-        assert result.promotion.skipped is True
-        assert result.promotion.promoted_run is None
+        assert result.terminal_notice.wake_queue_promotion is True
+        assert terminal_port.notices == [result.terminal_notice]
         assert _read_run(store.transaction_runner, first_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
         assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
-        assert spy.promotions == [session_id]
+        assert spy.promotions == []
         assert spy.dispatches == []
 
 
 def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
     tmp_path: Path,
 ) -> None:
-    """terminal closeout 后 projection catch-up 失败不影响 closeout / promotion。"""
+    """terminal notice 先于 best-effort projection，catch-up 失败不影响结果。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         projection = _FailingProjectionCatchup()
+        terminal_port = _TerminalNoticeRecorder()
         service = _service(
             store.transaction_runner,
             projection_catchup=projection,
+            terminal_port=terminal_port,
         )
         active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
@@ -1194,8 +1221,8 @@ def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
         )
 
         assert result.run.status == RunStatus.SUCCEEDED
-        assert result.promotion.skipped is True
-        assert result.promotion.promoted_run is None
+        assert result.terminal_notice.wake_queue_promotion is True
+        assert terminal_port.notices == [result.terminal_notice]
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
             RunStatus.QUEUED
         )
@@ -1205,12 +1232,17 @@ def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
 def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
     tmp_path: Path,
 ) -> None:
-    """terminal closeout 后 queue wakeup 失败不掩盖已完成 promotion。"""
+    """terminal closeout 不调用 ordinary promotion port。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _ToggleFailingWakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
+        terminal_port = _TerminalNoticeRecorder()
+        service = _service(
+            store.transaction_runner,
+            spy=spy,
+            terminal_port=terminal_port,
+        )
         active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         queued = service.submit_followup_queue(
@@ -1237,12 +1269,12 @@ def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
         )
 
         assert result.run.status == RunStatus.SUCCEEDED
-        assert result.promotion.skipped is True
-        assert result.promotion.promoted_run is None
+        assert result.terminal_notice.wake_queue_promotion is True
+        assert terminal_port.notices == [result.terminal_notice]
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
             RunStatus.QUEUED
         )
-        assert spy.promotions == [session_id]
+        assert spy.promotions == []
 
 
 def test_cancel_terminal_run_returns_current_terminal_without_new_facts(
@@ -1252,7 +1284,8 @@ def test_cancel_terminal_run_returns_current_terminal_without_new_facts(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        service = _service(store.transaction_runner)
+        terminal_port = _TerminalNoticeRecorder()
+        service = _service(store.transaction_runner, terminal_port=terminal_port)
         active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         service.closeout_attempt_terminal(
@@ -1277,7 +1310,9 @@ def test_cancel_terminal_run_returns_current_terminal_without_new_facts(
         assert result.attempt is not None
         assert result.attempt.status == AttemptStatus.SUCCEEDED
         assert result.dispatch_record is not None
-        assert result.promotion is None
+        assert result.terminal_notice is not None
+        assert result.terminal_notice.wake_queue_promotion is False
+        assert terminal_port.notices[-1] == result.terminal_notice
         assert result.active_cancel_target is None
         assert _event_count(store.transaction_runner) == before
         assert _read_run(store.transaction_runner, active.run.run_id).status == (
@@ -1481,6 +1516,7 @@ def _service(
     projection_catchup: ProjectionCatchupPort | None = None,
     event_log_store: EventLogStore | None = None,
     label: str = "main",
+    terminal_port: _TerminalNoticeRecorder | None = None,
 ) -> HostAdmissionService:
     """构造测试 admission service。
 
@@ -1494,6 +1530,9 @@ def _service(
 
     return create_host_admission_service(
         transaction_runner,
+        terminal_post_commit_port=(
+            terminal_port if terminal_port is not None else _TerminalNoticeRecorder()
+        ),
         clock=_FixedClock(),
         id_factory=_SequentialIdFactory(label),
         wakeup_port=spy if spy is not None else _WakeupSpy(),

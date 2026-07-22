@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import pathlib
 import sqlite3
-from collections.abc import AsyncIterator
+import sys
+import threading
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Protocol, cast
+from typing import cast
 
 import pytest
 
@@ -19,6 +23,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    ProviderDiagnosticData,
     ReasoningDeltaData,
     RunFailedData,
 )
@@ -28,6 +33,7 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
+from dayu.engine.contracts.runner_events import RunnerDiagnosticSeverity
 from dayu.host import (
     AttemptDispatchSnapshot,
     CancelMode,
@@ -43,15 +49,20 @@ from dayu.host import (
     HostEvent,
     HostEventClass,
     HostEventKind,
+    HostSessionEventDeliveryDetail,
+    HostSessionEventDeliveryReason,
+    HostSessionEventAdmissionDetail,
+    HostSessionEventAdmissionReason,
     HostSessionEvent,
+    HostSessionEventIterator,
     HostTerminalStatus,
     HostReasoningDelta,
     HostTransientDelta,
     HostTransientDeltaType,
-    HostUnavailableDetail,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
+    HostSessionEventDeliveryPolicy,
     OperationContext,
     OrdinaryRunExecutionBaseline,
     RunSnapshot,
@@ -60,9 +71,28 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.api import AuthorizationClaim
-from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host._execution_health import HostExecutionHealthState
+from dayu.host.command import HostCommandHandle
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPTS,
+    TABLE_HOST_RUNS,
+)
 from dayu.host.memory import default_memory_projection_policy
-from dayu.host.open_host import _PublicHostHandle
+from dayu.host.open_host import (
+    _HostSessionEventIterator,
+    _PublicHostHandle,
+    _SessionEventReconciliationWaiter,
+    _read_session_host_events_after,
+    _session_live_event_start_cursor,
+    _submit_followup,
+)
+from dayu.host.read_api import _SessionHostEventBatch
+from dayu.host.transient_delta import (
+    HostTransientDeltaHub,
+    HostTransientDeltaSubscription,
+    ValidatedTransientDeltaCandidate,
+)
 from tests.host.transient_stream_support import (
     TransientStreamCounts,
     TransientStreamWorkerFactory,
@@ -76,19 +106,9 @@ _WORKER_MODE_BLOCKING = "blocking"
 _WORKER_MODE_FAILED = "failed"
 _WORKER_MODE_EMPTY_FINAL = "empty_final"
 _WORKER_MODE_TRANSIENT_FINAL = "transient_final"
-
-
-class _ClosableSessionEventIterator(Protocol):
-    """测试使用的可关闭 Host Session iterator 窄协议。"""
-
-    async def aclose(self) -> None:
-        """关闭 iterator。
-
-        :returns: ``None``。
-        :raises Exception: 具体 Host iterator cleanup 失败时透传。
-        """
-
-        ...
+_WORKER_MODE_CONTROLLED_TRANSIENT_FINAL = "controlled_transient_final"
+_WORKER_MODE_PAGED_FINAL = "paged_final"
+_OPEN_HOST_MODULE = importlib.import_module("dayu.host.open_host")
 
 
 class _ImmediateFinalAnswerHandle:
@@ -204,6 +224,79 @@ class _TransientThenFinalAnswerHandle:
         del reason
 
 
+class _ControlledTransientThenFinalAnswerHandle:
+    """产出一个 transient 后等待 barrier 再提交 terminal 的 worker handle。"""
+
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        release_event: asyncio.Event,
+    ) -> None:
+        """初始化受控 worker handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param release_event: 允许 final answer 产出的 barrier。
+        :returns: 无返回值。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        self._snapshot = snapshot
+        self._release_event = release_event
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 本地 worker id。
+        :raises Exception: 本属性不抛出异常。
+        """
+
+        return "watch-controlled-transient-final-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """先产出 transient，再等待 barrier 并产出 final answer。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises asyncio.CancelledError: worker stream 被关闭时抛出。
+        """
+
+        yield EngineEvent(
+            occurred_at=datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC),
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.REASONING_DELTA,
+            data=ReasoningDeltaData(
+                iteration_id="iteration-controlled",
+                delta="正在等待终态屏障",
+            ),
+            metadata=None,
+        )
+        await self._release_event.wait()
+        yield _final_answer_event(
+            self._snapshot,
+            f"answer:{self._snapshot.run_id}",
+        )
+
+    async def close(self) -> None:
+        """关闭 handle。
+
+        :returns: ``None``。
+        :raises Exception: 本方法不抛出异常。
+        """
+
+        return None
+
+    def on_cancel(self, reason: str) -> None:
+        """忽略取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 本方法不抛出异常。
+        """
+
+        del reason
+
+
 class _BlockingFinalAnswerHandle:
     """测试用受控释放 final answer 的 worker handle。"""
 
@@ -255,6 +348,90 @@ class _BlockingFinalAnswerHandle:
         """
 
         self.cancel_reasons.append(reason)
+
+
+class _PagedFinalAnswerHandle:
+    """等待 barrier 后产出多页 durable diagnostics 与 final 的 handle。"""
+
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        release_event: asyncio.Event,
+        diagnostic_count: int,
+    ) -> None:
+        """初始化多页 durable event handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param release_event: 允许开始产出 events 的 barrier。
+        :param diagnostic_count: final 前产出的 diagnostic 数量。
+        :returns: 无返回值。
+        :raises ValueError: diagnostic count 不是正数时抛出。
+        """
+
+        if diagnostic_count <= 0:
+            raise ValueError("diagnostic_count must be positive")
+        self._snapshot = snapshot
+        self._release_event = release_event
+        self._diagnostic_count = diagnostic_count
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 本地 worker id。
+        :raises Exception: 本属性不抛出异常。
+        """
+
+        return "watch-paged-final-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出跨至少两页的 durable diagnostics，随后产出 final。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises asyncio.CancelledError: worker stream 被关闭时抛出。
+        """
+
+        await self._release_event.wait()
+        for index in range(self._diagnostic_count):
+            yield EngineEvent(
+                occurred_at=datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC),
+                session_id=self._snapshot.session_id,
+                run_id=self._snapshot.run_id,
+                type=EngineEventType.PROVIDER_DIAGNOSTIC,
+                data=ProviderDiagnosticData(
+                    iteration_id=f"iteration-page-{index}",
+                    diagnostic_code="page_padding",
+                    severity=RunnerDiagnosticSeverity.WARNING,
+                    message=f"page-padding-{index}",
+                    provider_request_id=None,
+                    raw_payload=None,
+                    client_correlation_id=None,
+                ),
+                metadata=None,
+            )
+        yield _final_answer_event(
+            self._snapshot,
+            f"paged:{self._snapshot.run_id}",
+        )
+
+    async def close(self) -> None:
+        """关闭 handle。
+
+        :returns: ``None``。
+        :raises Exception: 本方法不抛出异常。
+        """
+
+        return None
+
+    def on_cancel(self, reason: str) -> None:
+        """忽略取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 本方法不抛出异常。
+        """
+
+        del reason
 
 
 class _FailedHandle:
@@ -407,16 +584,24 @@ class _HandleWorker:
 class _Factory:
     """按 dispatch 顺序创建测试 worker 的 factory。"""
 
-    def __init__(self, mode: str, release_event: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        mode: str,
+        release_event: asyncio.Event | None = None,
+        *,
+        diagnostic_count: int = 0,
+    ) -> None:
         """初始化 factory。
 
         :param mode: worker 行为模式。
         :param release_event: blocking 模式使用的释放事件。
+        :param diagnostic_count: paged final 模式的 durable diagnostic 数量。
         :returns: ``None``。
         """
 
         self._mode = mode
         self._release_event = release_event
+        self._diagnostic_count = diagnostic_count
         self.accepted_event = asyncio.Event()
         self.created_handles: list[LocalWorkerHandle] = []
 
@@ -432,6 +617,15 @@ class _Factory:
             handle: LocalWorkerHandle = _ImmediateFinalAnswerHandle(snapshot)
         elif self._mode == _WORKER_MODE_TRANSIENT_FINAL:
             handle = _TransientThenFinalAnswerHandle(snapshot)
+        elif self._mode == _WORKER_MODE_CONTROLLED_TRANSIENT_FINAL:
+            if self._release_event is None:
+                raise RuntimeError(
+                    "controlled transient mode requires release_event"
+                )
+            handle = _ControlledTransientThenFinalAnswerHandle(
+                snapshot,
+                self._release_event,
+            )
         elif self._mode == _WORKER_MODE_FAILED:
             handle = _FailedHandle(snapshot)
         elif self._mode == _WORKER_MODE_EMPTY_FINAL:
@@ -440,11 +634,219 @@ class _Factory:
             if self._release_event is None:
                 raise RuntimeError("blocking mode requires release_event")
             handle = _BlockingFinalAnswerHandle(snapshot, self._release_event)
+        elif self._mode == _WORKER_MODE_PAGED_FINAL:
+            if self._release_event is None:
+                raise RuntimeError("paged final mode requires release_event")
+            handle = _PagedFinalAnswerHandle(
+                snapshot,
+                self._release_event,
+                self._diagnostic_count,
+            )
         else:
             raise RuntimeError("unknown worker mode")
         self.created_handles.append(handle)
         self.accepted_event.set()
         return _HandleWorker(handle)
+
+
+class _ControlledSessionEventReconciliationWaiter:
+    """测试用可逐次释放 timeout、同时响应 owner readiness 的 waiter。"""
+
+    def __init__(self) -> None:
+        """初始化独立 opener waiter。
+
+        :returns: 无返回值。
+        :raises Exception: asyncio primitive 构造失败时透传。
+        """
+
+        self._timeout_signal = asyncio.Event()
+        self.wait_call_count = 0
+        self.timeout_count = 0
+
+    def release_one_timeout(self) -> None:
+        """释放当前或下一次 mailbox-empty timeout。
+
+        :returns: ``None``。
+        :raises Exception: 本方法不主动抛出异常。
+        """
+
+        self._timeout_signal.set()
+
+    async def wait_for_readiness(
+        self,
+        subscription: HostTransientDeltaSubscription,
+    ) -> bool:
+        """竞争 subscription readiness 与测试控制的单次 timeout。
+
+        :param subscription: 当前 iterator 的真实 delivery subscription。
+        :returns: owner readiness 获胜时返回 ``True``；测试 timeout 获胜时返回
+            ``False``。
+        :raises asyncio.CancelledError: iterator 被取消时抛出。
+        """
+
+        self.wait_call_count += 1
+        readiness_task = asyncio.create_task(
+            subscription.wait_ready(3_600.0)
+        )
+        timeout_task = asyncio.create_task(self._wait_for_timeout_signal())
+        done, pending = await asyncio.wait(
+            (readiness_task, timeout_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        try:
+            if readiness_task in done:
+                return readiness_task.result()
+            self.timeout_count += 1
+            return False
+        finally:
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    async def _wait_for_timeout_signal(self) -> None:
+        """等待并消费一个测试 timeout signal。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: readiness 先到时抛出。
+        """
+
+        await self._timeout_signal.wait()
+        self._timeout_signal.clear()
+
+
+class _ReconciliationWaiterFactory:
+    """按 opener 创建顺序返回彼此独立的 controlled waiter。"""
+
+    def __init__(
+        self,
+        waiters: tuple[_ControlledSessionEventReconciliationWaiter, ...],
+    ) -> None:
+        """初始化 waiter factory。
+
+        :param waiters: 按 opener 进入顺序排列的独立 waiter。
+        :returns: 无返回值。
+        :raises ValueError: waiter 列表为空时抛出。
+        """
+
+        if not waiters:
+            raise ValueError("waiters must be non-empty")
+        self._waiters = waiters
+        self._next_index = 0
+
+    def __call__(self) -> _SessionEventReconciliationWaiter:
+        """返回下一个 opener 独占 waiter。
+
+        :returns: 下一个 controlled waiter。
+        :raises RuntimeError: opener 数量超过预置 waiter 数时抛出。
+        """
+
+        if self._next_index >= len(self._waiters):
+            raise RuntimeError("unexpected reconciliation waiter allocation")
+        waiter = self._waiters[self._next_index]
+        self._next_index += 1
+        return waiter
+
+
+class _TerminalWatermarkHookCallCounter:
+    """按 opener 实例记录并转发 local terminal watermark hook。"""
+
+    def __init__(
+        self,
+        *,
+        target_hub: HostTransientDeltaHub,
+        hook: Callable[[HostTransientDeltaHub, str, int], bool],
+    ) -> None:
+        """初始化目标 opener 的本地 hook 计数器。
+
+        :param target_hub: 该计数器唯一允许观测的 opener-local hub。
+        :param hook: production 原始未绑定 watermark hook。
+        :returns: 无返回值。
+        :raises Exception: 本构造函数不抛出异常。
+        """
+
+        self._target_hub = target_hub
+        self._hook = hook
+        self.call_count = 0
+
+    def __call__(
+        self,
+        hub: HostTransientDeltaHub,
+        session_id: str,
+        event_sequence: int,
+    ) -> bool:
+        """记录目标 opener 的调用并转发给 production owner hook。
+
+        :param hub: 实际收到 hook 调用的 opener-local hub。
+        :param session_id: notice Session 标识。
+        :param event_sequence: notice terminal sequence。
+        :returns: production hook 的 watermark 前移结果。
+        :raises AssertionError: 调用被错误路由到其它 opener 时抛出。
+        :raises Exception: production hook 失败时原样透传。
+        """
+
+        if hub is not self._target_hub:
+            raise AssertionError("terminal hook routed to unexpected opener")
+        if not session_id or event_sequence <= 0:
+            raise AssertionError("unexpected invalid terminal watermark hook call")
+        self.call_count += 1
+        return self._hook(hub, session_id, event_sequence)
+
+
+class _SessionEventPageReadSpy:
+    """记录目标 Session 每次 bounded durable page read 的 cursor。"""
+
+    def __init__(
+        self,
+        original: Callable[
+            [HostCommandHandle, str, int],
+            _SessionHostEventBatch,
+        ],
+    ) -> None:
+        """初始化 production read wrapper。
+
+        :param original: production session HostEvent page reader。
+        :returns: 无返回值。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        self._original = original
+        self._target_session_id: str | None = None
+        self._lock = threading.Lock()
+        self.cursors: list[int] = []
+
+    def set_target_session(self, session_id: str) -> None:
+        """设置唯一记录目标 Session。
+
+        :param session_id: 目标 Session 标识。
+        :returns: ``None``。
+        :raises ValueError: Session 标识为空时抛出。
+        """
+
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        self._target_session_id = session_id
+
+    def __call__(
+        self,
+        host: HostCommandHandle,
+        session_id: str,
+        cursor: int,
+    ) -> _SessionHostEventBatch:
+        """记录 cursor 后调用真实 bounded page reader。
+
+        :param host: actor-owned command handle。
+        :param session_id: 读取目标 Session 标识。
+        :param cursor: 本页起始 cursor。
+        :returns: production bounded page。
+        :raises HostApiError: production reader public failure时抛出。
+        """
+
+        if session_id == self._target_session_id:
+            with self._lock:
+                self.cursors.append(cursor)
+        return self._original(host, session_id, cursor)
 
 
 @pytest.mark.asyncio
@@ -456,8 +858,8 @@ async def test_two_watchers_observe_same_terminal_event_and_iterator_continues(
     factory = _Factory(_WORKER_MODE_FINAL)
     async with open_host(_options(tmp_path, factory)) as host:
         session = await host.ensure_session(_ensure_request("watch-two"))
-        first_watcher = host.watch_session_events(session.session_id)
-        second_watcher = host.watch_session_events(session.session_id)
+        first_watcher = await host.watch_session_events(session.session_id)
+        second_watcher = await host.watch_session_events(session.session_id)
 
         await host.submit_followup(
             session.session_id,
@@ -504,8 +906,8 @@ async def test_watch_attaches_before_return_and_delivers_transient_before_termin
     options = _options(tmp_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request("watch-transient"))
-        first_watcher = host.watch_session_events(session.session_id)
-        second_watcher = host.watch_session_events(session.session_id)
+        first_watcher = await host.watch_session_events(session.session_id)
+        second_watcher = await host.watch_session_events(session.session_id)
 
         followup = await host.submit_followup(
             session.session_id,
@@ -542,10 +944,323 @@ async def test_watch_attaches_before_return_and_delivers_transient_before_termin
 
 
 @pytest.mark.asyncio
+async def test_watch_factory_waits_for_actual_cursor_transaction(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor transaction 阻塞期间 factory 不返回且只持有 reservation。"""
+
+    cursor_started = threading.Event()
+    cursor_release = threading.Event()
+    original_cursor = _session_live_event_start_cursor
+
+    def blocked_cursor(handle: HostCommandHandle, session_id: str) -> int:
+        """在 actor thread 阻塞实际 cursor transaction。
+
+        :param handle: actor 私有 command handle。
+        :param session_id: 目标 Session 标识。
+        :returns: durable cursor。
+        :raises RuntimeError: barrier 超时时抛出。
+        """
+
+        cursor_started.set()
+        if not cursor_release.wait(timeout=2):
+            raise RuntimeError("cursor barrier timed out")
+        return original_cursor(handle, session_id)
+
+    monkeypatch.setattr(
+        sys.modules["dayu.host.open_host"],
+        "_session_live_event_start_cursor",
+        blocked_cursor,
+    )
+    async with open_host(_options(tmp_path, _Factory(_WORKER_MODE_FINAL))) as host:
+        public_host = cast(_PublicHostHandle, host)
+        session = await host.ensure_session(_ensure_request("delayed-cursor"))
+        watch_task = asyncio.create_task(
+            host.watch_session_events(session.session_id)
+        )
+        assert await asyncio.to_thread(cursor_started.wait, 1)
+        assert watch_task.done() is False
+        assert (
+            public_host._transient_delta_hub.reservation_count(
+                session.session_id
+            )
+            == 1
+        )
+        assert _subscription_count(host, session.session_id) == 0
+
+        cursor_release.set()
+        watcher = await asyncio.wait_for(watch_task, timeout=1)
+        assert _subscription_count(host, session.session_id) == 1
+        await watcher.aclose()
+        assert (
+            public_host._transient_delta_hub.reservation_count(
+                session.session_id
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_watch_cursor_snapshot_to_return_gap_remains_durably_visible(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor snapshot 后、factory return 前提交的 durable Run 仍可读取。"""
+
+    accepted_run_ids: list[str] = []
+    original_cursor = _session_live_event_start_cursor
+
+    def cursor_then_commit(handle: HostCommandHandle, session_id: str) -> int:
+        """先完成 cursor read transaction，再在同 actor operation 提交 Run。
+
+        :param handle: actor 私有 command handle。
+        :param session_id: 目标 Session 标识。
+        :returns: commit 前读取的 cursor。
+        :raises Exception: durable read 或 follow-up commit 失败时透传。
+        """
+
+        cursor = original_cursor(handle, session_id)
+        followup = _submit_followup(
+            handle,
+            session_id,
+            _followup_request(session_id, "cursor-return-gap"),
+        )
+        accepted_run_ids.append(followup.accepted_run_id)
+        return cursor
+
+    monkeypatch.setattr(
+        sys.modules["dayu.host.open_host"],
+        "_session_live_event_start_cursor",
+        cursor_then_commit,
+    )
+    async with open_host(_options(tmp_path, _Factory(_WORKER_MODE_FINAL))) as host:
+        session = await host.ensure_session(_ensure_request("cursor-gap"))
+        watcher = await host.watch_session_events(session.session_id)
+        terminal = await _next_terminal(watcher)
+        await watcher.aclose()
+
+    assert accepted_run_ids == [terminal.run_id]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_attach_cap_rejects_before_cursor_allocation_and_readmits(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cap+1 在 cursor/task/mailbox 前拒绝，detach 后可 readmit 且 Session 隔离。"""
+
+    cursor_started = threading.Event()
+    cursor_release = threading.Event()
+    cursor_call_count = 0
+    original_cursor = _session_live_event_start_cursor
+
+    def blocked_first_cursor(handle: HostCommandHandle, session_id: str) -> int:
+        """只阻塞首个 cursor transaction 并记录调用次数。
+
+        :param handle: actor 私有 command handle。
+        :param session_id: 目标 Session 标识。
+        :returns: durable cursor。
+        :raises RuntimeError: barrier 超时时抛出。
+        """
+
+        nonlocal cursor_call_count
+        cursor_call_count += 1
+        if cursor_call_count == 1:
+            cursor_started.set()
+            if not cursor_release.wait(timeout=2):
+                raise RuntimeError("first cursor barrier timed out")
+        return original_cursor(handle, session_id)
+
+    monkeypatch.setattr(
+        sys.modules["dayu.host.open_host"],
+        "_session_live_event_start_cursor",
+        blocked_first_cursor,
+    )
+    options = replace(
+        _options(tmp_path, _Factory(_WORKER_MODE_FINAL)),
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=512,
+            max_subscriptions_per_session=1,
+        ),
+    )
+    async with open_host(options) as host:
+        public_host = cast(_PublicHostHandle, host)
+        first_session = await host.ensure_session(_ensure_request("attach-cap"))
+        second_session = await host.ensure_session(_ensure_request("attach-other"))
+        first_task = asyncio.create_task(
+            host.watch_session_events(first_session.session_id)
+        )
+        assert await asyncio.to_thread(cursor_started.wait, 1)
+
+        with pytest.raises(HostApiError) as exc_info:
+            await host.watch_session_events(first_session.session_id)
+        assert exc_info.value.code is HostApiErrorCode.RESOURCE_EXHAUSTED
+        assert exc_info.value.retryable is True
+        assert exc_info.value.detail == HostSessionEventAdmissionDetail(
+            reason=(
+                HostSessionEventAdmissionReason.SESSION_SUBSCRIPTION_LIMIT_REACHED
+            ),
+        )
+        assert cursor_call_count == 1
+        assert _subscription_count(host, first_session.session_id) == 0
+        assert (
+            public_host._transient_delta_hub.reservation_count(
+                first_session.session_id
+            )
+            == 1
+        )
+
+        cursor_release.set()
+        first = await asyncio.wait_for(first_task, timeout=1)
+        other = await host.watch_session_events(second_session.session_id)
+        assert cursor_call_count == 2
+        await first.aclose()
+        replacement = await host.watch_session_events(first_session.session_id)
+        assert cursor_call_count == 3
+        await replacement.aclose()
+        await other.aclose()
+
+
+@pytest.mark.asyncio
+async def test_watch_factory_cancellation_close_race_and_allocation_failure_release(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """factory 取消、Host close 与 iterator allocation 失败均精确释放 reservation。"""
+
+    cursor_started = threading.Event()
+    cursor_release = threading.Event()
+    original_cursor = _session_live_event_start_cursor
+
+    def blocked_cursor(handle: HostCommandHandle, session_id: str) -> int:
+        """阻塞 cursor operation 以控制 cancellation race。
+
+        :param handle: actor 私有 command handle。
+        :param session_id: 目标 Session 标识。
+        :returns: durable cursor。
+        :raises RuntimeError: barrier 超时时抛出。
+        """
+
+        cursor_started.set()
+        if not cursor_release.wait(timeout=2):
+            raise RuntimeError("cancellation cursor barrier timed out")
+        return original_cursor(handle, session_id)
+
+    monkeypatch.setattr(
+        sys.modules["dayu.host.open_host"],
+        "_session_live_event_start_cursor",
+        blocked_cursor,
+    )
+    manager = open_host(_options(tmp_path, _Factory(_WORKER_MODE_FINAL)))
+    host = cast(_PublicHostHandle, await manager.__aenter__())
+    session = await host.ensure_session(_ensure_request("factory-cancel"))
+    cancelled_task = asyncio.create_task(
+        host.watch_session_events(session.session_id)
+    )
+    assert await asyncio.to_thread(cursor_started.wait, 1)
+    cancelled_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_task
+    assert host._transient_delta_hub.reservation_count(session.session_id) == 0
+    assert _subscription_count(host, session.session_id) == 0
+    cursor_release.set()
+    await asyncio.sleep(0)
+
+    close_cursor_started = threading.Event()
+    close_cursor_release = threading.Event()
+
+    def close_race_cursor(handle: HostCommandHandle, session_id: str) -> int:
+        """阻塞第二个 cursor operation 以控制 Host close race。
+
+        :param handle: actor 私有 command handle。
+        :param session_id: 目标 Session 标识。
+        :returns: durable cursor。
+        :raises RuntimeError: barrier 超时时抛出。
+        """
+
+        close_cursor_started.set()
+        if not close_cursor_release.wait(timeout=2):
+            raise RuntimeError("close cursor barrier timed out")
+        return original_cursor(handle, session_id)
+
+    monkeypatch.setattr(
+        sys.modules["dayu.host.open_host"],
+        "_session_live_event_start_cursor",
+        close_race_cursor,
+    )
+    close_watch_task = asyncio.create_task(
+        host.watch_session_events(session.session_id)
+    )
+    assert await asyncio.to_thread(close_cursor_started.wait, 1)
+    close_task = asyncio.create_task(host.close())
+    while host._health_gate.state is not HostExecutionHealthState.CLOSING:
+        await asyncio.sleep(0)
+    close_cursor_release.set()
+    with pytest.raises(HostClosedError):
+        await close_watch_task
+    await close_task
+    assert host._transient_delta_hub.reservation_count(session.session_id) == 0
+    await manager.__aexit__(None, None, None)
+
+    allocation_manager = open_host(
+        _options(tmp_path / "allocation", _Factory(_WORKER_MODE_FINAL))
+    )
+    allocation_host = cast(
+        _PublicHostHandle,
+        await allocation_manager.__aenter__(),
+    )
+    allocation_session = await allocation_host.ensure_session(
+        _ensure_request("allocation-failure")
+    )
+
+    def fail_iterator_allocation(
+        self: _HostSessionEventIterator,
+        *,
+        owner: _PublicHostHandle,
+        session_id: str,
+        cursor: int,
+        subscription: HostTransientDeltaSubscription,
+    ) -> None:
+        """模拟 iterator allocation 失败。
+
+        :param self: 未完成初始化的 iterator。
+        :param owner: public Host handle。
+        :param session_id: 目标 Session 标识。
+        :param cursor: durable cursor。
+        :param subscription: 已注册 subscription。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        del self, owner, session_id, cursor, subscription
+        raise RuntimeError("forced iterator allocation failure")
+
+    monkeypatch.setattr(
+        _HostSessionEventIterator,
+        "__init__",
+        fail_iterator_allocation,
+    )
+    with pytest.raises(RuntimeError, match="forced iterator allocation failure"):
+        await allocation_host.watch_session_events(
+            allocation_session.session_id
+        )
+    assert (
+        allocation_host._transient_delta_hub.reservation_count(
+            allocation_session.session_id
+        )
+        == 0
+    )
+    assert _subscription_count(allocation_host, allocation_session.session_id) == 0
+    await allocation_host.close()
+    await allocation_manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_terminal(
     tmp_path: pathlib.Path,
 ) -> None:
-    """容量 256 的慢 watcher overflow 不得阻塞快 watcher 或 durable terminal。
+    """retained item cap 的慢 watcher overflow 不阻塞快 watcher或 terminal。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -553,9 +1268,9 @@ async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_ter
     """
 
     expected_counts = TransientStreamCounts(
-        content=86,
-        reasoning=86,
-        tool_call=86,
+        content=171,
+        reasoning=171,
+        tool_call=171,
     )
     factory = TransientStreamWorkerFactory(
         counts=expected_counts,
@@ -564,8 +1279,8 @@ async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_ter
     options = transient_stream_open_host_options(tmp_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request("capacity-overflow"))
-        slow_watcher = host.watch_session_events(session.session_id)
-        fast_watcher = host.watch_session_events(session.session_id)
+        slow_watcher = await host.watch_session_events(session.session_id)
+        fast_watcher = await host.watch_session_events(session.session_id)
         fast_task = asyncio.create_task(_collect_mixed_stream_until_terminal(fast_watcher))
         followup = await host.submit_followup(
             session.session_id,
@@ -581,14 +1296,19 @@ async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_ter
             while True:
                 event = await asyncio.wait_for(anext(slow_watcher), timeout=2.0)
                 if not isinstance(event, HostTransientDelta):
-                    raise AssertionError("slow watcher received a fake durable terminal")
+                    raise AssertionError(
+                        "slow watcher received durable event before overflow"
+                    )
                 slow_prefix.append(event)
 
         run = await host.get_run(followup.accepted_run_id)
         await _close_iterator(fast_watcher)
         await _close_iterator(slow_watcher)
 
-    assert len(slow_prefix) == 256
+    assert len(slow_prefix) == 512
+    assert [event.worker_event_index for event in slow_prefix] == list(
+        range(1, 513)
+    )
     assert fast_counts == expected_counts
     assert fast_terminal.kind is HostEventKind.SUCCEEDED
     assert fast_terminal.final_answer is not None
@@ -597,11 +1317,10 @@ async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_ter
     assert factory.cancel_reasons == []
 
     overflow = exc_info.value
-    assert overflow.code is HostApiErrorCode.UNAVAILABLE
-    assert overflow.retryable is True
-    assert overflow.detail == HostUnavailableDetail(
-        component="session_live_stream",
-        reason_code="slow_consumer",
+    assert overflow.code is HostApiErrorCode.DELIVERY_INTERRUPTED
+    assert overflow.retryable is False
+    assert overflow.detail == HostSessionEventDeliveryDetail(
+        reason=HostSessionEventDeliveryReason.TRANSIENT_MAILBOX_OVERFLOW,
     )
     assert event_log_type_count(options.db_path, EngineEventType.CONTENT_DELTA.value) == 0
     assert event_log_type_count(options.db_path, EngineEventType.REASONING_DELTA.value) == 0
@@ -618,6 +1337,448 @@ async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_ter
 
 
 @pytest.mark.asyncio
+async def test_same_run_prefix_hands_off_to_terminal_before_different_run_head(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A mailbox prefix 必须先于 A terminal，B head 必须保留到 terminal 后。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: prefix、terminal 或 different-Run 顺序漂移时抛出。
+    """
+
+    terminal_release = asyncio.Event()
+    factory = _Factory(
+        _WORKER_MODE_CONTROLLED_TRANSIENT_FINAL,
+        terminal_release,
+    )
+    options = _options(tmp_path, factory)
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request("terminal-handoff"))
+        watcher = await host.watch_session_events(session.session_id)
+        assert isinstance(watcher, _HostSessionEventIterator)
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "terminal-handoff-a"),
+        )
+        for _ in range(500):
+            if watcher._subscription.retained_items == 1:
+                break
+            await asyncio.sleep(0)
+        assert watcher._subscription.retained_items == 1
+
+        terminal_release.set()
+        await _wait_run_terminal(host, followup.accepted_run_id)
+        durable = read_transient_durable_snapshot(
+            options.db_path,
+            run_id=followup.accepted_run_id,
+        )
+        _publish_fenced_reasoning_delta(
+            host,
+            session_id=session.session_id,
+            run_id="run-b-retained-head",
+            attempt_id="attempt-b-retained-head",
+            execution_id="execution-b-retained-head",
+            durable_causal_fence_event_sequence=(
+                durable.run_terminal_event_sequence
+            ),
+            worker_event_index=1,
+        )
+        assert watcher._subscription.retained_items == 2
+
+        observed: list[HostSessionEvent] = []
+        for _ in range(200):
+            event = await asyncio.wait_for(anext(watcher), timeout=2.0)
+            if (
+                isinstance(event, HostTransientDelta)
+                and event.run_id
+                in {followup.accepted_run_id, "run-b-retained-head"}
+            ):
+                observed.append(event)
+            elif (
+                isinstance(event, HostEvent)
+                and event.run_id == followup.accepted_run_id
+                and event.terminal_status is not None
+            ):
+                observed.append(event)
+            if len(observed) == 3:
+                break
+
+        assert len(observed) == 3
+        first, second, third = observed
+        assert isinstance(first, HostTransientDelta)
+        assert first.run_id == followup.accepted_run_id
+        assert isinstance(second, HostEvent)
+        assert second.run_id == followup.accepted_run_id
+        assert second.terminal_status is HostTerminalStatus.SUCCEEDED
+        assert isinstance(third, HostTransientDelta)
+        assert third.run_id == "run-b-retained-head"
+        await _close_iterator(watcher)
+
+
+@pytest.mark.asyncio
+async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C opener 不接收 A local notice，B fence 仍强制多页追平 A terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: opener-local waiter 与 page-read 观测注入工具。
+    :returns: ``None``。
+    :raises AssertionError: opener 隔离、fence 或 cursor/page 顺序漂移时抛出。
+    """
+
+    release_a = asyncio.Event()
+    release_b = asyncio.Event()
+    factory_a = _Factory(
+        _WORKER_MODE_PAGED_FINAL,
+        release_a,
+        diagnostic_count=140,
+    )
+    factory_c = _Factory(_WORKER_MODE_BLOCKING, release_b)
+    waiter_a = _ControlledSessionEventReconciliationWaiter()
+    waiter_c = _ControlledSessionEventReconciliationWaiter()
+    waiter_factory = _ReconciliationWaiterFactory((waiter_a, waiter_c))
+    original_terminal_watermark_hook = (
+        HostTransientDeltaHub.advance_committed_terminal_event_sequence_high_watermark
+    )
+    page_read_spy = _SessionEventPageReadSpy(
+        _read_session_host_events_after
+    )
+    monkeypatch.setattr(
+        _OPEN_HOST_MODULE,
+        "_new_session_event_reconciliation_waiter",
+        waiter_factory,
+    )
+    monkeypatch.setattr(
+        _OPEN_HOST_MODULE,
+        "_read_session_host_events_after",
+        page_read_spy,
+    )
+    shared_db_path = tmp_path / "shared-host.sqlite3"
+    shared_lane_db_path = tmp_path / "shared-lane.sqlite3"
+    options_a = replace(
+        _options(tmp_path / "opener-a", factory_a),
+        db_path=shared_db_path,
+        lane_db_path=shared_lane_db_path,
+    )
+    options_c = replace(
+        _options(tmp_path / "opener-c", factory_c),
+        db_path=shared_db_path,
+        lane_db_path=shared_lane_db_path,
+    )
+    assert options_a.db_path == options_c.db_path
+    assert options_a.lane_db_path == options_c.lane_db_path
+    assert options_a.artifact_root != options_c.artifact_root
+    assert options_a.worker_factory is not options_c.worker_factory
+
+    manager_a = open_host(options_a)
+    host_a = await manager_a.__aenter__()
+    manager_c = open_host(options_c)
+    watcher: HostSessionEventIterator | None = None
+    first_next: asyncio.Task[HostSessionEvent] | None = None
+    try:
+        session = await host_a.ensure_session(_ensure_request("dual-opener-fence"))
+        run_a = await host_a.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "dual-opener-run-a"),
+        )
+        await asyncio.wait_for(factory_a.accepted_event.wait(), timeout=2.0)
+
+        host_c = await manager_c.__aenter__()
+        assert isinstance(host_a, _PublicHostHandle)
+        assert isinstance(host_c, _PublicHostHandle)
+        hub_a = host_a._transient_delta_hub
+        hub_c = host_c._transient_delta_hub
+        hook_calls_a = _TerminalWatermarkHookCallCounter(
+            target_hub=hub_a,
+            hook=original_terminal_watermark_hook,
+        )
+        hook_calls_c = _TerminalWatermarkHookCallCounter(
+            target_hub=hub_c,
+            hook=original_terminal_watermark_hook,
+        )
+
+        def _record_instance_terminal_watermark_hook(
+            hub: HostTransientDeltaHub,
+            session_id: str,
+            event_sequence: int,
+        ) -> bool:
+            """把 class hook 调用路由到对应 opener 实例计数器。
+
+            :param hub: 实际收到调用的 opener-local hub。
+            :param session_id: notice Session 标识。
+            :param event_sequence: notice terminal sequence。
+            :returns: 对应 opener production hook 的 watermark 前移结果。
+            :raises AssertionError: 未登记 opener 收到调用时抛出。
+            :raises Exception: production hook 失败时原样透传。
+            """
+
+            if hub is hub_a:
+                return hook_calls_a(hub, session_id, event_sequence)
+            if hub is hub_c:
+                return hook_calls_c(hub, session_id, event_sequence)
+            raise AssertionError("terminal hook called for unknown opener")
+
+        monkeypatch.setattr(
+            HostTransientDeltaHub,
+            "advance_committed_terminal_event_sequence_high_watermark",
+            _record_instance_terminal_watermark_hook,
+        )
+        page_read_spy.set_target_session(session.session_id)
+        watcher = await host_c.watch_session_events(session.session_id)
+        first_next = asyncio.create_task(anext(watcher))
+        await _wait_for_wait_call_count(waiter_c, 1)
+        pre_action_a_watermark = (
+            hub_a.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+        )
+        pre_action_c_watermark = (
+            hub_c.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+        )
+        assert pre_action_a_watermark == 0
+        assert pre_action_c_watermark == 0
+
+        release_a.set()
+        terminal_a = await _wait_run_terminal(host_a, run_a.accepted_run_id)
+        assert terminal_a.status is RunStatus.SUCCEEDED
+        assert first_next.done() is False
+        assert page_read_spy.cursors == []
+        assert hook_calls_a.call_count >= 1
+        assert (
+            hub_a.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+            > pre_action_a_watermark
+        )
+        assert hook_calls_c.call_count == 0
+        assert (
+            hub_c.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+            == pre_action_c_watermark
+        )
+
+        run_b = await host_c.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "dual-opener-run-b"),
+        )
+        await asyncio.wait_for(factory_c.accepted_event.wait(), timeout=2.0)
+        attempt_id, execution_id, b_fence = (
+            _attempt_identity_and_started_sequence(
+                options_c.db_path,
+                run_id=run_b.accepted_run_id,
+            )
+        )
+        _publish_fenced_reasoning_delta(
+            host_c,
+            session_id=session.session_id,
+            run_id=run_b.accepted_run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            durable_causal_fence_event_sequence=b_fence,
+            worker_event_index=1,
+        )
+        assert isinstance(watcher, _HostSessionEventIterator)
+        assert watcher._subscription.retained_items == 1
+
+        observed_terminal_a: HostEvent | None = None
+        observed_b: HostTransientDelta | None = None
+        event = await asyncio.wait_for(first_next, timeout=2.0)
+        first_next = None
+        for _ in range(500):
+            if (
+                isinstance(event, HostEvent)
+                and event.run_id == run_a.accepted_run_id
+                and event.terminal_status is not None
+            ):
+                observed_terminal_a = event
+            if (
+                isinstance(event, HostTransientDelta)
+                and event.run_id == run_b.accepted_run_id
+            ):
+                observed_b = event
+                break
+            assert watcher._subscription.retained_items == 1
+            event = await asyncio.wait_for(anext(watcher), timeout=2.0)
+
+        assert observed_terminal_a is not None
+        assert observed_terminal_a.terminal_status is HostTerminalStatus.SUCCEEDED
+        assert observed_b is not None
+        assert len(page_read_spy.cursors) >= 3
+        assert page_read_spy.cursors == sorted(set(page_read_spy.cursors))
+        assert waiter_c.timeout_count == 0
+        assert hook_calls_c.call_count == 0
+        assert (
+            hub_c.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+            == pre_action_c_watermark
+        )
+        assert (
+            b_fence
+            > observed_terminal_a.event_sequence
+        )
+    finally:
+        if first_next is not None and not first_next.done():
+            first_next.cancel()
+            with suppress(asyncio.CancelledError):
+                await first_next
+        if watcher is not None:
+            await watcher.aclose()
+        await manager_c.__aexit__(None, None, None)
+        await manager_a.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_dual_opener_empty_mailbox_reconciles_one_page_per_timeout_and_close_wakes(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C 每次 empty-mailbox timeout 只读一页，且 close 不等待下一 tick。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: opener-local waiter 与 page-read 观测注入工具。
+    :returns: ``None``。
+    :raises AssertionError: periodic reconcile 或 close readiness 漂移时抛出。
+    """
+
+    release_a = asyncio.Event()
+    factory_a = _Factory(
+        _WORKER_MODE_PAGED_FINAL,
+        release_a,
+        diagnostic_count=140,
+    )
+    factory_c = _Factory(_WORKER_MODE_BLOCKING, asyncio.Event())
+    waiter_a = _ControlledSessionEventReconciliationWaiter()
+    waiter_c = _ControlledSessionEventReconciliationWaiter()
+    monkeypatch.setattr(
+        _OPEN_HOST_MODULE,
+        "_new_session_event_reconciliation_waiter",
+        _ReconciliationWaiterFactory((waiter_a, waiter_c)),
+    )
+    page_read_spy = _SessionEventPageReadSpy(
+        _read_session_host_events_after
+    )
+    monkeypatch.setattr(
+        _OPEN_HOST_MODULE,
+        "_read_session_host_events_after",
+        page_read_spy,
+    )
+
+    shared_db_path = tmp_path / "shared-host.sqlite3"
+    shared_lane_db_path = tmp_path / "shared-lane.sqlite3"
+    options_a = replace(
+        _options(tmp_path / "opener-a", factory_a),
+        db_path=shared_db_path,
+        lane_db_path=shared_lane_db_path,
+    )
+    options_c = replace(
+        _options(tmp_path / "opener-c", factory_c),
+        db_path=shared_db_path,
+        lane_db_path=shared_lane_db_path,
+    )
+    assert options_a.db_path == options_c.db_path
+    assert options_a.lane_db_path == options_c.lane_db_path
+    assert options_a.artifact_root != options_c.artifact_root
+    assert options_a.worker_factory is not options_c.worker_factory
+    manager_a = open_host(options_a)
+    host_a = await manager_a.__aenter__()
+    manager_c = open_host(options_c)
+    watcher: HostSessionEventIterator | None = None
+    next_task: asyncio.Task[HostSessionEvent] | None = None
+    try:
+        session = await host_a.ensure_session(
+            _ensure_request("dual-opener-periodic")
+        )
+        run_a = await host_a.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "dual-opener-periodic-a"),
+        )
+        await asyncio.wait_for(factory_a.accepted_event.wait(), timeout=2.0)
+        host_c = await manager_c.__aenter__()
+        page_read_spy.set_target_session(session.session_id)
+        watcher = await host_c.watch_session_events(session.session_id)
+        next_task = asyncio.create_task(anext(watcher))
+        await _wait_for_wait_call_count(waiter_c, 1)
+
+        release_a.set()
+        await _wait_run_terminal(host_a, run_a.accepted_run_id)
+        assert next_task.done() is False
+        assert page_read_spy.cursors == []
+        assert isinstance(host_c, _PublicHostHandle)
+        assert (
+            host_c._transient_delta_hub.committed_terminal_event_sequence_high_watermark(
+                session.session_id
+            )
+            == 0
+        )
+
+        current_wait_call = 1
+        observed_terminal: HostEvent | None = None
+        while observed_terminal is None:
+            before_page_count = len(page_read_spy.cursors)
+            waiter_c.release_one_timeout()
+            assert next_task is not None
+            event = await asyncio.wait_for(next_task, timeout=2.0)
+            next_task = None
+            assert len(page_read_spy.cursors) == before_page_count + 1
+            if (
+                isinstance(event, HostEvent)
+                and event.run_id == run_a.accepted_run_id
+                and event.terminal_status is not None
+            ):
+                observed_terminal = event
+                break
+
+            while observed_terminal is None:
+                next_task = asyncio.create_task(anext(watcher))
+                completed = await _wait_for_task_or_wait_call(
+                    next_task,
+                    waiter_c,
+                    current_wait_call + 1,
+                )
+                if not completed:
+                    current_wait_call += 1
+                    break
+                event = await next_task
+                next_task = None
+                if (
+                    isinstance(event, HostEvent)
+                    and event.run_id == run_a.accepted_run_id
+                    and event.terminal_status is not None
+                ):
+                    observed_terminal = event
+
+        assert observed_terminal is not None
+        assert observed_terminal.terminal_status is HostTerminalStatus.SUCCEEDED
+        assert len(page_read_spy.cursors) >= 3
+        assert waiter_c.timeout_count == len(page_read_spy.cursors)
+        assert page_read_spy.cursors == sorted(set(page_read_spy.cursors))
+
+        next_task = asyncio.create_task(anext(watcher))
+        await _wait_for_wait_call_count(waiter_c, current_wait_call + 1)
+        close_task = asyncio.create_task(host_c.close())
+        await asyncio.wait_for(close_task, timeout=2.0)
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(next_task, timeout=0.5)
+        next_task = None
+    finally:
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await next_task
+        if watcher is not None:
+            await watcher.aclose()
+        await manager_c.__aexit__(None, None, None)
+        await manager_a.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_consumer_early_cancel_does_not_cancel_run_or_write_eventlog(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -628,7 +1789,7 @@ async def test_consumer_early_cancel_does_not_cancel_run_or_write_eventlog(
     options = _options(tmp_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request("watch-cancel"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         consumer = asyncio.create_task(_consume_forever(watcher))
 
         followup = await host.submit_followup(
@@ -670,20 +1831,18 @@ async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
     host = await manager.__aenter__()
     session = await host.ensure_session(_ensure_request("watch-cleanup"))
 
-    never_started = host.watch_session_events(session.session_id)
+    never_started = await host.watch_session_events(session.session_id)
     assert _subscription_count(host, session.session_id) == 1
     await _close_iterator(never_started)
     assert _subscription_count(host, session.session_id) == 0
 
-    missing = host.watch_session_events("missing-session")
-    assert _subscription_count(host, "missing-session") == 1
     with pytest.raises(HostApiError) as missing_exc:
-        await anext(missing)
+        await host.watch_session_events("missing-session")
     assert missing_exc.value.code is HostApiErrorCode.NOT_FOUND
     assert missing_exc.value.retryable is False
     assert _subscription_count(host, "missing-session") == 0
 
-    first_cancel = host.watch_session_events(session.session_id)
+    first_cancel = await host.watch_session_events(session.session_id)
     first_next = asyncio.ensure_future(anext(first_cancel))
     await asyncio.sleep(0.05)
     assert _subscription_count(host, session.session_id) == 1
@@ -692,7 +1851,7 @@ async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
         await first_next
     assert _subscription_count(host, session.session_id) == 0
 
-    started = host.watch_session_events(session.session_id)
+    started = await host.watch_session_events(session.session_id)
     await host.submit_followup(
         session.session_id,
         _followup_request(session.session_id, "started-aclose-run"),
@@ -703,7 +1862,7 @@ async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
     await _close_iterator(started)
     assert _subscription_count(host, session.session_id) == 0
 
-    close_watcher = host.watch_session_events(session.session_id)
+    close_watcher = await host.watch_session_events(session.session_id)
     close_next = asyncio.ensure_future(anext(close_watcher))
     await asyncio.sleep(0.05)
     await host.close()
@@ -711,7 +1870,7 @@ async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
         await asyncio.wait_for(close_next, timeout=1.0)
     assert _subscription_count(host, session.session_id) == 0
     with pytest.raises(HostClosedError):
-        host.watch_session_events(session.session_id)
+        await host.watch_session_events(session.session_id)
     await manager.__aexit__(None, None, None)
 
 
@@ -736,7 +1895,7 @@ async def test_watch_cancel_after_first_delta_detaches_without_cancelling_run(
         transient_stream_open_host_options(tmp_path, factory)
     ) as host:
         session = await host.ensure_session(_ensure_request("post-delta-cancel"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             _followup_request(
@@ -791,7 +1950,7 @@ async def test_watch_does_not_replay_pre_attach_transient_and_keeps_first_post_a
         )
         await _wait_run_terminal(host, first.accepted_run_id)
 
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         second = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "post-attach-run"),
@@ -820,7 +1979,7 @@ async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach
     first_options = _options(first_path, _Factory(_WORKER_MODE_FINAL))
     async with open_host(first_options) as host:
         session = await host.ensure_session(_ensure_request("durable-failure-first"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "durable-failure-first-run"),
@@ -846,11 +2005,12 @@ async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach
         assert _subscription_count(host, session.session_id) == 0
 
     subsequent_path = tmp_path / "subsequent"
-    subsequent_factory = TransientStreamWorkerFactory(
-        counts=TransientStreamCounts(content=0, reasoning=1, tool_call=0),
-        final_answer="durable-failure-subsequent-final",
+    subsequent_release = asyncio.Event()
+    subsequent_factory = _Factory(
+        _WORKER_MODE_CONTROLLED_TRANSIENT_FINAL,
+        subsequent_release,
     )
-    subsequent_options = transient_stream_open_host_options(
+    subsequent_options = _options(
         subsequent_path,
         subsequent_factory,
     )
@@ -858,7 +2018,7 @@ async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach
         session = await host.ensure_session(
             _ensure_request("durable-failure-subsequent")
         )
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             _followup_request(
@@ -868,6 +2028,7 @@ async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach
         )
         transient = await _next_transient(watcher)
         assert transient.run_id == followup.accepted_run_id
+        subsequent_release.set()
         await _wait_run_terminal(host, followup.accepted_run_id)
         durable = read_transient_durable_snapshot(
             subsequent_options.db_path,
@@ -903,7 +2064,7 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
     failed_factory = _Factory(_WORKER_MODE_FAILED)
     async with open_host(_options(tmp_path / "failed", failed_factory)) as host:
         session = await host.ensure_session(_ensure_request("watch-failed"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "followup-failed"),
@@ -921,7 +2082,7 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
     cancel_factory = _Factory(_WORKER_MODE_BLOCKING, release_event)
     async with open_host(_options(tmp_path / "cancelled", cancel_factory)) as host:
         session = await host.ensure_session(_ensure_request("watch-cancelled"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "followup-active"),
@@ -963,7 +2124,7 @@ async def test_empty_final_answer_terminal_projects_as_failed_event(
     factory = _Factory(_WORKER_MODE_EMPTY_FINAL)
     async with open_host(_options(tmp_path, factory)) as host:
         session = await host.ensure_session(_ensure_request("watch-empty-final"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "followup-empty-final"),
@@ -990,15 +2151,14 @@ async def test_watch_lifecycle_errors_and_closed_session_watch(
     host = await manager.__aenter__()
     await host.close()
     with pytest.raises(HostClosedError):
-        host.watch_session_events("missing-session")
+        await host.watch_session_events("missing-session")
     await manager.__aexit__(None, None, None)
 
     async with open_host(
         _options(tmp_path / "open", _Factory(_WORKER_MODE_FINAL))
     ) as host:
-        missing_watcher = host.watch_session_events("missing-session")
         with pytest.raises(HostApiError) as exc_info:
-            await anext(missing_watcher)
+            await host.watch_session_events("missing-session")
         assert exc_info.value.code is HostApiErrorCode.NOT_FOUND
 
         session = await host.ensure_session(_ensure_request("watch-closed"))
@@ -1010,7 +2170,7 @@ async def test_watch_lifecycle_errors_and_closed_session_watch(
                 reason="user_closed_input",
             ),
         )
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         await _close_iterator(watcher)
 
 
@@ -1157,14 +2317,142 @@ async def _cancel_pending_next_iteration(
     raise AssertionError("watcher did not enter a pending next iteration")
 
 
-async def _close_iterator(iterator: AsyncIterator[HostSessionEvent]) -> None:
+async def _wait_for_wait_call_count(
+    waiter: _ControlledSessionEventReconciliationWaiter,
+    expected_count: int,
+) -> None:
+    """等待 controlled waiter 进入指定次数的 readiness wait。
+
+    :param waiter: 目标 opener waiter。
+    :param expected_count: 期待的累计调用次数。
+    :returns: ``None``。
+    :raises AssertionError: bounded event-loop turns 内未进入时抛出。
+    """
+
+    for _ in range(2_000):
+        if waiter.wait_call_count >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("reconciliation waiter did not reach expected call count")
+
+
+async def _wait_for_task_or_wait_call(
+    task: asyncio.Task[HostSessionEvent],
+    waiter: _ControlledSessionEventReconciliationWaiter,
+    expected_wait_call_count: int,
+) -> bool:
+    """等待 anext 完成或 iterator 进入下一次 readiness wait。
+
+    :param task: 当前唯一 active ``anext`` task。
+    :param waiter: 当前 opener controlled waiter。
+    :param expected_wait_call_count: 用于识别 page 已耗尽的下一 wait 次数。
+    :returns: task 先完成时返回 ``True``；waiter 先进入时返回 ``False``。
+    :raises AssertionError: bounded event-loop turns 内两者均未发生时抛出。
+    """
+
+    for _ in range(4_000):
+        if task.done():
+            return True
+        if waiter.wait_call_count >= expected_wait_call_count:
+            return False
+        await asyncio.sleep(0)
+    raise AssertionError("session iterator did not reach deterministic barrier")
+
+
+async def _close_iterator(iterator: HostSessionEventIterator) -> None:
     """关闭测试中持有的 async generator iterator。
 
     :param iterator: HostSessionEvent async iterator。
     :returns: ``None``。
     """
 
-    await cast(_ClosableSessionEventIterator, iterator).aclose()
+    await iterator.aclose()
+
+
+def _attempt_identity_and_started_sequence(
+    db_path: pathlib.Path,
+    *,
+    run_id: str,
+) -> tuple[str, str, int]:
+    """从 durable state 读取 current Attempt identity 与 start fence。
+
+    :param db_path: Host durable SQLite 路径。
+    :param run_id: 目标 Run 标识。
+    :returns: ``attempt_id``、``execution_id`` 与严格正整数 start sequence。
+    :raises AssertionError: durable row 缺失或字段 shape 非法时抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            f"""
+            SELECT attempt.attempt_id,
+                   attempt.execution_id,
+                   attempt.started_event_sequence
+              FROM {TABLE_HOST_RUNS} AS run
+              JOIN {TABLE_HOST_ATTEMPTS} AS attempt
+                ON attempt.attempt_id = run.current_attempt_id
+             WHERE run.run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    attempt_id, execution_id, started_event_sequence = row
+    assert isinstance(attempt_id, str) and attempt_id
+    assert isinstance(execution_id, str) and execution_id
+    assert (
+        isinstance(started_event_sequence, int)
+        and not isinstance(started_event_sequence, bool)
+        and started_event_sequence > 0
+    )
+    return attempt_id, execution_id, started_event_sequence
+
+
+def _publish_fenced_reasoning_delta(
+    host: Host,
+    *,
+    session_id: str,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    durable_causal_fence_event_sequence: int,
+    worker_event_index: int,
+) -> None:
+    """通过指定 opener 的真实 delivery owner 发布 fenced test candidate。
+
+    :param host: ``open_host`` 返回的 C opener handle。
+    :param session_id: candidate Session 标识。
+    :param run_id: candidate Run 标识。
+    :param attempt_id: candidate Attempt 标识。
+    :param execution_id: candidate execution 标识。
+    :param durable_causal_fence_event_sequence: durable Attempt start fence。
+    :param worker_event_index: execution 内事件序号。
+    :returns: ``None``。
+    :raises AssertionError: host 不是 production handle 时抛出。
+    """
+
+    if not isinstance(host, _PublicHostHandle):
+        raise AssertionError("expected production _PublicHostHandle")
+    host._transient_delta_hub.publish(
+        ValidatedTransientDeltaCandidate(
+            session_id=session_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            worker_event_index=worker_event_index,
+            durable_causal_fence_event_sequence=(
+                durable_causal_fence_event_sequence
+            ),
+            observed_at=datetime(2026, 7, 21, 1, 2, 3, tzinfo=UTC),
+            type=HostTransientDeltaType.REASONING_DELTA,
+            data=HostReasoningDelta(
+                iteration_id="iteration-fenced",
+                text_delta="fenced-delta",
+            ),
+        )
+    )
 
 
 async def _wait_run_terminal(host: Host, run_id: str) -> RunSnapshot:
@@ -1398,6 +2686,10 @@ def _options(tmp_path: pathlib.Path, worker_factory: _Factory) -> OpenHostOption
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+        session_event_delivery_policy=HostSessionEventDeliveryPolicy(
+            transient_mailbox_max_items=512,
+            max_subscriptions_per_session=4,
+        ),
     )
 
 

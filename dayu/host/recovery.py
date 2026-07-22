@@ -28,6 +28,7 @@ from dayu.host.durable.run_transition import (
     StartupRecoveringLostInput,
     close_startup_orphan_attempt_in_transaction,
     lose_recovering_run_in_transaction,
+    project_terminal_notice_from_exact_run_event,
     read_cancel_requested_event_from_run_link,
     start_recovery_run_with_starting_attempt_in_transaction,
 )
@@ -46,6 +47,10 @@ from dayu.host.durable.state import (
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.terminal_post_commit import (
+    TerminalPostCommitNotice,
+    TerminalPostCommitPort,
+)
 from dayu.host.recovery_process import (
     DurableOrphanCandidate,
     OrphanClassification,
@@ -151,11 +156,13 @@ class StartupRecoveryScanResult:
     :param pending_dispatches: 本次 scan 事务提交后唤醒的 pending dispatch 摘要。
     :param queue_promotion_sessions: 本次 scan 事务提交后唤醒 queue
         promotion 的 Session id。
+    :param terminal_notices: 本次 transaction 提交的 exact terminal notices。
     """
 
     actions: tuple[StartupRecoveryAction, ...]
     pending_dispatches: tuple[PendingDispatchRecord, ...] = ()
     queue_promotion_sessions: tuple[str, ...] = ()
+    terminal_notices: tuple[TerminalPostCommitNotice, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +220,7 @@ class _StartupRecoveryBatchOperation:
         actions: list[StartupRecoveryAction] = []
         pending_dispatches: list[PendingDispatchRecord] = []
         queue_promotion_sessions: list[str] = []
+        terminal_notices: list[TerminalPostCommitNotice] = []
         seen_queue_promotion_sessions = set(self.seen_queue_promotion_sessions)
         for run in runs:
             actions.append(
@@ -223,6 +231,7 @@ class _StartupRecoveryBatchOperation:
                     pending_dispatches,
                     queue_promotion_sessions,
                     seen_queue_promotion_sessions,
+                    terminal_notices,
                 )
             )
         next_cursor = self.cursor
@@ -233,6 +242,12 @@ class _StartupRecoveryBatchOperation:
                 actions=tuple(actions),
                 pending_dispatches=tuple(pending_dispatches),
                 queue_promotion_sessions=tuple(queue_promotion_sessions),
+                terminal_notices=tuple(
+                    sorted(
+                        terminal_notices,
+                        key=lambda notice: notice.terminal_event_sequence,
+                    )
+                ),
             ),
             next_cursor=next_cursor,
             page_size=len(runs),
@@ -259,6 +274,7 @@ class StartupRecoveryScanner:
 
     transaction_runner: HostTransactionRunner
     event_log_store: EventLogStore
+    terminal_post_commit_port: TerminalPostCommitPort
     process_probe: ProcessLivenessProbe = StdlibPidLivenessProbe()
     dispatch_wakeup_port: AdmissionWakeupPort | None = None
     recovery_owner_host_instance_id: str | None = None
@@ -289,6 +305,7 @@ class StartupRecoveryScanner:
         actions: list[StartupRecoveryAction] = []
         pending_dispatches: list[PendingDispatchRecord] = []
         queue_promotion_sessions: list[str] = []
+        terminal_notices: list[TerminalPostCommitNotice] = []
         seen_queue_promotion_sessions: set[str] = set()
         while cursor != upper_watermark:
             batch = self.transaction_runner.run_write(
@@ -312,6 +329,7 @@ class StartupRecoveryScanner:
             queue_promotion_sessions.extend(
                 batch.result.queue_promotion_sessions
             )
+            terminal_notices.extend(batch.result.terminal_notices)
             seen_queue_promotion_sessions.update(
                 batch.result.queue_promotion_sessions
             )
@@ -323,6 +341,7 @@ class StartupRecoveryScanner:
             actions=tuple(actions),
             pending_dispatches=tuple(pending_dispatches),
             queue_promotion_sessions=tuple(queue_promotion_sessions),
+            terminal_notices=tuple(terminal_notices),
         )
 
     def _wake_after_committed_batch(self, result: StartupRecoveryScanResult) -> None:
@@ -333,6 +352,8 @@ class StartupRecoveryScanner:
         :raises Exception: scheduler wake bridge 失败时透传，中止 startup READY。
         """
 
+        for notice in result.terminal_notices:
+            self.terminal_post_commit_port.notify_terminal_post_commit(notice)
         if self.dispatch_wakeup_port is not None:
             for pending_dispatch in result.pending_dispatches:
                 self.dispatch_wakeup_port.wake_dispatch(pending_dispatch)
@@ -354,6 +375,7 @@ class StartupRecoveryScanner:
         pending_dispatches: list[PendingDispatchRecord],
         queue_promotion_sessions: list[str],
         seen_queue_promotion_sessions: set[str],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> StartupRecoveryAction:
         """分类单个非终态 Run。
 
@@ -365,6 +387,7 @@ class StartupRecoveryScanner:
             queue promotion 的 Session id 集合。
         :param seen_queue_promotion_sessions: 已加入
             ``queue_promotion_sessions`` 的 Session id 集合。
+        :param terminal_notices: 本 batch transaction-local exact notices。
         :returns: 单个 Run 的分类结果。
         """
 
@@ -396,7 +419,11 @@ class StartupRecoveryScanner:
             )
         if run.status is RunStatus.RECOVERING:
             return self._classify_recovering(
-                transaction, run, policy, pending_dispatches
+                transaction,
+                run,
+                policy,
+                pending_dispatches,
+                terminal_notices,
             )
         if run.status in (RunStatus.RUNNING, RunStatus.CANCELLING):
             if (
@@ -415,7 +442,11 @@ class StartupRecoveryScanner:
                     "accepted_cancel_watchdog_owner",
                 )
             return self._classify_active_or_cancelling(
-                transaction, run, policy, pending_dispatches
+                transaction,
+                run,
+                policy,
+                pending_dispatches,
+                terminal_notices,
             )
         return _action(run, StartupRecoveryDecision.INVALID_STATE, "unsupported_status")
 
@@ -425,6 +456,7 @@ class StartupRecoveryScanner:
         run: RunRow,
         policy: StartupRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> StartupRecoveryAction:
         """分类 recovering Run。
 
@@ -432,6 +464,7 @@ class StartupRecoveryScanner:
         :param run: recovering Run row。
         :param policy: scan 策略。
         :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
+        :param terminal_notices: 当前 batch 的 exact terminal notices。
         :returns: 分类结果。
         """
 
@@ -466,6 +499,14 @@ class StartupRecoveryScanner:
                 recovery_dispatch_limit=policy.recovery_dispatch_limit,
             ),
         )
+        if result.status is StateMutationStatus.UPDATED:
+            terminal_notices.append(
+                project_terminal_notice_from_exact_run_event(
+                    result.run,
+                    result.run_event,
+                    wake_queue_promotion=True,
+                )
+            )
         return _action_from_mutation(
             run,
             result.status,
@@ -479,6 +520,7 @@ class StartupRecoveryScanner:
         run: RunRow,
         policy: StartupRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> StartupRecoveryAction:
         """分类 running 或 cancelling Run。
 
@@ -486,6 +528,7 @@ class StartupRecoveryScanner:
         :param run: running 或 cancelling Run row。
         :param policy: scan 策略。
         :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
+        :param terminal_notices: 当前 batch 的 exact terminal notices。
         :returns: 分类结果。
         """
 
@@ -519,6 +562,7 @@ class StartupRecoveryScanner:
             classification,
             policy,
             pending_dispatches,
+            terminal_notices,
         )
 
     def _classify_owner(
@@ -559,6 +603,7 @@ class StartupRecoveryScanner:
         proof: PositiveOrphanProof,
         policy: StartupRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> StartupRecoveryAction:
         """对 positive orphan proof 执行 CAS closeout。
 
@@ -569,6 +614,7 @@ class StartupRecoveryScanner:
         :param proof: positive orphan proof。
         :param policy: scan 策略。
         :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
+        :param terminal_notices: 当前 batch 的 exact terminal notices。
         :returns: closeout 分类结果。
         """
 
@@ -617,6 +663,14 @@ class StartupRecoveryScanner:
             else StartupRecoveryDecision.RUN_LOST,
             reason,
         )
+        if not recoverable and result.status is StateMutationStatus.UPDATED:
+            terminal_notices.append(
+                project_terminal_notice_from_exact_run_event(
+                    result.run,
+                    result.run_event,
+                    wake_queue_promotion=True,
+                )
+            )
         if (
             not recoverable
             or result.status is not StateMutationStatus.UPDATED

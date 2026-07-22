@@ -3008,7 +3008,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
         session = await host.ensure_session(_ensure_request(args, smoke_run_id))
         session_id = session.session_id
         assembly.smoke_tool.track_session(session.session_id)
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         print(f"SMOKE SESSION session_id={session.session_id}")
         _assert_session_open(session, label="ensure-session")
         _print_session_observation(session, label="ensure-session")
@@ -3107,7 +3107,7 @@ async def _run_deterministic_compact_smoke(args: SmokeArgs, env: Mapping[str, st
             session = await host.ensure_session(_ensure_request(args, smoke_run_id))
             session_id = session.session_id
             assembly.smoke_tool.track_session(session.session_id)
-            watcher = host.watch_session_events(session.session_id)
+            watcher = await host.watch_session_events(session.session_id)
             print(f"SMOKE SESSION session_id={session.session_id}")
             _assert_session_open(session, label="ensure-session")
             _print_session_observation(session, label="ensure-session")

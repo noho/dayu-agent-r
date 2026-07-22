@@ -59,11 +59,36 @@ from dayu.host.recovery import (
     StartupRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
 
 _NOW = datetime(2026, 5, 19, 4, 5, 6, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "recovery-dispatch-test"})
 _INPUT_DIGEST = sha256_digest_json({"input": "recovery"})
+
+
+class _RecordingTerminalPort:
+    """记录 recovery/ingest exact terminal notices。"""
+
+    def __init__(self) -> None:
+        """初始化空记录器。
+
+        :returns: ``None``。
+        """
+
+        self.notices: list[TerminalPostCommitNotice] = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录 exact terminal notice。
+
+        :param notice: 已提交的精确通知。
+        :returns: ``None``。
+        """
+
+        self.notices.append(notice)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +192,7 @@ def test_recovering_scan_creates_new_attempt_dispatch_and_wakes_scheduler(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             recovery_owner_host_instance_id="host-instance-new",
@@ -203,6 +229,7 @@ def test_late_old_execution_event_after_recovery_dispatch_is_rejected(
         StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             recovery_owner_host_instance_id="host-instance-new",
@@ -211,6 +238,7 @@ def test_late_old_execution_event_after_recovery_dispatch_is_rejected(
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            terminal_post_commit_port=_RecordingTerminalPort(),
         ).ingest(_old_final_answer_candidate(old))
 
         assert result.status is EngineIngestStatus.REJECTED
@@ -235,6 +263,7 @@ def test_orphan_closeout_dispatch_invalid_state_reports_recovering_ready(
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             recovery_owner_host_instance_id="host-instance-new",
@@ -282,6 +311,7 @@ def _return_invalid_recovery_dispatch(
         run=read_run_by_id(transaction, request.run_id),
         attempt=None,
         dispatch_record=None,
+        run_event=None,
     )
 
 

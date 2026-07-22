@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Never
 
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.agent_entrypoint import (
@@ -57,7 +57,11 @@ from dayu.cli.run_keys import (
     new_running_key_monitor,
 )
 from dayu.cli.run_view import InteractiveRunView, new_interactive_run_view
-from dayu.cli.runtime_display import RuntimeDisplayController
+from dayu.cli.runtime_display import (
+    RuntimeActivityDisplay,
+    RuntimeDisplayController,
+    RuntimeThinkingDisplay,
+)
 from dayu.cli.session_terminal_cursor import (
     advance_cli_terminal_cursor,
     read_cli_terminal_cursor,
@@ -411,28 +415,65 @@ async def execute_interactive_on_session(
     effective_composer = new_interactive_composer(input_reader=effective_input_reader) if composer is None else composer
     effective_sigint_monitor_factory = CliSigintMonitor if sigint_monitor_factory is None else sigint_monitor_factory
     effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
-    if run_startup_reconnect:
-        startup_exit_code = await _run_existing_session_startup_reconnect(
-            host=host,
-            prepared=prepared,
-            session_id=session_id,
-        )
-        if startup_exit_code != EXIT_SUCCESS:
-            return startup_exit_code
-    return await _run_interactive_repl(
-        host=host,
-        runtime=prepared.runtime,
-        workspace_root=prepared.workspace_root,
-        invocation=prepared.invocation,
-        session_id=session_id,
-        run_overrides=prepared.run_overrides,
-        composer=effective_composer,
-        sigint_monitor_factory=effective_sigint_monitor_factory,
-        key_monitor_factory=effective_key_monitor_factory,
-        run_view=run_view,
-        detail=detail,
-        thinking=thinking,
+    effective_run_view = run_view
+    if effective_run_view is None and detail:
+        effective_run_view = new_interactive_run_view(show_activity=True)
+    effective_thinking_renderer = _new_thinking_renderer() if thinking else None
+    runtime_display = _new_runtime_display_controller(
+        activity_display=effective_run_view if detail else None,
+        thinking_display=effective_thinking_renderer,
     )
+    primary_error: BaseException | None = None
+    exit_code = EXIT_SUCCESS
+    try:
+        if runtime_display is not None:
+            await runtime_display.install_runtime_line_guard()
+        if run_startup_reconnect:
+            startup_exit_code = await _run_existing_session_startup_reconnect(
+                host=host,
+                prepared=prepared,
+                session_id=session_id,
+            )
+            if startup_exit_code != EXIT_SUCCESS:
+                exit_code = startup_exit_code
+            else:
+                exit_code = await _run_interactive_repl(
+                    host=host,
+                    runtime=prepared.runtime,
+                    workspace_root=prepared.workspace_root,
+                    invocation=prepared.invocation,
+                    session_id=session_id,
+                    run_overrides=prepared.run_overrides,
+                    composer=effective_composer,
+                    sigint_monitor_factory=effective_sigint_monitor_factory,
+                    key_monitor_factory=effective_key_monitor_factory,
+                    run_view=effective_run_view if detail else None,
+                    thinking_renderer=effective_thinking_renderer,
+                    runtime_display=runtime_display,
+                )
+        else:
+            exit_code = await _run_interactive_repl(
+                host=host,
+                runtime=prepared.runtime,
+                workspace_root=prepared.workspace_root,
+                invocation=prepared.invocation,
+                session_id=session_id,
+                run_overrides=prepared.run_overrides,
+                composer=effective_composer,
+                sigint_monitor_factory=effective_sigint_monitor_factory,
+                key_monitor_factory=effective_key_monitor_factory,
+                run_view=effective_run_view if detail else None,
+                thinking_renderer=effective_thinking_renderer,
+                runtime_display=runtime_display,
+            )
+    except BaseException as error:
+        primary_error = error
+    cleanup_error = await _close_runtime_display(runtime_display)
+    if primary_error is not None:
+        _raise_lifecycle_primary(primary_error, cleanup_error)
+    if cleanup_error is not None:
+        raise cleanup_error
+    return exit_code
 
 
 async def _prepare_session_runtime(
@@ -507,9 +548,7 @@ async def _run_existing_session_startup_reconnect(
             seen_terminal_event_ids=frozenset(cursor_record.seen_terminal_event_ids),
             poll_interval_seconds=DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
             outbox_lagged_max_attempts=ENTRYPOINT_STARTUP_OUTBOX_LAGGED_MAX_ATTEMPTS,
-            promotion_poll_interval_seconds=(
-                DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS
-            ),
+            promotion_poll_interval_seconds=(DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS),
             promotion_max_attempts=ENTRYPOINT_STARTUP_PROMOTION_MAX_ATTEMPTS,
         ),
     )
@@ -551,6 +590,219 @@ def _new_thinking_renderer() -> CliThinkingRenderer:
     return CliThinkingRenderer(options=CliThinkingRendererOptions(enabled=True))
 
 
+def _new_runtime_display_controller(
+    *,
+    activity_display: RuntimeActivityDisplay | None,
+    thinking_display: RuntimeThinkingDisplay | None,
+) -> RuntimeDisplayController | None:
+    """只在存在真实 callback/display consumer 时创建执行域。
+
+    :param activity_display: activity-like renderer；无 renderer 时为 ``None``。
+    :param thinking_display: thinking renderer；无 renderer 时为 ``None``。
+    :returns: 私有 display controller；两类 renderer 都不存在时返回 ``None``。
+    :raises RuntimeError: 私有 executor 构造失败时透传。
+    """
+
+    if activity_display is None and thinking_display is None:
+        return None
+    return RuntimeDisplayController(
+        activity_display=activity_display,
+        thinking_display=thinking_display,
+    )
+
+
+async def _close_runtime_display(
+    runtime_display: RuntimeDisplayController | None,
+) -> BaseException | None:
+    """关闭可选 display controller 并捕获 caller-cleanup failure。
+
+    :param runtime_display: invocation/prompt display controller。
+    :returns: close failure；无 controller 或成功时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if runtime_display is None:
+        return None
+    try:
+        await runtime_display.aclose()
+    except BaseException as error:
+        return error
+    return None
+
+
+async def _close_prompt_lifecycle(
+    *,
+    runtime_display: RuntimeDisplayController | None,
+    monitor: RunningKeyMonitor,
+    sigint_monitor: CliSigintMonitor,
+    submit_task: asyncio.Task[EntrypointRunTerminalResult] | None,
+    sigint_task: asyncio.Task[int] | None,
+    key_task: asyncio.Task[RunningKeyAction] | None,
+) -> BaseException | None:
+    """按 display -> caller-local 顺序关闭 prompt lifecycle。
+
+    :param runtime_display: prompt display controller。
+    :param monitor: prompt 按键 monitor。
+    :param sigint_monitor: prompt SIGINT monitor。
+    :param submit_task: 可选 Service submit/observation task。
+    :param sigint_task: 可选 SIGINT wait task。
+    :param key_task: 可选按键 wait task。
+    :returns: 首个 cleanup failure；全部成功时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    cleanup_error: BaseException | None = None
+    if runtime_display is not None:
+        runtime_display.begin_closing()
+    if submit_task is not None and not submit_task.done():
+        try:
+            await cancel_and_await_task(submit_task)
+        except BaseException as error:
+            cleanup_error = error
+    display_error = await _close_runtime_display(runtime_display)
+    if display_error is not None:
+        cleanup_error = _combine_lifecycle_cleanup_errors(
+            cleanup_error,
+            display_error,
+        )
+    try:
+        monitor.close()
+    except BaseException as error:
+        cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    try:
+        sigint_monitor.close()
+    except BaseException as error:
+        cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    if sigint_task is not None:
+        try:
+            await cancel_and_await_task(sigint_task)
+        except BaseException as error:
+            cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    if key_task is not None:
+        try:
+            await cancel_and_await_task(key_task)
+        except BaseException as error:
+            cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    return cleanup_error
+
+
+async def _close_interactive_turn_lifecycle(
+    *,
+    close_runtime_display: bool,
+    runtime_display: RuntimeDisplayController | None,
+    monitor: RunningKeyMonitor,
+    sigint_monitor: CliSigintMonitor,
+    submit_task: asyncio.Task[EntrypointRunTerminalResult] | None,
+    sigint_task: asyncio.Task[int] | None,
+    key_task: asyncio.Task[RunningKeyAction] | None,
+) -> BaseException | None:
+    """关闭 interactive failure display 与单轮 caller-local resource。
+
+    :param close_runtime_display: 当前 turn failure 是否结束整个 display lifecycle。
+    :param runtime_display: interactive invocation display controller。
+    :param monitor: 单轮按键 monitor。
+    :param sigint_monitor: 单轮 SIGINT monitor。
+    :param submit_task: 可选 Service submit/observation task。
+    :param sigint_task: 可选 SIGINT wait task。
+    :param key_task: 可选按键 wait task。
+    :returns: 首个 cleanup failure；全部成功时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    cleanup_error: BaseException | None = None
+    if close_runtime_display and runtime_display is not None:
+        runtime_display.begin_closing()
+    if submit_task is not None and not submit_task.done():
+        try:
+            await cancel_and_await_task(submit_task)
+        except BaseException as error:
+            cleanup_error = error
+    if close_runtime_display:
+        display_error = await _close_runtime_display(runtime_display)
+        if display_error is not None:
+            cleanup_error = _combine_lifecycle_cleanup_errors(
+                cleanup_error,
+                display_error,
+            )
+    try:
+        monitor.close()
+    except BaseException as error:
+        cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    try:
+        sigint_monitor.close()
+    except BaseException as error:
+        cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    if sigint_task is not None:
+        try:
+            await cancel_and_await_task(sigint_task)
+        except BaseException as error:
+            cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    if key_task is not None:
+        try:
+            await cancel_and_await_task(key_task)
+        except BaseException as error:
+            cleanup_error = _combine_lifecycle_cleanup_errors(cleanup_error, error)
+    return cleanup_error
+
+
+def _combine_lifecycle_cleanup_errors(
+    primary_error: BaseException | None,
+    later_error: BaseException,
+) -> BaseException:
+    """保留首个 lifecycle cleanup failure 并串接后续 failure。
+
+    :param primary_error: 既有首个 cleanup failure；尚无失败时为 ``None``。
+    :param later_error: 后续 cleanup failure。
+    :returns: 应继续传播的首个 cleanup failure。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if primary_error is None:
+        return later_error
+    _append_lifecycle_cleanup_cause(primary_error, later_error)
+    return primary_error
+
+
+def _append_lifecycle_cleanup_cause(
+    primary_error: BaseException,
+    later_error: BaseException,
+) -> None:
+    """把后续 caller cleanup failure 追加到既有 cause 链尾部。
+
+    :param primary_error: 必须保持 top-level identity 的首个 cleanup failure。
+    :param later_error: 后续 caller cleanup failure。
+    :returns: ``None``。
+    :raises RuntimeError: 检测到既有 cause 环时抛出。
+    """
+
+    current = primary_error
+    seen_ids: set[int] = set()
+    while current.__cause__ is not None:
+        current_id = id(current)
+        if current_id in seen_ids:
+            raise RuntimeError("CLI lifecycle cleanup cause chain contains a cycle")
+        seen_ids.add(current_id)
+        current = current.__cause__
+    current.__cause__ = later_error
+
+
+def _raise_lifecycle_primary(
+    primary_error: BaseException,
+    cleanup_error: BaseException | None,
+) -> Never:
+    """保持业务/cancellation primary，并附加 lifecycle cleanup cause。
+
+    :param primary_error: caller-visible primary failure。
+    :param cleanup_error: lifecycle cleanup failure；无失败时为 ``None``。
+    :returns: 本函数不返回。
+    :raises BaseException: 原样抛出 ``primary_error``。
+    """
+
+    if cleanup_error is None:
+        raise primary_error
+    raise primary_error from cleanup_error
+
+
 async def _submit_prompt_turn_handling_sigint(
     *,
     host: Host,
@@ -583,61 +835,69 @@ async def _submit_prompt_turn_handling_sigint(
     accepted_run = _PromptAcceptedRunState()
     renderer = activity_renderer
     thinking = thinking_renderer
-    runtime_display = RuntimeDisplayController(
+    runtime_display = _new_runtime_display_controller(
         activity_display=renderer,
         thinking_display=thinking,
     )
-    runtime_display.install_runtime_line_guard()
     monitor = NoopRunningKeyMonitor() if key_monitor is None else key_monitor
-    sigint_monitor.install()
-    observed_sigint_count = sigint_monitor.count
-    monitor.start()
-    submit_task = asyncio.create_task(
-        submit_entrypoint_turn_and_wait(
-            host,
-            request=EntrypointTurnRequest(
-                context=build_prompt_host_context(
-                    invocation,
-                    operation=_PROMPT_OPERATION_SUBMIT_FOLLOWUP,
-                ),
-                session_id=session_id,
-                client_request_id=prompt_submit_client_request_id(
-                    invocation,
-                    turn_index=PROMPT_TURN_INDEX,
-                ),
-                user_prompt=user_prompt,
-                tool_names=runtime.scene_inputs.tool_selection.tool_names,
-                behavior=FollowupBehavior.QUEUE,
-                target_run_id=None,
-                run_overrides=run_overrides,
-            ),
-            scene_inputs=runtime.scene_inputs,
-            host_assembly=runtime.host_assembly,
-            on_run_accepted=accepted_run.record,
-            on_activity=None if renderer is None else renderer.record,
-            on_thinking=None if thinking is None else thinking.record,
-        )
-    )
-    sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
-    key_task = asyncio.create_task(monitor.wait_next())
+    submit_task: asyncio.Task[EntrypointRunTerminalResult] | None = None
+    sigint_task: asyncio.Task[int] | None = None
+    key_task: asyncio.Task[RunningKeyAction] | None = None
+    primary_error: BaseException | None = None
+    terminal_result: EntrypointRunTerminalResult | None = None
     try:
+        if runtime_display is not None:
+            await runtime_display.install_runtime_line_guard()
+        sigint_monitor.install()
+        observed_sigint_count = sigint_monitor.count
+        monitor.start()
+        submit_task = asyncio.create_task(
+            submit_entrypoint_turn_and_wait(
+                host,
+                request=EntrypointTurnRequest(
+                    context=build_prompt_host_context(
+                        invocation,
+                        operation=_PROMPT_OPERATION_SUBMIT_FOLLOWUP,
+                    ),
+                    session_id=session_id,
+                    client_request_id=prompt_submit_client_request_id(
+                        invocation,
+                        turn_index=PROMPT_TURN_INDEX,
+                    ),
+                    user_prompt=user_prompt,
+                    tool_names=runtime.scene_inputs.tool_selection.tool_names,
+                    behavior=FollowupBehavior.QUEUE,
+                    target_run_id=None,
+                    run_overrides=run_overrides,
+                ),
+                scene_inputs=runtime.scene_inputs,
+                host_assembly=runtime.host_assembly,
+                on_run_accepted=accepted_run.record,
+                on_activity=None if renderer is None else renderer.record,
+                on_thinking=None if thinking is None else thinking.record,
+                callback_execution_port=runtime_display,
+            )
+        )
+        sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+        key_task = asyncio.create_task(monitor.wait_next())
         while True:
             done, _pending = await asyncio.wait(
                 (submit_task, sigint_task, key_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if submit_task in done:
-                terminal = await submit_task
-                runtime_display.finish_runtime_display()
-                return terminal
+                terminal_result = await submit_task
+                if runtime_display is not None:
+                    await runtime_display.finish_runtime_display()
+                break
             if key_task in done:
                 action = await key_task
                 if action is RunningKeyAction.TOGGLE_ACTIVITY:
-                    if renderer is not None:
-                        renderer.toggle_visible()
+                    if runtime_display is not None:
+                        await runtime_display.toggle_activity_display()
                     key_task = asyncio.create_task(monitor.wait_next())
                     continue
-                return await _cancel_prompt_turn_after_local_request(
+                terminal_result = await _cancel_prompt_turn_after_local_request(
                     host=host,
                     invocation=invocation,
                     accepted_run=accepted_run,
@@ -646,8 +906,9 @@ async def _submit_prompt_turn_handling_sigint(
                     observed_sigint_count=observed_sigint_count,
                     runtime_display=runtime_display,
                 )
+                break
             first_sigint_count = await sigint_task
-            return await _cancel_prompt_turn_after_local_request(
+            terminal_result = await _cancel_prompt_turn_after_local_request(
                 host=host,
                 invocation=invocation,
                 accepted_run=accepted_run,
@@ -656,12 +917,22 @@ async def _submit_prompt_turn_handling_sigint(
                 observed_sigint_count=first_sigint_count,
                 runtime_display=runtime_display,
             )
-    finally:
-        runtime_display.close()
-        monitor.close()
-        sigint_monitor.close()
-        await cancel_and_await_task(sigint_task)
-        await cancel_and_await_task(key_task)
+            break
+    except BaseException as error:
+        primary_error = error
+    cleanup_error = await _close_prompt_lifecycle(
+        runtime_display=runtime_display,
+        monitor=monitor,
+        sigint_monitor=sigint_monitor,
+        submit_task=submit_task,
+        sigint_task=sigint_task,
+        key_task=key_task,
+    )
+    if primary_error is not None:
+        _raise_lifecycle_primary(primary_error, cleanup_error)
+    if cleanup_error is not None:
+        raise cleanup_error
+    return terminal_result
 
 
 async def _cancel_prompt_turn_after_local_request(
@@ -672,7 +943,7 @@ async def _cancel_prompt_turn_after_local_request(
     submit_task: asyncio.Task[EntrypointRunTerminalResult],
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
-    runtime_display: RuntimeDisplayController,
+    runtime_display: RuntimeDisplayController | None,
 ) -> EntrypointRunTerminalResult | None:
     """本地取消请求后取消 prompt turn 并等待 Host terminal 或二次 SIGINT。
 
@@ -689,13 +960,17 @@ async def _cancel_prompt_turn_after_local_request(
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
-    runtime_display.finish_and_close_thinking()
+    if runtime_display is not None:
+        await runtime_display.finish_thinking_display()
+    if submit_task.done():
+        return await submit_task
     submit_task.cancel()
     with suppress(asyncio.CancelledError):
         await submit_task
     if accepted_run.run_id is None:
         return None
-    runtime_display.render_cancel_requested()
+    if runtime_display is not None:
+        await runtime_display.render_cancel_requested()
     return await _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
         host=host,
         invocation=invocation,
@@ -713,7 +988,7 @@ async def _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
     run_id: str,
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
-    runtime_display: RuntimeDisplayController,
+    runtime_display: RuntimeDisplayController | None,
 ) -> EntrypointRunTerminalResult | None:
     """发起 prompt Host cancel，并在二次 SIGINT 时本地退出。
 
@@ -754,7 +1029,8 @@ async def _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
         )
         if cancel_task in done:
             return await cancel_task
-        runtime_display.render_local_exit_after_cancel()
+        if runtime_display is not None:
+            await runtime_display.render_local_exit_after_cancel()
         cancel_task.cancel()
         with suppress(asyncio.CancelledError):
             await cancel_task
@@ -774,10 +1050,10 @@ async def _run_interactive_repl(
     sigint_monitor_factory: Callable[[], CliSigintMonitor],
     key_monitor_factory: Callable[[], RunningKeyMonitor] | None = None,
     run_view: InteractiveRunView | None = None,
+    thinking_renderer: CliThinkingRenderer | None = None,
+    runtime_display: RuntimeDisplayController | None = None,
     composer: InteractiveComposer | None = None,
     input_reader: Callable[[str], str] | None = None,
-    detail: bool = True,
-    thinking: bool = True,
 ) -> int:
     """运行 interactive REPL。
 
@@ -789,11 +1065,11 @@ async def _run_interactive_repl(
     :param run_overrides: 本命令所有 turn 复用的运行时 override。
     :param sigint_monitor_factory: 单轮 SIGINT monitor 工厂。
     :param key_monitor_factory: 单轮运行态按键 monitor 工厂；``None`` 表示默认 TTY policy。
-    :param run_view: interactive 运行态 view；``None`` 表示按 TTY policy 创建。
+    :param run_view: interactive 运行态 view；``None`` 表示不输出 activity。
+    :param thinking_renderer: invocation 级 thinking renderer；``None`` 表示不输出。
+    :param runtime_display: invocation 级私有 display execution domain。
     :param composer: 输入态 composer；``None`` 时使用 input reader adapter。
     :param input_reader: 旧式输入函数；仅在 ``composer`` 为 ``None`` 时使用。
-    :param detail: 是否显示运行态 activity stream。
-    :param thinking: 是否显示运行态 thinking 增量。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
@@ -804,63 +1080,57 @@ async def _run_interactive_repl(
         if composer is not None
         else InputReaderComposer(_read_user_input if input_reader is None else input_reader)
     )
-    effective_key_monitor_factory = (
-        new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
-    )
-    effective_run_view = run_view
-    if effective_run_view is None and detail:
-        effective_run_view = new_interactive_run_view(show_activity=True)
+    effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
     idle_interrupt_exit_pending = False
-    try:
-        while True:
-            try:
-                user_prompt = await effective_composer.read("dayu> ")
-            except EOFError:
-                idle_interrupt_exit_pending = False
-                return EXIT_SUCCESS
-            except KeyboardInterrupt:
-                if idle_interrupt_exit_pending:
-                    return EXIT_KEYBOARD_INTERRUPT
-                idle_interrupt_exit_pending = True
-                continue
+    while True:
+        try:
+            user_prompt = await effective_composer.read("dayu> ")
+        except EOFError:
             idle_interrupt_exit_pending = False
-            stripped_prompt = user_prompt.strip()
-            if stripped_prompt == "":
-                continue
-            terminal = await _submit_interactive_turn_handling_sigint(
-                host=host,
-                runtime=runtime,
-                invocation=invocation,
-                session_id=session_id,
-                turn_index=turn_index,
-                user_prompt=stripped_prompt,
-                run_overrides=run_overrides,
-                sigint_monitor=sigint_monitor_factory(),
-                run_view=effective_run_view if detail else None,
-                thinking_renderer=_new_thinking_renderer() if thinking else None,
-                key_monitor=effective_key_monitor_factory(),
-            )
-            if terminal is None:
+            return EXIT_SUCCESS
+        except KeyboardInterrupt:
+            if idle_interrupt_exit_pending:
                 return EXIT_KEYBOARD_INTERRUPT
-            if effective_run_view is None:
-                render_exit_code = render_interactive_terminal_result(terminal)
-            else:
-                render_exit_code = effective_run_view.render_terminal_result(terminal)
-            await advance_cli_terminal_cursor(
-                workspace_root=workspace_root,
-                session_id=session_id,
-                terminal_event_id=terminal.terminal_event_id,
-                event_sequence=terminal.event_sequence,
+            idle_interrupt_exit_pending = True
+            continue
+        idle_interrupt_exit_pending = False
+        stripped_prompt = user_prompt.strip()
+        if stripped_prompt == "":
+            continue
+        terminal = await _submit_interactive_turn_handling_sigint(
+            host=host,
+            runtime=runtime,
+            invocation=invocation,
+            session_id=session_id,
+            turn_index=turn_index,
+            user_prompt=stripped_prompt,
+            run_overrides=run_overrides,
+            sigint_monitor=sigint_monitor_factory(),
+            run_view=run_view,
+            thinking_renderer=thinking_renderer,
+            runtime_display=runtime_display,
+            key_monitor=effective_key_monitor_factory(),
+        )
+        if terminal is None:
+            return EXIT_KEYBOARD_INTERRUPT
+        if run_view is None:
+            render_exit_code = render_interactive_terminal_result(terminal)
+        elif runtime_display is None:
+            raise RuntimeError("interactive run view requires runtime display")
+        else:
+            render_exit_code = await runtime_display.render_terminal_result(
+                run_view.render_terminal_result,
+                terminal,
             )
-            if render_exit_code != EXIT_SUCCESS:
-                return render_exit_code
-            turn_index += 1
-    finally:
-        if effective_run_view is not None:
-            RuntimeDisplayController(
-                activity_display=effective_run_view,
-                thinking_display=None,
-            ).close_activity()
+        await advance_cli_terminal_cursor(
+            workspace_root=workspace_root,
+            session_id=session_id,
+            terminal_event_id=terminal.terminal_event_id,
+            event_sequence=terminal.event_sequence,
+        )
+        if render_exit_code != EXIT_SUCCESS:
+            return render_exit_code
+        turn_index += 1
 
 
 async def _submit_interactive_turn_handling_sigint(
@@ -875,6 +1145,7 @@ async def _submit_interactive_turn_handling_sigint(
     sigint_monitor: CliSigintMonitor,
     run_view: InteractiveRunView | None = None,
     thinking_renderer: CliThinkingRenderer | None = None,
+    runtime_display: RuntimeDisplayController | None = None,
     key_monitor: RunningKeyMonitor | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """提交 interactive turn，并在 SIGINT 时按 Host cancel 语义收口。
@@ -888,7 +1159,8 @@ async def _submit_interactive_turn_handling_sigint(
     :param run_overrides: 本轮可映射执行 override。
     :param sigint_monitor: 本轮运行阶段 SIGINT monitor。
     :param run_view: 运行态 view；``None`` 表示不输出 activity。
-    :param thinking_renderer: 运行态 thinking renderer；``None`` 表示不输出。
+    :param thinking_renderer: invocation 级 thinking renderer；``None`` 表示不输出。
+    :param runtime_display: interactive invocation 私有 display execution domain。
     :param key_monitor: 运行态 TTY 按键 monitor；``None`` 表示 no-op。
     :returns: Host terminal result；第二次 SIGINT 本地退出时返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
@@ -896,62 +1168,63 @@ async def _submit_interactive_turn_handling_sigint(
 
     accepted_run = _InteractiveAcceptedRunState()
     view = run_view
-    thinking = thinking_renderer
-    runtime_display = RuntimeDisplayController(
-        activity_display=view,
-        thinking_display=thinking,
-    )
-    runtime_display.install_runtime_line_guard()
     monitor = NoopRunningKeyMonitor() if key_monitor is None else key_monitor
-    sigint_monitor.install()
-    observed_sigint_count = sigint_monitor.count
-    monitor.start()
-    submit_task = asyncio.create_task(
-        submit_entrypoint_turn_and_wait(
-            host,
-            request=EntrypointTurnRequest(
-                context=build_interactive_host_context(
-                    invocation,
-                    operation=_INTERACTIVE_OPERATION_SUBMIT_FOLLOWUP,
-                ),
-                session_id=session_id,
-                client_request_id=interactive_submit_client_request_id(
-                    invocation,
-                    turn_index=turn_index,
-                ),
-                user_prompt=user_prompt,
-                tool_names=runtime.scene_inputs.tool_selection.tool_names,
-                behavior=FollowupBehavior.QUEUE,
-                target_run_id=None,
-                run_overrides=run_overrides,
-            ),
-            scene_inputs=runtime.scene_inputs,
-            host_assembly=runtime.host_assembly,
-            on_run_accepted=accepted_run.record,
-            on_activity=None if view is None else view.activity_sink().record_activity,
-            on_thinking=None if thinking is None else thinking.record,
-        )
-    )
-    sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
-    key_task = asyncio.create_task(monitor.wait_next())
+    submit_task: asyncio.Task[EntrypointRunTerminalResult] | None = None
+    sigint_task: asyncio.Task[int] | None = None
+    key_task: asyncio.Task[RunningKeyAction] | None = None
+    primary_error: BaseException | None = None
+    terminal_result: EntrypointRunTerminalResult | None = None
     try:
+        sigint_monitor.install()
+        observed_sigint_count = sigint_monitor.count
+        monitor.start()
+        submit_task = asyncio.create_task(
+            submit_entrypoint_turn_and_wait(
+                host,
+                request=EntrypointTurnRequest(
+                    context=build_interactive_host_context(
+                        invocation,
+                        operation=_INTERACTIVE_OPERATION_SUBMIT_FOLLOWUP,
+                    ),
+                    session_id=session_id,
+                    client_request_id=interactive_submit_client_request_id(
+                        invocation,
+                        turn_index=turn_index,
+                    ),
+                    user_prompt=user_prompt,
+                    tool_names=runtime.scene_inputs.tool_selection.tool_names,
+                    behavior=FollowupBehavior.QUEUE,
+                    target_run_id=None,
+                    run_overrides=run_overrides,
+                ),
+                scene_inputs=runtime.scene_inputs,
+                host_assembly=runtime.host_assembly,
+                on_run_accepted=accepted_run.record,
+                on_activity=(None if view is None else view.activity_sink().record_activity),
+                on_thinking=(None if thinking_renderer is None else thinking_renderer.record),
+                callback_execution_port=runtime_display,
+            )
+        )
+        sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+        key_task = asyncio.create_task(monitor.wait_next())
         while True:
             done, _pending = await asyncio.wait(
                 (submit_task, sigint_task, key_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if submit_task in done:
-                terminal = await submit_task
-                runtime_display.finish_runtime_display()
-                return terminal
+                terminal_result = await submit_task
+                if runtime_display is not None:
+                    await runtime_display.finish_runtime_display()
+                break
             if key_task in done:
                 action = await key_task
                 if action is RunningKeyAction.TOGGLE_ACTIVITY:
-                    if view is not None:
-                        view.toggle_view()
+                    if runtime_display is not None:
+                        await runtime_display.toggle_activity_display()
                     key_task = asyncio.create_task(monitor.wait_next())
                     continue
-                return await _cancel_interactive_turn_after_first_sigint(
+                terminal_result = await _cancel_interactive_turn_after_first_sigint(
                     host=host,
                     invocation=invocation,
                     turn_index=turn_index,
@@ -961,8 +1234,9 @@ async def _submit_interactive_turn_handling_sigint(
                     observed_sigint_count=observed_sigint_count,
                     runtime_display=runtime_display,
                 )
+                break
             first_sigint_count = await sigint_task
-            return await _cancel_interactive_turn_after_first_sigint(
+            terminal_result = await _cancel_interactive_turn_after_first_sigint(
                 host=host,
                 invocation=invocation,
                 turn_index=turn_index,
@@ -972,13 +1246,23 @@ async def _submit_interactive_turn_handling_sigint(
                 observed_sigint_count=first_sigint_count,
                 runtime_display=runtime_display,
             )
-    finally:
-        runtime_display.clear_runtime_line_guard()
-        runtime_display.close_thinking()
-        monitor.close()
-        sigint_monitor.close()
-        await cancel_and_await_task(sigint_task)
-        await cancel_and_await_task(key_task)
+            break
+    except BaseException as error:
+        primary_error = error
+    cleanup_error = await _close_interactive_turn_lifecycle(
+        close_runtime_display=primary_error is not None,
+        runtime_display=runtime_display,
+        monitor=monitor,
+        sigint_monitor=sigint_monitor,
+        submit_task=submit_task,
+        sigint_task=sigint_task,
+        key_task=key_task,
+    )
+    if primary_error is not None:
+        _raise_lifecycle_primary(primary_error, cleanup_error)
+    if cleanup_error is not None:
+        raise cleanup_error
+    return terminal_result
 
 
 async def _cancel_interactive_turn_after_first_sigint(
@@ -990,7 +1274,7 @@ async def _cancel_interactive_turn_after_first_sigint(
     submit_task: asyncio.Task[EntrypointRunTerminalResult],
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
-    runtime_display: RuntimeDisplayController,
+    runtime_display: RuntimeDisplayController | None,
 ) -> EntrypointRunTerminalResult | None:
     """第一次 SIGINT 后等待 run id 并发起 Host cancel。
 
@@ -1007,7 +1291,8 @@ async def _cancel_interactive_turn_after_first_sigint(
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
-    runtime_display.finish_and_close_thinking()
+    if runtime_display is not None:
+        await runtime_display.finish_thinking_display()
     run_id = accepted_run.run_id
     if run_id is None:
         wait_outcome = await _wait_for_run_id_or_local_exit(
@@ -1026,7 +1311,8 @@ async def _cancel_interactive_turn_after_first_sigint(
     submit_task.cancel()
     with suppress(asyncio.CancelledError):
         await submit_task
-    runtime_display.render_cancel_requested()
+    if runtime_display is not None:
+        await runtime_display.render_cancel_requested()
     return await _cancel_run_waiting_for_terminal_or_second_sigint(
         host=host,
         invocation=invocation,
@@ -1083,7 +1369,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
     run_id: str,
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
-    runtime_display: RuntimeDisplayController,
+    runtime_display: RuntimeDisplayController | None,
 ) -> EntrypointRunTerminalResult | None:
     """发起 Host cancel，并在第二次 SIGINT 时本地退出。
 
@@ -1125,7 +1411,8 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
         )
         if cancel_task in done:
             return await cancel_task
-        runtime_display.render_local_exit_after_cancel()
+        if runtime_display is not None:
+            await runtime_display.render_local_exit_after_cancel()
         cancel_task.cancel()
         with suppress(asyncio.CancelledError):
             await cancel_task

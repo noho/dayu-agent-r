@@ -275,6 +275,10 @@ def _host_runtime_config_record(
         "payload_inline_threshold_bytes": 4096,
         "worker_startup_timeout_seconds": 10.0,
         "memory_projection_catch_up_batch_size": 10,
+        "session_event_delivery_policy": {
+            "transient_mailbox_max_items": 512,
+            "max_subscriptions_per_session": 4,
+        },
         "wait_poller_policy": _wait_poller_policy_record(),
     }
     if include_process_capsule_interrupt_policy:
@@ -451,6 +455,14 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert host_runtime.sqlite.path == ".dayu/host/dayu_host.sqlite3"
     assert host_runtime.payload_inline_threshold_bytes == 65535
     assert host_runtime.worker_startup_timeout_seconds == 10.0
+    assert (
+        host_runtime.session_event_delivery_policy.transient_mailbox_max_items
+        == 512
+    )
+    assert (
+        host_runtime.session_event_delivery_policy.max_subscriptions_per_session
+        == 4
+    )
     assert host_runtime.wait_poller_policy.enabled is True
     assert host_runtime.wait_poller_policy.poll_interval_seconds == 1.0
     assert host_runtime.wait_poller_policy.claim_ttl_seconds == 60.0
@@ -583,6 +595,96 @@ def test_host_runtime_wait_poller_policy_block_is_required(tmp_path: Path) -> No
     _write_json(package_root / "host_runtime.json", record)
 
     with pytest.raises(ConfigFieldError, match="wait_poller_policy"):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+def test_host_runtime_session_event_delivery_policy_block_is_required(
+    tmp_path: Path,
+) -> None:
+    """host runtime 缺少 Session Event Delivery policy 必须失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    del _local_host_runtime_record(record)["session_event_delivery_policy"]
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match="session_event_delivery_policy"):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("transient_mailbox_max_items", "max_subscriptions_per_session"),
+)
+def test_host_runtime_session_event_delivery_policy_fields_are_required(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    """Session Event Delivery policy 两个字段均不可缺失。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy: dict[str, JsonValue] = {
+        "transient_mailbox_max_items": 512,
+        "max_subscriptions_per_session": 4,
+    }
+    del policy[missing_field]
+    _local_host_runtime_record(record)["session_event_delivery_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match=missing_field):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+def test_host_runtime_session_event_delivery_policy_rejects_unknown_field(
+    tmp_path: Path,
+) -> None:
+    """Session Event Delivery policy 不接受第三个容量字段。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy: dict[str, JsonValue] = {
+        "transient_mailbox_max_items": 512,
+        "max_subscriptions_per_session": 4,
+        "unexpected_policy_field": 1,
+    }
+    _local_host_runtime_record(record)["session_event_delivery_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize(
+    "value",
+    (True, False, 0, -1, 1.5, "4"),
+)
+@pytest.mark.parametrize(
+    "field_name",
+    ("transient_mailbox_max_items", "max_subscriptions_per_session"),
+)
+def test_host_runtime_session_event_delivery_policy_rejects_invalid_values(
+    tmp_path: Path,
+    field_name: str,
+    value: JsonValue,
+) -> None:
+    """Session Event Delivery policy 只接受严格正整数。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    record = _host_runtime_config_record()
+    policy: dict[str, JsonValue] = {
+        "transient_mailbox_max_items": 512,
+        "max_subscriptions_per_session": 4,
+    }
+    policy[field_name] = value
+    _local_host_runtime_record(record)["session_event_delivery_policy"] = policy
+    _write_json(package_root / "host_runtime.json", record)
+
+    with pytest.raises(ConfigFieldError, match=field_name):
         ConfigLoader(package_config_dir=package_root).load_host_runtime()
 
 
@@ -1547,6 +1649,10 @@ def test_host_runtime_lane_reference_must_exist(tmp_path: Path) -> None:
                     "payload_inline_threshold_bytes": 4096,
                     "worker_startup_timeout_seconds": 10.0,
                     "memory_projection_catch_up_batch_size": 10,
+                    "session_event_delivery_policy": {
+                        "transient_mailbox_max_items": 512,
+                        "max_subscriptions_per_session": 4,
+                    },
                     "wait_poller_policy": _wait_poller_policy_record(),
                 }
             },

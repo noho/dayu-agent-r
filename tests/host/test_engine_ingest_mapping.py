@@ -83,6 +83,7 @@ from dayu.engine.contracts.tool_records import (
     AwaitingToolExecutionRecord,
 )
 from dayu.host.admission import PendingDispatchRecord
+from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
     RunnerCallProjectorMetadata,
@@ -271,6 +272,43 @@ class _SeededRun:
     dispatch_record_id: str
 
 
+class _AttemptFenceReadSpy:
+    """把 validation transaction 读取的 Attempt fence 替换为唯一 sentinel。"""
+
+    def __init__(self, *, started_event_sequence: int) -> None:
+        """初始化 transaction read spy。
+
+        :param started_event_sequence: 注入 current Attempt row 的正整数 fence。
+        :returns: 无返回值。
+        :raises ValueError: 本测试 helper 不主动校验 sentinel。
+        """
+
+        self._started_event_sequence = started_event_sequence
+        self.call_count = 0
+
+    def __call__(
+        self,
+        transaction: HostTransaction,
+        attempt_id: str,
+    ) -> AttemptRow | None:
+        """读取真实 current Attempt，并只替换 transaction-local fence。
+
+        :param transaction: 当前 validation write transaction。
+        :param attempt_id: candidate Attempt 标识。
+        :returns: 缺失时返回 ``None``；否则返回携带 sentinel fence 的 row。
+        :raises HostDurableError: durable row 解码失败时抛出。
+        """
+
+        self.call_count += 1
+        attempt = read_attempt_by_id(transaction, attempt_id)
+        if attempt is None:
+            return None
+        return replace(
+            attempt,
+            started_event_sequence=self._started_event_sequence,
+        )
+
+
 def _cas_lost_terminal_closeout(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -299,6 +337,7 @@ def _cas_lost_terminal_closeout(
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
+        run_event=None,
     )
 
 
@@ -510,6 +549,160 @@ class _WakeupSpy:
         self.promoted_session_ids.append(session_id)
 
 
+@dataclass(slots=True)
+class _RecordingTerminalPostCommitPort:
+    """记录 Engine ingest commit 后的 exact terminal notices。"""
+
+    notices: list[TerminalPostCommitNotice]
+
+    def __init__(self) -> None:
+        """初始化空记录器。
+
+        :returns: ``None``。
+        """
+
+        self.notices = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """记录一次已提交 terminal notice。
+
+        :param notice: exact terminal notice。
+        :returns: ``None``。
+        """
+
+        self.notices.append(notice)
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedTerminalObservation:
+    """terminal port 回调内读取到的 committed Run 与 exact event。"""
+
+    notice: TerminalPostCommitNotice
+    run: RunRow
+    run_event: EventLogRow
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadCommittedTerminalObservation:
+    """按预期 Run identity 读取已提交 terminal owner facts。"""
+
+    expected_session_id: str
+    expected_run_id: str
+
+    def __call__(
+        self,
+        transaction: HostTransaction,
+    ) -> tuple[RunRow, EventLogRow]:
+        """读取 committed Run 与其 stable terminal event。
+
+        :param transaction: callback 发起的独立 read transaction。
+        :returns: identity 与 stable ref 完全一致的 Run/event 二元组。
+        :raises AssertionError: Run、terminal ref、event 或 identity 缺失时抛出。
+        """
+
+        run = read_run_by_id(transaction, self.expected_run_id)
+        assert run is not None
+        assert run.session_id == self.expected_session_id
+        assert run.terminal_event_id is not None
+        assert run.terminal_event_sequence is not None
+        run_event = EventLogStore().read_event_by_id(
+            transaction,
+            run.terminal_event_id,
+        )
+        assert run_event is not None
+        assert run_event.event_sequence == run.terminal_event_sequence
+        assert run_event.session_id == run.session_id
+        assert run_event.run_id == run.run_id
+        return run, run_event
+
+
+@dataclass(slots=True)
+class _CommittedTerminalPostCommitPort:
+    """在 terminal port 回调中验证 commit 已返回且 exact row 可见。"""
+
+    _db_path: Path
+    _transaction_runner: HostTransactionRunner
+    _reader: _ReadCommittedTerminalObservation
+    observations: list[_CommittedTerminalObservation]
+
+    def __init__(
+        self,
+        *,
+        db_path: Path,
+        transaction_runner: HostTransactionRunner,
+        expected_session_id: str,
+        expected_run_id: str,
+    ) -> None:
+        """初始化 committed terminal 观察端口。
+
+        :param db_path: production ingest 使用的 durable DB路径。
+        :param transaction_runner: production ingest 使用的 durable runner。
+        :param expected_session_id: 预期 terminal Session id。
+        :param expected_run_id: 预期 terminal Run id。
+        :returns: ``None``。
+        :raises: 无主动抛出。
+        """
+
+        self._db_path = db_path
+        self._transaction_runner = transaction_runner
+        self._reader = _ReadCommittedTerminalObservation(
+            expected_session_id=expected_session_id,
+            expected_run_id=expected_run_id,
+        )
+        self.observations = []
+
+    def notify_terminal_post_commit(
+        self,
+        notice: TerminalPostCommitNotice,
+    ) -> None:
+        """验证 callback 位于 commit return 后并记录 exact owner facts。
+
+        :param notice: production ``_finish_ingest`` 交付的 terminal notice。
+        :returns: ``None``。
+        :raises AssertionError: callback 仍在 transaction 中或 notice 与已提交
+            stable Run/event ref 不一致时抛出。
+        """
+
+        assert not self._transaction_runner.has_active_transaction
+        with sqlite3.connect(self._db_path) as connection:
+            committed_row = connection.execute(
+                f"""
+                SELECT
+                    runs.session_id,
+                    runs.run_id,
+                    runs.terminal_event_sequence,
+                    events.event_sequence,
+                    events.session_id,
+                    events.run_id
+                FROM {TABLE_HOST_RUNS} AS runs
+                JOIN {TABLE_EVENT_LOG} AS events
+                  ON events.event_id = runs.terminal_event_id
+                WHERE runs.run_id = ?
+                """,
+                (self._reader.expected_run_id,),
+            ).fetchone()
+        assert committed_row is not None
+        assert str(committed_row[0]) == notice.session_id
+        assert str(committed_row[1]) == self._reader.expected_run_id
+        assert int(committed_row[2]) == notice.terminal_event_sequence
+        assert int(committed_row[3]) == notice.terminal_event_sequence
+        assert str(committed_row[4]) == notice.session_id
+        assert str(committed_row[5]) == self._reader.expected_run_id
+        run, run_event = self._transaction_runner.run_read(self._reader)
+        assert notice.session_id == run.session_id
+        assert notice.terminal_event_sequence == run_event.event_sequence
+        self.observations.append(
+            _CommittedTerminalObservation(
+                notice=notice,
+                run=run,
+                run_event=run_event,
+            )
+        )
+
+
 def test_final_answer_closes_attempt_and_run_with_phase5_payload(
     tmp_path: Path,
 ) -> None:
@@ -531,12 +724,14 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert result.terminal_closeout is True
-        assert result.promotion_triggered is True
+        assert result.terminal_notice is not None
+        assert result.terminal_notice.wake_queue_promotion is True
         assert [event.event_type for event in result.events] == [
             "ATTEMPT_SUCCEEDED",
             "RUN_SUCCEEDED",
@@ -668,6 +863,7 @@ def test_engine_owned_empty_final_failure_closes_failed(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -712,6 +908,7 @@ def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -749,6 +946,7 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -790,6 +988,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
@@ -895,6 +1094,7 @@ async def test_reactive_memory_catch_up_failure_still_starts_recovery(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
@@ -921,6 +1121,7 @@ async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=_PreparedManifestReactiveCompactor(),
@@ -954,6 +1155,7 @@ async def test_reactive_freezes_overflow_material_list_before_compaction(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -980,6 +1182,7 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
@@ -1031,6 +1234,7 @@ async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
@@ -1063,6 +1267,7 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
@@ -1103,6 +1308,7 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=context_budget_policy_from_threshold_tokens(
                 context_window_size=100,
@@ -1138,6 +1344,7 @@ async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=context_budget_policy_from_threshold_tokens(
                 context_window_size=100,
@@ -1182,6 +1389,7 @@ def test_context_compaction_requested_stale_identity_is_rejected(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -1218,6 +1426,7 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
         seeded = _seed_active_run(store.transaction_runner)
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest_async(
@@ -1263,15 +1472,23 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
 async def test_reactive_fallback_over_budget_fails_closed_without_lost(
     tmp_path: Path,
 ) -> None:
-    """reactive fallback view 仍超 hard budget 时 FAILED 收口且不 LOST。"""
+    """recovery fail commit 后向 terminal port 交付 exact promotion notice。"""
 
-    with open_host_durable_store(_options(tmp_path)) as store:
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
         seeded = _seed_active_run(
             store.transaction_runner,
             display_text="overflow " * 80,
         )
+        terminal_port = _CommittedTerminalPostCommitPort(
+            db_path=options.db_path,
+            transaction_runner=store.transaction_runner,
+            expected_session_id=seeded.session_id,
+            expected_run_id=seeded.run_id,
+        )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=terminal_port,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest_async(
@@ -1299,14 +1516,32 @@ async def test_reactive_fallback_over_budget_fails_closed_without_lost(
         )
         assert isinstance(failed_payload["fallback_budget_result"], Mapping)
         assert failed_payload["fallback_budget_result"]["status"] == "over_hard_budget"
+        assert len(terminal_port.observations) == 1
+        observation = terminal_port.observations[0]
+        assert result.terminal_notice is observation.notice
+        assert observation.notice.session_id == seeded.session_id
+        assert observation.notice.wake_queue_promotion is True
+        assert observation.run.status is RunStatus.FAILED
+        assert observation.run.run_id == seeded.run_id
+        assert observation.run_event == result.events[-1]
+        assert (
+            observation.notice.terminal_event_sequence
+            == observation.run.terminal_event_sequence
+            == observation.run_event.event_sequence
+        )
 
 
+@pytest.mark.parametrize(
+    "mutation_status",
+    (StateMutationStatus.CAS_LOST, StateMutationStatus.INVALID_STATE),
+)
 @pytest.mark.asyncio
 async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mutation_status: StateMutationStatus,
 ) -> None:
-    """recovering Run fail CAS 拒绝时 ingest 结果必须传播 REJECTED。"""
+    """recovering Run fail CAS-lost/rejected 时不得伪造 terminal notice。"""
 
     def reject_fail_recovering_run(
         transaction: HostTransaction,
@@ -1318,15 +1553,17 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
         :param transaction: Host transaction。
         :param event_log_store: EventLog store。
         :param request: fail recovering run 输入。
-        :returns: INVALID_STATE transition result。
+        :returns: 参数指定的非 UPDATED transition result。
+        :raises: 无主动抛出。
         """
 
         del transaction, event_log_store, request
         return RunTransitionResult(
-            status=StateMutationStatus.INVALID_STATE,
+            status=mutation_status,
             run=None,
             attempt=None,
             dispatch_record=None,
+            run_event=None,
         )
 
     monkeypatch.setattr(
@@ -1339,9 +1576,11 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
             store.transaction_runner,
             display_text="overflow " * 80,
         )
+        terminal_port = _RecordingTerminalPostCommitPort()
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=terminal_port,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest_async(
@@ -1350,6 +1589,8 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
 
         assert result.status is EngineIngestStatus.REJECTED
         assert result.terminal_closeout is False
+        assert result.terminal_notice is None
+        assert terminal_port.notices == []
         assert result.reason == "recovering_run_failed_precondition_failed"
         assert tuple(event.event_type for event in result.events) == (
             CONTEXT_COMPACTION_REQUESTED,
@@ -1357,6 +1598,7 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
             "RUN_RECOVERING",
             CONTEXT_COMPACTION_FAILED,
         )
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
 
 
 @pytest.mark.asyncio
@@ -1369,6 +1611,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -1413,6 +1656,7 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
         current = _steer_to_new_running_attempt(store.transaction_runner, seeded)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
 
@@ -1459,6 +1703,7 @@ def test_stale_transient_delta_is_rejected_before_no_row_short_circuit(
         publisher = RecordingTransientDeltaPublisher()
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=publisher,
         )
 
@@ -1495,6 +1740,7 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(max_reactive_compactions_per_run=1),
             context_compactor=FakeContextCompactor(),
@@ -1536,6 +1782,7 @@ async def test_reactive_repeated_overflow_respects_max_reactive_compactions_per_
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(max_reactive_compactions_per_run=1),
             context_compactor=FakeContextCompactor(),
@@ -1577,6 +1824,7 @@ async def test_reactive_compact_count_allows_second_operation(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -1609,6 +1857,7 @@ async def test_reactive_compact_corrupt_count_fact_fails_closed(
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
@@ -1651,6 +1900,7 @@ def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
         )
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
 
@@ -1689,6 +1939,7 @@ def test_tool_awaiting_only_writes_diagnostic_and_duplicate_is_idempotent(
         )
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
 
@@ -1729,6 +1980,7 @@ def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -1770,6 +2022,7 @@ def test_run_suspended_confirms_only_matching_host_accepted_wait_refs(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -1813,6 +2066,7 @@ def test_tool_awaiting_rejects_mismatched_engine_record_without_state_change(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -1858,6 +2112,7 @@ def test_waiting_confirmation_wrong_attempt_identity_is_rejected(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -1900,6 +2155,7 @@ def test_waiting_confirmation_wrong_execution_identity_is_rejected(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -1924,7 +2180,8 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
         assert isinstance(accept_result, ToolAwaitingAcceptedAck)
         resolved = DefaultHostResolveWaitService(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
         ).resolve_wait(
             accept_result.wait_id,
             _resolve_wait_completed_request("resolve-old-attempt"),
@@ -1942,6 +2199,7 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -1973,6 +2231,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
@@ -2042,6 +2301,7 @@ def test_usage_reported_without_policy_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2098,6 +2358,7 @@ def test_usage_reported_missing_input_event_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
@@ -2144,6 +2405,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
@@ -2186,6 +2448,7 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
@@ -2214,11 +2477,12 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
 
 
 def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
-    """同一 terminal candidate 重放不追加 canonical event 但会重试 promotion wakeup。"""
+    """同一 terminal candidate 重放 exact sequence，且 replay flag 为 false。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         wakeup = _WakeupSpy()
+        terminal_port = _RecordingTerminalPostCommitPort()
         candidate = _candidate(
             seeded,
             worker_event_index=8,
@@ -2232,6 +2496,7 @@ def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
         )
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=terminal_port,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
         )
@@ -2240,18 +2505,25 @@ def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
         second = ingestor.ingest(candidate)
 
         assert first.status == EngineIngestStatus.ACCEPTED
-        assert first.promotion_triggered is True
+        assert first.terminal_notice is not None
+        assert first.terminal_notice.wake_queue_promotion is True
         assert second.status == EngineIngestStatus.DUPLICATE
-        assert second.promotion_triggered is True
+        assert second.terminal_notice is not None
+        assert second.terminal_notice.wake_queue_promotion is False
+        assert terminal_port.notices == [
+            first.terminal_notice,
+            second.terminal_notice,
+        ]
+        assert (
+            first.terminal_notice.terminal_event_sequence
+            == second.terminal_notice.terminal_event_sequence
+        )
         assert [event.event_id for event in first.events] == [
             event.event_id for event in second.events
         ]
         assert _event_count(store.transaction_runner, "ATTEMPT_SUCCEEDED") == 1
         assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 1
-        assert wakeup.promoted_session_ids == [
-            seeded.session_id,
-            seeded.session_id,
-        ]
+        assert wakeup.promoted_session_ids == []
 
 
 def test_stale_execution_id_is_rejected_diagnostic(tmp_path: Path) -> None:
@@ -2280,6 +2552,7 @@ def test_stale_execution_id_is_rejected_diagnostic(tmp_path: Path) -> None:
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2326,6 +2599,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2382,6 +2656,7 @@ def test_provider_diagnostic_is_nonfatal_diagnostic_without_failure_metadata(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2445,6 +2720,7 @@ def test_provider_protocol_error_serializes_partial_tool_call_signal(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2517,6 +2793,7 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         )
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
 
@@ -2548,6 +2825,7 @@ def test_all_transient_deltas_publish_once_without_event_log_rows(
         publisher = RecordingTransientDeltaPublisher()
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=publisher,
         )
         candidates = (
@@ -2605,6 +2883,58 @@ def test_all_transient_deltas_publish_once_without_event_log_rows(
         assert _event_count(store.transaction_runner, "TOOL_CALL_DELTA") == 0
 
 
+def test_transient_fence_comes_from_same_validation_transaction_attempt_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """candidate fence 必须原样来自 validation transaction 的 current Attempt。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: transaction read owner 注入工具。
+    :returns: ``None``。
+    :raises AssertionError: ingest 另行回读或重算 fence 时抛出。
+    """
+
+    sentinel_fence = 987_654_321
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        publisher = RecordingTransientDeltaPublisher()
+        attempt_read_spy = _AttemptFenceReadSpy(
+            started_event_sequence=sentinel_fence,
+        )
+        monkeypatch.setattr(
+            engine_ingest_module,
+            "read_attempt_by_id",
+            attempt_read_spy,
+        )
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=publisher,
+        )
+
+        result = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=14,
+                data=ReasoningDeltaData(
+                    iteration_id="iter-fence",
+                    delta="fenced",
+                ),
+                event_type=EngineEventType.REASONING_DELTA,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.events == ()
+        assert attempt_read_spy.call_count == 1
+        assert len(publisher.candidates) == 1
+        assert (
+            publisher.candidates[0].durable_causal_fence_event_sequence
+            == sentinel_fence
+        )
+
+
 def test_transient_publisher_failure_is_sanitized_and_does_not_change_acceptance(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -2615,6 +2945,7 @@ def test_transient_publisher_failure_is_sanitized_and_does_not_change_acceptance
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=FailingTransientDeltaPublisher(),
         )
         with caplog.at_level("ERROR"):
@@ -2655,6 +2986,7 @@ def test_transient_transaction_rollback_does_not_publish(
         publisher = RecordingTransientDeltaPublisher()
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=publisher,
         )
         monkeypatch.setattr(
@@ -2692,6 +3024,7 @@ def test_tool_batch_events_stay_preview_not_canonical(
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
         ready = _candidate(
@@ -2743,6 +3076,7 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
         first = _candidate(
@@ -2786,6 +3120,7 @@ def test_late_reasoning_delta_is_rejected_before_transient_publish(
         publisher = RecordingTransientDeltaPublisher()
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=publisher,
         )
         first = _candidate(
@@ -2838,6 +3173,7 @@ def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2875,6 +3211,7 @@ def test_run_cancelled_with_malformed_active_cancel_payload_uses_typed_link(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2913,6 +3250,7 @@ def test_run_cancelled_requested_at_uses_cancel_requested_event_time(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2945,6 +3283,7 @@ def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -2980,6 +3319,7 @@ def test_late_final_answer_after_run_cancelling_is_rejected_with_diagnostic(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -3016,6 +3356,7 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -3051,6 +3392,7 @@ def test_host_lifecycle_after_run_cancelling_is_diagnostic_only(
         store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
         if lifecycle_source == "worker_clean_eof":
@@ -3101,6 +3443,7 @@ def test_late_awaiting_after_cancel_does_not_move_to_waiting(
         store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
         suspended = _candidate(
@@ -3275,6 +3618,7 @@ def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
         seeded = _seed_active_run(store.transaction_runner)
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_clean_eof(
             _envelope(seeded),
@@ -3352,6 +3696,7 @@ def test_host_lifecycle_ingress_rejects_mismatched_run_identity(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_clean_eof(
             _envelope(seeded),
@@ -3386,6 +3731,7 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         )
         envelope = _envelope(seeded)
@@ -3462,6 +3808,7 @@ def test_engine_terminal_invalid_state_rolls_back_payload_and_events(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(
             _candidate(
@@ -3504,6 +3851,7 @@ def test_host_lifecycle_invalid_state_rolls_back_payload_and_events(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_worker_lost(
             _envelope(seeded),
@@ -3542,6 +3890,7 @@ def test_engine_terminal_cas_lost_rolls_back_real_payload_repository(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(
             _candidate(
@@ -3586,6 +3935,7 @@ def test_host_lifecycle_cas_lost_rolls_back_real_payload_repository(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).close_clean_eof(
             _envelope(seeded),
@@ -3625,6 +3975,7 @@ def test_engine_run_failed_with_worker_lifecycle_reason_remains_engine_failed(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -3798,6 +4149,7 @@ def test_transient_delta_event_accepts_matching_type_without_row(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -3841,6 +4193,7 @@ def test_iteration_started_links_prepared_runner_call_manifest(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -3930,10 +4283,12 @@ def test_iteration_started_mismatch_fails_closed_after_link(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
         replay = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4007,6 +4362,7 @@ def test_iteration_started_missing_initial_manifest_fails_closed(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4071,10 +4427,12 @@ def test_iteration_started_mismatch_link_does_not_seed_continuation(
 
         mismatch_result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(mismatch)
         next_result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(next_iteration)
 
@@ -4136,10 +4494,12 @@ def test_iteration_started_rejected_event_does_not_seed_continuation(
 
         first_result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(first)
         second_result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(second)
 
@@ -4196,6 +4556,7 @@ def test_iteration_started_ambiguous_prepared_manifest_fails_closed(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4254,10 +4615,12 @@ def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
 
         accepted = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(first)
         rejected = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(second)
 
@@ -4314,6 +4677,7 @@ def test_iteration_started_links_all_ordinary_dispatch_kinds(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4359,6 +4723,7 @@ def test_iteration_started_does_not_link_compactor_manifest(tmp_path: Path) -> N
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4419,10 +4784,12 @@ def test_iteration_started_continuation_reset_uses_limited_signal_after_link(
 
         accepted = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(initial)
         continued = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(continuation)
 
@@ -4478,6 +4845,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4608,6 +4976,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
@@ -4764,6 +5133,7 @@ def test_iteration_completed_preview_includes_client_correlation_id(
 
         result = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 

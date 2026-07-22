@@ -18,6 +18,10 @@
       "payload_inline_threshold_bytes": 65535,
       "worker_startup_timeout_seconds": 10.0,
       "memory_projection_catch_up_batch_size": 100,
+      "session_event_delivery_policy": {
+        "transient_mailbox_max_items": 512,
+        "max_subscriptions_per_session": 4
+      },
       "wait_poller_policy": {
         "enabled": true,
         "poll_interval_seconds": 1,

@@ -530,7 +530,7 @@ async def test_no_compaction_recent_raw_turns_continuity(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-no-compact"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -592,7 +592,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-tool-evidence"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -694,7 +694,7 @@ async def test_long_user_input_second_factor_survives_reference_continuity(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-min-preserve"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -752,7 +752,7 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-multi-compact"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         for index in range(4):
             followup = await host.submit_followup(
                 session.session_id,
@@ -814,7 +814,7 @@ async def test_proactive_compact_long_current_input_reaches_compactor_without_lo
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-duplicate"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -874,7 +874,7 @@ async def test_public_reactive_compact_recovers_with_followup_attempt(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-reactive"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -930,7 +930,7 @@ async def test_public_compact_failure_dispatches_deterministic_recent_window(
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-fallback"))
-        watcher = host.watch_session_events(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
             followup_request(
@@ -1025,7 +1025,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     try:
         async with open_host(options) as host:
             session = await host.ensure_session(ensure_request("real-compact"))
-            watcher = host.watch_session_events(session.session_id)
+            watcher = await host.watch_session_events(session.session_id)
             compacted = await host.submit_followup(
                 session.session_id,
                 followup_request(
