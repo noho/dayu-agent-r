@@ -2798,7 +2798,6 @@ def _write_execution_profile_overlay(
                     "context_budget_policy": {
                         "soft_threshold_context_ratio": 0.65,
                         "hard_threshold_context_ratio": 0.82,
-                        "max_proactive_compactions_per_run": 2,
                         "max_reactive_compactions_per_run": 2,
                         "max_compaction_attempts_per_operation": 7,
                         "policy_ref": profile_id,

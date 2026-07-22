@@ -17,7 +17,6 @@ from dayu.host._public_validation import require_positive_int as _require_positi
 
 DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO = 0.8
 DEFAULT_HARD_THRESHOLD_CONTEXT_RATIO = 0.9
-DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN = 1
 DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN = 2
 DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = 5
 DEFAULT_CONTEXT_BUDGET_POLICY_REF = "host-context-budget-policy:default"
@@ -44,7 +43,6 @@ class ContextBudgetPolicy:
     :param context_window_size: Service / composition root 显式传入的上下文窗口 token 数。
     :param soft_threshold_context_ratio: soft threshold 占上下文窗口比例。
     :param hard_threshold_context_ratio: hard threshold 占上下文窗口比例。
-    :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :param max_compaction_attempts_per_operation: 单次 compaction operation 内
         Host semantic proposal attempt 上限，包含首次 proposal 与后续 repair attempt。
@@ -54,7 +52,6 @@ class ContextBudgetPolicy:
     context_window_size: int
     soft_threshold_context_ratio: float
     hard_threshold_context_ratio: float
-    max_proactive_compactions_per_run: int
     max_reactive_compactions_per_run: int
     max_compaction_attempts_per_operation: int
     policy_ref: str
@@ -96,10 +93,6 @@ class ContextBudgetPolicy:
                 "ContextBudgetPolicy.soft_threshold_context_ratio must derive "
                 "a threshold smaller than hard_threshold_context_ratio"
             )
-        _require_positive_int(
-            self.max_proactive_compactions_per_run,
-            field_name="ContextBudgetPolicy.max_proactive_compactions_per_run",
-        )
         _require_positive_int(
             self.max_reactive_compactions_per_run,
             field_name="ContextBudgetPolicy.max_reactive_compactions_per_run",
@@ -162,9 +155,6 @@ def default_context_budget_policy(
     policy_ref: str = DEFAULT_CONTEXT_BUDGET_POLICY_REF,
     soft_threshold_context_ratio: float = DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
     hard_threshold_context_ratio: float = DEFAULT_HARD_THRESHOLD_CONTEXT_RATIO,
-    max_proactive_compactions_per_run: int = (
-        DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN
-    ),
     max_reactive_compactions_per_run: int = DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
     max_compaction_attempts_per_operation: int = (
         DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION
@@ -176,7 +166,6 @@ def default_context_budget_policy(
     :param policy_ref: policy snapshot / composition ref。
     :param soft_threshold_context_ratio: soft threshold 占上下文窗口比例。
     :param hard_threshold_context_ratio: hard threshold 占上下文窗口比例。
-    :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :param max_compaction_attempts_per_operation: 单次 compaction operation 内
         Host semantic proposal attempt 上限，包含首次 proposal 与后续 repair attempt。
@@ -189,7 +178,6 @@ def default_context_budget_policy(
         context_window_size=context_window_size,
         soft_threshold_context_ratio=soft_threshold_context_ratio,
         hard_threshold_context_ratio=hard_threshold_context_ratio,
-        max_proactive_compactions_per_run=max_proactive_compactions_per_run,
         max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         max_compaction_attempts_per_operation=(
             max_compaction_attempts_per_operation
@@ -204,9 +192,6 @@ def context_budget_policy_from_threshold_tokens(
     soft_threshold_tokens: int,
     hard_threshold_tokens: int,
     policy_ref: str = DEFAULT_CONTEXT_BUDGET_POLICY_REF,
-    max_proactive_compactions_per_run: int = (
-        DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN
-    ),
     max_reactive_compactions_per_run: int = DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
     max_compaction_attempts_per_operation: int = (
         DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION
@@ -221,7 +206,6 @@ def context_budget_policy_from_threshold_tokens(
     :param soft_threshold_tokens: 已计算的 soft threshold token 数。
     :param hard_threshold_tokens: 已计算的 hard threshold token 数。
     :param policy_ref: policy snapshot / composition ref。
-    :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :param max_compaction_attempts_per_operation: 单次 compaction operation 内 proposal 上限。
     :returns: 已校验的 ContextBudgetPolicy。
@@ -254,7 +238,6 @@ def context_budget_policy_from_threshold_tokens(
         context_window_size=context_window_size,
         soft_threshold_context_ratio=soft_threshold_tokens / context_window_size,
         hard_threshold_context_ratio=hard_threshold_tokens / context_window_size,
-        max_proactive_compactions_per_run=max_proactive_compactions_per_run,
         max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         max_compaction_attempts_per_operation=(
             max_compaction_attempts_per_operation
@@ -297,7 +280,6 @@ __all__ = [
     "DEFAULT_CONTEXT_BUDGET_POLICY_REF",
     "DEFAULT_HARD_THRESHOLD_CONTEXT_RATIO",
     "DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION",
-    "DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO",
     "MIN_CONTEXT_HARD_THRESHOLD_TOKENS",

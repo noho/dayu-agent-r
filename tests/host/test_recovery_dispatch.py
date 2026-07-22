@@ -54,9 +54,9 @@ from dayu.host.engine_ingest import (
     LocalEngineEnvelope,
 )
 from dayu.host.recovery import (
-    StartupRecoveryDecision,
-    StartupRecoveryPolicy,
-    StartupRecoveryScanner,
+    SessionAttachmentRecoveryDecision,
+    SessionAttachmentRecoveryPolicy,
+    SessionAttachmentRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
 from dayu.host.terminal_post_commit import TerminalPostCommitNotice
@@ -189,7 +189,8 @@ def test_recovering_scan_creates_new_attempt_dispatch_and_wakes_scheduler(
     with open_host_durable_store(_options(tmp_path)) as store:
         old = _seed_running_dispatching_run(store.transaction_runner)
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=old.session_id,
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -199,7 +200,7 @@ def test_recovering_scan_creates_new_attempt_dispatch_and_wakes_scheduler(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RECOVERY_DISPATCHED,
+            SessionAttachmentRecoveryDecision.RECOVERY_DISPATCHED,
         )
         assert len(result.pending_dispatches) == 1
         assert wakeup.dispatches == list(result.pending_dispatches)
@@ -226,7 +227,8 @@ def test_late_old_execution_event_after_recovery_dispatch_is_rejected(
     wakeup = _RecordingWakeup()
     with open_host_durable_store(_options(tmp_path)) as store:
         old = _seed_running_dispatching_run(store.transaction_runner)
-        StartupRecoveryScanner(
+        SessionAttachmentRecoveryScanner(
+            session_id=old.session_id,
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -260,7 +262,8 @@ def test_orphan_closeout_dispatch_invalid_state_reports_recovering_ready(
     with open_host_durable_store(_options(tmp_path)) as store:
         old = _seed_running_dispatching_run(store.transaction_runner)
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=old.session_id,
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -270,7 +273,7 @@ def test_orphan_closeout_dispatch_invalid_state_reports_recovering_ready(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RECOVERING_READY,
+            SessionAttachmentRecoveryDecision.RECOVERING_READY,
         )
         assert result.actions[0].status is RunStatus.RECOVERING
         assert result.pending_dispatches == ()
@@ -335,13 +338,13 @@ def _options(tmp_path: Path) -> HostDurableStoreOptions:
     )
 
 
-def _policy() -> StartupRecoveryPolicy:
+def _policy() -> SessionAttachmentRecoveryPolicy:
     """构造测试 recovery policy。
 
     :returns: startup recovery policy。
     """
 
-    return StartupRecoveryPolicy(
+    return SessionAttachmentRecoveryPolicy(
         now=_NOW,
         stale_after=timedelta(seconds=30),
         recovery_dispatch_limit=1,

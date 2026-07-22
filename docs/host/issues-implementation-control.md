@@ -154,11 +154,11 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CTX-04` accepted Slice 1 commit。 |
+| phase | `WU-CTX-04` implementation Slice 3。 |
 | active work unit | `WU-CTX-04`；类型为 GitHub Issue #112 对应的 architecture-sensitive issue work unit。 |
-| gate | `accepted-slice-commit-in-flight`（Slice 1/3） |
+| gate | `implementation-in-flight`（Slice 3/3） |
 | blocking open questions | None。 |
-| next entry point | 创建并核验Slice 1受保护本地commit；随后把commit hash写回总控并进入implementation Slice 2/3。 |
+| next entry point | 先创建Slice 2受保护accepted commit，再由AgentCodex按accepted plan Slice 3实施execution-owner cancel reconcile、README/product integration与final verification。 |
 
 ## 推进规则
 
@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
-| WU-CTX-04 | accepted-slice-commit-in-flight (Slice 1/3) | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | accepted plan保护提交=`1f032b5e`；双路re-review均确认CR-DS-001 fixed且无new findings，当前创建Slice 1受保护本地commit。 |
+| WU-CTX-04 | implementation-in-flight (Slice 3/3) | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | accepted plan保护提交=`1f032b5e`；accepted Slice 1 commit=`eda1d70e`；Slice 2 implementation/review-fix/双路re-review已由Controller最终裁决`pass`，acceptance artifact已完成；创建Slice 2受保护commit后进入Slice 3。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
@@ -688,7 +688,7 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 
 ### 状态
 
-GitHub Issue #112 当前为 OPEN；本条状态为 `accepted-slice-commit-in-flight (Slice 1/3)`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；AgentCodex已完成Slice 1 contract-only实现。双路deepreview经总控裁决仅接受`CR-DS-001`低风险诊断缺口；AgentCodex已用结构化双失败异常链完成修复，focused pytest为44 passed、targeted pyright为0 errors，AgentMiMo / AgentDS双路re-review均判定fixed且无new findings。当前创建Slice 1受保护本地commit；不得提前公开`Host.attach_session`或改变现有production行为。
+GitHub Issue #112 当前为 OPEN；本条状态为 `implementation-in-flight (Slice 3/3)`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；Slice 1 contract-only实现及review loop已通过，受保护本地commit为`eda1d70e`。Slice 2联合implementation、initial review、review fix与双路re-review均已闭环，Controller最终acceptance decision=`pass`；zero-request orphan/unknown proactive history现由projection owner严格fail closed，recovery nested work-lease contract与Host close mandatory/best-effort文档已同步。当前先创建Slice 2受保护accepted commit，再只按accepted plan推进Slice 3 execution-owner cancel reconcile、README/product integration与final verification。
 
 ### Gate artifacts
 
@@ -716,6 +716,29 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `accepted-slice-commit-in-fli
   findings/blocking/open questions；最终总控artifact=
   `docs/reviews/wu-ctx-04-slice-1-acceptance-controller.md`，decision=`pass`。Controller
   post-fix runtime suite=`595 passed`、全量pyright=`0 errors`。
+- accepted Slice 1 commit：`eda1d70e`（`gateflow: accept WU-CTX-04 slice 1`）。
+- Slice 2 initial implementation audit：`docs/reviews/wu-ctx-04-slice-2-implementation-codex.md`
+  初始状态=`blocked`，production/test code未开始；B-001/B-002均为accepted plan漏列直接测试消费者。
+  Controller scope amendment=`docs/reviews/wu-ctx-04-slice-2-scope-amendment-controller.md`，
+  decision=`resume-with-narrow-test-only-amendment`；仅追加`test_public_host_admin.py`、
+  `test_active_cancel_dispatch.py`与同rename链的`test_terminal_post_commit.py`机械迁移，blocking
+  open questions=None。
+- Slice 2 implementation完成后双路code review：
+  `docs/reviews/code-review-20260722-161504-mimo.md`（AgentMiMo）与
+  `docs/reviews/code-review-20260723-000000-ds.md`（AgentDS）；Controller独立复核artifact=
+  `docs/reviews/wu-ctx-04-slice-2-code-review-controller-adjudication.md`，decision=`needs-fix`。
+  blocking finding=`CTRL-S2-001`：无proactive request时orphan/unknown compaction rows在strict
+  校验前被投影为`ABSENT`，可错误创建request/provider side effect；另接受recovery nested
+  work-lease contract/test与Host close mandatory/best-effort docstring澄清，blocking questions=None。
+- Slice 2 review fix：`docs/reviews/wu-ctx-04-slice-2-review-fix-codex.md`；
+  `CTRL-S2-001`、`F-DS-01`与Controller接受的close docstring correction均完成；focused
+  pytest=`153 passed`，Host suite=`2133 passed, 1 skipped, 6 deselected`，全量pyright=`0 errors`，
+  targeted ruff与`git diff --check`通过；completion=`pass-for-re-review`，未提交。
+- Slice 2 code re-review：`docs/reviews/wu-ctx-04-slice-2-re-review-mimo.md`（AgentMiMo）与
+  `docs/reviews/wu-ctx-04-slice-2-re-review-ds.md`（AgentDS）均判定accepted findings fixed并建议
+  pass；Controller最终artifact=`docs/reviews/wu-ctx-04-slice-2-acceptance-controller.md`，
+  decision=`pass`。DS新增identity observation被直接控制流反证为evidence-invalid，其余新增
+  observations均未形成actionable gap；blocking questions=None。
 
 ### 已确认问题与直接代码证据
 

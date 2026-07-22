@@ -538,7 +538,7 @@ def build_tier_recovery_request_plans(
                 tier_name="tier_2_section_degrade",
                 request_plan=_request_plan_from_segment(
                     source_snapshot=source_snapshot,
-                    selected_segment=root_request_plan.selected_segment,
+                    selected_segment=bounded_selection,
                     previous_compacted_view=degraded_blocks,
                     previous_compacted_readable_view=degraded_readable_view,
                     budget_before_compact=(

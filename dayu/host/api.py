@@ -1523,7 +1523,45 @@ class SteerConflictDetail:
         _require_optional_non_empty(
             self.current_active_run_id,
             field_name="SteerConflictDetail.current_active_run_id",
-        )
+            )
+
+
+class HostSessionAttachment(Protocol):
+    """public Session attachment 资源协议。
+
+    attachment 的访问模式在 successful attach 后冻结；关闭 attachment 只释放
+    当前 Host handle 的运行态访问资格，不关闭 Session，也不隐式取消 Run。
+    """
+
+    @property
+    def session_id(self) -> str:
+        """返回 attachment 对应的稳定 Session id。
+
+        :returns: Session id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        ...
+
+    @property
+    def access_mode(self) -> HostSessionAccessMode:
+        """返回 attachment 生命周期内冻结的访问模式。
+
+        :returns: ``READ_WRITE`` 或 ``READ_ONLY``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        ...
+
+    async def aclose(self) -> None:
+        """关闭 attachment 并等待其已接受的新工作收口。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: 当前等待被取消时抛出；底层关闭继续。
+        :raises Exception: native resource 释放失败时透传 typed 错误。
+        """
+
+        ...
 
 
 class HostSessionEventDeliveryReason(StrEnum):
@@ -3991,6 +4029,21 @@ class Host(Protocol):
     store、scheduler、registry、dispatch row、wakeup port 或 ToolRuntime 内部对象。
     """
 
+    async def attach_session(self, session_id: str) -> HostSessionAttachment:
+        """显式 attach 一个已有 Session。
+
+        同一 Host handle 对同一 Session 同时只允许一个 live attachment；跨
+        opener 竞争由 strict-native per-Session mutex 决定不可变访问模式。
+
+        :param session_id: 目标 Session id。
+        :returns: successful return 后已生效的 Session attachment。
+        :raises HostClosedError: Host 正在关闭或已经关闭时抛出。
+        :raises HostApiError: Session 不存在、重复 attach 或 recovery 失败时抛出。
+        :raises Exception: strict-native mutex 或 durable recovery 失败时透传。
+        """
+
+        ...
+
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
 
@@ -4237,6 +4290,12 @@ __all__ = [
     "HostSessionEventDeliveryPolicy",
     "HostSessionEventDeliveryReason",
     "HostSessionEventIterator",
+    "HostSessionAccessMode",
+    "HostSessionAttachment",
+    "HostSessionAttachmentConflictDetail",
+    "HostSessionAttachmentConflictReason",
+    "HostSessionMutationErrorDetail",
+    "HostSessionMutationRejectionReason",
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostToolCallDelta",

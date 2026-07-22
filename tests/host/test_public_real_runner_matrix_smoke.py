@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+from contextlib import AsyncExitStack
 
 import pytest
 
@@ -11,6 +12,7 @@ from tests.host.public_smoke_support import (
     PROVIDER_CASES,
     ProviderSmokeCase,
     api_key_or_skip,
+    close_attachment_shielded,
     ensure_request,
     followup_request,
     next_terminal_for_run,
@@ -95,8 +97,15 @@ async def _run_provider_case(
         allow_tool_calls=False,
         max_tokens=2048,
     )
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request(f"matrix-{case.name}"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,

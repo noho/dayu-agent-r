@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+from contextlib import AsyncExitStack
 
 import pytest
 
@@ -10,6 +11,7 @@ from dayu.host import RunStatus, open_host
 from tests.host.public_smoke_support import (
     AwaitingThenFinalWorkerFactory,
     awaiting_tooling_options,
+    close_attachment_shielded,
     completed_wait_request,
     deterministic_runner_spec,
     open_host_options,
@@ -36,8 +38,15 @@ async def test_resolve_wait_resumes_through_open_host_and_terminal_event(
         allow_tool_calls=True,
         tooling_options=awaiting_tooling_options(),
     )
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("resolve-wait-public"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "resolve-wait-source"),

@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import threading
 from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
@@ -55,6 +55,7 @@ from dayu.host import (
     HostSessionEventAdmissionReason,
     HostSessionEvent,
     HostSessionEventIterator,
+    HostSessionAttachment,
     HostTerminalStatus,
     HostReasoningDelta,
     HostTransientDelta,
@@ -88,6 +89,7 @@ from dayu.host.open_host import (
     _submit_followup,
 )
 from dayu.host.read_api import _SessionHostEventBatch
+from tests.host.public_smoke_support import close_attachment_shielded
 from dayu.host.transient_delta import (
     HostTransientDeltaHub,
     HostTransientDeltaSubscription,
@@ -856,8 +858,15 @@ async def test_two_watchers_observe_same_terminal_event_and_iterator_continues(
     """两个 watcher 观察同一 terminal，并且 terminal 不结束 iterator。"""
 
     factory = _Factory(_WORKER_MODE_FINAL)
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("watch-two"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first_watcher = await host.watch_session_events(session.session_id)
         second_watcher = await host.watch_session_events(session.session_id)
 
@@ -904,8 +913,15 @@ async def test_watch_attaches_before_return_and_delivers_transient_before_termin
 
     factory = _Factory(_WORKER_MODE_TRANSIENT_FINAL)
     options = _options(tmp_path, factory)
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("watch-transient"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first_watcher = await host.watch_session_events(session.session_id)
         second_watcher = await host.watch_session_events(session.session_id)
 
@@ -1034,8 +1050,15 @@ async def test_watch_cursor_snapshot_to_return_gap_remains_durably_visible(
         "_session_live_event_start_cursor",
         cursor_then_commit,
     )
-    async with open_host(_options(tmp_path, _Factory(_WORKER_MODE_FINAL))) as host:
+    async with (
+        open_host(_options(tmp_path, _Factory(_WORKER_MODE_FINAL))) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("cursor-gap"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         terminal = await _next_terminal(watcher)
         await watcher.aclose()
@@ -1277,8 +1300,15 @@ async def test_capacity_slow_watcher_overflow_does_not_block_fast_watcher_or_ter
         final_answer="capacity-overflow-final",
     )
     options = transient_stream_open_host_options(tmp_path, factory)
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("capacity-overflow"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         slow_watcher = await host.watch_session_events(session.session_id)
         fast_watcher = await host.watch_session_events(session.session_id)
         fast_task = asyncio.create_task(_collect_mixed_stream_until_terminal(fast_watcher))
@@ -1353,8 +1383,15 @@ async def test_same_run_prefix_hands_off_to_terminal_before_different_run_head(
         terminal_release,
     )
     options = _options(tmp_path, factory)
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("terminal-handoff"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         assert isinstance(watcher, _HostSessionEventIterator)
         followup = await host.submit_followup(
@@ -1478,8 +1515,11 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
     manager_c = open_host(options_c)
     watcher: HostSessionEventIterator | None = None
     first_next: asyncio.Task[HostSessionEvent] | None = None
+    attachment_a: HostSessionAttachment | None = None
+    attachment_c: HostSessionAttachment | None = None
     try:
         session = await host_a.ensure_session(_ensure_request("dual-opener-fence"))
+        attachment_a = await host_a.attach_session(session.session_id)
         run_a = await host_a.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "dual-opener-run-a"),
@@ -1563,6 +1603,9 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
             == pre_action_c_watermark
         )
 
+        await close_attachment_shielded(attachment_a)
+        attachment_a = None
+        attachment_c = await host_c.attach_session(session.session_id)
         run_b = await host_c.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "dual-opener-run-b"),
@@ -1630,6 +1673,10 @@ async def test_dual_opener_b_fence_catches_up_pages_before_terminal_handoff(
                 await first_next
         if watcher is not None:
             await watcher.aclose()
+        if attachment_c is not None:
+            await close_attachment_shielded(attachment_c)
+        if attachment_a is not None:
+            await close_attachment_shielded(attachment_a)
         await manager_c.__aexit__(None, None, None)
         await manager_a.__aexit__(None, None, None)
 
@@ -1691,10 +1738,12 @@ async def test_dual_opener_empty_mailbox_reconciles_one_page_per_timeout_and_clo
     manager_c = open_host(options_c)
     watcher: HostSessionEventIterator | None = None
     next_task: asyncio.Task[HostSessionEvent] | None = None
+    attachment_a: HostSessionAttachment | None = None
     try:
         session = await host_a.ensure_session(
             _ensure_request("dual-opener-periodic")
         )
+        attachment_a = await host_a.attach_session(session.session_id)
         run_a = await host_a.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "dual-opener-periodic-a"),
@@ -1774,6 +1823,8 @@ async def test_dual_opener_empty_mailbox_reconciles_one_page_per_timeout_and_clo
                 await next_task
         if watcher is not None:
             await watcher.aclose()
+        if attachment_a is not None:
+            await close_attachment_shielded(attachment_a)
         await manager_c.__aexit__(None, None, None)
         await manager_a.__aexit__(None, None, None)
 
@@ -1787,8 +1838,15 @@ async def test_consumer_early_cancel_does_not_cancel_run_or_write_eventlog(
     release_event = asyncio.Event()
     factory = _Factory(_WORKER_MODE_BLOCKING, release_event)
     options = _options(tmp_path, factory)
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("watch-cancel"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         consumer = asyncio.create_task(_consume_forever(watcher))
 
@@ -1852,6 +1910,7 @@ async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
     assert _subscription_count(host, session.session_id) == 0
 
     started = await host.watch_session_events(session.session_id)
+    attachment = await host.attach_session(session.session_id)
     await host.submit_followup(
         session.session_id,
         _followup_request(session.session_id, "started-aclose-run"),
@@ -1866,6 +1925,7 @@ async def test_watch_never_started_first_cancel_missing_and_host_close_cleanup(
     close_next = asyncio.ensure_future(anext(close_watcher))
     await asyncio.sleep(0.05)
     await host.close()
+    await close_attachment_shielded(attachment)
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(close_next, timeout=1.0)
     assert _subscription_count(host, session.session_id) == 0
@@ -1891,10 +1951,15 @@ async def test_watch_cancel_after_first_delta_detaches_without_cancelling_run(
         final_answer="post-delta-cancel-final",
         terminal_release_event=terminal_release,
     )
-    async with open_host(
-        transient_stream_open_host_options(tmp_path, factory)
-    ) as host:
+    async with (
+        open_host(transient_stream_open_host_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("post-delta-cancel"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -1940,10 +2005,15 @@ async def test_watch_does_not_replay_pre_attach_transient_and_keeps_first_post_a
         counts=TransientStreamCounts(content=1, reasoning=1, tool_call=1),
         final_answer="attach-boundary-final",
     )
-    async with open_host(
-        transient_stream_open_host_options(tmp_path, factory)
-    ) as host:
+    async with (
+        open_host(transient_stream_open_host_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("attach-boundary"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "pre-attach-run"),
@@ -1977,8 +2047,15 @@ async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach
 
     first_path = tmp_path / "first"
     first_options = _options(first_path, _Factory(_WORKER_MODE_FINAL))
-    async with open_host(first_options) as host:
+    async with (
+        open_host(first_options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("durable-failure-first"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -2014,9 +2091,16 @@ async def test_watch_first_and_subsequent_durable_failures_are_public_and_detach
         subsequent_path,
         subsequent_factory,
     )
-    async with open_host(subsequent_options) as host:
+    async with (
+        open_host(subsequent_options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(
             _ensure_request("durable-failure-subsequent")
+        )
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
         )
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
@@ -2062,8 +2146,15 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
     """FAILED / CANCELLED terminal HostEvent 提供 typed status 与展示字段。"""
 
     failed_factory = _Factory(_WORKER_MODE_FAILED)
-    async with open_host(_options(tmp_path / "failed", failed_factory)) as host:
+    async with (
+        open_host(_options(tmp_path / "failed", failed_factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("watch-failed"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         await host.submit_followup(
             session.session_id,
@@ -2080,8 +2171,15 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
 
     release_event = asyncio.Event()
     cancel_factory = _Factory(_WORKER_MODE_BLOCKING, release_event)
-    async with open_host(_options(tmp_path / "cancelled", cancel_factory)) as host:
+    async with (
+        open_host(_options(tmp_path / "cancelled", cancel_factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("watch-cancelled"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         await host.submit_followup(
             session.session_id,
@@ -2122,8 +2220,15 @@ async def test_empty_final_answer_terminal_projects_as_failed_event(
     """Engine-owned 空 final 失败会投影为 failed HostEvent。"""
 
     factory = _Factory(_WORKER_MODE_EMPTY_FINAL)
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("watch-empty-final"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         await host.submit_followup(
             session.session_id,
@@ -2154,14 +2259,19 @@ async def test_watch_lifecycle_errors_and_closed_session_watch(
         await host.watch_session_events("missing-session")
     await manager.__aexit__(None, None, None)
 
-    async with open_host(
-        _options(tmp_path / "open", _Factory(_WORKER_MODE_FINAL))
-    ) as host:
+    async with (
+        open_host(_options(tmp_path / "open", _Factory(_WORKER_MODE_FINAL))) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         with pytest.raises(HostApiError) as exc_info:
             await host.watch_session_events("missing-session")
         assert exc_info.value.code is HostApiErrorCode.NOT_FOUND
 
         session = await host.ensure_session(_ensure_request("watch-closed"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         await host.close_session(
             session.session_id,
             CloseSessionRequest(

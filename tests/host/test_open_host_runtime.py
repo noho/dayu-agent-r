@@ -42,6 +42,7 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    HostSessionAttachment,
     HostSessionEvent,
     HostSessionEventIterator,
     HostTerminalStatus,
@@ -111,9 +112,13 @@ from dayu.host.dispatch import _TerminalPostCommitPortFactory
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import (
-    StartupRecoveryPolicy,
-    StartupRecoveryScanner,
-    StartupRecoveryScanResult,
+    SessionAttachmentRecoveryPolicy,
+    SessionAttachmentRecoveryScanner,
+    SessionAttachmentRecoveryScanResult,
+)
+from dayu.host.session_attachment import (
+    HostSessionAttachmentRegistry,
+    SessionNewWorkAccessPort,
 )
 from dayu.host.transient_delta import (
     HostTransientDeltaHub,
@@ -821,14 +826,18 @@ async def test_submit_followup_queue_auto_wakes_scheduler(
 
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-auto-wakeup"),
-        )
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-auto-wakeup"),
+            )
 
-        final_run = await _wait_for_run_status(
-            host, followup.accepted_run_id, RunStatus.SUCCEEDED
-        )
+            final_run = await _wait_for_run_status(
+                host, followup.accepted_run_id, RunStatus.SUCCEEDED
+            )
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     assert final_run.status == RunStatus.SUCCEEDED
     assert len(factory.accepted_snapshots) == 1
@@ -976,13 +985,17 @@ async def test_public_ensure_submit_read_and_watch_share_actor_thread(
     monkeypatch.setattr(module, "_session_live_event_start_cursor", record_watch_cursor)
     async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "actor-thread-contract"),
-        )
-        watcher = await host.watch_session_events(session.session_id)
-        await host.get_run(followup.accepted_run_id)
-        await watcher.aclose()
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "actor-thread-contract"),
+            )
+            watcher = await host.watch_session_events(session.session_id)
+            await host.get_run(followup.accepted_run_id)
+            await watcher.aclose()
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     assert set(operation_threads) == {"ensure", "submit", "read", "watch"}
     assert len(set(operation_threads.values())) == 1
@@ -1000,15 +1013,19 @@ async def test_open_host_close_flushes_outbox_projection(
 
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-outbox-close-flush"),
-        )
-        await _wait_for_run_status(
-            host,
-            followup.accepted_run_id,
-            RunStatus.SUCCEEDED,
-        )
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-outbox-close-flush"),
+            )
+            await _wait_for_run_status(
+                host,
+                followup.accepted_run_id,
+                RunStatus.SUCCEEDED,
+            )
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     with open_host_durable_store(_durable_options_from_open_options(options)) as store:
         page = store.transaction_runner.run_read(
@@ -1034,25 +1051,33 @@ async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_o
     options = _options(tmp_path, interrupted_factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-interrupted"),
-        )
-        await asyncio.wait_for(interrupted_factory.accepted_event.wait(), timeout=1)
-        run_id = followup.accepted_run_id
-        session_id = session.session_id
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-interrupted"),
+            )
+            await asyncio.wait_for(interrupted_factory.accepted_event.wait(), timeout=1)
+            run_id = followup.accepted_run_id
+            session_id = session.session_id
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     _mark_current_dispatch_owner_as_stale_running(options, run_id)
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:
-        watcher = await host.watch_session_events(session_id)
-        await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
-        terminal_task = asyncio.create_task(_next_terminal(watcher))
-        recovery_factory.release_event.set()
-        terminal = await asyncio.wait_for(terminal_task, timeout=1)
-        await _close_iterator(watcher)
-        final_run = await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+        attachment = await host.attach_session(session_id)
+        try:
+            watcher = await host.watch_session_events(session_id)
+            await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
+            terminal_task = asyncio.create_task(_next_terminal(watcher))
+            recovery_factory.release_event.set()
+            terminal = await asyncio.wait_for(terminal_task, timeout=1)
+            await _close_iterator(watcher)
+            final_run = await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert terminal.final_answer is not None
@@ -1074,46 +1099,50 @@ async def test_same_durable_page_two_terminals_each_preserve_transient_handoff(
     factory = _TransientThenFinalWorkerFactory()
     async with open_host(_options(tmp_path, factory)) as host:
         session = await host.ensure_session(_ensure_request())
-        watcher = await host.watch_session_events(session.session_id)
-        public_host = cast(_PublicHostHandle, host)
-        attached_cursor = await public_host._durable_actor.call(
-            lambda handle: _actor_watch_cursor(handle, session.session_id)
-        )
-        first = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "same-page-first"),
-        )
-        assert await asyncio.wait_for(factory.accepted_queue.get(), timeout=1) == 0
-        second = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "same-page-second"),
-        )
-        factory.release_events[0].set()
-        assert await asyncio.wait_for(factory.accepted_queue.get(), timeout=1) == 1
-        factory.release_events[1].set()
-        await _wait_for_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
-        await _wait_for_run_status(host, second.accepted_run_id, RunStatus.SUCCEEDED)
-        durable_page = await public_host._durable_actor.call(
-            lambda handle: _actor_read_session_host_events_after(
-                handle,
-                session.session_id,
-                attached_cursor,
+        attachment = await host.attach_session(session.session_id)
+        try:
+            watcher = await host.watch_session_events(session.session_id)
+            public_host = cast(_PublicHostHandle, host)
+            attached_cursor = await public_host._durable_actor.call(
+                lambda handle: _actor_watch_cursor(handle, session.session_id)
             )
-        )
-        durable_page_terminals = tuple(
-            event
-            for event in durable_page.events
-            if event.terminal_status is not None
-        )
-        assert tuple(event.run_id for event in durable_page_terminals) == (
-            first.accepted_run_id,
-            second.accepted_run_id,
-        )
-        collected = await asyncio.wait_for(
-            _collect_until_two_terminals(watcher),
-            timeout=2,
-        )
-        await watcher.aclose()
+            first = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "same-page-first"),
+            )
+            assert await asyncio.wait_for(factory.accepted_queue.get(), timeout=1) == 0
+            second = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "same-page-second"),
+            )
+            factory.release_events[0].set()
+            assert await asyncio.wait_for(factory.accepted_queue.get(), timeout=1) == 1
+            factory.release_events[1].set()
+            await _wait_for_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
+            await _wait_for_run_status(host, second.accepted_run_id, RunStatus.SUCCEEDED)
+            durable_page = await public_host._durable_actor.call(
+                lambda handle: _actor_read_session_host_events_after(
+                    handle,
+                    session.session_id,
+                    attached_cursor,
+                )
+            )
+            durable_page_terminals = tuple(
+                event
+                for event in durable_page.events
+                if event.terminal_status is not None
+            )
+            assert tuple(event.run_id for event in durable_page_terminals) == (
+                first.accepted_run_id,
+                second.accepted_run_id,
+            )
+            collected = await asyncio.wait_for(
+                _collect_until_two_terminals(watcher),
+                timeout=2,
+            )
+            await watcher.aclose()
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     terminal_events = tuple(
         event
@@ -1167,8 +1196,10 @@ async def test_pre_dispatch_cancel_terminal_precedes_queued_promotion_entry(
     host = cast(_PublicHostHandle, await manager.__aenter__())
     watcher: HostSessionEventIterator | None = None
     frozen_next: asyncio.Task[HostSessionEvent] | None = None
+    attachment: HostSessionAttachment | None = None
     try:
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
         run_a = await host.submit_followup(
             session.session_id,
             _followup_request(
@@ -1203,6 +1234,8 @@ async def test_pre_dispatch_cancel_terminal_precedes_queued_promotion_entry(
         )
     finally:
         await _close_terminal_barrier_watcher(watcher, frozen_next)
+        if attachment is not None:
+            await asyncio.shield(attachment.aclose())
         await manager.__aexit__(None, None, None)
 
 
@@ -1228,11 +1261,13 @@ async def test_wait_failed_terminal_precedes_queued_promotion_entry(
     host = cast(_PublicHostHandle, await manager.__aenter__())
     watcher: HostSessionEventIterator | None = None
     frozen_next: asyncio.Task[HostSessionEvent] | None = None
+    attachment: HostSessionAttachment | None = None
     try:
         waiting_a = await host.get_run(run_a_id)
         queued_b = await host.get_run(run_b_id)
         assert waiting_a.status is RunStatus.WAITING
         assert queued_b.status is RunStatus.QUEUED
+        attachment = await host.attach_session(waiting_a.session_id)
         watcher = await host.watch_session_events(waiting_a.session_id)
         frozen_next = asyncio.create_task(anext(watcher))
         await asyncio.sleep(0)
@@ -1251,6 +1286,8 @@ async def test_wait_failed_terminal_precedes_queued_promotion_entry(
         )
     finally:
         await _close_terminal_barrier_watcher(watcher, frozen_next)
+        if attachment is not None:
+            await asyncio.shield(attachment.aclose())
         await manager.__aexit__(None, None, None)
 
 
@@ -1276,11 +1313,13 @@ async def test_wait_expiry_terminal_precedes_queued_promotion_entry(
     host = cast(_PublicHostHandle, await manager.__aenter__())
     watcher: HostSessionEventIterator | None = None
     frozen_next: asyncio.Task[HostSessionEvent] | None = None
+    attachment: HostSessionAttachment | None = None
     try:
         waiting_a = await host.get_run(run_a_id)
         queued_b = await host.get_run(run_b_id)
         assert waiting_a.status is RunStatus.WAITING
         assert queued_b.status is RunStatus.QUEUED
+        attachment = await host.attach_session(waiting_a.session_id)
         watcher = await host.watch_session_events(waiting_a.session_id)
         frozen_next = asyncio.create_task(anext(watcher))
         await asyncio.sleep(0)
@@ -1307,6 +1346,8 @@ async def test_wait_expiry_terminal_precedes_queued_promotion_entry(
         )
     finally:
         await _close_terminal_barrier_watcher(watcher, frozen_next)
+        if attachment is not None:
+            await asyncio.shield(attachment.aclose())
         await manager.__aexit__(None, None, None)
 
 
@@ -1320,23 +1361,31 @@ async def test_open_host_startup_recovery_dispatches_gracefully_closed_run(
     options = _options(tmp_path, interrupted_factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-graceful-close"),
-        )
-        await asyncio.wait_for(interrupted_factory.accepted_event.wait(), timeout=1)
-        run_id = followup.accepted_run_id
-        session_id = session.session_id
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-graceful-close"),
+            )
+            await asyncio.wait_for(interrupted_factory.accepted_event.wait(), timeout=1)
+            run_id = followup.accepted_run_id
+            session_id = session.session_id
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:
-        watcher = await host.watch_session_events(session_id)
-        await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
-        terminal_task = asyncio.create_task(_next_terminal(watcher))
-        recovery_factory.release_event.set()
-        terminal = await asyncio.wait_for(terminal_task, timeout=1)
-        await _close_iterator(watcher)
-        final_run = await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+        attachment = await host.attach_session(session_id)
+        try:
+            watcher = await host.watch_session_events(session_id)
+            await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
+            terminal_task = asyncio.create_task(_next_terminal(watcher))
+            recovery_factory.release_event.set()
+            terminal = await asyncio.wait_for(terminal_task, timeout=1)
+            await _close_iterator(watcher)
+            final_run = await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert terminal.final_answer is not None
@@ -1417,30 +1466,34 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
     monkeypatch.setattr(_ControlledFinalAnswerHandle, "on_cancel", record_worker_hook)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-active-cancel-watchdog"),
-        )
-        await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
-        watcher = await host.watch_session_events(session.session_id)
-        terminal_task = asyncio.create_task(_next_terminal(watcher))
-        await asyncio.sleep(0)
-        await host.get_run(followup.accepted_run_id)
-        cancelling = await host.cancel_run(
-            followup.accepted_run_id,
-            _cancel_request("cancel-active-watchdog"),
-        )
-        assert hook_event.is_set()
-        assert watchdog_threads == [opener_thread_id]
-        assert watchdog_event_states == [True]
-        assert token_threads == [opener_thread_id]
-        assert hook_threads == [opener_thread_id]
-        cast(_PublicHostHandle, host)._scheduler.tick_active_cancel_watchdog(
-            datetime(2030, 1, 1, tzinfo=UTC)
-        )
-        terminal = await asyncio.wait_for(terminal_task, timeout=1)
-        await _close_iterator(watcher)
-        final_run = await host.get_run(followup.accepted_run_id)
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-active-cancel-watchdog"),
+            )
+            await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+            watcher = await host.watch_session_events(session.session_id)
+            terminal_task = asyncio.create_task(_next_terminal(watcher))
+            await asyncio.sleep(0)
+            await host.get_run(followup.accepted_run_id)
+            cancelling = await host.cancel_run(
+                followup.accepted_run_id,
+                _cancel_request("cancel-active-watchdog"),
+            )
+            assert hook_event.is_set()
+            assert watchdog_threads == [opener_thread_id]
+            assert watchdog_event_states == [True]
+            assert token_threads == [opener_thread_id]
+            assert hook_threads == [opener_thread_id]
+            cast(_PublicHostHandle, host)._scheduler.tick_active_cancel_watchdog(
+                datetime(2030, 1, 1, tzinfo=UTC)
+            )
+            terminal = await asyncio.wait_for(terminal_task, timeout=1)
+            await _close_iterator(watcher)
+            final_run = await host.get_run(followup.accepted_run_id)
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     assert cancelling.status is RunStatus.CANCELLING
     assert terminal.kind is HostEventKind.CANCELLED
@@ -1458,16 +1511,20 @@ async def test_open_host_reopen_closes_existing_cancelling_run_as_cancelled(
     options = _options(tmp_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-reopen-watchdog-closeout"),
-        )
-        await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
-        await host.cancel_run(
-            followup.accepted_run_id,
-            _cancel_request("cancel-reopen-watchdog-closeout"),
-        )
-        run_id = followup.accepted_run_id
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-reopen-watchdog-closeout"),
+            )
+            await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+            await host.cancel_run(
+                followup.accepted_run_id,
+                _cancel_request("cancel-reopen-watchdog-closeout"),
+            )
+            run_id = followup.accepted_run_id
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     async with open_host(replace(options, worker_factory=_FinalAnswerWorkerFactory())) as host:
         final_run = await host.get_run(run_id)
@@ -1487,16 +1544,20 @@ async def test_open_host_reopen_closes_accepted_cancel_with_watchdog(
     options = _options(tmp_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "followup-reopen-watchdog"),
-        )
-        await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
-        await host.cancel_run(
-            followup.accepted_run_id,
-            _cancel_request("cancel-reopen-watchdog"),
-        )
-        run_id = followup.accepted_run_id
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "followup-reopen-watchdog"),
+            )
+            await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+            await host.cancel_run(
+                followup.accepted_run_id,
+                _cancel_request("cancel-reopen-watchdog"),
+            )
+            run_id = followup.accepted_run_id
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     async with open_host(replace(options, worker_factory=_FinalAnswerWorkerFactory())) as host:
         snapshot = await host.get_run(run_id)
@@ -1718,6 +1779,7 @@ async def test_public_admission_first_commit_and_wake_precede_fatal(
     manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
     public_host = cast(_PublicHostHandle, await manager.__aenter__())
     session = await public_host.ensure_session(_ensure_request())
+    attachment = await public_host.attach_session(session.session_id)
     actor_started = threading.Event()
     actor_release = threading.Event()
     admission_submitted = asyncio.Event()
@@ -1825,6 +1887,7 @@ async def test_public_admission_first_commit_and_wake_precede_fatal(
         assert cancel_error.value.code is HostApiErrorCode.NOT_FOUND
     finally:
         actor_release.set()
+        await asyncio.shield(attachment.aclose())
         await manager.__aexit__(None, None, None)
 
 
@@ -1843,6 +1906,7 @@ async def test_cancelled_public_admission_keeps_lease_until_actor_wake(
     manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
     public_host = cast(_PublicHostHandle, await manager.__aenter__())
     session = await public_host.ensure_session(_ensure_request())
+    attachment = await public_host.attach_session(session.session_id)
     actor_started = threading.Event()
     actor_release = threading.Event()
     admission_submitted = asyncio.Event()
@@ -1932,6 +1996,7 @@ async def test_cancelled_public_admission_keeps_lease_until_actor_wake(
         assert public_host._health_gate.state is HostExecutionHealthState.UNAVAILABLE
     finally:
         actor_release.set()
+        await asyncio.shield(attachment.aclose())
         await manager.__aexit__(None, None, None)
 
 
@@ -2013,102 +2078,65 @@ async def test_open_host_wait_poller_resolves_waiting_run_in_background(
 
 
 @pytest.mark.asyncio
-async def test_startup_recovery_runs_on_actor_before_ready(
+async def test_open_host_has_no_session_recovery_side_effect_before_ready(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """startup recovery 必须在 actor thread 完成后才进入 READY。
+    """单独 open_host 不创建 target recovery scanner。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
-    :raises Exception: opener 或真实 recovery scan 失败时透传。
+    :raises Exception: opener 失败时透传。
     """
 
-    opener_thread_id = threading.get_ident()
-    recovery_thread_ids: list[int] = []
-    ready_thread_ids: list[int] = []
-    recovery_started = threading.Event()
-    recovery_release = threading.Event()
-    original_scan = StartupRecoveryScanner.scan
-    original_mark_ready = HostExecutionHealthGate.mark_ready
+    scan_calls = 0
 
-    def barrier_scan(
-        self: StartupRecoveryScanner,
-        policy: StartupRecoveryPolicy | None = None,
-    ) -> StartupRecoveryScanResult:
-        """记录 actor thread，并以 barrier 固定 recovery/READY 顺序。
+    def record_scan(
+        self: SessionAttachmentRecoveryScanner,
+        policy: SessionAttachmentRecoveryPolicy | None = None,
+    ) -> SessionAttachmentRecoveryScanResult:
+        """记录任何意外 recovery scan。
 
-        :param self: startup recovery scanner。
+        :param self: target recovery scanner。
         :param policy: 可选 recovery policy。
-        :returns: 真实 recovery scan 结果。
-        :raises RuntimeError: barrier 未在测试预算内释放时抛出。
-        :raises Exception: 真实 recovery scan 失败时透传。
+        :returns: 空 scan 结果。
+        :raises Exception: 不主动抛出异常。
         """
 
-        recovery_thread_ids.append(threading.get_ident())
-        recovery_started.set()
-        if not recovery_release.wait(timeout=5):
-            raise RuntimeError("startup recovery barrier timed out")
-        return original_scan(self, policy)
+        nonlocal scan_calls
+        del self, policy
+        scan_calls += 1
+        return SessionAttachmentRecoveryScanResult(actions=())
 
-    def record_ready(self: HostExecutionHealthGate) -> None:
-        """记录 READY handoff thread 后委托真实 health owner。
-
-        :param self: execution health gate。
-        :returns: ``None``。
-        :raises Exception: 真实 READY transition 失败时透传。
-        """
-
-        ready_thread_ids.append(threading.get_ident())
-        original_mark_ready(self)
-
-    monkeypatch.setattr(StartupRecoveryScanner, "scan", barrier_scan)
-    monkeypatch.setattr(HostExecutionHealthGate, "mark_ready", record_ready)
-    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
-    open_task = asyncio.create_task(manager.__aenter__())
-    try:
-        started = await asyncio.wait_for(
-            asyncio.to_thread(recovery_started.wait),
-            timeout=2,
-        )
-        assert started
-        assert recovery_thread_ids != [opener_thread_id]
-        assert ready_thread_ids == []
-
-        recovery_release.set()
-        await asyncio.wait_for(open_task, timeout=2)
-
-        assert ready_thread_ids == [opener_thread_id]
-    finally:
-        recovery_release.set()
-        if not open_task.done():
-            await open_task
-        if not open_task.cancelled() and open_task.exception() is None:
-            await manager.__aexit__(None, None, None)
+    monkeypatch.setattr(SessionAttachmentRecoveryScanner, "scan", record_scan)
+    async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())):
+        assert scan_calls == 0
+    assert scan_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_open_host_startup_failure_flushes_projection_before_close(
+async def test_attachment_recovery_failure_does_not_fail_open_host(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_host ready 前失败时仍应 best-effort 追平 projection。"""
+    """target recovery failure 只使 attachment factory 失败。"""
 
     catch_up_calls = 0
-    ready_calls = 0
 
     def raise_recovery_scan(
-        self: StartupRecoveryScanner,
+        self: SessionAttachmentRecoveryScanner,
+        policy: SessionAttachmentRecoveryPolicy | None = None,
     ) -> None:
-        """模拟 startup recovery scan 失败。
+        """模拟 target recovery scan 失败。
 
         :param self: 被 monkeypatch 的 scanner。
+        :param policy: 可选 fixed-now recovery policy。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出测试错误。
         """
 
-        del self
+        del self, policy
         raise RuntimeError("forced startup recovery failure")
 
     def record_catch_up(
@@ -2124,19 +2152,8 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
         del self
         catch_up_calls += 1
 
-    def record_ready(self: HostExecutionHealthGate) -> None:
-        """记录 recovery 失败路径是否错误进入 READY。
-
-        :param self: execution health gate。
-        :returns: ``None``。
-        """
-
-        nonlocal ready_calls
-        del self
-        ready_calls += 1
-
     monkeypatch.setattr(
-        StartupRecoveryScanner,
+        SessionAttachmentRecoveryScanner,
         "scan",
         raise_recovery_scan,
     )
@@ -2145,14 +2162,18 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
         "catch_up_projection",
         record_catch_up,
     )
-    monkeypatch.setattr(HostExecutionHealthGate, "mark_ready", record_ready)
-
-    with pytest.raises(RuntimeError, match="forced startup recovery failure"):
-        async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())):
-            raise AssertionError("open_host must fail before yielding")
+    async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())) as host:
+        session = await host.ensure_session(
+            EnsureSessionRequest(
+                scope="workspace",
+                slot_key="attach-failure",
+                metadata=(),
+            )
+        )
+        with pytest.raises(RuntimeError, match="forced startup recovery failure"):
+            await host.attach_session(session.session_id)
 
     assert catch_up_calls == 1
-    assert ready_calls == 0
 
 
 @pytest.mark.asyncio
@@ -2174,6 +2195,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         health_gate: HostExecutionHealthGate,
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
+        session_attachment_registry: HostSessionAttachmentRegistry,
         projection_catchup_port: ProjectionCatchupPort,
         session_event_reconciliation_waiter: (
             _SessionEventReconciliationWaiter
@@ -2190,6 +2212,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         :param health_gate: execution health gate。
         :param host_handle_id: Host handle id。
         :param scheduler: scheduler。
+        :param session_attachment_registry: opener attachment registry。
         :param projection_catchup_port: projection catch-up port。
         :param session_event_reconciliation_waiter: opener-local session
             event reconciliation waiter。
@@ -2202,6 +2225,7 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         """
 
         del self, durable_actor, health_gate, host_handle_id, scheduler
+        del session_attachment_registry
         del projection_catchup_port
         del session_event_reconciliation_waiter
         del scheduler_store
@@ -2272,6 +2296,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
         terminal_post_commit_port_factory: _TerminalPostCommitPortFactory,
+        session_new_work_access: SessionNewWorkAccessPort,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
         health_gate: HostExecutionHealthGate | None = None,
@@ -2284,6 +2309,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         :param host_handle_id: Host handle id。
         :param transient_delta_publisher: Host 瞬态增量 publisher。
         :param terminal_post_commit_port_factory: terminal port 构造期工厂。
+        :param session_new_work_access: Session new-work access port。
         :param active_registry: active worker registry。
         :param projection_catchup_port: commit 后 projection catch-up port。
         :param health_gate: shared execution health gate。
@@ -2298,6 +2324,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
             host_handle_id=host_handle_id,
             transient_delta_publisher=transient_delta_publisher,
             terminal_post_commit_port_factory=terminal_post_commit_port_factory,
+            session_new_work_access=session_new_work_access,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
             health_gate=health_gate,
@@ -2329,15 +2356,19 @@ async def test_open_host_dispatch_memory_catchup_reaches_required_cursor(
 
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        followup = await host.submit_followup(
-            session.session_id,
-            _followup_request(session.session_id, "required-memory-dispatch"),
-        )
-        final_run = await _wait_for_run_status(
-            host,
-            followup.accepted_run_id,
-            RunStatus.SUCCEEDED,
-        )
+        attachment = await host.attach_session(session.session_id)
+        try:
+            followup = await host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "required-memory-dispatch"),
+            )
+            final_run = await _wait_for_run_status(
+                host,
+                followup.accepted_run_id,
+                RunStatus.SUCCEEDED,
+            )
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     assert final_run.status is RunStatus.SUCCEEDED
     assert len(factory.accepted_snapshots) == 1
@@ -2354,11 +2385,15 @@ async def test_open_host_admin_purge_keeps_execution_capability_separate(
 
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
-        await host.close_session(
-            session.session_id,
-            _close_request("close-before-purge"),
-        )
-        assert not hasattr(host, "purge_session")
+        attachment = await host.attach_session(session.session_id)
+        try:
+            await host.close_session(
+                session.session_id,
+                _close_request("close-before-purge"),
+            )
+            assert not hasattr(host, "purge_session")
+        finally:
+            await asyncio.shield(attachment.aclose())
 
     async with open_host_admin(_admin_options(options)) as host_admin:
         result = await host_admin.purge_session(

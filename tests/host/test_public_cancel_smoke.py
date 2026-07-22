@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import sqlite3
+from contextlib import AsyncExitStack
 from dataclasses import replace
 
 import pytest
@@ -17,6 +18,7 @@ from dayu.host import (
     open_host,
 )
 from tests.host.public_smoke_support import (
+    close_attachment_shielded,
     next_terminal_for_run,
     wait_for_diagnostic_event_type_count,
 )
@@ -38,8 +40,15 @@ async def test_cancel_accepted_queued_and_active_public_path(
     """public cancel 覆盖 queued 与 active，并通过 shared registry 可见。"""
 
     factory = _SequencedWorkerFactory([_BLOCK])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("cancel"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         active = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "cancel-active"),
@@ -92,8 +101,15 @@ async def test_pre_dispatch_cancel_visible_in_watch(
     """
 
     factory = _SequencedWorkerFactory([_BLOCK])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("cancel-watch"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         active = await host.submit_followup(
             session.session_id,
@@ -133,8 +149,15 @@ async def test_active_cancel_emits_public_cancel_event(
     """
 
     factory = _SequencedWorkerFactory([_BLOCK])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("active-cancel"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         active = await host.submit_followup(
             session.session_id,
@@ -169,8 +192,15 @@ async def test_recovering_cancel_does_not_propagate_worker_cancel(
     """
 
     factory = _SequencedWorkerFactory([_BLOCK])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("recovering-cancel"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         active = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "recovering-cancel-run"),
@@ -210,9 +240,20 @@ async def test_cancel_session_runs_scoped_to_session(
         lane_capacity=2,
         lane_name="slice5-session-scope",
     )
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         first_session = await host.ensure_session(_ensure_request("scope-first"))
         second_session = await host.ensure_session(_ensure_request("scope-second"))
+        first_attachment = await host.attach_session(first_session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, first_attachment
+        )
+        second_attachment = await host.attach_session(second_session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, second_attachment
+        )
         first_run = await host.submit_followup(
             first_session.session_id,
             _followup_request(first_session.session_id, "scope-first-run"),

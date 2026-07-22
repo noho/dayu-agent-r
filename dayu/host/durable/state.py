@@ -1923,66 +1923,24 @@ def read_non_terminal_runs_for_session(transaction: HostTransaction, session_id:
     return tuple(run_row_from_host_row(row) for row in rows)
 
 
-def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
-    """读取全部非终态 Run。
-
-    :param transaction: 调用方提供的 Host transaction。
-    :returns: 按 accepted event sequence 升序排列的非终态 Run row 元组。
-    :raises HostDurableError: row 字段无效时抛出。
-    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
-    """
-
-    status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
-    rows = transaction.fetchall(
-        f"""
-        SELECT
-          run_id,
-          session_id,
-          status,
-          client_request_id,
-          input_event_id,
-          input_event_sequence,
-          accepted_event_id,
-          accepted_event_sequence,
-          queued_event_id,
-          queued_event_sequence,
-          started_event_id,
-          started_event_sequence,
-          terminal_event_id,
-          terminal_event_sequence,
-          cancel_request_event_id,
-          current_attempt_id,
-          source_run_id,
-          source_run_relation,
-          execution_target,
-          queue_policy,
-          created_at,
-          updated_at,
-          terminal_at
-        FROM {TABLE_HOST_RUNS}
-        WHERE status {status_clause}
-        ORDER BY accepted_event_sequence ASC, run_id ASC
-        """,
-        status_params,
-    )
-    return tuple(run_row_from_host_row(row) for row in rows)
-
-
-def read_non_terminal_run_upper_watermark(
+def read_non_terminal_run_upper_watermark_for_session(
     transaction: HostTransaction,
+    session_id: str,
 ) -> NonTerminalRunKeysetCursor | None:
-    """读取 recovery scan 开始时固定的 non-terminal Run upper watermark。
+    """读取目标 Session recovery scan 的固定 non-terminal Run upper watermark。
 
     watermark 只来自 durable Run governance rows，并以
     ``(accepted_event_sequence, run_id)`` 全序确定边界；projection/read model
     不参与。
 
     :param transaction: 调用方提供的 Host read transaction。
+    :param session_id: recovery attachment 对应的目标 Session id。
     :returns: 当前最大 keyset；没有 non-terminal Run 时返回 ``None``。
     :raises HostDurableError: watermark row 字段无效时抛出。
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
+    _require_non_empty_text(session_id, field_name="session_id")
     status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
     row = transaction.fetchone(
         f"""
@@ -1990,11 +1948,12 @@ def read_non_terminal_run_upper_watermark(
           accepted_event_sequence,
           run_id
         FROM {TABLE_HOST_RUNS}
-        WHERE status {status_clause}
+        WHERE session_id = ?
+          AND status {status_clause}
         ORDER BY accepted_event_sequence DESC, run_id DESC
         LIMIT 1
         """,
-        status_params,
+        (session_id, *status_params),
     )
     if row is None:
         return None
@@ -2019,19 +1978,21 @@ def read_non_terminal_run_upper_watermark(
     )
 
 
-def read_non_terminal_runs_keyset_page(
+def read_non_terminal_runs_for_session_keyset_page(
     transaction: HostTransaction,
     *,
+    session_id: str,
     upper_watermark: NonTerminalRunKeysetCursor,
     cursor: NonTerminalRunKeysetCursor | None,
     batch_size: int,
 ) -> tuple[RunRow, ...]:
-    """读取 upper watermark 内下一页 non-terminal Run。
+    """读取目标 Session upper watermark 内下一页 non-terminal Run。
 
     查询严格使用 keyset，不使用 OFFSET。``fetchall`` 只消费带 ``LIMIT`` 的
     单个 bounded page。
 
     :param transaction: 调用方提供的 Host write transaction。
+    :param session_id: recovery attachment 对应的目标 Session id。
     :param upper_watermark: scan 开始时固定的最大 keyset。
     :param cursor: 上一批最后处理的 keyset；首批为 ``None``。
     :param batch_size: 本页最大 Run row 数。
@@ -2041,6 +2002,7 @@ def read_non_terminal_runs_keyset_page(
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
+    _require_non_empty_text(session_id, field_name="session_id")
     _validate_non_terminal_run_keyset(
         upper_watermark,
         field_name="upper_watermark",
@@ -2098,7 +2060,8 @@ def read_non_terminal_runs_keyset_page(
           updated_at,
           terminal_at
         FROM {TABLE_HOST_RUNS}
-        WHERE status {status_clause}
+        WHERE session_id = ?
+          AND status {status_clause}
           AND (
             accepted_event_sequence < ?
             OR (accepted_event_sequence = ? AND run_id <= ?)
@@ -2108,6 +2071,7 @@ def read_non_terminal_runs_keyset_page(
         LIMIT ?
         """,
         (
+            session_id,
             *status_params,
             upper_watermark.accepted_event_sequence,
             upper_watermark.accepted_event_sequence,
@@ -2201,6 +2165,55 @@ def read_cancelling_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
         ORDER BY accepted_event_sequence ASC, run_id ASC
         """,
         (serialize_run_status(RunStatus.CANCELLING),),
+    )
+    return tuple(run_row_from_host_row(row) for row in rows)
+
+
+def read_cancelling_runs_for_session(
+    transaction: HostTransaction,
+    session_id: str,
+) -> tuple[RunRow, ...]:
+    """读取目标 Session 的全部 ``CANCELLING`` Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: 目标 Session id。
+    :returns: 按 accepted event sequence 升序排列的 cancelling Run row 元组。
+    :raises HostDurableError: Session id 或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          cancel_request_event_id,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ? AND status = ?
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        """,
+        (session_id, serialize_run_status(RunStatus.CANCELLING)),
     )
     return tuple(run_row_from_host_row(row) for row in rows)
 

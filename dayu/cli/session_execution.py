@@ -356,28 +356,32 @@ async def execute_prompt_on_session(
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
-    terminal = await _submit_prompt_turn_handling_sigint(
-        host=host,
-        runtime=prepared.runtime,
-        invocation=prepared.invocation,
-        session_id=session_id,
-        user_prompt=prepared.user_prompt,
-        run_overrides=prepared.run_overrides,
-        sigint_monitor=sigint_monitor,
-        activity_renderer=_new_detail_activity_renderer() if detail else None,
-        thinking_renderer=_new_thinking_renderer() if thinking else None,
-        key_monitor=new_running_key_monitor(),
-    )
-    if terminal is None:
-        return EXIT_KEYBOARD_INTERRUPT
-    render_exit_code = render_prompt_terminal_result(terminal)
-    await advance_cli_terminal_cursor(
-        workspace_root=prepared.workspace_root,
-        session_id=session_id,
-        terminal_event_id=terminal.terminal_event_id,
-        event_sequence=terminal.event_sequence,
-    )
-    return render_exit_code
+    attachment = await host.attach_session(session_id)
+    try:
+        terminal = await _submit_prompt_turn_handling_sigint(
+            host=host,
+            runtime=prepared.runtime,
+            invocation=prepared.invocation,
+            session_id=session_id,
+            user_prompt=prepared.user_prompt,
+            run_overrides=prepared.run_overrides,
+            sigint_monitor=sigint_monitor,
+            activity_renderer=_new_detail_activity_renderer() if detail else None,
+            thinking_renderer=_new_thinking_renderer() if thinking else None,
+            key_monitor=new_running_key_monitor(),
+        )
+        if terminal is None:
+            return EXIT_KEYBOARD_INTERRUPT
+        render_exit_code = render_prompt_terminal_result(terminal)
+        await advance_cli_terminal_cursor(
+            workspace_root=prepared.workspace_root,
+            session_id=session_id,
+            terminal_event_id=terminal.terminal_event_id,
+            event_sequence=terminal.event_sequence,
+        )
+        return render_exit_code
+    finally:
+        await asyncio.shield(attachment.aclose())
 
 
 async def execute_interactive_on_session(
@@ -425,6 +429,7 @@ async def execute_interactive_on_session(
     )
     primary_error: BaseException | None = None
     exit_code = EXIT_SUCCESS
+    attachment = await host.attach_session(session_id)
     try:
         if runtime_display is not None:
             await runtime_display.install_runtime_line_guard()
@@ -469,6 +474,13 @@ async def execute_interactive_on_session(
     except BaseException as error:
         primary_error = error
     cleanup_error = await _close_runtime_display(runtime_display)
+    try:
+        await asyncio.shield(attachment.aclose())
+    except BaseException as error:
+        cleanup_error = _combine_lifecycle_cleanup_errors(
+            cleanup_error,
+            error,
+        )
     if primary_error is not None:
         _raise_lifecycle_primary(primary_error, cleanup_error)
     if cleanup_error is not None:

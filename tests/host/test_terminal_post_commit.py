@@ -89,11 +89,11 @@ _EXPECTED_TERMINAL_PRODUCERS: dict[str, frozenset[tuple[str, str]]] = {
     "dayu/host/recovery.py": frozenset(
         {
             (
-                "StartupRecoveryScanner._classify_recovering",
+                "SessionAttachmentRecoveryScanner._classify_recovering",
                 "lose_recovering_run_in_transaction",
             ),
             (
-                "StartupRecoveryScanner._close_positive_orphan",
+                "SessionAttachmentRecoveryScanner._close_positive_orphan",
                 "close_startup_orphan_attempt_in_transaction",
             ),
         }
@@ -101,7 +101,7 @@ _EXPECTED_TERMINAL_PRODUCERS: dict[str, frozenset[tuple[str, str]]] = {
     "dayu/host/dispatch.py": frozenset(
         {
             (
-                "HostDispatchScheduler.tick_active_cancel_watchdog._operation",
+                "HostDispatchScheduler._tick_active_cancel_watchdog._operation",
                 "active_cancel_watchdog_closeout_in_transaction",
             ),
             (
@@ -127,7 +127,7 @@ _EXPECTED_DIRECT_PROMOTION_CALLS = Counter(
         ("dayu/host/admission.py", "_wake_start_governance_if_needed"): 1,
         (
             "dayu/host/recovery.py",
-            "StartupRecoveryScanner._wake_after_committed_batch",
+            "SessionAttachmentRecoveryScanner._wake_after_committed_batch",
         ): 1,
         (
             "dayu/host/open_host.py",

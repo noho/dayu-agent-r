@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from typing import Protocol, cast
 
 import pytest
@@ -22,6 +23,7 @@ from dayu.host import (
     open_host,
 )
 from tests.host.public_smoke_support import (
+    close_attachment_shielded,
     ensure_request,
     followup_request,
 )
@@ -75,8 +77,15 @@ async def test_three_thousand_transient_deltas_leave_zero_rows_and_durable_termi
     )
     options = transient_stream_open_host_options(tmp_path, factory)
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("transient-stress"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         observation_task = asyncio.create_task(_collect_until_terminal(watcher))
         followup = await host.submit_followup(

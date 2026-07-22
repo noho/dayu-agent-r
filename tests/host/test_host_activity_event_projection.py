@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator, Mapping
+from contextlib import AsyncExitStack
 from dataclasses import asdict
 from typing import cast
 
@@ -55,6 +56,7 @@ from dayu.host import (
     SubmitFollowupRequest,
     open_host,
 )
+from tests.host.public_smoke_support import close_attachment_shielded
 from dayu.host.durable.codec import canonical_json_dumps
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
@@ -267,8 +269,15 @@ async def test_tool_activity_uses_admission_display_snapshot(
     """工具 activity 从 USER_INPUT_ACCEPTED snapshot 读取展示名。"""
 
     factory = _BlockingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         accepted = await host.submit_followup(
             session.session_id,
             _followup(
@@ -342,8 +351,15 @@ async def test_tool_activity_falls_back_to_stable_name_without_display(
     """缺少 display metadata 的 selected tool fallback 稳定工具名。"""
 
     factory = _BlockingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         accepted = await host.submit_followup(
             session.session_id,
             _followup(
@@ -748,8 +764,15 @@ async def test_tool_display_fallback_chain_for_missing_snapshot_parts(
     """display lookup 在 run/payload/mapping 缺失时 fallback 稳定工具名。"""
 
     factory = _BlockingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         accepted = await host.submit_followup(
             session.session_id,
             _followup(
@@ -802,8 +825,15 @@ async def test_tool_display_fallback_when_input_event_missing(
     """display lookup 读不到 input event 时 fallback 稳定工具名。"""
 
     factory = _BlockingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         accepted = await host.submit_followup(
             session.session_id,
             _followup(

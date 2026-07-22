@@ -68,6 +68,10 @@ _FIELD_QUALITY_CHECK_RESULT = "quality_check_result"
 _FIELD_BUDGET_AFTER_COMPACT = "budget_after_compact"
 _FIELD_FAILURE_REASON = "failure_reason"
 _FIELD_OPERATION_ID = "operation_id"
+_FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = (
+    "max_compaction_attempts_per_operation"
+)
+_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _FIELD_ATTEMPT_NUMBER = "attempt_number"
 _FIELD_FAILURE_CATEGORY = "failure_category"
 _FIELD_REPAIRABLE = "repairable"
@@ -104,6 +108,8 @@ _FIELD_ACCEPTED = "accepted"
 _FIELD_REJECTION_REASONS = "rejection_reasons"
 
 _REQUESTED_REQUIRED_FIELDS = (
+    _FIELD_OPERATION_ID,
+    _FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION,
     _FIELD_TRIGGER_SOURCE,
     _FIELD_BUDGET_REASON,
     _FIELD_BUDGET_SNAPSHOT_REF,
@@ -114,6 +120,9 @@ _REQUESTED_REQUIRED_FIELDS = (
     _FIELD_PROVIDER_ERROR_REF,
     _FIELD_ATTEMPT_ID,
     _FIELD_EXECUTION_ID,
+    _FIELD_CLIENT_CORRELATION_ID,
+    _FIELD_FROZEN_MATERIAL_LIST_DIGEST,
+    _FIELD_FROZEN_MATERIAL_REFS,
 )
 _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_OPERATION_ID,
@@ -181,6 +190,8 @@ _FALLBACK_ACTIONS = frozenset(
 
 def build_context_compaction_requested_payload(
     *,
+    operation_id: str,
+    max_compaction_attempts_per_operation: int,
     trigger_source: ContextCompactionTriggerSource,
     budget_reason: str,
     budget_snapshot_ref: str,
@@ -191,11 +202,15 @@ def build_context_compaction_requested_payload(
     provider_error_ref: str | None,
     attempt_id: str | None,
     execution_id: str | None,
-    frozen_material_list_digest: str | None = None,
-    frozen_material_refs: tuple[str, ...] = (),
+    client_correlation_id: str | None,
+    frozen_material_list_digest: str,
+    frozen_material_refs: tuple[str, ...],
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTION_REQUESTED`` payload。
 
+    :param operation_id: durable compact operation id；producer 必须与 request
+        event id 使用同一预生成值。
+    :param max_compaction_attempts_per_operation: 本 operation 冻结的全局预算。
     :param trigger_source: compact 触发来源。
     :param budget_reason: 预算触发或 provider fallback 原因。
     :param budget_snapshot_ref: budget snapshot / estimate ref。
@@ -206,8 +221,9 @@ def build_context_compaction_requested_payload(
     :param provider_error_ref: provider error ref；没有时为 ``None``。
     :param attempt_id: reactive compact 对应 Attempt id。
     :param execution_id: reactive compact 对应 execution id。
-    :param frozen_material_list_digest: reactive overflow material list digest。
-    :param frozen_material_refs: reactive overflow material source refs。
+    :param client_correlation_id: reactive 客户端关联 id；proactive 为 ``None``。
+    :param frozen_material_list_digest: 冻结 material list digest。
+    :param frozen_material_refs: 冻结 material source refs。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises TypeError: 字段类型非法时抛出。
     :raises ValueError: 字段值非法时抛出。
@@ -216,6 +232,10 @@ def build_context_compaction_requested_payload(
     if not isinstance(trigger_source, ContextCompactionTriggerSource):
         raise TypeError("trigger_source must be ContextCompactionTriggerSource")
     payload: Mapping[str, JsonValue] = {
+        _FIELD_OPERATION_ID: operation_id,
+        _FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION: (
+            max_compaction_attempts_per_operation
+        ),
         _FIELD_TRIGGER_SOURCE: trigger_source.value,
         _FIELD_BUDGET_REASON: budget_reason,
         _FIELD_BUDGET_SNAPSHOT_REF: budget_snapshot_ref,
@@ -226,6 +246,7 @@ def build_context_compaction_requested_payload(
         _FIELD_PROVIDER_ERROR_REF: provider_error_ref,
         _FIELD_ATTEMPT_ID: attempt_id,
         _FIELD_EXECUTION_ID: execution_id,
+        _FIELD_CLIENT_CORRELATION_ID: client_correlation_id,
         _FIELD_FROZEN_MATERIAL_LIST_DIGEST: frozen_material_list_digest,
         _FIELD_FROZEN_MATERIAL_REFS: _string_list_json(frozen_material_refs),
     }
@@ -243,7 +264,12 @@ def validate_context_compaction_requested_payload(
     :raises ValueError: payload 缺少必填字段或字段非法时抛出。
     """
 
-    _require_fields(payload, _REQUESTED_REQUIRED_FIELDS)
+    _require_exact_fields(payload, _REQUESTED_REQUIRED_FIELDS)
+    _required_text(payload, _FIELD_OPERATION_ID)
+    _required_positive_int(
+        payload,
+        _FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION,
+    )
     trigger_source = ContextCompactionTriggerSource(
         _required_text(payload, _FIELD_TRIGGER_SOURCE)
     )
@@ -254,15 +280,16 @@ def validate_context_compaction_requested_payload(
     _required_text(payload, _FIELD_POLICY_REF)
     _optional_text(payload, _FIELD_PROVIDER_REQUEST_ID)
     _optional_text(payload, _FIELD_PROVIDER_ERROR_REF)
-    frozen_digest = _optional_text(payload, _FIELD_FROZEN_MATERIAL_LIST_DIGEST)
-    if frozen_digest is not None and not is_sha256_digest(frozen_digest):
-        raise ValueError("frozen_material_list_digest must be sha256 digest")
-    _optional_text_list(payload, _FIELD_FROZEN_MATERIAL_REFS)
+    _optional_text(payload, _FIELD_CLIENT_CORRELATION_ID)
+    _required_digest(payload, _FIELD_FROZEN_MATERIAL_LIST_DIGEST)
+    _required_text_list(payload, _FIELD_FROZEN_MATERIAL_REFS)
     attempt_id = _optional_text(payload, _FIELD_ATTEMPT_ID)
     execution_id = _optional_text(payload, _FIELD_EXECUTION_ID)
     if trigger_source is ContextCompactionTriggerSource.REACTIVE:
         if attempt_id is None or execution_id is None:
             raise ValueError("reactive compaction requires attempt_id and execution_id")
+    elif attempt_id is not None or execution_id is not None:
+        raise ValueError("proactive compaction forbids attempt_id and execution_id")
 
 
 def build_context_compacted_payload(
@@ -694,6 +721,26 @@ def _require_fields(payload: Mapping[str, JsonValue], fields: tuple[str, ...]) -
     for field_name in fields:
         if field_name not in payload:
             raise ValueError(f"{field_name} is required")
+
+
+def _require_exact_fields(
+    payload: Mapping[str, JsonValue],
+    fields: tuple[str, ...],
+) -> None:
+    """校验 payload 顶层字段集合与 fresh schema 精确相等。
+
+    :param payload: JSON payload。
+    :param fields: 唯一允许的字段名。
+    :returns: ``None``。
+    :raises ValueError: 缺少必填字段或出现未知字段时抛出。
+    """
+
+    _require_fields(payload, fields)
+    unexpected = frozenset(payload) - frozenset(fields)
+    if unexpected:
+        raise ValueError(
+            "unexpected payload fields: " + ", ".join(sorted(unexpected))
+        )
 
 
 def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import sqlite3
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 
 import pytest
@@ -124,8 +125,15 @@ async def test_public_outbox_read_rejects_raw_blank_final_answer_content(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(smoke.ensure_request("outbox-raw-blank"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
+        )
         followup = await host.submit_followup(
             session.session_id,
             smoke.followup_request(
@@ -209,9 +217,16 @@ async def test_public_outbox_read_rejects_raw_blank_finish_reason(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(
             smoke.ensure_request("outbox-raw-blank-finish-reason")
+        )
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
         )
         followup = await host.submit_followup(
             session.session_id,
@@ -338,7 +353,10 @@ async def test_public_outbox_session_not_found_and_drain_conflict(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         with pytest.raises(HostApiError) as missing:
             await host.read_outbox_terminal_items(
                 "missing-session",
@@ -352,6 +370,10 @@ async def test_public_outbox_session_not_found_and_drain_conflict(
 
         session = await host.ensure_session(
             smoke.ensure_request("outbox-drain-conflict")
+        )
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
         )
         followup = await host.submit_followup(
             session.session_id,
@@ -407,8 +429,15 @@ async def test_public_outbox_reports_lagged_then_catches_up(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(smoke.ensure_request("outbox-lagged"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
+        )
         followup = await host.submit_followup(
             session.session_id,
             smoke.followup_request(

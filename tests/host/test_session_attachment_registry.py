@@ -291,7 +291,7 @@ async def test_recovering_record_only_allows_allocation_recovery_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RECOVERING RW 不授予 mutation/普通 work，只允许 allocation recovery lease。
+    """RECOVERING RW 只在 root recovery lease 存续时允许嵌套 work。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -322,9 +322,13 @@ async def test_recovering_record_only_allows_allocation_recovery_work(
 
     recovery_lease = allocation.acquire_recovery_work_lease()
     assert isinstance(recovery_lease, SessionWorkLease)
+    nested_lease = registry.try_acquire_new_work_lease("session-1")
+    assert isinstance(nested_lease, SessionWorkLease)
+    nested_lease.release()
     with pytest.raises(RuntimeError, match="recovery work"):
         allocation.activate()
     recovery_lease.release()
+    assert registry.try_acquire_new_work_lease("session-1") is None
     attachment = allocation.activate()
     assert attachment.access_mode is HostSessionAccessMode.READ_WRITE
     await attachment.aclose()
@@ -666,22 +670,27 @@ def test_new_api_value_types_validate_closed_contracts() -> None:
         )
 
 
-def test_slice_one_does_not_export_attachment_contract_from_package_root() -> None:
-    """Slice 1 不得从 ``dayu.host`` 包根公开半成品 attachment API。
+def test_slice_two_exports_only_public_attachment_contract_from_package_root() -> None:
+    """Slice 2 从 ``dayu.host`` 包根公开 attachment value contract。
 
     :returns: ``None``。
-    :raises AssertionError: 新 value type 或 registry 被包根导出时抛出。
+    :raises AssertionError: public value type 缺失或 internal owner 被导出时抛出。
     """
 
-    forbidden = {
+    public_contract = {
         "HostSessionAccessMode",
+        "HostSessionAttachment",
         "HostSessionAttachmentConflictDetail",
         "HostSessionAttachmentConflictReason",
-        "HostSessionAttachmentRegistry",
         "HostSessionMutationErrorDetail",
         "HostSessionMutationRejectionReason",
+    }
+    internal_contract = {
+        "HostSessionAttachmentRegistry",
         "SessionNewWorkAccessPort",
         "SessionWorkLease",
     }
-    assert forbidden.isdisjoint(host_package.__all__)
-    assert forbidden.isdisjoint(vars(host_package))
+    assert public_contract.issubset(host_package.__all__)
+    assert public_contract.issubset(vars(host_package))
+    assert internal_contract.isdisjoint(host_package.__all__)
+    assert internal_contract.isdisjoint(vars(host_package))

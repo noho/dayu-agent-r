@@ -679,7 +679,8 @@ async def test_run_compaction_operation_retries_async_proposal_failure() -> None
     result = await run_compaction_operation(
         request=_request(),
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -702,7 +703,8 @@ async def test_run_compaction_operation_records_prepared_proposal_manifest_befor
     result = await run_compaction_operation(
         request=_request(),
         compactor=_PreparedManifestCompactor(events),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-prepared-accepted",
         proposal_manifest_recorder=recorder,
@@ -788,7 +790,8 @@ async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest
     result = await run_compaction_operation(
         request=_request(),
         compactor=_PreparedManifestCompactor(events, fail_run=True),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-prepared-failed",
         proposal_manifest_recorder=recorder,
@@ -815,7 +818,8 @@ async def test_run_compaction_operation_cancelled_proposal_keeps_manifest_ref() 
     result = await run_compaction_operation(
         request=_request(),
         compactor=_PreparedCancelledCompactor(events, token),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=token,
         compaction_operation_id="operation-prepared-cancelled",
         proposal_manifest_recorder=recorder,
@@ -846,6 +850,7 @@ def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> N
         rejected_attempts=(),
         failure_reason=None,
         budget_after_attempted_compact=10,
+        accepted_attempt_number=1,
         accepted_proposal_manifest_ref=None,
         accepted_proposal_manifest_digest=_DIGEST,
     )
@@ -855,6 +860,7 @@ def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> N
         rejected_attempts=(),
         failure_reason=None,
         budget_after_attempted_compact=10,
+        accepted_attempt_number=1,
         accepted_proposal_manifest_ref="runner-call-manifest:test",
         accepted_proposal_manifest_digest=None,
     )
@@ -879,7 +885,8 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
     result = await run_compaction_operation(
         request=_request(),
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -927,7 +934,8 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
     result = await run_compaction_operation(
         request=_request(),
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -958,7 +966,8 @@ async def test_run_compaction_operation_retries_reactive_hard_threshold_after_co
     result = await run_compaction_operation(
         request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -985,7 +994,8 @@ async def test_run_compaction_operation_fails_closed_for_reactive_over_budget_ou
     result = await run_compaction_operation(
         request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
         compactor=compactor,
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1007,7 +1017,8 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
     result = await run_compaction_operation(
         request=_request(),
         compactor=_AlwaysFailingCompactor(),
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1036,7 +1047,8 @@ async def test_run_compaction_operation_logs_terminal_reject_as_warning(
         result = await run_compaction_operation(
             request=_request(),
             compactor=_AlwaysFailingCompactor(),
-            max_attempts=1,
+            first_attempt_number=1,
+            max_attempt_number=1,
             cancellation_token=ControllableCancellationToken(),
         )
 
@@ -1063,7 +1075,8 @@ async def test_run_compaction_operation_budget_excludes_candidate_diagnostics() 
     result = await run_compaction_operation(
         request=request,
         compactor=_DiagnosticsOnlyLargeCompactor(),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-diagnostics-budget",
     )
@@ -1086,7 +1099,8 @@ async def test_run_compaction_operation_stops_before_retry_when_cancelled() -> N
     result = await run_compaction_operation(
         request=_request(),
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=token,
     )
 
@@ -1119,7 +1133,8 @@ async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> N
     result = await run_compaction_operation(
         request=_request(),
         compactor=_SensitiveFailingCompactor(),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1176,7 +1191,8 @@ async def test_run_compaction_operation_redacts_each_value_bearing_secret_patter
     result = await run_compaction_operation(
         request=_request(),
         compactor=_SensitiveFailingCompactor(message),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1197,7 +1213,8 @@ async def test_run_compaction_operation_keeps_plain_token_expired_context() -> N
     result = await run_compaction_operation(
         request=_request(),
         compactor=_SensitiveFailingCompactor("provider failed: JWT token has expired"),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1217,7 +1234,8 @@ async def test_exception_diagnostic_suffix_uses_exception_type_for_empty_message
     result = await run_compaction_operation(
         request=_request(),
         compactor=_EmptyMessageFailingCompactor(),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1236,7 +1254,8 @@ async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> 
     result = await run_compaction_operation(
         request=request,
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
@@ -1257,7 +1276,8 @@ async def test_reactive_multi_pass_uses_last_whole_vnext_fact_tuple() -> None:
     result = await run_compaction_operation(
         request=request,
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
@@ -1280,7 +1300,8 @@ async def test_reactive_multi_pass_uses_last_whole_vnext_candidate() -> None:
     result = await run_compaction_operation(
         request=request,
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
@@ -1334,7 +1355,8 @@ async def test_vnext_quality_reject_records_rejected_attempt(
     result = await run_compaction_operation(
         request=request,
         compactor=_RecordingCompactor(),
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
     )
 
@@ -1362,7 +1384,8 @@ async def test_reactive_multi_pass_intermediate_failure_commits_single_failed_ev
     result = await run_compaction_operation(
         request=request,
         compactor=compactor,
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
@@ -1384,7 +1407,8 @@ async def test_reactive_passes_share_operation_attempt_budget() -> None:
     result = await run_compaction_operation(
         request=request,
         compactor=compactor,
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )

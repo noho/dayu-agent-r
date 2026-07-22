@@ -95,6 +95,7 @@ from dayu.host.terminal_post_commit import (
     TerminalPostCommitPort,
 )
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
+from tests.host.fake_session_access import ExplicitFakeSessionAccess
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
@@ -1502,6 +1503,9 @@ async def _open_scheduler(
         ),
         host_handle_id="host-active-cancel",
         active_registry=active_registry,
+        session_new_work_access=ExplicitFakeSessionAccess(
+            allowed_session_ids=None
+        ),
     )
 
 
@@ -1652,7 +1656,17 @@ async def _start_governed_refs(
     :raises AssertionError: 没有可启动 Run 时抛出。
     """
 
-    stage = await scheduler._run_pre_start_governance(session_id)
+    work_lease = scheduler._session_new_work_access.try_acquire_new_work_lease(
+        session_id
+    )
+    assert work_lease is not None
+    try:
+        stage = await scheduler._run_pre_start_governance(
+            session_id,
+            work_lease=work_lease,
+        )
+    finally:
+        work_lease.release()
     assert stage.pending_dispatch is not None
     pending = stage.pending_dispatch
     return _RunRefs(

@@ -3,8 +3,8 @@
 本模块拥有单个 Host opener 内的 attachment mode、live record、mutation /
 new-work lease 和 close 顺序。跨 opener 的机械互斥委托给层中立
 ``dayu.runtime.native_mutex``；mutex availability 不表达 Run / Attempt durable
-truth。Slice 1 仅建立 internal contract，不接入 public Host Protocol、scheduler
-或 recovery production call path。
+truth。本模块不读取 durable Run/Attempt 状态，也不让 scheduler、UI 或 Service
+反向推断 access truth。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from dayu.host.api import (
     HostApiError,
     HostApiErrorCode,
     HostClosedError,
+    HostSessionAttachment,
     HostSessionAccessMode,
     HostSessionAttachmentConflictDetail,
     HostSessionAttachmentConflictReason,
@@ -192,7 +193,10 @@ class SessionNewWorkAccessPort(Protocol):
         self,
         session_id: str,
     ) -> SessionWorkLease | None:
-        """尝试为 ACTIVE RW Session 获取 pre-start/new-work lease。
+        """尝试为允许新工作的 RW Session 获取 pre-start/new-work lease。
+
+        ACTIVE RW 可直接取得 lease；RECOVERING RW 仅在 root recovery lease
+        仍持有时允许嵌套取得，避免无 recovery owner 的外部工作进入半状态。
 
         :param session_id: 目标 Session id。
         :returns: 有资格时返回 lease，否则返回 ``None``。
@@ -211,11 +215,11 @@ class SessionNewWorkAccessPort(Protocol):
         ...
 
 
-class _HostSessionAttachmentImpl:
+class _HostSessionAttachmentImpl(HostSessionAttachment):
     """Host public attachment Protocol 的内部资源实现。
 
-    Slice 1 不把本类型加入 public Protocol 或包根导出；它只冻结只读
-    ``session_id`` / ``access_mode`` 与 cancellation-safe ``aclose`` 语义。
+    本类型实现 public Protocol，只冻结只读 ``session_id`` / ``access_mode``
+    与 cancellation-safe ``aclose`` 语义。
 
     :param registry: 拥有 record 的 registry。
     :param record: attachment 对应的唯一 live record。
@@ -488,7 +492,10 @@ class HostSessionAttachmentRegistry:
         self,
         session_id: str,
     ) -> SessionWorkLease | None:
-        """尝试为 ACTIVE RW Session 获取 pre-start/new-work lease。
+        """尝试为允许新工作的 RW Session 获取 pre-start/new-work lease。
+
+        ACTIVE RW 可直接取得 lease；RECOVERING RW 仅在 root recovery lease
+        仍持有时允许嵌套取得，root lease 释放后恢复拒绝。
 
         :param session_id: 目标 Session id。
         :returns: registry access truth 允许时返回 lease，否则返回 ``None``。
@@ -501,8 +508,16 @@ class HostSessionAttachmentRegistry:
         record = self._records.get(session_id)
         if (
             record is None
-            or record.state is not _AttachmentLifecycleState.ACTIVE
+            or record.state not in (
+                _AttachmentLifecycleState.RECOVERING,
+                _AttachmentLifecycleState.ACTIVE,
+            )
             or record.access_mode is not HostSessionAccessMode.READ_WRITE
+        ):
+            return None
+        if (
+            record.state is _AttachmentLifecycleState.RECOVERING
+            and record.new_work_lease_count == 0
         ):
             return None
         return self._acquire_lease(record, _SessionLeaseKind.NEW_WORK)

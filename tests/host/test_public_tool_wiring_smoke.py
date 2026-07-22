@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import pathlib
 import asyncio
+import pathlib
+from contextlib import AsyncExitStack
 
 import pytest
 
@@ -13,6 +14,7 @@ from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
     ToolCallingWorkerFactory,
     assert_at_most_one_system_message,
+    close_attachment_shielded,
     deterministic_runner_spec,
     ensure_request,
     followup_request,
@@ -35,16 +37,23 @@ async def test_mock_tool_result_feeds_same_run_and_later_run_continuity(
     """
 
     factory = ToolCallingWorkerFactory()
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=deterministic_runner_spec("tool-model"),
-            worker_factory=factory,
-            allow_tool_calls=True,
-            tooling_options=mock_tooling_options(),
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=deterministic_runner_spec("tool-model"),
+                worker_factory=factory,
+                allow_tool_calls=True,
+                tooling_options=mock_tooling_options(),
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("tool-memory"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -98,16 +107,23 @@ async def test_tool_names_subset_and_empty_freeze(tmp_path: pathlib.Path) -> Non
     """
 
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=deterministic_runner_spec("tool-select-model"),
-            worker_factory=factory,
-            allow_tool_calls=True,
-            tooling_options=mock_tooling_options(),
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=deterministic_runner_spec("tool-select-model"),
+                worker_factory=factory,
+                allow_tool_calls=True,
+                tooling_options=mock_tooling_options(),
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("tool-select"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         await host.submit_followup(
             session.session_id,
             followup_request(

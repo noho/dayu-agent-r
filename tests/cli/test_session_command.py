@@ -47,6 +47,8 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostCallContext,
     HostCommandHandleOptions,
+    HostSessionAccessMode,
+    HostSessionAttachment,
     HostStreamCursor,
     ListSessionsResult,
     OperationContext,
@@ -226,6 +228,31 @@ class _FakeHostContext:
         """
 
 
+class _FakeSessionAttachment:
+    """CLI session resume fake Host 返回的显式 RW attachment。"""
+
+    def __init__(self, session_id: str) -> None:
+        """初始化测试 attachment。
+
+        :param session_id: attachment 绑定的 Session id。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.session_id = session_id
+        self.access_mode = HostSessionAccessMode.READ_WRITE
+        self.close_count = 0
+
+    async def aclose(self) -> None:
+        """记录 attachment lexical close。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+
 class _FakeSessionHost:
     """测试用 Session Host public API fake。"""
 
@@ -238,6 +265,8 @@ class _FakeSessionHost:
     purge_requests: list[tuple[str, PurgeSessionRequest]]
     submit_requests: list[tuple[str, SubmitFollowupRequest]]
     close_cancel_calls: int
+    attach_session_ids: list[str]
+    attachments: list[_FakeSessionAttachment]
 
     def __init__(
         self,
@@ -273,6 +302,21 @@ class _FakeSessionHost:
         self.purge_requests = []
         self.submit_requests = []
         self.close_cancel_calls = 0
+        self.attach_session_ids = []
+        self.attachments = []
+
+    async def attach_session(self, session_id: str) -> HostSessionAttachment:
+        """记录显式 Session attachment 并返回可关闭对象。
+
+        :param session_id: 目标 Session id。
+        :returns: 测试用 RW attachment。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        attachment = _FakeSessionAttachment(session_id)
+        self.attach_session_ids.append(session_id)
+        self.attachments.append(attachment)
+        return attachment
 
     async def list_sessions(self) -> ListSessionsResult:
         """返回预设 Session 列表并记录调用。
