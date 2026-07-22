@@ -10,6 +10,7 @@ Host 的设计目标是支撑生产级通用 Agent，具备买方财报分析能
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run 生命周期，不持久化 Host 状态，不恢复旧 Agent / Runner。
 - 多入口 interactive / web / GUI / CLI / WeChat 共享同一本地 Host 真源。
 - 支持单机多客户端 / 多进程，并支持本地 Engine 与远程 Engine 并列执行。
+- 多个 UI / opener 可以并行操作同一 workspace 中的不同 Session；同一 Session 的用户命令能力由 per-Session attachment mutex 限定为单一 `READ_WRITE` attachment，其余 attachment 为模式不可变的 `READ_ONLY` observer。
 
 Host 设计必须优先保证：
 
@@ -55,7 +56,7 @@ Host 内部模块边界：
 - Context Governance：唯一负责上下文预算、compact 编排与 compact 事件收口；它是治理 orchestrator，不直接写 memory、audit、trace 或其它 projection。
 - ToolRuntime / TruncationManager：唯一负责工具执行治理、截断、`fetch_more`、等待与重复调用治理；工具事实必须走 Host accept barrier。
 - Observer / Sink / Projection：只消费 committed EventLog events，维护派生视图和外部投递队列。
-- Recovery：唯一负责 Host startup scan、旧 Attempt `LOST` 收口和可恢复 Run 的新 Attempt 创建。
+- Recovery：唯一负责 fresh `READ_WRITE` Session attachment recovery scan、旧 Attempt `LOST` 收口和可恢复 Run 的新 Attempt 创建。
 
 这些模块可以在实现中进一步拆分，但不能互相绕过上述 ownership。尤其是 dispatch、sink、tool runtime 和 remote stub 都不能直接写 Run / Attempt / EventLog。
 
@@ -751,7 +752,34 @@ Run -> CANCELLED / RECOVERING / LOST
 
 同一个 Session 同时最多一个 active Run。
 
-多客户端可以同时打开和写入同一个 Session。Host 不维护 client ownership truth，不发放 session write lock，不要求 attach token，也不把某个 watcher 视为 Session owner。多个客户端同时调用 `submit_followup(queue)` 时，写入顺序、幂等和冲突处理只由 Host durable admission transaction、`(session_id, client_request_id)` 幂等、Run 状态 precondition、全局 `event_sequence` 与 scheduler governance 决定。不同 `client_request_id` 的 prompt 按 durable accepted order 进入 `ACCEPTED` / `QUEUED` 和后续 FIFO promotion；相同 `(session_id, client_request_id)` 重放必须返回同一 accepted Run，不重复创建。客户端身份、权限、channel delivery 和本地 UI 去重属于 Service / UI 边界，不进入 Host Session ownership 语义。
+多个 UI / Service 可以各自 `open_host(...)`、使用同一 workspace，并同时打开同一 Session；Host 不因此建立 workspace-wide 单写者，也不拒绝第二个 opener。用户命令能力按 Session attachment 隔离：同一 Session 同时最多一个 `READ_WRITE` attachment，其余 attachment 为 `READ_ONLY`。同一个 opener 可以对 Session A 持有 `READ_WRITE`、同时对 Session B 持有 `READ_ONLY`；另一个 opener 可以持有相反组合，因此一个 Session 的占用不得阻止其它 Session 并行提交。
+
+### Session attachment access ownership
+
+Session attachment 与 Session Event Delivery subscription 是两个独立 owner。watcher、`watch_session_events(...)` iterator 或 Outbox reader 都不取得用户命令能力，也不能从“正在观察”反推出 Session owner。Host public contract 必须提供显式、可关闭的 Session attachment；目标 shape 为 `await host.attach_session(session_id) -> HostSessionAttachment`，attachment 至少公开稳定 `session_id`、`access_mode: READ_WRITE | READ_ONLY` 与 `aclose()`。successful attach return 是本次 attachment mode 的生效边界；mode 在该 attachment 生命周期内不可变。
+
+Host Session attachment registry 是 `READ_WRITE` / `READ_ONLY` 运行态语义的唯一 owner。`READ_WRITE` attachment允许当前 Host handle提交用户发起的 Session mutation；`READ_ONLY` attachment只允许 durable read、Outbox read和event observation，`submit_followup`、steer、retry、replay、用户 cancel与其它用户发起的Session mutation必须在写入任何 durable fact前返回typed read-only rejection。background wait resolution、当前 Run / Attempt owner的terminal ingest、cancel closeout和其它既有执行continuation不从UI attachment反推授权，它们继续由各自durable owner/state machine约束。access mode不是Session durable business fact，不写EventLog、不进入SessionSnapshot、memory、audit或LLM-facing projection。
+
+跨进程 admission只使用严格native、进程退出可释放的per-Session mutex作为attachment mode互斥原语。mutex key必须由同一canonical workspace / Host durable-store identity与`session_id`稳定派生；acquire必须non-blocking，成功得到`READ_WRITE`，已被其它live attachment持有时得到`READ_ONLY`。soft-lock fallback、按marker文件存在性推断owner、TTL/heartbeat takeover、强制break、自动选主、generation/epoch fencing和跨进程command/event forwarding均不属于该contract。当前`dayu.runtime.filelock`只承诺普通文件短临界区且可能使用第三方fallback，不能未经runtime design扩展直接冒充该mutex；实施必须选择或扩展一个layer-neutral、strict-native、fail-closed的runtime primitive，Host只拥有attachment语义，不把mutex token提升为Run/Attempt durable truth。
+
+attachment mode与重新打开规则固定如下：
+
+```text
+UI A attach Session 1 -> mutex acquired -> attachment A1 READ_WRITE
+UI B attach Session 1 -> mutex busy     -> attachment B1 READ_ONLY
+UI A close attachment A1               -> release Session 1 mutex
+attachment B1                           -> remains READ_ONLY
+UI B close B1 and attach Session 1 again
+                                        -> new attachment B2 READ_WRITE when mutex is free
+```
+
+既有`READ_ONLY` attachment在前owner释放后不得原地升级，不接收promotion通知，也不静默改变UI能力；只有关闭旧attachment并创建fresh attachment才重新竞争mutex。并发fresh attach只允许一个成功取得`READ_WRITE`。`HostSessionAttachment.aclose()`不是`close_session`、不是`cancel_session_runs`，不写用户cancel或Session terminal事实。
+
+`READ_WRITE` attachment关闭时，Host必须先关闭该attachment的新用户command入口，drain已进入其durable actor的Session command，并停止/收口尚未形成stable Run/Attempt execution owner的pre-start governance（包括事务外proactive compaction），然后才可释放mutex。已经建立durable Run / Attempt / execution identity的existing execution可以在原scheduler中继续至terminal / waiting continuation；attachment release不take over旧Attempt，也不把旧Run转移给新attachment。原scheduler在释放后不得再为该Session接受新用户command、启动新的unowned Run governance或promote下一Run；fresh `READ_WRITE` attachment提交的新输入仍按durable active-slot admission进入`ACCEPTED`或`QUEUED`，并在既有active Run收口后由当前具备写能力的opener推进。跨opener user cancel若命中旧opener仍执行的active Attempt，durable cancel仍是truth，物理传播由该Attempt当前execution owner通过durable reconciliation消费；Session mutex不承担control-message routing。
+
+每个`open_host`仍可持有正常scheduler，但scheduler对“新Session工作”的资格来自当前opener的live `READ_WRITE` attachment集合，而不是workspace-wide opener身份。`READ_ONLY` attachment不得触发该Session的startup recovery、accepted wake、pre-start governance、proactive compaction、queue promotion或新dispatch；它仍可通过Session Event Delivery的bounded periodic durable reconciliation观察其它opener提交的durable progress/terminal。opener可以继续驱动自己在attachment release前已经durable-own的existing Run / Attempt，但该例外不授权它开始下一个Run。
+
+因此recovery entry point必须从当前无条件workspace-wide startup scan收敛为attachment-aware路径：fresh `READ_WRITE` attach在返回可提交状态前，对目标Session执行bounded recovery / accepted reconciliation；`READ_ONLY` attach不执行recovery；没有任何`READ_WRITE` attachment的Session不由无关opener主动启动新治理。owner进程崩溃后native mutex由OS释放，后续fresh `READ_WRITE` attach仍必须依据既有Host-instance liveness与positive orphan proof处理旧Run / Attempt，不能把“mutex可获取”解释为旧Attempt可takeover的充分事实。
 
 active Run 状态：
 
@@ -790,7 +818,7 @@ RECOVERING
 - 不引入重 lease / fencing 系统。
 - 不做旧 Attempt takeover；不做远端 worker 自治恢复；新执行必须创建新 Attempt 和新 `execution_id`。
 - `dayu.runtime.lane` 可作为层中立 named semaphore，被 Host 或其它层用于非真源资源的容量控制；它不能替代 Session active Run admission、SQLite 事务或 CAS 状态迁移。
-- `dayu.runtime.filelock` 是对 `from filelock import FileLock` 的统一封装，只用于多进程访问普通文件时的互斥保护；不得用 file lock 表达 Host durable truth、EventLog ordering 或 Run / Attempt owner。
+- `dayu.runtime.filelock` 是对 `from filelock import FileLock` 的统一封装，只用于多进程访问普通文件时的互斥保护；不得用 marker存在性或普通file-lock token表达Host durable truth、EventLog ordering或Run / Attempt owner。per-Session attachment使用的strict-native mutex只是live attachment mode的机械互斥，语义owner仍是Host Session attachment registry；它不替代SQLite admission、Run / Attempt identity、positive orphan proof或recovery CAS。
 
 durable queue promotion：
 
@@ -1441,7 +1469,7 @@ Run 接口语义：
 
 - `submit_followup(queue)` 是 Service / UI 发送普通 prompt 的统一入口，包括同一 Session 的第一条 prompt。调用方取得 Session 后不需要判断“首轮调用 `start_run`、后续调用 `submit_followup`”；Host 在 admission transaction 内决定该输入是直接成为可启动 Run，还是排到当前 active Run 后面。
 - `get_run`：读取 RunSnapshot；不触发执行、不触发 queue promotion、不改变 Run / Attempt 状态。
-- `watch_session_events` / session-level Host event stream：Service / UI 观察 agent session 的主事件流。在线 / 已 attach 客户端通过 public `HostSessionEventIterator` 接收目标 Session 的 `HostSessionEvent` 封闭联合，适合多客户端打开同一 Session、观察三类 live-only delta、排队 Run、steer、retry / replay 链路和 final answer 展示。调用必须`await watch_session_events(...)`；successful return后iterator已生效，调用方此后才可提交`submit_followup(...)` / `retry_run(...)` / `replay_run(...)`等同actor mutation，首次`anext()`不能补做attach。iterator facade 直接合流 EventLog reader 与唯一 transient mailbox / in-flight retained state，Service 不得为同一 subscription 再建事件 relay buffer；每个 watch runtime 恰好一个 consumer task 是 sole `anext` 和唯一 observation-result first-commit owner，command / durable probe 只等待容量一、generation-tagged closed union slot。`watch_session_events` 不接收 cursor，不承担离线补读；Service 取得 Session 后进入 attach / reconnect 流程：先await live watch并建立sole consumer，再按客户端已保存的 terminal watermark / seen ids 补读 Outbox terminal 增量并用 durable terminal 的 `terminal_event_id` / `event_sequence` / `run_id` 去重，避免 Outbox drain 与 live watch attach 之间出现漏消息窗口。断线后的 terminal/final answer 补读由 Outbox terminal delivery queue 承接；pre-return、未 attach / 离线渠道不接收也不补放 transient delta。
+- `watch_session_events` / session-level Host event stream：Service / UI 观察 agent session 的主事件流。在线 / 已 attach 客户端通过 public `HostSessionEventIterator` 接收目标 Session 的 `HostSessionEvent` 封闭联合；watch subscription不取得Session用户命令能力，也不改变`HostSessionAttachment.access_mode`。只有事件producer与watcher同属一个`open_host` runtime时，watcher才可能收到该runtime发布的三类live-only delta；另一个opener的`READ_ONLY` attachment以及fresh `READ_WRITE` attachment对旧opener仍在执行的既有Run都不接收跨进程delta，只通过bounded periodic durable reconciliation / Outbox观察durable progress与terminal。调用必须`await watch_session_events(...)`；successful return后iterator已生效，但调用方只有同时持有live `READ_WRITE` Session attachment时才可提交`submit_followup(...)` / `retry_run(...)` / `replay_run(...)`等用户mutation，首次`anext()`不能补做watch attach。iterator facade直接合流EventLog reader与唯一transient mailbox / in-flight retained state，Service不得为同一subscription再建事件relay buffer；每个watch runtime恰好一个consumer task是sole `anext`和唯一observation-result first-commit owner，command / durable probe只等待容量一、generation-tagged closed union slot。`watch_session_events`不接收cursor、不承担离线补读；Service取得Session后进入attach / reconnect流程：先取得Session attachment mode，再await live watch并建立sole consumer，随后按客户端已保存的terminal watermark / seen ids补读Outbox terminal增量并用durable terminal的`terminal_event_id` / `event_sequence` / `run_id`去重，避免Outbox drain与live watch attach之间出现漏消息窗口。断线后的terminal/final answer补读由Outbox terminal delivery queue承接；pre-return、未attach /离线渠道不接收也不补放transient delta。
 - 普通 Service 的官方事件入口只有 `watch_session_events(session_id)`。普通多轮 recipe、thin Service proof、P10.5 no-tool / mock-tool / real-runner smoke 都必须走 session-level live watch，不能用内部 run-level EventLog 补读绕过 session live watch 来证明多轮闭环。
 - 内部 `stream_run_events` / run-scoped EventLog 补读：从全局 `event_sequence` cursor 补读目标 Run 的事件。它是 Host 内部 diagnostic / detail / debug / drill-down helper，只服务内部测试、排查某次 retry / replay source run 或运维诊断；不得和 `watch_session_events` 并列成为 Service-facing 聊天入口。若未来要公开给 Run detail 页面，必须先定义 public diagnostic event DTO，不得直接暴露内部 `HostEventView`。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
@@ -2867,7 +2895,7 @@ client requests cancel
   `canonical_fact` 进入 EventLog，并至少追加 `WAIT_LATE_RESULT_REJECTED` diagnostic EventLog event；完整 tool trace 可由
   后续 projection 消费该 diagnostic event 生成。
 - cancel 控制消息最小携带 `run_id`、`attempt_id`、`execution_id`。
-- accepted-cancel watchdog 没有 construction-time timeout opt-out。startup recovery 必须先执行 watchdog tick；带 accepted cancel facts 的 `CANCELLING` Run 不因缺少 timeout 配置而进入 `LOST`，而是由 watchdog closeout 或既有 terminal / recovery proof 处理。
+- accepted-cancel watchdog 没有 construction-time timeout opt-out。fresh `READ_WRITE` Session attachment recovery 必须先执行目标 Session 的 watchdog tick；带 accepted cancel facts 的 `CANCELLING` Run 不因缺少 timeout 配置而进入 `LOST`，而是由 watchdog closeout 或既有 terminal / recovery proof 处理。
 - 同一 `(run_id, client_request_id)` cancel 重试必须返回既有结果，不重复 append `RUN_CANCELLING`。Run 已是 `CANCELLING` 时，新的不同 cancel 请求不能重复制造状态迁移；可按 policy 返回当前状态或记录 diagnostic。
 - 强制终止执行环境、后台 job reconcile、细粒度资源收口失败事实属于 cancel governance 扩展能力，不影响基础 Host 状态收口。
 
@@ -2889,7 +2917,7 @@ client requests cancel
 - terminal 已抢先提交时 terminal 优先，`cancel_session_runs` 返回当前终态，不改写 terminal。
 - 返回 `SessionSnapshot`，包含 cancel 后的 session / run summary。
 
-客户端同时 attach 多个 Session 时，调用方必须逐个 session 调用 `cancel_session_runs`，并同时 cancel / close 自己持有的 lane wait 或 lane token。Host 不维护客户端到多个 Session 的 ownership 真源。
+客户端同时attach多个Session时，每个`HostSessionAttachment`独立持有不可变access mode和独立lifecycle；关闭一个attachment不得关闭、降级或释放其它Session的attachment。调用方若要取消多个Session，仍必须逐个Session显式调用`cancel_session_runs`；attachment close本身不隐式cancel任何Run，也不把调用方本地lane wait / token当作Session ownership truth。
 
 Host ingest 顺序是分布式竞态排序真源。不得用物理时间重写该规则。
 
@@ -3786,7 +3814,7 @@ provider tokenizer adapter 是 Host 预算治理的后续精确能力，不进�
 
 ## 27. Host Lifecycle / Recovery
 
-Host 启动时必须执行 recovery scan：
+`open_host(options)` 启动只打开 runtime、durable actor、scheduler 与 Host instance liveness，不得仅因 workspace 中存在未终态 Run 就恢复、唤醒或推进尚未 attach 的 Session。fresh `READ_WRITE` Session attachment 在成功取得 strict-native per-Session mutex 后，必须对目标 Session 执行 recovery scan；`READ_ONLY` attachment 不执行 recovery scan、accepted wake、pre-start governance、queue promotion 或 dispatch：
 
 - `ACCEPTED` Run 保持 `ACCEPTED`，等待 scheduler / pre-start governance；它不是 orphan Attempt，不得进入 `RECOVERING`。
 - `QUEUED` Run 保持 `QUEUED`，等待调度。
@@ -3799,15 +3827,16 @@ Recovery scan 不得让旧 Attempt takeover。恢复必须创建新 Attempt。
 
 Recovery 的输入只能是 Host durable truth：Run / Attempt indexes、EventLog canonical facts、dispatch record、wait record、payload descriptors 和 host instance liveness record。Projection checkpoint、Session timeline、RunResult、audit、tool trace、outbox、memory snapshot lag 或其它 read model 不能作为 recovery scan 的前置条件或事实依据；这些 projection 只能在 recovery 提交 canonical facts 后按 `event_sequence` 追平。
 
-同一次 startup recovery scan 必须在开始时冻结 `policy.now`，并从 durable Run governance index 取得固定 upper watermark。扫描顺序固定为 `(accepted_event_sequence, run_id)` keyset 全序；同 sequence 由 `run_id` 稳定打破平局，不允许使用 offset。scanner 在 durable actor 独占连接上按有界 page 执行，每个 page 是独立 write transaction；默认 batch size 为 64。只有当前 page commit 成功后才能投递该 page 的 matching dispatch / queue-promotion wake；rollback page 不得 wake，先前已提交 page 不得因后续失败回滚。失败后的完整重跑只能依赖 durable CAS / idempotency 收敛，不得依赖内存 cursor。
+同一次 per-Session attachment recovery scan 必须只读取目标 `session_id`，并在开始时冻结 `policy.now`，从 durable Run governance index 取得固定 upper watermark。扫描顺序固定为 `(accepted_event_sequence, run_id)` keyset 全序；同 sequence 由 `run_id` 稳定打破平局，不允许使用 offset。scanner 在 durable actor 独占连接上按有界 page 执行，每个 page 是独立 write transaction；默认 batch size 为 64。只有当前 page commit 成功后才能投递该 page 的 matching dispatch / queue-promotion wake；rollback page 不得 wake，先前已提交 page 不得因后续失败回滚。失败后的完整重跑只能依赖 durable CAS / idempotency 收敛，不得依赖内存 cursor。
 
-opener 在 execution health 仍为 `STARTING` 时完成全部 recovery pages 与 commit 后 wake；任一 batch、cursor invariant 或 wake bridge 失败时不得进入 `READY`。固定 watermark 之后新接受、且 keyset 高于该 watermark 的 Run 留给下一轮 scan，避免启动扫描因并发 admission 无限延长。
+fresh attachment 的 access mode 只能在 mutex acquire 完成后确定；`READ_WRITE` attachment 必须在对外 successful return 前完成目标 Session 的全部 recovery pages 与 commit 后 wake。任一 batch、cursor invariant 或 wake bridge 失败时，attach 必须清理局部分配、释放 mutex 并失败，不能返回一个表面可写但 recovery 未完成的 attachment。固定 watermark 之后新接受、且 keyset 高于该 watermark 的 Run 留给下一轮 scan，避免 attach 扫描因并发 admission 无限延长。
 
 Recovery scan semantic path：
 
 ```text
-Host startup
-  -> read Run / Attempt indexes
+fresh READ_WRITE Session attach
+  -> acquire strict-native per-Session mutex
+  -> read target Session Run / Attempt indexes
   -> classify each non-terminal Run
   -> append ATTEMPT_LOST / RUN_RECOVERING / RUN_LOST when needed
   -> keep QUEUED and WAITING in place
@@ -3831,12 +3860,12 @@ Host startup
 - `RUNNING` / `CANCELLING` 且只能判断 owner heartbeat stale，但无法证明 owner 进程已死：记录 suspect / diagnostic，跳过 recovery。
 - `RECOVERING`：继续按 recovery policy 创建新 Attempt，或因超过上限进入 `LOST`。
 
-Phase 11 第一版 startup recovery policy：
+Phase 11 第一版 attachment recovery policy：
 
-- `ACCEPTED`、`QUEUED` 与 `WAITING` 都不是 orphan Attempt，不得因 Host startup scan 被推进到 `RECOVERING`。
-- `RUNNING` / `CANCELLING` 的旧 Attempt 只有在 positive orphan proof 成立后才能写入 `ATTEMPT_LOST`；随后如果用户输入、payload descriptor、tool fact reuse policy、memory / compact input refs 等必要 canonical facts 足以重建 messages，则 Run 进入 `RECOVERING`，否则进入 `LOST`。startup 先执行一次 watchdog tick，再由 scanner defer 剩余 accepted-cancel `CANCELLING` Run，避免正常 close/reopen 把用户已取消的 Run 标为 `LOST`。
+- `ACCEPTED`、`QUEUED` 与 `WAITING` 都不是 orphan Attempt，不得因 attachment recovery scan 被推进到 `RECOVERING`。
+- `RUNNING` / `CANCELLING` 的旧 Attempt 只有在 positive orphan proof 成立后才能写入 `ATTEMPT_LOST`；随后如果用户输入、payload descriptor、tool fact reuse policy、memory / compact input refs 等必要 canonical facts足以重建 messages，则 Run 进入 `RECOVERING`，否则进入 `LOST`。目标 Session 的 attach recovery 先执行一次 watchdog tick，再由 scanner defer 剩余 accepted-cancel `CANCELLING` Run，避免正常 detach / reattach 把用户已取消的 Run 标为 `LOST`。
 - `RECOVERING` Run 在未被用户取消且未超过 recovery policy 上限时，创建新的 Attempt 与新的 `execution_id`，并以 `RUN_STARTED(start_reason=recovery)` 重新派发；不得恢复旧 Engine / Agent / Runner / provider request。
-- 第一版每个 Run 最多允许一次 automatic startup recovery dispatch。若再次 startup scan 发现同一 Run 已消耗该上限，必须以结构化 reason 将 Run 收口为 `LOST`，不得无限创建新 Attempt，也不得伪造 `FAILED` 或 successful final answer。
+- 第一版每个 Run 最多允许一次 automatic recovery dispatch。若再次 attachment recovery scan 发现同一 Run 已消耗该上限，必须以结构化 reason 将 Run 收口为 `LOST`，不得无限创建新 Attempt，也不得伪造 `FAILED` 或 successful final answer。
 - owner heartbeat stale 但 positive orphan proof 不成立时，只能追加或投递 suspect diagnostic，不得写 `ATTEMPT_LOST`、`RUN_RECOVERING`、`RUN_LOST`，也不得取消或接管旧 Attempt。
 
 多进程 recovery 不得把“当前进程不可确认控制”当作 orphan proof。一个 Host 进程无法控制另一个 Host 进程持有的 LocalProxy / RemoteProxy channel，并不表示该 Attempt 已丢失。
@@ -3904,7 +3933,7 @@ USER_INPUT_ACCEPTED durable accepted
 
 - 用户 prompt 只有在 `USER_INPUT_ACCEPTED` 已提交后才具备恢复语义；若崩溃发生在 durable append 之前，Host 没有事实真源，不能凭空恢复这次输入。
 - Recovery 不恢复旧 Engine / Agent / Runner / provider request，也不接管旧远端 worker；旧 Attempt 只有在 positive orphan proof 成立后才能进入 `LOST`。
-- Host opener 正常 close 若在 terminal 到达前停止本地 worker，只能传播 lifecycle cancel 与关闭本地 runtime，不能写用户 cancel facts；重启后由 owner `STOPPED` lifecycle proof 直接推进 recovery。若进程停在 `STOPPING` 后崩溃，startup recovery 必须等待 heartbeat stale 且 pid missing / identity mismatch 等进程证据成立后再推进 recovery，避免抢正在正常关闭的旧 Host。
+- Host opener 正常 close 若在 terminal 到达前停止本地 worker，只能传播 lifecycle cancel 与关闭本地 runtime，不能写用户 cancel facts；重启并 fresh `READ_WRITE` attach 目标 Session 后，由 owner `STOPPED` lifecycle proof 直接推进 recovery。若进程停在 `STOPPING` 后崩溃，attachment recovery 必须等待 heartbeat stale 且 pid missing / identity mismatch 等进程证据成立后再推进 recovery，避免抢正在正常关闭的旧 Host。
 - 若 terminal event 在 close lifecycle cancel 前已经到达并完成 ingest，answer 已经由正常 terminal closeout 产出，后续由 Outbox / read model 处理可见性，不再走 recovery 重放。
 - 新执行必须基于 EventLog canonical facts 重建完整 messages，并创建新 Attempt / 新 `execution_id`。
 - 用户不需要感知 Run / Attempt 细节；用户可见语义是“已提交 prompt 不丢，之后仍能收到 answer”。
