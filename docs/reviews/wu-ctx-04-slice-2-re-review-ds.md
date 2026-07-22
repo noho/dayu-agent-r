@@ -216,27 +216,27 @@ best-effort owner 阶段。进入 best-effort 阶段后会尝试全部安全 cle
    - reactive request → trigger_source 不是 PROACTIVE → skip
    - 返回第一个 valid proactive operation_id
    - 没有 valid proactive request → `None`
-   
+
    验证通过。不引入兼容 parser，是同一 semantic owner 的复用。
 
 2. **dispatcher FAIL_EXISTING_OPERATION 两个子分支**（dispatch diff lines 59-135）：
-   
+
    **分支 2a：`operation_id is None`** → `_fail_unstarted_in_transaction`（Run FAILED，零增量）
-   
+
    **分支 2b：`operation_id is not None` 但有 terminal 证据** → 同样 `_fail_unstarted_in_transaction`
-   
+
    **分支 2c：`operation_id is not None` 且无 terminal 证据** → `_append_compaction_failed_with_proactive_fallback`（写 FAILED terminal + fallback dispatch）
-   
+
    三个分支覆盖了所有 FAIL_EXISTING_OPERATION 子情况。分支 2c 正确使用了 safe proactive id（不是 reactive id），并正确传递 `attempt_count`（prepared ∪ rejected 的并集大小）和 `retry_repair_budget_exhausted=True`。
 
 3. **scheduler close retry contract**（dispatch diff lines 707-818）：
-   
+
    `_close_cleanup_done` 的语义从"cleanup 尝试过"改为"cleanup 成功完成"。关键标志位：
    - `_host_instance_stopping_marked`：防止重复写 STOPPING
    - `_lane_close_done`：lane 已关闭不重复关闭
    - `_host_instance_stopped_marked`：防止重复写 STOPPED
    - `_close_cleanup_done`：只在所有 mandatory 步骤成功后置 True
-   
+
    测试 `test_scheduler_close_keeps_cleanup_incomplete_when_cleanup_raises` 验证：lane close 失败 → `_close_cleanup_done=False`，重试后成功。
    测试 `test_scheduler_close_retries_mandatory_residual_handle_before_stopped` 验证：handle close 失败 → STOPPING，重试 → STOPPED。
    测试 `test_scheduler_close_retries_stopped_write_without_reclosing_lane` 验证：STOPPED 写入失败 → STOPPING + lane 已关闭，重试 → STOPPED（不重新关闭 lane）。
@@ -254,7 +254,7 @@ best-effort owner 阶段。进入 best-effort 阶段后会尝试全部安全 cle
    RUNNING → (close called) → STOPPING → (mandatory cleanup success) → STOPPED
    ```
    任一步骤失败均保持在当前状态，允许重试。`STOPPED` 仅在全部 mandatory 步骤成功后写入。
-   
+
    该设计保证了 accepted plan 的关键不变量：release_host_close()（释放 mutex）之前 scheduler 必须已完成 STOPPED 写入，fresh RW attachment 的 target recovery 才能以 STOPPED 作为 positive orphan proof。
 
 ### semantic ownership
