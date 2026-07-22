@@ -63,16 +63,21 @@ from dayu.host.durable.liveness import (
 from dayu.host.durable.run_transition import (
     ActiveCancelWatchdogCloseoutInput,
     FailUnstartedRunInput,
+    OwnedAttemptCancelDelivery,
+    OwnedAttemptCancelTarget,
     StartGovernedRunInput,
     TerminalCloseoutInput,
     active_cancel_watchdog_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
     project_terminal_notice_from_exact_run_event,
     read_cancel_requested_event_from_run_link,
+    read_exact_owned_attempt_cancel_deliveries,
+    read_exact_owned_attempt_cancel_targets,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.state import (
+    AttemptExecutionIdentity,
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordStatus,
@@ -88,7 +93,6 @@ from dayu.host.durable.state import (
     read_active_run_for_session,
     read_accepted_run_for_session,
     read_attempt_by_id,
-    read_cancelling_runs,
     read_cancelling_runs_for_session,
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
@@ -279,6 +283,7 @@ _CRITICAL_COMPONENT_HEARTBEAT = "heartbeat"
 _CRITICAL_COMPONENT_DISPATCH = "dispatch"
 _CRITICAL_COMPONENT_PROMOTION = "promotion"
 _CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG = "active_cancel_watchdog"
+_CRITICAL_COMPONENT_ACTIVE_CANCEL_OWNER = "active_cancel_owner_reconciliation"
 
 
 class _MemoryProjectionDispatchDiagnosticError(HostDurableError):
@@ -433,6 +438,22 @@ class OwnedSessionReconciliationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ActiveWorkerCancelReconciliationResult:
+    """一次 execution-owner active cancel reconciliation 摘要。
+
+    :param snapshot_count: 本轮 registry exact identity 快照数量。
+    :param target_count: durable strict query 返回的 owned cancel target 数量。
+    :param propagated_count: transaction 外仍命中同一 local worker 的数量。
+    :param closed_count: 本轮 exact watchdog 成功写入 terminal closeout 的数量。
+    """
+
+    snapshot_count: int
+    target_count: int
+    propagated_count: int
+    closed_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveCancelWatchdogTickResult:
     """active cancel watchdog 单次 tick 摘要。
 
@@ -463,6 +484,26 @@ class _ActiveCancelWatchdogCandidate:
     session_id: str
     attempt_id: str
     cancel_requested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveCancelWatchdogSessionScope:
+    """caller / fresh attachment 指定的 Session watchdog scope。
+
+    :param session_id: 目标 Session id。
+    """
+
+    session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveCancelWatchdogOwnedTargetScope:
+    """execution owner 已严格验证的 exact target watchdog scope。
+
+    :param target: 需要在写事务内重验的 exact owned target。
+    """
+
+    target: OwnedAttemptCancelTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,12 +558,14 @@ class _ReadCommittedCancelRequestedAtOperation:
 class ActiveCancelMessage:
     """active worker cancel registry 的最小取消消息。
 
+    :param session_id: 目标 Session id。
     :param run_id: 目标 Run id。
     :param attempt_id: 目标 Attempt id。
     :param execution_id: 目标 execution id。
     :param reason: 取消原因。
     """
 
+    session_id: str
     run_id: str
     attempt_id: str
     execution_id: str
@@ -680,12 +723,12 @@ class _EffectiveDispatchDecision:
 class _ActiveWorkerEntry:
     """active worker registry 内部条目。
 
-    :param run_id: 目标 Run id。
+    :param identity: 目标 worker 的 exact durable identity。
     :param handle: worker handle。
     :param cancellation_token: Host 注入 Engine 的取消 token。
     """
 
-    run_id: str
+    identity: AttemptExecutionIdentity
     handle: LocalWorkerHandle
     cancellation_token: "_HostCancellationToken"
 
@@ -732,6 +775,7 @@ class ActiveWorkerRegistry:
     def register(
         self,
         *,
+        session_id: str,
         run_id: str,
         attempt_id: str,
         execution_id: str,
@@ -740,6 +784,7 @@ class ActiveWorkerRegistry:
     ) -> None:
         """注册 active worker handle。
 
+        :param session_id: 目标 Session id。
         :param run_id: 目标 Run id。
         :param attempt_id: active Attempt id。
         :param execution_id: active execution id。
@@ -750,7 +795,12 @@ class ActiveWorkerRegistry:
 
         with self._lock:
             self._entries[(attempt_id, execution_id)] = _ActiveWorkerEntry(
-                run_id=run_id,
+                identity=AttemptExecutionIdentity(
+                    session_id=session_id,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    execution_id=execution_id,
+                ),
                 handle=handle,
                 cancellation_token=cancellation_token,
             )
@@ -775,10 +825,39 @@ class ActiveWorkerRegistry:
 
         with self._lock:
             entry = self._entries.get((message.attempt_id, message.execution_id))
-        if entry is None or entry.run_id != message.run_id:
+        if entry is None or entry.identity != AttemptExecutionIdentity(
+            session_id=message.session_id,
+            run_id=message.run_id,
+            attempt_id=message.attempt_id,
+            execution_id=message.execution_id,
+        ):
             return False
         _propagate_active_worker_cancel(message, entry)
         return True
+
+    def snapshot_identities(self) -> tuple[AttemptExecutionIdentity, ...]:
+        """返回当前 active workers 的稳定 exact identity 快照。
+
+        快照不暴露 handle 或 cancellation token，供 scheduler 在 transaction
+        外按同一 identity 传播已验证的 durable cancel truth。
+
+        :returns: 按 Session / Run / Attempt / execution 排序的 identity 元组。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        with self._lock:
+            identities = tuple(entry.identity for entry in self._entries.values())
+        return tuple(
+            sorted(
+                identities,
+                key=lambda identity: (
+                    identity.session_id,
+                    identity.run_id,
+                    identity.attempt_id,
+                    identity.execution_id,
+                ),
+            )
+        )
 
     def cancel_all(self, reason: str) -> int:
         """向所有当前 active worker best-effort 传播取消。
@@ -791,7 +870,8 @@ class ActiveWorkerRegistry:
             entries = tuple(
                 (
                     ActiveCancelMessage(
-                        run_id=entry.run_id,
+                        session_id=entry.identity.session_id,
+                        run_id=entry.identity.run_id,
                         attempt_id=attempt_id,
                         execution_id=execution_id,
                         reason=reason,
@@ -1114,6 +1194,7 @@ class HostDispatchScheduler:
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._active_cancel_watchdog_event = asyncio.Event()
+        self._active_cancel_watchdog_session_ids: set[str] = set()
         self._closed = False
         self._close_cleanup_done = False
         self._host_instance_stopping_marked = False
@@ -1123,6 +1204,7 @@ class HostDispatchScheduler:
         self._drain_task: asyncio.Task[None] | None = None
         self._promotion_drain_task: asyncio.Task[None] | None = None
         self._owned_session_reconciliation_task: asyncio.Task[None] | None = None
+        self._active_worker_cancel_reconciliation_task: asyncio.Task[None] | None = None
         self._active_cancel_watchdog_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
@@ -1249,6 +1331,7 @@ class HostDispatchScheduler:
             scheduler._bind_terminal_post_commit_port(terminal_post_commit_port)
             scheduler._start_host_instance_heartbeat()
             scheduler._start_active_cancel_watchdog_loop()
+            scheduler._start_active_worker_cancel_reconciliation_loop()
             scheduler._start_owned_session_reconciliation_loop()
             return scheduler
         except BaseException:
@@ -1324,31 +1407,23 @@ class HostDispatchScheduler:
                 component=_CRITICAL_COMPONENT_PROMOTION,
             )
 
-    def wake_active_cancel_watchdog(self) -> None:
-        """唤醒 active cancel watchdog 执行一次 accepted-cancel 收口扫描。
+    def wake_active_cancel_watchdog(self, session_id: str) -> None:
+        """唤醒 active cancel watchdog 收口目标 Session。
 
+        :param session_id: 已提交 cancel command 的目标 Session id。
         :returns: ``None``。
+        :raises ValueError: Session id 为空时抛出。
         :raises HostApiError: scheduler 已关闭或 execution unavailable 时抛出。
         """
 
+        if session_id.strip() == "":
+            raise ValueError("session_id must be non-empty")
         self._raise_if_wake_unavailable(
             component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG
         )
+        self._active_cancel_watchdog_session_ids.add(session_id)
         self._active_cancel_watchdog_event.set()
         self._start_active_cancel_watchdog_loop()
-
-    def tick_active_cancel_watchdog(
-        self, now: datetime
-    ) -> ActiveCancelWatchdogTickResult:
-        """同步执行一次 accepted-cancel watchdog 收口扫描。
-
-        :param now: 本轮 watchdog 判定使用的 UTC aware 时间。
-        :returns: 单次 tick 摘要。
-        :raises ValueError: ``now`` 不是 UTC aware 时间时抛出。
-        :raises HostTransactionRetryExhaustedError: durable 写事务重试耗尽时抛出。
-        """
-
-        return self._tick_active_cancel_watchdog(now=now, session_id=None)
 
     def tick_active_cancel_watchdog_for_session(
         self,
@@ -1366,20 +1441,27 @@ class HostDispatchScheduler:
 
         if session_id.strip() == "":
             raise ValueError("session_id must be non-empty")
-        return self._tick_active_cancel_watchdog(now=now, session_id=session_id)
+        return self._tick_active_cancel_watchdog(
+            now=now,
+            scope=_ActiveCancelWatchdogSessionScope(session_id=session_id),
+        )
 
     def _tick_active_cancel_watchdog(
         self,
         *,
         now: datetime,
-        session_id: str | None,
+        scope: (
+            _ActiveCancelWatchdogSessionScope
+            | _ActiveCancelWatchdogOwnedTargetScope
+        ),
     ) -> ActiveCancelWatchdogTickResult:
-        """执行一次可选 target-session 的 accepted-cancel closeout。
+        """在唯一 terminal producer 内执行一次 accepted-cancel closeout。
 
         :param now: 本轮 watchdog 判定使用的 UTC aware 时间。
-        :param session_id: 目标 Session id；``None`` 表示既有全局 watchdog。
+        :param scope: target Session 或 exact execution-owner target。
         :returns: 单次 tick 摘要。
         :raises ValueError: ``now`` 不是 UTC aware 时间时抛出。
+        :raises HostDurableError: exact target 的 cancel link 非法时抛出。
         :raises HostTransactionRetryExhaustedError: durable 写事务重试耗尽时抛出。
         """
 
@@ -1388,11 +1470,25 @@ class HostDispatchScheduler:
         def _operation(
             transaction: HostTransaction,
         ) -> _ActiveCancelWatchdogOperationResult:
-            candidates, scanned, ignored = _read_active_cancel_watchdog_candidates(
-                transaction,
-                self._event_log_store,
-                session_id=session_id,
-            )
+            if isinstance(scope, _ActiveCancelWatchdogSessionScope):
+                candidates, scanned, ignored = (
+                    _read_active_cancel_watchdog_candidates(
+                        transaction,
+                        self._event_log_store,
+                        session_id=scope.session_id,
+                    )
+                )
+            else:
+                candidates, scanned, ignored = (
+                    _read_exact_owned_active_cancel_watchdog_candidate(
+                        transaction,
+                        self._event_log_store,
+                        owner_host_instance_id=(
+                            self._host_instance_identity.host_instance_id
+                        ),
+                        target=scope.target,
+                    )
+                )
             eligible = 0
             terminal_notices: list[TerminalPostCommitNotice] = []
             for candidate in candidates:
@@ -2979,6 +3075,78 @@ class HostDispatchScheduler:
             timed_out=timed_out,
         )
 
+    def reconcile_active_worker_cancels_once(
+        self,
+        *,
+        fixed_now: datetime,
+    ) -> ActiveWorkerCancelReconciliationResult:
+        """按本 scheduler 的 active registry 快照传播 durable cancel truth。
+
+        本方法只查询 ``dispatch_record.owner_host_instance_id`` 精确等于当前
+        scheduler 且仍匹配同一 Session / Run / Attempt / execution 的 targets。
+        它不依赖当前 attachment，也不授予 queued promotion 或新 Attempt 治理资格。
+
+        :param fixed_now: 本轮 exact watchdog closeout 共用的 UTC aware 时间。
+        :returns: execution-owner reconciliation typed 摘要。
+        :raises ValueError: ``fixed_now`` 不是 UTC aware 时间时抛出。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostDurableError: durable cancel link 或 canonical fact 非法时抛出。
+        :raises HostTransactionRetryExhaustedError: durable transaction 重试耗尽时抛出。
+        """
+
+        _validate_watchdog_now(fixed_now)
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
+        identities = self._active_registry.snapshot_identities()
+        if len(identities) == 0:
+            return ActiveWorkerCancelReconciliationResult(
+                snapshot_count=0,
+                target_count=0,
+                propagated_count=0,
+                closed_count=0,
+            )
+
+        def _read(
+            transaction: HostTransaction,
+        ) -> tuple[OwnedAttemptCancelDelivery, ...]:
+            return read_exact_owned_attempt_cancel_deliveries(
+                transaction,
+                self._event_log_store,
+                owner_host_instance_id=(
+                    self._host_instance_identity.host_instance_id
+                ),
+                identities=identities,
+            )
+
+        deliveries = self._transaction_runner.run_read(_read)
+        propagated = 0
+        closed = 0
+        for delivery in deliveries:
+            target = delivery.target
+            identity = target.identity
+            if self._active_registry.cancel(
+                ActiveCancelMessage(
+                    session_id=identity.session_id,
+                    run_id=identity.run_id,
+                    attempt_id=identity.attempt_id,
+                    execution_id=identity.execution_id,
+                    reason=delivery.reason,
+                )
+            ):
+                propagated += 1
+            closeout = self._tick_active_cancel_watchdog(
+                now=fixed_now,
+                scope=_ActiveCancelWatchdogOwnedTargetScope(target=target),
+            )
+            if closeout.closed > 0:
+                closed += 1
+        return ActiveWorkerCancelReconciliationResult(
+            snapshot_count=len(identities),
+            target_count=len(deliveries),
+            propagated_count=propagated,
+            closed_count=closed,
+        )
+
     async def reconcile_owned_sessions_once(
         self,
         *,
@@ -3056,6 +3224,7 @@ class HostDispatchScheduler:
                 self._drain_task,
                 self._promotion_drain_task,
                 self._owned_session_reconciliation_task,
+                self._active_worker_cancel_reconciliation_task,
                 self._active_cancel_watchdog_task,
             )
             if task is not None
@@ -3152,6 +3321,24 @@ class HostDispatchScheduler:
                 component=_CRITICAL_COMPONENT_PROMOTION,
             )
 
+    def _start_active_worker_cancel_reconciliation_loop(self) -> None:
+        """启动 execution-owner exact cancel periodic reconciliation loop。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            self._active_worker_cancel_reconciliation_task is None
+            or self._active_worker_cancel_reconciliation_task.done()
+        ):
+            self._active_worker_cancel_reconciliation_task = (
+                self._start_critical_task(
+                    self._active_worker_cancel_reconciliation_loop,
+                    component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_OWNER,
+                )
+            )
+
     def _start_critical_task(
         self,
         operation_factory: Callable[[], Awaitable[None]],
@@ -3235,40 +3422,42 @@ class HostDispatchScheduler:
         )
 
     async def _active_cancel_watchdog_loop(self) -> None:
-        """active cancel watchdog 后台循环。
+        """按 target-scoped commit wake 运行 active cancel watchdog。
 
-        循环通过 level-triggered cancel commit wakeup 降低延迟，并通过 periodic
-        fallback scan 覆盖重启后的剩余 ``CANCELLING`` 状态。event 必须在 tick
-        前 clear，使 tick 期间到达的新 wake 保持 set 并驱动下一轮。
+        execution-owner 的跨 opener 传播由 dispatch poll loop 独立读取本地 worker
+        exact identity；本循环只消费 caller/fresh-attach 指定的 Session，不进行
+        workspace-wide periodic scan。event 在读取 target 集合前 clear，使本轮
+        期间到达的新 wake 保持 set 并驱动下一轮。
 
         :returns: ``None``。
         :raises asyncio.CancelledError: scheduler close 时透传取消。
         """
 
-        interval = self._local_execution.dispatch_poll_interval_seconds
         try:
             while not self._closed:
-                try:
-                    await asyncio.wait_for(
-                        self._active_cancel_watchdog_event.wait(),
-                        timeout=interval,
-                    )
-                except TimeoutError:
-                    pass
+                await self._active_cancel_watchdog_event.wait()
                 if self._closed:
                     break
                 self._active_cancel_watchdog_event.clear()
-                result = self.tick_active_cancel_watchdog(datetime.now(UTC))
-                if result.scanned > 0 or result.closed > 0:
-                    _LOGGER.log(
-                        VERBOSE_LOG_LEVEL,
-                        "dispatch.active_cancel_watchdog.tick scanned=%s "
-                        "eligible=%s closed=%s ignored=%s",
-                        result.scanned,
-                        result.eligible,
-                        result.closed,
-                        result.ignored,
+                session_ids = tuple(sorted(self._active_cancel_watchdog_session_ids))
+                self._active_cancel_watchdog_session_ids.clear()
+                fixed_now = datetime.now(UTC)
+                for session_id in session_ids:
+                    result = self.tick_active_cancel_watchdog_for_session(
+                        session_id,
+                        fixed_now,
                     )
+                    if result.scanned > 0 or result.closed > 0:
+                        _LOGGER.log(
+                            VERBOSE_LOG_LEVEL,
+                            "dispatch.active_cancel_watchdog.tick session_id=%s "
+                            "scanned=%s eligible=%s closed=%s ignored=%s",
+                            session_id,
+                            result.scanned,
+                            result.eligible,
+                            result.closed,
+                            result.ignored,
+                        )
         except asyncio.CancelledError:
             _LOGGER.debug(
                 "dispatch.active_cancel_watchdog.cancelled host_handle_id=%s",
@@ -3490,7 +3679,7 @@ class HostDispatchScheduler:
             raise
 
     async def _owned_session_reconciliation_loop(self) -> None:
-        """按既有 dispatch poll interval 调用唯一 one-shot reconciliation。
+        """周期运行 attachment-authorized Session new-work reconciliation。
 
         :returns: ``None``。
         :raises asyncio.CancelledError: scheduler close 时透传取消。
@@ -3510,6 +3699,35 @@ class HostDispatchScheduler:
         except asyncio.CancelledError:
             _LOGGER.debug(
                 "dispatch.owned_session_reconciliation.cancelled host_handle_id=%s",
+                self._host_handle_id,
+            )
+            raise
+
+    async def _active_worker_cancel_reconciliation_loop(self) -> None:
+        """周期传播本 scheduler exact worker identities 的 durable cancel。
+
+        本任务不进入 Session promotion 或 proactive compactor await 链，确保旧
+        execution owner 的 physical cancel poll 拥有独立进度。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler close 时透传取消。
+        :raises Exception: exact durable reconciliation 失败时透传给 health owner。
+        """
+
+        try:
+            while not self._closed:
+                await asyncio.sleep(
+                    self._local_execution.dispatch_poll_interval_seconds
+                )
+                if self._closed:
+                    return
+                self.reconcile_active_worker_cancels_once(
+                    fixed_now=datetime.now(UTC),
+                )
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "dispatch.active_worker_cancel_reconciliation.cancelled "
+                "host_handle_id=%s",
                 self._host_handle_id,
             )
             raise
@@ -3917,6 +4135,7 @@ class HostDispatchScheduler:
             record.dispatch_record_id,
         )
         self._active_registry.register(
+            session_id=snapshot.session_id,
             run_id=record.run_id,
             attempt_id=record.attempt_id,
             execution_id=record.execution_id,
@@ -4831,24 +5050,20 @@ def _read_active_cancel_watchdog_candidates(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
     *,
-    session_id: str | None,
+    session_id: str,
 ) -> tuple[tuple[_ActiveCancelWatchdogCandidate, ...], int, int]:
-    """读取 active cancel watchdog 当前可评估候选。
+    """读取目标 Session 的 active cancel watchdog 可评估候选。
 
     :param transaction: Host transaction。
     :param event_log_store: EventLog primitive。
-    :param session_id: 目标 Session id；``None`` 表示既有全局 periodic scan。
+    :param session_id: 目标 Session id。
     :returns: 候选集合、扫描到的 ``CANCELLING`` Run 数和跳过数量。
     """
 
     candidates: list[_ActiveCancelWatchdogCandidate] = []
     scanned = 0
     ignored = 0
-    runs = (
-        read_cancelling_runs(transaction)
-        if session_id is None
-        else read_cancelling_runs_for_session(transaction, session_id)
-    )
+    runs = read_cancelling_runs_for_session(transaction, session_id)
     for run in runs:
         scanned += 1
         candidate = _active_cancel_watchdog_candidate_from_run(
@@ -4861,6 +5076,59 @@ def _read_active_cancel_watchdog_candidates(
         else:
             candidates.append(candidate)
     return tuple(candidates), scanned, ignored
+
+
+def _read_exact_owned_active_cancel_watchdog_candidate(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    owner_host_instance_id: str,
+    target: OwnedAttemptCancelTarget,
+) -> tuple[tuple[_ActiveCancelWatchdogCandidate, ...], int, int]:
+    """在 watchdog 写事务内重验 execution-owner exact target。
+
+    本 helper 只把 run-transition owner 已严格校验的 target 投影为既有
+    watchdog candidate；terminal transition 仍只由 ``_tick`` 的唯一调用点执行。
+
+    :param transaction: Host write transaction。
+    :param event_log_store: EventLog primitive。
+    :param owner_host_instance_id: 当前 scheduler 的 durable owner id。
+    :param target: bounded read transaction 返回的 exact target。
+    :returns: 仍精确匹配时返回单 candidate；stale 时返回空集合。
+    :raises HostDurableError: linked cancel fact 在重验时非法时抛出。
+    """
+
+    exact_targets = read_exact_owned_attempt_cancel_targets(
+        transaction,
+        event_log_store,
+        owner_host_instance_id=owner_host_instance_id,
+        identities=(target.identity,),
+    )
+    if exact_targets != (target,):
+        return (), 0, 0
+    cancel_requested = event_log_store.read_event_by_id(
+        transaction,
+        target.cancel_request_event_id,
+    )
+    if cancel_requested is None:
+        raise HostDurableError(
+            "owned Attempt cancel target lost its validated event"
+        )
+    identity = target.identity
+    return (
+        (
+            _ActiveCancelWatchdogCandidate(
+                run_id=identity.run_id,
+                session_id=identity.session_id,
+                attempt_id=identity.attempt_id,
+                cancel_requested_at=parse_utc_timestamp(
+                    cancel_requested.occurred_at
+                ),
+            ),
+        ),
+        1,
+        0,
+    )
 
 
 def _active_cancel_watchdog_candidate_from_run(

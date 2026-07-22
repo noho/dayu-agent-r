@@ -59,6 +59,7 @@ from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerRegistry,
     HostDispatchScheduler,
+    OwnedSessionReconciliationResult,
     _HostCancellationToken,
 )
 from dayu.host.open_host import _ThreadsafeActiveWorkerCancelPort
@@ -75,6 +76,7 @@ from dayu.host.durable.run_transition import (
 )
 from dayu.host.durable.schema import TABLE_HOST_ATTEMPT_DISPATCH_RECORDS
 from dayu.host.durable.state import (
+    AttemptExecutionIdentity,
     DispatchRecordRow,
     DispatchRecordStatus,
     StateMutationStatus,
@@ -100,6 +102,22 @@ from tests.host.fake_session_access import ExplicitFakeSessionAccess
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
 T = TypeVar("T")
+
+
+def _reject_transaction_read(
+    transaction_runner: HostTransactionRunner,
+    operation: HostReadTransactionOperation[T],
+) -> T:
+    """拒绝测试目标路径进入 durable read。
+
+    :param transaction_runner: 被替换的 transaction runner。
+    :param operation: 不应执行的 read operation。
+    :returns: 本 helper 不返回。
+    :raises AssertionError: 一旦发生 durable read 即抛出。
+    """
+
+    del transaction_runner, operation
+    raise AssertionError("empty owner reconcile must not open a read")
 
 
 class _PromotingTerminalPort(TerminalPostCommitPort):
@@ -153,6 +171,46 @@ class _TerminalPortFactory:
         return None
 
 
+class _BlockingOwnedSessionReconciliation:
+    """用 barrier 阻塞 attachment-authorized Session reconciliation。"""
+
+    def __init__(self) -> None:
+        """初始化进入、放行与取消信号。
+
+        :returns: ``None``。
+        """
+
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def run(
+        self,
+        *,
+        fixed_now: datetime,
+    ) -> OwnedSessionReconciliationResult:
+        """阻塞 Session reconciliation 直到测试放行或 scheduler close。
+
+        :param fixed_now: production loop 传入的本轮固定时间。
+        :returns: 放行后的空 reconciliation 摘要。
+        :raises asyncio.CancelledError: scheduler close 取消 task 时透传。
+        """
+
+        del fixed_now
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return OwnedSessionReconciliationResult(
+            owned_session_count=0,
+            leased_session_count=0,
+            dispatched_session_count=0,
+            skipped_session_count=0,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _RunRefs:
     """测试 Run 的 durable 引用。"""
@@ -179,12 +237,34 @@ async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread(
     )
     token = _HostCancellationToken()
     registry.register(
+        session_id="session-bridge",
         run_id="run-bridge",
         attempt_id="attempt-bridge",
         execution_id="execution-bridge",
         handle=handle,
         cancellation_token=token,
     )
+    assert registry.snapshot_identities() == (
+        AttemptExecutionIdentity(
+            session_id="session-bridge",
+            run_id="run-bridge",
+            attempt_id="attempt-bridge",
+            execution_id="execution-bridge",
+        ),
+    )
+    assert (
+        registry.cancel(
+            ActiveCancelMessage(
+                session_id="session-wrong",
+                run_id="run-bridge",
+                attempt_id="attempt-bridge",
+                execution_id="execution-bridge",
+                reason="must-not-propagate",
+            )
+        )
+        is False
+    )
+    assert token.is_cancelled() is False
     port = _ThreadsafeActiveWorkerCancelPort(
         loop=asyncio.get_running_loop(),
         active_registry=registry,
@@ -206,6 +286,7 @@ async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread(
         actor_thread_ids.append(threading.get_ident())
         return port.cancel(
             ActiveCancelMessage(
+                session_id="session-bridge",
                 run_id="run-bridge",
                 attempt_id="attempt-bridge",
                 execution_id="execution-bridge",
@@ -224,6 +305,188 @@ async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread(
     assert handle.cancel_reasons == ["bridge-test"]
     assert handle.cancel_thread_ids == [opener_thread_id]
     assert handle._cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_owner_cancel_reconcile_empty_snapshot_skips_durable_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空 local registry 直接返回，不用无意义事务争抢调度窗口。"""
+
+    handle = _CancelAwareHandle(
+        local_worker_id="worker-empty-owner-reconcile",
+        terminal="hang",
+    )
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(tmp_path, store, handle)
+        try:
+            monkeypatch.setattr(
+                HostTransactionRunner,
+                "run_read",
+                _reject_transaction_read,
+            )
+            result = scheduler.reconcile_active_worker_cancels_once(
+                fixed_now=_NOW,
+            )
+            assert result.snapshot_count == 0
+            assert result.target_count == 0
+            assert result.propagated_count == 0
+            assert result.closed_count == 0
+        finally:
+            monkeypatch.undo()
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_cancel_periodic_task_progresses_while_session_reconcile_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session reconcile 阻塞时独立 owner poll 仍传播并被 close 收口。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: owner poll 被阻塞或 close 泄漏 task 时抛出。
+    """
+
+    options = _command_options(tmp_path)
+    owner_registry = ActiveWorkerRegistry()
+    owner_host = create_host_command_handle(
+        options,
+        active_registry=owner_registry,
+    )
+    caller_host = create_host_command_handle(options)
+    handle = _CancelAwareHandle(
+        local_worker_id="worker-independent-owner-cancel",
+        terminal="blocked",
+    )
+    blocker = _BlockingOwnedSessionReconciliation()
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "reconcile_owned_sessions_once",
+        blocker.run,
+    )
+    try:
+        session_id = _session_id(owner_host)
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            scheduler = await _open_scheduler(
+                tmp_path,
+                store,
+                handle,
+                active_registry=owner_registry,
+            )
+            try:
+                start_run(
+                    owner_host,
+                    _start_request(session_id, "start-independent-owner-cancel"),
+                )
+                refs = await _start_governed_refs(scheduler, session_id)
+                scheduler.wake_dispatch(_pending_dispatch(refs))
+                assert (await scheduler.drain_once()).dispatched == 1
+                await asyncio.wait_for(blocker.started.wait(), timeout=1.0)
+
+                session_task = scheduler._owned_session_reconciliation_task
+                owner_cancel_task = (
+                    scheduler._active_worker_cancel_reconciliation_task
+                )
+                assert session_task is not None
+                assert owner_cancel_task is not None
+                assert session_task.done() is False
+                assert owner_cancel_task.done() is False
+
+                cancelling = cancel_run(
+                    caller_host,
+                    refs.run_id,
+                    _cancel_request("cancel-independent-owner-cancel"),
+                )
+                assert cancelling.status is RunStatus.CANCELLING
+                assert handle.cancel_reasons == []
+
+                await asyncio.wait_for(handle._cancelled.wait(), timeout=1.0)
+                assert handle.cancel_reasons == ["user_stop"]
+
+                await scheduler.close()
+                assert blocker.cancelled.is_set()
+                assert session_task.done()
+                assert owner_cancel_task.done()
+            finally:
+                blocker.release.set()
+                await scheduler.close()
+    finally:
+        caller_host.close()
+        owner_host.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_cancel_task_is_joined_when_later_scheduler_open_step_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """owner cancel task 启动后的 failed-open 必须取消并 await 它。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: failed-open 泄漏 owner cancel task 时抛出。
+    """
+
+    captured_tasks: list[asyncio.Task[None]] = []
+    original_start = (
+        HostDispatchScheduler._start_active_worker_cancel_reconciliation_loop
+    )
+
+    def record_owner_cancel_start(self: HostDispatchScheduler) -> None:
+        """启动并记录 owner cancel task。
+
+        :param self: 正在打开的 scheduler。
+        :returns: ``None``。
+        :raises Exception: production start 失败时透传。
+        """
+
+        original_start(self)
+        task = self._active_worker_cancel_reconciliation_task
+        assert task is not None
+        captured_tasks.append(task)
+
+    def fail_owned_session_start(self: HostDispatchScheduler) -> None:
+        """模拟 owner cancel task 之后的 scheduler open 失败。
+
+        :param self: 正在打开的 scheduler。
+        :returns: 本 helper 不返回。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        del self
+        raise RuntimeError("forced owned session reconciliation start failure")
+
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "_start_active_worker_cancel_reconciliation_loop",
+        record_owner_cancel_start,
+    )
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "_start_owned_session_reconciliation_loop",
+        fail_owned_session_start,
+    )
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        with pytest.raises(
+            RuntimeError,
+            match="forced owned session reconciliation start failure",
+        ):
+            await _open_scheduler(
+                tmp_path,
+                store,
+                _CancelAwareHandle(
+                    local_worker_id="worker-failed-open-owner-cancel",
+                    terminal="hang",
+                ),
+            )
+
+    assert len(captured_tasks) == 1
+    assert captured_tasks[0].done()
 
 
 class _CancelAwareHandle:
@@ -916,7 +1179,8 @@ async def test_active_cancel_watchdog_times_out_non_cooperative_worker(
                 )
                 assert cancelling.status == RunStatus.CANCELLING
 
-                result = scheduler.tick_active_cancel_watchdog(
+                result = scheduler.tick_active_cancel_watchdog_for_session(
+                    session_id,
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
 
@@ -958,7 +1222,10 @@ async def test_active_cancel_watchdog_closes_on_first_tick_after_cancel(
                 assert (await scheduler.drain_once()).dispatched == 1
 
                 cancel_run(host, refs.run_id, _cancel_request("cancel-before-watchdog"))
-                result = scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
+                result = scheduler.tick_active_cancel_watchdog_for_session(
+                    session_id,
+                    datetime.now(UTC),
+                )
 
                 assert result.closed == 1
                 assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLED
@@ -982,7 +1249,8 @@ async def test_active_cancel_watchdog_zero_cancelling_runs_noops(
             _CancelAwareHandle(local_worker_id="worker-zero", terminal="blocked"),
         )
         try:
-            result = scheduler.tick_active_cancel_watchdog(
+            result = scheduler.tick_active_cancel_watchdog_for_session(
+                "session-without-cancel",
                 datetime(2030, 1, 1, tzinfo=UTC)
             )
 
@@ -1049,12 +1317,19 @@ async def test_active_cancel_watchdog_multiple_cancelling_runs_closes_each_eligi
 
                 cancel_run(host, first.run_id, _cancel_request("cancel-multi-1"))
                 cancel_run(host, second.run_id, _cancel_request("cancel-multi-2"))
-                result = scheduler.tick_active_cancel_watchdog(
+                first_result = scheduler.tick_active_cancel_watchdog_for_session(
+                    first_session_id,
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
+                second_result = scheduler.tick_active_cancel_watchdog_for_session(
+                    second_session_id,
+                    datetime(2030, 1, 1, tzinfo=UTC),
+                )
 
-                assert result.scanned == 2
-                assert result.closed == 2
+                assert first_result.scanned == 1
+                assert first_result.closed == 1
+                assert second_result.scanned == 1
+                assert second_result.closed == 1
                 assert _run_status(options.db_path, first.run_id) == RunStatus.CANCELLED
                 assert _run_status(options.db_path, second.run_id) == RunStatus.CANCELLED
             finally:
@@ -1092,10 +1367,12 @@ async def test_active_cancel_watchdog_closeout_promotes_queued_run(tmp_path: Pat
                 assert (await scheduler.drain_once()).dispatched == 1
                 cancel_run(host, active.run_id, _cancel_request("cancel-promote"))
 
-                result = scheduler.tick_active_cancel_watchdog(
+                result = scheduler.tick_active_cancel_watchdog_for_session(
+                    session_id,
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
-                replay = scheduler.tick_active_cancel_watchdog(
+                replay = scheduler.tick_active_cancel_watchdog_for_session(
+                    session_id,
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
 
@@ -1339,7 +1616,8 @@ async def test_cancel_session_replay_after_watchdog_does_not_append_or_propagate
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 assert (await scheduler.drain_once()).dispatched == 1
                 cancel_session_runs(host, session_id, request)
-                scheduler.tick_active_cancel_watchdog(
+                scheduler.tick_active_cancel_watchdog_for_session(
+                    session_id,
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
                 after_watchdog_events = _event_count(options.db_path)

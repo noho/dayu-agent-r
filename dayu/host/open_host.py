@@ -593,17 +593,20 @@ class _ThreadsafeSchedulerWakeupPort:
             return
         self._run_on_loop(lambda: self.scheduler.wake_queue_promotion(session_id))
 
-    def wake_active_cancel_watchdog(self) -> None:
-        """在线程安全边界唤醒 active cancel watchdog。
+    def wake_active_cancel_watchdog(self, session_id: str) -> None:
+        """在线程安全边界唤醒目标 Session active cancel watchdog。
 
+        :param session_id: 已提交 cancel command 的目标 Session id。
         :returns: ``None``。
         :raises Exception: scheduler wakeup 失败时透传。
         """
 
         if _is_current_event_loop(self.loop):
-            self.scheduler.wake_active_cancel_watchdog()
+            self.scheduler.wake_active_cancel_watchdog(session_id)
             return
-        self._run_on_loop(self.scheduler.wake_active_cancel_watchdog)
+        self._run_on_loop(
+            lambda: self.scheduler.wake_active_cancel_watchdog(session_id)
+        )
 
     def _run_on_loop(self, callback: Callable[[], None]) -> None:
         """在 opener event loop 上同步执行 callback。

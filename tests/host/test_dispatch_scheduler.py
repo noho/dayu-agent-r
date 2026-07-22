@@ -1231,6 +1231,7 @@ class _RegisteringCancelHandle(_FakeHandle):
 
         self.cancel_reasons.append(reason)
         self._registry.register(
+            session_id="session-second",
             run_id="run-second",
             attempt_id="attempt-second",
             execution_id="execution-second",
@@ -2250,16 +2251,20 @@ class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
         self._event_states_before_tick = []
         self._event_state_after_nested_wake = None
 
-    def tick_active_cancel_watchdog(
-        self, now: datetime
+    def tick_active_cancel_watchdog_for_session(
+        self,
+        session_id: str,
+        now: datetime,
     ) -> host_dispatch.ActiveCancelWatchdogTickResult:
         """记录 tick 前 event 已 clear，并可在第一轮内注入第二次 wake。
 
+        :param session_id: target watchdog 的 Session id。
         :param now: watchdog tick 的当前时间。
         :returns: 空扫描 tick 结果。
         :raises Exception: 不主动抛出异常。
         """
 
+        assert session_id == "session-watchdog-probe"
         _ = now
         self._tick_count += 1
         self._event_states_before_tick.append(
@@ -2268,7 +2273,7 @@ class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
         if self._tick_count == 1:
             self._first_tick_seen.set()
             if self._wake_during_first_tick:
-                self.wake_active_cancel_watchdog()
+                self.wake_active_cancel_watchdog(session_id)
                 self._event_state_after_nested_wake = self._active_cancel_watchdog_event.is_set()
         elif self._tick_count == 2:
             self._second_tick_seen.set()
@@ -2283,16 +2288,20 @@ class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
 class _FailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
     """测试用 active cancel watchdog fatal tick scheduler。"""
 
-    def tick_active_cancel_watchdog(
-        self, now: datetime
+    def tick_active_cancel_watchdog_for_session(
+        self,
+        session_id: str,
+        now: datetime,
     ) -> host_dispatch.ActiveCancelWatchdogTickResult:
         """固定抛出 watchdog unexpected failure。
 
+        :param session_id: target watchdog 的 Session id。
         :param now: watchdog tick 的当前时间。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出测试异常。
         """
 
+        assert session_id == "session-watchdog-probe"
         _ = now
         raise RuntimeError("active cancel watchdog private failure")
 
@@ -2585,6 +2594,7 @@ def test_active_worker_registry_cancel_all_uses_snapshot_when_entry_registers_af
         second_handle=second_handle,
     )
     registry.register(
+        session_id="session-first",
         run_id="run-first",
         attempt_id="attempt-first",
         execution_id="execution-first",
@@ -3138,6 +3148,7 @@ async def test_drain_loop_retries_durable_retry_exhausted_without_self_close(
         registry = ActiveWorkerRegistry()
         active_token = _HostCancellationToken()
         registry.register(
+            session_id="session-active",
             run_id="run-active",
             attempt_id="attempt-active",
             execution_id="execution-active",
@@ -3224,7 +3235,7 @@ async def test_active_cancel_watchdog_wake_during_tick_drives_second_tick(
             wake_during_first_tick=True,
         )
         try:
-            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog("session-watchdog-probe")
             await asyncio.wait_for(second_tick_seen.wait(), timeout=0.5)
 
             assert first_tick_seen.is_set()
@@ -3262,9 +3273,9 @@ async def test_active_cancel_watchdog_concurrent_wakes_coalesce_to_level_signal(
             wake_during_first_tick=False,
         )
         try:
-            scheduler.wake_active_cancel_watchdog()
-            scheduler.wake_active_cancel_watchdog()
-            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog("session-watchdog-probe")
+            scheduler.wake_active_cancel_watchdog("session-watchdog-probe")
+            scheduler.wake_active_cancel_watchdog("session-watchdog-probe")
             await asyncio.wait_for(first_tick_seen.wait(), timeout=0.5)
 
             assert scheduler._tick_count == 1
@@ -3292,14 +3303,14 @@ async def test_active_cancel_watchdog_unexpected_failure_reports_typed_fatal(
             ),
         )
         try:
-            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog("session-watchdog-probe")
             task = scheduler._active_cancel_watchdog_task
             assert task is not None
             await task
 
             assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
             with pytest.raises(HostApiError) as exc_info:
-                scheduler.wake_active_cancel_watchdog()
+                scheduler.wake_active_cancel_watchdog("session-watchdog-probe")
             assert exc_info.value.code is HostApiErrorCode.UNAVAILABLE
             assert isinstance(exc_info.value.detail, HostUnavailableDetail)
             assert exc_info.value.detail.component == "active_cancel_watchdog"
@@ -4144,6 +4155,7 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
             assert (
                 registry.cancel(
                     ActiveCancelMessage(
+                        session_id=seeded.session_id,
                         run_id=seeded.run_id,
                         attempt_id=seeded.attempt_id,
                         execution_id=seeded.execution_id,
@@ -4280,6 +4292,7 @@ async def test_scheduler_close_cleans_active_handle_when_consumer_task_never_sta
                 pass
             scheduler._active_cancel_watchdog_task = None
         registry.register(
+            session_id=seeded.session_id,
             run_id=seeded.run_id,
             attempt_id=seeded.attempt_id,
             execution_id=seeded.execution_id,
@@ -4303,6 +4316,7 @@ async def test_scheduler_close_cleans_active_handle_when_consumer_task_never_sta
         assert (
             registry.cancel(
                 ActiveCancelMessage(
+                    session_id=seeded.session_id,
                     run_id=seeded.run_id,
                     attempt_id=seeded.attempt_id,
                     execution_id=seeded.execution_id,
@@ -4401,6 +4415,7 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
         assert (
             registry.cancel(
                 ActiveCancelMessage(
+                    session_id=seeded.session_id,
                     run_id=seeded.run_id,
                     attempt_id=seeded.attempt_id,
                     execution_id=seeded.execution_id,
@@ -4570,6 +4585,7 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
         assert (
             registry.cancel(
                 ActiveCancelMessage(
+                    session_id=seeded.session_id,
                     run_id=seeded.run_id,
                     attempt_id=seeded.attempt_id,
                     execution_id=seeded.execution_id,
@@ -4739,6 +4755,7 @@ async def test_consume_pre_event_exception_releases_lane_and_unregisters(
             assert (
                 registry.cancel(
                     ActiveCancelMessage(
+                        session_id=seeded.session_id,
                         run_id=seeded.run_id,
                         attempt_id=seeded.attempt_id,
                         execution_id=seeded.execution_id,
@@ -5547,7 +5564,7 @@ async def test_scheduler_wake_methods_fail_after_close_and_close_is_idempotent(
             scheduler.wake_queue_promotion(seeded.session_id)
         assert promotion_error.value.code is HostApiErrorCode.UNAVAILABLE
         with pytest.raises(HostApiError) as watchdog_error:
-            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog(seeded.session_id)
         assert watchdog_error.value.code is HostApiErrorCode.UNAVAILABLE
         assert scheduler._promotion_queue.qsize() == 0
 

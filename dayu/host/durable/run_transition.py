@@ -9,10 +9,12 @@ orchestration、WorkerProxy、Engine dispatch 或 public facade。
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import AttemptStatus, CancelMode, RunStatus
@@ -22,7 +24,11 @@ from dayu.host.durable._validation import (
     require_optional_sha256_digest as _require_optional_sha256_digest,
     require_sha256_digest as _require_sha256_digest,
 )
-from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
+from dayu.host.durable.codec import (
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -37,10 +43,12 @@ from dayu.host.queue_policy import (
 )
 from dayu.host.durable.state import (
     AttemptMutationResult,
+    AttemptExecutionIdentity,
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordMutationResult,
     DispatchRecordStatus,
+    OwnedAttemptCancelCandidate,
     RunRow,
     RunMutationResult,
     RunStartReason,
@@ -76,6 +84,7 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
+    read_owned_attempt_cancel_candidates,
     read_run_by_id,
     read_wait_record_by_id,
     resume_waiting_run_row,
@@ -106,6 +115,16 @@ _EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _EVENT_TYPE_RESUME_REQUESTED = "RESUME_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _ACTIVE_CANCEL_WATCHDOG_CLOSEOUT_REASON = "active_cancel_watchdog_closeout"
+_CANCEL_REQUESTED_PAYLOAD_FIELDS = frozenset(
+    {
+        "run_id",
+        "client_request_id",
+        "reason",
+        "mode",
+        "target_status_at_accept",
+        "call_context_digest",
+    }
+)
 
 
 class PromotionSkipReason(StrEnum):
@@ -115,6 +134,39 @@ class PromotionSkipReason(StrEnum):
     ACTIVE_RUN_EXISTS = "active_run_exists"
     CAS_LOST_OR_NO_LONGER_ELIGIBLE = "cas_lost_or_no_longer_eligible"
     DELEGATED_TO_GOVERNANCE = "delegated_to_governance"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedAttemptCancelTarget:
+    """已由 state join 与 canonical cancel fact 共同验证的 owner target。
+
+    :param identity: current Attempt execution 的精确四元身份。
+    :param cancel_request_event_id: 已严格验证的 ``CANCEL_REQUESTED`` event id。
+    """
+
+    identity: AttemptExecutionIdentity
+    cancel_request_event_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedAttemptCancelDelivery:
+    """execution owner 可直接传播的 canonical cancel typed 投影。
+
+    :param target: accepted plan 定义的 exact owner target。
+    :param reason: linked ``CANCEL_REQUESTED`` canonical fact 的取消原因。
+    """
+
+    target: OwnedAttemptCancelTarget
+    reason: str
+
+    def __post_init__(self) -> None:
+        """校验 canonical cancel reason 非空。
+
+        :returns: ``None``。
+        :raises HostDurableError: reason 为空时抛出。
+        """
+
+        _require_non_empty_text(self.reason, field_name="cancel reason")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2355,6 +2407,216 @@ def read_cancel_requested_event_from_run_link(
     ):
         return None
     return cancel_requested
+
+
+def read_exact_owned_attempt_cancel_targets(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    owner_host_instance_id: str,
+    identities: tuple[AttemptExecutionIdentity, ...],
+) -> tuple[OwnedAttemptCancelTarget, ...]:
+    """读取 execution owner 当前 exact workers 对应的已接受 cancel targets。
+
+    state owner 只完成 Run / Attempt / dispatch exact join；本函数作为 cancel
+    canonical fact owner，逐个严格验证 typed link、EventLog row、事件体 digest
+    与当前 producer 的六字段 payload。stale identity 被 state join 过滤，坏 link
+    或坏 canonical fact 则 fail closed。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
+    :param owner_host_instance_id: 当前 scheduler 的 durable Host instance id。
+    :param identities: 本地 active registry 的有界 exact identity 快照。
+    :returns: 按输入 identity 顺序排列的严格 target。
+    :raises HostDurableError: 输入重复、字段非法、linked row 缺失或 canonical
+        cancel fact 任一字段、payload、digest 不合法时抛出。
+    """
+
+    return tuple(
+        delivery.target
+        for delivery in read_exact_owned_attempt_cancel_deliveries(
+            transaction,
+            event_log_store,
+            owner_host_instance_id=owner_host_instance_id,
+            identities=identities,
+        )
+    )
+
+
+def read_exact_owned_attempt_cancel_deliveries(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    owner_host_instance_id: str,
+    identities: tuple[AttemptExecutionIdentity, ...],
+) -> tuple[OwnedAttemptCancelDelivery, ...]:
+    """读取带 canonical reason 的 execution-owner cancel 投影。
+
+    本函数与 exact target contract 共用同一 state join 和 canonical fact
+    validator；raw EventLog payload 不离开 run-transition owner boundary。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
+    :param owner_host_instance_id: 当前 scheduler 的 durable Host instance id。
+    :param identities: 本地 active registry 的有界 exact identity 快照。
+    :returns: 按输入 identity 顺序排列的 typed cancel delivery。
+    :raises HostDurableError: 输入或 linked canonical cancel fact 非法时抛出。
+    """
+
+    candidates = read_owned_attempt_cancel_candidates(
+        transaction,
+        owner_host_instance_id=owner_host_instance_id,
+        identities=identities,
+    )
+    deliveries: list[OwnedAttemptCancelDelivery] = []
+    for candidate in candidates:
+        event = event_log_store.read_event_by_id(
+            transaction,
+            candidate.cancel_request_event_id,
+        )
+        if event is None:
+            raise HostDurableError(
+                "owned Attempt cancel_request_event_id references a missing event"
+            )
+        reason = _validate_exact_owned_cancel_requested_event(candidate, event)
+        deliveries.append(
+            OwnedAttemptCancelDelivery(
+                target=OwnedAttemptCancelTarget(
+                    identity=candidate.identity,
+                    cancel_request_event_id=candidate.cancel_request_event_id,
+                ),
+                reason=reason,
+            )
+        )
+    return tuple(deliveries)
+
+
+def _validate_exact_owned_cancel_requested_event(
+    candidate: OwnedAttemptCancelCandidate,
+    event: EventLogRow,
+) -> str:
+    """严格校验并投影 execution-owner target 的 cancel canonical fact。
+
+    :param candidate: state owner 精确 join 返回的候选。
+    :param event: typed link 指向的 EventLog row。
+    :returns: 已验证的 canonical cancel reason。
+    :raises HostDurableError: row identity、shape、digest 或 payload 非法时抛出。
+    """
+
+    identity = candidate.identity
+    if event.event_id != candidate.cancel_request_event_id:
+        raise HostDurableError("owned Attempt cancel event id does not match typed link")
+    if event.event_class is not EventClass.CANONICAL_FACT:
+        raise HostDurableError("owned Attempt cancel event must be canonical fact")
+    if event.event_type != _EVENT_TYPE_CANCEL_REQUESTED:
+        raise HostDurableError("owned Attempt cancel event type is invalid")
+    if event.session_id != identity.session_id or event.run_id != identity.run_id:
+        raise HostDurableError("owned Attempt cancel event identity is invalid")
+    if event.attempt_id is not None or event.execution_id is not None:
+        raise HostDurableError("owned Attempt cancel event must be Run-scoped")
+    if event.payload_ref is not None or event.payload_digest is not None:
+        raise HostDurableError("owned Attempt cancel event must use inline payload")
+    _validate_event_body_digest(event)
+    return _validate_cancel_requested_payload(event, identity=identity)
+
+
+def _validate_cancel_requested_payload(
+    event: EventLogRow,
+    *,
+    identity: AttemptExecutionIdentity,
+) -> str:
+    """严格解析当前 producer 的 ``CANCEL_REQUESTED`` 六字段 payload。
+
+    :param event: 已通过 row identity 校验的 EventLog row。
+    :param identity: target 的精确 Attempt execution identity。
+    :returns: 已验证的 canonical cancel reason。
+    :raises HostDurableError: JSON、字段集合、字段类型、枚举或 digest 非法时抛出。
+    """
+
+    try:
+        decoded = cast(JsonValue, json.loads(event.payload_json))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HostDurableError("owned Attempt cancel payload is invalid JSON") from exc
+    if not isinstance(decoded, Mapping):
+        raise HostDurableError("owned Attempt cancel payload must be a mapping")
+    payload = cast(Mapping[str, JsonValue], decoded)
+    if frozenset(payload) != _CANCEL_REQUESTED_PAYLOAD_FIELDS:
+        raise HostDurableError("owned Attempt cancel payload fields are invalid")
+
+    run_id = payload["run_id"]
+    client_request_id = payload["client_request_id"]
+    reason = payload["reason"]
+    mode = payload["mode"]
+    target_status = payload["target_status_at_accept"]
+    call_context_digest = payload["call_context_digest"]
+    if not isinstance(run_id, str) or run_id != identity.run_id:
+        raise HostDurableError("owned Attempt cancel payload run_id is invalid")
+    if (
+        not isinstance(client_request_id, str)
+        or client_request_id.strip() == ""
+        or client_request_id != event.client_request_id
+    ):
+        raise HostDurableError(
+            "owned Attempt cancel payload client_request_id is invalid"
+        )
+    if not isinstance(reason, str) or reason.strip() == "":
+        raise HostDurableError("owned Attempt cancel payload reason is invalid")
+    if not isinstance(mode, str):
+        raise HostDurableError("owned Attempt cancel payload mode is invalid")
+    try:
+        CancelMode(mode)
+    except ValueError as exc:
+        raise HostDurableError("owned Attempt cancel payload mode is invalid") from exc
+    if not isinstance(target_status, str):
+        raise HostDurableError(
+            "owned Attempt cancel payload target_status_at_accept is invalid"
+        )
+    try:
+        RunStatus(target_status)
+    except ValueError as exc:
+        raise HostDurableError(
+            "owned Attempt cancel payload target_status_at_accept is invalid"
+        ) from exc
+    if not isinstance(call_context_digest, str):
+        raise HostDurableError(
+            "owned Attempt cancel payload call_context_digest is invalid"
+        )
+    _require_sha256_digest(
+        call_context_digest,
+        field_name="owned Attempt cancel payload call_context_digest",
+    )
+    return reason
+
+
+def _validate_event_body_digest(event: EventLogRow) -> None:
+    """校验 EventLog row 保存的事件体 digest 与当前 row 完整一致。
+
+    :param event: 待校验 EventLog row。
+    :returns: ``None``。
+    :raises HostDurableError: digest 格式或内容不一致时抛出。
+    """
+
+    _require_sha256_digest(event.event_body_digest, field_name="event_body_digest")
+    digest_input: dict[str, JsonValue] = {
+        "event_class": event.event_class.value,
+        "session_id": event.session_id,
+        "run_id": event.run_id,
+        "attempt_id": event.attempt_id,
+        "execution_id": event.execution_id,
+        "event_type": event.event_type,
+        "occurred_at": event.occurred_at,
+        "actor": event.actor,
+        "source": event.source,
+        "client_request_id": event.client_request_id,
+        "idempotency_key": event.idempotency_key,
+        "policy_decision_json": event.policy_decision_json,
+        "reason_json": event.reason_json,
+        "payload_json": event.payload_json,
+        "payload_ref": event.payload_ref,
+        "payload_digest": event.payload_digest,
+    }
+    if sha256_digest_json(digest_input) != event.event_body_digest:
+        raise HostDurableError("owned Attempt cancel event body digest mismatch")
 
 
 def read_terminal_run_event_in_transaction(

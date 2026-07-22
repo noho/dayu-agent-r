@@ -154,11 +154,11 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CTX-04` implementation Slice 3。 |
+| phase | `WU-CTX-04` Slice 3 acceptance。 |
 | active work unit | `WU-CTX-04`；类型为 GitHub Issue #112 对应的 architecture-sensitive issue work unit。 |
-| gate | `implementation-in-flight`（Slice 3/3） |
+| gate | `accepted-pending-protected-commit`（Slice 3/3） |
 | blocking open questions | None。 |
-| next entry point | 先创建Slice 2受保护accepted commit，再由AgentCodex按accepted plan Slice 3实施execution-owner cancel reconcile、README/product integration与final verification。 |
+| next entry point | Controller创建accepted Slice 3保护提交；随后进入WU-CTX-04 aggregate deepreview gate。 |
 
 ## 推进规则
 
@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
-| WU-CTX-04 | implementation-in-flight (Slice 3/3) | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | accepted plan保护提交=`1f032b5e`；accepted Slice 1 commit=`eda1d70e`；Slice 2 implementation/review-fix/双路re-review已由Controller最终裁决`pass`，acceptance artifact已完成；创建Slice 2受保护commit后进入Slice 3。 |
+| WU-CTX-04 | accepted-pending-protected-commit (Slice 3/3) | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | accepted plan保护提交=`1f032b5e`；accepted Slice 1 commit=`eda1d70e`；accepted Slice 2 commit=`4ca0810b`；Slice 3双路re-review与Controller acceptance均为`pass`。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
@@ -688,7 +688,7 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 
 ### 状态
 
-GitHub Issue #112 当前为 OPEN；本条状态为 `implementation-in-flight (Slice 3/3)`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；Slice 1 contract-only实现及review loop已通过，受保护本地commit为`eda1d70e`。Slice 2联合implementation、initial review、review fix与双路re-review均已闭环，Controller最终acceptance decision=`pass`；zero-request orphan/unknown proactive history现由projection owner严格fail closed，recovery nested work-lease contract与Host close mandatory/best-effort文档已同步。当前先创建Slice 2受保护accepted commit，再只按accepted plan推进Slice 3 execution-owner cancel reconcile、README/product integration与final verification。
+GitHub Issue #112 当前为 OPEN；本条状态为 `accepted-pending-protected-commit (Slice 3/3)`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；Slice 1 contract-only实现及review loop已通过，受保护本地commit为`eda1d70e`。Slice 2联合implementation、initial review、review fix与双路re-review均已闭环，Controller最终acceptance decision=`pass`；zero-request orphan/unknown proactive history现由projection owner严格fail closed，recovery nested work-lease contract与Host close mandatory/best-effort文档已同步。Slice 3 implementation、initial双路review、Controller adjudication、review fix与双路re-review均已完成；3项accepted findings全部fixed，两路均为`pass`且0个新actionable findings，Controller最终acceptance decision=`pass`，等待形成accepted Slice 3保护提交。
 
 ### Gate artifacts
 
@@ -739,6 +739,45 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `implementation-in-flight (Sl
   pass；Controller最终artifact=`docs/reviews/wu-ctx-04-slice-2-acceptance-controller.md`，
   decision=`pass`。DS新增identity observation被直接控制流反证为evidence-invalid，其余新增
   observations均未形成actionable gap；blocking questions=None。
+- accepted Slice 2 commit：`4ca0810b`（`gateflow: accept WU-CTX-04 slice 2`）。
+- Slice 3 pre-edit audit：`docs/reviews/wu-ctx-04-slice-3-implementation-codex.md`初始
+  status=`blocked`；Controller直接核对确认严格`session_id`/target wake契约遗漏两个测试消费者。
+  scope amendment=`docs/reviews/wu-ctx-04-slice-3-scope-amendment-controller.md`，decision=
+  `resume-with-narrow-test-only-amendment`；仅追加`test_dispatch_scheduler.py`与
+  `test_admission_multiprocess.py`做required signature/obsolete global-watchdog机械迁移。
+- Slice 3 implementation：同一artifact=`docs/reviews/wu-ctx-04-slice-3-implementation-codex.md`
+  最终status=`complete`，并保留初始blocker与scope amendment历史。execution owner按本地exact
+  identity快照读取strict durable cancel link并传播token/hook；target watchdog不再做workspace-wide
+  scan，terminal closeout复用唯一producer。计划8.4=`325 passed`，amendment tests=`110 passed`，
+  最终全量=`5590 passed, 11 skipped, 6 deselected`，全量pyright=`0 errors`；21个变更production
+  Python文件逐文件coverage均>=80%，最低81%。
+- Slice 3 initial code review：`docs/reviews/wu-ctx-04-slice-3-code-review-mimo.md`
+  （AgentMiMo，`pass`，0 findings）与
+  `docs/reviews/wu-ctx-04-slice-3-code-review-ds.md`（AgentDS，`pass`，1 Medium + 3 Low）。
+  Controller adjudication=`docs/reviews/wu-ctx-04-slice-3-code-review-controller-adjudication.md`，
+  decision=`needs-fix`：接受独立execution-owner poll被proactive compactor阻塞、canonical cancel
+  reason被dispatch常量替代、dynamic VALUES bind可移植性3项；驳回workspace-wide safety scan、
+  LRU/size guard与无失败条件的monkeypatch观察。blocking questions=None。
+- Slice 3 review fix：`docs/reviews/wu-ctx-04-slice-3-review-fix-codex.md`；
+  `CTRL-S3-001`以独立health-supervised execution-owner cancel periodic task解除Session
+  reconcile/proactive compactor阻塞并覆盖open/failed-open/close；`CTRL-S3-002`由run-transition
+  typed delivery投影canonical cancel reason，dispatch不再生成替代常量；`CTRL-S3-003`在同一
+  transaction内按SQLite历史默认999 bind预算推导199条安全批次，先做完整输入校验并严格保持
+  全局输入顺序。focused matrix=`438 passed`，terminal producer manifest=`1 passed`，canonical
+  全量=`5593 passed, 11 skipped, 6 deselected`，全量pyright=`0 errors`；coverage测试面
+  `3542 passed, 9 skipped, 6 deselected`，21个变更production Python文件逐文件均>=80%。
+  Controller独立复跑4个根因反例=`4 passed`，fix相关production/tests pyright=`0 errors`；
+  blocking questions=None，下一步为双路re-review。
+- Slice 3 code re-review：`docs/reviews/wu-ctx-04-slice-3-re-review-mimo.md`（AgentMiMo）与
+  `docs/reviews/wu-ctx-04-slice-3-re-review-ds.md`（AgentDS）均判定`CTRL-S3-001/002/003`
+  已root-cause closure，verdict=`pass`，0个new actionable findings，blocking questions=None。
+  AgentMiMo独立full Host=`2150 passed, 2 skipped, 6 deselected`；AgentDS独立canonical
+  full suite=`5593 passed, 11 skipped, 6 deselected`，两路pyright均`0 errors`。
+- Slice 3最终Controller acceptance：
+  `docs/reviews/wu-ctx-04-slice-3-acceptance-controller.md`，decision=`pass`；Controller按
+  production owner、根因反例、唯一terminal producer、typed canonical reason与batch order
+  证据独立裁决，不按review票数接受。所有residual risk均已分类，blocking questions=None；
+  允许创建accepted Slice 3保护提交并进入aggregate deepreview。
 
 ### 已确认问题与直接代码证据
 

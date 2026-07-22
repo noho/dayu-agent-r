@@ -346,6 +346,11 @@ dayu-cli session purge --session-id <session-id> --yes
 
 只有已关闭且全部任务都已终态的 Session 才能 purge。
 
+同一个工作区内，若两个 CLI 进程同时选择同一 Session，先进入的进程可以继续提交、改向或取消，
+后进入的进程会以只读方式打开，并在尝试修改时得到明确错误。需要在后进入的进程继续操作时，
+先在原进程正常退出当前 prompt 或 interactive 会话并等待其关闭完成，再退出并重新执行
+`session resume`；已经打开的只读会话不会在原进程退出后自动变为可写。
+
 ## 7. 常见问题
 
 ### 配置文件已存在

@@ -135,8 +135,6 @@ from dayu.host.wait_adapter import (
     WaitPollerSupervisor,
 )
 from dayu.host.waiting import ExpireWaitInput
-
-T = TypeVar("T")
 from tests.host.public_smoke_support import awaiting_tooling_options
 from tests.host.test_command_handle import _start_request
 from tests.host.test_resolve_wait_command import (
@@ -145,6 +143,7 @@ from tests.host.test_resolve_wait_command import (
     _set_wait_deadline_text,
 )
 
+T = TypeVar("T")
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
 _PROMOTION_BARRIER_EXPIRED_AT = datetime(2026, 5, 18, 3, 0, 0, tzinfo=UTC)
 
@@ -1417,16 +1416,20 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
     original_request_cancel = _HostCancellationToken.request_cancel
     original_on_cancel = _ControlledFinalAnswerHandle.on_cancel
 
-    def record_watchdog_wake(self: HostDispatchScheduler) -> None:
+    def record_watchdog_wake(
+        self: HostDispatchScheduler,
+        session_id: str,
+    ) -> None:
         """记录 watchdog Event.set 所在线程与 set 后状态。
 
         :param self: scheduler。
+        :param session_id: cancel command 的目标 Session id。
         :returns: ``None``。
         :raises Exception: 原始 wake 失败时透传。
         """
 
         watchdog_threads.append(threading.get_ident())
-        original_watchdog_wake(self)
+        original_watchdog_wake(self, session_id)
         watchdog_event_states.append(
             self._active_cancel_watchdog_event.is_set()
         )
@@ -1486,7 +1489,11 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
             assert watchdog_event_states == [True]
             assert token_threads == [opener_thread_id]
             assert hook_threads == [opener_thread_id]
-            cast(_PublicHostHandle, host)._scheduler.tick_active_cancel_watchdog(
+            cast(
+                _PublicHostHandle,
+                host,
+            )._scheduler.tick_active_cancel_watchdog_for_session(
+                session.session_id,
                 datetime(2030, 1, 1, tzinfo=UTC)
             )
             terminal = await asyncio.wait_for(terminal_task, timeout=1)

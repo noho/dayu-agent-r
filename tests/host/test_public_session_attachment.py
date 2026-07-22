@@ -237,6 +237,7 @@ class _DelayedFinalAnswerHandle:
         """
 
         self._factory.cancel_count += 1
+        self._factory.cancel_reasons.append(reason)
         self._inner.on_cancel(reason)
 
     async def close(self) -> None:
@@ -275,6 +276,7 @@ class _DelayedFinalAnswerWorker:
         :raises Exception: delegate accept 失败时透传。
         """
 
+        self._factory.active_snapshot = snapshot
         delegate = self._factory.delegate.create_worker(snapshot)
         inner = await delegate.accept(snapshot, request)
         return _DelayedFinalAnswerHandle(
@@ -296,7 +298,9 @@ class _DelayedFinalAnswerWorkerFactory:
         self.events_started = asyncio.Event()
         self.events_release = asyncio.Event()
         self.cancel_count = 0
+        self.cancel_reasons: list[str] = []
         self.handle_close_count = 0
+        self.active_snapshot: AttemptDispatchSnapshot | None = None
 
     def create_worker(
         self,
@@ -651,6 +655,21 @@ async def test_cross_opener_read_only_is_frozen_until_fresh_reacquire(
             del scheduler, session_id
             wake_calls.append("promotion")
 
+        def record_cancel_watchdog_wake(
+            scheduler: HostDispatchScheduler,
+            session_id: str,
+        ) -> None:
+            """记录任何越过 RO gate 的 target cancel watchdog wake。
+
+            :param scheduler: scheduler 实例。
+            :param session_id: wake 目标 Session id。
+            :returns: ``None``。
+            :raises Exception: 不主动抛出异常。
+            """
+
+            del scheduler, session_id
+            wake_calls.append("cancel_watchdog")
+
         monkeypatch.setattr(
             HostDispatchScheduler,
             "wake_dispatch",
@@ -660,6 +679,11 @@ async def test_cross_opener_read_only_is_frozen_until_fresh_reacquire(
             HostDispatchScheduler,
             "wake_queue_promotion",
             record_promotion_wake,
+        )
+        monkeypatch.setattr(
+            HostDispatchScheduler,
+            "wake_active_cancel_watchdog",
+            record_cancel_watchdog_wake,
         )
         event_count_before_rejections = _event_count(options.db_path)
         provider_count_before_rejections = len(factory.requests)
@@ -1058,6 +1082,100 @@ async def test_periodic_reconcile_one_shot_targets_only_active_read_write(
         finally:
             await close_attachment_shielded(observer_attachment)
             await close_attachment_shielded(owner_attachment)
+
+
+@pytest.mark.asyncio
+async def test_cross_opener_cancel_reaches_detached_execution_owner(
+    tmp_path: pathlib.Path,
+) -> None:
+    """fresh RW caller 的 cancel 由旧 execution owner 精确传播到本地 worker。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: durable acceptance、owner identity 或物理传播漂移时抛出。
+    """
+
+    factory = _DelayedFinalAnswerWorkerFactory()
+    options = _options(tmp_path, factory)
+    async with open_host(options) as owner_host, open_host(options) as caller_host:
+        session = await owner_host.ensure_session(
+            ensure_request("attachment-cross-opener-cancel")
+        )
+        owner_attachment = await owner_host.attach_session(session.session_id)
+        caller_attachment = await caller_host.attach_session(session.session_id)
+        assert owner_attachment.access_mode is HostSessionAccessMode.READ_WRITE
+        assert caller_attachment.access_mode is HostSessionAccessMode.READ_ONLY
+        fresh_caller_attachment: HostSessionAttachment | None = None
+        try:
+            accepted = await owner_host.submit_followup(
+                session.session_id,
+                followup_request(
+                    session.session_id,
+                    "attachment-cross-opener-active",
+                    "hold stable execution for cross-opener cancel",
+                ),
+            )
+            await asyncio.wait_for(factory.events_started.wait(), timeout=2.0)
+            owner_scheduler = cast(_PublicHostHandle, owner_host)._scheduler
+            owner_reconcile_task = (
+                owner_scheduler._owned_session_reconciliation_task
+            )
+            assert owner_reconcile_task is not None
+            owner_reconcile_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner_reconcile_task
+            owner_scheduler._owned_session_reconciliation_task = None
+            owner_cancel_task = (
+                owner_scheduler._active_worker_cancel_reconciliation_task
+            )
+            assert owner_cancel_task is not None
+            owner_cancel_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner_cancel_task
+            owner_scheduler._active_worker_cancel_reconciliation_task = None
+
+            await close_attachment_shielded(owner_attachment)
+            await close_attachment_shielded(caller_attachment)
+            fresh_caller_attachment = await caller_host.attach_session(
+                session.session_id
+            )
+            assert (
+                fresh_caller_attachment.access_mode
+                is HostSessionAccessMode.READ_WRITE
+            )
+
+            cancelling = await caller_host.cancel_run(
+                accepted.accepted_run_id,
+                CancelRunRequest(
+                    context=host_context("attachment-cross-opener-cancel"),
+                    client_request_id="attachment-cross-opener-cancel",
+                    reason="cross_opener_cancel",
+                    mode=CancelMode.GRACEFUL,
+                ),
+            )
+            result = owner_scheduler.reconcile_active_worker_cancels_once(
+                fixed_now=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+
+            assert cancelling.status in (RunStatus.CANCELLING, RunStatus.CANCELLED)
+            assert result.snapshot_count == 1
+            assert result.target_count == 1
+            assert result.propagated_count == 1
+            assert factory.cancel_count == 1
+            assert factory.cancel_reasons == ["cross_opener_cancel"]
+            assert factory.active_snapshot is not None
+            assert factory.active_snapshot.cancellation_token.cancel_reason() == (
+                "cross_opener_cancel"
+            )
+            await wait_for_status(
+                caller_host,
+                accepted.accepted_run_id,
+                HostTerminalStatus.CANCELLED,
+            )
+        finally:
+            factory.events_release.set()
+            if fresh_caller_attachment is not None:
+                await close_attachment_shielded(fresh_caller_attachment)
 
 
 @pytest.mark.asyncio

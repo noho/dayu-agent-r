@@ -28,6 +28,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 
 - Host 以 durable EventLog 与同事务状态索引作为事实真源；projection、memory、tool trace、audit、outbox 与 diagnostic 都是派生视图或观察记录。
 - 同一 Session 的 active Run 由 Host admission 约束；queued Run 是 durable state，不是内存队列。
+- Session public mutation 权限由 opener 内 attachment registry 唯一拥有；跨 opener 的 strict-native per-Session mutex 只决定 attachment 的不可变 read-write / read-only 模式，不代替 durable Run / Attempt truth。
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run / Attempt 生命周期；EngineEvent 必须经 Host identity、状态与幂等校验后才能变成 Host facts。
 - 用户取消动作经 UI / Service 映射为 Host cancel command 后，Host 的公开承诺是 Codex / Claude Code 类体感：快速停止等待当前模型 / 工具执行并恢复可交互路径；旧模型输出、旧工具结果或旧 wait result 不能污染已取消 Run。该承诺不表示远端 LLM provider、外部 job 或第三方服务一定已经物理停止。
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
@@ -70,6 +71,7 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 
 `Host` handle 当前提供：
 
+- `attach_session(session_id)`：显式 attach 已存在的 Session；同一 handle 对同一 Session 只允许一个 live attachment。返回的 `HostSessionAttachment.access_mode` 在生命周期内保持不变；read-write attachment 完成 target recovery 后才返回，read-only attachment 可读取和订阅但不能发起 public mutation。
 - `ensure_session(request)`：按 `(scope, slot_key)` 原子确保当前 Session。
 - `create_session(request)`：显式创建新 Session，可选择重绑定 slot。
 - `get_session(session_id)`：读取 Session snapshot。
@@ -83,7 +85,7 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
-- `watch_session_events(session_id)`：异步 attach live `HostSessionEvent` 订阅；调用方必须 `await` factory，successful return 表示 durable cursor transaction、per-Session reservation 与当前 runtime 瞬态订阅均已生效。订阅不 replay attach 前的瞬态增量，也不提供离线 replay cursor。
+- `watch_session_events(session_id)`：异步建立 live `HostSessionEvent` 订阅；调用方必须 `await` factory，successful return 表示 durable cursor transaction、per-Session reservation 与当前 runtime 瞬态订阅均已生效。订阅不授予 Session 修改权限，不 replay 建立前的瞬态增量，也不提供离线 replay cursor。
 - `close()`：关闭当前 execution runtime；停止新 public call 后先用 finite shared deadline 关闭 wait poller、撤销全部 adapter observation token，再 drain actor command / wake，随后按 scheduler、Session Event Delivery owner、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。仍阻塞的 provider thread 不持 Host durable authority，supervisor 保持 `CLOSING`，最后一个 thread finally 后才变为 `STOPPED`。该操作不写用户 cancel / failed terminal facts。
 
 `HostAdmin` handle 当前提供：
@@ -96,6 +98,8 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
 `OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size、Session Event Delivery policy 与 truncation manager 开关。process-backed 工具子进程 terminate / kill cleanup grace 属于 `HostToolingOptions.process_capsule_interrupt_policy`，不作为 `OpenHostOptions` 直接字段，也不改变 `AgentPolicy.tool_execution_timeout_seconds` 的业务执行 deadline 语义。
+
+创建或确保 Session 本身不授予后续修改权限。`submit_followup`、steer、retry、replay、cancel、resolve wait、close、outbox drain 等 public mutation 都要求目标 Session 存在 active read-write attachment；read-only、recovering、closing 或 unattached 状态在创建 actor mutation Future 前 typed reject。attachment close 会先阻止新工作并 drain 已接受的 mutation / pre-start work，再释放跨进程机械互斥；同一 live attachment 不会在后台升级模式。
 
 本地执行边界由 `LocalEngineWorkerFactory`、`LocalEngineWorker` 与 `LocalWorkerHandle` 表达。Host 创建 `AttemptDispatchSnapshot` 与 `AgentRunRequest`，worker 接住后返回 handle；Host 消费 handle 的 EngineEvent stream，并在 cancel 或 shutdown 时调用 handle 的关闭 / cancel hook。
 
@@ -119,7 +123,8 @@ options = build_open_host_options(
 
 async with open_host(options) as host:
     session = await host.ensure_session(ensure_request)
-    run = await host.submit_followup(session.session_id, followup_request)
+    async with await host.attach_session(session.session_id):
+        run = await host.submit_followup(session.session_id, followup_request)
 ```
 
 `build_open_host_options(...)` 代表 Service / composition root 的本地装配函数，不是 Host public API。它必须产出完整 typed `OpenHostOptions`，包括 durable 路径、ordinary run baseline、worker factory、tooling options、context / memory policy 和可选 compactor baseline。
@@ -335,7 +340,7 @@ dayu.host
 
 ## 稳定边界
 
-Host 稳定边界是 durable command、typed request / snapshot、async attach 后返回的 `HostSessionEventIterator` live view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostSessionEvent` 是 durable `HostEvent` 与当前 runtime `HostTransientDelta` 的联合；只有前者来自 committed facts。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
+Host 稳定边界是 durable command、typed request / snapshot、async subscription factory 返回的 `HostSessionEventIterator` live view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostSessionEvent` 是 durable `HostEvent` 与当前 runtime `HostTransientDelta` 的联合；只有前者来自 committed facts。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
 
 Host 不负责：
 
@@ -602,7 +607,7 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 
 - `ACCEPTED` / `QUEUED` Run 可直接写入 cancel request 与 `RUN_CANCELLED` terminal，并释放 queue promotion 资格。
 - pre-worker `STARTING` Attempt 可在 worker accept 前直接写入 Attempt / Run cancelled。
-- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING` 并在 Run row 保存 typed `cancel_request_event_id`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。watchdog wake 使用 opener-loop owned level-triggered `asyncio.Event`，每轮 tick 前 clear；tick 期间的新 wake 保留到下一轮，多个并发 wake 可以合并但不能丢失。watchdog 非取消异常由 execution health supervisor提交 typed fatal，正常 scheduler close 取消不误报。该收口不表示底层 provider / tool 已被物理杀停。
+- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING` 并在 Run row 保存 typed `cancel_request_event_id`。提交 cancel 的 opener 先按含 Session 的精确 worker identity 走本地 fast path，并只唤醒目标 Session watchdog；fresh read-write attach 也只恢复目标 Session。实际拥有 worker 的 scheduler 周期性快照自己的精确 `(session_id, run_id, attempt_id, execution_id)`，用 dispatch owner 与 durable cancel link 读取 strict typed target，再向同一 worker 的 Engine cancellation token 与 `LocalWorkerHandle.on_cancel(reason)` 传播。该查询不按 terminal Run status 过滤，因此 caller watchdog 先完成 durable closeout也不会抹掉物理传播控制事实；identity、current Attempt / execution 或 dispatch owner 漂移时则过滤 stale target。linked cancel event 缺失、错链、非 canonical 或 payload / digest 非法均 fail closed。terminal closeout 仍复用既有 accepted-cancel watchdog transition，不创建第二套 cancel 状态 owner。该收口不表示底层 provider / tool 已被物理杀停。
 - active worker event stream 在取消路径上会被关闭或取消，避免 Host 继续等待旧模型流自然结束；迟到 EngineEvent 进入 Host 前必须通过 identity 与状态校验，不匹配当前 durable state 时 fail closed 为 rejected / diagnostic。
 - Doc、Fins read 与 Web blocking 工具生产路径声明为 process-backed execution；取消或超时时，ToolRuntime 父进程治理返回 `tool_runtime_cancelled` / `tool_runtime_timeout` 类结果，并对进程边界执行 terminate / kill cleanup。子进程不得返回 `awaiting`、`cancelled`、`timeout` 或 `host_cancelled` 等 Host-governed 信封；迟到工具结果不能越过 Host accept barrier。
 - WAITING Run 取消只收口 Host durable wait / Run / Attempt 事实，不在 command transaction 内等待 provider I/O；外部 lifecycle 由 wait poller / adapter best-effort 处理，迟到 wait result 不会恢复旧 Attempt。
@@ -635,7 +640,7 @@ resume Attempt 的 runner input 会把当前用户请求、使用 exact canonica
 
 Dispatch scheduler 不从内存队列恢复状态，只扫描 durable accepted / queued / pending dispatch facts。standard path 是 dispatch 前执行 context governance，写入 `RUN_STARTED` / `ATTEMPT_STARTED` / dispatch record，然后 acquire runtime lane、durable recheck、调用 `LocalEngineWorker.accept(...)`，最后写入 `ATTEMPT_RUNNING` 并消费 worker 的 EngineEvent stream。
 
-runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。worker EOF / crash closeout 使用 Host lifecycle identity，不借用 EngineEvent identity；`CANCELLING` 下该 signal 只产生 Host lifecycle diagnostic，terminal cancel 仍由 accepted-cancel watchdog 或既有 terminal first-committer 拥有。active cancel watchdog 使用当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 与已接受 cancel fact 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
+runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。worker EOF / crash closeout 使用 Host lifecycle identity，不借用 EngineEvent identity；`CANCELLING` 下该 signal 只产生 Host lifecycle diagnostic，terminal cancel 仍由 accepted-cancel watchdog 或既有 terminal first-committer 拥有。caller cancel 与 fresh read-write attach 只唤醒目标 Session watchdog；scheduler 的 periodic reconcile 先快照本 opener 的 active worker exact identities，再只读取这些 identities 中由自己 dispatch ownership 持有且具有合法 durable cancel link 的 target。它不做 workspace-wide cancelling scan，不凭 Session attachment 接管旧 worker。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
 
 ### Host 启动恢复
 
@@ -651,6 +656,8 @@ startup recovery 读取 durable Run / Attempt / dispatch / Host instance livenes
 scanner 在 durable actor 独占的连接上冻结本轮 `policy.now` 与 non-terminal Run upper watermark，并按 `(accepted_event_sequence, run_id)` keyset 读取有界 page；每个 page 独立提交 write transaction，默认最多处理 64 个 Run，不使用 offset。matching dispatch / queue-promotion wake 只在所属 page commit 后经 opener-loop bridge 投递。全部 page 与 wake 完成后 execution health 才从 `STARTING` 进入 `READY`；任一 batch、invariant 或 wake 失败都会中止 opener，后续 healthy opener 只依赖 durable facts 重新扫描，不依赖进程内 offset。
 
 positive orphan proof 需要 durable owner liveness 与本机进程证据支持，例如 owner 已 `STOPPED`、pid 缺失、pid 被复用且 start token / boot id 不匹配等。heartbeat stale 单独不构成 takeover proof；runtime lane TTL、projection lag 或 worker 没有返回也不构成 Host recovery truth。
+
+Session attachment 使用独立的 target recovery：read-write allocation 先处于 recovering，扫描只绑定目标 Session 的 fixed watermark 与有界 page；page commit 后才唤醒对应 dispatch / promotion，并在 target active cancel watchdog 与 recovery 全部收口后激活 attachment。read-only attachment 不运行 recovery，unattached opener 也不扫描其它 Session。稳定旧 Attempt 可以由原 scheduler 继续收口，但 detach 后不再获得新工作资格。
 
 ### EngineEvent ingest
 
@@ -686,7 +693,7 @@ ToolRuntime 只有在 Host 接受工具事实后才向 Engine 返回 batch outco
 
 `ContextBudgetPolicy.context_window_size` 是 Host 的上下文窗口 typed 输入；Service / composition root 通常从模型配置的 `context_window_tokens` 映射而来。Host 以 ratio-first policy 派生 soft / hard threshold，并用保守估算器判断 proactive compact 或 reactive recovery。usage 是 provider capability 驱动的 post-call observation，只能用于诊断、校准和后续治理参考，不能回头修改已经完成的 dispatch decision。Engine usage 事件携带 provider request id 时，Host ingest 会把它写入 durable usage projection signal 与 usage observation diagnostic；缺失时保持 `None`，不使用 client correlation id 伪装 provider id。
 
-proactive compact 发生在 Attempt 创建前；预算超限时 Host 写入 proactive `CONTEXT_COMPACTION_REQUESTED`，运行 compactor，接受合格 compact 后继续普通 dispatch，失败时按 fallback / failure path 收口。reactive compact 只由 EngineEvent `context_compaction_requested` 触发；Host 关闭当前 Attempt、把 Run 推进为 `RECOVERING`，冻结 overflow material，再执行 compact 并创建 recovery Attempt。`finish_reason=LENGTH` 表示模型输出上限，不触发 reactive compact。
+proactive compact 发生在 Attempt 创建前；同一 Run / input 最多创建一个 durable proactive operation，operation id 与其 request event id 同源。operation 在 request 中冻结 source identity、material refs 与 semantic proposal attempt budget，每个 prepared proposal 先写 manifest，crash 后按已提交 attempt number 继续剩余预算；重复 wake 只恢复或收口同一 operation，不创建第二个 request。预算超限时 Host 运行 compactor，接受合格 compact 后继续普通 dispatch，失败时按 fallback / failure path 收口。reactive compact 只由 EngineEvent `context_compaction_requested` 触发，并继续受单 Run reactive operation 上限约束；Host 关闭当前 Attempt、把 Run 推进为 `RECOVERING`，冻结 overflow material，再执行 compact 并创建 recovery Attempt。proactive 与 reactive operation 共用单 operation semantic proposal attempt 预算，Runner transport retry 不计入该预算；`finish_reason=LENGTH` 表示模型输出上限，不触发 reactive compact。
 
 ### Conversation Memory projection
 

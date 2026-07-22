@@ -55,7 +55,7 @@ from dayu.host.durable.state import (
     is_terminal_run_status,
     promote_queued_run_row,
     read_active_run_for_session,
-    read_cancelling_runs,
+    read_cancelling_runs_for_session,
     read_non_terminal_runs_for_session,
     read_run_by_id,
     read_session_by_id,
@@ -1173,8 +1173,10 @@ def test_multiple_queued_runs_for_one_session_succeed(tmp_path: Path) -> None:
         assert store.transaction_runner.run_write(operation) == 2
 
 
-def test_read_cancelling_runs_returns_only_cancelling_rows(tmp_path: Path) -> None:
-    """cancelling Run 专用查询只返回 watchdog 需要的状态。"""
+def test_read_cancelling_runs_for_session_returns_only_target_cancelling_rows(
+    tmp_path: Path,
+) -> None:
+    """target cancelling 查询不读取其它 Session 或其它状态。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -1218,12 +1220,15 @@ def test_read_cancelling_runs_returns_only_cancelling_rows(tmp_path: Path) -> No
                 status=RunStatus.CANCELLING,
                 client_request_id="request-cancelling-2",
             )
-            return tuple(row.run_id for row in read_cancelling_runs(transaction))
+            return tuple(
+                row.run_id
+                for row in read_cancelling_runs_for_session(
+                    transaction,
+                    "session-cancelling-2",
+                )
+            )
 
-        assert store.transaction_runner.run_write(operation) == (
-            "run-cancelling-1",
-            "run-cancelling-2",
-        )
+        assert store.transaction_runner.run_write(operation) == ("run-cancelling-2",)
 
 
 def test_dispatch_record_status_check_allows_phase5_statuses(

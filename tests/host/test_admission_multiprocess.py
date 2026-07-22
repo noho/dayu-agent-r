@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Generic, TypeVar
 from unittest.mock import patch
 
-import dayu.host.admission as host_admission
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
@@ -172,7 +171,6 @@ class _RecordingAdmissionWakeupPort:
 
         self.dispatches: list[PendingDispatchRecord] = []
         self.promotions: list[str] = []
-        self.watchdog_wake_count = 0
 
     def wake_dispatch(self, record: PendingDispatchRecord) -> None:
         """记录 matching dispatch wake。
@@ -192,14 +190,6 @@ class _RecordingAdmissionWakeupPort:
 
         self.promotions.append(session_id)
 
-    def wake_active_cancel_watchdog(self) -> None:
-        """记录 active cancel watchdog wake。
-
-        :returns: ``None``。
-        """
-
-        self.watchdog_wake_count += 1
-
     def clear(self) -> None:
         """清空全部 wake 记录。
 
@@ -208,7 +198,6 @@ class _RecordingAdmissionWakeupPort:
 
         self.dispatches.clear()
         self.promotions.clear()
-        self.watchdog_wake_count = 0
 
 
 def test_multiprocess_same_slot_ensure_returns_one_bound_session(
@@ -798,7 +787,6 @@ def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
         assert cancelled_replay.run.status is RunStatus.CANCELLED
         assert wakeup.dispatches == []
         assert wakeup.promotions == []
-        assert wakeup.watchdog_wake_count == 0
 
 
 def _options(db_path: Path, artifact_root: Path) -> HostDurableStoreOptions:
