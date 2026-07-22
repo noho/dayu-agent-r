@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
-| WU-CTX-04 | selected-next-blocked-by-pr-181-merge | Per-Session attachment ownership and compaction concurrency boundary | GitHub Issue #112 | 用户明确指定为 Draft PR #181 手工 merge 后的下一个 WU；设计真源为 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware recovery。merge 后重新 preflight，再进入 goal confirmation；此前不得派发 plan 或实施。 |
+| WU-CTX-04 | selected-next-blocked-by-pr-181-merge | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | 用户明确指定为 Draft PR #181 手工 merge 后的下一个 WU；设计真源为 `docs/host/design.md` 的“Session attachment access ownership”、attachment-aware recovery与每Run/input snapshot唯一proactive operation不变量。merge后重新preflight，再进入goal confirmation；此前不得派发plan或实施。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
@@ -684,7 +684,7 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 - compact failure、fallback fail-closed 和 reactive recovery failure 默认不迁移到 `REJECTED`；如未来要例外处理，必须先证明它是独立 policy refusal，而不是治理执行失败。
 - 文档同步说明 `FAILED` 与 `REJECTED` 的边界、用户动作差异、retry / replay 语义，以及本 WU 对后续 feature 的前向约束。
 
-## WU-CTX-04 Per-Session Attachment Ownership and Compaction Concurrency Boundary
+## WU-CTX-04 Per-Session Attachment Ownership and Proactive Governance Single-operation Boundary
 
 ### 状态
 
@@ -703,16 +703,17 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-
 1. **startup recovery overlap**：scheduler A 对某个 `ACCEPTED` Run 提交 proactive `CONTEXT_COMPACTION_REQUESTED` 后，在事务外等待 LLM compactor；此时 Run status 与 input cursor 保持不变。第二个 `open_host` 若在该窗口启动，其 `StartupRecoveryScanner` 会把同一 `ACCEPTED` Run 分类为 `ACCEPTED_WAKE`，并通过当前 opener 的 wakeup port 唤醒 queue promotion，使 scheduler B 对同一 Session / Run 再次进入 `_run_pre_start_governance(...)`。
 2. **accepted admission replay**：另一个 opener 对同一幂等 admission 做 replay，若 durable 返回的同一 Run 仍为 `ACCEPTED`，`_wake_start_governance_if_needed(...)` 会再次唤醒该 opener 的 queue promotion；它也可能与 scheduler A 的事务外 compact 重叠。
 
-竞态成立的直接代码条件如下：
+竞态成立及配置漂移的直接代码条件如下：
 
-- packaged `execution_profiles.json` 的四个 profile 都把 `max_proactive_compactions_per_run` 配成 `2`；当前代码以已提交 proactive `CONTEXT_COMPACTION_REQUESTED` 数量与该字段比较，因此它限制的是单个 Run 的 proactive operation/request 数，不是重试次数。单 operation 内的语义 proposal / repair attempt 上限由 `max_compaction_attempts_per_operation` 拥有，Runner transport retry 由更低层 runner policy 的 `max_retries` 拥有。
-- proactive path 在短 transaction 中统计已提交 request 数并追加 `CONTEXT_COMPACTION_REQUESTED`，随后释放 transaction，等待外部 compactor；该 request fact 表达历史与 policy budget，不原子占用 active execution ownership。
-- scheduler A 与 B 可以先后看到历史 request count 小于 2，各自提交 request 并执行 compactor。两次结果写回都只校验 Run status、input cursor 与 Session 是否仍允许 proactive compact，没有校验当前 operation owner，因此两者都可能追加有效 `CONTEXT_COMPACTED`。
-- 重复 provider 调用、重复有效 compact fact、policy budget 重复消耗和 memory projection 的重复输入都是实际影响；更多 contender 还可能在已有合法 operation 运行时命中 limit 分支并把 Run 失败收口。
-- reactive path 在 request transaction 内同时关闭当前 Attempt 并把 Run 推进 `RECOVERING`，且 Attempt identity / terminal status gate 已形成唯一提交边界。当前直接反例集中在 proactive path，不应无证据重写 reactive pipeline。
-- 把 `max_proactive_compactions_per_run` 临时改成 1 不能构成 root fix：loser 看到第一个 in-flight request 后仍可能进入 `proactive_compact_limit_reached` 并错误收口 Run。
+- design truth明确第一版每个Run最多一个proactive operation，Host fallback常量也是`1`；但packaged `execution_profiles.json`的四个profile自引入起一直把`max_proactive_compactions_per_run`配置为`2`，没有对应的第二operation业务路径。该字段不是`max_compaction_attempts_per_operation`的别名，前者错误地暴露了operation数量，后者才拥有单operation内proposal / semantic repair总尝试预算；Runner `max_retries`另行拥有每次proposal call内部的transport retry。
+- 正常scheduler路径在proactive compact accepted后直接创建Attempt / dispatch，不重新估算并启动同一Run的第二个proactive operation；现有“second proactive compact”测试覆盖的是同一Session的第二个Run，而不是同一Run第二次operation。因此packaged值`2`是config/public policy漂移，不是需求证据。
+- proactive path在短transaction中统计已提交request数并追加`CONTEXT_COMPACTION_REQUESTED`，随后释放transaction等待外部compactor。scheduler A与B可先后看到count 0和1；由于packaged上限为2，二者分别追加独立request并调用provider。两次结果写回只校验Run status、input cursor与Session是否仍允许compact，没有唯一operation门禁，因此都可能追加有效`CONTEXT_COMPACTED`。
+- 单纯把字段改为1仍不是root fix：loser看到既有request后会进入`proactive_compact_limit_reached`并错误把Run收口为`FAILED`。单纯删除字段但保留现有prepare逻辑也不正确，因为每次重复wake或crash recovery都会追加新的request，失去任何有界性。
+- 同一`HostDispatchScheduler`的production promotion入口由单一`_promotion_drain_task`串行await queue item；公开Host command只wake该队列，不并发直调`run_queue_promotion(...)`。因此在per-Session attachment mutex确保同一Session只有一个eligible scheduler后，正常同opener wake不再需要额外compaction fence或operation mutex；重复wake在首轮完成后只做状态reconciliation。
+- graceful attachment close必须drain事务外proactive operation后才释放mutex；process crash则可能留下`CONTEXT_COMPACTION_REQUESTED`而没有同operation的`CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED`。fresh`READ_WRITE` owner必须恢复或确定性收口同一个operation，并把durable proposal manifests / rejected attempts计入`max_compaction_attempts_per_operation`；不得把crash recovery伪装成第二个proactive operation。
+- reactive path在request transaction内同时关闭当前Attempt并把Run推进`RECOVERING`，且真实recovery dispatch仍可能再次收到provider overflow，因此`max_reactive_compactions_per_run`有独立设计需求并保留。当前直接反例集中在proactive path，不应无证据重写reactive pipeline。
 
-因此，准确问题定义是：**在多个 execution-capable `open_host` 共享 SQLite 的现有拓扑下，startup recovery 或 accepted admission replay 可以让两个 scheduler 在同一 Session 的同一 Run / input snapshot 上并发执行 proactive compact；根因是 scheduler 的 Session 级执行资格没有唯一 owner，而不是 compact retry 次数本身。**
+因此，准确问题定义是：**在多个execution-capable `open_host`共享SQLite的现有拓扑下，startup recovery或accepted admission replay可以让两个scheduler在同一Session的同一Run / input snapshot上并发创建本应唯一的proactive operation；根因是scheduler的Session级执行资格没有唯一owner，且proactive single-operation不变量被错误建模成可配置count。**删除该字段会收窄并澄清WU，但不会替代per-Session attachment ownership或incomplete-operation recovery。
 
 ### 用户已裁决的设计方向
 
@@ -725,11 +726,11 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-
 - `READ_WRITE` attachment close 必须先 gate 该 Session 的新命令，并 drain 已进入但尚无稳定 Run / Attempt owner 的 command / pre-start governance，包括 transaction 外 proactive compaction，然后释放 mutex。已经 durable-owned 的 active Run / Attempt 可继续由旧 scheduler治理，但旧 scheduler释放后不得再为该 Session 启动无 owner 的新 Run或推进下一个 Run。
 - fresh `READ_WRITE` attach 只对目标 Session 做 bounded attachment-aware recovery，再 successful return；`READ_ONLY` attach 和单纯 `open_host` startup 都不做 workspace-wide recovery。mutex availability 不能替代 positive orphan proof，不能授权接管旧 Attempt。
 - watcher / subscription 与 attachment mode 正交；watch 从不授予写权限。跨 opener transient delta 不持久化、不重放、不转发，observer 通过 bounded durable reconciliation / Outbox 看到 durable progress与 terminal。
-- mutex 不代表 Run / Attempt owner，不替代 SQLite transaction / CAS、`owner_host_instance_id`、Attempt / execution identity 或 positive orphan proof。跨 opener cancel 的 durable cancel fact 仍是真源，物理 cancel 由当前 Attempt execution owner 通过 durable reconciliation执行。
+- mutex 不代表 Run / Attempt owner，不替代 SQLite transaction / CAS、`owner_host_instance_id`、Attempt / execution identity 或 positive orphan proof。cancel完全服从统一attachment access rule：任意live `READ_WRITE` attachment可取消该Session中任意满足既有状态前置的Run，不按originating / admitting opener或execution owner过滤；`READ_ONLY`在durable write前拒绝。durable commit后由当前Attempt execution owner scheduler有界reconcile并作用于自己的worker，caller本地registry直达只作低延迟fast path；这不是独立的跨opener业务语义。
 - 本方案不引入 Session generation / epoch fence、lease、TTL / heartbeat takeover、自动 promotion、跨进程 command/event proxy 或 workspace-wide leader。只要所有 scheduler entry point 都严格受 live `READ_WRITE` attachment资格约束，就不需要再为 WU-CTX-04 增加 compaction fence。
-- `max_proactive_compactions_per_run` 继续表达每 Run 可提交的 proactive operation/request 数，不是 retry 次数；`max_compaction_attempts_per_operation` 表达单 operation 的语义 proposal / repair attempts；Runner `max_retries` 表达 transport retry。packaged 值 `2` 是否与第一版业务路径一致，仍需在本 WU plan 中依据代码与 design policy 收敛，但不得把它误当作 concurrency owner。
+- 删除`max_proactive_compactions_per_run`的config、typed config、Host public policy、assembly、fallback constant、count-limit failure branch、tests与文档。每Run/input snapshot最多一个proactive operation改为不可配置的Host状态机不变量；既有request表示该operation已经存在，不得触发第二个operation或`proactive_compact_limit_reached`失败。`max_compaction_attempts_per_operation`继续表达同operation内的proposal / semantic repair总预算，Runner`max_retries`继续表达transport retry；`max_reactive_compactions_per_run`保持独立且不受本次删除影响。
 
-用户体感必须固定为：UI A fresh attach Session 1 获得 `READ_WRITE`，UI B attach 同一 Session 1 获得 `READ_ONLY`；UI A detach Session 1 并转到 Session 2 后，UI B 的既有 attachment 仍为 `READ_ONLY`；UI B 关闭并 fresh reattach Session 1 后，在 mutex 已释放时获得 `READ_WRITE`。与此同时，UI B 对其它没有 owner 的 Session 可以独立获得 `READ_WRITE` 并正常 submit。
+用户体感必须固定为：UI A fresh attach Session 1 获得 `READ_WRITE`，UI B attach 同一 Session 1 获得 `READ_ONLY`；UI A通过该attachment提交Run X后detach Session 1并转到Session 2，UI B的既有attachment仍为`READ_ONLY`；UI B关闭并fresh reattach Session 1后，在mutex已释放时获得`READ_WRITE`，随后可按普通cancel contract取消Run X，不区分Run X由A提交或其active worker仍由A持有。与此同时，UI B对其它没有owner的Session可以独立获得`READ_WRITE`并正常submit。
 
 ### 目标
 
@@ -737,6 +738,8 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-
 - 提供 strict-native per-Session mutex 与进程内 attachment registry；确保 partial allocation failure、factory cancellation、Host close 与 attachment close 都不泄漏 mutex 或 eligibility。
 - 将 startup recovery 改成 fresh `READ_WRITE` attach 后的 target-Session bounded recovery，消除 unrelated opener 对同一 Session 的 accepted wake / governance overlap。
 - 通过 attachment eligibility 从根因上消除双 scheduler proactive compact，而不向 EventLog、compact artifact 或 reactive pipeline引入无关 ownership 语义。
+- 删除无业务owner的`max_proactive_compactions_per_run`配置面，把同一Run/input snapshot唯一proactive operation及incomplete-operation recovery固定为Host状态机contract；crash后复用原operation id和剩余semantic attempt预算，不追加第二条request。
+- 让cancel授权只复用统一`READ_WRITE` truth，并让每个execution scheduler有界reconcile自己owned active Attempt的durable cancel；不得以originating opener分支或caller本地registry命中作为correctness条件。
 - 更新 runtime assembly、Service / UI 调用点、typed errors、tests与 README，使 public 命令、取消、观察和生命周期边界一致。
 
 ### 非目标
@@ -747,7 +750,7 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-
 - 不持久化、重放或跨进程转发 transient delta；不实现跨进程 command/event proxy。
 - 不把 compact artifact 改成 `run_id` 唯一覆盖文件；compact artifact 仍是内容寻址、不可变、可审计材料。
 - 不在 dispatch 或 engine_ingest 单侧增加只能覆盖单进程的 in-memory lock。
-- 不把单纯降低 `max_proactive_compactions_per_run` 当作并发 root fix，也不把该字段解释成 retry budget。
+- 不用新的proactive operation count、retry count、lease或fence字段替代被删除的`max_proactive_compactions_per_run`；不把crash recovery建模为第二个operation。
 - 不在缺少直接反例时改写 reactive compaction pipeline。
 
 ### 验收信号
@@ -757,10 +760,12 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-
 - A detach 时若仍有 transaction 外 proactive compaction或其它无稳定 Run / Attempt owner 的 pre-start work，mutex 必须在它们取消 / drain 后才释放；fresh owner 不启动第二个 provider call、不产生重复 `CONTEXT_COMPACTED`、不错误消耗 policy budget或把 Run 收口为 `FAILED`。
 - A detach 时若存在已 durable-owned active Run / Attempt，旧 execution owner 可继续治理它；B fresh attach 后的新输入按 durable admission 进入 `QUEUED`，B 不接管旧 Attempt，A terminal 后旧 scheduler不得 promotion 下一个 Run，future work由当前 `READ_WRITE` attachment scheduler 推进。
 - startup recovery overlap 与 accepted admission replay 的既有 public reproduction 都必须变成确定性反例：`READ_ONLY` opener 无法进入 recovery / accepted wake / pre-start governance / proactive compact；只构造内部 scheduler 不能替代 public-path 回归。
+- packaged与workspace config schema拒绝`max_proactive_compactions_per_run`旧字段；runtime typed config、Host `ContextBudgetPolicy`、assembly、fallback constant、count helper、`proactive_compact_limit_reached`错误分支和相关旧测试全部删除，stale-field grep为零。`max_compaction_attempts_per_operation`与`max_reactive_compactions_per_run`行为不回归。
+- 对同一Run/input snapshot，正常wake、重复accepted admission wake与恢复reconciliation最多只有一条proactive`CONTEXT_COMPACTION_REQUESTED`。已有incomplete request时不得创建第二个operation、不得因为“budget reached”失败Run；graceful detach先drain原operation，process crash后的fresh`READ_WRITE` attach按原operation id恢复剩余proposal attempts，或在无法可信重建时以原operation确定性fail / fallback。
 - opener crash 后 native mutex 由 OS 释放；fresh attach 仍须按 positive orphan proof 判断旧 Attempt，不得因 mutex 可用直接 takeover。strict-native lock不支持时 fail closed，测试证明没有 soft-lock fallback。
-- cross-opener cancel 保持 durable cancel truth，由当前 Attempt execution owner观察并执行物理 cancel；attachment mutex 不承担 control routing。
+- A通过`READ_WRITE` attachment提交Run X后detach，B从既有`READ_ONLY` attachment close / fresh attach取得`READ_WRITE`并cancel Run X时，必须走与本openerRun完全相同的public cancel、幂等与durable状态迁移，不读取或比较originating opener。若X的active worker仍由A持有，A的execution scheduler必须在有界时间内观察durable cancel并作用于本地worker；caller registry未命中不得影响cancel acceptance或最终物理传播，watchdog只作既有closeout supervisor而非替代owner传播。
 - attachment factory cancellation、Host close、attachment close、partial allocation failure、重复 close和并发 close 都有确定性 cleanup；已返回 attachment 的 mode 终身不变。
-- `max_proactive_compactions_per_run`、`max_compaction_attempts_per_operation` 与 Runner `max_retries` 的 owner、默认值、字段说明和测试互不混淆；packaged config与设计真源一致。
+- `max_compaction_attempts_per_operation`与Runner`max_retries`的owner、默认值、字段说明和测试互不混淆；前者是同一durable compaction operation内所有semantic proposal attempts总预算，后者是每次Runner call的transport retry。不存在proactive operation count配置。
 - 受影响文件单文件覆盖率目标 `>=80%`，完整 pyright 与受影响测试通过；按触发规则完成 Host、Service/UI、runtime、config、tests与分层 README audit。
 
 ## WU-CTX-01 Provider Tokenizer / Sizing Adapter
