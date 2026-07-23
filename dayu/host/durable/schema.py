@@ -36,7 +36,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostDurableError, HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 23
+HOST_SCHEMA_VERSION = 24
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"

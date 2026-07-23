@@ -123,10 +123,13 @@ from dayu.host.api import (
     WaitResolutionSource,
 )
 from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    append_context_budget_evaluated_in_transaction,
+    parse_context_budget_evaluated_payload,
 )
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
@@ -154,7 +157,11 @@ from dayu.host.context_policy import (
 from dayu.host.context_budget import (
     CONTEXT_ESTIMATOR_CONTRACT,
     BudgetEstimate,
+    ContextBudgetDecision,
+    ContextEstimatorContract,
+    ContextPressureLevel,
     ContextSizingStage,
+    build_conservative_context_sizing_result_from_atoms,
 )
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -789,7 +796,7 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.status == EngineIngestStatus.ACCEPTED, result.reason
         assert result.terminal_closeout is True
         assert result.terminal_notice is not None
         assert result.terminal_notice.wake_queue_promotion is True
@@ -1129,8 +1136,9 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             "RUN_RECOVERING",
             CONTEXT_COMPACTED,
         )
-        assert event_types[-3:] == (
+        assert event_types[-4:] == (
             "RUNNER_CALL_INPUT_ASSEMBLED",
+            "CONTEXT_BUDGET_EVALUATED",
             "RUN_STARTED",
             "ATTEMPT_STARTED",
         )
@@ -1193,7 +1201,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert len(wakeup.dispatches) == 1
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
-        recovery_manifest_event = result.events[-3]
+        recovery_manifest_event = result.events[-4]
         hot = parse_runner_call_hot_payload(
             _payload(recovery_manifest_event)
         )
@@ -1271,7 +1279,7 @@ async def test_reactive_reuses_source_frozen_tool_snapshot_and_mode(
             )
         )
 
-        hot = parse_runner_call_hot_payload(_payload(result.events[-3]))
+        hot = parse_runner_call_hot_payload(_payload(result.events[-4]))
         recovery_attempt_id = hot.attempt_id
         recovery_execution_id = hot.execution_id
         assert recovery_attempt_id is not None
@@ -1649,12 +1657,13 @@ async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
             _context_compaction_candidate(seeded, worker_event_index=152)
         )
 
-        assert tuple(event.event_type for event in result.events)[-3:] == (
+        assert tuple(event.event_type for event in result.events)[-4:] == (
             "RUNNER_CALL_INPUT_ASSEMBLED",
+            "CONTEXT_BUDGET_EVALUATED",
             "RUN_STARTED",
             "ATTEMPT_STARTED",
         )
-        hot = parse_runner_call_hot_payload(_payload(result.events[-3]))
+        hot = parse_runner_call_hot_payload(_payload(result.events[-4]))
         manifest_json = store.transaction_runner.run_read(
             lambda transaction: sqlite_payload_object(
                 transaction,
@@ -1848,6 +1857,10 @@ async def test_reactive_start_precondition_miss_rolls_back_candidate_and_manifes
             store.transaction_runner,
             "RUNNER_CALL_INPUT_ASSEMBLED",
         ) == 1
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_BUDGET_EVALUATED,
+        ) == 0
         descriptor_count_after = store.transaction_runner.run_read(
             lambda transaction: _table_row_count(
                 transaction,
@@ -2222,12 +2235,13 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
         assert tuple(event.event_type for event in result.events) == (
             CONTEXT_COMPACTION_REQUESTED,
             "ATTEMPT_FAILED",
-            "RUN_RECOVERING",
-            CONTEXT_COMPACTION_FAILED,
-            "RUNNER_CALL_INPUT_ASSEMBLED",
-            "RUN_STARTED",
-            "ATTEMPT_STARTED",
-        )
+                "RUN_RECOVERING",
+                CONTEXT_COMPACTION_FAILED,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+                "CONTEXT_BUDGET_EVALUATED",
+                "RUN_STARTED",
+                "ATTEMPT_STARTED",
+            )
         assert result.terminal_closeout is False
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -5702,6 +5716,10 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "RUNNER_CALL_INPUT_ASSEMBLED",
             "ITERATION_STARTED",
         ]
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_BUDGET_EVALUATED,
+        ) == 0
         manifest_event = result.events[0]
         preview_event = result.events[1]
         manifest_hot = _payload(manifest_event)
@@ -5728,7 +5746,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "status": "limited_signal",
             "reason": "missing_projection_artifact",
             "missing_atom_kind": None,
-                "missing_ref_kind": "artifact_ref",
+            "missing_ref_kind": "artifact_ref",
             "missing_ref": None,
             "observed_count": 4,
             "expected_count": None,
@@ -5798,13 +5816,16 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
     with open_host_durable_store(
         _options(tmp_path, payload_inline_threshold_bytes=4096)
     ) as store:
-        seeded = _seed_active_run(store.transaction_runner)
-        _append_prior_iteration_started_preview(
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_complete_sizing=True,
+        )
+        _link_pre_start_runner_call_manifest(
             store.transaction_runner,
             seeded,
-            event_id="event-prior-iteration-preview-complete",
             iteration_id="iter-prior-complete",
-            iteration_index=0,
+            worker_event_index=1,
         )
         candidate = _candidate(
             seeded,
@@ -5828,12 +5849,28 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.status == EngineIngestStatus.ACCEPTED, result.reason
+        assert tuple(event.event_type for event in result.events) == (
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            CONTEXT_BUDGET_EVALUATED,
+            "ITERATION_STARTED",
+        )
         manifest_hot = _payload(result.events[0])
-        preview_payload = _payload(result.events[1])
+        budget_payload = parse_context_budget_evaluated_payload(
+            _payload(result.events[1])
+        )
+        preview_payload = _payload(result.events[2])
         validation = preview_payload["runner_call_manifest_validation"]
         assert isinstance(validation, Mapping)
         assert manifest_hot["validation_status"] == "complete"
+        assert (
+            budget_payload.sizing_stage
+            is ContextSizingStage.CONTINUATION
+        )
+        assert (
+            budget_payload.budget_decision
+            is ContextBudgetDecision.ALLOW_DISPATCH
+        )
         hot_diagnostic = _json_object(manifest_hot["diagnostic"])
         assert hot_diagnostic["status"] == "complete"
         assert hot_diagnostic["reason"] is None
@@ -6593,12 +6630,18 @@ def _seed_active_run(
             owner_host_instance_id=None,
         )
         sizing_snapshot: RunnerCallSizingSnapshot
+        source_estimator_digest = sha256_digest_json(
+            {"estimate": "source"}
+        )
+        source_policy_digest = sha256_digest_json(
+            {"context_policy": "source"}
+        )
         if source_complete_sizing:
             sizing_snapshot = complete_runner_call_sizing_snapshot(
                 sizing_stage=ContextSizingStage.ORDINARY,
                 estimator_id=CONTEXT_ESTIMATOR_CONTRACT.estimator_id,
                 estimator_version=CONTEXT_ESTIMATOR_CONTRACT.estimator_version,
-                estimator_digest=sha256_digest_json({"estimate": "source"}),
+                estimator_digest=source_estimator_digest,
                 conservative_input_tokens=128,
                 context_window_size=32768,
                 provider=candidate.policy_snapshot.runner_spec.provider,
@@ -6610,16 +6653,14 @@ def _seed_active_run(
                 ),
                 input_snapshot_digest=candidate.input_snapshot_digest,
                 policy_ref="context-policy:source",
-                policy_snapshot_digest=sha256_digest_json(
-                    {"context_policy": "source"}
-                ),
+                policy_snapshot_digest=source_policy_digest,
             )
         else:
             sizing_snapshot = unavailable_runner_call_sizing_snapshot(
                 RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
                 sizing_stage=ContextSizingStage.ORDINARY,
             )
-        record_prepared_runner_call_candidate_in_transaction(
+        manifest_event = record_prepared_runner_call_candidate_in_transaction(
             transaction,
             EventLogStore(),
             PayloadStore(),
@@ -6630,6 +6671,42 @@ def _seed_active_run(
             candidate=candidate,
             sizing_snapshot=sizing_snapshot,
         )
+        if source_complete_sizing:
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                EventLogStore(),
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                occurred_at=_NOW,
+                result=build_conservative_context_sizing_result_from_atoms(
+                    stage=ContextSizingStage.ORDINARY,
+                    candidate_input_cursor=candidate.candidate_input_cursor,
+                    candidate_input_projection_ref=(
+                        candidate.candidate_input_projection_ref
+                    ),
+                    candidate_input_digest=candidate.input_snapshot_digest,
+                    estimator_contract=ContextEstimatorContract(
+                        estimator_id=(
+                            CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+                        ),
+                        estimator_version=(
+                            CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+                        ),
+                    ),
+                    estimator_digest=source_estimator_digest,
+                    conservative_input_tokens=128,
+                    context_window_size=32_768,
+                    soft_threshold_tokens=20_000,
+                    hard_threshold_tokens=30_000,
+                    policy_ref="context-policy:source",
+                    policy_snapshot_digest=source_policy_digest,
+                ),
+            )
+            assert manifest_event.event_sequence > (
+                candidate.candidate_input_cursor
+            )
 
     transaction_runner.run_write(_record_source_candidate)
     return seeded

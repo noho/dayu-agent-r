@@ -11,6 +11,9 @@ from dayu.service.entrypoint_runtime import (
     EntrypointActivityKind,
     EntrypointActivitySeverity,
     EntrypointActivityStatus,
+    EntrypointContextEstimateMethod,
+    EntrypointContextPressureLevel,
+    EntrypointContextUsage,
 )
 
 
@@ -155,6 +158,23 @@ def test_activity_renderer_finish_tty_clears_rendered_activity_lines() -> None:
     assert output.endswith("\x1b[1A\r\x1b[2K")
 
 
+def test_activity_renderer_accepts_typed_context_usage_activity() -> None:
+    """renderer 应直接展示 typed context usage activity 标题。"""
+
+    stderr = StringIO()
+    renderer = CliActivityRenderer(
+        stderr=stderr,
+        options=CliActivityRendererOptions(visible=True, enabled=True),
+    )
+
+    renderer.record(_context_usage_activity())
+
+    output = stderr.getvalue()
+    assert "Activity:" in output
+    assert "上下文预算已评估" in output
+    assert "tool=" not in output
+
+
 def _activity(*, dedupe_key: str, event_sequence: int) -> EntrypointActivity:
     """构造测试 activity。
 
@@ -176,4 +196,39 @@ def _activity(*, dedupe_key: str, event_sequence: int) -> EntrypointActivity:
         tool_name="record_smoke_fact",
         tool_display_name="记录烟测事实",
         counts=EntrypointActivityCounts(total=1, completed=1, failed=0, cancelled=0),
+    )
+
+
+def _context_usage_activity() -> EntrypointActivity:
+    """构造 typed context usage activity。
+
+    :returns: Service entrypoint context usage activity。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointActivity(
+        kind=EntrypointActivityKind.CONTEXT_USAGE,
+        status=EntrypointActivityStatus.INFO,
+        run_id="run-1",
+        event_sequence=2,
+        dedupe_key="context-budget-fact",
+        title="上下文预算已评估",
+        summary=None,
+        severity=EntrypointActivitySeverity.INFO,
+        tool_name=None,
+        tool_display_name=None,
+        counts=None,
+        context_usage=EntrypointContextUsage(
+            predicted_input_tokens=1_200,
+            context_window_size=1_000,
+            utilization_basis_points=12_000,
+            soft_threshold_tokens=800,
+            hard_threshold_tokens=900,
+            estimate_method=(
+                EntrypointContextEstimateMethod.CONSERVATIVE_FALLBACK
+            ),
+            pressure_level=(
+                EntrypointContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+            ),
+        ),
     )

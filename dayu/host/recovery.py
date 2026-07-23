@@ -55,7 +55,17 @@ from dayu.host._runner_call_manifest import (
     complete_runner_call_sizing_snapshot,
     unavailable_runner_call_sizing_snapshot,
 )
-from dayu.host.context_budget import ContextSizingStage
+from dayu.host.context_budget import (
+    ContextEstimatorContract,
+    ContextSizingResult,
+    ContextSizingStage,
+    build_conservative_context_sizing_result_from_atoms,
+)
+from dayu.host.context_events import (
+    ContextBudgetEvaluationIdentity,
+    append_context_budget_evaluated_in_transaction,
+    load_matching_context_budget_evaluation_in_transaction,
+)
 from dayu.host.run_input import (
     PreparedRunnerCallSource,
     load_prepared_runner_call_source_in_transaction,
@@ -809,6 +819,14 @@ class SessionAttachmentRecoveryScanner:
                 attempt_id=source_attempt.attempt_id,
                 execution_id=source_attempt.execution_id,
             )
+            sizing_snapshot = _startup_continuation_sizing(source)
+            sizing_result = _startup_continuation_budget_result(
+                transaction,
+                self.event_log_store,
+                run=run,
+                source_attempt=source_attempt,
+                source=source,
+            )
         except HostDurableError:
             return self._lose_unrecoverable_source(
                 transaction,
@@ -834,7 +852,7 @@ class SessionAttachmentRecoveryScanner:
             context_compacted_event_id=None,
             context_compacted_event_sequence=None,
         )
-        record_prepared_runner_call_candidate_in_transaction(
+        manifest_event = record_prepared_runner_call_candidate_in_transaction(
             transaction,
             self.event_log_store,
             self.payload_store,
@@ -843,8 +861,48 @@ class SessionAttachmentRecoveryScanner:
             execution_id=execution_id,
             occurred_at=policy.now,
             candidate=source.candidate,
-            sizing_snapshot=_startup_continuation_sizing(source),
+            sizing_snapshot=sizing_snapshot,
         )
+        if sizing_result is not None:
+            sizing_result = (
+                build_conservative_context_sizing_result_from_atoms(
+                    stage=ContextSizingStage.CONTINUATION,
+                    candidate_input_cursor=manifest_event.event_sequence,
+                    candidate_input_projection_ref=(
+                        sizing_result.candidate_input_projection_ref
+                    ),
+                    candidate_input_digest=(
+                        sizing_result.candidate_input_digest
+                    ),
+                    estimator_contract=sizing_result.estimator_contract,
+                    estimator_digest=sizing_result.estimator_digest,
+                    conservative_input_tokens=(
+                        sizing_result.conservative_input_tokens
+                    ),
+                    context_window_size=sizing_result.context_window_size,
+                    soft_threshold_tokens=(
+                        sizing_result.soft_threshold_tokens
+                    ),
+                    hard_threshold_tokens=(
+                        sizing_result.hard_threshold_tokens
+                    ),
+                    policy_ref=sizing_result.policy_ref,
+                    policy_snapshot_digest=(
+                        sizing_result.policy_snapshot_digest
+                    ),
+                    fallback_reason=sizing_result.fallback_reason,
+                )
+            )
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self.event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=attempt_id,
+                execution_id=execution_id,
+                occurred_at=policy.now,
+                result=sizing_result,
+            )
         result = start_recovery_run_with_starting_attempt_in_transaction(
             transaction,
             self.event_log_store,
@@ -986,6 +1044,100 @@ def _startup_continuation_sizing(
         input_snapshot_digest=sizing.input_snapshot_digest,
         policy_ref=sizing.policy_ref,
         policy_snapshot_digest=sizing.policy_snapshot_digest,
+    )
+
+
+def _startup_continuation_budget_result(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+    source_attempt: AttemptRow,
+    source: PreparedRunnerCallSource,
+) -> ContextSizingResult | None:
+    """从matching source manifest/fact重绑定startup continuation truth。
+
+    complete source必须存在严格匹配的budget fact；本函数复用其estimate与threshold
+    atoms，只重绑定stage/action，不调用estimator或读取当前配置。unavailable source
+    保持零fact。
+
+    :param transaction: 当前startup write transaction。
+    :param event_log_store: EventLog primitive。
+    :param run: recovering Run。
+    :param source_attempt: terminal source Attempt。
+    :param source: strict prepared source。
+    :returns: new Attempt应写的continuation result；source unavailable时为``None``。
+    :raises HostDurableError: complete source fact缺失、mismatch或atoms损坏时抛出。
+    """
+
+    sizing = source.manifest.sizing_snapshot
+    if sizing.status is RunnerCallSizingStatus.UNAVAILABLE:
+        return None
+    if (
+        sizing.status is not RunnerCallSizingStatus.COMPLETE
+        or sizing.sizing_stage is None
+        or sizing.estimator_id is None
+        or sizing.estimator_version is None
+        or sizing.estimator_digest is None
+        or sizing.conservative_input_tokens is None
+        or sizing.context_window_size is None
+        or sizing.policy_ref is None
+        or sizing.policy_snapshot_digest is None
+    ):
+        raise HostDurableError(
+            "startup source complete sizing atoms are incomplete"
+        )
+    source_budget = load_matching_context_budget_evaluation_in_transaction(
+        transaction,
+        event_log_store,
+        session_id=run.session_id,
+        attempt_id=source_attempt.attempt_id,
+        execution_id=source_attempt.execution_id,
+        identity=ContextBudgetEvaluationIdentity(
+            run_id=run.run_id,
+            candidate_input_cursor=(
+                source.manifest_event.event_sequence
+                if sizing.sizing_stage is ContextSizingStage.CONTINUATION
+                else source.candidate.candidate_input_cursor
+            ),
+            candidate_input_digest=source.candidate.input_snapshot_digest,
+            sizing_stage=sizing.sizing_stage,
+            policy_snapshot_digest=sizing.policy_snapshot_digest,
+            estimator_id=sizing.estimator_id,
+            estimator_version=sizing.estimator_version,
+        ),
+        candidate_input_projection_ref=(
+            source.candidate.candidate_input_projection_ref
+        ),
+        estimator_digest=sizing.estimator_digest,
+        conservative_input_tokens=sizing.conservative_input_tokens,
+        context_window_size=sizing.context_window_size,
+        policy_ref=sizing.policy_ref,
+    )
+    fallback_reason = source_budget.fallback_reason
+    if fallback_reason is None:
+        raise HostDurableError(
+            "startup source conservative fact fallback reason is missing"
+        )
+    return build_conservative_context_sizing_result_from_atoms(
+        stage=ContextSizingStage.CONTINUATION,
+        candidate_input_cursor=source.candidate.candidate_input_cursor,
+        candidate_input_projection_ref=(
+            source.candidate.candidate_input_projection_ref
+        ),
+        candidate_input_digest=source.candidate.input_snapshot_digest,
+        estimator_contract=ContextEstimatorContract(
+            estimator_id=sizing.estimator_id,
+            estimator_version=sizing.estimator_version,
+        ),
+        estimator_digest=sizing.estimator_digest,
+        conservative_input_tokens=sizing.conservative_input_tokens,
+        context_window_size=sizing.context_window_size,
+        soft_threshold_tokens=source_budget.soft_threshold_tokens,
+        hard_threshold_tokens=source_budget.hard_threshold_tokens,
+        policy_ref=sizing.policy_ref,
+        policy_snapshot_digest=sizing.policy_snapshot_digest,
+        fallback_reason=fallback_reason,
     )
 
 

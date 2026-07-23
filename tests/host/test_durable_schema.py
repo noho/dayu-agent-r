@@ -834,10 +834,10 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
     )
 
 
-def test_host_schema_version_is_queue_policy_check_version() -> None:
-    """当前 committed Host schema version 是 queue policy CHECK schema 23。"""
+def test_host_schema_version_is_context_budget_canonical_fact_version() -> None:
+    """当前 committed Host schema version 是 context budget canonical fact schema 24。"""
 
-    assert HOST_SCHEMA_VERSION == 23
+    assert HOST_SCHEMA_VERSION == 24
 
 
 def test_host_runs_queue_policy_check_uses_owner_values(tmp_path: Path) -> None:

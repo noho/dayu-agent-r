@@ -29,6 +29,7 @@ from dayu.host._execution_config_projection import (
 )
 from dayu.host._runner_call_manifest import (
     RunnerCallSizingUnavailableReason,
+    complete_runner_call_sizing_snapshot,
     unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.queue_policy import RunQueuePolicy
@@ -59,7 +60,19 @@ from dayu.host.api import (
 )
 from dayu.host.command import HostCommandHandle
 from dayu.host.tooling import HostToolingOptions
-from dayu.host.context_budget import ContextSizingStage
+from dayu.host.context_budget import (
+    CONTEXT_ESTIMATOR_CONTRACT,
+    ContextBudgetDecision,
+    ContextEstimatorContract,
+    ContextPressureLevel,
+    ContextSizingStage,
+    build_conservative_context_sizing_result_from_atoms,
+)
+from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
+    append_context_budget_evaluated_in_transaction,
+    parse_context_budget_evaluated_payload,
+)
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
@@ -249,6 +262,117 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
         assert isinstance(tool, ToolMessage)
         assert tool.tool_call_id == "tool-call-resolve"
         assert tool.content == '{"answer": 42}'
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("outcome_kind", ("completed", "cancelled"))
+def test_budgeted_wait_resume_orders_continuation_fact_before_start(
+    tmp_path: Path,
+    outcome_kind: str,
+) -> None:
+    """completed/cancelled wait以hard continuation fact恢复且仍allow。
+
+    :param tmp_path: pytest临时目录。
+    :param outcome_kind: completed或tool-level cancelled outcome。
+    :returns: ``None``。
+    :raises AssertionError: producer顺序、pressure或decision错误时抛出。
+    """
+
+    host = _create_execution_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host, budgeted_hard=True)
+        before_events = _events(host._transaction_runner())
+        request = (
+            _completed_request("resolve-budgeted-completed")
+            if outcome_kind == "completed"
+            else _cancelled_request("resolve-budgeted-cancelled")
+        )
+
+        snapshot = resolve_wait(host, seeded.wait_id, request)
+
+        after_events = _events(host._transaction_runner())
+        new_events = after_events[len(before_events) :]
+        new_event_types = tuple(event.event_type for event in new_events)
+        manifest_index = new_event_types.index(
+            "RUNNER_CALL_INPUT_ASSEMBLED"
+        )
+        fact_index = new_event_types.index(CONTEXT_BUDGET_EVALUATED)
+        run_started_index = new_event_types.index("RUN_STARTED")
+        attempt_started_index = new_event_types.index("ATTEMPT_STARTED")
+        assert (
+            manifest_index
+            < fact_index
+            < run_started_index
+            < attempt_started_index
+        )
+        fact = parse_context_budget_evaluated_payload(
+            cast(
+                Mapping[str, JsonValue],
+                json.loads(new_events[fact_index].payload_json),
+            )
+        )
+        assert fact.sizing_stage is ContextSizingStage.CONTINUATION
+        assert (
+            fact.pressure_level
+            is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+        )
+        assert fact.budget_decision is ContextBudgetDecision.ALLOW_DISPATCH
+        assert snapshot.status is RunStatus.RUNNING
+        assert snapshot.current_attempt_id != seeded.attempt_id
+        assert len(_events_by_type(after_events, CONTEXT_BUDGET_EVALUATED)) == 2
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("outcome_kind", ("failed", "lost"))
+def test_failed_lost_wait_add_no_budget_fact_manifest_or_attempt(
+    tmp_path: Path,
+    outcome_kind: str,
+) -> None:
+    """failed/lost wait只执行terminal owner，不创建continuation artifacts。
+
+    :param tmp_path: pytest临时目录。
+    :param outcome_kind: failed或lost terminal outcome。
+    :returns: ``None``。
+    :raises AssertionError: terminal路径新增fact、manifest或Attempt时抛出。
+    """
+
+    host = _create_execution_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host, budgeted_hard=True)
+        before = _read_resolution_tables(host._transaction_runner())
+        before_event_rows = _events(host._transaction_runner())
+        request = (
+            _failed_request("resolve-budgeted-failed")
+            if outcome_kind == "failed"
+            else _lost_request("resolve-budgeted-lost")
+        )
+
+        snapshot = resolve_wait(host, seeded.wait_id, request)
+
+        after = _read_resolution_tables(host._transaction_runner())
+        after_event_rows = _events(host._transaction_runner())
+        assert snapshot.status is (
+            RunStatus.FAILED
+            if outcome_kind == "failed"
+            else RunStatus.LOST
+        )
+        assert len(after.attempts) == len(before.attempts)
+        assert len(after.dispatch_records) == len(before.dispatch_records)
+        assert len(
+            _events_by_type(after_event_rows, CONTEXT_BUDGET_EVALUATED)
+        ) == len(
+            _events_by_type(before_event_rows, CONTEXT_BUDGET_EVALUATED)
+        )
+        assert len(
+            _events_by_type(after_event_rows, "RUNNER_CALL_INPUT_ASSEMBLED")
+        ) == len(
+            _events_by_type(
+                before_event_rows,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+        )
     finally:
         host.close()
 
@@ -1382,12 +1506,15 @@ def _seed_waiting_run(
     host: HostCommandHandle,
     *,
     tooling_options: HostToolingOptions | None = None,
+    budgeted_hard: bool = False,
 ) -> _SeededWaitingRun:
     """创建已进入 WAITING/SUSPENDED 的 Run。
 
     :param host: Host command handle。
     :param tooling_options: admission 时的 construction-time 工具真源。
+    :param budgeted_hard: source Attempt是否携带hard continuation budget fact。
     :returns: seeded waiting run。
+    :raises Exception: durable seed或budget contract失败时透传。
     """
 
     transaction_runner = host._transaction_runner()
@@ -1407,6 +1534,7 @@ def _seed_waiting_run(
         transaction_runner,
         base,
         tooling_options=tooling_options,
+        budgeted_hard=budgeted_hard,
     )
     candidate = _awaiting_candidate(base)
     result = DefaultHostToolAwaitingAcceptPort(
@@ -1511,13 +1639,16 @@ def _seed_active_run(
     seeded: _SeededWaitingRun,
     *,
     tooling_options: HostToolingOptions | None = None,
+    budgeted_hard: bool = False,
 ) -> None:
     """创建已 worker accepted 的 active Run。
 
     :param transaction_runner: Host transaction runner。
     :param seeded: seeded run 引用。
     :param tooling_options: admission 时的 construction-time 工具真源。
+    :param budgeted_hard: 是否记录hard continuation source fact。
     :returns: ``None``。
+    :raises Exception: durable seed或budget contract失败时透传。
     """
 
     def _operation(transaction: HostTransaction) -> None:
@@ -1614,7 +1745,36 @@ def _seed_active_run(
             worker_kind=WorkerKind.LOCAL,
             owner_host_instance_id=None,
         )
-        record_prepared_runner_call_candidate_in_transaction(
+        estimator_digest = sha256_digest_json(
+            {"estimate": "wait-hard-source"}
+        )
+        policy_digest = sha256_digest_json(
+            {"context_policy": "wait-hard-source"}
+        )
+        sizing_snapshot = (
+            complete_runner_call_sizing_snapshot(
+                sizing_stage=ContextSizingStage.CONTINUATION,
+                estimator_id=CONTEXT_ESTIMATOR_CONTRACT.estimator_id,
+                estimator_version=(
+                    CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+                ),
+                estimator_digest=estimator_digest,
+                conservative_input_tokens=950,
+                context_window_size=1_000,
+                provider=candidate.policy_snapshot.runner_spec.provider,
+                model=candidate.policy_snapshot.runner_spec.model,
+                request_semantics_digest=candidate.request_semantics_digest,
+                input_snapshot_digest=candidate.input_snapshot_digest,
+                policy_ref="context-policy:wait-hard-source",
+                policy_snapshot_digest=policy_digest,
+            )
+            if budgeted_hard
+            else unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
+            )
+        )
+        manifest_event = record_prepared_runner_call_candidate_in_transaction(
             transaction,
             EventLogStore(),
             PayloadStore(),
@@ -1623,11 +1783,45 @@ def _seed_active_run(
             execution_id=start_input.execution_id,
             occurred_at=start_input.occurred_at,
             candidate=candidate,
-            sizing_snapshot=unavailable_runner_call_sizing_snapshot(
-                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
-                sizing_stage=ContextSizingStage.ORDINARY,
-            ),
+            sizing_snapshot=sizing_snapshot,
         )
+        if budgeted_hard:
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                EventLogStore(),
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                occurred_at=_NOW,
+                result=(
+                    build_conservative_context_sizing_result_from_atoms(
+                        stage=ContextSizingStage.CONTINUATION,
+                        candidate_input_cursor=manifest_event.event_sequence,
+                        candidate_input_projection_ref=(
+                            candidate.candidate_input_projection_ref
+                        ),
+                        candidate_input_digest=(
+                            candidate.input_snapshot_digest
+                        ),
+                        estimator_contract=ContextEstimatorContract(
+                            estimator_id=(
+                                CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+                            ),
+                            estimator_version=(
+                                CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+                            ),
+                        ),
+                        estimator_digest=estimator_digest,
+                        conservative_input_tokens=950,
+                        context_window_size=1_000,
+                        soft_threshold_tokens=1,
+                        hard_threshold_tokens=2,
+                        policy_ref="context-policy:wait-hard-source",
+                        policy_snapshot_digest=policy_digest,
+                    )
+                ),
+            )
         started = start_governed_run_with_starting_attempt_in_transaction(
             transaction,
             EventLogStore(),

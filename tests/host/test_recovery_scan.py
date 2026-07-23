@@ -22,6 +22,7 @@ from dayu.host._execution_config_projection import (
 )
 from dayu.host._runner_call_manifest import (
     RunnerCallSizingUnavailableReason,
+    complete_runner_call_sizing_snapshot,
     unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.admission import PendingDispatchRecord, effective_tool_facts_json
@@ -89,12 +90,22 @@ from dayu.host.recovery import (
     SessionAttachmentRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
-from dayu.host.context_budget import ContextSizingStage
+from dayu.host.context_budget import (
+    ContextSizingStage,
+    build_conservative_context_sizing_result,
+)
+from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
+    append_context_budget_evaluated_in_transaction,
+    parse_context_budget_evaluated_payload,
+)
+from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.run_input import (
     PolicySnapshot,
     SessionContinuityView,
     ToolExecutionMode,
+    estimate_prepared_runner_call_candidate,
     prepare_runner_call_candidate_in_transaction,
     record_prepared_runner_call_candidate_in_transaction,
 )
@@ -520,6 +531,203 @@ def test_scan_running_positive_orphan_moves_to_recovering_without_projection(
             return run.status.value
 
         assert store.transaction_runner.run_write(verify) == RunStatus.RECOVERING.value
+
+
+def test_startup_recovery_reuses_source_budget_for_new_continuation_fact(
+    tmp_path: Path,
+) -> None:
+    """startup recovery 从 matching source truth 派生新 continuation fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: source/new fact identity、atoms或事务顺序错误时抛出。
+    """
+
+    wakeup = _RecordingWakeup()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(
+            store.transaction_runner,
+            "run-budgeted-startup",
+            budgeted=True,
+        )
+        _insert_current_recovery_owner(store.transaction_runner)
+        scanner = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(
+                store.transaction_runner,
+                "run-budgeted-startup",
+            ),
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
+            recovery_owner_host_instance_id="host-instance-new",
+        )
+
+        result = scanner.scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            SessionAttachmentRecoveryDecision.RECOVERY_DISPATCHED,
+        )
+        assert len(wakeup.dispatches) == 1
+
+        def verify(
+            transaction: HostTransaction,
+        ) -> tuple[tuple[str, ...], tuple[str, str], tuple[int, int]]:
+            """读取 source/new budget facts与完整event顺序。
+
+            :param transaction: Host read transaction。
+            :returns: event types、fact ids与source/new soft threshold。
+            :raises AssertionError: fact数量或payload类型非法时抛出。
+            """
+
+            rows = transaction.fetchall(
+                """
+                SELECT event_id, payload_json
+                FROM event_log
+                WHERE event_type = ?
+                ORDER BY event_sequence ASC
+                """,
+                (CONTEXT_BUDGET_EVALUATED,),
+            )
+            assert len(rows) == 2
+            source_payload = parse_context_budget_evaluated_payload(
+                cast(
+                    dict[str, JsonValue],
+                    json.loads(_required_text(rows[0], "payload_json")),
+                )
+            )
+            new_payload = parse_context_budget_evaluated_payload(
+                cast(
+                    dict[str, JsonValue],
+                    json.loads(_required_text(rows[1], "payload_json")),
+                )
+            )
+            assert source_payload.sizing_stage is ContextSizingStage.ORDINARY
+            assert new_payload.sizing_stage is ContextSizingStage.CONTINUATION
+            assert (
+                new_payload.conservative_input_tokens
+                == source_payload.conservative_input_tokens
+            )
+            assert new_payload.hard_threshold_tokens == (
+                source_payload.hard_threshold_tokens
+            )
+            return (
+                _event_types(transaction),
+                (
+                    _required_text(rows[0], "event_id"),
+                    _required_text(rows[1], "event_id"),
+                ),
+                (
+                    source_payload.soft_threshold_tokens,
+                    new_payload.soft_threshold_tokens,
+                ),
+            )
+
+        event_types, fact_ids, soft_thresholds = (
+            store.transaction_runner.run_read(verify)
+        )
+        assert event_types[-4:] == (
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            CONTEXT_BUDGET_EVALUATED,
+            "RUN_STARTED",
+            "ATTEMPT_STARTED",
+        )
+        assert fact_ids[0] != fact_ids[1]
+        assert soft_thresholds[0] == soft_thresholds[1]
+
+
+@pytest.mark.parametrize("source_corruption", ("missing", "mismatch"))
+def test_startup_recovery_source_budget_failure_is_unrecoverable_without_reestimate(
+    tmp_path: Path,
+    source_corruption: str,
+) -> None:
+    """startup complete source fact 缺失或不匹配时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param source_corruption: 删除source fact或篡改其estimator digest。
+    :returns: ``None``。
+    :raises AssertionError: scanner重估、追加manifest/fact或创建Attempt时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(
+            store.transaction_runner,
+            "run-corrupt-startup",
+            budgeted=True,
+        )
+        _insert_current_recovery_owner(store.transaction_runner)
+
+        def corrupt_source(transaction: HostTransaction) -> None:
+            """按测试参数破坏source budget fact。
+
+            :param transaction: Host write transaction。
+            :returns: ``None``。
+            :raises AssertionError: source fact不存在时抛出。
+            """
+
+            if source_corruption == "missing":
+                transaction.execute(
+                    f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_type = ?",
+                    (CONTEXT_BUDGET_EVALUATED,),
+                )
+                return
+            payload = _event_payload_by_type(
+                transaction,
+                event_type=CONTEXT_BUDGET_EVALUATED,
+            )
+            payload["estimator_digest"] = sha256_digest_json(
+                {"tampered": True}
+            )
+            result = transaction.execute(
+                f"""
+                UPDATE {TABLE_EVENT_LOG}
+                SET payload_json = ?
+                WHERE event_type = ?
+                """,
+                (
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    CONTEXT_BUDGET_EVALUATED,
+                ),
+            )
+            assert result.rowcount == 1
+
+        store.transaction_runner.run_write(corrupt_source)
+        expected_source_fact_count = (
+            0 if source_corruption == "missing" else 1
+        )
+
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(
+                store.transaction_runner,
+                "run-corrupt-startup",
+            ),
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=_RecordingWakeup(),
+            recovery_owner_host_instance_id="host-instance-new",
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            SessionAttachmentRecoveryDecision.RUN_LOST,
+        )
+        assert _event_type_count(
+            store.transaction_runner,
+            CONTEXT_BUDGET_EVALUATED,
+        ) == expected_source_fact_count
+        assert _event_type_count(
+            store.transaction_runner,
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+        ) == 1
+        assert _event_type_count(
+            store.transaction_runner,
+            "RUN_STARTED",
+        ) == 1
+        assert _count_rows(store.transaction_runner, "host_attempts") == 1
 
 
 def test_recovery_lifecycle_proof_matrix_covers_slice_a_rows() -> None:
@@ -1854,13 +2062,16 @@ def _seed_running_dispatching_run(
     run_id: str,
     *,
     slot_key: str = "recovery-scan",
+    budgeted: bool = False,
 ) -> None:
     """写入 running Run 与 stale owner dispatch record。
 
     :param transaction_runner: Host transaction runner。
     :param run_id: Run id。
     :param slot_key: 为多 Session batch fixture 隔离 active slot 的 key。
+    :param budgeted: 是否写入complete source manifest与matching budget fact。
     :returns: ``None``。
+    :raises Exception: durable seed或budget contract失败时透传。
     """
 
     session_id = _ensure_session_id(transaction_runner, slot_key=slot_key)
@@ -1939,6 +2150,44 @@ def _seed_running_dispatching_run(
             worker_kind=WorkerKind.LOCAL,
             owner_host_instance_id=None,
         )
+        if budgeted:
+            budget_policy = default_context_budget_policy(
+                context_window_size=8_192
+            )
+            estimate = estimate_prepared_runner_call_candidate(
+                candidate,
+                budget_policy,
+            )
+            sizing = build_conservative_context_sizing_result(
+                stage=ContextSizingStage.ORDINARY,
+                candidate_input_cursor=candidate.candidate_input_cursor,
+                candidate_input_projection_ref=(
+                    candidate.candidate_input_projection_ref
+                ),
+                candidate_input_digest=candidate.input_snapshot_digest,
+                policy=budget_policy,
+                estimate=estimate,
+            )
+            sizing_snapshot = complete_runner_call_sizing_snapshot(
+                sizing_stage=sizing.stage,
+                estimator_id=sizing.estimator_contract.estimator_id,
+                estimator_version=sizing.estimator_contract.estimator_version,
+                estimator_digest=sizing.estimator_digest,
+                conservative_input_tokens=sizing.conservative_input_tokens,
+                context_window_size=sizing.context_window_size,
+                provider=candidate.policy_snapshot.runner_spec.provider,
+                model=candidate.policy_snapshot.runner_spec.model,
+                request_semantics_digest=candidate.request_semantics_digest,
+                input_snapshot_digest=candidate.input_snapshot_digest,
+                policy_ref=sizing.policy_ref,
+                policy_snapshot_digest=sizing.policy_snapshot_digest,
+            )
+        else:
+            sizing = None
+            sizing_snapshot = unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
+            )
         record_prepared_runner_call_candidate_in_transaction(
             transaction,
             EventLogStore(),
@@ -1948,11 +2197,19 @@ def _seed_running_dispatching_run(
             execution_id=start_input.execution_id,
             occurred_at=start_input.occurred_at,
             candidate=candidate,
-            sizing_snapshot=unavailable_runner_call_sizing_snapshot(
-                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
-                sizing_stage=ContextSizingStage.ORDINARY,
-            ),
+            sizing_snapshot=sizing_snapshot,
         )
+        if sizing is not None:
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                EventLogStore(),
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=start_input.attempt_id,
+                execution_id=start_input.execution_id,
+                occurred_at=start_input.occurred_at,
+                result=sizing,
+            )
         started = start_governed_run_with_starting_attempt_in_transaction(
             transaction,
             EventLogStore(),

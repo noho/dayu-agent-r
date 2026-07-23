@@ -115,6 +115,18 @@ from dayu.host.accepted_tool_outcome import (
 from dayu.host.accepted_result_projection import (
     project_planned_accepted_tool_result,
 )
+from dayu.host._runner_call_manifest import RunnerCallSizingStatus
+from dayu.host.context_budget import (
+    ContextEstimatorContract,
+    ContextSizingResult,
+    ContextSizingStage,
+    build_conservative_context_sizing_result_from_atoms,
+)
+from dayu.host.context_events import (
+    ContextBudgetEvaluationIdentity,
+    append_context_budget_evaluated_in_transaction,
+    load_matching_context_budget_evaluation_in_transaction,
+)
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.run_input import (
     SessionContinuityView,
@@ -1225,7 +1237,93 @@ class DefaultHostResolveWaitService:
             tool_execution_mode=source.candidate.tool_execution_mode,
             memory_projection_policy=self._memory_projection_policy,
         )
-        record_prepared_runner_call_candidate_in_transaction(
+        sizing_snapshot = continuation_runner_call_sizing_snapshot(
+            candidate,
+            source.manifest.sizing_snapshot,
+        )
+        sizing_result: ContextSizingResult | None = None
+        if sizing_snapshot.status is RunnerCallSizingStatus.COMPLETE:
+            source_sizing = source.manifest.sizing_snapshot
+            if (
+                source_sizing.sizing_stage is None
+                or source_sizing.estimator_id is None
+                or source_sizing.estimator_version is None
+                or source_sizing.estimator_digest is None
+                or source_sizing.conservative_input_tokens is None
+                or source_sizing.context_window_size is None
+                or source_sizing.policy_ref is None
+                or source_sizing.policy_snapshot_digest is None
+                or sizing_snapshot.estimator_id is None
+                or sizing_snapshot.estimator_version is None
+                or sizing_snapshot.estimator_digest is None
+                or sizing_snapshot.conservative_input_tokens is None
+                or sizing_snapshot.context_window_size is None
+                or sizing_snapshot.policy_ref is None
+                or sizing_snapshot.policy_snapshot_digest is None
+            ):
+                raise HostDurableError(
+                    "wait continuation sizing atoms are incomplete"
+                )
+            source_budget = (
+                load_matching_context_budget_evaluation_in_transaction(
+                    transaction,
+                    self._event_log_store,
+                    session_id=run.session_id,
+                    attempt_id=wait_record.attempt_id,
+                    execution_id=wait_record.execution_id,
+                    identity=ContextBudgetEvaluationIdentity(
+                        run_id=run.run_id,
+                        candidate_input_cursor=(
+                            source.manifest_event.event_sequence
+                            if source_sizing.sizing_stage
+                            is ContextSizingStage.CONTINUATION
+                            else source.candidate.candidate_input_cursor
+                        ),
+                        candidate_input_digest=(
+                            source.candidate.input_snapshot_digest
+                        ),
+                        sizing_stage=source_sizing.sizing_stage,
+                        policy_snapshot_digest=(
+                            source_sizing.policy_snapshot_digest
+                        ),
+                        estimator_id=source_sizing.estimator_id,
+                        estimator_version=source_sizing.estimator_version,
+                    ),
+                    candidate_input_projection_ref=(
+                        source.candidate.candidate_input_projection_ref
+                    ),
+                    estimator_digest=source_sizing.estimator_digest,
+                    conservative_input_tokens=(
+                        source_sizing.conservative_input_tokens
+                    ),
+                    context_window_size=source_sizing.context_window_size,
+                    policy_ref=source_sizing.policy_ref,
+                )
+            )
+            sizing_result = build_conservative_context_sizing_result_from_atoms(
+                stage=ContextSizingStage.CONTINUATION,
+                candidate_input_cursor=candidate.candidate_input_cursor,
+                candidate_input_projection_ref=(
+                    candidate.candidate_input_projection_ref
+                ),
+                candidate_input_digest=candidate.input_snapshot_digest,
+                estimator_contract=ContextEstimatorContract(
+                    estimator_id=sizing_snapshot.estimator_id,
+                    estimator_version=sizing_snapshot.estimator_version,
+                ),
+                estimator_digest=sizing_snapshot.estimator_digest,
+                conservative_input_tokens=(
+                    sizing_snapshot.conservative_input_tokens
+                ),
+                context_window_size=sizing_snapshot.context_window_size,
+                soft_threshold_tokens=source_budget.soft_threshold_tokens,
+                hard_threshold_tokens=source_budget.hard_threshold_tokens,
+                policy_ref=sizing_snapshot.policy_ref,
+                policy_snapshot_digest=(
+                    sizing_snapshot.policy_snapshot_digest
+                ),
+            )
+        manifest_event = record_prepared_runner_call_candidate_in_transaction(
             transaction,
             self._event_log_store,
             self._payload_store,
@@ -1234,11 +1332,46 @@ class DefaultHostResolveWaitService:
             execution_id=event_plan.resume_execution_id,
             occurred_at=request.observed_at,
             candidate=candidate,
-            sizing_snapshot=continuation_runner_call_sizing_snapshot(
-                candidate,
-                source.manifest.sizing_snapshot,
-            ),
+            sizing_snapshot=sizing_snapshot,
         )
+        if sizing_result is not None:
+            sizing_result = build_conservative_context_sizing_result_from_atoms(
+                stage=ContextSizingStage.CONTINUATION,
+                candidate_input_cursor=manifest_event.event_sequence,
+                candidate_input_projection_ref=(
+                    sizing_result.candidate_input_projection_ref
+                ),
+                candidate_input_digest=(
+                    sizing_result.candidate_input_digest
+                ),
+                estimator_contract=sizing_result.estimator_contract,
+                estimator_digest=sizing_result.estimator_digest,
+                conservative_input_tokens=(
+                    sizing_result.conservative_input_tokens
+                ),
+                context_window_size=sizing_result.context_window_size,
+                soft_threshold_tokens=(
+                    sizing_result.soft_threshold_tokens
+                ),
+                hard_threshold_tokens=(
+                    sizing_result.hard_threshold_tokens
+                ),
+                policy_ref=sizing_result.policy_ref,
+                policy_snapshot_digest=(
+                    sizing_result.policy_snapshot_digest
+                ),
+                fallback_reason=sizing_result.fallback_reason,
+            )
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=event_plan.resume_attempt_id,
+                execution_id=event_plan.resume_execution_id,
+                occurred_at=request.observed_at,
+                result=sizing_result,
+            )
         transition = resume_run_from_waiting_in_transaction(
             transaction,
             self._event_log_store,

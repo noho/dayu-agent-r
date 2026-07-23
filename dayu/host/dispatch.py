@@ -208,6 +208,7 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    append_context_budget_evaluated_in_transaction,
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
@@ -1889,6 +1890,16 @@ class HostDispatchScheduler:
                     ),
                     compact_accepted=None,
                 )
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                occurred_at=datetime.now(UTC),
+                result=sizing,
+            )
             if decision is ContextBudgetDecision.BLOCK_HARD_THRESHOLD:
                 _LOGGER.error(
                     "dispatch.governance.failed session_id=%s run_id=%s "
@@ -2532,6 +2543,16 @@ class HostDispatchScheduler:
                 ),
                 terminal_notice=None,
             )
+        append_context_budget_evaluated_in_transaction(
+            transaction,
+            self._event_log_store,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=None,
+            execution_id=None,
+            occurred_at=datetime.now(UTC),
+            result=sizing,
+        )
         error_code, message = _hard_threshold_closeout(stage)
         terminal_notice = self._fail_unstarted_in_transaction(
             transaction,
@@ -2739,7 +2760,7 @@ class HostDispatchScheduler:
             start_input = plan.start_input
             sizing_snapshot = unavailable_runner_call_sizing_snapshot(
                 RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
-            sizing_stage=plan.stage,
+                sizing_stage=plan.stage,
             )
         record_prepared_runner_call_candidate_in_transaction(
             transaction,
@@ -2752,6 +2773,17 @@ class HostDispatchScheduler:
             candidate=candidate,
             sizing_snapshot=sizing_snapshot,
         )
+        if isinstance(plan, BudgetedDispatchStart):
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=start_input.attempt_id,
+                execution_id=start_input.execution_id,
+                occurred_at=start_input.occurred_at,
+                result=plan.sizing,
+            )
         result = start_governed_run_with_starting_attempt_in_transaction(
             transaction,
             self._event_log_store,

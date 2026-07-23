@@ -25,6 +25,7 @@ from dayu.host.api import (
     HostActivitySeverity,
     HostActivityStatus,
     HostActivityView,
+    HostContextUsageView,
     HostEventClass,
     HostEvent,
     HostEventKind,
@@ -82,6 +83,10 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
+    parse_context_budget_evaluated_payload,
+)
 from dayu.host.lifecycle_events import (
     HostRunEventType,
     parse_host_run_event_type,
@@ -107,6 +112,7 @@ _EVENT_TYPE_CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 _EVENT_TYPE_CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
 _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+_EVENT_TYPE_CONTEXT_BUDGET_EVALUATED = CONTEXT_BUDGET_EVALUATED
 _EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _PAYLOAD_FIELD_CONTENT = "content"
@@ -1089,6 +1095,8 @@ def _activity_from_row(
         _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     ):
         return _context_compaction_activity(row)
+    if row.event_type == _EVENT_TYPE_CONTEXT_BUDGET_EVALUATED:
+        return _context_usage_activity(row)
     if row.event_type == _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR:
         return _provider_protocol_error_activity(row)
     if row.event_type == _EVENT_TYPE_PROVIDER_DIAGNOSTIC:
@@ -1381,6 +1389,43 @@ def _context_compaction_activity(row: EventLogRow) -> HostActivityView | None:
         tool_name=None,
         tool_display_name=None,
         counts=None,
+    )
+
+
+def _context_usage_activity(row: EventLogRow) -> HostActivityView:
+    """从strict canonical fact投影七字段context usage。
+
+    :param row: ``CONTEXT_BUDGET_EVALUATED`` canonical row。
+    :returns: 不含Host-only诊断字段的public activity。
+    :raises HostDurableError: canonical payload损坏时fail closed。
+    """
+
+    try:
+        payload = parse_context_budget_evaluated_payload(
+            _payload_object(row)
+        )
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError(
+            "CONTEXT_BUDGET_EVALUATED canonical payload is invalid"
+        ) from exc
+    return HostActivityView(
+        kind=HostActivityKind.CONTEXT_USAGE,
+        status=HostActivityStatus.INFO,
+        title="上下文预算已评估",
+        summary=None,
+        severity=HostActivitySeverity.INFO,
+        tool_name=None,
+        tool_display_name=None,
+        counts=None,
+        context_usage=HostContextUsageView(
+            predicted_input_tokens=payload.predicted_input_tokens,
+            context_window_size=payload.context_window_size,
+            utilization_basis_points=payload.utilization_basis_points,
+            soft_threshold_tokens=payload.soft_threshold_tokens,
+            hard_threshold_tokens=payload.hard_threshold_tokens,
+            estimate_method=payload.estimate_method,
+            pressure_level=payload.pressure_level,
+        ),
     )
 
 

@@ -80,8 +80,13 @@ from dayu.host._runner_call_manifest import (
 )
 from dayu.host.context_budget import (
     ContextBudgetPolicy,
+    ContextSizingResult,
     ContextSizingStage,
     build_conservative_context_sizing_result,
+    build_conservative_context_sizing_result_from_atoms,
+)
+from dayu.host.context_events import (
+    append_context_budget_evaluated_in_transaction,
 )
 from dayu.host.durable.run_transition import (
     CancelActiveAttemptInput,
@@ -3067,6 +3072,7 @@ def _create_steer_attempt_result(
         tool_execution_mode=execution_mode,
         memory_projection_policy=memory_projection_policy,
     )
+    sizing: ContextSizingResult | None = None
     if context_budget_policy is None:
         sizing_snapshot = unavailable_runner_call_sizing_snapshot(
             RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
@@ -3101,7 +3107,7 @@ def _create_steer_attempt_result(
             policy_ref=sizing.policy_ref,
             policy_snapshot_digest=sizing.policy_snapshot_digest,
         )
-    record_prepared_runner_call_candidate_in_transaction(
+    manifest_event = record_prepared_runner_call_candidate_in_transaction(
         transaction,
         event_log_store,
         payload_store,
@@ -3112,6 +3118,34 @@ def _create_steer_attempt_result(
         candidate=candidate,
         sizing_snapshot=sizing_snapshot,
     )
+    if sizing is not None:
+        sizing = build_conservative_context_sizing_result_from_atoms(
+            stage=ContextSizingStage.CONTINUATION,
+            candidate_input_cursor=manifest_event.event_sequence,
+            candidate_input_projection_ref=(
+                sizing.candidate_input_projection_ref
+            ),
+            candidate_input_digest=sizing.candidate_input_digest,
+            estimator_contract=sizing.estimator_contract,
+            estimator_digest=sizing.estimator_digest,
+            conservative_input_tokens=sizing.conservative_input_tokens,
+            context_window_size=sizing.context_window_size,
+            soft_threshold_tokens=sizing.soft_threshold_tokens,
+            hard_threshold_tokens=sizing.hard_threshold_tokens,
+            policy_ref=sizing.policy_ref,
+            policy_snapshot_digest=sizing.policy_snapshot_digest,
+            fallback_reason=sizing.fallback_reason,
+        )
+        append_context_budget_evaluated_in_transaction(
+            transaction,
+            event_log_store,
+            session_id=target_run.session_id,
+            run_id=target_run.run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            occurred_at=occurred_at,
+            result=sizing,
+        )
     run_started_event = _append_steer_run_started_event(
         transaction=transaction,
         event_log_store=event_log_store,

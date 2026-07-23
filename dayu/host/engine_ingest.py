@@ -130,8 +130,10 @@ from dayu.host.context_budget import (
     BudgetJsonFragment,
     BudgetTextFragment,
     ContextBudgetDecision,
+    ContextEstimatorContract,
     ContextSizingStage,
     build_conservative_context_sizing_result,
+    build_conservative_context_sizing_result_from_atoms,
     UsageObservation,
     UsageObservationDiagnostic,
     USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
@@ -150,10 +152,14 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    ContextBudgetEvaluatedPayload,
+    ContextBudgetEvaluationIdentity,
+    append_context_budget_evaluated_in_transaction,
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
+    load_matching_context_budget_evaluation_in_transaction,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -683,6 +689,7 @@ class _ContinuationFrozenSources:
     :param estimator_version: frozen estimator version。
     :param policy_ref: frozen policy ref。
     :param policy_snapshot_digest: frozen policy digest。
+    :param source_budget: matching source canonical fact；source不可用时为``None``。
     """
 
     unavailable_reason: RunnerCallSizingUnavailableReason | None
@@ -696,6 +703,7 @@ class _ContinuationFrozenSources:
     estimator_version: str | None
     policy_ref: str | None
     policy_snapshot_digest: str | None
+    source_budget: ContextBudgetEvaluatedPayload | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -810,6 +818,16 @@ class _StartReactiveRecoveryOperation:
             and sizing.budget_decision
             is ContextBudgetDecision.BLOCK_HARD_THRESHOLD
         ):
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self.event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                occurred_at=datetime.now(UTC),
+                result=sizing,
+            )
             return _close_reactive_fallback_hard_in_transaction(
                 transaction,
                 self.event_log_store,
@@ -868,6 +886,16 @@ class _StartReactiveRecoveryOperation:
                 policy_snapshot_digest=sizing.policy_snapshot_digest,
             ),
         )
+        budget_fact = append_context_budget_evaluated_in_transaction(
+            transaction,
+            self.event_log_store,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=start_input.attempt_id,
+            execution_id=start_input.execution_id,
+            occurred_at=start_input.occurred_at,
+            result=sizing,
+        )
         result = start_recovery_run_with_starting_attempt_in_transaction(
             transaction,
             self.event_log_store,
@@ -908,7 +936,11 @@ class _StartReactiveRecoveryOperation:
         return _ReactiveRecoveryStarted(
             result=EngineIngestResult(
                 status=EngineIngestStatus.ACCEPTED,
-                events=self.accepted.result.events + (manifest,) + rows,
+                events=(
+                    self.accepted.result.events
+                    + (manifest, budget_fact)
+                    + rows
+                ),
                 terminal_closeout=False,
                 terminal_notice=None,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
@@ -3582,14 +3614,20 @@ class EngineEventIngestor:
                     reason=_RUNNER_CALL_MANIFEST_REASON_MISSING,
                     stop_worker_stream=True,
                 )
-            manifest_event = self._append_limited_runner_call_manifest_event(
-                transaction,
-                context,
-                data,
-                runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
-                runner_call_trigger_reason=_RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE,
+            manifest_event, budget_fact = (
+                self._append_limited_runner_call_manifest_event(
+                    transaction,
+                    context,
+                    data,
+                    runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
+                    runner_call_trigger_reason=(
+                        _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE
+                    ),
+                )
             )
             rows.append(manifest_event)
+            if budget_fact is not None:
+                rows.append(budget_fact)
             resolution = _resolution_from_limited_manifest_event(
                 manifest_event,
                 data,
@@ -3644,7 +3682,7 @@ class EngineEventIngestor:
         *,
         runner_call_kind: str | None = None,
         runner_call_trigger_reason: str | None = None,
-    ) -> EventLogRow:
+    ) -> tuple[EventLogRow, EventLogRow | None]:
         """为 Engine-only runner continuation 写入 limited-signal manifest。
 
         :param transaction: 当前 Host transaction。
@@ -3654,7 +3692,7 @@ class EngineEventIngestor:
             按 Engine iteration signal 推导。
         :param runner_call_trigger_reason: Host 已判定的 trigger reason；为
             ``None`` 时按 Engine iteration signal 推导。
-        :returns: `RUNNER_CALL_INPUT_ASSEMBLED` canonical EventLog row。
+        :returns: manifest row与可用时紧随其后的canonical budget fact。
         :raises HostDurableError: payload descriptor 或 manifest 校验失败时抛出。
         """
 
@@ -3708,7 +3746,7 @@ class EngineEventIngestor:
             manifest=manifest,
             manifest_digest=manifest_digest,
         )
-        return self._event_log_store.append_event(
+        manifest_event = self._event_log_store.append_event(
             transaction,
             _runner_call_manifest_event_request(
                 context=context,
@@ -3718,6 +3756,62 @@ class EngineEventIngestor:
                 manifest_digest=manifest_digest,
             ),
         ).row
+        typed_manifest = parse_runner_call_manifest(
+            manifest,
+            hot_payload=parse_runner_call_hot_payload(
+                _payload_object(manifest_event)
+            ),
+        )
+        sizing = typed_manifest.sizing_snapshot
+        if sizing.status is not RunnerCallSizingStatus.COMPLETE:
+            return (manifest_event, None)
+        source_budget = frozen_sources.source_budget
+        projection = typed_manifest.projection_descriptor
+        if (
+            source_budget is None
+            or projection is None
+            or sizing.estimator_id is None
+            or sizing.estimator_version is None
+            or sizing.estimator_digest is None
+            or sizing.conservative_input_tokens is None
+            or sizing.context_window_size is None
+            or sizing.input_snapshot_digest is None
+            or sizing.policy_ref is None
+            or sizing.policy_snapshot_digest is None
+        ):
+            raise HostDurableError(
+                "complete continuation manifest is missing budget atoms"
+            )
+        result = build_conservative_context_sizing_result_from_atoms(
+            stage=ContextSizingStage.CONTINUATION,
+            candidate_input_cursor=manifest_event.event_sequence,
+            candidate_input_projection_ref=projection.payload_ref,
+            candidate_input_digest=sizing.input_snapshot_digest,
+            estimator_contract=ContextEstimatorContract(
+                estimator_id=sizing.estimator_id,
+                estimator_version=sizing.estimator_version,
+            ),
+            estimator_digest=sizing.estimator_digest,
+            conservative_input_tokens=sizing.conservative_input_tokens,
+            context_window_size=sizing.context_window_size,
+            soft_threshold_tokens=source_budget.soft_threshold_tokens,
+            hard_threshold_tokens=source_budget.hard_threshold_tokens,
+            policy_ref=sizing.policy_ref,
+            policy_snapshot_digest=sizing.policy_snapshot_digest,
+        )
+        return (
+            manifest_event,
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=context.run.session_id,
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                execution_id=context.attempt.execution_id,
+                occurred_at=context.candidate.engine_event.occurred_at,
+                result=result,
+            ),
+        )
 
     def _append_runner_call_iteration_link_event(
         self,
@@ -6229,6 +6323,10 @@ def _continuation_frozen_sources(
         or sizing.request_semantics_digest is None
         or sizing.estimator_id is None
         or sizing.estimator_version is None
+        or sizing.estimator_digest is None
+        or sizing.conservative_input_tokens is None
+        or sizing.input_snapshot_digest is None
+        or sizing.sizing_stage is None
         or sizing.estimator_id
         != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
         or sizing.estimator_version
@@ -6236,6 +6334,40 @@ def _continuation_frozen_sources(
     ):
         return _unavailable_continuation_sources(
             RunnerCallSizingUnavailableReason.CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE,
+            tool_schema_snapshot_refs=tool_refs,
+            tool_schema_fragments=tool_fragments,
+        )
+    try:
+        source_budget = load_matching_context_budget_evaluation_in_transaction(
+            transaction,
+            event_log_store,
+            session_id=context.run.session_id,
+            attempt_id=context.attempt.attempt_id,
+            execution_id=context.attempt.execution_id,
+            identity=ContextBudgetEvaluationIdentity(
+                run_id=context.run.run_id,
+                candidate_input_cursor=(
+                    source.manifest_event.event_sequence
+                    if sizing.sizing_stage is ContextSizingStage.CONTINUATION
+                    else source.candidate.candidate_input_cursor
+                ),
+                candidate_input_digest=source.candidate.input_snapshot_digest,
+                sizing_stage=sizing.sizing_stage,
+                policy_snapshot_digest=sizing.policy_snapshot_digest,
+                estimator_id=sizing.estimator_id,
+                estimator_version=sizing.estimator_version,
+            ),
+            candidate_input_projection_ref=(
+                source.candidate.candidate_input_projection_ref
+            ),
+            estimator_digest=sizing.estimator_digest,
+            conservative_input_tokens=sizing.conservative_input_tokens,
+            context_window_size=sizing.context_window_size,
+            policy_ref=sizing.policy_ref,
+        )
+    except HostDurableError:
+        return _unavailable_continuation_sources(
+            RunnerCallSizingUnavailableReason.CONTINUATION_POLICY_UNAVAILABLE,
             tool_schema_snapshot_refs=tool_refs,
             tool_schema_fragments=tool_fragments,
         )
@@ -6251,6 +6383,7 @@ def _continuation_frozen_sources(
         estimator_version=sizing.estimator_version,
         policy_ref=sizing.policy_ref,
         policy_snapshot_digest=sizing.policy_snapshot_digest,
+        source_budget=source_budget,
     )
 
 
@@ -6304,6 +6437,7 @@ def _unavailable_continuation_sources(
         estimator_version=None,
         policy_ref=None,
         policy_snapshot_digest=None,
+        source_budget=None,
     )
 
 

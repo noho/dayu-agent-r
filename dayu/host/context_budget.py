@@ -1,6 +1,6 @@
 """Host context budget conservative estimator。
 
-本模块只实现 Phase 10 Slice 1 的 typed budget 估算与阈值决策。估算
+本模块实现 Host-owned typed budget 估算与阈值决策。估算
 依据来自 Host RunInputBuilder / Context Governance 可提供的 typed view，
 不读取 Engine spec、provider overflow payload、metadata 或 extra payload。
 Runner usage 只建模为 post-call observation，不参与当前阈值动态调整。
@@ -449,6 +449,15 @@ class ContextSizingResult:
             raise ValueError(
                 "conservative sizing predicted_input_tokens must equal estimate"
             )
+        if self.soft_threshold_tokens > self.hard_threshold_tokens:
+            raise ValueError(
+                "soft_threshold_tokens must not exceed hard_threshold_tokens"
+            )
+        expected_utilization = (
+            self.predicted_input_tokens * 10_000 // self.context_window_size
+        )
+        if self.utilization_basis_points != expected_utilization:
+            raise ValueError("ContextSizingResult.utilization_basis_points mismatch")
         expected_pressure, expected_decision = _pressure_and_decision(
             stage=self.stage,
             predicted_input_tokens=self.predicted_input_tokens,
@@ -662,33 +671,94 @@ def build_conservative_context_sizing_result(
         raise TypeError("estimate must be BudgetEstimate")
     if estimate.input_budget_tokens != policy.context_window_size:
         raise ValueError("estimate context window does not match policy")
-    predicted = estimate.estimated_input_tokens
-    pressure, decision = _pressure_and_decision(
-        stage=stage,
-        predicted_input_tokens=predicted,
-        soft_threshold_tokens=estimate.soft_threshold_tokens,
-        hard_threshold_tokens=estimate.hard_threshold_tokens,
-    )
-    return ContextSizingResult(
+    return build_conservative_context_sizing_result_from_atoms(
         stage=stage,
         candidate_input_cursor=candidate_input_cursor,
         candidate_input_projection_ref=candidate_input_projection_ref,
         candidate_input_digest=candidate_input_digest,
         estimator_contract=CONTEXT_ESTIMATOR_CONTRACT,
         estimator_digest=estimate.estimator_digest,
-        conservative_input_tokens=predicted,
-        estimate_method=ContextEstimateMethod.CONSERVATIVE_FALLBACK,
-        predicted_input_tokens=predicted,
+        conservative_input_tokens=estimate.estimated_input_tokens,
         context_window_size=policy.context_window_size,
         soft_threshold_tokens=estimate.soft_threshold_tokens,
         hard_threshold_tokens=estimate.hard_threshold_tokens,
-        utilization_basis_points=floor(
-            predicted * 10_000 / policy.context_window_size
-        ),
-        pressure_level=pressure,
-        budget_decision=decision,
         policy_ref=policy.policy_ref,
         policy_snapshot_digest=context_budget_policy_snapshot_digest(policy),
+        fallback_reason=fallback_reason,
+    )
+
+
+def build_conservative_context_sizing_result_from_atoms(
+    *,
+    stage: ContextSizingStage,
+    candidate_input_cursor: int,
+    candidate_input_projection_ref: str,
+    candidate_input_digest: str,
+    estimator_contract: ContextEstimatorContract,
+    estimator_digest: str,
+    conservative_input_tokens: int,
+    context_window_size: int,
+    soft_threshold_tokens: int,
+    hard_threshold_tokens: int,
+    policy_ref: str,
+    policy_snapshot_digest: str,
+    fallback_reason: ContextSizingFallbackReason = (
+        ContextSizingFallbackReason.USAGE_MISSING
+    ),
+) -> ContextSizingResult:
+    """从已冻结且同源的 canonical atoms 构造 conservative sizing truth。
+
+    该入口服务不能重读当前 policy 的 continuation producer；它只消费 source
+    budget fact 已承诺的 thresholds 与 manifest 已冻结的 estimator/policy atoms，
+    不执行 usage 选择、anchor pairing 或当前配置重算。
+
+    :param stage: 当前 sizing stage。
+    :param candidate_input_cursor: candidate source watermark。
+    :param candidate_input_projection_ref: exact candidate projection ref。
+    :param candidate_input_digest: complete candidate digest。
+    :param estimator_contract: frozen estimator identity。
+    :param estimator_digest: 当前 candidate conservative estimate digest。
+    :param conservative_input_tokens: 当前 candidate conservative tokens。
+    :param context_window_size: frozen policy context window。
+    :param soft_threshold_tokens: source policy soft threshold。
+    :param hard_threshold_tokens: source policy hard threshold。
+    :param policy_ref: frozen context policy ref。
+    :param policy_snapshot_digest: frozen context policy digest。
+    :param fallback_reason: conservative fallback closed reason。
+    :returns: 完整 conservative sizing result。
+    :raises TypeError: enum、contract 或整数字段类型非法时抛出。
+    :raises ValueError: atoms 违反 sizing contract 时抛出。
+    """
+
+    if not isinstance(stage, ContextSizingStage):
+        raise TypeError("stage must be ContextSizingStage")
+    if not isinstance(estimator_contract, ContextEstimatorContract):
+        raise TypeError("estimator_contract must be ContextEstimatorContract")
+    predicted = conservative_input_tokens
+    pressure, decision = _pressure_and_decision(
+        stage=stage,
+        predicted_input_tokens=predicted,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+    return ContextSizingResult(
+        stage=stage,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=candidate_input_projection_ref,
+        candidate_input_digest=candidate_input_digest,
+        estimator_contract=estimator_contract,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=predicted,
+        estimate_method=ContextEstimateMethod.CONSERVATIVE_FALLBACK,
+        predicted_input_tokens=predicted,
+        context_window_size=context_window_size,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+        utilization_basis_points=predicted * 10_000 // context_window_size,
+        pressure_level=pressure,
+        budget_decision=decision,
+        policy_ref=policy_ref,
+        policy_snapshot_digest=policy_snapshot_digest,
         fallback_reason=fallback_reason,
     )
 
@@ -837,6 +907,51 @@ def _pressure_and_decision(
     else:
         pressure = ContextPressureLevel.NORMAL
     return (pressure, _stage_pressure_action(stage, pressure))
+
+
+def context_sizing_pressure_and_decision(
+    *,
+    stage: ContextSizingStage,
+    predicted_input_tokens: int,
+    soft_threshold_tokens: int,
+    hard_threshold_tokens: int,
+) -> tuple[ContextPressureLevel, ContextBudgetDecision]:
+    """按唯一五阶段矩阵派生 pressure 与 action。
+
+    :param stage: producer 显式选择的 sizing stage。
+    :param predicted_input_tokens: 当前 decision basis token 数。
+    :param soft_threshold_tokens: frozen soft threshold。
+    :param hard_threshold_tokens: frozen hard threshold。
+    :returns: 真实 pressure 与 stage-aware action。
+    :raises TypeError: stage 或整数类型非法时抛出。
+    :raises ValueError: token/threshold 范围或顺序非法时抛出。
+    :raises AssertionError: stage/pressure 闭集出现未覆盖成员时抛出。
+    """
+
+    if not isinstance(stage, ContextSizingStage):
+        raise TypeError("stage must be ContextSizingStage")
+    _require_non_negative_int(
+        predicted_input_tokens,
+        field_name="predicted_input_tokens",
+    )
+    _require_positive_int(
+        soft_threshold_tokens,
+        field_name="soft_threshold_tokens",
+    )
+    _require_positive_int(
+        hard_threshold_tokens,
+        field_name="hard_threshold_tokens",
+    )
+    if soft_threshold_tokens > hard_threshold_tokens:
+        raise ValueError(
+            "soft_threshold_tokens must not exceed hard_threshold_tokens"
+        )
+    return _pressure_and_decision(
+        stage=stage,
+        predicted_input_tokens=predicted_input_tokens,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
 
 
 def _stage_pressure_action(
@@ -1239,7 +1354,9 @@ __all__ = [
     "USAGE_OBSERVATION_STATUS_OBSERVED",
     "build_usage_observation_diagnostic",
     "build_conservative_context_sizing_result",
+    "build_conservative_context_sizing_result_from_atoms",
     "context_budget_policy_snapshot_digest",
+    "context_sizing_pressure_and_decision",
     "decide_context_budget",
     "estimate_budget_text_tokens",
     "estimate_context_budget",

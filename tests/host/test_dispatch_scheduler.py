@@ -70,6 +70,7 @@ from dayu.host.api import (
     EnsureSessionRequest,
     HostApiError,
     HostApiErrorCode,
+    HostActivityKind,
     HostUnavailableDetail,
     HostLocalExecutionOptions,
     LocalEngineWorker,
@@ -114,9 +115,11 @@ from dayu.host.compaction_operation import (
 )
 from dayu.host.context_budget import (
     ContextBudgetDecision,
+    ContextPressureLevel,
     ContextSizingStage,
 )
 from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
@@ -124,6 +127,7 @@ from dayu.host.context_events import (
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_requested_payload,
+    parse_context_budget_evaluated_payload,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -225,6 +229,8 @@ from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_PAYLOAD_DESCRIPTORS,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
@@ -238,6 +244,7 @@ from dayu.host.durable.run_transition import (
     create_accepted_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     FailUnstartedRunInput,
+    RunTransitionResult,
     fail_unstarted_run_in_transaction,
     StartGovernedRunInput,
     start_governed_run_with_starting_attempt_in_transaction,
@@ -255,6 +262,7 @@ from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunRow,
     RunStartReason,
+    StateMutationStatus,
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
@@ -269,6 +277,7 @@ from dayu.host.durable.transaction import (
 )
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.read_api import _host_event_from_row
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneAcquireOutcome,
@@ -4985,11 +4994,305 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             )
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            budget_indexes = tuple(
+                index
+                for index, event_type in enumerate(event_types)
+                if event_type == CONTEXT_BUDGET_EVALUATED
+            )
+            assert len(budget_indexes) == 2
+            assert budget_indexes[0] < event_types.index(
+                CONTEXT_COMPACTION_REQUESTED
+            )
             assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < event_types.index(CONTEXT_COMPACTED)
-            assert event_types.index(CONTEXT_COMPACTED) < event_types.index("RUN_STARTED")
+            assert event_types.index(CONTEXT_COMPACTED) < budget_indexes[1]
+            assert budget_indexes[1] < event_types.index("RUN_STARTED")
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
+            budget_payloads = tuple(
+                parse_context_budget_evaluated_payload(
+                    _event_payload(event)
+                )
+                for event in _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_BUDGET_EVALUATED,
+                )
+            )
+            assert tuple(payload.sizing_stage for payload in budget_payloads) == (
+                ContextSizingStage.ORDINARY,
+                ContextSizingStage.POST_COMPACT,
+            )
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        ContextSizingStage.ORDINARY,
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.DISPATCH_FALLBACK,
+    ),
+)
+@pytest.mark.asyncio
+async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
+    tmp_path: Path,
+    stage: ContextSizingStage,
+) -> None:
+    """budgeted allow 对三个dispatch stage提交manifest、fact、start。
+
+    :param tmp_path: pytest 临时目录。
+    :param stage: 本次dispatch candidate的真实stage。
+    :returns: ``None``。
+    :raises AssertionError: stage或EventLog顺序错误时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-budgeted-allow-{stage.value}",
+            display_text="short budgeted input",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=32_768,
+                soft_threshold_tokens=30_000,
+                hard_threshold_tokens=31_000,
+            ),
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            scheduler._catch_up_memory_projection_before_candidate(
+                run.session_id
+            )
+            outcome = store.transaction_runner.run_write(
+                lambda transaction: (
+                    scheduler._prepare_and_commit_start_in_transaction(
+                        transaction,
+                        run,
+                        stage=stage,
+                    )
+                )
+            )
+
+            assert outcome.pending_dispatch is not None
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert event_types[-4:] == (
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+                CONTEXT_BUDGET_EVALUATED,
+                "RUN_STARTED",
+                "ATTEMPT_STARTED",
+            )
+            fact = parse_context_budget_evaluated_payload(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_BUDGET_EVALUATED,
+                    )
+                )
+            )
+            assert fact.sizing_stage is stage
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        ContextSizingStage.ORDINARY,
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.DISPATCH_FALLBACK,
+    ),
+)
+@pytest.mark.asyncio
+async def test_budgeted_hard_stage_records_fact_before_terminal(
+    tmp_path: Path,
+    stage: ContextSizingStage,
+) -> None:
+    """ordinary/post-compact/fallback hard均先写fact再收口。
+
+    :param tmp_path: pytest 临时目录。
+    :param stage: 本次hard candidate的真实stage。
+    :returns: ``None``。
+    :raises AssertionError: fact stage、pressure或terminal顺序错误时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-budgeted-hard-{stage.value}",
+            display_text=_hard_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=200,
+                soft_threshold_tokens=70,
+                hard_threshold_tokens=120,
+            ),
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            scheduler._catch_up_memory_projection_before_candidate(
+                run.session_id
+            )
+            outcome = store.transaction_runner.run_write(
+                lambda transaction: (
+                    scheduler._prepare_and_commit_start_in_transaction(
+                        transaction,
+                        run,
+                        stage=stage,
+                    )
+                )
+            )
+
+            assert outcome.pending_dispatch is None
+            assert outcome.terminal_notice is not None
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            fact_index = event_types.index(CONTEXT_BUDGET_EVALUATED)
+            assert fact_index < event_types.index("RUN_FAILED")
+            fact = parse_context_budget_evaluated_payload(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_BUDGET_EVALUATED,
+                    )
+                )
+            )
+            assert fact.sizing_stage is stage
+            assert (
+                fact.pressure_level
+                is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+            )
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize("failure_kind", ("precondition", "cas_lost"))
+@pytest.mark.asyncio
+async def test_budgeted_start_failure_rolls_back_candidate_fact_and_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """start precondition miss与CAS lost均回滚candidate/fact/state。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param failure_kind: 注入owner precondition miss或low-level CAS lost。
+    :returns: ``None``。
+    :raises AssertionError: transaction留下孤立写入时抛出。
+    """
+
+    def reject_start(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        request: StartGovernedRunInput,
+    ) -> RunTransitionResult:
+        """在manifest/fact之后注入transition失败。
+
+        :param transaction: Host write transaction。
+        :param event_log_store: EventLog primitive。
+        :param request: governed start input。
+        :returns: precondition场景的``INVALID_STATE``结果。
+        :raises HostDurableError: CAS lost场景固定抛出。
+        """
+
+        del transaction, event_log_store, request
+        if failure_kind == "cas_lost":
+            raise HostDurableError("injected governed start CAS lost")
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+            run_event=None,
+        )
+
+    monkeypatch.setattr(
+        host_dispatch,
+        "start_governed_run_with_starting_attempt_in_transaction",
+        reject_start,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-budgeted-rollback-{failure_kind}",
+            display_text="short rollback input",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=32_768,
+                soft_threshold_tokens=30_000,
+                hard_threshold_tokens=31_000,
+            ),
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            scheduler._catch_up_memory_projection_before_candidate(
+                run.session_id
+            )
+            descriptor_count_before = _table_count(
+                store.transaction_runner,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+            expected_error = (
+                HostDurableError
+                if failure_kind == "cas_lost"
+                else host_dispatch._StartCandidateCasMissRollback
+            )
+            with pytest.raises(expected_error):
+                store.transaction_runner.run_write(
+                    lambda transaction: (
+                        scheduler._prepare_and_commit_start_in_transaction(
+                            transaction,
+                            run,
+                            stage=ContextSizingStage.ORDINARY,
+                        )
+                    )
+                )
+
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert "RUNNER_CALL_INPUT_ASSEMBLED" not in event_types
+            assert CONTEXT_BUDGET_EVALUATED not in event_types
+            assert "RUN_STARTED" not in event_types
+            assert "ATTEMPT_STARTED" not in event_types
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == 0
+            assert _table_count(
+                store.transaction_runner,
+                TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+            ) == 0
+            assert _table_count(
+                store.transaction_runner,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            ) == descriptor_count_before
         finally:
             await scheduler.close()
 
@@ -8110,6 +8413,18 @@ async def test_no_budget_manifest_preserves_actual_dispatch_stage(
                 )
             )
             assert source.manifest.sizing_snapshot.sizing_stage is stage
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert CONTEXT_BUDGET_EVALUATED not in event_types
+            assert (
+                _has_context_usage_activity(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                is False
+            )
         finally:
             await scheduler.close()
 
@@ -9702,6 +10017,44 @@ def _attempt_count_for_run(transaction_runner: HostTransactionRunner, run_id: st
     return transaction_runner.run_read(_operation)
 
 
+def _table_count(
+    transaction_runner: HostTransactionRunner,
+    table_name: str,
+) -> int:
+    """读取测试白名单表的总行数。
+
+    :param transaction_runner: transaction runner。
+    :param table_name: 由调用测试传入的schema常量。
+    :returns: table row count。
+    :raises AssertionError: table不在白名单或count类型非法时抛出。
+    """
+
+    assert table_name in frozenset(
+        (
+            TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+            TABLE_PAYLOAD_DESCRIPTORS,
+        )
+    )
+
+    def _operation(transaction: HostTransaction) -> int:
+        """执行固定白名单table count。
+
+        :param transaction: Host read transaction。
+        :returns: row count。
+        :raises AssertionError: SQLite未返回int count时抛出。
+        """
+
+        row = transaction.fetchone(
+            f"SELECT COUNT(*) AS count FROM {table_name}"
+        )
+        assert row is not None
+        count = row.get("count")
+        assert isinstance(count, int)
+        return count
+
+    return transaction_runner.run_read(_operation)
+
+
 def _event_types_for_run(transaction_runner: HostTransactionRunner, run_id: str) -> tuple[str, ...]:
     """按 sequence 读取指定 Run 的 EventLog 类型。
 
@@ -9717,6 +10070,45 @@ def _event_types_for_run(transaction_runner: HostTransactionRunner, run_id: str)
             limit=_EVENT_LOG_TEST_READ_LIMIT,
         )
         return tuple(row.event_type for row in rows if row.run_id == run_id)
+
+    return transaction_runner.run_read(_operation)
+
+
+def _has_context_usage_activity(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> bool:
+    """检查指定Run是否投影出context usage activity。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: 任一durable row投影为context usage时返回``True``。
+    :raises Exception: durable读取或strict public投影失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> bool:
+        """在同一read transaction检查public activity。
+
+        :param transaction: Host read transaction。
+        :returns: 是否存在context usage activity。
+        :raises Exception: strict public投影失败时透传。
+        """
+
+        rows = EventLogStore().read_events_after(
+            transaction,
+            0,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
+        for row in rows:
+            if row.run_id != run_id:
+                continue
+            activity = _host_event_from_row(transaction, row).activity
+            if (
+                activity is not None
+                and activity.kind is HostActivityKind.CONTEXT_USAGE
+            ):
+                return True
+        return False
 
     return transaction_runner.run_read(_operation)
 

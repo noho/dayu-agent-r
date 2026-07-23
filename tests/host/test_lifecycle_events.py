@@ -117,6 +117,7 @@ def test_all_host_event_type_values_preserves_owner_categories() -> None:
         HostToolWaitEventType.WAIT_LATE_RESULT_REJECTED,
     )
     assert HOST_CONTEXT_GOVERNANCE_EVENT_TYPES == (
+        HostContextGovernanceEventType.CONTEXT_BUDGET_EVALUATED,
         HostContextGovernanceEventType.CONTEXT_COMPACTION_REQUESTED,
         HostContextGovernanceEventType.CONTEXT_COMPACTED,
         HostContextGovernanceEventType.CONTEXT_COMPACTION_FAILED,
