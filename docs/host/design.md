@@ -3455,6 +3455,10 @@ ForwardIntentMemoryView
 
 `latest_compaction_event_ref` 只是 provenance ref，用来说明当前 snapshot 的 compacted semantic view 来自哪个 accepted compact event；它不是 `latest_accepted_compacted_view` 本体。`TraceMemoryView.selected_recent_window` 与 `EvidenceFactMemoryView.recent_evidence_items` 如果物化在 snapshot 中，也只是对 `post_compact_delta_material` 的 bounded recent view，服务 ordinary RunInput 渲染与诊断；它们不是 compact output 生成的第六类 Semantic Memory，也不会自动生成 summary、answer anchor、forward intent 或 evidence-backed fact。
 
+accepted `CONTEXT_COMPACTED.source_boundary_refs` 的 typed read owner 固定为 compact payload source boundary。持久化顺序是 contract：第一项必须是 `current_input_ref`，其余去重 refs 是本次 accepted compact 实际覆盖的 `compacted_source_refs`；只有当前输入、没有被覆盖材料时，后者允许为空。strict parser 必须一次性校验列表非空、每项非空且全局唯一，并把两个角色投影为显式 typed fields；Conversation Memory 等消费者不得自行索引 raw list、按 ref 前缀猜角色，或从 event sequence / timestamp 推断覆盖范围。
+
+Conversation Memory projection 是 `selected_recent_window` 的唯一 owner。消费 accepted compact 时，它必须从既有 selected recent items 中移除 canonical source refs 与 `compacted_source_refs` 相交的项，显式保留 `current_input_ref` 对应项，并保留未被本次 compact selection 覆盖的 protected recent raw 项；随后 `recent_evidence_items` 只从更新后的 selected recent window 同源派生。compact event 之后的新 eligible canonical material 才继续形成 post-compact delta。incremental projection、full rebuild、inline delta repair 与 persisted snapshot reload 必须复用同一 projection rule 并得到相同结果。RunInput 只消费修正后的 typed memory view 并执行既有 memory / protected raw-tail source-ref 与 content-digest 去重，不得再实现一套 compact coverage filter。
+
 Projection 规则：
 
 - compact 前，Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory 为空。
@@ -3609,7 +3613,11 @@ reactive provider context overflow 通常没有可靠 usage 或 budget state。�
 
 - `context_window_size` 必须为正整数。
 - `soft_threshold_context_ratio` 与 `hard_threshold_context_ratio` 必须大于 0 且小于等于 1，且 soft ratio 不得大于 hard ratio。
-- Host 内部按 ratio 计算 soft / hard threshold tokens。超过 soft threshold 时，Host 应先尝试 compact，而不是直接 dispatch。
+- Host 内部按 ratio 计算 soft / hard threshold tokens。`pressure_level` 只表达 predicted tokens 与 thresholds 的比较结果，不因执行阶段改写：达到 hard 为 `hard_threshold_exceeded`，否则达到 soft 为 `soft_threshold_exceeded`，否则为 `normal`。实际 action 还必须消费 sizing stage：
+  - `ordinary`：normal 允许 dispatch，soft 启动该 Run / input snapshot 唯一一次 proactive compact，hard 禁止 dispatch 并 fail closed。
+  - `post_compact`：normal 与 soft 都允许 dispatch；hard 禁止 dispatch 并显式 fail closed。
+  - `dispatch_fallback`：normal 与 soft 都允许 dispatch；hard 按既有 fallback / failure policy 显式 fail closed。
+  post-compact / fallback soft 不得伪装成 normal，public pressure 仍如实报告；hard path 不得普通返回“无 dispatch”而让 Run 静默停在 accepted。对同一 snapshot 已启动 proactive operation 后，任何 post-compact / fallback sizing 都不得启动第二次 proactive operation。
 - proactive path 在 dispatch 前使用估算输入决定是否触发 compact 或禁止 dispatch；proactive compact operation 的 bounded repair attempts 全部耗尽后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。
 - reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；它接受 quality 通过的 compact 结果，随后用真实 recovery dispatch / Engine overflow 闭环判断是否还需要下一次 reactive compact。
 - 每个 Run / input snapshot 的 proactive trigger 固定最多启动一个 durable compaction operation；这是Host状态机不变量，不是可配置次数预算。正常成功、semantic repair、tier 1-3 recovery与tier 4/5 fallback都在该operation内收敛；不得通过第二条proactive `CONTEXT_COMPACTION_REQUESTED`重试同一snapshot。若Host在request committed后、operation terminal前退出，fresh`READ_WRITE` attachment只能恢复同一operation，并把已durable记录的proposal manifests / rejected attempts计入`max_compaction_attempts_per_operation`；无法可信恢复时按同一operation fail / fallback，不得新建operation。reactive trigger每次Engine overflow最多启动一个operation，但同一Run可在`max_reactive_compactions_per_run`上限内多次reactive compact，默认上限为2。一个operation内可以包含Host-owned bounded semantic repair attempts，但不得启动无界compact loop。

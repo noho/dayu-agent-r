@@ -5,8 +5,9 @@
 - Work Unit：`WU-CTX-01 Usage-Anchored Adaptive Context Sizing`
 - Issue：GitHub Issue #20。
 - 类型：architecture-sensitive issue / public-contract change。
-- 当前 gate：`plan review fix`；本 artifact 只修复 Controller accepted
-  findings，不进入 re-review、implementation、commit、push、PR 或 merge。
+- 当前 gate：`plan amendment`；本 artifact 只修复 Slice 1 stop condition 的
+  Controller accepted blocker，不进入 re-review、implementation、commit、push、PR
+  或 merge。
 - 设计真源：`docs/host/design.md` §25 `Context Governance`，唯一设计入口为
   `Usage-Anchored Adaptive Context Sizing`。
 - 控制真源：`docs/host/issues-implementation-control.md` 的 `Slice 切分原则` 与
@@ -14,22 +15,24 @@
 - goal confirmation：
   `docs/reviews/wu-ctx-01-goal-confirmation-controller.md`，decision=`pass`，
   blocking open questions=`None`。
-- finding 裁决唯一真源：
-  `docs/reviews/wu-ctx-01-plan-review-controller-adjudication.md`，
-  decision=`needs-fix`。两路 review 只提供证据，不得覆盖 Controller 对 accepted /
-  rejected findings 的裁决。
+- 原 plan finding 裁决真源：
+  `docs/reviews/wu-ctx-01-plan-review-controller-adjudication.md`；
+  本次 amendment 裁决唯一真源：
+  `docs/reviews/wu-ctx-01-slice-1-stop-controller-adjudication.md`，
+  decision=`accepted blocker / reopen plan`。两路 review 只提供证据，不得覆盖
+  Controller 对 owner、stage action、scope 与 partial implementation 的裁决。
 - 代码基线：branch=`feat/wu-ctx-01`，
   HEAD=`5afe71fefa2486ff0e0d9b2026fee23685d48c2e`。
-- preflight：当前不是 protected branch。开始 plan gate 时已有用户/Controller
-  修改的 `docs/host/issues-implementation-control.md` 和未跟踪的
-  `docs/reviews/wu-ctx-01-goal-confirmation-controller.md`；它们不是本 Agent
-  的写入，不得修改、stage 或清理。
-- 本 fix gate 允许写入仅为：
-  `docs/reviews/wu-ctx-01-plan-codex.md` 与
-  `docs/reviews/wu-ctx-01-plan-fix-codex.md`。
-- plan fix completion status：`complete`。accepted findings 已在 owner boundary
-  收敛；没有需要 implementation agent 猜测的 identity、CAS rollback、anchor
-  eligibility、continuation source、transaction read interface 或 consumer scope。
+- preflight：当前不是 protected branch。worktree 已有大量 Slice 1 partial
+  production/tests、Controller control doc 与 stop artifacts；它们必须原样保留，
+  本 gate 不继续编辑。
+- 本 amendment gate 允许写入仅为：
+  `docs/host/design.md`、`docs/reviews/wu-ctx-01-plan-codex.md` 与
+  `docs/reviews/wu-ctx-01-slice-1-plan-amendment-codex.md`。
+- amendment completion status：`complete`。accepted blocker 已在 compact payload
+  typed source boundary、Conversation Memory projection 与 stage-aware sizing action
+  owner处收敛；当前 partial implementation仍为`not accepted`，必须等
+  AgentMiMo / AgentDS双路plan re-review通过后才可恢复。
 
 ## 1. Goal、motivation 与 success signal
 
@@ -65,6 +68,12 @@
 不是 anchor 算法的附属事件：即使没有任何 usage、所有结果均为
 `conservative_fallback`，fact、idempotency、event ordering 与 public
 projection 仍必须完整成立。
+
+Slice 1 对 compact source boundary 与 Conversation Memory projection 的修正不是第三项
+产品修改；它是 complete candidate foundation 满足既有 compact/delta design truth
+的前置 owner 修复。accepted compact 后，exact candidate只能包含 latest accepted
+semantic view、真正的 post-compact delta、未被本次 selected compact覆盖的 protected
+raw tail与current input，不能继续携带已被 compact覆盖的旧 raw。
 
 ### 1.2 Motivation 与第一性原理判断
 
@@ -109,8 +118,8 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 - pre-start sizing 只消费不带 Attempt/execution identity 的完整 candidate，不依赖
   runner-call manifest。只有 decision=`ALLOW_DISPATCH` 后，才在同一 write
   transaction 分配并实际消费 Attempt/execution/dispatch identities，再按
-  manifest、budget fact、Run/Attempt start 顺序提交；soft/hard candidate 不写
-  runner-call manifest，也不分配 durable Attempt identity。
+  manifest、budget fact、Run/Attempt start 顺序提交；ordinary soft/hard candidate
+  不写runner-call manifest，也不分配durable Attempt identity。
 - start precondition/CAS miss 使同一 transaction 中新写的 projection、manifest 与
   budget fact全部 rollback；precondition miss由调用方把private rollback信号收敛为
   “本轮无dispatch”，低层CAS lost保持既有durable error传播；两者EventLog均零孤立
@@ -124,6 +133,17 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
   大于 `10000`。
 - public pressure 与实际 compact/dispatch decision 同源；Service 不重算任何
   token、ratio、threshold、basis points 或 pressure。
+- `pressure_level`只由prediction与soft/hard thresholds决定；`budget_decision`还消费
+  `ContextSizingStage`。`ORDINARY` soft触发唯一 proactive operation；
+  `POST_COMPACT` / `DISPATCH_FALLBACK` soft如实保留soft pressure但允许dispatch；
+  三个stage的hard都禁止dispatch并显式fail closed，不留下silent accepted Run。
+- accepted compact的typed source boundary严格区分第一个`current_input_ref`与其余
+  `compacted_source_refs`；memory projection删除covered older raw、保留current
+  input、保留未covered protected raw，并让后续新material自然成为post-compact
+  delta。rebuild、incremental、inline repair与persisted reload结果一致。
+- memory selected recent与ordinary protected raw tail继续按canonical source ref与
+  content digest同源去重；确有covered material时post-compact exact conservative
+  size下降，没有covered material时不得通过丢current input或protected raw伪造下降。
 - raw `USAGE_REPORTED` 继续没有 public activity；UI 不需要 EventLog reader。
 - anchor eligibility 只由同一 attempt/execution/iteration 的 complete ordinary
   manifest、accepted link、唯一合法 usage 与 durable accepted
@@ -138,6 +158,10 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 | 直接证据 | 当前事实 | 对实现的约束 |
 | --- | --- | --- |
 | `dayu/host/context_budget.py::estimate_context_budget` | conservative estimator 按 message text、canonical JSON bytes、message overhead 与 tool-schema overhead 估算；`estimator_digest` 是具体输入 digest，不是稳定 estimator identity/version。 | 保留现有估算公式与常量；新增显式 estimator id/version 和 exact-candidate adapter，不引入 tokenizer、动态 ratio 或 correction model。 |
+| `dayu/host/context_budget.py::ContextSizingResult` / `_pressure_and_decision` | 当前 partial implementation按prediction同时固定pressure与action；soft在所有stage都映射`COMPACT_SOFT_THRESHOLD`。 | pressure与action拆开判定：pressure仍纯阈值比较，action必须消费stage；post-compact/fallback soft允许dispatch，hard显式fail closed。 |
+| `dayu/host/compact_payload.py::ContextCompactedSemanticPayload` / `source_boundary_refs` | producer确定性写第一个`request.current_input_ref`与后续去重material/evidence/fact refs，但strict semantic parser没有读取 persisted `source_boundary_refs`。 | compact payload是唯一typed read owner；parser校验非空、非空字符串、全局唯一并投影`current_input_ref`与`compacted_source_refs`，consumer不得索引raw list。 |
+| `dayu/host/memory.py::project_conversation_memory_event` | `CONTEXT_COMPACTED`更新summary/facts/anchors/intents/reference continuity与latest compact ref，却没有移除已被accepted compact覆盖的`selected_recent_window`；`recent_evidence_items`随后仍从错误window派生。 | Conversation Memory projection按typed covered refs移除covered older raw，保留current input与未covered protected raw；rebuild/incremental/repair/persisted snapshot统一复用该owner rule。 |
+| `dayu/host/run_input.py::_memory_messages`与protected raw-tail assembly | 无条件渲染snapshot selected recent；既有raw-tail path已有source ref/content digest dedupe。 | 不在RunInput新增coverage filter；只消费修正后的typed memory view并保留现有raw-tail dedupe。 |
 | `dayu/host/dispatch.py::_run_pre_start_governance` | pre-start 只用 `PreDispatchCompactMaterialView.budget_fragments` 估算；allow 时直接写 `RUN_STARTED/ATTEMPT_STARTED`，没有 canonical budget fact。 | pre-start 必须先从与实际 Runner input 同源的 complete candidate 构造 typed sizing result；fact append 与后续 transition 同事务有序提交。 |
 | `dayu/host/run_input.py::RunInputBuilder.build` | actual messages、tool schema 与 `RUNNER_CALL_INPUT_ASSEMBLED` 目前在 Run/Attempt 已启动后才构造/记录。 | 将“纯候选组装/投影”与“Attempt runtime handle/AgentRunRequest 构造”分离；前者可在 start 前冻结，后者必须验证并消费同一个 candidate digest，不能再次自由组装另一份输入。 |
 | `dayu/host/durable/run_transition.py::StartGovernedRunInput` 与 `start_governed_run_with_starting_attempt_in_transaction` | transition 已要求调用方提供 `attempt_id`、`execution_id`、`dispatch_record_id` 与两个 start event id，并用这些精确值创建 Run/Attempt/dispatch rows；transition 自身不生成 identity。 | 不修改 durable transition owner。`dispatch.py` 只在 allow 后构造一次 typed `StartGovernedRunInput`，manifest与transition共同消费其中同一 identity。 |
@@ -157,9 +181,11 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 
 Root cause 的逻辑/数据真源是：**完整 runner-call candidate、conservative
 estimate、iteration link 与 usage observation 尚未形成一个可校验的 durable
-lineage contract**。display text 只是该缺口的一个错误消费者。修复必须建立 owner
-级 contract，不能在 read API、Service、UI、fixture 或单入口用 fallback shim
-补救。
+lineage contract；同时 accepted compact 的 persisted coverage尚未进入Conversation
+Memory typed projection，且pressure被错误地当成stage-independent action**。
+display text、post-compact size不下降与accepted Run无dispatch都只是这些owner缺口的
+下游表现。修复必须建立owner级contract，不能在RunInput、read API、Service、UI、
+fixture或单入口用fallback shim补救。
 
 ## 3. Scope boundary、non-goals 与不过度设计说明
 
@@ -167,6 +193,8 @@ lineage contract**。display text 只是该缺口的一个错误消费者。修�
 
 - complete ordinary/post-compact/dispatch-fallback candidate 的单一 typed assembly
   与 digest-verified projection。
+- accepted compact `source_boundary_refs` 的strict typed read boundary，以及
+  Conversation Memory对covered raw/post-compact delta的唯一projection rule。
 - conservative estimator stable identity/version 与 complete candidate adapter。
 - runner-call manifest v2 sizing snapshot、accepted iteration link 与 usage
   observation direct pairing。
@@ -191,6 +219,9 @@ lineage contract**。display text 只是该缺口的一个错误消费者。修�
 - Engine 理解 context window、soft/hard policy、pressure 或 compact state。
 - metadata、extra payload、request id、timestamp、display text、日志或偶然 event
   顺序推断 pairing。
+- 在`run_input.py`下游过滤compact-covered recent items、consumer索引raw
+  `source_boundary_refs`、按ref前缀/sequence/time猜coverage、或为同一snapshot启动
+  第二次proactive operation。
 - 改动 WU-OBS-00B / Issue #119 analyzer correlation owner；不新增
   `client_correlation_id` / `provider_request_id` correlation contract。
 - 把 compactor proposal usage 或 provider overflow 当 calibration sample。
@@ -200,25 +231,29 @@ lineage contract**。display text 只是该缺口的一个错误消费者。修�
 
 ### 3.3 为什么不是过度设计
 
-计划只增加一个 Host-private anchor resolver、一个共享 typed sizing result 和一个
-设计明确要求的 canonical fact/public DTO。现有 EventLog、payload descriptor、
-manifest、accepted link、usage signal、activity callback 与 context policy 全部复用；
-不增加 tokenizer、provider adapter、表、后台任务或 UI。manifest schema cutover是
-冻结直接 pairing contract 的必要最小改动；exact candidate assembly refactor 是避免
-多个估算真源的 owner 修复，不是为未来扩展预建框架。
+计划只增加一个 Host-private anchor resolver、一个共享 typed sizing result、一个
+设计明确要求的 canonical fact/public DTO，并在既有compact typed payload与memory
+projection owner上补齐coverage字段和过滤规则。现有 EventLog、payload descriptor、
+manifest、accepted link、usage signal、activity callback、memory snapshot与context
+policy全部复用；不增加 tokenizer、provider adapter、表、后台任务、第二套raw-history
+index或UI。manifest schema cutover是冻结direct pairing contract的必要最小改动；
+exact candidate assembly与memory boundary修正是避免多个输入/coverage真源的owner
+修复，不是为未来扩展预建框架。
 
 ## 4. Semantic owner decisions
 
 | 语义 | 唯一 owner | 产生/校验/持久化/投影边界 | 明确禁止 |
 | --- | --- | --- | --- |
 | complete candidate messages/tool schemas/source watermark/digest | `dayu.host.run_input` candidate assembly owner | pre-start 或 recovery dispatch 前构造 digest-verified projection；actual `AgentRunRequest` 只消费并复核 | dispatch/ingest/fallback 各自拼文本 |
+| accepted compact source coverage roles | `dayu.host.compact_payload` typed source boundary | producer持久化`source_boundary_refs`；strict parser唯一拆分`current_input_ref`与`compacted_source_refs` | consumer索引raw list、按ref形态/顺序以外隐式规则或时间猜角色 |
+| selected recent post-compact delta | `dayu.host.memory` Conversation Memory projection | accepted compact时按typed covered refs更新selected window；recent evidence、incremental/rebuild/repair/persisted snapshot同源 | RunInput下游临时filter、删除current input、跨boundary补满protected floor |
 | conservative formula/constants | `dayu.host.context_budget` | exact candidate adapter调用既有 estimator | provider/tokenizer 专用估算 |
 | estimator identity/version | `dayu.host.context_budget` module constants + typed `ContextEstimatorContract` | manifest/fact写入并严格比较 | 用具体 `estimator_digest` 冒充 version |
 | runner request serialization compatibility | runner-call manifest owner | 从 serializer schema、sanitized typed Runner request semantics 计算 digest | provider name分支；包含 secret/header值 |
 | actual usage legality | Engine Runner/parser | 只对实际出现且合法的 usage emit normalized observation | Host按 capability猜 usage |
 | manifest↔iteration↔usage pairing | Host Engine ingest + manifest parser | accepted link唯一定位 complete manifest；usage signal durable保存 pairing refs/status | request id、时间戳、display text |
 | compatible anchor选择与 lineage barrier | 新 `dayu.host.context_anchor` | 仅通过调用方显式传入的同一个 `HostTransaction` + `EventLogStore`，从该 consistent snapshot中的 committed manifests、links、usage、durable accepted iteration-completed preview与accepted compact boundary重建 | 自开transaction、跨transaction分页、模块可变状态/singleton/cache、Service/UI durable访问、projection copy、summary、日志、旧测试fixture |
-| predicted tokens/threshold/pressure/decision | `dayu.host.context_budget` 的 `ContextSizingResult` | anchored或fallback只产生一个 typed result | context events/read API/Service/UI重算 |
+| predicted tokens/threshold/pressure/stage-aware action | `dayu.host.context_budget` 的 `ContextSizingResult` | anchored或fallback只产生一个typed result；pressure纯阈值派生，budget decision由stage+pressure派生 | context events/read API/Service/UI重算；把post-compact soft改写成normal |
 | context-budget durable truth | `dayu.host.context_events` + dispatch/ingest transaction owner | deterministic canonical fact append | 把 fact 作为 usage event副作用 |
 | public context usage | `HostContextUsageView` | Host从 canonical fact严格投影 | 暴露 anchor refs/raw usage/policy internal refs |
 | Service activity DTO | `dayu.service.entrypoint_runtime` | typed closed mapping逐字段透传 | basis points/percentage/pressure重算 |
@@ -390,7 +425,7 @@ BEGIN IMMEDIATE
        -> commit
        (no sizing result/fact/activity)
   -> estimate E_current + resolve anchor + build ContextSizingResult
-  -> if soft/hard:
+  -> if ordinary soft/hard:
        append CONTEXT_BUDGET_EVALUATED
        -> append compaction/fail-close transition
        -> commit
@@ -410,7 +445,7 @@ BEGIN IMMEDIATE
 ```
 
 Slice 1 尚未引入 budget fact时，上述 allow sequence暂为
-`manifest -> RUN_STARTED -> ATTEMPT_STARTED`，soft/hard仍不写manifest；Slice 2只在
+`manifest -> RUN_STARTED -> ATTEMPT_STARTED`，ordinary soft/hard仍不写manifest；Slice 2只在
 同一transaction插入fact，不改变identity与start interface。actual
 `AgentRunRequest`随后消费已start Attempt snapshot时，必须读取这个pre-start frozen
 candidate/manifest并复核同一 attempt/execution/digest，不能重组第二份输入。
@@ -713,15 +748,30 @@ method变为 `conservative_fallback`，predicted tokens严格取 `E_current`。
 失败不是“usage缺失”；这是 Host input integrity/governance failure，按既有
 fail-closed边界收口。只有历史 usage/anchor不可用必须无失败地fallback。
 
-pressure规则唯一：
+pressure与action contract固定为：
 
 ```text
-predicted >= hard -> hard_threshold_exceeded / BLOCK_HARD_THRESHOLD
-predicted >= soft -> soft_threshold_exceeded / COMPACT_SOFT_THRESHOLD
-else              -> normal / ALLOW_DISPATCH
+pressure(predicted):
+  predicted >= hard -> hard_threshold_exceeded
+  predicted >= soft -> soft_threshold_exceeded
+  else              -> normal
+
+action(stage, pressure):
+  ORDINARY:
+    normal -> ALLOW_DISPATCH
+    soft   -> COMPACT_SOFT_THRESHOLD
+    hard   -> BLOCK_HARD_THRESHOLD
+  POST_COMPACT | DISPATCH_FALLBACK:
+    normal -> ALLOW_DISPATCH
+    soft   -> ALLOW_DISPATCH
+    hard   -> BLOCK_HARD_THRESHOLD
 ```
 
-ratio与threshold仍由 `ContextBudgetPolicy` 派生，不因usage变化。
+因此`ContextSizingResult.__post_init__`必须先仅由predicted/thresholds复核
+`pressure_level`，再由`stage + pressure_level`复核`budget_decision`。
+`POST_COMPACT` / `DISPATCH_FALLBACK` soft的pressure不得降为normal；public fact/view
+继续报告soft pressure，但Host允许dispatch。ratio与threshold仍由
+`ContextBudgetPolicy`派生，不因usage或stage变化。
 
 ### 5.6 `CONTEXT_BUDGET_EVALUATED` canonical schema
 
@@ -892,6 +942,71 @@ CLI现有formatter继续只消费通用title/summary；本WU不增加具体conte
 测试必须证明新增optional typed字段不破坏既有formatter，而不是添加空分支或百分比
 重算。
 
+### 5.8 Compact source boundary 与 Conversation Memory projection contract
+
+`dayu/host/compact_payload.py::source_boundary_refs(request)`的persisted producer
+contract保持：
+
+```text
+source_boundary_refs =
+  unique_in_order(
+    request.current_input_ref,
+    *request.material_source_refs,
+    *request.canonical_evidence_refs,
+    *request.evidence_backed_fact_refs,
+  )
+```
+
+第一个ref只拥有current-input boundary角色，不表示被compact覆盖；去重后其余refs才是
+accepted compact覆盖的canonical source refs。没有任何covered material时，
+persisted list合法地只含current input。
+
+`ContextCompactedSemanticPayload`的exact typed read contract扩充为：
+
+```python
+@dataclass(frozen=True, slots=True)
+class ContextCompactedSemanticPayload:
+    accepted_candidate: ConversationCompactOutputVNext
+    accepted_candidate_digest: str
+    accepted_evidence_mapping_refs: tuple[str, ...]
+    compact_artifact_ref: str
+    current_input_ref: str
+    compacted_source_refs: tuple[str, ...]
+```
+
+`parse_context_compacted_semantic_payload(...)`是raw
+`source_boundary_refs`的唯一reader：要求字段为list、至少一项、每项为非空`str`且全局
+唯一；owner parser读取第一项为`current_input_ref`、其余为
+`compacted_source_refs`。重复current ref、空ref、wrong type、空list或缺字段全部
+fail closed；不新增旧payload compatibility reader。所有consumer只读取typed fields，
+不得再次索引payload list。
+
+`dayu/host/memory.py::project_conversation_memory_event`处理accepted compact时按以下
+唯一顺序更新recent view：
+
+1. 对每个既有`SelectedRecentWindowItem`构造其canonical source set：
+   `item.event_id + item.source_refs`。
+2. canonical source set命中`current_input_ref`时保留该item；current input在projection
+   与后续RunInput raw-tail dedupe后只能渲染一次。
+3. 否则，canonical source set与`compacted_source_refs`相交时删除该item。
+4. 与covered refs不相交的item保留；这包括未被本次selected compact material覆盖的
+   protected recent raw。
+5. 对更新后的selected window执行既有bounded policy，再从它同源重建
+   `recent_evidence_items`。
+6. compact event之后到达的eligible user/assistant/evidence canonical facts按既有
+   projection自然追加，成为新的post-compact delta。
+
+full rebuild和incremental projection都必须调用同一个event projection函数；durable
+memory catch-up、inline delta repair与snapshot reload不得复制coverage规则。
+`run_input.py`不新增compact-aware filter，只继续消费snapshot并使用既有
+`selected_recent_source_refs` / `selected_recent_content_digests`与ordinary protected
+raw tail做source-ref/content-digest去重。
+
+该contract允许真实收缩但禁止伪造收缩：当`compacted_source_refs`确实覆盖older raw
+时，post-compact exact candidate的conservative size应下降；当tuple为空或未命中任何
+selected item时，memory recent view不能因为accepted compact本身而删除current input或
+protected raw，size也不得被测试夹具强行断言下降。
+
 ## 6. State、data flow、replay 与 recovery
 
 ### 6.1 Normal anchored flow
@@ -911,7 +1026,7 @@ next complete candidate
   -> anchor resolver reads all pages in that same transaction snapshot
      and proves eligibility/compatibility/lineage
   -> ContextSizingResult(P_current, thresholds, pressure, decision)
-  -> soft/hard: fact -> compact/block, with no manifest/Attempt identity
+  -> ordinary soft/hard: fact -> compact/block, with no manifest/Attempt identity
   -> allow: allocate start identity -> manifest -> fact -> start/attempt/dispatch
   -> HostContextUsageView
   -> EntrypointContextUsage
@@ -943,8 +1058,10 @@ no actual legal USAGE_REPORTED
 - older anchor可跨无usage call，但每个中间iteration都必须有complete manifest/link；
   还必须有exact accepted iteration-completed evidence；lineage gap或crash gap立即
   fallback。
-- accepted compact是hard baseline barrier；immediate post-compact candidate只能
-  conservative fallback。该call后出现新的合法paired usage，后续candidate才可anchor。
+- accepted compact是hard anchor baseline barrier；immediate post-compact candidate
+  只能conservative fallback。memory projection必须先按typed source boundary移除
+  covered older raw，再freeze exact candidate；该call后出现新的合法paired usage，
+  后续candidate才可anchor。
 - reactive overflow只进入既有recovery state machine；它不写anchor correction。
 - recovery不能从public view、Tool Trace、memory或usage diagnostic copy恢复anchor。
 - terminal Run/Attempt状态不重建缺失的iteration completion；usage先到后failure、
@@ -963,8 +1080,49 @@ no actual legal USAGE_REPORTED
 | current complete candidate cannot assemble/verify | Host input integrity fail closed；不是usage fallback |
 | conservative estimator/current policy invalid | existing governance fail closed |
 | fact identity conflict | fail closed，不执行矛盾decision |
+| post-compact/fallback soft pressure | 保留soft pressure并允许dispatch；不得第二次proactive compact |
+| post-compact hard pressure | 同transaction写显式Run failure transition；不得普通返回`None`留下accepted Run |
+| dispatch-fallback hard pressure | 沿既有compaction-failed/fallback failure policy写显式Run failure；不得dispatch或静默停留 |
 | public canonical payload corrupt | public projection fail closed，不下游重算 |
 | Service enum出现未覆盖Host值 | assertion/error fail closed，不透传raw字符串 |
+
+### 6.5 Post-compact / dispatch-fallback stage flow
+
+同一Run/input snapshot的action flow固定为：
+
+```text
+ORDINARY exact candidate
+  -> normal: dispatch
+  -> soft: start or resume the one durable proactive operation
+  -> hard: explicit fail closed
+
+accepted compact
+  -> compact payload typed boundary
+  -> memory projection removes covered older raw
+  -> rebuild POST_COMPACT exact candidate
+  -> normal or soft: dispatch with original pressure preserved
+  -> hard: explicit terminal Run failure
+
+compact failed + tier 4/5 selected
+  -> build DISPATCH_FALLBACK exact candidate
+  -> normal or soft: dispatch with original pressure preserved
+  -> hard: existing fallback/failure policy terminal Run failure
+```
+
+Slice 1尚未写`CONTEXT_BUDGET_EVALUATED`，但stage action与terminal behavior必须先完整
+成立。实现应把post-compact/fallback helper的结果收敛为closed outcome：
+`pending dispatch`或`terminal notice`；不得继续用`PendingDispatchRecord | None`让
+hard与CAS/precondition miss共享模糊`None`。terminal outcome在当前write transaction内
+复用`fail_unstarted_run_in_transaction`；transaction commit后由现有notifier交付。
+`POST_COMPACT` hard不得为已经accepted的同一operation再追加一条矛盾
+`CONTEXT_COMPACTION_FAILED`，但必须有Run terminal fact；`DISPATCH_FALLBACK` hard复用
+此前已写/同事务将写的compact-failed diagnostic并追加Run terminal fact。Slice 2再在
+这些transition之前插入同一个sizing result的canonical budget fact。
+
+proactive projection中的existing operation identity仍是同一snapshot唯一operation
+真源。post-compact/fallback soft直接dispatch，不回到ordinary soft branch；replay或
+fresh attachment只能resume该operation或消费其terminal outcome，不能append第二条
+`CONTEXT_COMPACTION_REQUESTED`。
 
 ## 7. Affected files/modules
 
@@ -976,7 +1134,13 @@ Controller裁决。
 
 - `dayu/host/context_budget.py`
   - estimator identity/version、complete candidate adapter、sizing/result/enums、
-    formula、range validation、basis points与pressure唯一owner。
+    formula、range validation、basis points、pressure与stage-aware action唯一owner。
+- `dayu/host/compact_payload.py`
+  - persisted`source_boundary_refs` strict parser与
+    `current_input_ref/compacted_source_refs` typed read owner。
+- `dayu/host/memory.py`
+  - accepted compact覆盖selected recent window、post-compact delta与recent evidence
+    同源projection owner。
 - `dayu/host/_runner_call_manifest.py`
   - manifest v2 sizing snapshot typed parser/graph validation。
 - `dayu/host/run_input.py`
@@ -1035,6 +1199,8 @@ tests。若implementation发现必须改变该typed input或transition写入语�
 - `tests/host/test_runner_call_hot_payload_contract.py`
 - `tests/host/test_engine_ingest_mapping.py`
 - `tests/host/test_context_compact_events.py`
+- `tests/host/test_memory_projection.py`
+- `tests/host/test_memory_repair.py`
 - `tests/host/test_compaction_operation.py`
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_proactive_compaction_operation.py`
@@ -1074,16 +1240,18 @@ tests。若implementation发现必须改变该typed input或transition写入语�
 若Engine production行为确实不再满足“只emit合法actual usage”，需停止并重新裁决，
 不得在本WU扩写Engine Host-budget语义。
 
-### 7.4 Manifest/event-ordering consumer audit
+### 7.4 Manifest/event/source-boundary consumer audit
 
 `rg` 对 production/tests 的完整直接名称审计与通用ordering审计固定如下，Slice 1
 implementation开始前再运行同一命令；出现新consumer必须先加入本表及对应allowed
 scope，否则stop：
 
-| consumer | 当前依赖 | manifest-before-start影响与计划动作 |
+| consumer | 当前依赖 | owner/order影响与计划动作 |
 | --- | --- | --- |
+| `compact_payload.py` | accepted compact persisted semantic/source boundary parser | strict typed投影current input与covered refs；不参与manifest ordering。 |
+| `memory.py` / `durable/memory.py` | compact event typed projection、incremental/rebuild/repair/snapshot persistence | 只在memory owner更新selected recent；durable adapter消费typed payload，不复制raw-list parsing。 |
 | `_runner_call_manifest.py` | manifest/hot strict schema owner | 直接切v2；不依赖start顺序。 |
-| `run_input.py` | ordinary producer、runner-call index、actual request复核 | producer前移到allow transaction；actual request不再二次写manifest。 |
+| `run_input.py` | ordinary producer、runner-call index、actual request复核、memory/raw-tail dedupe | producer前移到allow transaction；actual request不再二次写manifest；不新增compact coverage filter。 |
 | `engine_ingest.py` | continuation producer、prepared manifest lookup/link、usage pairing | 同transaction commit后Run/Attempt/manifest同时可见；按exact identity找pre-start manifest，不依赖它晚于start。 |
 | `compaction_operation.py` | compactor producer | proposal路径保持自身call前manifest时序，`sizing_snapshot=not_applicable`。 |
 | `proactive_compaction.py` | compactor manifest reader | 现有kind filter继续忽略ordinary manifest；增加ordinary-before-start反例。 |
@@ -1125,24 +1293,32 @@ filter自然成立，必须stop并重新裁决。
 
 **Objective**
 
-建立complete candidate单一真源，冻结estimator contract和manifest v2 direct
-pairing；所有当前dispatch-relevant sizing仍先保持
-`conservative_fallback`，不实现canonical context-budget fact或public view。
+建立complete candidate单一真源，补齐accepted compact source-boundary →
+Conversation Memory post-compact delta projection，冻结estimator contract、
+stage-aware action和manifest v2 direct pairing；所有当前dispatch-relevant sizing
+仍先保持`conservative_fallback`，不实现canonical context-budget fact或public view。
 
 **Expected outcome**
 
 - pre-start、post-compact、fallback、reactive recovery与actual Runner request使用同一
   candidate projection/digest。
+- accepted compact后，selected recent window只保留post-compact delta与未被selected
+  compact覆盖的protected raw；current input保留一次，covered older raw不再进入exact
+  candidate。
 - complete ordinary manifest durable保存可直接用作`E_anchor`的sizing snapshot。
 - usage diagnostic不再从display text重建；只接受accepted link指向manifest。
 - estimator公式/常量与无usage conservative fallback保持；输入从subset升级为complete
   candidate，token值与threshold decision允许安全地增大/跨阈值，不承诺逐值兼容。
 - sizing不依赖manifest；只有allow后分配并由manifest/start transition实际消费同一
-  identity。soft/hard不写manifest或durable Attempt identity。
+  identity。ordinary soft/hard不写manifest或durable Attempt identity。
+- ordinary soft只启动同一snapshot唯一 proactive operation；post-compact/fallback
+  soft保留soft pressure但允许dispatch；hard显式terminal fail closed。
 
 **Allowed production files**
 
 - `dayu/host/context_budget.py`
+- `dayu/host/compact_payload.py`
+- `dayu/host/memory.py`
 - `dayu/host/_runner_call_manifest.py`
 - `dayu/host/run_input.py`
 - `dayu/host/dispatch.py`
@@ -1160,6 +1336,9 @@ pairing；所有当前dispatch-relevant sizing仍先保持
 **Allowed tests**
 
 - `tests/host/test_context_budget.py`
+- `tests/host/test_context_compact_events.py`
+- `tests/host/test_memory_projection.py`
+- `tests/host/test_memory_repair.py`
 - `tests/host/test_run_input_builder.py`
 - `tests/host/test_runner_call_hot_payload_contract.py`
 - `tests/host/test_engine_ingest_mapping.py`
@@ -1174,35 +1353,67 @@ pairing；所有当前dispatch-relevant sizing仍先保持
 - `tests/host/test_run_attempt_transitions.py`
 - `tests/host/test_outbox_projection.py`
 
+**Allowed docs / README trigger**
+
+- `dayu/host/README.md`
+- `tests/README.md`
+
+Slice 1开始修改前必须先读这两个README自身的Agent更新约束。compact payload /
+memory / context action是Host稳定owner contract，新增owner tests属于tests手册职责；
+若其README职责判断要求同步，则在本slice更新，不延后用production兼容分支替代。根
+README、`dayu/README.md`与Service README当前无Slice 1职责变化，audit后预期不修改。
+
 **Exact changes**
 
-1. 冻结estimator id/version/range与conservative `ContextSizingResult` contract；新增
-   complete candidate adapter，不改公式常量。
-2. 将RunInputBuilder的pure candidate assembly提取为可在Attempt start前调用的typed
+1. 在`compact_payload.py`扩充strict semantic parser：raw
+   `source_boundary_refs`必须非空、元素为非空str且唯一；第一个投影为
+   `current_input_ref`，其余投影为`compacted_source_refs`。不写compat parser。
+2. 在`memory.py`的accepted compact event owner按§5.8更新selected recent并同源重建
+   recent evidence；incremental、rebuild、inline repair与persisted reload共享同一
+   rule。`run_input.py`不得新增coverage filter。
+3. 冻结estimator id/version/range与conservative `ContextSizingResult` contract；新增
+   complete candidate adapter，不改公式常量；pressure纯阈值派生，action按stage
+   派生。
+4. 将RunInputBuilder的pure candidate assembly提取为可在Attempt start前调用的typed
    preparation；actual request只消费并验证frozen candidate。
-3. 把existing memory catch-up/lag repair前移到candidate freeze前；tool schema
+5. 把existing memory catch-up/lag repair前移到candidate freeze前；tool schema
    selection与Attempt-scoped ToolRuntime handle构造分离，但二者消费同一frozen
    selected-tool snapshot。
-4. 所有candidate stage都提供source watermark、projection ref/digest、tool schema
+6. 所有candidate stage都提供source watermark、projection ref/digest、tool schema
    digest、request semantics digest。
-5. pre-start sizing先使用identity-free candidate；decision=allow后在同一transaction
+7. pre-start sizing先使用identity-free candidate；decision=allow后在同一transaction
    构造一个`StartGovernedRunInput`，manifest和existing durable transition消费其中
-   同一attempt/execution identity。soft/hard不写manifest、不分配identity。
-6. manifest直接切v2，三个producer写strict `sizing_snapshot`；continuation只从
+   同一attempt/execution identity。ordinary soft/hard不写manifest、不分配identity。
+8. ordinary soft进入唯一proactive operation；post-compact/fallback soft直接进入
+   allow start且pressure保持soft。post-compact/fallback hard返回closed terminal
+   outcome，在同一transaction复用既有unstarted Run failure transition；不得返回
+   ambiguous `None`或启动第二次proactive operation。
+9. manifest直接切v2，三个producer写strict `sizing_snapshot`；continuation只从
    accepted Engine input projection、首个complete manifest的selected-tool descriptor
    与admission-frozen policy/request semantics重建，crash缺源写closed unavailable。
-7. usage ingest通过accepted link读取manifest sizing snapshot，删除
+10. usage ingest通过accepted link读取manifest sizing snapshot，删除
    `_estimate_usage_observation_input`和`display_text` estimate。
-8. allow start precondition miss抛private rollback exception并由`run_write`外caller转为
+11. allow start precondition miss抛private rollback exception并由`run_write`外caller转为
    无dispatch；低层CAS_LOST沿existing HostDurableError传播；两者都零孤立manifest。
-9. 按§7.4适配全部direct manifest consumers并验证public/recovery/projection/Tool
+12. 按§7.4适配全部direct manifest consumers并验证public/recovery/projection/Tool
    Trace/terminal ordering；不改变Issue #119 correlation。
-10. `supports_stream_usage`不进入usage availability分支；不增加anchor selection、
+13. `supports_stream_usage`不进入usage availability分支；不增加anchor selection、
     signed-delta公式或public activity。
 
 **Owner-level assertions**
 
 - complete candidate的messages/tool schemas与actual `AgentRunRequest` digest相等。
+- compact payload parser接受`[current]`与`[current, *covered]`，并拒绝empty、
+  duplicate、non-string、empty-string、missing field；所有consumer只读typed
+  `current_input_ref/compacted_source_refs`。
+- owner projection覆盖：covered older user/assistant/evidence raw删除；current input
+  保留一次；未被selected compact覆盖的protected raw保留；compact后新delta保留；
+  `recent_evidence_items`与更新后的selected window一致。
+- 同一event序列的full rebuild、incremental projection、inline delta repair与persisted
+  snapshot reload得到相同selected recent/diagnostic/digest结果。
+- memory selected与ordinary protected raw tail按source ref和content digest去重；确有
+  covered material时post-compact conservative size下降；无covered material时不删除
+  current/protected raw、不伪造size下降。
 - mixed中文/英文财报、JSON/table excerpt、tool facts/citations/memory/compact/tool
   schemas继续按既有estimator常量计入。
 - 同一fixture中complete candidate严格包含旧subset时，新估算不小于旧subset；覆盖新增
@@ -1217,8 +1428,12 @@ pairing；所有当前dispatch-relevant sizing仍先保持
 - exact linked usage取得manifest `E_anchor`；missing/mismatch link只得到typed
   unavailable，不使用display text。
 - allow path事件顺序为manifest→RUN_STARTED→ATTEMPT_STARTED并消费相同identity；
-  soft/hard零manifest/Attempt identity；precondition miss与low-level CAS lost后
+  ordinary soft/hard零manifest/Attempt identity；precondition miss与low-level CAS lost后
   EventLog/payload/state零孤立写入。
+- stage matrix精确覆盖9个组合：ordinary normal/soft/hard分别allow/compact/block；
+  post-compact与dispatch-fallback normal/soft/hard分别allow/allow/block。soft
+  pressure值不改写；post-compact/fallback hard均产生Run terminal fact，零silent
+  accepted Run；同一snapshot只有一条proactive request。
 - Tool Trace correlation/public readable behavior无语义变化；public stream、
   projection checkpoint、recovery、outbox与terminal refs满足§7.4。
 
@@ -1228,6 +1443,9 @@ pairing；所有当前dispatch-relevant sizing仍先保持
 source .venv/bin/activate
 pytest -q \
   tests/host/test_context_budget.py \
+  tests/host/test_context_compact_events.py \
+  tests/host/test_memory_projection.py \
+  tests/host/test_memory_repair.py \
   tests/host/test_run_input_builder.py \
   tests/host/test_runner_call_hot_payload_contract.py \
   tests/host/test_engine_ingest_mapping.py \
@@ -1246,9 +1464,11 @@ python -m pyright dayu/ tests/ utils/
 
 **Completion signal**
 
-candidate→estimate→allow identity→manifest→start transition→actual request→usage
-pairing形成不循环同源闭环；所有预算仍为conservative method，但使用完整candidate；
-v2、consumer ordering与rollback tests通过。
+compact typed boundary→memory post-compact delta→candidate→stage-aware estimate/action
+→allow identity→manifest→start transition→actual request→usage pairing形成不循环同源
+闭环；所有预算仍为conservative method，但使用完整candidate；covered material产生
+真实收缩、无covered material不伪造收缩；v2、consumer ordering、terminal与rollback
+tests通过。
 
 **Stop condition**
 
@@ -1258,7 +1478,11 @@ v2、consumer ordering与rollback tests通过。
 - 必须改Tool Trace analyzer/correlation production contract；
 - 必须修改`dayu/host/durable/run_transition.py`或通用transaction runner才能消费同一
   identity/保证rollback；
-- candidate refactor改变memory/evidence/LLM-facing内容而非只改变组装时点/复用方式；
+- production证据表明compact coverage不能由`compact_payload` typed boundary与
+  Conversation Memory projection唯一拥有，或必须在RunInput再建第二套filter；
+- protected recent raw是否被selected compact覆盖无法从typed canonical refs唯一判断；
+- post-compact/fallback hard无法通过既有Run failure owner显式收口，或需要第二次
+  proactive operation；
 - 任何allowed files外production修改。
 
 ### 8.3 Slice 2 — Independent canonical fact 与 Host→Service typed projection
@@ -1310,10 +1534,20 @@ anchored算法附属事件。
 - `tests/service/test_weak_typing_guard.py`
 - `tests/cli/test_activity_renderer.py`
 
+**Allowed docs / README trigger**
+
+- `dayu/host/README.md`
+- `dayu/service/README.md`
+- `tests/README.md`
+
+修改前先读目标README自身约束；只同步本slice已经实现的canonical fact、Host public
+view、Service typed pass-through与稳定验证入口。
+
 **Exact changes**
 
-1. 复用Slice 1的sizing stage/method/pressure/result typed contract；本slice
-   producer继续固定method为`conservative_fallback`，不导入anchor resolver。
+1. 复用Slice 1的sizing stage/method/pressure/stage-aware action/result typed
+   contract；本slice producer继续固定method为`conservative_fallback`，不导入anchor
+   resolver。
 2. 新增strict `CONTEXT_BUDGET_EVALUATED` schema、deterministic identity与append
    helper。
 3. ordinary、post-compact、reactive post-compact、tier fallback与hard-block路径先
@@ -1339,6 +1573,9 @@ anchored算法附属事件。
   同样零残留；正常allow只消费一套identity。
 - repeated governance只一条fact；矛盾result被拒绝。
 - normal/soft/hard、basis points >10000不clamp。
+- canonical fact同时保存真实`pressure_level`与stage-aware`budget_decision`：
+  post-compact/fallback soft的public pressure仍为soft且fact-before-dispatch；
+  hard fact-before-terminal failure，零silent accepted Run、零第二次proactive request。
 - policy missing时不伪造fact，context usage unavailable。
 - Host activity只公开七个字段；不含raw usage、refs、delta、policy ref。
 - Service字段逐一相等；通过monkeypatch使任一重算会产生不同值的测试证明无重算。
@@ -1510,13 +1747,16 @@ replay acceptance通过；README audit完成。
 
 | area | assertions |
 | --- | --- |
+| compact source boundary | strict typed current/covered roles；empty/duplicate/wrong-type拒绝；consumer不索引raw list；no compatibility |
+| Conversation Memory | covered older raw删除；current input、uncovered protected raw、新delta保留；recent evidence同源；rebuild/incremental/repair/reload一致 |
 | estimator | 既有CJK/Latin/JSON/tool-schema公式与常量；stable id/version；complete candidate全atom恰计一次；strict subset不低估与threshold crossing |
 | manifest v2 | exact fields、closed states、all producers、v1/unknown/partial拒绝、hot/descriptor/digest graph；continuation四类frozen source与closed unavailable |
 | direct pairing | unique accepted link；same iteration；missing/mismatch/ambiguous；无request id/time/display text |
 | anchor | 同transaction snapshot；positive/negative delta；tool loop；older anchor through completed missing-usage calls；usage-before-failure/crash-gap/terminal barriers；all compatibility dimensions |
-| policy | policy present + usage absent产生conservative fact；policy none保持no-budget/no-fact；fixed ratios/thresholds；>= comparison；over-100 utilization no clamp |
+| policy/action | policy present + usage absent产生conservative fact；policy none保持no-budget/no-fact；fixed ratios/thresholds；>= comparison；9-cell stage matrix；soft pressure/action分离；hard terminal fail closed；over-100 utilization no clamp |
 | candidate stages | ordinary/post-compact/dispatch-fallback；internal compactor excluded |
-| durability | allow后identity allocation/consumption；soft/hard零manifest/Attempt identity；precondition miss与CAS lost整笔rollback；fact identity/idempotency/conflict/order；replay/recovery determinism |
+| compact size effect | covered material存在时exact size真实下降；无covered material时不丢current/protected raw、不伪造下降；memory/raw-tail source+digest去重 |
+| durability | allow后identity allocation/consumption；ordinary soft/hard零manifest/Attempt identity；precondition miss与CAS lost整笔rollback；fact identity/idempotency/conflict/order；replay/recovery determinism |
 | Host public | kind/view/invariants；anchored/fallback；normal/soft/hard；policy unavailable；raw usage hidden |
 | Service | exact field pass-through；enum exhaustiveness；callback delivery |
 | CLI regression | optional context usage不破坏existing formatter；不新增具体display |
@@ -1579,8 +1819,13 @@ fake-only execution、降低阈值或修改无关production代码padding coverag
 ```bash
 rg -n "_estimate_usage_observation_input|USER_INPUT_ACCEPTED.*display_text" \
   dayu/host tests/host
+rg -n "source_boundary_refs|current_input_ref|compacted_source_refs" \
+  dayu/host/compact_payload.py dayu/host/memory.py dayu/host/run_input.py \
+  tests/host/test_context_compact_events.py tests/host/test_memory_projection.py \
+  tests/host/test_memory_repair.py
 rg -n "runner_call_input_manifest\\.v1" dayu tests
 rg -n "hasattr\\(|getattr\\(" \
+  dayu/host/compact_payload.py dayu/host/memory.py dayu/host/run_input.py \
   dayu/host/context_budget.py dayu/host/context_anchor.py \
   dayu/host/context_events.py dayu/service/entrypoint_runtime.py
 rg -n "from dayu\\.host|import dayu\\.host" dayu/engine
@@ -1593,11 +1838,13 @@ git diff --exit-code -- dayu/host/durable/run_transition.py
 git diff --check
 ```
 
-前五项预期分别为：display-text estimator零命中、manifest v1零命中、changed owner
-新增weak-typing零命中、Engine→Host反向依赖零命中、Service durable依赖零命中。
-context contract grep与manifest consumer grep必须命中§7.4完整producer/consumer/tests/
-docs并由implementation artifact逐项对账；`run_transition.py`必须零diff；最后
-`diff --check`通过。
+预期为：display-text estimator零命中；source-boundary grep只显示
+`compact_payload` raw owner、`memory` typed consumer与`run_input`既有current-input /
+raw-tail dedupe，若出现RunInput读取raw `source_boundary_refs`立即失败；manifest v1
+零命中；changed owner新增weak-typing零命中；Engine→Host反向依赖零命中；Service
+durable依赖零命中。context contract grep与manifest consumer grep必须命中§7.4完整
+producer/consumer/tests/docs并由implementation artifact逐项对账；
+`run_transition.py`必须零diff；最后`diff --check`通过。
 
 ## 10. Schema cutover decision
 
@@ -1612,13 +1859,15 @@ docs并由implementation artifact逐项对账；`run_transition.py`必须零diff
 
 ## 11. README trigger audit
 
-实施完成后按目标README自身职责审计：
+每个slice修改Host/Service/tests前先读目标README自身的Agent更新约束，并在该slice
+artifact记录audit；属于其职责的稳定contract应在同slice更新，不机械同步过程状态。
+全WU完成时再做一次aggregate audit：
 
 | README | decision | reason/content boundary |
 | --- | --- | --- |
-| `dayu/host/README.md` | update required | Host context sizing owner、manifest direct pairing、canonical fact/event ordering、public Host view均是已实现稳定Host contract |
+| `dayu/host/README.md` | update required | compact source-boundary / Conversation Memory delta owner、stage-aware action、manifest direct pairing、canonical fact/event ordering、public Host view均是稳定Host contract |
 | `dayu/service/README.md` | update required | 新增`EntrypointContextUsage`与activity callback typed pass-through，明确Service不重算 |
-| `tests/README.md` | update required | 新增稳定Context Governance focused test/coverage命令，属于现有测试手册职责 |
+| `tests/README.md` | update required | 新增compact payload、memory projection/repair、stage matrix与Context Governance focused test/coverage命令，属于现有测试手册职责 |
 | `dayu/engine/README.md` | audit, no update expected | Engine production contract不改；既有usage normalize与supports gating语义保持 |
 | `dayu/README.md` | audit, no update expected | `UI -> Service -> Host -> Engine`关系和assembly ownership不变 |
 | root `README.md` | no update | 无用户可见CLI/Web/WeChat展示或workflow变化 |
@@ -1638,7 +1887,12 @@ boundary；本计划没有需要implementation agent自行发明的契约。
 
 | risk | classification / owner | mitigation |
 | --- | --- | --- |
-| pre-start exact candidate refactor可能暴露当前memory projection freshness与actual request组装时点差异 | fixed in Slice 1；blocking if unresolved | freeze committed source watermark；actual request只消费frozen candidate；mismatch fail closed |
+| pre-start exact candidate refactor已暴露accepted compact后memory selected window仍含covered raw | fixed in Slice 1；compact payload + memory owner | typed current/covered boundary；owner projection删除covered raw；RunInput不补偿 |
+| source boundary只含current input或covered refs未命中selected window时，测试可能错误要求size下降 | fixed in Slice 1 tests | 分离“确有covered material”和“无covered material”矩阵；后者禁止伪造下降 |
+| protected raw同时由memory selected与ordinary raw tail提供造成双计 | fixed in Slice 1 | 复用source-ref与content-digest去重；owner integration test冻结 |
+| post-compact/fallback soft若继续沿ordinary action会重复compact或静默不dispatch | fixed in Slice 1；ContextSizingResult/dispatch owner | 9-cell stage matrix；soft允许dispatch并保留pressure；同snapshot operation count=1 |
+| post-compact/fallback hard普通返回`None`会留下accepted Run | fixed in Slice 1；Host lifecycle owner | closed dispatch/terminal outcome；同transaction显式Run failure |
+| 当前worktree partial implementation尚未完成tests/type/coverage | not accepted；owned by resumed Slice 1 after plan re-review | amendment双路re-review pass前禁止继续implementation或commit |
 | session历史较长时anchor scan成本 | fixed in Slice 3 | indexed session/event-sequence keyset paging；遇latest accepted compact boundary停止；不加任意总cap |
 | usage合法但provider token口径与Host heuristic长期偏差 | accepted product property，属于本WU设计目标 | 只校正compatible anchor；不承诺billing-grade精确 |
 | schema v2不读取旧workspace | explicitly accepted by project schema policy | 全新起库；no compat；README不伪装为可升级 |
@@ -1688,7 +1942,7 @@ Controller adjudication是唯一finding裁决真源。accepted findings全部在
 
 | finding | disposition | plan location / reason |
 | --- | --- | --- |
-| DS-01 | fixed | §5.1、§5.3、§8.2：sizing使用identity-free candidate；allow后同transaction分配并由manifest/start实际消费identity；soft/hard零manifest/Attempt identity。 |
+| DS-01 | fixed | §5.1、§5.3、§8.2：sizing使用identity-free candidate；allow后同transaction分配并由manifest/start实际消费identity；ordinary soft/hard零manifest/Attempt identity。 |
 | CTRL-PR-001 | fixed | §2、§5.3、§7.1、§8.2：明确不修改`run_transition.py`；existing `StartGovernedRunInput`为exact interface，补`test_run_attempt_transitions.py`与dispatch owner tests。 |
 | DS-02 | fixed | §5.6、§8.2、§8.3：唯一private exception rollback方案，区分normal UPDATED、precondition miss caller handling与low-level CAS lost传播，并断言零孤立manifest/fact/payload/state。 |
 | DS-03 | fixed | §5.4、§6、§8.4：以现有manifest/link/usage/accepted iteration-completed preview定义success与barrier，覆盖tool loop、usage-before-failure、crash gap、terminal Run，不新增completion truth。 |
@@ -1701,16 +1955,22 @@ Controller adjudication是唯一finding裁决真源。accepted findings全部在
 | MIMO-002 | rejected-with-reason | 不采纳。strict-native per-Session owner已成立，且§5.4冻结resolver在单一Host transaction snapshot内全分页；跨transaction并发反例不适用。 |
 | MIMO-003 | fixed | §5.3、§8.2、§8.4：冻结continuation projection/selected schema/policy/request semantics唯一来源；四类crash缺源closed unavailable+fallback，禁止当前config重选。 |
 | MIMO-004 | rejected-with-reason | 不采纳。manifest`sizing_snapshot`只冻结conservative contract，不包含后选anchored/fallback method；`input_snapshot_digest`与manifest digest职责已分别定义，method变化不会重写manifest。 |
+| Slice 1 accepted blocker：compact coverage owner缺失 | fixed in amendment | §2、§4、§5.8、§6.3、§7、§8.2、§9：compact payload typed current/covered boundary + Conversation Memory唯一projection；禁止RunInput filter。 |
+| Slice 1 accepted blocker：pressure/action非stage-aware | fixed in amendment | §1.3、§4、§5.5、§6.4-§6.5、§8.2-§8.3、§9：9-cell matrix；post-compact/fallback soft allow且保留pressure，hard terminal fail closed。 |
+| Slice 1 scope / verification reopening | fixed in amendment | §0、§7、§8.2、§11-§12：新增compact payload、memory与owner tests；partial implementation保持not accepted，双路re-review前不恢复。 |
 
 ## 15. Plan gate completion
 
-- status：`complete`
+- status：`amendment complete / implementation not accepted`
 - artifact：
   `docs/reviews/wu-ctx-01-plan-codex.md`
 - slice count：`3`
 - slice basis：共享complete-input/manifest contract、独立durable/public fact闭环、
   adaptive anchor算法闭环；按依赖、schema回滚风险与验证矩阵切分，不按文件切分。
 - key owner decisions：
+  - compact payload strict parser拥有persisted source boundary typed角色；
+    Conversation Memory拥有covered raw removal与post-compact delta projection；
+    RunInput不拥有coverage过滤；
   - Host RunInput/manifest拥有complete candidate与`E_anchor`；
   - sizing只消费identity-free candidate；Host dispatch在allow后生成一次
     `StartGovernedRunInput`，manifest与unchanged durable transition实际消费同一
@@ -1718,7 +1978,9 @@ Controller adjudication是唯一finding裁决真源。accepted findings全部在
   - Engine只拥有actual legal usage normalize；
   - Host ingest只拥有direct iteration pairing；accepted iteration-completed preview
     是successful runner-call所需的现有durable completion evidence，Run terminal不补洞；
-  - Context Governance拥有anchor/prediction/threshold/pressure；
+  - Context Governance拥有anchor/prediction/threshold/pressure与stage-aware action；
+    post-compact/fallback soft允许dispatch且不改写pressure，hard显式terminal
+    fail closed，同snapshot不启动第二次proactive operation；
   - canonical fact与Host public view消费同一result；
   - Service只typed pass-through，UI不重算。
 - validation plan：每slice focused tests + full pyright；最终Host/Service/Engine/CLI与
@@ -1726,5 +1988,8 @@ Controller adjudication是唯一finding裁决真源。accepted findings全部在
   schema/import/stale-field/diff audits。
 - blocking questions：`None`
 - residual risks：均已分类，见§12.2。
-- next entry point：由Controller决定是否进入`plan re-review`；本fix Agent只完成handoff，
-  不进入该gate。
+- partial implementation：保留在worktree但仍为`not accepted`；focused tests、full
+  pyright与coverage均不得沿用为通过证据。
+- next entry point：只交回Controller进入AgentMiMo / AgentDS双路`plan re-review`；
+  re-review pass并创建新的accepted-plan-amendment protected local commit后，才恢复
+  Slice 1 implementation。

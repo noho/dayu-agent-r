@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-CTX-01` Usage-Anchored Adaptive Context Sizing。 |
 | active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
-| gate | `accepted plan commit` |
+| gate | `plan amendment accepted / protected commit` |
 | blocking open questions | None。 |
-| next entry point | AgentMiMo / AgentDS plan re-review 均已通过，Controller decision=`pass`；创建 protected local accepted plan commit 后派发 AgentCodex 实施 Slice 1。 |
+| next entry point | AgentMiMo / AgentDS 双路 plan re-review均为`pass-with-risks`；Controller逐项裁决后decision=`pass`，无 plan fix。先创建只含plan-amendment gate artifacts的protected local commit，再恢复AgentCodex Slice 1 implementation。 |
 
 ## 推进规则
 
@@ -883,7 +883,7 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `draft-pr-open / final-closeo
 
 GitHub Issue #20 当前为 OPEN，title / body 已与 `docs/host/design.md` §25 的 Usage-Anchored Adaptive Context Sizing 对齐，并明确 provider live evidence 不是 work unit 前置条件；usage 缺失时走 conservative fallback。
 
-本条状态是 `active / accepted plan commit`。PR #182 已于 2026-07-23 合并，merge commit=`5afe71fe`；工作树干净，`main == github/main == 5afe71fe`。goal confirmation artifact=`docs/reviews/wu-ctx-01-goal-confirmation-controller.md`，decision=`pass`。AgentCodex plan artifact=`docs/reviews/wu-ctx-01-plan-codex.md`，采用 3 个语义闭环 slices。双路 plan review artifacts=`docs/reviews/plan-review-20260723-211859.md`、`docs/reviews/plan-review-20260723-212146.md`；Controller adjudication=`docs/reviews/wu-ctx-01-plan-review-controller-adjudication.md`，decision=`needs-fix`。AgentCodex fix artifact=`docs/reviews/wu-ctx-01-plan-fix-codex.md`。双路 re-review artifacts=`docs/reviews/plan-review-20260723-215308.md`、`docs/reviews/plan-review-20260723-215320.md`；Controller re-review adjudication=`docs/reviews/wu-ctx-01-plan-rereview-controller-adjudication.md`，decision=`pass`，blocking findings=None。下一步创建 protected local accepted plan commit，再派发 AgentCodex 实施 Slice 1。
+本条状态是 `active / plan amendment accepted / protected commit`。PR #182 已于 2026-07-23 合并，merge commit=`5afe71fe`；goal confirmation artifact=`docs/reviews/wu-ctx-01-goal-confirmation-controller.md`，decision=`pass`。AgentCodex plan artifact=`docs/reviews/wu-ctx-01-plan-codex.md`，采用 3 个语义闭环 slices。双路 plan review/fix/re-review artifacts 与 Controller adjudications 已完成，accepted plan commit=`06c143f2`。Slice 1 partial implementation handoff=`docs/reviews/wu-ctx-01-slice-1-implementation-codex.md`，status=`blocked`；Controller stop adjudication=`docs/reviews/wu-ctx-01-slice-1-stop-controller-adjudication.md`，decision=`reopen-plan`。直接证据确认 compact payload typed boundary 未向 Conversation Memory 提供 compact-covered source refs，导致 accepted compact 后 selected recent window仍重放已覆盖 raw history；同时原 plan未定义 single-operation约束下 post-compact/fallback soft pressure的 stage-aware action。AgentCodex amendment=`docs/reviews/wu-ctx-01-slice-1-plan-amendment-codex.md`；AgentDS / AgentMiMo re-review=`docs/reviews/plan-review-20260723-231956.md`、`docs/reviews/plan-review-20260723-232040.md`，均为`pass-with-risks`；Controller final adjudication=`docs/reviews/wu-ctx-01-plan-amendment-rereview-controller-adjudication.md`，decision=`pass`。strict current/covered typed boundary、Conversation Memory唯一projection、9-cell stage action、hard terminal closeout与扩充后的owner test矩阵已接受；两个独立修改与3 slices不变。下一步只提交plan-amendment gate artifacts形成protected local commit；partial production/tests仍为`not accepted`且不得混入该提交。
 
 ### 设计与代码核对
 
