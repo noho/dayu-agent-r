@@ -90,9 +90,15 @@ from dayu.host.recovery import (
     SessionAttachmentRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
+)
 from dayu.host.context_budget import (
+    ContextEstimateMethod,
     ContextSizingStage,
     build_conservative_context_sizing_result,
+    build_context_sizing_result,
 )
 from dayu.host.context_events import (
     CONTEXT_BUDGET_EVALUATED,
@@ -549,6 +555,7 @@ def test_startup_recovery_reuses_source_budget_for_new_continuation_fact(
             store.transaction_runner,
             "run-budgeted-startup",
             budgeted=True,
+            anchored_budget=True,
         )
         _insert_current_recovery_owner(store.transaction_runner)
         scanner = SessionAttachmentRecoveryScanner(
@@ -606,6 +613,18 @@ def test_startup_recovery_reuses_source_budget_for_new_continuation_fact(
             )
             assert source_payload.sizing_stage is ContextSizingStage.ORDINARY
             assert new_payload.sizing_stage is ContextSizingStage.CONTINUATION
+            assert source_payload.estimate_method is (
+                ContextEstimateMethod.USAGE_ANCHORED
+            )
+            assert new_payload.estimate_method is (
+                ContextEstimateMethod.USAGE_ANCHORED
+            )
+            assert new_payload.predicted_input_tokens == (
+                source_payload.predicted_input_tokens
+            )
+            assert new_payload.anchor_diagnostic == (
+                source_payload.anchor_diagnostic
+            )
             assert (
                 new_payload.conservative_input_tokens
                 == source_payload.conservative_input_tokens
@@ -2063,6 +2082,7 @@ def _seed_running_dispatching_run(
     *,
     slot_key: str = "recovery-scan",
     budgeted: bool = False,
+    anchored_budget: bool = False,
 ) -> None:
     """写入 running Run 与 stale owner dispatch record。
 
@@ -2070,6 +2090,7 @@ def _seed_running_dispatching_run(
     :param run_id: Run id。
     :param slot_key: 为多 Session batch fixture 隔离 active slot 的 key。
     :param budgeted: 是否写入complete source manifest与matching budget fact。
+    :param anchored_budget: 是否把source fact构造成accepted anchored truth。
     :returns: ``None``。
     :raises Exception: durable seed或budget contract失败时透传。
     """
@@ -2158,16 +2179,56 @@ def _seed_running_dispatching_run(
                 candidate,
                 budget_policy,
             )
-            sizing = build_conservative_context_sizing_result(
-                stage=ContextSizingStage.ORDINARY,
-                candidate_input_cursor=candidate.candidate_input_cursor,
-                candidate_input_projection_ref=(
-                    candidate.candidate_input_projection_ref
-                ),
-                candidate_input_digest=candidate.input_snapshot_digest,
-                policy=budget_policy,
-                estimate=estimate,
-            )
+            if anchored_budget:
+                sizing = build_context_sizing_result(
+                    stage=ContextSizingStage.ORDINARY,
+                    candidate_input_cursor=(
+                        candidate.candidate_input_cursor
+                    ),
+                    candidate_input_projection_ref=(
+                        candidate.candidate_input_projection_ref
+                    ),
+                    candidate_input_digest=candidate.input_snapshot_digest,
+                    policy=budget_policy,
+                    estimate=estimate,
+                    anchor_resolution=ContextAnchorResolution(
+                        anchor=CompatibleContextAnchor(
+                            manifest_event_id="event-anchor-source",
+                            manifest_payload_ref="payload-anchor-source",
+                            manifest_digest=sha256_digest_json(
+                                {"anchor": "manifest"}
+                            ),
+                            iteration_link_event_id="event-anchor-link",
+                            usage_event_id="event-anchor-usage",
+                            usage_observation_digest=sha256_digest_json(
+                                {"anchor": "usage"}
+                            ),
+                            iteration_completed_event_id=(
+                                "event-anchor-completed"
+                            ),
+                            usage_anchor_tokens=(
+                                estimate.estimated_input_tokens + 10
+                            ),
+                            conservative_anchor_tokens=(
+                                estimate.estimated_input_tokens
+                            ),
+                        ),
+                        fallback_reason=None,
+                    ),
+                )
+            else:
+                sizing = build_conservative_context_sizing_result(
+                    stage=ContextSizingStage.ORDINARY,
+                    candidate_input_cursor=(
+                        candidate.candidate_input_cursor
+                    ),
+                    candidate_input_projection_ref=(
+                        candidate.candidate_input_projection_ref
+                    ),
+                    candidate_input_digest=candidate.input_snapshot_digest,
+                    policy=budget_policy,
+                    estimate=estimate,
+                )
             sizing_snapshot = complete_runner_call_sizing_snapshot(
                 sizing_stage=sizing.stage,
                 estimator_id=sizing.estimator_contract.estimator_id,

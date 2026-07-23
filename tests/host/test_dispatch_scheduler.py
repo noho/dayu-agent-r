@@ -115,8 +115,14 @@ from dayu.host.compaction_operation import (
 )
 from dayu.host.context_budget import (
     ContextBudgetDecision,
+    ContextEstimateMethod,
     ContextPressureLevel,
+    ContextSizingFallbackReason,
     ContextSizingStage,
+)
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
 )
 from dayu.host.context_events import (
     CONTEXT_BUDGET_EVALUATED,
@@ -278,6 +284,7 @@ from dayu.host.durable.transaction import (
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import _host_event_from_row
+from dayu.host.run_input import PreparedRunnerCallCandidate
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneAcquireOutcome,
@@ -5039,15 +5046,62 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
 async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
     tmp_path: Path,
     stage: ContextSizingStage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """budgeted allow 对三个dispatch stage提交manifest、fact、start。
 
     :param tmp_path: pytest 临时目录。
     :param stage: 本次dispatch candidate的真实stage。
+    :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
     :raises AssertionError: stage或EventLog顺序错误时抛出。
     """
 
+    resolver_calls: list[ContextSizingStage] = []
+
+    def resolve_anchor(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        *,
+        candidate: PreparedRunnerCallCandidate,
+        context_window_size: int,
+        candidate_input_cursor: int | None = None,
+    ) -> ContextAnchorResolution:
+        """为eligible dispatch stage注入compatible anchor。
+
+        :param transaction: 当前Host transaction。
+        :param event_log_store: EventLog primitive。
+        :param candidate: complete candidate。
+        :param context_window_size: frozen context window。
+        :param candidate_input_cursor: 可选scan cursor。
+        :returns: compatible anchor。
+        """
+
+        del transaction, event_log_store, candidate_input_cursor
+        assert context_window_size == 32_768
+        resolver_calls.append(stage)
+        return ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-anchor",
+                manifest_payload_ref="payload-anchor",
+                manifest_digest=sha256_digest_json({"anchor": "manifest"}),
+                iteration_link_event_id="event-anchor-link",
+                usage_event_id="event-anchor-usage",
+                usage_observation_digest=sha256_digest_json(
+                    {"anchor": "usage"}
+                ),
+                iteration_completed_event_id="event-anchor-completed",
+                usage_anchor_tokens=100,
+                conservative_anchor_tokens=100,
+            ),
+            fallback_reason=None,
+        )
+
+    monkeypatch.setattr(
+        host_dispatch,
+        "resolve_prepared_runner_call_context_anchor_in_transaction",
+        resolve_anchor,
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
             store,
@@ -5100,6 +5154,20 @@ async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
                 )
             )
             assert fact.sizing_stage is stage
+            if stage is ContextSizingStage.POST_COMPACT:
+                assert resolver_calls == []
+                assert fact.estimate_method is (
+                    ContextEstimateMethod.CONSERVATIVE_FALLBACK
+                )
+                assert fact.fallback_reason is (
+                    ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
+                )
+            else:
+                assert resolver_calls == [stage]
+                assert fact.estimate_method is (
+                    ContextEstimateMethod.USAGE_ANCHORED
+                )
+                assert fact.anchor_diagnostic is not None
         finally:
             await scheduler.close()
 

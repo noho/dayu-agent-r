@@ -8,6 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
+)
 from dayu.host.api import (
     HostActivityKind,
     HostActivityStatus,
@@ -21,6 +25,7 @@ from dayu.host.context_budget import (
     ContextSizingResult,
     ContextSizingStage,
     build_conservative_context_sizing_result,
+    build_context_sizing_result,
 )
 from dayu.host.context_events import (
     CONTEXT_BUDGET_EVALUATED,
@@ -32,7 +37,7 @@ from dayu.host.context_events import (
     parse_context_budget_evaluated_payload,
 )
 from dayu.host.context_policy import default_context_budget_policy
-from dayu.host.durable.codec import canonical_json_dumps
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import (
     HostDurableError,
@@ -194,6 +199,87 @@ def test_payload_utilization_is_unclamped_and_public_subset_is_exact(
     assert "usage" not in public_fields
 
 
+def test_anchored_fact_roundtrip_keeps_diagnostic_host_private(
+    tmp_path: Path,
+) -> None:
+    """canonical fact保留anchor诊断，public七字段仍不泄漏refs。
+
+    :param tmp_path: pytest临时目录。
+    """
+
+    policy = default_context_budget_policy(context_window_size=1_000)
+    estimate = BudgetEstimate(
+        estimated_input_tokens=650,
+        input_budget_tokens=1_000,
+        soft_threshold_tokens=800,
+        hard_threshold_tokens=900,
+        safety_margin_tokens=200,
+        estimator_digest=_ESTIMATOR_DIGEST,
+        overage_reason=None,
+    )
+    result = build_context_sizing_result(
+        stage=ContextSizingStage.ORDINARY,
+        candidate_input_cursor=4,
+        candidate_input_projection_ref="candidate:projection",
+        candidate_input_digest=_CANDIDATE_DIGEST,
+        policy=policy,
+        estimate=estimate,
+        anchor_resolution=ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-manifest-anchor",
+                manifest_payload_ref="payload-manifest-anchor",
+                manifest_digest=sha256_digest_json({"manifest": "anchor"}),
+                iteration_link_event_id="event-link-anchor",
+                usage_event_id="event-usage-anchor",
+                usage_observation_digest=sha256_digest_json(
+                    {"usage": "anchor"}
+                ),
+                iteration_completed_event_id="event-completed-anchor",
+                usage_anchor_tokens=620,
+                conservative_anchor_tokens=600,
+            ),
+            fallback_reason=None,
+        ),
+    )
+    payload = build_context_budget_evaluated_payload(
+        run_id="run-budget",
+        result=result,
+    )
+    parsed = parse_context_budget_evaluated_payload(payload)
+    assert parsed.estimate_method is ContextEstimateMethod.USAGE_ANCHORED
+    assert parsed.predicted_input_tokens == 670
+    assert parsed.anchor_diagnostic == result.anchor_diagnostic
+    with open_host_durable_store(_options(tmp_path)) as store:
+        row = store.transaction_runner.run_write(
+            lambda transaction: append_context_budget_evaluated_in_transaction(
+                transaction,
+                EventLogStore(),
+                session_id="session-budget",
+                run_id="run-budget",
+                attempt_id="attempt-budget",
+                execution_id="execution-budget",
+                occurred_at=_NOW,
+                result=result,
+            )
+        )
+        event = store.transaction_runner.run_read(
+            lambda transaction: _host_event_from_row(transaction, row)
+        )
+        assert event.activity is not None
+        assert event.activity.context_usage is not None
+        assert frozenset(
+            field.name for field in fields(event.activity.context_usage)
+        ) == frozenset(
+            {
+                "estimate_method",
+                "predicted_input_tokens",
+                "context_window_size",
+                "utilization_basis_points",
+                "soft_threshold_tokens",
+                "hard_threshold_tokens",
+                "pressure_level",
+            }
+        )
 def test_deterministic_append_reuses_same_truth_and_rejects_conflict(
     tmp_path: Path,
 ) -> None:

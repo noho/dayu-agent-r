@@ -21,6 +21,7 @@ from dayu.host.compaction import (
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_budget import (
     MAX_CONTEXT_TOKEN_COUNT,
+    ContextAnchorDiagnostic,
     ContextBudgetDecision,
     ContextEstimateMethod,
     ContextPressureLevel,
@@ -90,38 +91,6 @@ _ANCHOR_DIAGNOSTIC_FIELDS = (
     "signed_delta_tokens",
     "predicted_input_tokens",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class ContextAnchorDiagnostic:
-    """Host-only usage anchor diagnostic。
-
-    :param manifest_event_id: anchor manifest event id。
-    :param manifest_payload_ref: anchor manifest payload ref。
-    :param manifest_digest: anchor manifest digest。
-    :param iteration_link_event_id: accepted iteration link event id。
-    :param usage_event_id: paired usage observation event id。
-    :param usage_observation_digest: normalized usage observation digest。
-    :param iteration_completed_event_id: accepted iteration completion event id。
-    :param usage_anchor_tokens: provider-reported anchor input tokens。
-    :param conservative_anchor_tokens: anchor candidate conservative tokens。
-    :param conservative_current_tokens: current candidate conservative tokens。
-    :param signed_delta_tokens: signed conservative delta。
-    :param predicted_input_tokens: anchored prediction。
-    """
-
-    manifest_event_id: str
-    manifest_payload_ref: str
-    manifest_digest: str
-    iteration_link_event_id: str
-    usage_event_id: str
-    usage_observation_digest: str
-    iteration_completed_event_id: str
-    usage_anchor_tokens: int
-    conservative_anchor_tokens: int
-    conservative_current_tokens: int
-    signed_delta_tokens: int
-    predicted_input_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,8 +219,8 @@ def build_context_budget_evaluated_payload(
 ) -> Mapping[str, JsonValue]:
     """从唯一 sizing truth 构造 canonical payload。
 
-    Slice 2 producer只允许 conservative fallback；本 builder不选择usage、不读取
-    EventLog anchor，也不改变result中的pressure/action。
+    本 builder不选择usage、不读取EventLog anchor，也不改变result中的
+    pressure/action。
 
     :param run_id: owning Host Run id。
     :param result: complete conservative sizing truth。
@@ -295,8 +264,14 @@ def build_context_budget_evaluated_payload(
         "hard_threshold_tokens": result.hard_threshold_tokens,
         "pressure_level": result.pressure_level.value,
         "budget_decision": result.budget_decision.value,
-        "fallback_reason": result.fallback_reason.value,
-        "anchor_diagnostic": None,
+        "fallback_reason": (
+            result.fallback_reason.value
+            if result.fallback_reason is not None
+            else None
+        ),
+        "anchor_diagnostic": _anchor_diagnostic_payload(
+            result.anchor_diagnostic
+        ),
     }
     parse_context_budget_evaluated_payload(payload)
     return payload
@@ -608,8 +583,6 @@ def load_matching_context_budget_evaluation_in_transaction(
         or parsed.conservative_input_tokens != conservative_input_tokens
         or parsed.context_window_size != context_window_size
         or parsed.policy_ref != policy_ref
-        or parsed.estimate_method
-        is not ContextEstimateMethod.CONSERVATIVE_FALLBACK
     ):
         raise HostDurableError(
             "source context budget fact does not match frozen manifest"
@@ -802,6 +775,42 @@ def _parse_anchor_diagnostic(value: JsonValue) -> ContextAnchorDiagnostic | None
     if abs(diagnostic.signed_delta_tokens) > MAX_CONTEXT_TOKEN_COUNT:
         raise ValueError("anchor signed delta exceeds supported range")
     return diagnostic
+
+
+def _anchor_diagnostic_payload(
+    diagnostic: ContextAnchorDiagnostic | None,
+) -> Mapping[str, JsonValue] | None:
+    """把typed anchor diagnostic序列化为canonical nested object。
+
+    :param diagnostic: Host-private anchor诊断；fallback时为``None``。
+    :returns: canonical JSON object或``None``。
+    :raises TypeError: diagnostic类型非法时抛出。
+    """
+
+    if diagnostic is None:
+        return None
+    if not isinstance(diagnostic, ContextAnchorDiagnostic):
+        raise TypeError("anchor diagnostic must be ContextAnchorDiagnostic")
+    return {
+        "manifest_event_id": diagnostic.manifest_event_id,
+        "manifest_payload_ref": diagnostic.manifest_payload_ref,
+        "manifest_digest": diagnostic.manifest_digest,
+        "iteration_link_event_id": diagnostic.iteration_link_event_id,
+        "usage_event_id": diagnostic.usage_event_id,
+        "usage_observation_digest": diagnostic.usage_observation_digest,
+        "iteration_completed_event_id": (
+            diagnostic.iteration_completed_event_id
+        ),
+        "usage_anchor_tokens": diagnostic.usage_anchor_tokens,
+        "conservative_anchor_tokens": (
+            diagnostic.conservative_anchor_tokens
+        ),
+        "conservative_current_tokens": (
+            diagnostic.conservative_current_tokens
+        ),
+        "signed_delta_tokens": diagnostic.signed_delta_tokens,
+        "predicted_input_tokens": diagnostic.predicted_input_tokens,
+    }
 
 CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 """Context compaction requested canonical event type。"""
@@ -1837,7 +1846,6 @@ __all__ = [
     "CONTEXT_COMPACTION_ATTEMPT_REJECTED",
     "CONTEXT_COMPACTION_FAILED",
     "CONTEXT_COMPACTION_REQUESTED",
-    "ContextAnchorDiagnostic",
     "ContextBudgetEvaluatedPayload",
     "ContextBudgetEvaluationIdentity",
     "append_context_budget_evaluated_in_transaction",

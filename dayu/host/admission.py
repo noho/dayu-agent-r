@@ -83,7 +83,7 @@ from dayu.host.context_budget import (
     ContextSizingResult,
     ContextSizingStage,
     build_conservative_context_sizing_result,
-    build_conservative_context_sizing_result_from_atoms,
+    build_context_sizing_result,
 )
 from dayu.host.context_events import (
     append_context_budget_evaluated_in_transaction,
@@ -162,6 +162,7 @@ from dayu.host.run_input import (
     load_prepared_runner_call_source_in_transaction,
     prepare_runner_call_candidate_in_transaction,
     record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
 )
 from dayu.host.tool_runtime import (
     EffectiveToolBundleBuildRequest,
@@ -3119,22 +3120,33 @@ def _create_steer_attempt_result(
         sizing_snapshot=sizing_snapshot,
     )
     if sizing is not None:
-        sizing = build_conservative_context_sizing_result_from_atoms(
+        if context_budget_policy is None:
+            raise HostDurableError(
+                "steer sizing exists without context budget policy"
+            )
+        anchor_resolution = (
+            resolve_prepared_runner_call_context_anchor_in_transaction(
+                transaction,
+                event_log_store,
+                candidate=candidate,
+                context_window_size=(
+                    context_budget_policy.context_window_size
+                ),
+            )
+        )
+        sizing = build_context_sizing_result(
             stage=ContextSizingStage.CONTINUATION,
             candidate_input_cursor=manifest_event.event_sequence,
             candidate_input_projection_ref=(
                 sizing.candidate_input_projection_ref
             ),
             candidate_input_digest=sizing.candidate_input_digest,
-            estimator_contract=sizing.estimator_contract,
-            estimator_digest=sizing.estimator_digest,
-            conservative_input_tokens=sizing.conservative_input_tokens,
-            context_window_size=sizing.context_window_size,
-            soft_threshold_tokens=sizing.soft_threshold_tokens,
-            hard_threshold_tokens=sizing.hard_threshold_tokens,
-            policy_ref=sizing.policy_ref,
-            policy_snapshot_digest=sizing.policy_snapshot_digest,
-            fallback_reason=sizing.fallback_reason,
+            policy=context_budget_policy,
+            estimate=estimate_prepared_runner_call_candidate(
+                candidate,
+                context_budget_policy,
+            ),
+            anchor_resolution=anchor_resolution,
         )
         append_context_budget_evaluated_in_transaction(
             transaction,

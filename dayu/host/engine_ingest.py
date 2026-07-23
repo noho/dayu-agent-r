@@ -131,9 +131,11 @@ from dayu.host.context_budget import (
     BudgetTextFragment,
     ContextBudgetDecision,
     ContextEstimatorContract,
+    ContextSizingFallbackReason,
     ContextSizingStage,
     build_conservative_context_sizing_result,
-    build_conservative_context_sizing_result_from_atoms,
+    build_context_sizing_result,
+    build_context_sizing_result_from_atoms,
     UsageObservation,
     UsageObservationDiagnostic,
     USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
@@ -142,6 +144,10 @@ from dayu.host.context_budget import (
     decide_context_budget,
     estimate_context_budget,
     estimate_context_input,
+)
+from dayu.host.context_anchor import (
+    ContextAnchorQuery,
+    resolve_context_anchor,
 )
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
@@ -261,6 +267,7 @@ from dayu.host.run_input import (
     load_prepared_runner_call_candidate_in_transaction,
     prepare_runner_call_candidate_in_transaction,
     record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
 )
 from dayu.host.tool_trace_signals import (
     CONTEXT_PRESSURE_SCHEMA_VERSION as _CONTEXT_PRESSURE_SCHEMA_VERSION,
@@ -803,16 +810,42 @@ class _StartReactiveRecoveryOperation:
             candidate,
             self.context_budget_policy,
         )
-        sizing = build_conservative_context_sizing_result(
-            stage=stage,
-            candidate_input_cursor=candidate.candidate_input_cursor,
-            candidate_input_projection_ref=(
-                candidate.candidate_input_projection_ref
-            ),
-            candidate_input_digest=candidate.input_snapshot_digest,
-            policy=self.context_budget_policy,
-            estimate=estimate,
-        )
+        if stage is ContextSizingStage.REACTIVE_POST_COMPACT:
+            sizing = build_conservative_context_sizing_result(
+                stage=stage,
+                candidate_input_cursor=candidate.candidate_input_cursor,
+                candidate_input_projection_ref=(
+                    candidate.candidate_input_projection_ref
+                ),
+                candidate_input_digest=candidate.input_snapshot_digest,
+                policy=self.context_budget_policy,
+                estimate=estimate,
+                fallback_reason=(
+                    ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
+                ),
+            )
+        else:
+            anchor_resolution = (
+                resolve_prepared_runner_call_context_anchor_in_transaction(
+                    transaction,
+                    self.event_log_store,
+                    candidate=candidate,
+                    context_window_size=(
+                        self.context_budget_policy.context_window_size
+                    ),
+                )
+            )
+            sizing = build_context_sizing_result(
+                stage=stage,
+                candidate_input_cursor=candidate.candidate_input_cursor,
+                candidate_input_projection_ref=(
+                    candidate.candidate_input_projection_ref
+                ),
+                candidate_input_digest=candidate.input_snapshot_digest,
+                policy=self.context_budget_policy,
+                estimate=estimate,
+                anchor_resolution=anchor_resolution,
+            )
         if (
             stage is ContextSizingStage.DISPATCH_FALLBACK
             and sizing.budget_decision
@@ -3775,6 +3808,9 @@ class EngineEventIngestor:
             or sizing.estimator_digest is None
             or sizing.conservative_input_tokens is None
             or sizing.context_window_size is None
+            or sizing.provider is None
+            or sizing.model is None
+            or sizing.request_semantics_digest is None
             or sizing.input_snapshot_digest is None
             or sizing.policy_ref is None
             or sizing.policy_snapshot_digest is None
@@ -3782,7 +3818,27 @@ class EngineEventIngestor:
             raise HostDurableError(
                 "complete continuation manifest is missing budget atoms"
             )
-        result = build_conservative_context_sizing_result_from_atoms(
+        anchor_resolution = resolve_context_anchor(
+            transaction,
+            self._event_log_store,
+            ContextAnchorQuery(
+                session_id=context.run.session_id,
+                current_run_id=context.run.run_id,
+                candidate_input_cursor=manifest_event.event_sequence - 1,
+                candidate_input_digest=sizing.input_snapshot_digest,
+                provider=sizing.provider,
+                model=sizing.model,
+                context_window_size=sizing.context_window_size,
+                estimator_contract=ContextEstimatorContract(
+                    estimator_id=sizing.estimator_id,
+                    estimator_version=sizing.estimator_version,
+                ),
+                request_semantics_digest=(
+                    sizing.request_semantics_digest
+                ),
+            ),
+        )
+        result = build_context_sizing_result_from_atoms(
             stage=ContextSizingStage.CONTINUATION,
             candidate_input_cursor=manifest_event.event_sequence,
             candidate_input_projection_ref=projection.payload_ref,
@@ -3798,6 +3854,8 @@ class EngineEventIngestor:
             hard_threshold_tokens=source_budget.hard_threshold_tokens,
             policy_ref=sizing.policy_ref,
             policy_snapshot_digest=sizing.policy_snapshot_digest,
+            anchor_resolution=anchor_resolution,
+            fallback_reason=None,
         )
         return (
             manifest_event,

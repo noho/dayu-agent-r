@@ -116,6 +116,11 @@ from dayu.host.context_budget import (
     estimate_context_budget,
     estimate_context_input,
 )
+from dayu.host.context_anchor import (
+    ContextAnchorQuery,
+    ContextAnchorResolution,
+    resolve_context_anchor,
+)
 from dayu.host.context_policy import ContextBudgetPolicy
 from dayu.host.durable.event_log import (
     EventClass,
@@ -2493,6 +2498,53 @@ def estimate_prepared_runner_call_candidate(
     return estimate_context_budget(
         policy,
         _budget_estimate_input_from_prepared_candidate(candidate),
+    )
+
+
+def resolve_prepared_runner_call_context_anchor_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    candidate: PreparedRunnerCallCandidate,
+    context_window_size: int,
+    candidate_input_cursor: int | None = None,
+) -> ContextAnchorResolution:
+    """为complete prepared candidate构造typed query并解析durable anchor。
+
+    本helper只把RunInput owner已冻结的provider/model/request semantics/input digest
+    映射成resolver query；它不计算prediction、threshold或action。
+
+    :param transaction: 调用方现有Host transaction。
+    :param event_log_store: stateless EventLog primitive。
+    :param candidate: complete prepared candidate。
+    :param context_window_size: frozen context window。
+    :param candidate_input_cursor: 可选scan上界；省略时使用candidate source watermark。
+    :returns: compatible anchor或closed fallback reason。
+    :raises TypeError: candidate或cursor类型非法时抛出。
+    :raises ValueError: query atom范围或digest非法时抛出。
+    """
+
+    if not isinstance(candidate, PreparedRunnerCallCandidate):
+        raise TypeError("candidate must be PreparedRunnerCallCandidate")
+    scan_cursor = (
+        candidate.candidate_input_cursor
+        if candidate_input_cursor is None
+        else candidate_input_cursor
+    )
+    return resolve_context_anchor(
+        transaction,
+        event_log_store,
+        ContextAnchorQuery(
+            session_id=candidate.session_id,
+            current_run_id=candidate.run_id,
+            candidate_input_cursor=scan_cursor,
+            candidate_input_digest=candidate.input_snapshot_digest,
+            provider=candidate.policy_snapshot.runner_spec.provider,
+            model=candidate.policy_snapshot.runner_spec.model,
+            context_window_size=context_window_size,
+            estimator_contract=CONTEXT_ESTIMATOR_CONTRACT,
+            request_semantics_digest=candidate.request_semantics_digest,
+        ),
     )
 
 
@@ -8049,6 +8101,7 @@ __all__ = [
     "create_no_tool_run_input_builder",
     "create_tool_enabled_run_input_builder",
     "estimate_prepared_runner_call_candidate",
+    "resolve_prepared_runner_call_context_anchor_in_transaction",
     "load_prepared_runner_call_candidate",
     "load_prepared_runner_call_candidate_in_transaction",
     "prepare_runner_call_candidate",

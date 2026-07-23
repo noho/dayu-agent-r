@@ -142,6 +142,7 @@ from dayu.host.run_input import (
     load_prepared_runner_call_candidate,
     prepare_runner_call_candidate_in_transaction,
     record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
 )
 from dayu.host._runner_call_manifest import (
     RunnerCallSizingUnavailableReason,
@@ -193,9 +194,11 @@ from dayu.host.context_budget import (
     BudgetEstimateInput,
     BudgetTextFragment,
     ContextBudgetDecision,
+    ContextSizingFallbackReason,
     ContextSizingResult,
     ContextSizingStage,
     build_conservative_context_sizing_result,
+    build_context_sizing_result,
     decide_context_budget,
     estimate_context_budget,
 )
@@ -214,7 +217,10 @@ from dayu.host.context_events import (
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
 )
-from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    ContextCompactionTriggerSource,
+)
 from dayu.host.proactive_compaction import (
     ProactiveCompactionAttemptPlan,
     ProactiveCompactionAttemptStage,
@@ -737,6 +743,71 @@ DispatchStartPlan: TypeAlias = BudgetedDispatchStart | NoBudgetDispatchStart
 
 class _StartCandidateCasMissRollback(Exception):
     """start precondition miss 的 transaction-private rollback 信号。"""
+
+
+def _build_candidate_sizing_result(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    stage: ContextSizingStage,
+    candidate: PreparedRunnerCallCandidate,
+    policy: ContextBudgetPolicy,
+    estimate: BudgetEstimate,
+) -> ContextSizingResult:
+    """在当前 dispatch transaction 内构造唯一 candidate sizing 结果。
+
+    accepted compact 后的 immediate candidate 没有可证明的普通 lineage
+    continuity，因此固定使用完整 conservative estimate；其余 dispatch
+    candidate 在同一 snapshot 内解析 durable anchor，再交给 budget owner
+    计算预测与五阶段动作。
+
+    :param transaction: 调用方当前 Host transaction。
+    :param event_log_store: stateless EventLog primitive。
+    :param stage: 当前 candidate sizing stage。
+    :param candidate: complete prepared runner-call candidate。
+    :param policy: frozen context budget policy。
+    :param estimate: 当前 complete candidate 的 conservative estimate。
+    :returns: anchored 或 conservative sizing result。
+    :raises TypeError: typed 参数非法时抛出。
+    :raises ValueError: candidate、policy、estimate 或 resolver atoms 不一致时抛出。
+    """
+
+    if stage in (
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.REACTIVE_POST_COMPACT,
+    ):
+        return build_conservative_context_sizing_result(
+            stage=stage,
+            candidate_input_cursor=candidate.candidate_input_cursor,
+            candidate_input_projection_ref=(
+                candidate.candidate_input_projection_ref
+            ),
+            candidate_input_digest=candidate.input_snapshot_digest,
+            policy=policy,
+            estimate=estimate,
+            fallback_reason=(
+                ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
+            ),
+        )
+    anchor_resolution = (
+        resolve_prepared_runner_call_context_anchor_in_transaction(
+            transaction,
+            event_log_store,
+            candidate=candidate,
+            context_window_size=policy.context_window_size,
+        )
+    )
+    return build_context_sizing_result(
+        stage=stage,
+        candidate_input_cursor=candidate.candidate_input_cursor,
+        candidate_input_projection_ref=(
+            candidate.candidate_input_projection_ref
+        ),
+        candidate_input_digest=candidate.input_snapshot_digest,
+        policy=policy,
+        estimate=estimate,
+        anchor_resolution=anchor_resolution,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1844,13 +1915,11 @@ class HostDispatchScheduler:
                 candidate,
                 policy,
             )
-            sizing = build_conservative_context_sizing_result(
+            sizing = _build_candidate_sizing_result(
+                transaction,
+                self._event_log_store,
                 stage=ContextSizingStage.ORDINARY,
-                candidate_input_cursor=candidate.candidate_input_cursor,
-                candidate_input_projection_ref=(
-                    candidate.candidate_input_projection_ref
-                ),
-                candidate_input_digest=candidate.input_snapshot_digest,
+                candidate=candidate,
                 policy=policy,
                 estimate=estimate,
             )
@@ -2520,13 +2589,11 @@ class HostDispatchScheduler:
                 terminal_notice=None,
             )
         estimate = estimate_prepared_runner_call_candidate(candidate, policy)
-        sizing = build_conservative_context_sizing_result(
+        sizing = _build_candidate_sizing_result(
+            transaction,
+            self._event_log_store,
             stage=stage,
-            candidate_input_cursor=candidate.candidate_input_cursor,
-            candidate_input_projection_ref=(
-                candidate.candidate_input_projection_ref
-            ),
-            candidate_input_digest=candidate.input_snapshot_digest,
+            candidate=candidate,
             policy=policy,
             estimate=estimate,
         )

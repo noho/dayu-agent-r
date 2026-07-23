@@ -933,10 +933,9 @@ def parse_runner_call_manifest(
         value,
         "runner_input_serializer_schema_version",
     )
-    if serializer_schema_version != RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION:
-        raise HostDurableError(
-            "runner-call manifest serializer schema version is unsupported"
-        )
+    require_current_runner_input_serializer_schema_version(
+        serializer_schema_version
+    )
     input_projection_digest = _required_digest(
         value,
         "input_projection_digest",
@@ -969,6 +968,25 @@ def parse_runner_call_manifest(
         actual_manifest_digest=sha256_digest_json(value),
     )
     return manifest
+
+
+def require_current_runner_input_serializer_schema_version(
+    value: str,
+) -> None:
+    """校验runner input serializer schema version为当前唯一contract。
+
+    本validator由manifest owner复用Engine serializer的公开版本真源，使Host内其它
+    manifest lineage消费者无需反向依赖Engine模块或复制版本字面量。
+
+    :param value: 待校验serializer schema version。
+    :returns: ``None``。
+    :raises HostDurableError: value不是当前唯一版本时抛出。
+    """
+
+    if value != RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION:
+        raise HostDurableError(
+            "runner-call manifest serializer schema version is unsupported"
+        )
 
 
 def _validate_manifest_fields(value: Mapping[str, JsonValue]) -> None:

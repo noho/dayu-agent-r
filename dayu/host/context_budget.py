@@ -1,9 +1,11 @@
-"""Host context budget conservative estimator。
+"""Host context budget estimator、adaptive sizing 与五阶段决策。
 
 本模块实现 Host-owned typed budget 估算与阈值决策。估算
 依据来自 Host RunInputBuilder / Context Governance 可提供的 typed view，
 不读取 Engine spec、provider overflow payload、metadata 或 extra payload。
-Runner usage 只建模为 post-call observation，不参与当前阈值动态调整。
+当前 complete candidate 始终先生成 conservative estimate；兼容 durable usage
+anchor 可通过固定 signed-delta 公式校正 prediction，任何不可用或非法 anchor
+均回退同一个 complete-candidate estimate。
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import ceil, floor
+from typing import TYPE_CHECKING
 import unicodedata
 
 from dayu.contracts.json_value import JsonValue
@@ -31,7 +34,16 @@ from dayu.host.context_policy import (
     DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
     MIN_CONTEXT_HARD_THRESHOLD_TOKENS,
 )
-from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    is_sha256_digest,
+    sha256_digest_json,
+)
+
+if TYPE_CHECKING:
+    # anchor resolver消费本模块的estimator contract；此处延迟导入只用于打破
+    # 两个owner类型之间的模块初始化环，不承担兼容或可选依赖语义。
+    from dayu.host.context_anchor import ContextAnchorResolution
 
 DEFAULT_INPUT_SOFT_THRESHOLD_RATIO = DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO
 DEFAULT_ESTIMATOR_CHARS_PER_TOKEN = 3
@@ -154,6 +166,98 @@ CONTEXT_ESTIMATOR_CONTRACT = ContextEstimatorContract(
     estimator_id=CONTEXT_ESTIMATOR_ID,
     estimator_version=CONTEXT_ESTIMATOR_VERSION,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAnchorDiagnostic:
+    """Host-private usage anchor 诊断。
+
+    :param manifest_event_id: anchor manifest event id。
+    :param manifest_payload_ref: anchor manifest payload ref。
+    :param manifest_digest: anchor manifest digest。
+    :param iteration_link_event_id: accepted iteration link event id。
+    :param usage_event_id: paired usage observation event id。
+    :param usage_observation_digest: normalized usage observation digest。
+    :param iteration_completed_event_id: accepted iteration completion event id。
+    :param usage_anchor_tokens: provider-reported anchor input tokens。
+    :param conservative_anchor_tokens: anchor candidate conservative tokens。
+    :param conservative_current_tokens: current candidate conservative tokens。
+    :param signed_delta_tokens: signed conservative delta。
+    :param predicted_input_tokens: anchored prediction。
+    """
+
+    manifest_event_id: str
+    manifest_payload_ref: str
+    manifest_digest: str
+    iteration_link_event_id: str
+    usage_event_id: str
+    usage_observation_digest: str
+    iteration_completed_event_id: str
+    usage_anchor_tokens: int
+    conservative_anchor_tokens: int
+    conservative_current_tokens: int
+    signed_delta_tokens: int
+    predicted_input_tokens: int
+
+    def __post_init__(self) -> None:
+        """校验 anchor refs、digest、token 与固定公式。
+
+        :returns: ``None``。
+        :raises TypeError: 整数字段不是严格整数时抛出。
+        :raises ValueError: ref、digest、范围或公式不一致时抛出。
+        """
+
+        for field_name, value in (
+            ("manifest_event_id", self.manifest_event_id),
+            ("manifest_payload_ref", self.manifest_payload_ref),
+            ("iteration_link_event_id", self.iteration_link_event_id),
+            ("usage_event_id", self.usage_event_id),
+            ("iteration_completed_event_id", self.iteration_completed_event_id),
+        ):
+            _require_non_empty(
+                value,
+                field_name=f"ContextAnchorDiagnostic.{field_name}",
+            )
+        for field_name, value in (
+            ("manifest_digest", self.manifest_digest),
+            ("usage_observation_digest", self.usage_observation_digest),
+        ):
+            _require_sha256_digest(
+                value,
+                field_name=f"ContextAnchorDiagnostic.{field_name}",
+            )
+        for field_name, value in (
+            ("usage_anchor_tokens", self.usage_anchor_tokens),
+            ("conservative_anchor_tokens", self.conservative_anchor_tokens),
+            ("conservative_current_tokens", self.conservative_current_tokens),
+        ):
+            _require_context_token_count(
+                value,
+                field_name=f"ContextAnchorDiagnostic.{field_name}",
+            )
+        _require_int(
+            self.signed_delta_tokens,
+            field_name="ContextAnchorDiagnostic.signed_delta_tokens",
+        )
+        if abs(self.signed_delta_tokens) > MAX_CONTEXT_TOKEN_COUNT:
+            raise ValueError("anchor signed delta exceeds supported range")
+        _require_positive_int(
+            self.predicted_input_tokens,
+            field_name="ContextAnchorDiagnostic.predicted_input_tokens",
+        )
+        if self.predicted_input_tokens > MAX_CONTEXT_TOKEN_COUNT:
+            raise ValueError("anchor prediction exceeds supported range")
+        expected_delta = (
+            self.conservative_current_tokens
+            - self.conservative_anchor_tokens
+        )
+        if self.signed_delta_tokens != expected_delta:
+            raise ValueError("anchor signed delta mismatch")
+        if (
+            self.predicted_input_tokens
+            != self.usage_anchor_tokens + self.signed_delta_tokens
+        ):
+            raise ValueError("anchor prediction formula mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,9 +436,6 @@ class BudgetEstimate:
 class ContextSizingResult:
     """单个 complete candidate 的 Host-owned sizing truth。
 
-    Slice 1 只构造 ``CONSERVATIVE_FALLBACK``；anchored method 在后续 Slice
-    接入，但字段与不变量现在即被冻结。
-
     :param stage: sizing 阶段。
     :param candidate_input_cursor: candidate source watermark。
     :param candidate_input_projection_ref: identity-free candidate projection ref。
@@ -352,6 +453,7 @@ class ContextSizingResult:
     :param budget_decision: exact budget decision。
     :param policy_ref: Host context policy ref。
     :param policy_snapshot_digest: frozen context policy digest。
+    :param anchor_diagnostic: usage-anchored时的Host-private诊断。
     :param fallback_reason: conservative fallback 原因。
     """
 
@@ -372,10 +474,11 @@ class ContextSizingResult:
     budget_decision: ContextBudgetDecision
     policy_ref: str
     policy_snapshot_digest: str
-    fallback_reason: ContextSizingFallbackReason
+    anchor_diagnostic: ContextAnchorDiagnostic | None
+    fallback_reason: ContextSizingFallbackReason | None
 
     def __post_init__(self) -> None:
-        """校验 Slice 1 conservative sizing contract。
+        """校验 anchored/fallback sizing 单一真源。
 
         :returns: ``None``。
         :raises TypeError: enum 或整数字段类型非法时抛出。
@@ -389,14 +492,9 @@ class ContextSizingResult:
                 "ContextSizingResult.estimator_contract must be "
                 "ContextEstimatorContract"
             )
-        if self.estimate_method is not ContextEstimateMethod.CONSERVATIVE_FALLBACK:
-            raise ValueError(
-                "Slice 1 ContextSizingResult must use conservative_fallback"
-            )
-        if not isinstance(self.fallback_reason, ContextSizingFallbackReason):
+        if not isinstance(self.estimate_method, ContextEstimateMethod):
             raise TypeError(
-                "ContextSizingResult.fallback_reason must be "
-                "ContextSizingFallbackReason"
+                "ContextSizingResult.estimate_method must be ContextEstimateMethod"
             )
         _require_non_negative_int(
             self.candidate_input_cursor,
@@ -445,10 +543,35 @@ class ContextSizingResult:
         )
         if self.conservative_input_tokens > MAX_CONTEXT_TOKEN_COUNT:
             raise ValueError("conservative_input_tokens exceeds supported range")
-        if self.predicted_input_tokens != self.conservative_input_tokens:
-            raise ValueError(
-                "conservative sizing predicted_input_tokens must equal estimate"
-            )
+        if self.predicted_input_tokens > MAX_CONTEXT_TOKEN_COUNT:
+            raise ValueError("predicted_input_tokens exceeds supported range")
+        if self.estimate_method is ContextEstimateMethod.CONSERVATIVE_FALLBACK:
+            if not isinstance(self.fallback_reason, ContextSizingFallbackReason):
+                raise TypeError(
+                    "fallback sizing requires ContextSizingFallbackReason"
+                )
+            if self.anchor_diagnostic is not None:
+                raise ValueError("fallback sizing must not carry anchor diagnostic")
+            if self.predicted_input_tokens != self.conservative_input_tokens:
+                raise ValueError(
+                    "conservative sizing predicted_input_tokens must equal estimate"
+                )
+        elif self.estimate_method is ContextEstimateMethod.USAGE_ANCHORED:
+            if self.fallback_reason is not None:
+                raise ValueError("anchored sizing must not carry fallback reason")
+            if not isinstance(self.anchor_diagnostic, ContextAnchorDiagnostic):
+                raise TypeError(
+                    "anchored sizing requires ContextAnchorDiagnostic"
+                )
+            if (
+                self.anchor_diagnostic.conservative_current_tokens
+                != self.conservative_input_tokens
+                or self.anchor_diagnostic.predicted_input_tokens
+                != self.predicted_input_tokens
+            ):
+                raise ValueError("anchored sizing diagnostic mismatch")
+        else:
+            raise AssertionError("context estimate method is not exhaustive")
         if self.soft_threshold_tokens > self.hard_threshold_tokens:
             raise ValueError(
                 "soft_threshold_tokens must not exceed hard_threshold_tokens"
@@ -671,7 +794,7 @@ def build_conservative_context_sizing_result(
         raise TypeError("estimate must be BudgetEstimate")
     if estimate.input_budget_tokens != policy.context_window_size:
         raise ValueError("estimate context window does not match policy")
-    return build_conservative_context_sizing_result_from_atoms(
+    return build_context_sizing_result_from_atoms(
         stage=stage,
         candidate_input_cursor=candidate_input_cursor,
         candidate_input_projection_ref=candidate_input_projection_ref,
@@ -684,6 +807,7 @@ def build_conservative_context_sizing_result(
         hard_threshold_tokens=estimate.hard_threshold_tokens,
         policy_ref=policy.policy_ref,
         policy_snapshot_digest=context_budget_policy_snapshot_digest(policy),
+        anchor_resolution=None,
         fallback_reason=fallback_reason,
     )
 
@@ -734,7 +858,182 @@ def build_conservative_context_sizing_result_from_atoms(
         raise TypeError("stage must be ContextSizingStage")
     if not isinstance(estimator_contract, ContextEstimatorContract):
         raise TypeError("estimator_contract must be ContextEstimatorContract")
+    return build_context_sizing_result_from_atoms(
+        stage=stage,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=candidate_input_projection_ref,
+        candidate_input_digest=candidate_input_digest,
+        estimator_contract=estimator_contract,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=conservative_input_tokens,
+        context_window_size=context_window_size,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+        policy_ref=policy_ref,
+        policy_snapshot_digest=policy_snapshot_digest,
+        anchor_resolution=None,
+        fallback_reason=fallback_reason,
+    )
+
+
+def build_context_sizing_result(
+    *,
+    stage: ContextSizingStage,
+    candidate_input_cursor: int,
+    candidate_input_projection_ref: str,
+    candidate_input_digest: str,
+    policy: ContextBudgetPolicy,
+    estimate: BudgetEstimate,
+    anchor_resolution: ContextAnchorResolution,
+) -> ContextSizingResult:
+    """从当前完整估算与 durable anchor resolution 构造唯一 sizing truth。
+
+    :param stage: 当前 sizing stage。
+    :param candidate_input_cursor: canonical fact identity使用的candidate cursor。
+    :param candidate_input_projection_ref: exact candidate projection ref。
+    :param candidate_input_digest: complete candidate digest。
+    :param policy: frozen Host context policy。
+    :param estimate: 当前完整candidate的conservative estimate。
+    :param anchor_resolution: 同transaction resolver结果。
+    :returns: usage-anchored或完整conservative fallback结果。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: policy/estimate/anchor不满足typed contract时抛出。
+    """
+
+    if not isinstance(policy, ContextBudgetPolicy):
+        raise TypeError("policy must be ContextBudgetPolicy")
+    if not isinstance(estimate, BudgetEstimate):
+        raise TypeError("estimate must be BudgetEstimate")
+    if estimate.input_budget_tokens != policy.context_window_size:
+        raise ValueError("estimate context window does not match policy")
+    return build_context_sizing_result_from_atoms(
+        stage=stage,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=candidate_input_projection_ref,
+        candidate_input_digest=candidate_input_digest,
+        estimator_contract=CONTEXT_ESTIMATOR_CONTRACT,
+        estimator_digest=estimate.estimator_digest,
+        conservative_input_tokens=estimate.estimated_input_tokens,
+        context_window_size=policy.context_window_size,
+        soft_threshold_tokens=estimate.soft_threshold_tokens,
+        hard_threshold_tokens=estimate.hard_threshold_tokens,
+        policy_ref=policy.policy_ref,
+        policy_snapshot_digest=context_budget_policy_snapshot_digest(policy),
+        anchor_resolution=anchor_resolution,
+        fallback_reason=None,
+    )
+
+
+def build_context_sizing_result_from_atoms(
+    *,
+    stage: ContextSizingStage,
+    candidate_input_cursor: int,
+    candidate_input_projection_ref: str,
+    candidate_input_digest: str,
+    estimator_contract: ContextEstimatorContract,
+    estimator_digest: str,
+    conservative_input_tokens: int,
+    context_window_size: int,
+    soft_threshold_tokens: int,
+    hard_threshold_tokens: int,
+    policy_ref: str,
+    policy_snapshot_digest: str,
+    anchor_resolution: ContextAnchorResolution | None,
+    fallback_reason: ContextSizingFallbackReason | None,
+) -> ContextSizingResult:
+    """从同源atoms和可选resolver结果构造anchored/fallback sizing。
+
+    ``anchor_resolution=None``只供已明确选择conservative的owner使用，并要求
+    显式提供fallback reason；普通adaptive caller必须传resolver结果。
+
+    :param stage: 当前 sizing stage。
+    :param candidate_input_cursor: canonical fact identity使用的candidate cursor。
+    :param candidate_input_projection_ref: exact candidate projection ref。
+    :param candidate_input_digest: complete candidate digest。
+    :param estimator_contract: frozen estimator identity。
+    :param estimator_digest: 当前candidate estimator digest。
+    :param conservative_input_tokens: ``E_current``。
+    :param context_window_size: frozen context window。
+    :param soft_threshold_tokens: frozen soft threshold。
+    :param hard_threshold_tokens: frozen hard threshold。
+    :param policy_ref: frozen policy ref。
+    :param policy_snapshot_digest: frozen policy digest。
+    :param anchor_resolution: 同transaction resolver结果；强制fallback时为``None``。
+    :param fallback_reason: 强制fallback原因；resolver存在时必须为``None``。
+    :returns: 完整sizing result。
+    :raises TypeError: enum、contract、resolution或整数类型非法时抛出。
+    :raises ValueError: atoms、resolution或公式违反contract时抛出。
+    """
+
+    from dayu.host.context_anchor import ContextAnchorResolution
+
+    estimate_method = ContextEstimateMethod.CONSERVATIVE_FALLBACK
     predicted = conservative_input_tokens
+    anchor_diagnostic: ContextAnchorDiagnostic | None = None
+    resolved_fallback = fallback_reason
+    if anchor_resolution is not None:
+        if not isinstance(anchor_resolution, ContextAnchorResolution):
+            raise TypeError("anchor_resolution must be ContextAnchorResolution")
+        if fallback_reason is not None:
+            raise ValueError(
+                "resolver result and explicit fallback reason are mutually exclusive"
+            )
+        anchor = anchor_resolution.anchor
+        if anchor is None:
+            resolved_fallback = anchor_resolution.fallback_reason
+        else:
+            resolved_fallback = None
+            anchor_values = (
+                anchor.usage_anchor_tokens,
+                anchor.conservative_anchor_tokens,
+                conservative_input_tokens,
+            )
+            if not all(_is_context_token_count(value) for value in anchor_values):
+                resolved_fallback = ContextSizingFallbackReason.ANCHOR_VALUE_INVALID
+            else:
+                signed_delta = (
+                    conservative_input_tokens
+                    - anchor.conservative_anchor_tokens
+                )
+                anchored_prediction = anchor.usage_anchor_tokens + signed_delta
+                if (
+                    abs(signed_delta) > MAX_CONTEXT_TOKEN_COUNT
+                    or anchored_prediction > MAX_CONTEXT_TOKEN_COUNT
+                ):
+                    resolved_fallback = (
+                        ContextSizingFallbackReason.ARITHMETIC_RANGE_INVALID
+                    )
+                elif anchored_prediction <= 0:
+                    resolved_fallback = (
+                        ContextSizingFallbackReason.PREDICTION_NON_POSITIVE
+                    )
+                else:
+                    estimate_method = ContextEstimateMethod.USAGE_ANCHORED
+                    predicted = anchored_prediction
+                    anchor_diagnostic = ContextAnchorDiagnostic(
+                        manifest_event_id=anchor.manifest_event_id,
+                        manifest_payload_ref=anchor.manifest_payload_ref,
+                        manifest_digest=anchor.manifest_digest,
+                        iteration_link_event_id=anchor.iteration_link_event_id,
+                        usage_event_id=anchor.usage_event_id,
+                        usage_observation_digest=(
+                            anchor.usage_observation_digest
+                        ),
+                        iteration_completed_event_id=(
+                            anchor.iteration_completed_event_id
+                        ),
+                        usage_anchor_tokens=anchor.usage_anchor_tokens,
+                        conservative_anchor_tokens=(
+                            anchor.conservative_anchor_tokens
+                        ),
+                        conservative_current_tokens=(
+                            conservative_input_tokens
+                        ),
+                        signed_delta_tokens=signed_delta,
+                        predicted_input_tokens=anchored_prediction,
+                    )
+    if resolved_fallback is None and anchor_diagnostic is None:
+        raise ValueError("fallback sizing requires a closed reason")
     pressure, decision = _pressure_and_decision(
         stage=stage,
         predicted_input_tokens=predicted,
@@ -748,8 +1047,8 @@ def build_conservative_context_sizing_result_from_atoms(
         candidate_input_digest=candidate_input_digest,
         estimator_contract=estimator_contract,
         estimator_digest=estimator_digest,
-        conservative_input_tokens=predicted,
-        estimate_method=ContextEstimateMethod.CONSERVATIVE_FALLBACK,
+        conservative_input_tokens=conservative_input_tokens,
+        estimate_method=estimate_method,
         predicted_input_tokens=predicted,
         context_window_size=context_window_size,
         soft_threshold_tokens=soft_threshold_tokens,
@@ -759,7 +1058,131 @@ def build_conservative_context_sizing_result_from_atoms(
         budget_decision=decision,
         policy_ref=policy_ref,
         policy_snapshot_digest=policy_snapshot_digest,
+        anchor_diagnostic=anchor_diagnostic,
+        fallback_reason=resolved_fallback,
+    )
+
+
+def build_frozen_context_sizing_result_from_atoms(
+    *,
+    stage: ContextSizingStage,
+    candidate_input_cursor: int,
+    candidate_input_projection_ref: str,
+    candidate_input_digest: str,
+    estimator_contract: ContextEstimatorContract,
+    estimator_digest: str,
+    conservative_input_tokens: int,
+    estimate_method: ContextEstimateMethod,
+    predicted_input_tokens: int,
+    context_window_size: int,
+    soft_threshold_tokens: int,
+    hard_threshold_tokens: int,
+    policy_ref: str,
+    policy_snapshot_digest: str,
+    anchor_diagnostic: ContextAnchorDiagnostic | None,
+    fallback_reason: ContextSizingFallbackReason | None,
+) -> ContextSizingResult:
+    """从已接受source fact atoms重建exact replay sizing truth。
+
+    本入口只供 startup exact replay 使用：保留source method、prediction与
+    diagnostic，不重新解析anchor或重新计算估算；仅按新stage重新派生
+    pressure/action与fact identity。
+
+    :param stage: 新 fact 的 sizing stage。
+    :param candidate_input_cursor: 新 fact 的 candidate cursor。
+    :param candidate_input_projection_ref: exact candidate projection ref。
+    :param candidate_input_digest: exact complete candidate digest。
+    :param estimator_contract: source estimator identity。
+    :param estimator_digest: source estimator digest。
+    :param conservative_input_tokens: source ``E_current``。
+    :param estimate_method: source accepted estimate method。
+    :param predicted_input_tokens: source accepted prediction。
+    :param context_window_size: source frozen context window。
+    :param soft_threshold_tokens: source soft threshold。
+    :param hard_threshold_tokens: source hard threshold。
+    :param policy_ref: source policy ref。
+    :param policy_snapshot_digest: source policy digest。
+    :param anchor_diagnostic: source Host-private anchor diagnostic。
+    :param fallback_reason: source conservative fallback reason。
+    :returns: 新identity下语义不变的sizing result。
+    :raises TypeError: typed atoms非法时抛出。
+    :raises ValueError: source atoms不满足sizing invariant时抛出。
+    """
+
+    if not isinstance(stage, ContextSizingStage):
+        raise TypeError("stage must be ContextSizingStage")
+    if not isinstance(estimator_contract, ContextEstimatorContract):
+        raise TypeError("estimator_contract must be ContextEstimatorContract")
+    if not isinstance(estimate_method, ContextEstimateMethod):
+        raise TypeError("estimate_method must be ContextEstimateMethod")
+    pressure, decision = _pressure_and_decision(
+        stage=stage,
+        predicted_input_tokens=predicted_input_tokens,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+    return ContextSizingResult(
+        stage=stage,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=candidate_input_projection_ref,
+        candidate_input_digest=candidate_input_digest,
+        estimator_contract=estimator_contract,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=conservative_input_tokens,
+        estimate_method=estimate_method,
+        predicted_input_tokens=predicted_input_tokens,
+        context_window_size=context_window_size,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+        utilization_basis_points=(
+            predicted_input_tokens * 10_000 // context_window_size
+        ),
+        pressure_level=pressure,
+        budget_decision=decision,
+        policy_ref=policy_ref,
+        policy_snapshot_digest=policy_snapshot_digest,
+        anchor_diagnostic=anchor_diagnostic,
         fallback_reason=fallback_reason,
+    )
+
+
+def rebind_frozen_context_sizing_result(
+    source: ContextSizingResult,
+    *,
+    stage: ContextSizingStage,
+    candidate_input_cursor: int,
+) -> ContextSizingResult:
+    """为exact replay source sizing建立新stage/cursor fact identity。
+
+    :param source: 已strict验证的source sizing truth。
+    :param stage: 新 fact 的 stage。
+    :param candidate_input_cursor: 新 manifest event sequence。
+    :returns: method、prediction、diagnostic与source atoms不变的新结果。
+    :raises TypeError: source或stage类型非法时抛出。
+    :raises ValueError: 新cursor或source invariant非法时抛出。
+    """
+
+    if not isinstance(source, ContextSizingResult):
+        raise TypeError("source must be ContextSizingResult")
+    return build_frozen_context_sizing_result_from_atoms(
+        stage=stage,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=(
+            source.candidate_input_projection_ref
+        ),
+        candidate_input_digest=source.candidate_input_digest,
+        estimator_contract=source.estimator_contract,
+        estimator_digest=source.estimator_digest,
+        conservative_input_tokens=source.conservative_input_tokens,
+        estimate_method=source.estimate_method,
+        predicted_input_tokens=source.predicted_input_tokens,
+        context_window_size=source.context_window_size,
+        soft_threshold_tokens=source.soft_threshold_tokens,
+        hard_threshold_tokens=source.hard_threshold_tokens,
+        policy_ref=source.policy_ref,
+        policy_snapshot_digest=source.policy_snapshot_digest,
+        anchor_diagnostic=source.anchor_diagnostic,
+        fallback_reason=source.fallback_reason,
     )
 
 
@@ -1270,6 +1693,49 @@ def _require_int(value: int, *, field_name: str) -> None:
         raise TypeError(f"{field_name} must be int")
 
 
+def _is_context_token_count(value: int) -> bool:
+    """判断值是否为支持范围内的严格非负token整数。
+
+    :param value: 待判断值。
+    :returns: 值是``0..MAX_CONTEXT_TOKEN_COUNT``严格整数时返回``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and 0 <= value <= MAX_CONTEXT_TOKEN_COUNT
+    )
+
+
+def _require_context_token_count(value: int, *, field_name: str) -> None:
+    """校验支持范围内的严格非负token整数。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是严格整数时抛出。
+    :raises ValueError: 值不在支持范围时抛出。
+    """
+
+    _require_non_negative_int(value, field_name=field_name)
+    if value > MAX_CONTEXT_TOKEN_COUNT:
+        raise ValueError(f"{field_name} exceeds supported range")
+
+
+def _require_sha256_digest(value: str, *, field_name: str) -> None:
+    """校验sha256 digest。
+
+    :param value: 待校验文本。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises ValueError: 值不是canonical sha256 digest时抛出。
+    """
+
+    if not isinstance(value, str) or not is_sha256_digest(value):
+        raise ValueError(f"{field_name} must be sha256 digest")
+
+
 def _require_tuple_items(
     value: tuple[BudgetTextFragment, ...] | tuple[BudgetJsonFragment, ...],
     item_type: type[BudgetTextFragment] | type[BudgetJsonFragment],
@@ -1334,6 +1800,7 @@ __all__ = [
     "CONTEXT_ESTIMATOR_VERSION",
     "ContextBudgetDecision",
     "ContextBudgetOverageReason",
+    "ContextAnchorDiagnostic",
     "ContextEstimateMethod",
     "ContextEstimatorContract",
     "ContextPressureLevel",
@@ -1355,6 +1822,9 @@ __all__ = [
     "build_usage_observation_diagnostic",
     "build_conservative_context_sizing_result",
     "build_conservative_context_sizing_result_from_atoms",
+    "build_context_sizing_result",
+    "build_context_sizing_result_from_atoms",
+    "build_frozen_context_sizing_result_from_atoms",
     "context_budget_policy_snapshot_digest",
     "context_sizing_pressure_and_decision",
     "decide_context_budget",
@@ -1362,4 +1832,5 @@ __all__ = [
     "estimate_context_budget",
     "estimate_context_input",
     "estimate_post_compact_budget",
+    "rebind_frozen_context_sizing_result",
 ]

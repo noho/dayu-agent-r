@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 
+import dayu.host.admission as admission_module
 from dayu.contracts.json_value import JsonValue
 from dayu.host import (
     FollowupBehavior,
@@ -23,9 +24,18 @@ from dayu.host import (
 )
 from dayu.host.context_budget import (
     ContextBudgetDecision,
+    ContextEstimateMethod,
     ContextPressureLevel,
     ContextSizingStage,
 )
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
+)
+from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.transaction import HostTransaction
+from dayu.host.run_input import PreparedRunnerCallCandidate
 from dayu.host.context_events import (
     CONTEXT_BUDGET_EVALUATED,
     parse_context_budget_evaluated_payload,
@@ -107,14 +117,58 @@ async def test_steer_running_run_creates_new_attempt_public_path(
 @pytest.mark.asyncio
 async def test_steer_hard_continuation_orders_fact_before_new_attempt(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """running steer以hard continuation fact启动新Attempt且仍allow。
 
     :param tmp_path: pytest临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
     :raises AssertionError: manifest/fact/start顺序或decision错误时抛出。
     """
 
+    def resolve_anchor(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        *,
+        candidate: PreparedRunnerCallCandidate,
+        context_window_size: int,
+        candidate_input_cursor: int | None = None,
+    ) -> ContextAnchorResolution:
+        """为steer candidate注入compatible anchor。
+
+        :param transaction: admission transaction。
+        :param event_log_store: EventLog primitive。
+        :param candidate: steer complete candidate。
+        :param context_window_size: frozen context window。
+        :param candidate_input_cursor: 可选scan cursor。
+        :returns: compatible anchor。
+        """
+
+        del transaction, event_log_store, candidate, candidate_input_cursor
+        assert context_window_size == 4_096
+        return ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-anchor",
+                manifest_payload_ref="payload-anchor",
+                manifest_digest=sha256_digest_json({"anchor": "manifest"}),
+                iteration_link_event_id="event-anchor-link",
+                usage_event_id="event-anchor-usage",
+                usage_observation_digest=sha256_digest_json(
+                    {"anchor": "usage"}
+                ),
+                iteration_completed_event_id="event-anchor-completed",
+                usage_anchor_tokens=4_000,
+                conservative_anchor_tokens=0,
+            ),
+            fallback_reason=None,
+        )
+
+    monkeypatch.setattr(
+        admission_module,
+        "resolve_prepared_runner_call_context_anchor_in_transaction",
+        resolve_anchor,
+    )
     factory = _SequencedWorkerFactory([_BLOCK, _FINAL])
     options = replace(
         _options(tmp_path, factory),
@@ -193,6 +247,8 @@ async def test_steer_hard_continuation_orders_fact_before_new_attempt(
         cast(dict[str, JsonValue], json.loads(str(rows[continuation_index][1])))
     )
     assert payload.sizing_stage is ContextSizingStage.CONTINUATION
+    assert payload.estimate_method is ContextEstimateMethod.USAGE_ANCHORED
+    assert payload.anchor_diagnostic is not None
     assert (
         payload.pressure_level
         is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED

@@ -121,6 +121,7 @@ from dayu.host.context_budget import (
     ContextSizingResult,
     ContextSizingStage,
     build_conservative_context_sizing_result_from_atoms,
+    build_context_sizing_result_from_atoms,
 )
 from dayu.host.context_events import (
     ContextBudgetEvaluationIdentity,
@@ -135,6 +136,7 @@ from dayu.host.run_input import (
     prepare_runner_call_candidate_in_transaction,
     project_wait_resume_continuity,
     record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
 )
 from dayu.host.durable.wait_resolution_digest import (
     WAIT_RESOLUTION_OUTCOME_KIND_CANCELLED as _TOOL_FACT_KIND_CANCELLED,
@@ -1335,7 +1337,15 @@ class DefaultHostResolveWaitService:
             sizing_snapshot=sizing_snapshot,
         )
         if sizing_result is not None:
-            sizing_result = build_conservative_context_sizing_result_from_atoms(
+            anchor_resolution = (
+                resolve_prepared_runner_call_context_anchor_in_transaction(
+                    transaction,
+                    self._event_log_store,
+                    candidate=candidate,
+                    context_window_size=sizing_result.context_window_size,
+                )
+            )
+            sizing_result = build_context_sizing_result_from_atoms(
                 stage=ContextSizingStage.CONTINUATION,
                 candidate_input_cursor=manifest_event.event_sequence,
                 candidate_input_projection_ref=(
@@ -1360,7 +1370,8 @@ class DefaultHostResolveWaitService:
                 policy_snapshot_digest=(
                     sizing_result.policy_snapshot_digest
                 ),
-                fallback_reason=sizing_result.fallback_reason,
+                anchor_resolution=anchor_resolution,
+                fallback_reason=None,
             )
             append_context_budget_evaluated_in_transaction(
                 transaction,

@@ -59,7 +59,8 @@ from dayu.host.context_budget import (
     ContextEstimatorContract,
     ContextSizingResult,
     ContextSizingStage,
-    build_conservative_context_sizing_result_from_atoms,
+    build_frozen_context_sizing_result_from_atoms,
+    rebind_frozen_context_sizing_result,
 )
 from dayu.host.context_events import (
     ContextBudgetEvaluationIdentity,
@@ -865,32 +866,10 @@ class SessionAttachmentRecoveryScanner:
         )
         if sizing_result is not None:
             sizing_result = (
-                build_conservative_context_sizing_result_from_atoms(
+                rebind_frozen_context_sizing_result(
+                    sizing_result,
                     stage=ContextSizingStage.CONTINUATION,
                     candidate_input_cursor=manifest_event.event_sequence,
-                    candidate_input_projection_ref=(
-                        sizing_result.candidate_input_projection_ref
-                    ),
-                    candidate_input_digest=(
-                        sizing_result.candidate_input_digest
-                    ),
-                    estimator_contract=sizing_result.estimator_contract,
-                    estimator_digest=sizing_result.estimator_digest,
-                    conservative_input_tokens=(
-                        sizing_result.conservative_input_tokens
-                    ),
-                    context_window_size=sizing_result.context_window_size,
-                    soft_threshold_tokens=(
-                        sizing_result.soft_threshold_tokens
-                    ),
-                    hard_threshold_tokens=(
-                        sizing_result.hard_threshold_tokens
-                    ),
-                    policy_ref=sizing_result.policy_ref,
-                    policy_snapshot_digest=(
-                        sizing_result.policy_snapshot_digest
-                    ),
-                    fallback_reason=sizing_result.fallback_reason,
                 )
             )
             append_context_budget_evaluated_in_transaction(
@@ -1114,12 +1093,7 @@ def _startup_continuation_budget_result(
         context_window_size=sizing.context_window_size,
         policy_ref=sizing.policy_ref,
     )
-    fallback_reason = source_budget.fallback_reason
-    if fallback_reason is None:
-        raise HostDurableError(
-            "startup source conservative fact fallback reason is missing"
-        )
-    return build_conservative_context_sizing_result_from_atoms(
+    return build_frozen_context_sizing_result_from_atoms(
         stage=ContextSizingStage.CONTINUATION,
         candidate_input_cursor=source.candidate.candidate_input_cursor,
         candidate_input_projection_ref=(
@@ -1132,12 +1106,15 @@ def _startup_continuation_budget_result(
         ),
         estimator_digest=sizing.estimator_digest,
         conservative_input_tokens=sizing.conservative_input_tokens,
+        estimate_method=source_budget.estimate_method,
+        predicted_input_tokens=source_budget.predicted_input_tokens,
         context_window_size=sizing.context_window_size,
         soft_threshold_tokens=source_budget.soft_threshold_tokens,
         hard_threshold_tokens=source_budget.hard_threshold_tokens,
         policy_ref=sizing.policy_ref,
         policy_snapshot_digest=sizing.policy_snapshot_digest,
-        fallback_reason=fallback_reason,
+        anchor_diagnostic=source_budget.anchor_diagnostic,
+        fallback_reason=source_budget.fallback_reason,
     )
 
 

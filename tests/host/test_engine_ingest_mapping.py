@@ -158,10 +158,17 @@ from dayu.host.context_budget import (
     CONTEXT_ESTIMATOR_CONTRACT,
     BudgetEstimate,
     ContextBudgetDecision,
+    ContextEstimateMethod,
     ContextEstimatorContract,
     ContextPressureLevel,
+    ContextSizingFallbackReason,
     ContextSizingStage,
     build_conservative_context_sizing_result_from_atoms,
+)
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorQuery,
+    ContextAnchorResolution,
 )
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -1683,6 +1690,15 @@ async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
         assert (
             manifest.sizing_snapshot.conservative_input_tokens
             >= hard_pressure_tokens
+        )
+        budget_payload = parse_context_budget_evaluated_payload(
+            _payload(result.events[-3])
+        )
+        assert budget_payload.estimate_method is (
+            ContextEstimateMethod.CONSERVATIVE_FALLBACK
+        )
+        assert budget_payload.fallback_reason is (
+            ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
         )
         assert _event_count(
             store.transaction_runner,
@@ -5769,8 +5785,53 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
 
 def test_iteration_started_continuation_with_projection_writes_complete_manifest(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """tool-loop continuation 携带 observed projection 时写 complete manifest。"""
+    """complete tool-loop continuation在同事务消费typed anchor。
+
+    :param tmp_path: pytest临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    observed_queries: list[ContextAnchorQuery] = []
+
+    def resolve_anchor(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        query: ContextAnchorQuery,
+    ) -> ContextAnchorResolution:
+        """注入compatible continuation anchor。
+
+        :param transaction: 当前ingest transaction。
+        :param event_log_store: EventLog primitive。
+        :param query: complete continuation query。
+        :returns: compatible anchor。
+        """
+
+        del transaction, event_log_store
+        observed_queries.append(query)
+        return ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-anchor",
+                manifest_payload_ref="payload-anchor",
+                manifest_digest=sha256_digest_json({"anchor": "manifest"}),
+                iteration_link_event_id="event-anchor-link",
+                usage_event_id="event-anchor-usage",
+                usage_observation_digest=sha256_digest_json(
+                    {"anchor": "usage"}
+                ),
+                iteration_completed_event_id="event-anchor-completed",
+                usage_anchor_tokens=100,
+                conservative_anchor_tokens=100,
+            ),
+            fallback_reason=None,
+        )
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "resolve_context_anchor",
+        resolve_anchor,
+    )
 
     role_digest = runner_role_sequence_digest(
         ("system", "user", "assistant", "tool")
@@ -5870,6 +5931,14 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
         assert (
             budget_payload.budget_decision
             is ContextBudgetDecision.ALLOW_DISPATCH
+        )
+        assert budget_payload.estimate_method is (
+            ContextEstimateMethod.USAGE_ANCHORED
+        )
+        assert budget_payload.anchor_diagnostic is not None
+        assert len(observed_queries) == 1
+        assert observed_queries[0].candidate_input_cursor == (
+            result.events[0].event_sequence - 1
         )
         hot_diagnostic = _json_object(manifest_hot["diagnostic"])
         assert hot_diagnostic["status"] == "complete"
