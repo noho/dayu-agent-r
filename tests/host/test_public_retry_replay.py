@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 
 import pytest
@@ -43,6 +44,7 @@ from dayu.host import (
 )
 from dayu.host.api import AuthorizationClaim
 from dayu.host.memory import default_memory_projection_policy
+from tests.host.public_smoke_support import close_attachment_shielded
 
 _NOW = datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC)
 _FINAL = "final"
@@ -212,8 +214,13 @@ async def test_retry_failed_run_creates_related_run_public_path(
     """retry_run 只通过 public opener 为 FAILED 源 Run 创建关联新 Run。"""
 
     factory = _SequencedWorkerFactory([_FAILED, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("retry"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "retry-source"),
@@ -246,8 +253,13 @@ async def test_retry_run_replays_same_client_request_id_idempotently(
     """
 
     factory = _SequencedWorkerFactory([_FAILED, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("retry-idempotent"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "retry-idempotent-source"),
@@ -279,8 +291,13 @@ async def test_retry_run_policy_limit_rejects_second_retry(
     """
 
     factory = _SequencedWorkerFactory([_FAILED, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("retry-limit"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "retry-limit-source"),
@@ -347,8 +364,13 @@ async def test_retry_run_same_client_request_id_different_digest_conflicts(
     """retry_run 同一 client_request_id 不同语义 digest 返回幂等冲突。"""
 
     factory = _SequencedWorkerFactory([_FAILED, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("retry-digest-conflict"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "retry-digest-source"),
@@ -383,8 +405,13 @@ async def test_replay_succeeded_run_no_tool_public_path(
     """replay_run 为 SUCCEEDED 源 Run 创建 no-tool 关联新 Run。"""
 
     factory = _SequencedWorkerFactory([_FINAL, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("replay"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "replay-source"),
@@ -421,8 +448,13 @@ async def test_replay_run_replays_same_client_request_id_idempotently(
     """
 
     factory = _SequencedWorkerFactory([_FINAL, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("replay-idempotent"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "replay-idempotent-source"),
@@ -455,8 +487,13 @@ async def test_retry_and_replay_reject_non_target_source_status(
     """
 
     factory = _SequencedWorkerFactory([_FINAL, _FAILED])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("relation-reject"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         succeeded = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "relation-succeeded"),

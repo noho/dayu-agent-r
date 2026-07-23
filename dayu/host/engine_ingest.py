@@ -1669,8 +1669,18 @@ class EngineEventIngestor:
             )
         frozen_material_list_digest = _material_list_digest(frozen_material_blocks)
         frozen_material_refs = _material_source_refs(frozen_material_blocks)
+        operation_id = _event_id(
+            context.candidate,
+            EventClass.CANONICAL_FACT,
+            CONTEXT_COMPACTION_REQUESTED,
+            0,
+        )
         requested = self._append_reactive_compaction_requested_event(
             transaction,
+            operation_id=operation_id,
+            max_compaction_attempts_per_operation=(
+                policy.max_compaction_attempts_per_operation
+            ),
             context=context,
             data=data,
             estimate=estimate,
@@ -1877,6 +1887,8 @@ class EngineEventIngestor:
         self,
         transaction: HostTransaction,
         *,
+        operation_id: str,
+        max_compaction_attempts_per_operation: int,
         context: _ValidatedCandidate,
         data: ContextCompactionRequestedData,
         estimate: BudgetEstimate,
@@ -1887,6 +1899,8 @@ class EngineEventIngestor:
         """追加 reactive ``CONTEXT_COMPACTION_REQUESTED`` fact。
 
         :param transaction: 当前 Host transaction。
+        :param operation_id: 与 request event id 同源的预生成 operation id。
+        :param max_compaction_attempts_per_operation: 当前 pending policy 冻结预算。
         :param context: 已校验 candidate 上下文。
         :param data: Engine context compaction requested data。
         :param estimate: Host budget estimate。
@@ -1901,12 +1915,7 @@ class EngineEventIngestor:
         return self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
-                event_id=_event_id(
-                    candidate,
-                    EventClass.CANONICAL_FACT,
-                    CONTEXT_COMPACTION_REQUESTED,
-                    0,
-                ),
+                event_id=operation_id,
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=context.run.session_id,
                 run_id=context.run.run_id,
@@ -1920,23 +1929,25 @@ class EngineEventIngestor:
                 idempotency_key=None,
                 policy_decision=None,
                 reason={"decision": decision.value, "engine_reason": data.reason},
-                payload_json={
-                    **build_context_compaction_requested_payload(
-                        trigger_source=ContextCompactionTriggerSource.REACTIVE,
-                        budget_reason=data.reason,
-                        budget_snapshot_ref=estimate.estimator_digest,
-                        input_snapshot_cursor=context.run.input_event_sequence,
-                        estimator_digest=estimate.estimator_digest,
-                        policy_ref=policy_ref,
-                        provider_request_id=data.provider_request_id,
-                        provider_error_ref=_engine_event_ref(candidate),
-                        attempt_id=context.attempt.attempt_id,
-                        execution_id=context.attempt.execution_id,
-                        frozen_material_list_digest=frozen_material_list_digest,
-                        frozen_material_refs=frozen_material_refs,
+                payload_json=build_context_compaction_requested_payload(
+                    operation_id=operation_id,
+                    max_compaction_attempts_per_operation=(
+                        max_compaction_attempts_per_operation
                     ),
-                    "client_correlation_id": data.client_correlation_id,
-                },
+                    trigger_source=ContextCompactionTriggerSource.REACTIVE,
+                    budget_reason=data.reason,
+                    budget_snapshot_ref=estimate.estimator_digest,
+                    input_snapshot_cursor=context.run.input_event_sequence,
+                    estimator_digest=estimate.estimator_digest,
+                    policy_ref=policy_ref,
+                    provider_request_id=data.provider_request_id,
+                    provider_error_ref=_engine_event_ref(candidate),
+                    attempt_id=context.attempt.attempt_id,
+                    execution_id=context.attempt.execution_id,
+                    client_correlation_id=data.client_correlation_id,
+                    frozen_material_list_digest=frozen_material_list_digest,
+                    frozen_material_refs=frozen_material_refs,
+                ),
                 payload_ref=None,
                 payload_digest=None,
             ),
@@ -1976,17 +1987,16 @@ class EngineEventIngestor:
                 rejected_attempts=(),
                 failure_reason="compactor_or_artifact_store_missing",
                 budget_after_attempted_compact=None,
+                accepted_attempt_number=None,
             )
         else:
-            attempts = (
-                self._context_budget_policy.max_compaction_attempts_per_operation
-                if self._context_budget_policy is not None
-                else 1
-            )
             operation_result = await run_compaction_operation(
                 request=request,
                 compactor=compactor,
-                max_attempts=attempts,
+                first_attempt_number=1,
+                max_attempt_number=(
+                    pending.policy.max_compaction_attempts_per_operation
+                ),
                 cancellation_token=(
                     pending.context.candidate.envelope.cancellation_token
                 ),
@@ -2141,7 +2151,9 @@ class EngineEventIngestor:
                 request=request,
                 decision=pending.decision,
                 operation_id=pending.operation_id,
-                accepted_attempt_number=len(operation_result.rejected_attempts) + 1,
+                accepted_attempt_number=_required_accepted_attempt_number(
+                    operation_result
+                ),
                 candidate=operation_result.accepted_candidate,
                 quality=operation_result.quality_result,
                 budget_after_compact=(
@@ -2185,17 +2197,12 @@ class EngineEventIngestor:
         """构造 reactive compactor proposal durable manifest recorder。
 
         :returns: durable manifest recorder。
-        :raises RuntimeError: compact artifact root 缺失时抛出。
+        :raises Exception: 不主动抛出异常。
         """
 
-        artifact_root = self._compact_artifact_root
-        if artifact_root is None:
-            raise RuntimeError("compact artifact root is missing")
         return DurableCompactorProposalManifestRecorder(
             transaction_runner=self._transaction_runner,
             event_log_store=self._event_log_store,
-            artifact_root=artifact_root,
-            create_artifact_root=self._compact_artifact_create_parent_dirs,
             event_source=_EVENT_SOURCE,
         )
 
@@ -7174,6 +7181,20 @@ def _diagnostic_offending_text_length(
 
     offending = None if reference is None else reference.diagnostic.offending_block
     return None if offending is None else offending.text_length
+
+
+def _required_accepted_attempt_number(result: CompactionOperationResult) -> int:
+    """返回 accepted operation 的全局 attempt number。
+
+    :param result: 已由 operation owner 生成的结果。
+    :returns: 正数 accepted attempt number。
+    :raises RuntimeError: accepted result 缺少 attempt number 时抛出。
+    """
+
+    value = result.accepted_attempt_number
+    if value is None or value <= 0:
+        raise RuntimeError("accepted compaction is missing accepted attempt number")
+    return value
 
 
 __all__ = [

@@ -38,7 +38,7 @@ from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import project_host_durable_store_options
 from dayu.host.durable.transaction import HostTransactionRunner
 from dayu.host.projection import ProjectionCatchupPort
-from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.recovery import SessionAttachmentRecoveryScanner
 from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
@@ -336,7 +336,7 @@ async def test_admin_list_and_rejected_purge_do_not_start_execution_or_mutate_ru
         del active_registry, projection_catchup_port
         raise AssertionError("admin opener must not create scheduler")
 
-    def forbidden_recovery_scan(self: StartupRecoveryScanner) -> None:
+    def forbidden_recovery_scan(self: SessionAttachmentRecoveryScanner) -> None:
         """禁止 admin opener 执行 recovery。
 
         :param self: recovery scanner。
@@ -347,7 +347,7 @@ async def test_admin_list_and_rejected_purge_do_not_start_execution_or_mutate_ru
         raise AssertionError("admin opener must not run recovery")
 
     monkeypatch.setattr(HostDispatchScheduler, "open", forbidden_scheduler_open)
-    monkeypatch.setattr(StartupRecoveryScanner, "scan", forbidden_recovery_scan)
+    monkeypatch.setattr(SessionAttachmentRecoveryScanner, "scan", forbidden_recovery_scan)
     async with open_host_admin(_admin_options(tmp_path)) as admin:
         result = await admin.list_sessions()
         assert len(result.sessions) == 2

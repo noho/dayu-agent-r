@@ -52,6 +52,8 @@ from dayu.host.api import (
     HostLocalExecutionOptions,
     HostSessionEvent,
     HostSessionEventIterator,
+    HostSessionAccessMode,
+    HostSessionAttachment,
     HostCallContext,
     ListSessionsResult,
     OperationContext,
@@ -118,7 +120,12 @@ from dayu.host.read_api import (
 from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
-from dayu.host.recovery import StartupRecoveryScanResult, StartupRecoveryScanner
+from dayu.host.recovery import (
+    SessionAttachmentRecoveryPolicy,
+    SessionAttachmentRecoveryScanResult,
+    SessionAttachmentRecoveryScanner,
+)
+from dayu.host.session_attachment import HostSessionAttachmentRegistry
 from dayu.host.storage_maintenance import (
     HostStorageMaintenanceRequest,
     HostStorageMaintenanceResult,
@@ -586,17 +593,20 @@ class _ThreadsafeSchedulerWakeupPort:
             return
         self._run_on_loop(lambda: self.scheduler.wake_queue_promotion(session_id))
 
-    def wake_active_cancel_watchdog(self) -> None:
-        """在线程安全边界唤醒 active cancel watchdog。
+    def wake_active_cancel_watchdog(self, session_id: str) -> None:
+        """在线程安全边界唤醒目标 Session active cancel watchdog。
 
+        :param session_id: 已提交 cancel command 的目标 Session id。
         :returns: ``None``。
         :raises Exception: scheduler wakeup 失败时透传。
         """
 
         if _is_current_event_loop(self.loop):
-            self.scheduler.wake_active_cancel_watchdog()
+            self.scheduler.wake_active_cancel_watchdog(session_id)
             return
-        self._run_on_loop(self.scheduler.wake_active_cancel_watchdog)
+        self._run_on_loop(
+            lambda: self.scheduler.wake_active_cancel_watchdog(session_id)
+        )
 
     def _run_on_loop(self, callback: Callable[[], None]) -> None:
         """在 opener event loop 上同步执行 callback。
@@ -637,34 +647,44 @@ class _ThreadsafeActiveWorkerCancelPort(ActiveWorkerCancelPort):
 
 
 @dataclass(frozen=True, slots=True)
-class _StartupRecoveryActorOperation:
+class _SessionAttachmentRecoveryActorOperation:
     """在 S2 durable actor connection 上执行全部 bounded recovery batches。
 
+    :param session_id: 本次 recovery 唯一允许读取的目标 Session id。
+    :param fixed_now: watchdog 与全部 recovery page 共用的 UTC 时间快照。
     :param wakeup_port: actor thread 到 opener loop 的 scheduler wake bridge。
     :param terminal_post_commit_port: 当前 opener terminal coordinator port。
     :param recovery_owner_host_instance_id: 当前 scheduler Host instance id。
     """
 
+    session_id: str
+    fixed_now: datetime
     wakeup_port: _ThreadsafeSchedulerWakeupPort
     terminal_post_commit_port: TerminalPostCommitPort
     recovery_owner_host_instance_id: str
 
-    def __call__(self, handle: HostCommandHandle) -> StartupRecoveryScanResult:
-        """使用 actor-owned transaction runner 完成 startup recovery scan。
+    def __call__(self, handle: HostCommandHandle) -> SessionAttachmentRecoveryScanResult:
+        """使用 actor-owned transaction runner 完成 target recovery scan。
 
         :param handle: actor worker thread 独占的 command handle。
         :returns: 全部 committed batches 的 immutable aggregate result。
         :raises Exception: 任一 batch、invariant 或 wake bridge 失败时透传。
         """
 
-        return StartupRecoveryScanner(
+        return SessionAttachmentRecoveryScanner(
+            session_id=self.session_id,
             transaction_runner=handle._transaction_runner(),
             event_log_store=EventLogStore(),
             dispatch_wakeup_port=self.wakeup_port,
             terminal_post_commit_port=self.terminal_post_commit_port,
             recovery_owner_host_instance_id=self.recovery_owner_host_instance_id,
             defer_accepted_cancel_to_watchdog=True,
-        ).scan()
+        ).scan(
+            replace(
+                SessionAttachmentRecoveryPolicy.default(),
+                now=self.fixed_now,
+            )
+        )
 
 
 def _run_callback_on_event_loop(
@@ -946,6 +966,7 @@ class _PublicHostHandle:
         "_health_gate",
         "_host_handle_id",
         "_projection_catchup_port",
+        "_session_attachment_registry",
         "_session_event_reconciliation_waiter",
         "_scheduler",
         "_scheduler_store",
@@ -961,6 +982,7 @@ class _PublicHostHandle:
         health_gate: HostExecutionHealthGate,
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
+        session_attachment_registry: HostSessionAttachmentRegistry,
         projection_catchup_port: ProjectionCatchupPort,
         session_event_reconciliation_waiter: _SessionEventReconciliationWaiter,
         scheduler_store: HostDurableStore,
@@ -974,6 +996,7 @@ class _PublicHostHandle:
         :param health_gate: public admission 与 scheduler fatal 共享的 lifecycle gate。
         :param host_handle_id: 当前 Host handle 诊断 id。
         :param scheduler: 内部 dispatch scheduler。
+        :param session_attachment_registry: 当前 opener 的 attachment access owner。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
         :param session_event_reconciliation_waiter: 当前 opener 独占的 mailbox
             readiness / periodic reconciliation 等待端口。
@@ -988,6 +1011,7 @@ class _PublicHostHandle:
         self._health_gate = health_gate
         self._host_handle_id = host_handle_id
         self._scheduler = scheduler
+        self._session_attachment_registry = session_attachment_registry
         self._projection_catchup_port = projection_catchup_port
         self._session_event_reconciliation_waiter = (
             session_event_reconciliation_waiter
@@ -997,6 +1021,74 @@ class _PublicHostHandle:
         self._transient_delta_hub = transient_delta_hub
         self._wait_poller = wait_poller
         self._close_lock = asyncio.Lock()
+
+    async def attach_session(self, session_id: str) -> HostSessionAttachment:
+        """显式 attach 已存在的 Session 并完成 RW target recovery。
+
+        :param session_id: 目标 Session id。
+        :returns: 生命周期内 mode 不变的 public attachment。
+        :raises HostClosedError: Host 正在关闭或已经关闭时抛出。
+        :raises HostApiError: Session 不存在或同 handle 重复 attach 时抛出。
+        :raises Exception: native mutex、watchdog 或 target recovery 失败时透传。
+        """
+
+        health_lease = await self._health_gate.acquire_admission()
+        try:
+            await asyncio.shield(
+                self._durable_actor.submit(
+                    lambda handle: _get_session(handle, session_id)
+                )
+            )
+            allocation = self._session_attachment_registry.begin_attachment(session_id)
+        except BaseException:
+            health_lease.release()
+            raise
+
+        if allocation.access_mode is HostSessionAccessMode.READ_ONLY:
+            health_lease.release()
+            return allocation.activate()
+
+        recovery_lease = allocation.acquire_recovery_work_lease()
+        fixed_now = datetime.now(UTC)
+        try:
+            self._scheduler.tick_active_cancel_watchdog_for_session(
+                session_id,
+                fixed_now,
+            )
+            recovery_future = self._durable_actor.submit(
+                _SessionAttachmentRecoveryActorOperation(
+                    session_id=session_id,
+                    fixed_now=fixed_now,
+                    wakeup_port=_ThreadsafeSchedulerWakeupPort(
+                        loop=asyncio.get_running_loop(),
+                        scheduler=self._scheduler,
+                    ),
+                    terminal_post_commit_port=self._terminal_post_commit_coordinator,
+                    recovery_owner_host_instance_id=self._scheduler.host_instance_id,
+                )
+            )
+        except BaseException:
+            recovery_lease.release()
+            health_lease.release()
+            await asyncio.shield(allocation.aclose())
+            raise
+
+        recovery_lease.release_when_done(recovery_future)
+        health_lease.release_when_done(recovery_future)
+        try:
+            await asyncio.shield(recovery_future)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(recovery_future)
+            finally:
+                await asyncio.shield(allocation.aclose())
+            raise
+        except BaseException:
+            await asyncio.shield(allocation.aclose())
+            raise
+        recovery_lease.release()
+        health_lease.release()
+        return allocation.activate()
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
@@ -1085,8 +1177,8 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._durable_actor.call(
+        return await self._invoke_session_mutation(
+            session_id,
             lambda handle: _drain_outbox_terminal_items(
                 handle,
                 session_id,
@@ -1103,8 +1195,8 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._invoke_new_work(
+        return await self._invoke_session_mutation(
+            session_id,
             lambda handle: _submit_followup(handle, session_id, request)
         )
 
@@ -1117,8 +1209,9 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._invoke_new_work(
+        run = await self.get_run(run_id)
+        return await self._invoke_session_mutation(
+            run.session_id,
             lambda handle: _retry_run(handle, run_id, request)
         )
 
@@ -1131,8 +1224,9 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._invoke_new_work(
+        run = await self.get_run(run_id)
+        return await self._invoke_session_mutation(
+            run.session_id,
             lambda handle: _replay_run(handle, run_id, request)
         )
 
@@ -1159,8 +1253,9 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._durable_actor.call(
+        run = await self.get_run(run_id)
+        return await self._invoke_session_mutation(
+            run.session_id,
             lambda handle: _cancel_run(handle, run_id, request)
         )
 
@@ -1173,8 +1268,8 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._durable_actor.call(
+        return await self._invoke_session_mutation(
+            session_id,
             lambda handle: _cancel_session_runs(handle, session_id, request)
         )
 
@@ -1187,8 +1282,8 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        self._raise_if_closed()
-        return await self._durable_actor.call(
+        return await self._invoke_session_mutation(
+            session_id,
             lambda handle: _close_session(handle, session_id, request)
         )
 
@@ -1419,51 +1514,30 @@ class _PublicHostHandle:
     async def _close_owned_resources(self) -> None:
         """按 owner 顺序关闭 execution Host 全部资源。
 
+        mandatory 阶段失败会立即阻断后续 owner close，并保留 Host 的
+        ``CLOSING`` retry contract；只有 mandatory 阶段全部成功后才进入
+        best-effort owner 阶段。进入 best-effort 阶段后会尝试全部安全 cleanup，
+        最终传播其中首个错误。
+
         :returns: ``None``。
-        :raises Exception: cleanup 首个错误在全部 owner cleanup 尝试后传播。
+        :raises Exception: mandatory 阶段错误立即传播；best-effort 阶段在全部
+            安全 cleanup 尝试后传播首个错误。
         """
 
+        self._session_attachment_registry.begin_host_close()
         await self._health_gate.begin_closing()
         _LOGGER.info(
             "host.public_handle.close_start host_handle_id=%s",
             self._host_handle_id,
         )
+        if self._wait_poller is not None:
+            await asyncio.to_thread(self._wait_poller.close)
+        await self._durable_actor.stop_and_drain()
+        await self._session_attachment_registry.drain_host_close()
+        await self._scheduler.close()
+        await self._session_attachment_registry.release_host_close()
+
         close_error: BaseException | None = None
-        try:
-            if self._wait_poller is not None:
-                await asyncio.to_thread(self._wait_poller.close)
-        except Exception as exc:
-            close_error = exc
-            _LOGGER.error(
-                "host.public_handle.close_wait_poller_failed host_handle_id=%s error_type=%s",
-                self._host_handle_id,
-                exc.__class__.__name__,
-                exc_info=True,
-            )
-        try:
-            await self._durable_actor.stop_and_drain()
-        except Exception as exc:
-            if close_error is None:
-                close_error = exc
-            else:
-                _LOGGER.error(
-                    "host.public_handle.close_actor_drain_failed host_handle_id=%s error_type=%s",
-                    self._host_handle_id,
-                    exc.__class__.__name__,
-                    exc_info=True,
-                )
-        try:
-            await self._scheduler.close()
-        except Exception as exc:
-            if close_error is None:
-                close_error = exc
-            else:
-                _LOGGER.error(
-                    "host.public_handle.close_scheduler_failed host_handle_id=%s error_type=%s",
-                    self._host_handle_id,
-                    exc.__class__.__name__,
-                    exc_info=True,
-                )
         try:
             await self._terminal_post_commit_coordinator.close()
         except Exception as exc:
@@ -1544,29 +1618,40 @@ class _PublicHostHandle:
         if close_error is not None:
             raise close_error
 
-    async def _invoke_new_work(
+    async def _invoke_session_mutation(
         self,
+        session_id: str,
         operation: Callable[[HostCommandHandle], T],
     ) -> T:
-        """在 shared admission lease 下提交 new-work actor operation。
+        """在 health admission 与 attachment mutation lease 下提交操作。
 
         lease 绑定 actor future 而不是 caller awaiter，因此 caller cancellation
         不会让 fatal transition 越过尚未完成的 commit/rollback 与 matching wake。
 
-        :param operation: new-work command operation。
+        :param session_id: mutation 所属的唯一 Session id。
+        :param operation: actor command operation。
         :returns: actor operation 返回值。
         :raises HostApiError: Host 尚未 READY 或已经 UNAVAILABLE 时抛出。
         :raises HostClosedError: Host 正在关闭或已经关闭时抛出。
         :raises Exception: actor operation 异常原样透传。
         """
 
-        lease = await self._health_gate.acquire_admission()
+        health_lease = await self._health_gate.acquire_admission()
+        try:
+            mutation_lease = self._session_attachment_registry.acquire_mutation_lease(
+                session_id
+            )
+        except BaseException:
+            health_lease.release()
+            raise
         try:
             future = self._durable_actor.submit(operation)
-        except Exception:
-            lease.release()
+        except BaseException:
+            mutation_lease.release()
+            health_lease.release()
             raise
-        lease.release_when_done(future)
+        mutation_lease.release_when_done(future)
+        health_lease.release_when_done(future)
         return await asyncio.shield(future)
 
     def _raise_if_closed(self) -> None:
@@ -1842,6 +1927,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             _TerminalPostCommitCoordinator | None
         ) = None
         health_gate = HostExecutionHealthGate()
+        session_attachment_registry = HostSessionAttachmentRegistry(
+            scheduler_store.options.db_path
+        )
         transient_delta_hub = HostTransientDeltaHub(
             policy=self._options.session_event_delivery_policy,
         )
@@ -1883,6 +1971,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 terminal_post_commit_port_factory=(
                     terminal_post_commit_port_factory
                 ),
+                session_new_work_access=session_attachment_registry,
                 active_registry=active_registry,
                 projection_catchup_port=None,
                 health_gate=health_gate,
@@ -1890,7 +1979,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             terminal_post_commit_coordinator = (
                 terminal_post_commit_port_factory.required_coordinator()
             )
-            scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
             wakeup_port = _ThreadsafeSchedulerWakeupPort(
                 loop=loop,
                 scheduler=scheduler,
@@ -1914,15 +2002,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     f"{host_handle_id}-{_DURABLE_ACTOR_THREAD_NAME_SUFFIX}"
                 ),
             )
-            await durable_actor.call(
-                _StartupRecoveryActorOperation(
-                    wakeup_port=wakeup_port,
-                    terminal_post_commit_port=(
-                        terminal_post_commit_coordinator
-                    ),
-                    recovery_owner_host_instance_id=scheduler.host_instance_id,
-                )
-            )
             wait_poller = _wait_poller_supervisor_from_open_host_options(
                 self._options,
                 command_options=command_options,
@@ -1939,6 +2018,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 health_gate=health_gate,
                 host_handle_id=host_handle_id,
                 scheduler=scheduler,
+                session_attachment_registry=session_attachment_registry,
                 projection_catchup_port=close_projection_catchup_port,
                 session_event_reconciliation_waiter=(
                     _new_session_event_reconciliation_waiter()

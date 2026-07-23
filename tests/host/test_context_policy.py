@@ -77,7 +77,6 @@ def test_context_budget_policy_direct_constructor_requires_attempt_budget() -> N
         context_window_size=1000,
         soft_threshold_context_ratio=0.7,
         hard_threshold_context_ratio=0.9,
-        max_proactive_compactions_per_run=1,
         max_reactive_compactions_per_run=1,
         max_compaction_attempts_per_operation=3,
         policy_ref="policy:test",

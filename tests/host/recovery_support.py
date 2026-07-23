@@ -49,6 +49,7 @@ from dayu.host.durable.projection import (
     read_projection_checkpoint,
 )
 from tests.host.public_smoke_support import (
+    close_attachment_shielded,
     deterministic_runner_spec,
     ensure_request,
     followup_request,
@@ -490,6 +491,7 @@ async def _run_blocking_owner_async(
     options = recovery_open_host_options(root_path, factory)
     async with open_host(options) as host:
         session = await host.ensure_session(ensure_request(slot_key))
+        attachment = await host.attach_session(session.session_id)
         watcher = await host.watch_session_events(session.session_id)
         try:
             followup = await host.submit_followup(
@@ -507,6 +509,7 @@ async def _run_blocking_owner_async(
             )
         finally:
             await close_host_event_iterator(watcher)
+            await close_attachment_shielded(attachment)
 
 
 async def _run_open_probe_async(

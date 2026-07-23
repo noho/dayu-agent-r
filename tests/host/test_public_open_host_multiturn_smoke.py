@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+from contextlib import AsyncExitStack
 
 import pytest
 
@@ -13,6 +14,7 @@ from dayu.host import Host, HostEventKind, HostTerminalStatus, RunStatus, open_h
 from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
     assert_at_most_one_system_message,
+    close_attachment_shielded,
     deterministic_runner_spec,
     ensure_request,
     first_available_provider_case,
@@ -43,8 +45,15 @@ async def test_real_runner_no_tool_two_turn_public_path(
         allow_tool_calls=False,
         max_tokens=2048,
     )
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("real-two-turn"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -93,15 +102,22 @@ async def test_two_watchers_observe_same_terminal_event(
     """
 
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=deterministic_runner_spec(),
-            worker_factory=factory,
-            allow_tool_calls=False,
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=deterministic_runner_spec(),
+                worker_factory=factory,
+                allow_tool_calls=False,
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("two-watchers"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first_watcher = await host.watch_session_events(session.session_id)
         second_watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
@@ -132,15 +148,22 @@ async def test_deterministic_two_turn_request_contains_prior_final_answer(
     """
 
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=deterministic_runner_spec(),
-            worker_factory=factory,
-            allow_tool_calls=False,
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=deterministic_runner_spec(),
+                worker_factory=factory,
+                allow_tool_calls=False,
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("two-turn-continuity"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first = await host.submit_followup(
             session.session_id,
             followup_request(session.session_id, "continuity-first", "first prompt"),
@@ -180,15 +203,22 @@ async def test_concurrent_queue_uses_client_request_id_idempotency(
     """
 
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=deterministic_runner_spec(),
-            worker_factory=factory,
-            allow_tool_calls=False,
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=deterministic_runner_spec(),
+                worker_factory=factory,
+                allow_tool_calls=False,
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("queue-idempotency"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         request = followup_request(
             session.session_id,
             "concurrent-same",
@@ -227,15 +257,22 @@ async def test_submit_followup_field_level_execution_override_freezes_effective_
         top_p=0.9,
         stream=False,
     )
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=baseline_spec,
-            worker_factory=factory,
-            allow_tool_calls=False,
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=baseline_spec,
+                worker_factory=factory,
+                allow_tool_calls=False,
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("override"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         await host.submit_followup(
             session.session_id,
             followup_request(

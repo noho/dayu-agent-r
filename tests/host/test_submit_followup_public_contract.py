@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from dataclasses import fields
 from typing import cast
@@ -34,6 +35,7 @@ from dayu.host import (
     SubmitFollowupRequest,
     open_host,
 )
+from tests.host.public_smoke_support import close_attachment_shielded
 from dayu.host.api import HostStreamCursor
 from dayu.host.memory import default_memory_projection_policy
 
@@ -183,8 +185,16 @@ async def test_repeated_client_request_returns_same_run_and_watermark(
     """重复提交同一 session/client_request_id 返回同一 accepted Run。"""
 
     factory = _RecordingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded,
+            attachment,
+        )
         request = _followup(
             session_id=session.session_id,
             client_request_id="client-repeat",

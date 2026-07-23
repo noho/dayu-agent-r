@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from enum import StrEnum
 from pathlib import Path
 
@@ -56,8 +55,7 @@ from dayu.host.durable.state import (
     is_terminal_run_status,
     promote_queued_run_row,
     read_active_run_for_session,
-    read_cancelling_runs,
-    read_non_terminal_runs,
+    read_cancelling_runs_for_session,
     read_non_terminal_runs_for_session,
     read_run_by_id,
     read_session_by_id,
@@ -401,11 +399,11 @@ def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> No
 
         def verify(
             transaction: HostTransaction,
-        ) -> tuple[str | None, tuple[str, ...], tuple[str, ...], bool, bool, bool]:
+        ) -> tuple[str | None, tuple[str, ...], bool, bool]:
             """比较 durable read helper 与 helper SQL 的结果。
 
             :param transaction: Host transaction。
-            :returns: active id、session/all 非终态 id 与三条 planner 输出是否存在。
+            :returns: active id、target Session 非终态 id 与两条 planner 输出。
             """
 
             active_clause, active_params = run_status_in_clause(
@@ -437,16 +435,6 @@ def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> No
                 """,
                 ("session-sql-1", *non_terminal_params),
             )
-            all_plan = transaction.fetchall(
-                f"""
-                EXPLAIN QUERY PLAN
-                SELECT run_id
-                FROM {TABLE_HOST_RUNS}
-                WHERE status {non_terminal_clause}
-                ORDER BY accepted_event_sequence ASC, run_id ASC
-                """,
-                non_terminal_params,
-            )
             active_equivalent = transaction.fetchone(
                 f"""
                 SELECT run_id
@@ -468,20 +456,10 @@ def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> No
                 """,
                 ("session-sql-1", *non_terminal_params),
             )
-            all_equivalent = transaction.fetchall(
-                f"""
-                SELECT run_id
-                FROM {TABLE_HOST_RUNS}
-                WHERE status {non_terminal_clause}
-                ORDER BY accepted_event_sequence ASC, run_id ASC
-                """,
-                non_terminal_params,
-            )
             active = read_active_run_for_session(transaction, "session-sql-1")
             session_runs = read_non_terminal_runs_for_session(
                 transaction, "session-sql-1"
             )
-            all_runs = read_non_terminal_runs(transaction)
             active_id = active.run_id if active is not None else None
             equivalent_active_id = (
                 _required_row_text(active_equivalent, column="run_id")
@@ -492,24 +470,17 @@ def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> No
             assert tuple(row.run_id for row in session_runs) == tuple(
                 _required_row_text(row, column="run_id") for row in session_equivalent
             )
-            assert tuple(row.run_id for row in all_runs) == tuple(
-                _required_row_text(row, column="run_id") for row in all_equivalent
-            )
             return (
                 active_id,
                 tuple(row.run_id for row in session_runs),
-                tuple(row.run_id for row in all_runs),
                 len(active_plan) > 0,
                 len(session_plan) > 0,
-                len(all_plan) > 0,
             )
 
         store.transaction_runner.run_write(seed)
         assert store.transaction_runner.run_read(verify) == (
             "run-sql-accepted",
             ("run-sql-accepted", "run-sql-queued"),
-            ("run-sql-accepted", "run-sql-queued", "run-sql-running"),
-            True,
             True,
             True,
         )
@@ -1202,8 +1173,10 @@ def test_multiple_queued_runs_for_one_session_succeed(tmp_path: Path) -> None:
         assert store.transaction_runner.run_write(operation) == 2
 
 
-def test_read_cancelling_runs_returns_only_cancelling_rows(tmp_path: Path) -> None:
-    """cancelling Run 专用查询只返回 watchdog 需要的状态。"""
+def test_read_cancelling_runs_for_session_returns_only_target_cancelling_rows(
+    tmp_path: Path,
+) -> None:
+    """target cancelling 查询不读取其它 Session 或其它状态。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -1247,12 +1220,15 @@ def test_read_cancelling_runs_returns_only_cancelling_rows(tmp_path: Path) -> No
                 status=RunStatus.CANCELLING,
                 client_request_id="request-cancelling-2",
             )
-            return tuple(row.run_id for row in read_cancelling_runs(transaction))
+            return tuple(
+                row.run_id
+                for row in read_cancelling_runs_for_session(
+                    transaction,
+                    "session-cancelling-2",
+                )
+            )
 
-        assert store.transaction_runner.run_write(operation) == (
-            "run-cancelling-1",
-            "run-cancelling-2",
-        )
+        assert store.transaction_runner.run_write(operation) == ("run-cancelling-2",)
 
 
 def test_dispatch_record_status_check_allows_phase5_statuses(

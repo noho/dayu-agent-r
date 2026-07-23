@@ -18,6 +18,7 @@ import os
 import pathlib
 import sys
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from math import floor
 from typing import Final
@@ -53,6 +54,7 @@ from dayu.host import (
     EnsureSessionRequest,
     FollowupBehavior,
     Host,
+    HostSessionAttachment,
     HostCallContext,
     HostEvent,
     HostEventKind,
@@ -363,6 +365,19 @@ def _resolve_workspace_root(workspace_root_text: str | None) -> pathlib.Path:
     ).resolve()
 
 
+async def _close_attachment_shielded(
+    attachment: HostSessionAttachment,
+) -> None:
+    """在调用方取消下仍收口 public attachment。
+
+    :param attachment: 当前 smoke lifecycle 唯一持有的 attachment。
+    :returns: ``None``。
+    :raises Exception: attachment cleanup 失败时透传。
+    """
+
+    await asyncio.shield(attachment.aclose())
+
+
 async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     """运行 Host public 多轮 smoke。
 
@@ -383,8 +398,15 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     print("SMOKE LOG_LEVEL", args.log_level.name)
     _print_compact_pressure_plan(assembly.options)
 
-    async with open_host(assembly.options) as host:
+    async with (
+        open_host(assembly.options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request(args, smoke_run_id))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            _close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         print(f"SMOKE SESSION session_id={session.session_id}")
 

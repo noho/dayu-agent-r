@@ -127,7 +127,6 @@ def _execution_profile_record() -> dict[str, JsonValue]:
         "context_budget_policy": {
             "soft_threshold_context_ratio": 0.6,
             "hard_threshold_context_ratio": 0.8,
-            "max_proactive_compactions_per_run": 1,
             "max_reactive_compactions_per_run": 1,
             "max_compaction_attempts_per_operation": 2,
             "policy_ref": "test",

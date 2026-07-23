@@ -67,6 +67,12 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostSessionEventDeliveryPolicy",
         "HostSessionEventDeliveryReason",
         "HostSessionEventIterator",
+        "HostSessionAccessMode",
+        "HostSessionAttachment",
+        "HostSessionAttachmentConflictDetail",
+        "HostSessionAttachmentConflictReason",
+        "HostSessionMutationErrorDetail",
+        "HostSessionMutationRejectionReason",
         "HostStreamCursor",
         "HostTerminalStatus",
         "HostToolCallDelta",
@@ -419,6 +425,7 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
 
     expected_async_methods = frozenset(
         {
+            "attach_session",
             "cancel_run",
             "cancel_session_runs",
             "close",

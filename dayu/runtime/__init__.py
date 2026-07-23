@@ -3,7 +3,8 @@
 ``dayu.runtime`` 是层中立的 runtime 基础设施包，承载层中立、运行期通用、
 可被 :mod:`dayu.engine` / ``dayu.host`` / ``dayu.service`` / ``dayu.ui`` /
 ``dayu.fins`` 复用的基础能力（日志装配、协作式取消等待 / race helper、
-  cross-process lane、同步 filelock wrapper、层中立 ``diagnostic_text`` 文本
+  cross-process lane、strict-native 非阻塞进程 mutex、同步 filelock wrapper、
+  层中立 ``diagnostic_text`` 文本
   脱敏与截断、层中立文本/JSON digest helper、
   workspace 路径公共契约、层中立工具发现装配、层中立配置加载、
   层中立 runtime 位置解析、层中立 scene manifest 装配、
@@ -24,7 +25,8 @@
   :mod:`dayu.runtime.log_levels`。
 
 本包不导出业务语义、不持有 Host 治理状态、不持有 Engine 协议状态机。
-当前包含 ``dayu.runtime.lane``、``dayu.runtime.filelock``、
+当前包含 ``dayu.runtime.lane``、``dayu.runtime.native_mutex``、
+``dayu.runtime.filelock``、
 ``dayu.runtime.tools_discovery``、``dayu.runtime.workspace_paths``、
 ``dayu.runtime.config_loader`` 与 ``dayu.runtime.location``、
 ``dayu.runtime.scene_prepare``、

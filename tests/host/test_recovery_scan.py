@@ -40,6 +40,8 @@ from dayu.host.durable.run_transition import (
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.schema import (
+    INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION,
+    INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
     TABLE_EVENT_LOG,
     TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
     TABLE_HOST_RUNS,
@@ -58,7 +60,7 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
-    read_non_terminal_runs_keyset_page,
+    read_non_terminal_runs_for_session_keyset_page,
     serialize_run_start_reason,
 )
 from dayu.host.durable.transaction import (
@@ -68,10 +70,10 @@ from dayu.host.durable.transaction import (
     HostTransactionRunner,
 )
 from dayu.host.recovery import (
-    StartupRecoveryDecision,
-    StartupRecoveryPolicy,
-    StartupRecoveryScanResult,
-    StartupRecoveryScanner,
+    SessionAttachmentRecoveryDecision,
+    SessionAttachmentRecoveryPolicy,
+    SessionAttachmentRecoveryScanResult,
+    SessionAttachmentRecoveryScanner,
 )
 from dayu.host.recovery_process import ProcessEvidence
 from dayu.host.terminal_post_commit import TerminalPostCommitNotice
@@ -148,7 +150,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="accepted-startup-wake",
         run_status=RunStatus.ACCEPTED.value,
         owner_proof_or_dispatch_condition="unstarted run requires queue promotion wake",
-        expected_decision=StartupRecoveryDecision.ACCEPTED_WAKE.value,
+        expected_decision=SessionAttachmentRecoveryDecision.ACCEPTED_WAKE.value,
         expected_durable_mutation="none",
         expected_reason="accepted",
         coverage_classification=_COVERAGE_EXISTING,
@@ -157,7 +159,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="queued-startup-promotion-check",
         run_status=RunStatus.QUEUED.value,
         owner_proof_or_dispatch_condition="queued run requires queue promotion check",
-        expected_decision=StartupRecoveryDecision.QUEUE_PROMOTION_CHECK.value,
+        expected_decision=SessionAttachmentRecoveryDecision.QUEUE_PROMOTION_CHECK.value,
         expected_durable_mutation="none",
         expected_reason="queued",
         coverage_classification=_COVERAGE_EXISTING,
@@ -166,7 +168,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="waiting-diagnostic-only-low-level",
         run_status=RunStatus.WAITING.value,
         owner_proof_or_dispatch_condition="wait adapter observation unavailable at startup",
-        expected_decision=StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY.value,
+        expected_decision=SessionAttachmentRecoveryDecision.WAITING_DIAGNOSTIC_ONLY.value,
         expected_durable_mutation="none",
         expected_reason=_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,
         coverage_classification=_COVERAGE_EXISTING,
@@ -175,7 +177,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="waiting-durable-read-diagnostic-only",
         run_status=RunStatus.WAITING.value,
         owner_proof_or_dispatch_condition="durable read preserves WAITING semantics after startup scan",
-        expected_decision=StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY.value,
+        expected_decision=SessionAttachmentRecoveryDecision.WAITING_DIAGNOSTIC_ONLY.value,
         expected_durable_mutation="none",
         expected_reason=_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,
         coverage_classification=_COVERAGE_NEW,
@@ -184,7 +186,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="running-positive-orphan-projection-lag",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="stale owner pid missing with projection lag marker",
-        expected_decision=StartupRecoveryDecision.RUN_RECOVERING.value,
+        expected_decision=SessionAttachmentRecoveryDecision.RUN_RECOVERING.value,
         expected_durable_mutation="ATTEMPT_LOST,RUN_RECOVERING",
         expected_reason="startup_orphan_attempt_lost",
         coverage_classification=_COVERAGE_EXISTING,
@@ -193,7 +195,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="running-owner-heartbeat-recent",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="owner heartbeat is inside stale threshold",
-        expected_decision=StartupRecoveryDecision.OWNER_STILL_LIVE.value,
+        expected_decision=SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE.value,
         expected_durable_mutation="none",
         expected_reason=_REASON_OWNER_HEARTBEAT_RECENT,
         coverage_classification=_COVERAGE_NEW,
@@ -202,7 +204,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="running-process-probe-error",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="process probe returns an error for stale owner",
-        expected_decision=StartupRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
+        expected_decision=SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
         expected_durable_mutation="none",
         expected_reason=_REASON_PROCESS_PROBE_ERROR,
         coverage_classification=_COVERAGE_NEW,
@@ -211,7 +213,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="running-stale-heartbeat-only",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="stale heartbeat without process identity proof",
-        expected_decision=StartupRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
+        expected_decision=SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
         expected_durable_mutation="none",
         expected_reason=_REASON_PID_LIVE_WITHOUT_IDENTITY,
         coverage_classification=_COVERAGE_NEW,
@@ -220,7 +222,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="running-missing-current-attempt-or-dispatch",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="current Attempt or dispatch record is absent",
-        expected_decision=StartupRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
+        expected_decision=SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
         expected_durable_mutation="none",
         expected_reason=_REASON_MISSING_CURRENT_ATTEMPT_OR_DISPATCH,
         coverage_classification=_COVERAGE_NEW,
@@ -229,7 +231,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="cancelling-positive-orphan",
         run_status=RunStatus.CANCELLING.value,
         owner_proof_or_dispatch_condition="stale owner pid missing during cancellation",
-        expected_decision=StartupRecoveryDecision.RUN_LOST.value,
+        expected_decision=SessionAttachmentRecoveryDecision.RUN_LOST.value,
         expected_durable_mutation="ATTEMPT_LOST,RUN_LOST",
         expected_reason=_REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST,
         coverage_classification=_COVERAGE_EXISTING,
@@ -238,7 +240,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="recovering-under-dispatch-limit",
         run_status=RunStatus.RECOVERING.value,
         owner_proof_or_dispatch_condition="canonical recovery dispatch count under limit",
-        expected_decision=StartupRecoveryDecision.RECOVERY_DISPATCHED.value,
+        expected_decision=SessionAttachmentRecoveryDecision.RECOVERY_DISPATCHED.value,
         expected_durable_mutation="RUN_STARTED,ATTEMPT_STARTED,dispatch record",
         expected_reason=RunStartReason.RECOVERY.value,
         coverage_classification=_COVERAGE_EXISTING,
@@ -247,7 +249,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="recovering-over-dispatch-limit-projection-lag",
         run_status=RunStatus.RECOVERING.value,
         owner_proof_or_dispatch_condition="canonical EventLog recovery count reaches limit",
-        expected_decision=StartupRecoveryDecision.RUN_LOST.value,
+        expected_decision=SessionAttachmentRecoveryDecision.RUN_LOST.value,
         expected_durable_mutation="RUN_LOST",
         expected_reason="startup_recovery_dispatch_limit_exceeded",
         coverage_classification=_COVERAGE_EXISTING,
@@ -265,7 +267,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="live-owner-multiprocess",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="separate process owner is live",
-        expected_decision=StartupRecoveryDecision.OWNER_STILL_LIVE.value,
+        expected_decision=SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE.value,
         expected_durable_mutation="none",
         expected_reason="multiprocess live owner proof",
         coverage_classification=_COVERAGE_EXISTING,
@@ -274,7 +276,7 @@ _RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
         scenario_id="owner-crash-public-stream-recovery",
         run_status=RunStatus.RUNNING.value,
         owner_proof_or_dispatch_condition="owner process exits before reopen",
-        expected_decision=StartupRecoveryDecision.RECOVERY_DISPATCHED.value,
+        expected_decision=SessionAttachmentRecoveryDecision.RECOVERY_DISPATCHED.value,
         expected_durable_mutation="ATTEMPT_LOST,RUN_RECOVERING,RUN_STARTED",
         expected_reason="public stream observes recovered final answer",
         coverage_classification=_COVERAGE_EXISTING,
@@ -470,7 +472,8 @@ def test_scan_running_positive_orphan_moves_to_recovering_without_projection(
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _insert_projection_lag_marker(store.transaction_runner)
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -478,7 +481,7 @@ def test_scan_running_positive_orphan_moves_to_recovering_without_projection(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RUN_RECOVERING,
+            SessionAttachmentRecoveryDecision.RUN_RECOVERING,
         )
 
         def verify(transaction: HostTransaction) -> str:
@@ -541,7 +544,8 @@ def test_scan_running_owner_heartbeat_recent_does_not_mutate_durable_rows(
         )
         before = _active_run_observation(store.transaction_runner, "run-1")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -549,7 +553,7 @@ def test_scan_running_owner_heartbeat_recent_does_not_mutate_durable_rows(
         ).scan(_policy())
 
         after = _active_run_observation(store.transaction_runner, "run-1")
-        assert tuple(action.decision for action in result.actions) == (StartupRecoveryDecision.OWNER_STILL_LIVE,)
+        assert tuple(action.decision for action in result.actions) == (SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,)
         assert tuple(action.reason for action in result.actions) == (_REASON_OWNER_HEARTBEAT_RECENT,)
         assert after == before
         _assert_no_recovery_or_terminal_facts(store.transaction_runner)
@@ -580,7 +584,8 @@ def test_scan_running_inconclusive_owner_proof_does_not_mutate_durable_rows(
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         before = _active_run_observation(store.transaction_runner, "run-1")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -588,7 +593,7 @@ def test_scan_running_inconclusive_owner_proof_does_not_mutate_durable_rows(
         ).scan(_policy())
 
         after = _active_run_observation(store.transaction_runner, "run-1")
-        assert tuple(action.decision for action in result.actions) == (StartupRecoveryDecision.ORPHAN_INCONCLUSIVE,)
+        assert tuple(action.decision for action in result.actions) == (SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE,)
         assert tuple(action.reason for action in result.actions) == (expected_reason,)
         assert after == before
         _assert_no_recovery_or_terminal_facts(store.transaction_runner)
@@ -601,7 +606,8 @@ def test_scan_waiting_uses_diagnostic_only_fallback(tmp_path: Path) -> None:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _mark_run_status(store.transaction_runner, "run-1", RunStatus.WAITING)
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -609,7 +615,7 @@ def test_scan_waiting_uses_diagnostic_only_fallback(tmp_path: Path) -> None:
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
+            SessionAttachmentRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
         )
         assert tuple(action.reason for action in result.actions) == (_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,)
         assert _count_rows(store.transaction_runner, "host_attempts") == 1
@@ -632,14 +638,15 @@ def test_scan_waiting_durable_read_state_remains_diagnostic_only(
         _mark_run_status(store.transaction_runner, "run-1", RunStatus.WAITING)
         attempt_count_before = _count_rows(store.transaction_runner, "host_attempts")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
         ).scan(_policy())
 
-        assert tuple(action.decision for action in result.actions) == (StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,)
+        assert tuple(action.decision for action in result.actions) == (SessionAttachmentRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,)
         assert tuple(action.reason for action in result.actions) == (_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,)
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.WAITING.value
         assert _count_rows(store.transaction_runner, "host_attempts") == attempt_count_before
@@ -660,7 +667,8 @@ def test_scan_running_missing_dispatch_record_is_inconclusive_without_mutation(
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _delete_dispatch_record_for_attempt(store.transaction_runner, "attempt-run-1")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -668,7 +676,7 @@ def test_scan_running_missing_dispatch_record_is_inconclusive_without_mutation(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.ORPHAN_INCONCLUSIVE,
+            SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE,
         )
         assert tuple(action.reason for action in result.actions) == (
             _REASON_MISSING_CURRENT_ATTEMPT_OR_DISPATCH,
@@ -687,7 +695,8 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -695,7 +704,7 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RUN_LOST,
+            SessionAttachmentRecoveryDecision.RUN_LOST,
         )
         assert tuple(action.reason for action in result.actions) == (
             _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST,
@@ -745,7 +754,8 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
         wakeup = _RecordingWakeup()
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -755,7 +765,7 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+            SessionAttachmentRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
         )
         assert tuple(action.reason for action in result.actions) == (
             "accepted_cancel_watchdog_owner",
@@ -777,7 +787,8 @@ def test_scan_accepted_cancel_without_scheduler_uses_recovery_fallback(
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -786,7 +797,7 @@ def test_scan_accepted_cancel_without_scheduler_uses_recovery_fallback(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RUN_LOST,
+            SessionAttachmentRecoveryDecision.RUN_LOST,
         )
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
@@ -806,7 +817,8 @@ def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
         _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
         wakeup = _RecordingWakeup()
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -816,7 +828,7 @@ def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+            SessionAttachmentRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
         )
         assert tuple(action.reason for action in result.actions) == (
             "accepted_cancel_watchdog_owner",
@@ -834,7 +846,8 @@ def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -843,7 +856,7 @@ def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RUN_LOST,
+            SessionAttachmentRecoveryDecision.RUN_LOST,
         )
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
@@ -857,7 +870,8 @@ def test_scan_accepted_does_not_mutate_or_create_attempt(tmp_path: Path) -> None
         before = _unstarted_scan_observation(store.transaction_runner, "run-1")
         wakeup = _RecordingWakeup()
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -867,7 +881,7 @@ def test_scan_accepted_does_not_mutate_or_create_attempt(tmp_path: Path) -> None
 
         after = _unstarted_scan_observation(store.transaction_runner, "run-1")
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.ACCEPTED_WAKE,
+            SessionAttachmentRecoveryDecision.ACCEPTED_WAKE,
         )
         assert len(result.queue_promotion_sessions) == 1
         assert wakeup.dispatches == []
@@ -885,7 +899,8 @@ def test_scan_accepted_without_wakeup_port_logs_error(
         _seed_unstarted_run(store.transaction_runner, "run-1", RunStatus.ACCEPTED)
         caplog.set_level(logging.ERROR, logger="dayu.host.recovery")
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -893,7 +908,7 @@ def test_scan_accepted_without_wakeup_port_logs_error(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.ACCEPTED_WAKE,
+            SessionAttachmentRecoveryDecision.ACCEPTED_WAKE,
         )
         assert len(result.queue_promotion_sessions) == 1
         assert "host.recovery.queue_promotion_wakeup_unavailable" in caplog.text
@@ -907,7 +922,8 @@ def test_scan_queued_does_not_mutate_or_create_attempt(tmp_path: Path) -> None:
         before = _unstarted_scan_observation(store.transaction_runner, "run-1")
         wakeup = _RecordingWakeup()
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -917,7 +933,7 @@ def test_scan_queued_does_not_mutate_or_create_attempt(tmp_path: Path) -> None:
 
         after = _unstarted_scan_observation(store.transaction_runner, "run-1")
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.QUEUE_PROMOTION_CHECK,
+            SessionAttachmentRecoveryDecision.QUEUE_PROMOTION_CHECK,
         )
         assert len(result.queue_promotion_sessions) == 1
         assert wakeup.dispatches == []
@@ -936,7 +952,8 @@ def test_scan_recovering_loses_when_eventlog_recovery_limit_reached_despite_proj
         _append_recovery_started_event(store.transaction_runner, "run-1")
         _insert_projection_lag_marker(store.transaction_runner)
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -944,7 +961,7 @@ def test_scan_recovering_loses_when_eventlog_recovery_limit_reached_despite_proj
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RUN_LOST,
+            SessionAttachmentRecoveryDecision.RUN_LOST,
         )
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
 
@@ -965,7 +982,8 @@ def test_scan_skips_non_terminal_run_when_session_row_is_missing(
     _delete_session_rows_without_foreign_keys(options.db_path)
 
     with open_host_durable_store(options) as store:
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-1"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -973,7 +991,7 @@ def test_scan_skips_non_terminal_run_when_session_row_is_missing(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.NOT_FOUND,
+            SessionAttachmentRecoveryDecision.NOT_FOUND,
         )
         assert tuple(action.reason for action in result.actions) == (
             "session_missing",
@@ -983,11 +1001,11 @@ def test_scan_skips_non_terminal_run_when_session_row_is_missing(
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_RECOVERING) == 0
 
 
-def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
+def test_target_keyset_page_excludes_other_sessions_with_sequence_ties(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """batch size=2 时 keyset page 有界、严格递增且 tie-break 稳定。
+    """target keyset page 即使 sequence tie 也不读取其它 Session。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -998,12 +1016,13 @@ def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
     page_keys: list[tuple[tuple[int, str], ...]] = []
     input_cursors: list[NonTerminalRunKeysetCursor | None] = []
     upper_watermarks: list[NonTerminalRunKeysetCursor] = []
-    original_reader = read_non_terminal_runs_keyset_page
-    result: StartupRecoveryScanResult | None = None
+    original_reader = read_non_terminal_runs_for_session_keyset_page
+    result: SessionAttachmentRecoveryScanResult | None = None
 
     def record_page(
         transaction: HostTransaction,
         *,
+        session_id: str,
         upper_watermark: NonTerminalRunKeysetCursor,
         cursor: NonTerminalRunKeysetCursor | None,
         batch_size: int,
@@ -1011,6 +1030,7 @@ def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
         """记录 bounded page 输入输出后委托真实 keyset reader。
 
         :param transaction: 当前 recovery write transaction。
+        :param session_id: target recovery Session id。
         :param upper_watermark: fixed upper watermark。
         :param cursor: 上一批 cursor。
         :param batch_size: 单批上限。
@@ -1019,6 +1039,7 @@ def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
 
         rows = original_reader(
             transaction,
+            session_id=session_id,
             upper_watermark=upper_watermark,
             cursor=cursor,
             batch_size=batch_size,
@@ -1045,11 +1066,12 @@ def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
         )
         monkeypatch.setattr(
             host_recovery,
-            "read_non_terminal_runs_keyset_page",
+            "read_non_terminal_runs_for_session_keyset_page",
             record_page,
         )
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-c"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -1058,27 +1080,18 @@ def test_keyset_batches_are_bounded_and_stable_with_sequence_ties(
         ).scan(_policy())
 
     assert result is not None
-    assert tuple(len(page) for page in page_keys) == (2, 2, 1)
-    flattened = tuple(key for page in page_keys for key in page)
-    assert flattened == tuple((100, run_id) for run_id in sorted(run_ids))
-    assert all(left < right for left, right in zip(flattened, flattened[1:]))
-    assert tuple(action.run_id for action in result.actions) == tuple(sorted(run_ids))
-    assert len(frozenset(action.run_id for action in result.actions)) == len(run_ids)
-    assert input_cursors == [
-        None,
-        NonTerminalRunKeysetCursor(100, "run-b"),
-        NonTerminalRunKeysetCursor(100, "run-d"),
-    ]
-    assert upper_watermarks == [
-        NonTerminalRunKeysetCursor(100, "run-e"),
-    ] * 3
+    assert tuple(len(page) for page in page_keys) == (1,)
+    assert page_keys == [((100, "run-c"),)]
+    assert tuple(action.run_id for action in result.actions) == ("run-c",)
+    assert input_cursors == [None]
+    assert upper_watermarks == [NonTerminalRunKeysetCursor(100, "run-c")]
 
 
-def test_fixed_upper_watermark_defers_concurrent_higher_run_to_next_scan(
+def test_target_scan_excludes_concurrent_higher_run_from_other_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """watermark 固定后插入的高序号 Run 只由下一次 scan 处理。
+    """watermark 后插入的其它 Session Run 在后续 target scan 仍排除。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -1087,8 +1100,8 @@ def test_fixed_upper_watermark_defers_concurrent_higher_run_to_next_scan(
 
     original_run_read = HostTransactionRunner.run_read
     inserted = False
-    first: StartupRecoveryScanResult | None = None
-    second: StartupRecoveryScanResult | None = None
+    first: SessionAttachmentRecoveryScanResult | None = None
+    second: SessionAttachmentRecoveryScanResult | None = None
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_unstarted_run(
             store.transaction_runner,
@@ -1132,7 +1145,8 @@ def test_fixed_upper_watermark_defers_concurrent_higher_run_to_next_scan(
             "run_read",
             run_read_then_insert,
         )
-        scanner = StartupRecoveryScanner(
+        scanner = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(store.transaction_runner, "run-b"),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -1144,13 +1158,8 @@ def test_fixed_upper_watermark_defers_concurrent_higher_run_to_next_scan(
 
     assert first is not None
     assert second is not None
-    assert tuple(action.run_id for action in first.actions) == ("run-b", "run-a")
-    assert "run-new" not in tuple(action.run_id for action in first.actions)
-    assert tuple(action.run_id for action in second.actions) == (
-        "run-b",
-        "run-a",
-        "run-new",
-    )
+    assert tuple(action.run_id for action in first.actions) == ("run-b",)
+    assert tuple(action.run_id for action in second.actions) == ("run-b",)
 
 
 def test_policy_now_is_fixed_across_all_batches(
@@ -1166,10 +1175,10 @@ def test_policy_now_is_fixed_across_all_batches(
 
     default_calls = 0
     observed_policy_times: list[datetime] = []
-    original_classify = StartupRecoveryScanner._classify_run
-    result: StartupRecoveryScanResult | None = None
+    original_classify = SessionAttachmentRecoveryScanner._classify_run
+    result: SessionAttachmentRecoveryScanResult | None = None
 
-    def advancing_default(cls: type[StartupRecoveryPolicy]) -> StartupRecoveryPolicy:
+    def advancing_default(cls: type[SessionAttachmentRecoveryPolicy]) -> SessionAttachmentRecoveryPolicy:
         """每次调用返回推进一分钟的 policy time。
 
         :param cls: policy class。
@@ -1180,22 +1189,22 @@ def test_policy_now_is_fixed_across_all_batches(
         del cls
         now = _NOW + timedelta(minutes=default_calls)
         default_calls += 1
-        return StartupRecoveryPolicy(
+        return SessionAttachmentRecoveryPolicy(
             now=now,
             stale_after=timedelta(seconds=30),
             recovery_dispatch_limit=1,
         )
 
     def record_policy_time(
-        self: StartupRecoveryScanner,
+        self: SessionAttachmentRecoveryScanner,
         transaction: HostTransaction,
         run: RunRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
         queue_promotion_sessions: list[str],
         seen_queue_promotion_sessions: set[str],
         terminal_notices: list[TerminalPostCommitNotice],
-    ) -> host_recovery.StartupRecoveryAction:
+    ) -> host_recovery.SessionAttachmentRecoveryAction:
         """记录每行分类使用的 policy time 并委托真实 owner。
 
         :param self: recovery scanner。
@@ -1233,17 +1242,21 @@ def test_policy_now_is_fixed_across_all_batches(
             heartbeat_at="2026-05-19T03:03:55.000000Z",
         )
         monkeypatch.setattr(
-            StartupRecoveryPolicy,
+            SessionAttachmentRecoveryPolicy,
             "default",
             classmethod(advancing_default),
         )
         monkeypatch.setattr(
-            StartupRecoveryScanner,
+            SessionAttachmentRecoveryScanner,
             "_classify_run",
             record_policy_time,
         )
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(
+                store.transaction_runner,
+                "run-fixed-now-0",
+            ),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -1253,17 +1266,17 @@ def test_policy_now_is_fixed_across_all_batches(
 
     assert result is not None
     assert default_calls == 1
-    assert observed_policy_times == [_NOW] * 5
+    assert observed_policy_times == [_NOW]
     assert tuple(action.decision for action in result.actions) == (
-        StartupRecoveryDecision.OWNER_STILL_LIVE,
-    ) * 5
+        SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,
+    )
 
 
-def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
+def test_second_target_page_failure_rolls_back_without_wake_and_rerun_converges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """第2批失败不 wake；第1批 facts 保持且完整重跑收敛到 durable truth。
+    """同一 target Session 第2页失败整页回滚，重跑后收敛。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -1272,20 +1285,21 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
 
     run_ids = tuple(f"run-batch-failure-{index}" for index in range(5))
     wakeup = _RecordingWakeup()
+    terminal_port = _RecordingTerminalPort()
     classify_count = 0
-    original_classify = StartupRecoveryScanner._classify_run
+    original_classify = SessionAttachmentRecoveryScanner._classify_run
 
     def fail_after_first_mutation_in_second_batch(
-        self: StartupRecoveryScanner,
+        self: SessionAttachmentRecoveryScanner,
         transaction: HostTransaction,
         run: RunRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
         queue_promotion_sessions: list[str],
         seen_queue_promotion_sessions: set[str],
         terminal_notices: list[TerminalPostCommitNotice],
-    ) -> host_recovery.StartupRecoveryAction:
-        """让第3行先写 mutation 后抛错，验证整批 rollback。
+    ) -> host_recovery.SessionAttachmentRecoveryAction:
+        """让第3行先写 mutation 后抛错以验证整页 rollback。
 
         :param self: recovery scanner。
         :param transaction: 当前 batch transaction。
@@ -1322,18 +1336,32 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
                 run_id,
                 slot_key=f"batch-failure-{index}",
             )
+            _append_accepted_cancel_facts(
+                store.transaction_runner,
+                run_id,
+            )
+        target_session_id = _run_session_id(
+            store.transaction_runner,
+            run_ids[0],
+        )
+        _remap_runs_to_target_session_without_active_indexes(
+            _options(tmp_path).db_path,
+            run_ids=run_ids,
+            target_session_id=target_session_id,
+        )
         _insert_current_recovery_owner(store.transaction_runner)
-        scanner = StartupRecoveryScanner(
+        scanner = SessionAttachmentRecoveryScanner(
+            session_id=target_session_id,
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
-            terminal_post_commit_port=_RecordingTerminalPort(),
+            terminal_post_commit_port=terminal_port,
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
             recovery_owner_host_instance_id="host-instance-new",
             batch_size=2,
         )
         monkeypatch.setattr(
-            StartupRecoveryScanner,
+            SessionAttachmentRecoveryScanner,
             "_classify_run",
             fail_after_first_mutation_in_second_batch,
         )
@@ -1344,50 +1372,146 @@ def test_second_batch_failure_rolls_back_without_wake_and_full_rerun_converges(
         ):
             scanner.scan(_policy())
 
-        assert len(wakeup.dispatches) == 2
-        assert _current_attempt_id(store.transaction_runner, run_ids[0]) != (
-            f"attempt-{run_ids[0]}"
-        )
-        assert _current_attempt_id(store.transaction_runner, run_ids[1]) != (
-            f"attempt-{run_ids[1]}"
-        )
-        assert _current_attempt_id(store.transaction_runner, run_ids[2]) == (
-            f"attempt-{run_ids[2]}"
-        )
-        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_ATTEMPT_LOST) == 2
+        assert wakeup.dispatches == []
+        assert len(terminal_port.notices) == 2
+        assert _run_status(
+            store.transaction_runner,
+            run_ids[0],
+        ) == RunStatus.LOST.value
+        assert _run_status(
+            store.transaction_runner,
+            run_ids[1],
+        ) == RunStatus.LOST.value
+        assert _run_status(
+            store.transaction_runner,
+            run_ids[2],
+        ) == RunStatus.CANCELLING.value
+        assert _event_type_count(
+            store.transaction_runner,
+            _EVENT_TYPE_ATTEMPT_LOST,
+        ) == 2
 
         monkeypatch.setattr(
-            StartupRecoveryScanner,
+            SessionAttachmentRecoveryScanner,
             "_classify_run",
             original_classify,
         )
         rerun = scanner.scan(_policy())
 
-        assert len(wakeup.dispatches) == 5
-        assert len(frozenset(item.dispatch_record_id for item in wakeup.dispatches)) == 5
-        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_ATTEMPT_LOST) == 5
-        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_RECOVERING) == 5
-        assert tuple(action.decision for action in rerun.actions[:2]) == (
-            StartupRecoveryDecision.OWNER_STILL_LIVE,
-            StartupRecoveryDecision.OWNER_STILL_LIVE,
-        )
-        assert tuple(action.decision for action in rerun.actions[2:]) == (
-            StartupRecoveryDecision.RECOVERY_DISPATCHED,
+        assert wakeup.dispatches == []
+        assert len(terminal_port.notices) == 5
+        assert _event_type_count(
+            store.transaction_runner,
+            _EVENT_TYPE_ATTEMPT_LOST,
+        ) == 5
+        assert _event_type_count(
+            store.transaction_runner,
+            _EVENT_TYPE_RUN_LOST,
+        ) == 5
+        assert tuple(action.decision for action in rerun.actions) == (
+            SessionAttachmentRecoveryDecision.RUN_LOST,
         ) * 3
-        for run_id in run_ids:
-            current_dispatch_id = _current_dispatch_record_id(
+
+
+def test_target_scan_does_not_enter_foreign_session_failure_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target scan 不进入其它 Session 的分类或批次失败注入。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    run_ids = tuple(f"run-target-isolation-{index}" for index in range(3))
+    wakeup = _RecordingWakeup()
+    classify_count = 0
+    original_classify = SessionAttachmentRecoveryScanner._classify_run
+
+    def fail_if_foreign_run_is_classified(
+        self: SessionAttachmentRecoveryScanner,
+        transaction: HostTransaction,
+        run: RunRow,
+        policy: SessionAttachmentRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
+        queue_promotion_sessions: list[str],
+        seen_queue_promotion_sessions: set[str],
+        terminal_notices: list[TerminalPostCommitNotice],
+    ) -> host_recovery.SessionAttachmentRecoveryAction:
+        """记录 target 分类；若进入第二个 Session 则立即失败。
+
+        :param self: recovery scanner。
+        :param transaction: 当前 batch transaction。
+        :param run: 当前 Run row。
+        :param policy: fixed scan policy。
+        :param pending_dispatches: 本批 pending accumulator。
+        :param queue_promotion_sessions: 本批 promotion accumulator。
+        :param seen_queue_promotion_sessions: 已提交 promotion 去重集合。
+        :param terminal_notices: 本批 exact terminal notice accumulator。
+        :returns: target Run 的真实 action。
+        :raises RuntimeError: foreign Run 被错误分类时抛出。
+        """
+
+        nonlocal classify_count
+        classify_count += 1
+        if run.run_id != run_ids[0]:
+            raise RuntimeError("foreign session entered target recovery")
+        return original_classify(
+            self,
+            transaction,
+            run,
+            policy,
+            pending_dispatches,
+            queue_promotion_sessions,
+            seen_queue_promotion_sessions,
+            terminal_notices,
+        )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        for index, run_id in enumerate(run_ids):
+            _seed_running_dispatching_run(
                 store.transaction_runner,
                 run_id,
+                slot_key=f"target-isolation-{index}",
             )
-            assert current_dispatch_id in tuple(
-                item.dispatch_record_id for item in wakeup.dispatches
-            )
+        _insert_current_recovery_owner(store.transaction_runner)
+        scanner = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(
+                store.transaction_runner,
+                run_ids[0],
+            ),
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
+            recovery_owner_host_instance_id="host-instance-new",
+            batch_size=2,
+        )
+        monkeypatch.setattr(
+            SessionAttachmentRecoveryScanner,
+            "_classify_run",
+            fail_if_foreign_run_is_classified,
+        )
+
+        result = scanner.scan(_policy())
+
+        assert classify_count == 1
+        assert tuple(action.run_id for action in result.actions) == (run_ids[0],)
+        assert len(wakeup.dispatches) == 1
+        assert _current_attempt_id(store.transaction_runner, run_ids[0]) != (
+            f"attempt-{run_ids[0]}"
+        )
+        assert _current_attempt_id(store.transaction_runner, run_ids[1]) == (
+            f"attempt-{run_ids[1]}"
+        )
 
 
-def test_paginated_scan_preserves_accepted_queued_waiting_and_cancel_owners(
+def test_target_scan_preserves_only_target_accepted_owner(
     tmp_path: Path,
 ) -> None:
-    """分页不改变 ACCEPTED/QUEUED/WAITING/accepted-cancel 分类真源。
+    """target scan 只分类目标 ACCEPTED，不触碰其它 Session owner。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -1427,7 +1551,11 @@ def test_paginated_scan_preserves_accepted_queued_waiting_and_cancel_owners(
             "run-mixed-cancelling",
         )
 
-        result = StartupRecoveryScanner(
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(
+                store.transaction_runner,
+                "run-mixed-accepted",
+            ),
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
@@ -1438,12 +1566,11 @@ def test_paginated_scan_preserves_accepted_queued_waiting_and_cancel_owners(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.ACCEPTED_WAKE,
-            StartupRecoveryDecision.QUEUE_PROMOTION_CHECK,
-            StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
-            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+            SessionAttachmentRecoveryDecision.ACCEPTED_WAKE,
         )
-        assert len(wakeup.promoted_sessions) == 2
+        assert wakeup.promoted_sessions == [
+            _run_session_id(store.transaction_runner, "run-mixed-accepted")
+        ]
         assert wakeup.dispatches == []
         assert _run_status(
             store.transaction_runner,
@@ -1483,6 +1610,43 @@ def _set_shared_accepted_sequence_without_foreign_keys(
                 """,
                 (accepted_event_sequence, run_id),
             )
+
+
+def _remap_runs_to_target_session_without_active_indexes(
+    db_path: Path,
+    *,
+    run_ids: tuple[str, ...],
+    target_session_id: str,
+) -> None:
+    """构造同一 target Session 的 defensive multi-page recovery fixture。
+
+    production schema 只允许每个 Session 一个 active Run；recovery reader 仍按
+    bounded keyset page 实现，因此本 fixture 仅在测试库删除两个 active 唯一索引
+    并重映射指定 Run，用于验证第二页事务回滚与重跑收敛。
+
+    :param db_path: Host durable SQLite 路径。
+    :param run_ids: 待映射到同一 Session 的 Run ids。
+    :param target_session_id: target Session id。
+    :returns: ``None``。
+    :raises ValueError: ``run_ids`` 为空时抛出。
+    :raises sqlite3.Error: fixture DDL/DML 失败时抛出。
+    """
+
+    if not run_ids:
+        raise ValueError("run_ids must be non-empty")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            f"DROP INDEX IF EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}"
+        )
+        connection.execute(
+            f"DROP INDEX IF EXISTS {INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION}"
+        )
+        placeholders = ", ".join("?" for _ in run_ids)
+        connection.execute(
+            f"UPDATE {TABLE_HOST_RUNS} SET session_id = ? "
+            f"WHERE run_id IN ({placeholders})",
+            (target_session_id, *run_ids),
+        )
 
 
 def _insert_current_recovery_owner(
@@ -1585,13 +1749,13 @@ def _current_dispatch_record_id(
     return transaction_runner.run_read(operation)
 
 
-def _policy() -> StartupRecoveryPolicy:
+def _policy() -> SessionAttachmentRecoveryPolicy:
     """构造测试 recovery policy。
 
     :returns: startup recovery policy。
     """
 
-    return StartupRecoveryPolicy(
+    return SessionAttachmentRecoveryPolicy(
         now=_NOW,
         stale_after=timedelta(seconds=30),
         recovery_dispatch_limit=1,
@@ -1713,6 +1877,25 @@ def _seed_running_dispatching_run(
         assert dispatching.status is StateMutationStatus.UPDATED
 
     transaction_runner.run_write(operation)
+
+
+def _run_session_id(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> str:
+    """从 durable Run truth 读取 target recovery Session id。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :returns: Run 所属 Session id。
+    :raises AssertionError: Run 不存在时抛出。
+    """
+
+    run = transaction_runner.run_read(
+        lambda transaction: read_run_by_id(transaction, run_id)
+    )
+    assert run is not None
+    return run.session_id
 
 
 def _seed_unstarted_run(

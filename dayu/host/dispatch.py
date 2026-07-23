@@ -13,9 +13,8 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from threading import RLock
 from typing import Protocol
 from uuid import uuid4
@@ -27,12 +26,10 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     RunCancelledData,
-    runner_role_sequence_digest,
 )
 from dayu.host.admission import (
     AdmissionWakeupPort,
     PendingDispatchRecord,
-    create_host_admission_service,
 )
 from dayu.host.api import (
     AttemptDispatchSnapshot,
@@ -53,7 +50,6 @@ from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
-    EventPayloadTextEqualsFilter,
     EventLogStore,
 )
 from dayu.host.durable.errors import HostDurableError, HostTransactionRetryExhaustedError
@@ -67,17 +63,21 @@ from dayu.host.durable.liveness import (
 from dayu.host.durable.run_transition import (
     ActiveCancelWatchdogCloseoutInput,
     FailUnstartedRunInput,
+    OwnedAttemptCancelDelivery,
+    OwnedAttemptCancelTarget,
     StartGovernedRunInput,
     TerminalCloseoutInput,
     active_cancel_watchdog_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
     project_terminal_notice_from_exact_run_event,
     read_cancel_requested_event_from_run_link,
+    read_exact_owned_attempt_cancel_deliveries,
+    read_exact_owned_attempt_cancel_targets,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import (
+    AttemptExecutionIdentity,
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordStatus,
@@ -93,7 +93,7 @@ from dayu.host.durable.state import (
     read_active_run_for_session,
     read_accepted_run_for_session,
     read_attempt_by_id,
-    read_cancelling_runs,
+    read_cancelling_runs_for_session,
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
@@ -102,6 +102,10 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host._execution_health import HostExecutionHealthGate
+from dayu.host.session_attachment import (
+    SessionNewWorkAccessPort,
+    SessionWorkLease,
+)
 from dayu.host._execution_config_projection import (
     effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
     required_json_mapping as _required_json_mapping,
@@ -173,10 +177,9 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
     CompactionRejectedAttemptDiagnosticReference,
-    CompactionFailureCategory,
     CompactionOperationResult,
     DurableCompactorProposalManifestRecorder,
-    run_compaction_operation,
+    run_compaction_attempt,
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
 from dayu.host.context_budget import (
@@ -203,6 +206,16 @@ from dayu.host.context_events import (
     build_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.proactive_compaction import (
+    ProactiveCompactionAttemptPlan,
+    ProactiveCompactionAttemptStage,
+    ProactiveCompactionDecision,
+    ProactiveCompactionState,
+    ProactiveCompactionTierRequest,
+    build_proactive_compaction_attempt_schedule,
+    read_proactive_compaction_projection,
+    validate_proactive_compaction_attempt_schedule,
+)
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.payload import PayloadStore
 from dayu.host.tool_runtime import (
@@ -251,6 +264,9 @@ _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
 _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
+_PROACTIVE_INVALID_OR_EXHAUSTED_REASON = (
+    "proactive_operation_invalid_or_exhausted"
+)
 _COMPACTION_CANCEL_REASON_RUN_MISSING = "run_missing"
 _COMPACTION_CANCEL_REASON_SESSION_MISSING = "session_missing"
 _COMPACTION_CANCEL_REASON_SESSION_CLOSED = "session_closed"
@@ -267,6 +283,7 @@ _CRITICAL_COMPONENT_HEARTBEAT = "heartbeat"
 _CRITICAL_COMPONENT_DISPATCH = "dispatch"
 _CRITICAL_COMPONENT_PROMOTION = "promotion"
 _CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG = "active_cancel_watchdog"
+_CRITICAL_COMPONENT_ACTIVE_CANCEL_OWNER = "active_cancel_owner_reconciliation"
 
 
 class _MemoryProjectionDispatchDiagnosticError(HostDurableError):
@@ -405,6 +422,38 @@ class DispatchDrainResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedSessionReconciliationResult:
+    """一次 ACTIVE RW Session durable reconciliation 摘要。
+
+    :param owned_session_count: 入口稳定快照包含的 ACTIVE RW Session 数。
+    :param leased_session_count: 快照后仍成功取得 new-work lease 的 Session 数。
+    :param dispatched_session_count: 本轮创建 stable dispatch 的 Session 数。
+    :param skipped_session_count: close race 或没有可推进工作而跳过的 Session 数。
+    """
+
+    owned_session_count: int
+    leased_session_count: int
+    dispatched_session_count: int
+    skipped_session_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveWorkerCancelReconciliationResult:
+    """一次 execution-owner active cancel reconciliation 摘要。
+
+    :param snapshot_count: 本轮 registry exact identity 快照数量。
+    :param target_count: durable strict query 返回的 owned cancel target 数量。
+    :param propagated_count: transaction 外仍命中同一 local worker 的数量。
+    :param closed_count: 本轮 exact watchdog 成功写入 terminal closeout 的数量。
+    """
+
+    snapshot_count: int
+    target_count: int
+    propagated_count: int
+    closed_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveCancelWatchdogTickResult:
     """active cancel watchdog 单次 tick 摘要。
 
@@ -435,6 +484,26 @@ class _ActiveCancelWatchdogCandidate:
     session_id: str
     attempt_id: str
     cancel_requested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveCancelWatchdogSessionScope:
+    """caller / fresh attachment 指定的 Session watchdog scope。
+
+    :param session_id: 目标 Session id。
+    """
+
+    session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveCancelWatchdogOwnedTargetScope:
+    """execution owner 已严格验证的 exact target watchdog scope。
+
+    :param target: 需要在写事务内重验的 exact owned target。
+    """
+
+    target: OwnedAttemptCancelTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,12 +558,14 @@ class _ReadCommittedCancelRequestedAtOperation:
 class ActiveCancelMessage:
     """active worker cancel registry 的最小取消消息。
 
+    :param session_id: 目标 Session id。
     :param run_id: 目标 Run id。
     :param attempt_id: 目标 Attempt id。
     :param execution_id: 目标 execution id。
     :param reason: 取消原因。
     """
 
+    session_id: str
     run_id: str
     attempt_id: str
     execution_id: str
@@ -587,6 +658,8 @@ class _GovernanceCompactPending:
     :param operation_id: 对应 ``CONTEXT_COMPACTION_REQUESTED`` event id。
     :param estimate: compact 前预算估算。
     :param decision: 预算决策。
+    :param first_attempt_number: 本次 execution 的首个全局 attempt number。
+    :param max_attempt_number: request 冻结的全局 attempt 上限。
     """
 
     run_id: str
@@ -600,18 +673,8 @@ class _GovernanceCompactPending:
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
-
-
-@dataclass(frozen=True, slots=True)
-class _ProactiveCompactionRecoveryAttempt:
-    """proactive compaction recovery tier 的内存态 attempt 摘要。
-
-    :param request: recovery tier 使用的 compaction request。
-    :param reason: 日志诊断用本地 tier 原因，不写入 durable payload。
-    """
-
-    request: CompactionRequest
-    reason: str
+    first_attempt_number: int
+    max_attempt_number: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,12 +723,12 @@ class _EffectiveDispatchDecision:
 class _ActiveWorkerEntry:
     """active worker registry 内部条目。
 
-    :param run_id: 目标 Run id。
+    :param identity: 目标 worker 的 exact durable identity。
     :param handle: worker handle。
     :param cancellation_token: Host 注入 Engine 的取消 token。
     """
 
-    run_id: str
+    identity: AttemptExecutionIdentity
     handle: LocalWorkerHandle
     cancellation_token: "_HostCancellationToken"
 
@@ -712,6 +775,7 @@ class ActiveWorkerRegistry:
     def register(
         self,
         *,
+        session_id: str,
         run_id: str,
         attempt_id: str,
         execution_id: str,
@@ -720,6 +784,7 @@ class ActiveWorkerRegistry:
     ) -> None:
         """注册 active worker handle。
 
+        :param session_id: 目标 Session id。
         :param run_id: 目标 Run id。
         :param attempt_id: active Attempt id。
         :param execution_id: active execution id。
@@ -730,7 +795,12 @@ class ActiveWorkerRegistry:
 
         with self._lock:
             self._entries[(attempt_id, execution_id)] = _ActiveWorkerEntry(
-                run_id=run_id,
+                identity=AttemptExecutionIdentity(
+                    session_id=session_id,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    execution_id=execution_id,
+                ),
                 handle=handle,
                 cancellation_token=cancellation_token,
             )
@@ -755,10 +825,39 @@ class ActiveWorkerRegistry:
 
         with self._lock:
             entry = self._entries.get((message.attempt_id, message.execution_id))
-        if entry is None or entry.run_id != message.run_id:
+        if entry is None or entry.identity != AttemptExecutionIdentity(
+            session_id=message.session_id,
+            run_id=message.run_id,
+            attempt_id=message.attempt_id,
+            execution_id=message.execution_id,
+        ):
             return False
         _propagate_active_worker_cancel(message, entry)
         return True
+
+    def snapshot_identities(self) -> tuple[AttemptExecutionIdentity, ...]:
+        """返回当前 active workers 的稳定 exact identity 快照。
+
+        快照不暴露 handle 或 cancellation token，供 scheduler 在 transaction
+        外按同一 identity 传播已验证的 durable cancel truth。
+
+        :returns: 按 Session / Run / Attempt / execution 排序的 identity 元组。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        with self._lock:
+            identities = tuple(entry.identity for entry in self._entries.values())
+        return tuple(
+            sorted(
+                identities,
+                key=lambda identity: (
+                    identity.session_id,
+                    identity.run_id,
+                    identity.attempt_id,
+                    identity.execution_id,
+                ),
+            )
+        )
 
     def cancel_all(self, reason: str) -> int:
         """向所有当前 active worker best-effort 传播取消。
@@ -771,7 +870,8 @@ class ActiveWorkerRegistry:
             entries = tuple(
                 (
                     ActiveCancelMessage(
-                        run_id=entry.run_id,
+                        session_id=entry.identity.session_id,
+                        run_id=entry.identity.run_id,
                         attempt_id=attempt_id,
                         execution_id=execution_id,
                         reason=reason,
@@ -997,6 +1097,7 @@ class HostDispatchScheduler:
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
         terminal_post_commit_port: TerminalPostCommitPort,
+        session_new_work_access: SessionNewWorkAccessPort,
         host_instance_identity: HostInstanceIdentity | None = None,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
@@ -1011,6 +1112,7 @@ class HostDispatchScheduler:
         :param host_handle_id: Host handle 诊断 id。
         :param transient_delta_publisher: 已验证 Engine delta 的 Host 瞬态发布端口。
         :param terminal_post_commit_port: terminal commit 后的本地最终通知端口。
+        :param session_new_work_access: Session 新工作资格的唯一只读端口。
         :param host_instance_identity: 当前 scheduler 的 Host instance 身份；
             不传时创建仅供测试直接构造使用的身份。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
@@ -1028,6 +1130,7 @@ class HostDispatchScheduler:
             lane_controller=lane_controller,
             host_handle_id=host_handle_id,
             transient_delta_publisher=transient_delta_publisher,
+            session_new_work_access=session_new_work_access,
             host_instance_identity=host_instance_identity,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
@@ -1044,6 +1147,7 @@ class HostDispatchScheduler:
         lane_controller: LaneController,
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
+        session_new_work_access: SessionNewWorkAccessPort,
         host_instance_identity: HostInstanceIdentity | None,
         active_registry: ActiveWorkerRegistry | None,
         projection_catchup_port: ProjectionCatchupPort | None,
@@ -1057,6 +1161,7 @@ class HostDispatchScheduler:
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
         :param transient_delta_publisher: Host 瞬态发布端口。
+        :param session_new_work_access: Session 新工作资格的唯一只读端口。
         :param host_instance_identity: Host instance 身份。
         :param active_registry: active worker registry。
         :param projection_catchup_port: projection catch-up 端口。
@@ -1073,6 +1178,7 @@ class HostDispatchScheduler:
         self._lane_controller = lane_controller
         self._host_handle_id = host_handle_id
         self._transient_delta_publisher = transient_delta_publisher
+        self._session_new_work_access = session_new_work_access
         self._host_instance_identity = (
             host_instance_identity
             if host_instance_identity is not None
@@ -1088,11 +1194,17 @@ class HostDispatchScheduler:
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._active_cancel_watchdog_event = asyncio.Event()
+        self._active_cancel_watchdog_session_ids: set[str] = set()
         self._closed = False
         self._close_cleanup_done = False
+        self._host_instance_stopping_marked = False
+        self._lane_close_done = False
+        self._host_instance_stopped_marked = False
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._promotion_drain_task: asyncio.Task[None] | None = None
+        self._owned_session_reconciliation_task: asyncio.Task[None] | None = None
+        self._active_worker_cancel_reconciliation_task: asyncio.Task[None] | None = None
         self._active_cancel_watchdog_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
@@ -1147,6 +1259,7 @@ class HostDispatchScheduler:
         host_handle_id: str,
         transient_delta_publisher: HostTransientDeltaPublisher,
         terminal_post_commit_port_factory: _TerminalPostCommitPortFactory,
+        session_new_work_access: SessionNewWorkAccessPort,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
         health_gate: HostExecutionHealthGate | None = None,
@@ -1158,6 +1271,7 @@ class HostDispatchScheduler:
         :param host_handle_id: Host handle 诊断 id。
         :param transient_delta_publisher: 已验证 Engine delta 的 Host 瞬态发布端口。
         :param terminal_post_commit_port_factory: 构造最终 terminal port 的内部工厂。
+        :param session_new_work_access: Session 新工作资格的唯一只读端口。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :param health_gate: execution opener 持有的共享 health gate。
@@ -1202,6 +1316,7 @@ class HostDispatchScheduler:
             lane_controller=lane_controller,
             host_handle_id=host_handle_id,
             transient_delta_publisher=transient_delta_publisher,
+            session_new_work_access=session_new_work_access,
             host_instance_identity=host_identity,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
@@ -1216,6 +1331,8 @@ class HostDispatchScheduler:
             scheduler._bind_terminal_post_commit_port(terminal_post_commit_port)
             scheduler._start_host_instance_heartbeat()
             scheduler._start_active_cancel_watchdog_loop()
+            scheduler._start_active_worker_cancel_reconciliation_loop()
+            scheduler._start_owned_session_reconciliation_loop()
             return scheduler
         except BaseException:
             try:
@@ -1267,6 +1384,16 @@ class HostDispatchScheduler:
         """
 
         self._raise_if_wake_unavailable(component=_CRITICAL_COMPONENT_PROMOTION)
+        eligibility = self._session_new_work_access.try_acquire_new_work_lease(
+            session_id
+        )
+        if eligibility is None:
+            _LOGGER.debug(
+                "dispatch.queue_promotion.drop_ineligible session_id=%s",
+                session_id,
+            )
+            return
+        eligibility.release()
         self._promotion_queue.put_nowait(session_id)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1280,27 +1407,61 @@ class HostDispatchScheduler:
                 component=_CRITICAL_COMPONENT_PROMOTION,
             )
 
-    def wake_active_cancel_watchdog(self) -> None:
-        """唤醒 active cancel watchdog 执行一次 accepted-cancel 收口扫描。
+    def wake_active_cancel_watchdog(self, session_id: str) -> None:
+        """唤醒 active cancel watchdog 收口目标 Session。
 
+        :param session_id: 已提交 cancel command 的目标 Session id。
         :returns: ``None``。
+        :raises ValueError: Session id 为空时抛出。
         :raises HostApiError: scheduler 已关闭或 execution unavailable 时抛出。
         """
 
+        if session_id.strip() == "":
+            raise ValueError("session_id must be non-empty")
         self._raise_if_wake_unavailable(
             component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG
         )
+        self._active_cancel_watchdog_session_ids.add(session_id)
         self._active_cancel_watchdog_event.set()
         self._start_active_cancel_watchdog_loop()
 
-    def tick_active_cancel_watchdog(
-        self, now: datetime
+    def tick_active_cancel_watchdog_for_session(
+        self,
+        session_id: str,
+        now: datetime,
     ) -> ActiveCancelWatchdogTickResult:
-        """同步执行一次 accepted-cancel watchdog 收口扫描。
+        """同步收口目标 Session 已接受的 active cancel。
+
+        :param session_id: fresh RW attachment 对应的目标 Session id。
+        :param now: 本轮 watchdog 判定使用的 UTC aware 时间。
+        :returns: 单次 target tick 摘要。
+        :raises ValueError: Session id 为空或 ``now`` 非 UTC aware 时抛出。
+        :raises HostTransactionRetryExhaustedError: durable 写事务重试耗尽时抛出。
+        """
+
+        if session_id.strip() == "":
+            raise ValueError("session_id must be non-empty")
+        return self._tick_active_cancel_watchdog(
+            now=now,
+            scope=_ActiveCancelWatchdogSessionScope(session_id=session_id),
+        )
+
+    def _tick_active_cancel_watchdog(
+        self,
+        *,
+        now: datetime,
+        scope: (
+            _ActiveCancelWatchdogSessionScope
+            | _ActiveCancelWatchdogOwnedTargetScope
+        ),
+    ) -> ActiveCancelWatchdogTickResult:
+        """在唯一 terminal producer 内执行一次 accepted-cancel closeout。
 
         :param now: 本轮 watchdog 判定使用的 UTC aware 时间。
+        :param scope: target Session 或 exact execution-owner target。
         :returns: 单次 tick 摘要。
         :raises ValueError: ``now`` 不是 UTC aware 时间时抛出。
+        :raises HostDurableError: exact target 的 cancel link 非法时抛出。
         :raises HostTransactionRetryExhaustedError: durable 写事务重试耗尽时抛出。
         """
 
@@ -1309,10 +1470,25 @@ class HostDispatchScheduler:
         def _operation(
             transaction: HostTransaction,
         ) -> _ActiveCancelWatchdogOperationResult:
-            candidates, scanned, ignored = _read_active_cancel_watchdog_candidates(
-                transaction,
-                self._event_log_store,
-            )
+            if isinstance(scope, _ActiveCancelWatchdogSessionScope):
+                candidates, scanned, ignored = (
+                    _read_active_cancel_watchdog_candidates(
+                        transaction,
+                        self._event_log_store,
+                        session_id=scope.session_id,
+                    )
+                )
+            else:
+                candidates, scanned, ignored = (
+                    _read_exact_owned_active_cancel_watchdog_candidate(
+                        transaction,
+                        self._event_log_store,
+                        owner_host_instance_id=(
+                            self._host_instance_identity.host_instance_id
+                        ),
+                        target=scope.target,
+                    )
+                )
             eligible = 0
             terminal_notices: list[TerminalPostCommitNotice] = []
             for candidate in candidates:
@@ -1394,13 +1570,46 @@ class HostDispatchScheduler:
 
         if self._closed:
             raise RuntimeError("HostDispatchScheduler is closed")
+        work_lease = self._session_new_work_access.try_acquire_new_work_lease(
+            session_id
+        )
+        if work_lease is None:
+            return
+        try:
+            await self._run_queue_promotion_with_lease(
+                session_id,
+                work_lease=work_lease,
+            )
+        finally:
+            work_lease.release()
+
+    async def _run_queue_promotion_with_lease(
+        self,
+        session_id: str,
+        *,
+        work_lease: SessionWorkLease,
+    ) -> bool:
+        """在 caller 已持真实 work lease 时执行一次 promotion/governance。
+
+        :param session_id: 目标 Session id。
+        :param work_lease: 覆盖 pre-start 与 stable dispatch commit 的真实 lease。
+        :returns: 本轮创建 stable pending dispatch 时返回 ``True``。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises Exception: governance 或 durable mutation 失败时透传。
+        """
+
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "dispatch.queue_promotion.start session_id=%s",
             session_id,
         )
         catch_up_projection_best_effort(self._projection_catchup_port)
-        stage = await self._run_pre_start_governance(session_id)
+        stage = await self._run_pre_start_governance(
+            session_id,
+            work_lease=work_lease,
+        )
         pending_dispatch = stage.pending_dispatch
         if stage.compact_accepted is not None:
             _LOGGER.log(
@@ -1421,13 +1630,23 @@ class HostDispatchScheduler:
         )
         if pending_dispatch is not None:
             self.wake_dispatch(pending_dispatch)
+            return True
+        return False
 
-    async def _run_pre_start_governance(self, session_id: str) -> _GovernanceStageResult:
+    async def _run_pre_start_governance(
+        self,
+        session_id: str,
+        *,
+        work_lease: SessionWorkLease,
+    ) -> _GovernanceStageResult:
         """执行一次 pre-start Context Governance。
 
         :param session_id: 目标 Session id。
+        :param work_lease: caller 持有并覆盖本次事务外治理的真实 new-work lease。
         :returns: governance 阶段结果。
         """
+
+        del work_lease
 
         def _operation(transaction: HostTransaction) -> _GovernanceStageResult:
             run = _read_startable_run(transaction, session_id)
@@ -1595,28 +1814,91 @@ class HostDispatchScheduler:
                         message="Context estimate exceeds hard threshold before dispatch",
                     ),
                 )
-            try:
-                compact_count = self._committed_proactive_compact_count(transaction, run)
-            except Exception:
-                _LOGGER.error(
-                    "dispatch.governance.compact_count_unreadable " "session_id=%s run_id=%s",
-                    run.session_id,
-                    run.run_id,
-                    exc_info=True,
+            projection = read_proactive_compaction_projection(
+                transaction,
+                self._event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+            )
+            if projection.decision is ProactiveCompactionDecision.USE_COMPACTED:
+                compacted_sequence = projection.state.compacted_event_sequence
+                if compacted_sequence is None:
+                    raise RuntimeError("COMPACTED proactive state is missing sequence")
+                return _GovernanceStageResult(
+                    pending_dispatch=None,
+                    compact_accepted=_GovernanceCompactAccepted(
+                        run_id=run.run_id,
+                        session_id=run.session_id,
+                        expected_status=run.status,
+                        compacted_event_sequence=compacted_sequence,
+                    ),
                 )
-                self._append_compaction_failed_event(
+            if projection.decision is ProactiveCompactionDecision.USE_FAILED_FALLBACK:
+                return _GovernanceStageResult(
+                    pending_dispatch=self._start_governed_in_transaction(
+                        transaction,
+                        run,
+                    ),
+                    compact_accepted=None,
+                )
+            if projection.decision is ProactiveCompactionDecision.FAIL_EXISTING_OPERATION:
+                operation_id = projection.state.operation_id
+                if operation_id is None:
+                    return _GovernanceStageResult(
+                        pending_dispatch=None,
+                        compact_accepted=None,
+                        terminal_notice=self._fail_unstarted_in_transaction(
+                            transaction,
+                            run,
+                            reason=_GOVERNANCE_FAILURE_REASON,
+                            error_code=_PROACTIVE_INVALID_OR_EXHAUSTED_REASON,
+                            message=(
+                                "Proactive compaction history has no safe "
+                                "operation identity"
+                            ),
+                        ),
+                    )
+                if (
+                    projection.state.compacted_event_sequence is not None
+                    or projection.state.failed_event_sequence is not None
+                ):
+                    return _GovernanceStageResult(
+                        pending_dispatch=None,
+                        compact_accepted=None,
+                        terminal_notice=self._fail_unstarted_in_transaction(
+                            transaction,
+                            run,
+                            reason=_GOVERNANCE_FAILURE_REASON,
+                            error_code=_PROACTIVE_INVALID_OR_EXHAUSTED_REASON,
+                            message=(
+                                "Proactive compaction operation has invalid "
+                                "terminal history"
+                            ),
+                        ),
+                    )
+                fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
+                    material_view=material_view,
                     estimate=estimate,
                     decision=decision,
-                    operation_id=_precondition_compaction_operation_id(
-                        failure_reason="proactive_compact_count_unreadable",
-                        estimate=estimate,
+                    operation_id=operation_id,
+                    failure_reason=_PROACTIVE_INVALID_OR_EXHAUSTED_REASON,
+                    attempt_count=len(
+                        frozenset(
+                            (
+                                *projection.state.prepared_attempt_numbers,
+                                *projection.state.rejected_attempt_numbers,
+                            )
+                        )
                     ),
-                    failure_reason="proactive_compact_count_unreadable",
-                    attempt_count=0,
-                    retry_repair_budget_exhausted=False,
+                    retry_repair_budget_exhausted=True,
                 )
+                if fallback_dispatch is not None:
+                    return _GovernanceStageResult(
+                        pending_dispatch=fallback_dispatch,
+                        compact_accepted=None,
+                    )
                 return _GovernanceStageResult(
                     pending_dispatch=None,
                     compact_accepted=None,
@@ -1624,45 +1906,8 @@ class HostDispatchScheduler:
                         transaction,
                         run,
                         reason=_GOVERNANCE_FAILURE_REASON,
-                        error_code="proactive_compact_count_unreadable",
-                        message="Committed proactive compact facts are unreadable",
-                    ),
-                )
-            if compact_count >= policy.max_proactive_compactions_per_run:
-                _LOGGER.error(
-                    "dispatch.governance.failed session_id=%s run_id=%s "
-                    "failure_reason=%s decision=%s compact_count=%s "
-                    "max_compact_count=%s policy_ref=%s",
-                    run.session_id,
-                    run.run_id,
-                    "proactive_compact_limit_reached",
-                    decision.value,
-                    compact_count,
-                    policy.max_proactive_compactions_per_run,
-                    policy.policy_ref,
-                )
-                self._append_compaction_failed_event(
-                    transaction,
-                    run=run,
-                    estimate=estimate,
-                    decision=decision,
-                    operation_id=_precondition_compaction_operation_id(
-                        failure_reason="proactive_compact_limit_reached",
-                        estimate=estimate,
-                    ),
-                    failure_reason="proactive_compact_limit_reached",
-                    attempt_count=0,
-                    retry_repair_budget_exhausted=False,
-                )
-                return _GovernanceStageResult(
-                    pending_dispatch=None,
-                    compact_accepted=None,
-                    terminal_notice=self._fail_unstarted_in_transaction(
-                        transaction,
-                        run,
-                        reason=_GOVERNANCE_FAILURE_REASON,
-                        error_code="proactive_compact_limit_reached",
-                        message="Run already used its proactive compaction budget",
+                        error_code=_PROACTIVE_INVALID_OR_EXHAUSTED_REASON,
+                        message="Proactive compaction operation is invalid or exhausted",
                     ),
                 )
             prepared = self._prepare_compact_before_dispatch(
@@ -1671,6 +1916,12 @@ class HostDispatchScheduler:
                 material_view=material_view,
                 estimate=estimate,
                 decision=decision,
+                existing_state=(
+                    projection.state
+                    if projection.decision
+                    is ProactiveCompactionDecision.RESUME_EXISTING
+                    else None
+                ),
             )
             return prepared
 
@@ -1720,11 +1971,6 @@ class HostDispatchScheduler:
                 compacted_event_sequence=None,
                 pending_dispatch=None,
             )
-        attempts = (
-            self._local_execution.context_budget_policy.max_compaction_attempts_per_operation
-            if self._local_execution.context_budget_policy is not None
-            else 1
-        )
         cancellation_token = _DurableRunCancellationToken(
             transaction_runner=self._transaction_runner,
             run_id=pending.run_id,
@@ -1733,49 +1979,38 @@ class HostDispatchScheduler:
             expected_input_event_sequence=pending.expected_input_event_sequence,
         )
         proposal_manifest_recorder = self._compactor_proposal_manifest_recorder()
-        result = await run_compaction_operation(
-            request=pending.request,
-            compactor=compactor,
-            max_attempts=attempts,
-            cancellation_token=cancellation_token,
-            compaction_operation_id=pending.operation_id,
-            proposal_manifest_recorder=proposal_manifest_recorder,
-        )
-        accepted_request = pending.request
-        accepted_result = result
-        accepted_attempt_number = _accepted_attempt_number(result)
-        completed_attempt_count = _completed_compaction_proposal_attempt_count(result)
-        operation_rejected_attempts = list(result.rejected_attempts)
-        budget_after_attempted_compact = result.budget_after_attempted_compact
-        if not _compaction_result_accepted(result):
-            for recovery in self._proactive_compaction_recovery_attempts(pending):
-                if cancellation_token.is_cancelled():
-                    break
-                tier_result = await run_compaction_operation(
-                    request=recovery.request,
-                    compactor=compactor,
-                    max_attempts=1,
-                    cancellation_token=cancellation_token,
-                    compaction_operation_id=pending.operation_id,
-                    proposal_manifest_recorder=proposal_manifest_recorder,
+        schedule = self._proactive_compaction_attempt_schedule(pending)
+        execution_plans = schedule[pending.first_attempt_number - 1 :]
+        if len(execution_plans) == 0:
+            raise RuntimeError("proactive attempt schedule has no remaining attempt")
+        accepted_request = execution_plans[0].request
+        accepted_result: CompactionOperationResult | None = None
+        accepted_attempt_number: int | None = None
+        operation_rejected_attempts: list[CompactionAttemptRejected] = []
+        budget_after_attempted_compact: int | None = None
+        for attempt_plan in execution_plans:
+            attempt_result = await run_compaction_attempt(
+                request=attempt_plan.request,
+                compactor=compactor,
+                attempt_number=attempt_plan.attempt_number,
+                max_attempt_number=pending.max_attempt_number,
+                cancellation_token=cancellation_token,
+                compaction_operation_id=pending.operation_id,
+                proposal_manifest_recorder=proposal_manifest_recorder,
+            )
+            accepted_request = attempt_plan.request
+            accepted_result = attempt_result
+            operation_rejected_attempts.extend(attempt_result.rejected_attempts)
+            if attempt_result.budget_after_attempted_compact is not None:
+                budget_after_attempted_compact = (
+                    attempt_result.budget_after_attempted_compact
                 )
-                operation_rejected_attempts.extend(
-                    _renumber_compaction_rejected_attempts(
-                        tier_result.rejected_attempts,
-                        offset=completed_attempt_count,
-                    )
-                )
-                if tier_result.budget_after_attempted_compact is not None:
-                    budget_after_attempted_compact = (
-                        tier_result.budget_after_attempted_compact
-                    )
-                if cancellation_token.is_cancelled():
-                    break
-                if _compaction_result_accepted(tier_result):
-                    accepted_attempt_number = (
-                        completed_attempt_count
-                        + _accepted_attempt_number(tier_result)
-                    )
+            if _compaction_result_accepted(attempt_result):
+                accepted_attempt_number = attempt_result.accepted_attempt_number
+                if attempt_plan.stage not in (
+                    ProactiveCompactionAttemptStage.ROOT,
+                    ProactiveCompactionAttemptStage.ROOT_REPAIR,
+                ):
                     _LOGGER.log(
                         VERBOSE_LOG_LEVEL,
                         "dispatch.compact.recovery_accepted session_id=%s "
@@ -1783,15 +2018,21 @@ class HostDispatchScheduler:
                         pending.session_id,
                         pending.run_id,
                         pending.operation_id,
-                        recovery.reason,
+                        attempt_plan.stage.value,
                     )
-                    accepted_request = recovery.request
-                    accepted_result = tier_result
-                    break
-                completed_attempt_count += (
-                    _completed_compaction_proposal_attempt_count(tier_result)
-                )
+                break
+            if cancellation_token.is_cancelled():
+                break
+        if accepted_result is None:
+            raise RuntimeError("proactive attempt execution produced no result")
         rejected_attempts = tuple(operation_rejected_attempts)
+        attempt_count = max(
+            pending.first_attempt_number - 1,
+            _highest_attempt_number(
+                rejected_attempts,
+                accepted_attempt_number=accepted_attempt_number,
+            ),
+        )
 
         def _operation(transaction: HostTransaction) -> _ProactiveCompactionExecutionResult:
             run = read_run_by_id(transaction, pending.run_id)
@@ -1808,7 +2049,7 @@ class HostDispatchScheduler:
                         decision=pending.decision,
                         operation_id=pending.operation_id,
                         failure_reason="stale_compaction_result",
-                        attempt_count=len(rejected_attempts),
+                        attempt_count=attempt_count,
                         retry_repair_budget_exhausted=False,
                         budget_after_attempted_compact=budget_after_attempted_compact,
                     )
@@ -1831,7 +2072,7 @@ class HostDispatchScheduler:
                     decision=pending.decision,
                     operation_id=pending.operation_id,
                     failure_reason="stale_compaction_result",
-                    attempt_count=len(rejected_attempts),
+                    attempt_count=attempt_count,
                     retry_repair_budget_exhausted=False,
                     budget_after_attempted_compact=budget_after_attempted_compact,
                 )
@@ -1848,9 +2089,9 @@ class HostDispatchScheduler:
                     decision=pending.decision,
                     operation_id=pending.operation_id,
                     failure_reason=accepted_result.failure_reason or "compaction_failed",
-                    attempt_count=len(rejected_attempts),
+                    attempt_count=attempt_count,
                     retry_repair_budget_exhausted=(
-                        len(rejected_attempts) > 0
+                        attempt_count >= pending.max_attempt_number
                     ),
                     budget_after_attempted_compact=budget_after_attempted_compact,
                 )
@@ -1884,7 +2125,9 @@ class HostDispatchScheduler:
                 candidate=accepted_result.accepted_candidate,
                 quality=accepted_result.quality_result,
                 operation_id=pending.operation_id,
-                accepted_attempt_number=accepted_attempt_number,
+                accepted_attempt_number=_required_accepted_attempt_number(
+                    accepted_attempt_number
+                ),
                 budget_after_compact=(
                     accepted_result.budget_after_attempted_compact
                     if accepted_result.budget_after_attempted_compact is not None
@@ -1907,28 +2150,56 @@ class HostDispatchScheduler:
             self._notify_terminal_post_commit(operation_result.terminal_notice)
         return operation_result
 
-    def _proactive_compaction_recovery_attempts(
+    def _proactive_compaction_attempt_schedule(
         self, pending: _GovernanceCompactPending
-    ) -> tuple[_ProactiveCompactionRecoveryAttempt, ...]:
-        """构造 S4 proactive compact recovery tier attempts。
+    ) -> tuple[ProactiveCompactionAttemptPlan, ...]:
+        """构造 proactive root repair 与 tier 1-3 frozen attempt schedule。
 
-        所有 attempt 都基于 pending 中冻结的 selected material view，不重新读取
-        EventLog，也不重新选择 compact 以外的材料来源。
+        所有 stage 都基于 pending 中冻结的 source snapshot，不重新读取 EventLog；
+        attempt number 到 stage/request 的映射由 proactive operation owner 统一分配。
 
         :param pending: 已冻结的 proactive compact pending 摘要。
-        :returns: tier 1-3 recovery attempt 元组。
+        :returns: 长度精确等于 frozen max 的全局 attempt plans。
+        :raises ValueError: pipeline tier 名称或 schedule 非法时抛出。
         """
 
-        return tuple(
-            _ProactiveCompactionRecoveryAttempt(
+        return self._build_proactive_compaction_attempt_schedule(
+            source_snapshot=pending.source_snapshot,
+            root_request_plan=pending.request_plan,
+            max_attempt_number=pending.max_attempt_number,
+        )
+
+    def _build_proactive_compaction_attempt_schedule(
+        self,
+        *,
+        source_snapshot: CompactPipelineSourceSnapshot,
+        root_request_plan: CompactPipelineRequestPlan,
+        max_attempt_number: int,
+    ) -> tuple[ProactiveCompactionAttemptPlan, ...]:
+        """由 frozen pipeline inputs 构造唯一 proactive attempt schedule。
+
+        :param source_snapshot: request 使用的 frozen source snapshot。
+        :param root_request_plan: normal/root request plan。
+        :param max_attempt_number: operation frozen semantic budget。
+        :returns: root repair 与可用 tier 的连续 attempt plans。
+        :raises ValueError: tier 名称或 schedule 非法时抛出。
+        """
+
+        tier_requests = tuple(
+            ProactiveCompactionTierRequest(
+                stage=ProactiveCompactionAttemptStage(plan.tier_name),
                 request=plan.request_plan.request,
-                reason=plan.tier_name,
             )
             for plan in build_tier_recovery_request_plans(
-                source_snapshot=pending.source_snapshot,
-                root_request_plan=pending.request_plan,
+                source_snapshot=source_snapshot,
+                root_request_plan=root_request_plan,
                 memory_policy=self._local_execution.memory_projection_policy,
             )
+        )
+        return build_proactive_compaction_attempt_schedule(
+            root_request=root_request_plan.request,
+            tier_requests=tier_requests,
+            max_attempt_number=max_attempt_number,
         )
 
     def _compactor_proposal_manifest_recorder(
@@ -1937,19 +2208,12 @@ class HostDispatchScheduler:
         """构造 compactor proposal durable manifest recorder。
 
         :returns: durable manifest recorder。
-        :raises RuntimeError: compact artifact root 缺失时抛出。
+        :raises Exception: 不主动抛出异常。
         """
 
-        artifact_root = self._local_execution.compact_artifact_root
-        if artifact_root is None:
-            raise RuntimeError("compact artifact root is missing")
         return DurableCompactorProposalManifestRecorder(
             transaction_runner=self._transaction_runner,
             event_log_store=self._event_log_store,
-            artifact_root=artifact_root,
-            create_artifact_root=(
-                self._local_execution.compact_artifact_create_parent_dirs
-            ),
             event_source=_EVENT_SOURCE,
         )
 
@@ -2074,28 +2338,6 @@ class HostDispatchScheduler:
             wake_queue_promotion=False,
         )
 
-    def _committed_proactive_compact_count(self, transaction: HostTransaction, run: RunRow) -> int:
-        """读取 durable EventLog 中本 Run proactive compact 请求数。
-
-        :param transaction: 当前 Host transaction。
-        :param run: 目标 Run。
-        :returns: committed proactive request 数。
-        """
-
-        return self._event_log_store.count_committed_events_by_run_and_type(
-            transaction,
-            run_id=run.run_id,
-            event_type=CONTEXT_COMPACTION_REQUESTED,
-            payload_filter=EventPayloadTextEqualsFilter(
-                field_name="trigger_source",
-                expected_value=ContextCompactionTriggerSource.PROACTIVE.value,
-                allowed_values=(
-                    ContextCompactionTriggerSource.PROACTIVE.value,
-                    ContextCompactionTriggerSource.REACTIVE.value,
-                ),
-            ),
-        )
-
     def _prepare_compact_before_dispatch(
         self,
         transaction: HostTransaction,
@@ -2104,6 +2346,7 @@ class HostDispatchScheduler:
         material_view: PreDispatchCompactMaterialView,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
+        existing_state: ProactiveCompactionState | None,
     ) -> _GovernanceStageResult:
         """在当前事务内写入 proactive compact request 并冻结请求。
 
@@ -2112,11 +2355,16 @@ class HostDispatchScheduler:
         :param material_view: 已冻结的 EventLog-backed compact material view。
         :param estimate: compact 前预算估算。
         :param decision: 触发 compact 的预算决策。
+        :param existing_state: 可恢复的既有 INCOMPLETE operation；新 operation
+            时为 ``None``。
         :returns: 待事务外执行的 compact 或 fallback dispatch / fail closed 结果。
         """
 
         compactor = self._local_execution.context_compactor
         artifact_root = self._local_execution.compact_artifact_root
+        policy = self._local_execution.context_budget_policy
+        if policy is None:
+            raise RuntimeError("proactive compaction requires context budget policy")
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "dispatch.compact.start session_id=%s run_id=%s decision=%s "
@@ -2127,12 +2375,95 @@ class HostDispatchScheduler:
             estimate.estimated_input_tokens,
             estimate.hard_threshold_tokens,
         )
-        requested = self._append_compaction_requested_event(
-            transaction,
+        source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
+            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
             run=run,
-            estimate=estimate,
-            decision=decision,
+            material_view=material_view,
         )
+        memory_policy = self._local_execution.memory_projection_policy
+        request_plan = build_normal_compact_request_plan(
+            source_snapshot=source_snapshot,
+            selection_policy_digest=digest_memory_projection_policy(memory_policy),
+            budget_before_compact=estimate,
+            selected_recent_window_turn_floor=(
+                memory_policy.selected_recent_window_turn_floor
+            ),
+        )
+        request = request_plan.request
+        if existing_state is None:
+            operation_id = _new_event_id(
+                _EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX
+            )
+            self._append_compaction_requested_event(
+                transaction,
+                operation_id=operation_id,
+                run=run,
+                estimate=estimate,
+                decision=decision,
+                source_snapshot=source_snapshot,
+                max_attempt_number=(
+                    policy.max_compaction_attempts_per_operation
+                ),
+            )
+            first_attempt_number = 1
+            max_attempt_number = policy.max_compaction_attempts_per_operation
+        else:
+            operation_id = _required_proactive_operation_id(existing_state)
+            first_attempt_number = _required_proactive_next_attempt(existing_state)
+            max_attempt_number = _required_proactive_max_attempt(existing_state)
+            try:
+                _validate_proactive_resume_snapshot(
+                    existing_state,
+                    source_snapshot=source_snapshot,
+                    attempt_schedule=(
+                        self._build_proactive_compaction_attempt_schedule(
+                            source_snapshot=source_snapshot,
+                            root_request_plan=request_plan,
+                            max_attempt_number=max_attempt_number,
+                        )
+                    ),
+                    expected_input_event_sequence=run.input_event_sequence,
+                )
+            except RuntimeError:
+                attempt_count = len(
+                    frozenset(
+                        (
+                            *existing_state.prepared_attempt_numbers,
+                            *existing_state.rejected_attempt_numbers,
+                        )
+                    )
+                )
+                fallback_dispatch = (
+                    self._append_compaction_failed_with_proactive_fallback(
+                        transaction,
+                        run=run,
+                        material_view=material_view,
+                        estimate=estimate,
+                        decision=decision,
+                        operation_id=operation_id,
+                        failure_reason=_PROACTIVE_INVALID_OR_EXHAUSTED_REASON,
+                        attempt_count=attempt_count,
+                        retry_repair_budget_exhausted=True,
+                    )
+                )
+                if fallback_dispatch is not None:
+                    return _GovernanceStageResult(
+                        pending_dispatch=fallback_dispatch,
+                        compact_accepted=None,
+                    )
+                return _GovernanceStageResult(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code=_PROACTIVE_INVALID_OR_EXHAUSTED_REASON,
+                        message=(
+                            "Proactive compaction resume snapshot is invalid"
+                        ),
+                    ),
+                )
         if compactor is None or artifact_root is None:
             _LOGGER.error(
                 "dispatch.compact.failed session_id=%s run_id=%s "
@@ -2151,7 +2482,7 @@ class HostDispatchScheduler:
                 material_view=material_view,
                 estimate=estimate,
                 decision=decision,
-                operation_id=requested.event_id,
+                operation_id=operation_id,
                 failure_reason="compactor_or_artifact_store_missing",
                 attempt_count=0,
                 retry_repair_budget_exhausted=False,
@@ -2172,21 +2503,6 @@ class HostDispatchScheduler:
                     message="Context compactor or artifact store is not configured",
                 ),
             )
-        source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
-            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-            run=run,
-            material_view=material_view,
-        )
-        memory_policy = self._local_execution.memory_projection_policy
-        request_plan = build_normal_compact_request_plan(
-            source_snapshot=source_snapshot,
-            selection_policy_digest=digest_memory_projection_policy(memory_policy),
-            budget_before_compact=estimate,
-            selected_recent_window_turn_floor=(
-                memory_policy.selected_recent_window_turn_floor
-            ),
-        )
-        request = request_plan.request
         return _GovernanceStageResult(
             pending_dispatch=None,
             compact_accepted=None,
@@ -2199,9 +2515,11 @@ class HostDispatchScheduler:
                 source_snapshot=source_snapshot,
                 request_plan=request_plan,
                 material_view=material_view,
-                operation_id=requested.event_id,
+                operation_id=operation_id,
                 estimate=estimate,
                 decision=decision,
+                first_attempt_number=first_attempt_number,
+                max_attempt_number=max_attempt_number,
             ),
         )
 
@@ -2319,23 +2637,29 @@ class HostDispatchScheduler:
         self,
         transaction: HostTransaction,
         *,
+        operation_id: str,
         run: RunRow,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
+        source_snapshot: CompactPipelineSourceSnapshot,
+        max_attempt_number: int,
     ) -> EventLogRow:
         """追加 proactive ``CONTEXT_COMPACTION_REQUESTED``。
 
         :param transaction: 当前 Host transaction。
+        :param operation_id: 预生成且同时作为 request event id 的 operation id。
         :param run: 目标 Run。
         :param estimate: budget estimate。
         :param decision: budget decision。
+        :param source_snapshot: request 冻结的 material snapshot。
+        :param max_attempt_number: operation 冻结的全局 attempt 上限。
         :returns: 已写入的 request EventLog row。
         """
 
         return self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
-                event_id=_new_event_id(_EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX),
+                event_id=operation_id,
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=run.session_id,
                 run_id=run.run_id,
@@ -2350,6 +2674,8 @@ class HostDispatchScheduler:
                 policy_decision=None,
                 reason={"decision": decision.value},
                 payload_json=build_context_compaction_requested_payload(
+                    operation_id=operation_id,
+                    max_compaction_attempts_per_operation=max_attempt_number,
                     trigger_source=ContextCompactionTriggerSource.PROACTIVE,
                     budget_reason=decision.value,
                     budget_snapshot_ref=estimate.estimator_digest,
@@ -2364,6 +2690,11 @@ class HostDispatchScheduler:
                     provider_error_ref=None,
                     attempt_id=None,
                     execution_id=None,
+                    client_correlation_id=None,
+                    frozen_material_list_digest=(
+                        source_snapshot.material_view_digest
+                    ),
+                    frozen_material_refs=source_snapshot.material_source_refs,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -2744,57 +3075,210 @@ class HostDispatchScheduler:
             timed_out=timed_out,
         )
 
+    def reconcile_active_worker_cancels_once(
+        self,
+        *,
+        fixed_now: datetime,
+    ) -> ActiveWorkerCancelReconciliationResult:
+        """按本 scheduler 的 active registry 快照传播 durable cancel truth。
+
+        本方法只查询 ``dispatch_record.owner_host_instance_id`` 精确等于当前
+        scheduler 且仍匹配同一 Session / Run / Attempt / execution 的 targets。
+        它不依赖当前 attachment，也不授予 queued promotion 或新 Attempt 治理资格。
+
+        :param fixed_now: 本轮 exact watchdog closeout 共用的 UTC aware 时间。
+        :returns: execution-owner reconciliation typed 摘要。
+        :raises ValueError: ``fixed_now`` 不是 UTC aware 时间时抛出。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostDurableError: durable cancel link 或 canonical fact 非法时抛出。
+        :raises HostTransactionRetryExhaustedError: durable transaction 重试耗尽时抛出。
+        """
+
+        _validate_watchdog_now(fixed_now)
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
+        identities = self._active_registry.snapshot_identities()
+        if len(identities) == 0:
+            return ActiveWorkerCancelReconciliationResult(
+                snapshot_count=0,
+                target_count=0,
+                propagated_count=0,
+                closed_count=0,
+            )
+
+        def _read(
+            transaction: HostTransaction,
+        ) -> tuple[OwnedAttemptCancelDelivery, ...]:
+            return read_exact_owned_attempt_cancel_deliveries(
+                transaction,
+                self._event_log_store,
+                owner_host_instance_id=(
+                    self._host_instance_identity.host_instance_id
+                ),
+                identities=identities,
+            )
+
+        deliveries = self._transaction_runner.run_read(_read)
+        propagated = 0
+        closed = 0
+        for delivery in deliveries:
+            target = delivery.target
+            identity = target.identity
+            if self._active_registry.cancel(
+                ActiveCancelMessage(
+                    session_id=identity.session_id,
+                    run_id=identity.run_id,
+                    attempt_id=identity.attempt_id,
+                    execution_id=identity.execution_id,
+                    reason=delivery.reason,
+                )
+            ):
+                propagated += 1
+            closeout = self._tick_active_cancel_watchdog(
+                now=fixed_now,
+                scope=_ActiveCancelWatchdogOwnedTargetScope(target=target),
+            )
+            if closeout.closed > 0:
+                closed += 1
+        return ActiveWorkerCancelReconciliationResult(
+            snapshot_count=len(identities),
+            target_count=len(deliveries),
+            propagated_count=propagated,
+            closed_count=closed,
+        )
+
+    async def reconcile_owned_sessions_once(
+        self,
+        *,
+        fixed_now: datetime,
+    ) -> OwnedSessionReconciliationResult:
+        """对入口快照中的 ACTIVE RW Session 执行一次 durable reconciliation。
+
+        本方法是 production interval loop 与确定性测试共用的唯一 one-shot
+        semantic step；它不扫描 RO/closing/未 attach Session。
+
+        :param fixed_now: 本轮所有 target 判定共用的 UTC aware 时间。
+        :returns: 不携带业务 payload 的严格 typed 诊断摘要。
+        :raises ValueError: ``fixed_now`` 不是 UTC aware 时间时抛出。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises Exception: target promotion 或 durable read/write 失败时透传。
+        """
+
+        _validate_watchdog_now(fixed_now)
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
+        session_ids = self._session_new_work_access.active_read_write_session_ids()
+        leased = 0
+        dispatched = 0
+        skipped = 0
+        for session_id in session_ids:
+            work_lease = self._session_new_work_access.try_acquire_new_work_lease(
+                session_id
+            )
+            if work_lease is None:
+                skipped += 1
+                continue
+            leased += 1
+            try:
+                did_dispatch = await self._run_queue_promotion_with_lease(
+                    session_id,
+                    work_lease=work_lease,
+                )
+            finally:
+                work_lease.release()
+            if did_dispatch:
+                dispatched += 1
+            else:
+                skipped += 1
+        return OwnedSessionReconciliationResult(
+            owned_session_count=len(session_ids),
+            leased_session_count=leased,
+            dispatched_session_count=dispatched,
+            skipped_session_count=skipped,
+        )
+
     async def close(self) -> None:
-        """关闭 scheduler 并 best-effort 收尾 active workers。
+        """关闭 scheduler 并完成必须成功的 lifecycle 收口。
 
         :returns: ``None``。
+        :raises Exception: mandatory cleanup 或 durable lifecycle 写入失败时透传；
+            此时不宣称 cleanup 完成，后续 ``close`` 可重试。
         """
 
         if self._closed and self._close_cleanup_done:
             return
         self._closed = True
-        self._best_effort_mark_host_instance_stopping(_SCHEDULER_CLOSE_REASON)
+        if not self._host_instance_stopping_marked:
+            self._mark_host_instance_stopping()
+            self._host_instance_stopping_marked = True
         _LOGGER.info(
             "dispatch.scheduler.close_start host_handle_id=%s active_tasks=%s " "active_handles=%s",
             self._host_handle_id,
             len(self._active_tasks),
             len(self._active_handles),
         )
-        try:
-            heartbeat_task = self._heartbeat_task
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                await _suppress_task_cancel(heartbeat_task)
-            task = self._drain_task
-            if task is not None:
-                task.cancel()
-                await _suppress_task_cancel(task)
-            promotion_task = self._promotion_drain_task
-            if promotion_task is not None:
-                promotion_task.cancel()
-                await _suppress_task_cancel(promotion_task)
-            watchdog_task = self._active_cancel_watchdog_task
-            if watchdog_task is not None:
-                watchdog_task.cancel()
-                await _suppress_task_cancel(watchdog_task)
-            self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
-            for active_task in tuple(self._active_tasks):
-                active_task.cancel()
-                await _suppress_task_cancel(active_task)
-            for active_handle in tuple(self._active_handles):
-                await _safe_close_worker_handle(active_handle)
-                self._active_handles.discard(active_handle)
-            self._active_registry.clear()
+        background_tasks = tuple(
+            task
+            for task in (
+                self._heartbeat_task,
+                self._drain_task,
+                self._promotion_drain_task,
+                self._owned_session_reconciliation_task,
+                self._active_worker_cancel_reconciliation_task,
+                self._active_cancel_watchdog_task,
+            )
+            if task is not None
+        )
+        active_tasks = tuple(self._active_tasks)
+        self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
+        # 先同步发出全部取消，避免逐个 await 时尚未启动的任务获得执行窗口。
+        for task in (*background_tasks, *active_tasks):
+            task.cancel()
+        for task in background_tasks:
+            await _suppress_task_cancel(task)
+        for active_task in active_tasks:
+            await _suppress_task_cancel(active_task)
+        for active_handle in tuple(self._active_handles):
+            await _close_worker_handle_mandatory(active_handle)
+            self._active_handles.discard(active_handle)
+        self._active_registry.clear()
+        if not self._lane_close_done:
             await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
-            self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
-        except Exception:
-            self._close_cleanup_done = True
-            raise
+            self._lane_close_done = True
+        if not self._host_instance_stopped_marked:
+            self._mark_host_instance_stopped()
+            self._host_instance_stopped_marked = True
         self._close_cleanup_done = True
         _LOGGER.info(
             "dispatch.scheduler.close_done host_handle_id=%s",
             self._host_handle_id,
         )
+
+    def _mark_host_instance_stopping(self) -> None:
+        """必须成功地把当前 Host instance 标记为 ``STOPPING``。
+
+        :returns: ``None``。
+        :raises HostTransactionRetryExhaustedError: durable 写重试耗尽时抛出。
+        :raises Exception: durable lifecycle 写失败时透传。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            mark_current_instance_stopping(transaction, self._host_instance_identity)
+
+        self._transaction_runner.run_write(_operation)
+
+    def _mark_host_instance_stopped(self) -> None:
+        """必须成功地把当前 Host instance 标记为 ``STOPPED``。
+
+        :returns: ``None``。
+        :raises HostTransactionRetryExhaustedError: durable 写重试耗尽时抛出。
+        :raises Exception: durable lifecycle 写失败时透传。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            mark_current_instance_stopped(transaction, self._host_instance_identity)
+
+        self._transaction_runner.run_write(_operation)
 
     def _start_host_instance_heartbeat(self) -> None:
         """启动当前 Host instance heartbeat 后台任务。
@@ -2819,6 +3303,40 @@ class HostDispatchScheduler:
             self._active_cancel_watchdog_task = self._start_critical_task(
                 self._active_cancel_watchdog_loop,
                 component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG,
+            )
+
+    def _start_owned_session_reconciliation_loop(self) -> None:
+        """启动 ACTIVE RW Session 的 bounded periodic reconciliation loop。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            self._owned_session_reconciliation_task is None
+            or self._owned_session_reconciliation_task.done()
+        ):
+            self._owned_session_reconciliation_task = self._start_critical_task(
+                self._owned_session_reconciliation_loop,
+                component=_CRITICAL_COMPONENT_PROMOTION,
+            )
+
+    def _start_active_worker_cancel_reconciliation_loop(self) -> None:
+        """启动 execution-owner exact cancel periodic reconciliation loop。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            self._active_worker_cancel_reconciliation_task is None
+            or self._active_worker_cancel_reconciliation_task.done()
+        ):
+            self._active_worker_cancel_reconciliation_task = (
+                self._start_critical_task(
+                    self._active_worker_cancel_reconciliation_loop,
+                    component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_OWNER,
+                )
             )
 
     def _start_critical_task(
@@ -2904,40 +3422,42 @@ class HostDispatchScheduler:
         )
 
     async def _active_cancel_watchdog_loop(self) -> None:
-        """active cancel watchdog 后台循环。
+        """按 target-scoped commit wake 运行 active cancel watchdog。
 
-        循环通过 level-triggered cancel commit wakeup 降低延迟，并通过 periodic
-        fallback scan 覆盖重启后的剩余 ``CANCELLING`` 状态。event 必须在 tick
-        前 clear，使 tick 期间到达的新 wake 保持 set 并驱动下一轮。
+        execution-owner 的跨 opener 传播由 dispatch poll loop 独立读取本地 worker
+        exact identity；本循环只消费 caller/fresh-attach 指定的 Session，不进行
+        workspace-wide periodic scan。event 在读取 target 集合前 clear，使本轮
+        期间到达的新 wake 保持 set 并驱动下一轮。
 
         :returns: ``None``。
         :raises asyncio.CancelledError: scheduler close 时透传取消。
         """
 
-        interval = self._local_execution.dispatch_poll_interval_seconds
         try:
             while not self._closed:
-                try:
-                    await asyncio.wait_for(
-                        self._active_cancel_watchdog_event.wait(),
-                        timeout=interval,
-                    )
-                except TimeoutError:
-                    pass
+                await self._active_cancel_watchdog_event.wait()
                 if self._closed:
                     break
                 self._active_cancel_watchdog_event.clear()
-                result = self.tick_active_cancel_watchdog(datetime.now(UTC))
-                if result.scanned > 0 or result.closed > 0:
-                    _LOGGER.log(
-                        VERBOSE_LOG_LEVEL,
-                        "dispatch.active_cancel_watchdog.tick scanned=%s "
-                        "eligible=%s closed=%s ignored=%s",
-                        result.scanned,
-                        result.eligible,
-                        result.closed,
-                        result.ignored,
+                session_ids = tuple(sorted(self._active_cancel_watchdog_session_ids))
+                self._active_cancel_watchdog_session_ids.clear()
+                fixed_now = datetime.now(UTC)
+                for session_id in session_ids:
+                    result = self.tick_active_cancel_watchdog_for_session(
+                        session_id,
+                        fixed_now,
                     )
+                    if result.scanned > 0 or result.closed > 0:
+                        _LOGGER.log(
+                            VERBOSE_LOG_LEVEL,
+                            "dispatch.active_cancel_watchdog.tick session_id=%s "
+                            "scanned=%s eligible=%s closed=%s ignored=%s",
+                            session_id,
+                            result.scanned,
+                            result.eligible,
+                            result.closed,
+                            result.ignored,
+                        )
         except asyncio.CancelledError:
             _LOGGER.debug(
                 "dispatch.active_cancel_watchdog.cancelled host_handle_id=%s",
@@ -3154,6 +3674,60 @@ class HostDispatchScheduler:
         except asyncio.CancelledError:
             _LOGGER.debug(
                 "dispatch.queue_promotion.cancelled host_handle_id=%s",
+                self._host_handle_id,
+            )
+            raise
+
+    async def _owned_session_reconciliation_loop(self) -> None:
+        """周期运行 attachment-authorized Session new-work reconciliation。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler close 时透传取消。
+        :raises Exception: one-shot durable reconciliation 失败时透传给 health owner。
+        """
+
+        try:
+            while not self._closed:
+                await asyncio.sleep(
+                    self._local_execution.dispatch_poll_interval_seconds
+                )
+                if self._closed:
+                    return
+                await self.reconcile_owned_sessions_once(
+                    fixed_now=datetime.now(UTC),
+                )
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "dispatch.owned_session_reconciliation.cancelled host_handle_id=%s",
+                self._host_handle_id,
+            )
+            raise
+
+    async def _active_worker_cancel_reconciliation_loop(self) -> None:
+        """周期传播本 scheduler exact worker identities 的 durable cancel。
+
+        本任务不进入 Session promotion 或 proactive compactor await 链，确保旧
+        execution owner 的 physical cancel poll 拥有独立进度。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler close 时透传取消。
+        :raises Exception: exact durable reconciliation 失败时透传给 health owner。
+        """
+
+        try:
+            while not self._closed:
+                await asyncio.sleep(
+                    self._local_execution.dispatch_poll_interval_seconds
+                )
+                if self._closed:
+                    return
+                self.reconcile_active_worker_cancels_once(
+                    fixed_now=datetime.now(UTC),
+                )
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "dispatch.active_worker_cancel_reconciliation.cancelled "
+                "host_handle_id=%s",
                 self._host_handle_id,
             )
             raise
@@ -3561,23 +4135,40 @@ class HostDispatchScheduler:
             record.dispatch_record_id,
         )
         self._active_registry.register(
+            session_id=snapshot.session_id,
             run_id=record.run_id,
             attempt_id=record.attempt_id,
             execution_id=record.execution_id,
             handle=handle,
             cancellation_token=cancellation_token,
         )
+        consumer_started = asyncio.Event()
+        consumer_continue = asyncio.Event()
+        consumer_ready = asyncio.Event()
+        consumer_stream_continue = asyncio.Event()
         task = asyncio.create_task(
             self._consume_worker_events(
                 record=record,
                 handle=handle,
                 token=token,
                 cancellation_token=cancellation_token,
+                consumer_started=consumer_started,
+                consumer_continue=consumer_continue,
+                consumer_ready=consumer_ready,
+                consumer_stream_continue=consumer_stream_continue,
             )
         )
         self._active_handles.add(handle)
         self._active_tasks.add(task)
         task.add_done_callback(self._active_tasks.discard)
+        # ``dispatched`` 返回前让 consumer 建立自己的 durable closeout/finally
+        # owner；显式 barrier 同时阻止它提前消费并递归填充当前 drain queue。
+        await consumer_started.wait()
+        consumer_continue.set()
+        # ``ready`` 在初始化成功及外层 finally 两条路径都置位，因此同步初始化
+        # 失败也不会挂 caller；成功路径则先把取消处理安装在 stream barrier 上。
+        await consumer_ready.wait()
+        consumer_stream_continue.set()
         return "dispatched"
 
     def _build_run_input_with_lag_repair(
@@ -4088,6 +4679,10 @@ class HostDispatchScheduler:
         handle: LocalWorkerHandle,
         token: LaneClaimToken,
         cancellation_token: _HostCancellationToken,
+        consumer_started: asyncio.Event,
+        consumer_continue: asyncio.Event,
+        consumer_ready: asyncio.Event,
+        consumer_stream_continue: asyncio.Event,
     ) -> None:
         """消费 worker EngineEvent stream 并在结束时释放 lane。
 
@@ -4095,12 +4690,20 @@ class HostDispatchScheduler:
         :param handle: worker handle。
         :param token: runtime lane token。
         :param cancellation_token: Host 注入 Engine 的取消 token。
+        :param consumer_started: consumer 已建立 closeout owner 的一次性信号。
+        :param consumer_continue: 允许 consumer 执行同步初始化的 barrier。
+        :param consumer_ready: 初始化成功或失败后的必达握手信号。
+        :param consumer_stream_continue: dispatch 返回前禁止消费 stream 的 barrier。
         :returns: ``None``。
         """
 
         run_terminal_closed = False
         local_worker_id: str | None = None
         try:
+            # 最外层 owner 一建立就完成握手；后续任何同步初始化失败都只能让
+            # consumer task 失败，不能让 dispatch caller 永久等待 started。
+            consumer_started.set()
+            await consumer_continue.wait()
             envelope = LocalEngineEnvelope(
                 session_id=self._read_run_session_id(record.run_id),
                 run_id=record.run_id,
@@ -4141,6 +4744,8 @@ class HostDispatchScheduler:
             )
             while True:
                 try:
+                    consumer_ready.set()
+                    await consumer_stream_continue.wait()
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
@@ -4287,12 +4892,14 @@ class HostDispatchScheduler:
                         run_terminal_closed = _ingest_closed_run(result)
                         break
         finally:
-            self._active_handles.discard(handle)
+            consumer_ready.set()
             self._active_registry.unregister(
                 attempt_id=record.attempt_id,
                 execution_id=record.execution_id,
             )
-            await _safe_close_worker_handle(handle)
+            handle_closed = await _safe_close_worker_handle(handle)
+            if handle_closed:
+                self._active_handles.discard(handle)
             await _safe_release_lane_token(token)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
@@ -4442,18 +5049,22 @@ def _validate_watchdog_now(now: datetime) -> None:
 def _read_active_cancel_watchdog_candidates(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
+    *,
+    session_id: str,
 ) -> tuple[tuple[_ActiveCancelWatchdogCandidate, ...], int, int]:
-    """读取 active cancel watchdog 当前可评估候选。
+    """读取目标 Session 的 active cancel watchdog 可评估候选。
 
     :param transaction: Host transaction。
     :param event_log_store: EventLog primitive。
+    :param session_id: 目标 Session id。
     :returns: 候选集合、扫描到的 ``CANCELLING`` Run 数和跳过数量。
     """
 
     candidates: list[_ActiveCancelWatchdogCandidate] = []
     scanned = 0
     ignored = 0
-    for run in read_cancelling_runs(transaction):
+    runs = read_cancelling_runs_for_session(transaction, session_id)
+    for run in runs:
         scanned += 1
         candidate = _active_cancel_watchdog_candidate_from_run(
             transaction,
@@ -4465,6 +5076,59 @@ def _read_active_cancel_watchdog_candidates(
         else:
             candidates.append(candidate)
     return tuple(candidates), scanned, ignored
+
+
+def _read_exact_owned_active_cancel_watchdog_candidate(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    owner_host_instance_id: str,
+    target: OwnedAttemptCancelTarget,
+) -> tuple[tuple[_ActiveCancelWatchdogCandidate, ...], int, int]:
+    """在 watchdog 写事务内重验 execution-owner exact target。
+
+    本 helper 只把 run-transition owner 已严格校验的 target 投影为既有
+    watchdog candidate；terminal transition 仍只由 ``_tick`` 的唯一调用点执行。
+
+    :param transaction: Host write transaction。
+    :param event_log_store: EventLog primitive。
+    :param owner_host_instance_id: 当前 scheduler 的 durable owner id。
+    :param target: bounded read transaction 返回的 exact target。
+    :returns: 仍精确匹配时返回单 candidate；stale 时返回空集合。
+    :raises HostDurableError: linked cancel fact 在重验时非法时抛出。
+    """
+
+    exact_targets = read_exact_owned_attempt_cancel_targets(
+        transaction,
+        event_log_store,
+        owner_host_instance_id=owner_host_instance_id,
+        identities=(target.identity,),
+    )
+    if exact_targets != (target,):
+        return (), 0, 0
+    cancel_requested = event_log_store.read_event_by_id(
+        transaction,
+        target.cancel_request_event_id,
+    )
+    if cancel_requested is None:
+        raise HostDurableError(
+            "owned Attempt cancel target lost its validated event"
+        )
+    identity = target.identity
+    return (
+        (
+            _ActiveCancelWatchdogCandidate(
+                run_id=identity.run_id,
+                session_id=identity.session_id,
+                attempt_id=identity.attempt_id,
+                cancel_requested_at=parse_utc_timestamp(
+                    cancel_requested.occurred_at
+                ),
+            ),
+        ),
+        1,
+        0,
+    )
 
 
 def _active_cancel_watchdog_candidate_from_run(
@@ -4720,57 +5384,109 @@ def _new_event_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
-def _accepted_attempt_number(result: CompactionOperationResult) -> int:
-    """返回 accepted candidate 对应的 operation attempt number。
-
-    :param result: compaction operation result。
-    :returns: accepted attempt number。
-    """
-
-    return len(result.rejected_attempts) + 1
-
-
-def _completed_compaction_proposal_attempt_count(
-    result: CompactionOperationResult,
-) -> int:
-    """返回 operation result 中已完成真实 proposal call 的数量。
-
-    cancellation-before-attempt 会产生 rejected 诊断，但没有执行 proposal call；
-    因此该诊断不计入全局 accepted attempt number。
-
-    :param result: compaction operation result。
-    :returns: 已完成 proposal call 数量。
-    """
-
-    rejected_completed = sum(
-        1
-        for rejected in result.rejected_attempts
-        if rejected.failure_category
-        is not CompactionFailureCategory.CANCELLATION_REQUESTED
-    )
-    if _compaction_result_accepted(result):
-        return rejected_completed + 1
-    return rejected_completed
-
-
-def _renumber_compaction_rejected_attempts(
+def _highest_attempt_number(
     rejected_attempts: tuple[CompactionAttemptRejected, ...],
     *,
-    offset: int,
-) -> tuple[CompactionAttemptRejected, ...]:
-    """把 recovery pass 的 rejected attempts 重编号为 operation 内序号。
+    accepted_attempt_number: int | None,
+    minimum: int = 0,
+) -> int:
+    """返回 rejected/accepted attempt numbers 的最大值。
 
-    :param rejected_attempts: 单个 recovery pass 返回的 rejected attempts。
-    :param offset: 该 pass 前已经完成的 proposal attempt 数。
-    :returns: attempt_number 连续递增后的 rejected attempts。
+    :param rejected_attempts: 本次 execution 的 rejected attempts。
+    :param accepted_attempt_number: 可选 accepted attempt number。
+    :param minimum: 没有结果时使用的非负下界。
+    :returns: 最大 attempt number。
+    :raises ValueError: 下界为负数时抛出。
     """
 
-    if offset == 0:
-        return rejected_attempts
-    return tuple(
-        replace(rejected, attempt_number=offset + rejected.attempt_number)
-        for rejected in rejected_attempts
-    )
+    if minimum < 0:
+        raise ValueError("minimum must be non-negative")
+    numbers = [minimum]
+    numbers.extend(rejected.attempt_number for rejected in rejected_attempts)
+    if accepted_attempt_number is not None:
+        numbers.append(accepted_attempt_number)
+    return max(numbers)
+
+
+def _required_accepted_attempt_number(value: int | None) -> int:
+    """校验并返回 accepted 全局 attempt number。
+
+    :param value: operation result 中的 accepted number。
+    :returns: 正数 attempt number。
+    :raises RuntimeError: accepted result 缺失或非法时抛出。
+    """
+
+    if value is None or value <= 0:
+        raise RuntimeError("accepted compaction is missing attempt number")
+    return value
+
+
+def _required_proactive_operation_id(state: ProactiveCompactionState) -> str:
+    """返回 existing proactive state 的 operation id。
+
+    :param state: typed proactive state。
+    :returns: 非空 operation id。
+    :raises RuntimeError: state 缺少 operation id 时抛出。
+    """
+
+    value = state.operation_id
+    if value is None or value.strip() == "":
+        raise RuntimeError("proactive state is missing operation id")
+    return value
+
+
+def _required_proactive_next_attempt(state: ProactiveCompactionState) -> int:
+    """返回 existing proactive state 的下一 attempt number。
+
+    :param state: typed proactive state。
+    :returns: 正数下一 attempt number。
+    :raises RuntimeError: state 缺少合法 number 时抛出。
+    """
+
+    value = state.next_attempt_number
+    if value is None or value <= 0:
+        raise RuntimeError("proactive state is missing next attempt number")
+    return value
+
+
+def _required_proactive_max_attempt(state: ProactiveCompactionState) -> int:
+    """返回 existing proactive state 的冻结 attempt 上限。
+
+    :param state: typed proactive state。
+    :returns: 正数 attempt 上限。
+    :raises RuntimeError: state 缺少合法上限时抛出。
+    """
+
+    value = state.max_attempt_number
+    if value is None or value <= 0:
+        raise RuntimeError("proactive state is missing max attempt number")
+    return value
+
+
+def _validate_proactive_resume_snapshot(
+    state: ProactiveCompactionState,
+    *,
+    source_snapshot: CompactPipelineSourceSnapshot,
+    attempt_schedule: tuple[ProactiveCompactionAttemptPlan, ...],
+    expected_input_event_sequence: int,
+) -> None:
+    """验证 resume material/request 与 request fact 冻结值同源。
+
+    :param state: existing INCOMPLETE proactive state。
+    :param source_snapshot: 当前 durable material 重建结果。
+    :param attempt_schedule: 当前 frozen inputs 重建的 typed attempt schedule。
+    :param expected_input_event_sequence: 当前 Run input cursor。
+    :returns: ``None``。
+    :raises RuntimeError: cursor、material 或 request digest 漂移时抛出。
+    """
+
+    if state.input_snapshot_cursor != expected_input_event_sequence:
+        raise RuntimeError("proactive resume input cursor changed")
+    if state.frozen_material_list_digest != source_snapshot.material_view_digest:
+        raise RuntimeError("proactive resume material digest changed")
+    if state.frozen_material_refs != source_snapshot.material_source_refs:
+        raise RuntimeError("proactive resume material refs changed")
+    validate_proactive_compaction_attempt_schedule(state, attempt_schedule)
 
 
 def _required_compactor_manifest_ref(result: CompactionOperationResult) -> str:
@@ -4949,11 +5665,11 @@ def _new_dispatch_host_instance_identity(
     )
 
 
-async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
+async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> bool:
     """best-effort 关闭 worker handle。
 
     :param handle: worker handle。
-    :returns: ``None``。
+    :returns: handle close 成功时返回 ``True``；timeout 或异常时返回 ``False``。
     """
 
     try:
@@ -4961,6 +5677,7 @@ async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
             handle.close(),
             timeout=_LOCAL_WORKER_CLOSE_GRACE_SECONDS,
         )
+        return True
     except TimeoutError:
         _LOGGER.warning(
             "dispatch.worker_handle.close_timed_out local_worker_id=%s "
@@ -4968,13 +5685,33 @@ async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
             _safe_worker_id_for_log(handle),
             _LOCAL_WORKER_CLOSE_GRACE_SECONDS,
         )
+        return False
     except Exception as exc:
         _LOGGER.warning(
             "dispatch.worker_handle.close_failed error_type=%s",
             exc.__class__.__name__,
             exc_info=True,
         )
-        return
+        return False
+
+
+async def _close_worker_handle_mandatory(handle: LocalWorkerHandle) -> None:
+    """在 scheduler close owner 边界必须成功关闭残余 worker handle。
+
+    正常执行路径继续使用 best-effort helper；scheduler lifecycle close 只有在
+    handle 确认关闭后才可清除 registry、关闭 lane 并写入 ``STOPPED``。timeout
+    或异常必须向上传播，让同一个 scheduler 的后续 ``close`` 重试该阶段。
+
+    :param handle: scheduler 仍持有的残余 worker handle。
+    :returns: ``None``。
+    :raises TimeoutError: handle 未在既有 close grace 内完成时抛出。
+    :raises Exception: handle close 失败时原样抛出。
+    """
+
+    await asyncio.wait_for(
+        handle.close(),
+        timeout=_LOCAL_WORKER_CLOSE_GRACE_SECONDS,
+    )
 
 
 def _safe_worker_id_for_log(handle: LocalWorkerHandle) -> str:

@@ -185,6 +185,8 @@ def test_tier_recovery_request_plans_use_fallback_caps_degrade_and_delta_only() 
     )
     tier_1, tier_2, tier_3 = (plan.request_plan.request for plan in plans)
     assert len(tier_1.segment_selection.selected_block_ids) <= 1
+    assert tier_2.segment_selection == tier_1.segment_selection
+    assert tier_2.segment_selection != root.request.segment_selection
     assert tuple(block.kind for block in tier_2.material_pack.previous_compacted_view) == (
         CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
     )

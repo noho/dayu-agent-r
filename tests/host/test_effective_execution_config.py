@@ -7,6 +7,7 @@ import dataclasses
 import pathlib
 from collections.abc import AsyncIterator
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -73,6 +74,7 @@ from dayu.host._execution_config_projection import (
     runner_spec_from_json,
     runner_spec_json,
 )
+from tests.host.public_smoke_support import close_attachment_shielded
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.event_log import EventLogRow, EventLogStore
@@ -294,8 +296,15 @@ async def test_field_level_partial_merge_uses_baseline_for_omitted_fields(
         top_p=0.9,
         stream=False,
     )
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         await host.submit_followup(
             session.session_id,
             _followup(
@@ -613,8 +622,15 @@ async def test_effective_config_freezes_override_and_idempotent_replay(
 
     factory = _RecordingWorkerFactory()
     override_spec = _runner_spec("override-model")
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         request = _followup(session.session_id, runner_spec=override_spec)
 
         first = await host.submit_followup(session.session_id, request)
@@ -650,8 +666,15 @@ async def test_descriptor_payload_dispatch_uses_per_run_override(
         continuation_prompt="test continuation prompt",
     )
     large_prompt = "descriptor prompt " * 600
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         accepted = await host.submit_followup(
             session.session_id,
             _followup(
@@ -710,8 +733,15 @@ async def test_agent_policy_override_freezes_payload_and_dispatch_snapshot_ref(
         continuation_prompt="test continuation prompt",
         max_consecutive_failed_tool_batches=4,
     )
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         accepted = await host.submit_followup(
             session.session_id,
             _followup(

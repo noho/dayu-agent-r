@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 from collections.abc import AsyncIterator, Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import cast
@@ -67,6 +68,7 @@ from tests.host.public_smoke_support import (
     ToolCallingWorkerFactory,
     api_key_or_skip,
     assert_at_most_one_system_message,
+    close_attachment_shielded,
     deterministic_runner_spec,
     ensure_request,
     followup_request,
@@ -521,15 +523,22 @@ async def test_no_compaction_recent_raw_turns_continuity(
     """
 
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        open_host_options(
-            tmp_path,
-            runner_spec=deterministic_runner_spec("p12-6-no-compact"),
-            worker_factory=factory,
-            allow_tool_calls=False,
-        )
-    ) as host:
+    async with (
+        open_host(
+            open_host_options(
+                tmp_path,
+                runner_spec=deterministic_runner_spec("p12-6-no-compact"),
+                worker_factory=factory,
+                allow_tool_calls=False,
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-no-compact"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -581,17 +590,24 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         fake_compactor,
     )
     factory = ToolCallingWorkerFactory()
-    async with open_host(
-        _fake_compact_open_options(
-            tmp_path,
-            worker_factory=factory,
-            allow_tool_calls=True,
-            tooling_options=_long_chapter_tooling_options(),
-            policy_ref="p12-6-public-tool-evidence",
-            selected_recent_window_turn_floor=0,
-        )
-    ) as host:
+    async with (
+        open_host(
+            _fake_compact_open_options(
+                tmp_path,
+                worker_factory=factory,
+                allow_tool_calls=True,
+                tooling_options=_long_chapter_tooling_options(),
+                policy_ref="p12-6-public-tool-evidence",
+                selected_recent_window_turn_floor=0,
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-tool-evidence"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -684,16 +700,23 @@ async def test_long_user_input_second_factor_survives_reference_continuity(
         fake_compactor,
     )
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        _fake_compact_open_options(
-            tmp_path,
-            worker_factory=factory,
-            allow_tool_calls=False,
-            tooling_options=None,
-            policy_ref="p12-6-public-minimum-preserve",
-        )
-    ) as host:
+    async with (
+        open_host(
+            _fake_compact_open_options(
+                tmp_path,
+                worker_factory=factory,
+                allow_tool_calls=False,
+                tooling_options=None,
+                policy_ref="p12-6-public-minimum-preserve",
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-min-preserve"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -742,16 +765,23 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
         fake_compactor,
     )
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        _fake_compact_open_options(
-            tmp_path,
-            worker_factory=factory,
-            allow_tool_calls=False,
-            tooling_options=None,
-            policy_ref="p12-6-public-multi-compact",
-        )
-    ) as host:
+    async with (
+        open_host(
+            _fake_compact_open_options(
+                tmp_path,
+                worker_factory=factory,
+                allow_tool_calls=False,
+                tooling_options=None,
+                policy_ref="p12-6-public-multi-compact",
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-multi-compact"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         for index in range(4):
             followup = await host.submit_followup(
@@ -804,16 +834,23 @@ async def test_proactive_compact_long_current_input_reaches_compactor_without_lo
         fake_compactor,
     )
     factory = FinalAnswerWorkerFactory()
-    async with open_host(
-        _fake_compact_open_options(
-            tmp_path,
-            worker_factory=factory,
-            allow_tool_calls=False,
-            tooling_options=None,
-            policy_ref="p12-6-public-duplicate-prompt",
-        )
-    ) as host:
+    async with (
+        open_host(
+            _fake_compact_open_options(
+                tmp_path,
+                worker_factory=factory,
+                allow_tool_calls=False,
+                tooling_options=None,
+                policy_ref="p12-6-public-duplicate-prompt",
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-duplicate"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -864,16 +901,23 @@ async def test_public_reactive_compact_recovers_with_followup_attempt(
         fake_compactor,
     )
     factory = _ReactivePublicWorkerFactory()
-    async with open_host(
-        _fake_compact_open_options(
-            tmp_path,
-            worker_factory=factory,
-            allow_tool_calls=False,
-            tooling_options=None,
-            policy_ref="p12-6-public-reactive-compact",
-        )
-    ) as host:
+    async with (
+        open_host(
+            _fake_compact_open_options(
+                tmp_path,
+                worker_factory=factory,
+                allow_tool_calls=False,
+                tooling_options=None,
+                policy_ref="p12-6-public-reactive-compact",
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-reactive"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -917,19 +961,26 @@ async def test_public_compact_failure_dispatches_deterministic_recent_window(
     )
     factory = FinalAnswerWorkerFactory()
     prompt = f"{_soft_threshold_prompt()} public fallback current input marker"
-    async with open_host(
-        _fake_compact_open_options(
-            tmp_path,
-            worker_factory=factory,
-            allow_tool_calls=False,
-            tooling_options=None,
-            policy_ref="p12-6-public-fallback-compact",
-            max_compaction_attempts_per_operation=(
-                _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
-            ),
-        )
-    ) as host:
+    async with (
+        open_host(
+            _fake_compact_open_options(
+                tmp_path,
+                worker_factory=factory,
+                allow_tool_calls=False,
+                tooling_options=None,
+                policy_ref="p12-6-public-fallback-compact",
+                max_compaction_attempts_per_operation=(
+                    _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+                ),
+            )
+        ) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(ensure_request("p12-6-fallback"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -1023,8 +1074,15 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     )
 
     try:
-        async with open_host(options) as host:
+        async with (
+            open_host(options) as host,
+            AsyncExitStack() as attachment_stack,
+        ):
             session = await host.ensure_session(ensure_request("real-compact"))
+            attachment = await host.attach_session(session.session_id)
+            attachment_stack.push_async_callback(
+                close_attachment_shielded, attachment
+            )
             watcher = await host.watch_session_events(session.session_id)
             compacted = await host.submit_followup(
                 session.session_id,

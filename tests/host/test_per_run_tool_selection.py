@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 
 import pytest
@@ -51,6 +52,7 @@ from dayu.host import (
 )
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.memory import default_memory_projection_policy
+from tests.host.public_smoke_support import close_attachment_shielded
 
 
 class _FinalHandle:
@@ -200,8 +202,15 @@ async def test_unknown_tool_name_is_rejected_before_dispatch(
     """admission 必须在 durable dispatch 前拒绝未知业务工具名。"""
 
     factory = _RecordingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         with pytest.raises(HostApiError) as error:
             await host.submit_followup(
                 session.session_id,
@@ -227,8 +236,15 @@ async def _accepted_request(
     """
 
     factory = _RecordingWorkerFactory()
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request())
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         await host.submit_followup(
             session.session_id,
             _followup(

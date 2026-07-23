@@ -94,7 +94,7 @@ execution profile 选择是 Service / composition root 的显式业务决策，�
 
 `context_budget_policy` 对齐 ratio-first Host public `ContextBudgetPolicy`，只表达治理策略，不表达模型能力或本次调用输出预算。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `ContextBudgetPolicy.context_window_size` 直接传入 typed policy。`ContextBudgetPolicy` 至少包含 `context_window_size`、`soft_threshold_context_ratio`、`hard_threshold_context_ratio`、`max_reactive_compactions_per_run`、`max_compaction_attempts_per_operation` 与 `policy_ref`；Host 内部根据 ratio 计算 soft / hard threshold tokens。proactive compaction 对同一 Run / input snapshot 固定最多一个 durable operation，这是状态机不变量，不是 operator policy，因此不得暴露 `max_proactive_compactions_per_run` config/public 字段。绝对 token 阈值、输出预留和触发阈值不作为 config/public policy 字段暴露。
 
-usage 是 provider capability 驱动的治理观测信号，不是 scene / Service 业务风格参数。流式 OpenAI-compatible 请求在 `RunnerCallOptions.stream=True` 且 `RunnerSpec.supports_stream_usage=True` 时默认请求 `stream_options.include_usage=true`；非流式响应如果 provider 返回 `usage`，Engine 默认读取并上报。Config 不提供 `usage_enabled`、`collect_usage`、`include_usage` 这类 override，也不引入独立 `supports_usage` 字段。Engine 只负责如实上报 usage，不理解 Host budget；Host ingest 负责 durable 化 `usage_reported` 并保留 attempt / execution context、估算 digest、policy ref 等后续消费所需关联信息。Context Governance 可主动消费 usage，但 usage 是 post-call observation，只用于估算器校准、diagnostic 与后续 Run / 后续 compaction 治理参考；不得回头修改当前已经完成的 dispatch decision。usage 缺失、provider 不支持 usage 或 usage 字段格式异常都不得导致 Run 失败。
+usage 是 provider capability 驱动的治理观测信号，不是 scene / Service 业务风格参数。`RunnerSpec.supports_stream_usage` 只表示流式 OpenAI-compatible 请求是否发送 `stream_options.include_usage=true` 扩展，不是 provider 是否会返回 usage、也不是 Host 能否建立 usage anchor 的判定条件；像 MiMo 这类无需该扩展即可在流式 chunk 自动返回 nullable usage 的 provider，仍由通用 SSE / response parser 按实际字段处理。无论流式还是非流式，只要 provider response 实际出现合法 usage，Engine 就必须归一化并上报 `USAGE_REPORTED`；未出现或字段非法则不产生可用 usage observation，禁止按 provider 名称猜测。Config 不提供 `usage_enabled`、`collect_usage`、`include_usage` 这类 override，也不引入独立 `supports_usage` 字段。Engine 只负责如实归一化 usage，不理解 Host budget；Host ingest 负责 durable 化 `usage_reported`，并保留与同一 iteration、同一 runner-call input manifest 的可验证关联。Context Governance 可以把成功 ordinary runner call 的 `prompt_tokens` 用作后续候选输入的估算锚点，但不得回头修改已经完成的 dispatch decision；usage 缺失、provider 不支持 usage 或 usage 字段格式异常都不得导致 Run 失败，后续预算判断必须确定性 fallback。
 
 `memory_projection_policy` 对齐 Host public `MemoryProjectionPolicy`，采用按语义分区的 deterministic floor / cap 预算模型。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `MemoryProjectionPolicy.context_window_size` 直接传入 typed policy。policy 至少包含 `context_window_size`、`selected_recent_window_item_cap`、`selected_recent_window_char_cap`、`selected_recent_window_turn_floor`、`fallback_selected_recent_window_item_cap`、`fallback_selected_recent_window_char_cap`、`evidence_fact_item_cap`、`evidence_fact_char_cap`、`evidence_fact_floor`、`session_summary_char_cap`、`answer_anchor_item_cap`、`answer_anchor_char_cap`、`forward_intent_item_cap`、`forward_intent_char_cap`、`reference_continuity_item_cap`、`reference_continuity_char_cap`、`reference_continuity_item_floor`、`max_lag_events_for_inline_delta`、`max_delta_repair_events` 与 `policy_ref`。fallback selected recent window caps 必须不小于 `selected_recent_window_turn_floor` 所需材料，且不得大于普通 selected recent window caps；否则 fallback 会失去“更小、更保守恢复视图”的治理含义。同一个运行语义只能有一个 policy owner；若某个值同时影响 context governance 与 memory projection，必须由唯一 owner 派生给另一侧使用，不得复制成会漂移的双份真源。policy 存在即表示装配 stateful memory projection；不再使用 `enabled` 字段表达单轮 / 多轮语义。
 
@@ -1474,6 +1474,8 @@ Run 接口语义：
 - `submit_followup(queue)` 是 Service / UI 发送普通 prompt 的统一入口，包括同一 Session 的第一条 prompt。调用方取得 Session 后不需要判断“首轮调用 `start_run`、后续调用 `submit_followup`”；Host 在 admission transaction 内决定该输入是直接成为可启动 Run，还是排到当前 active Run 后面。
 - `get_run`：读取 RunSnapshot；不触发执行、不触发 queue promotion、不改变 Run / Attempt 状态。
 - `watch_session_events` / session-level Host event stream：Service / UI 观察 agent session 的主事件流。在线 / 已 attach 客户端通过 public `HostSessionEventIterator` 接收目标 Session 的 `HostSessionEvent` 封闭联合；watch subscription不取得Session用户命令能力，也不改变`HostSessionAttachment.access_mode`。只有事件producer与watcher同属一个`open_host` runtime时，watcher才可能收到该runtime发布的三类live-only delta；另一个opener的`READ_ONLY` attachment以及fresh `READ_WRITE` attachment对旧opener仍在执行的既有Run都不接收跨进程delta，只通过bounded periodic durable reconciliation / Outbox观察durable progress与terminal。调用必须`await watch_session_events(...)`；successful return后iterator已生效，但调用方只有同时持有live `READ_WRITE` Session attachment时才可提交`submit_followup(...)` / `retry_run(...)` / `replay_run(...)`等用户mutation，首次`anext()`不能补做watch attach。iterator facade直接合流EventLog reader与唯一transient mailbox / in-flight retained state，Service不得为同一subscription再建事件relay buffer；每个watch runtime恰好一个consumer task是sole `anext`和唯一observation-result first-commit owner，command / durable probe只等待容量一、generation-tagged closed union slot。`watch_session_events`不接收cursor、不承担离线补读；Service取得Session后进入attach / reconnect流程：先取得Session attachment mode，再await live watch并建立sole consumer，随后按客户端已保存的terminal watermark / seen ids补读Outbox terminal增量并用durable terminal的`terminal_event_id` / `event_sequence` / `run_id`去重，避免Outbox drain与live watch attach之间出现漏消息窗口。断线后的terminal/final answer补读由Outbox terminal delivery queue承接；pre-return、未attach /离线渠道不接收也不补放transient delta。
+- Context Governance 每次对 ordinary / post-compact / dispatch-fallback 候选输入完成 dispatch-relevant sizing 时，必须先提交 `CONTEXT_BUDGET_EVALUATED` canonical governance fact，再提交由该 decision 驱动的 `CONTEXT_COMPACTION_REQUESTED` 或 `RUN_STARTED` / `ATTEMPT_STARTED`。该 fact 通过 `watch_session_events` 投影为 `HostActivityKind.CONTEXT_USAGE`，并在 `HostActivityView.context_usage` 中携带 typed `HostContextUsageView`；它不是 provider 原始 `USAGE_REPORTED` 的公开转发。`HostContextUsageView` 至少包含 `predicted_input_tokens`、`context_window_size`、`utilization_basis_points`、`soft_threshold_tokens`、`hard_threshold_tokens`、`estimate_method` 与 `pressure_level`。`estimate_method` 只允许 `usage_anchored` / `conservative_fallback`；`pressure_level` 只允许 `normal` / `soft_threshold_exceeded` / `hard_threshold_exceeded`。`utilization_basis_points = floor(predicted_input_tokens * 10000 / context_window_size)`，不得 clamp 到 `10000`，因此 UI 可以区分 100% 与真实超窗；例如 `6200` 表示 62.00%。Host 拥有 token、ratio-derived threshold、basis points 与 pressure level 的派生语义，Service 只能原样 typed 投影为 `EntrypointContextUsage`，UI 只负责展示格式，不得重新解析 EventLog payload、`USAGE_REPORTED`、summary 文本或 provider response 计算该值。
+- `CONTEXT_BUDGET_EVALUATED` 的 public activity 只暴露上述当前候选输入的安全预算视图与普通 event identity；不得暴露 anchor manifest ref / digest、usage observation ref、provider request id、provider / model secret、完整 messages、policy 内部 ref 或 estimator diagnostic。缺少 usage 但 conservative fallback 可用时仍产生 typed context-usage activity，并明确 `estimate_method=conservative_fallback`；没有有效 context budget policy 时不产生该 activity，UI 必须把缺失解释为“不可用”，不能解释为 0%。内部 compactor proposal sizing、semantic repair attempt sizing 与 response 刚返回时的历史 provider usage 不单独产生 public context-usage activity，避免 UI 把非当前 ordinary dispatch candidate 显示为“上下文已使用”。`USAGE_REPORTED` 继续作为 Host 内部 projection signal / Tool Trace diagnostic，不进入 public activity allowlist。
 - 普通 Service 的官方事件入口只有 `watch_session_events(session_id)`。普通多轮 recipe、thin Service proof、P10.5 no-tool / mock-tool / real-runner smoke 都必须走 session-level live watch，不能用内部 run-level EventLog 补读绕过 session live watch 来证明多轮闭环。
 - 内部 `stream_run_events` / run-scoped EventLog 补读：从全局 `event_sequence` cursor 补读目标 Run 的事件。它是 Host 内部 diagnostic / detail / debug / drill-down helper，只服务内部测试、排查某次 retry / replay source run 或运维诊断；不得和 `watch_session_events` 并列成为 Service-facing 聊天入口。若未来要公开给 Run detail 页面，必须先定义 public diagnostic event DTO，不得直接暴露内部 `HostEventView`。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
@@ -1822,6 +1824,7 @@ TOOL_AWAITING
 GUIDANCE_INSERTED
 RUNNER_CALL_INPUT_ASSEMBLED
 RUNNER_CALL_INPUT_ITERATION_LINKED
+CONTEXT_BUDGET_EVALUATED
 CONTEXT_COMPACTION_REQUESTED
 CONTEXT_COMPACTED
 CONTEXT_COMPACTION_FAILED
@@ -1873,6 +1876,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
 | `RUNNER_CALL_INPUT_ASSEMBLED` | `session_id`、`host_run_id`；有 Attempt 时必须带 `attempt_id`、`execution_id`；compactor proposal 必须可由 manifest 关联 parent run 与 compaction operation | runner_call_index / runner_call_kind / runner_call_trigger_reason / manifest_payload_ref / manifest_digest / manifest_schema_version / validation_status | 无 Run / Attempt 状态副作用；不参与 terminal decision、recovery scan、memory projection、dispatch decision 或 lifecycle transition | resume 不消费；reconstruction consumer 只能消费 refs / digests / projector metadata | audit optional / tool trace 是 |
 | `RUNNER_CALL_INPUT_ITERATION_LINKED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id` | manifest_event_id / manifest_payload_ref / manifest_digest / manifest_schema_version / runner_call_index / runner_call_kind / runner_call_trigger_reason / iteration_id / iteration_index / engine_message_count / engine_role_sequence_digest / runner_input_serializer_schema_version / expected_message_count / expected_role_sequence_digest / validation_status / diagnostic | 无 Run / Attempt 状态副作用；只表达 prepared runner-call manifest 与 Engine `ITERATION_STARTED` observation 的追加式 link / validation fact | resume 不消费；reconstruction consumer 可用 refs / digests / observed-vs-expected summary 判断 Engine link 是否完成 | audit optional / tool trace optional |
+| `CONTEXT_BUDGET_EVALUATED` | `session_id`、`run_id`、input snapshot cursor / digest | sizing stage、sizing method、predicted input tokens、context window、soft / hard threshold tokens、pressure level、anchor / estimator diagnostic refs | 无 Run / Attempt 状态副作用；记录并公开本次 ordinary / post-compact / dispatch-fallback 候选输入的 dispatch-relevant sizing result；必须先于其驱动的 compact request 或 dispatch lifecycle facts 提交 | resume 不进入 messages；recovery 只消费 digest-verified internal refs 重建 decision | audit / trace 是；Host event stream 投影安全 typed context-usage activity |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
 | `PROVIDER_DIAGNOSTIC` | `session_id`、`run_id`、`attempt_id`、`execution_id` | diagnostic code / severity / message / provider request id / diagnostic source / payload ref + digest | 无 Run / Attempt 状态副作用；非 terminal；不写 failure metadata | resume 不消费；memory 不消费；LLM-facing material 不消费 | audit optional / Host activity optional / tool trace diagnostic |
@@ -3555,9 +3559,51 @@ Host 负责：
 
 Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace、audit projection 或 outbox。它只能 append / request append compact-related canonical facts 或 projection_signal，并通过 typed ports 调用 compactor、budget estimator、RunInputBuilder 和 policy view。memory、trace、audit 等 projection 只从已提交 EventLog 追平。
 
-第一版不实现 provider-specific token counting / provider tokenizer adapter。Context Governance 使用 conservative estimator、provider-aware configured limits 和 safety margin 做 proactive 判断；Engine context overflow event 是 reactive 收口信号。provider-specific tokenizer adapter 是后续精确能力。
+Context Governance 不实现 provider-specific token counting、provider tokenizer adapter、远程预计算 endpoint 或 tokenizer 下载。预算估算采用 usage-anchored adaptive sizing：成功 ordinary runner call 实际上报的 `prompt_tokens` 提供历史输入锚点，现有 Host conservative estimator 只计算锚点输入与下一候选完整输入之间的同源差量；没有可验证兼容锚点时，仍对当前完整输入执行 conservative estimate。Engine context overflow event 是 reactive 收口信号，不是精确校准样本。
 
-`context_window_size` 是 Host context policy 的显式 typed input，由 Service / composition root 从 effective model config 读取并传入 typed policy。Host 不从 Engine 反查模型窗口，不从 per-run metadata 或 extra payload 中读取预算参数，也不把 provider overflow event 当作预算真源。Runner 返回的 usage 只能作为 post-call observation / diagnostics / policy calibration 输入，不能替代下一次 dispatch 前对当前 messages 的估算。
+`context_window_size` 是 Host context policy 的显式 typed input，由 Service / composition root 从 effective model config 读取并传入 typed policy。Host 不从 Engine 反查模型窗口，不从 per-run metadata 或 extra payload 中读取预算参数，也不把 provider overflow event 当作预算真源。Runner 返回的 usage 只能在 response 后成为已完成 runner call 的 observation；它可以按下述同源公式锚定后续输入估算，但不能单独替代下一次 dispatch 前对当前完整 messages 的 conservative estimate / delta estimate，也不能回写已完成 decision。
+
+### Usage-Anchored Adaptive Context Sizing
+
+该能力只服务 proactive compact、hard budget decision、compact / fallback 前后 sizing 与相应 diagnostics，不追求 provider billing 级 token 精确性。语义 owner 固定为：
+
+- Engine provider / Runner 层拥有 provider response usage 的解析与归一化；它只在 response 实际出现合法 usage 时 emit iteration-scoped `USAGE_REPORTED` observation，不根据 `supports_stream_usage`、provider 名称或配置推断 usage presence。
+- runner-call manifest owner 负责在 dispatch 前把完整 logical input 与 conservative estimate 同源冻结。ordinary input 必须先形成 durable `RUNNER_CALL_INPUT_ASSEMBLED`，再通过 accepted `RUNNER_CALL_INPUT_ITERATION_LINKED` 与实际 Engine iteration 建立追加式 link；不得在 response 后只用 `USER_INPUT_ACCEPTED.display_text`、时间戳、provider request id 或其它间接字段重建本次输入。
+- Host ingest 只把同一 iteration 的合法 `prompt_tokens` 与已经完成 link validation 的 manifest estimate 配对并 durable 化，不改变已发生的 dispatch decision，也不把 compactor proposal usage 写入 ordinary anchor。
+- Context Governance 拥有 compatible anchor 选择、当前预测值、soft / hard threshold 比较与 fallback decision。conservative estimator 继续唯一拥有完整输入的 heuristic sizing；context policy 继续唯一拥有 ratio 与由 ratio 派生的 token thresholds。
+
+对一个 compatible ordinary runner call，记：
+
+- `U_anchor`：该次成功 response 由 Engine 归一化的实际 `prompt_tokens`；
+- `E_anchor`：dispatch 前对该次完整 runner-call input 用当前 conservative estimator 冻结的估算值；
+- `E_current`：对下一候选完整 input 用同一 estimator / version 计算的估算值；
+- `P_current`：下一候选输入参与预算决策的预测 token 数。
+
+算法固定为：
+
+```text
+delta = E_current - E_anchor
+P_current = U_anchor + delta
+```
+
+`delta` 是 signed delta，不允许默认截断为零。只有 manifest lineage 能证明 `E_anchor` 与 `E_current` 都来自同一套完整 input 语义、相同 estimator contract，且其间每一项新增、删除或替换均可确定性重建时，才允许使用该差量；否则必须对当前完整输入使用 conservative fallback，不得伪造 pairing。该算法不是“上一次 usage 超过 ratio，下一 Run 才 compact”：即使 `U_anchor / context_window_size` 只有 62%，只要下一输入差量使 `P_current` 达到 65% soft threshold，下一 Run 仍应在 dispatch 前进入 proactive compact。
+
+compatible anchor 至少绑定 provider、model、context window、ordinary runner-call kind、estimator id / version，以及同源完整 input / manifest lineage。实现必须显式校验这些维度，不能在 Context Governance 中写 provider name branch。以下情况使既有 anchor 失效，当前判断回退为完整 conservative estimate，直到新的 compatible successful ordinary call 建立 anchor：
+
+- provider、model、context window、estimator id / version 或 request serialization semantics 改变；
+- accepted compact 改变上下文基线；
+- anchor 来自 compactor proposal、无法证明是 ordinary runner call，或 iteration-scoped usage 无法与 complete manifest / accepted link 唯一对应；
+- 中间存在无法从 durable input lineage 重建的输入变化、manifest mismatch、usage 非法或 pairing 冲突。
+
+单次或连续多次 response 缺少 usage 不必自动丢弃较旧 anchor。若该较旧 anchor 仍 compatible，且从它到当前候选输入之间的全部变化都能从 durable lineage 用同一 estimator 重建，则可以继续使用 `U_anchor + (E_current - E_anchor)` 累计差量；任一环节不可证明就整体 fallback。accepted compact 后的 immediate post-compact sizing 因旧 anchor 已失效，必须先使用当前完整 conservative estimate；新的 ordinary call 成功并产生合法 usage 后再建立新 anchor。
+
+`U_anchor`、`E_anchor`、`E_current` 与算出的 `P_current` 必须通过 typed integer / range validation；任一字段非法、计算溢出或 `P_current` 不为正数时，anchor 无效并执行完整 conservative fallback。每次 sizing decision 的 durable diagnostic 至少记录 anchored / fallback 方法、estimator id / version、anchor manifest ref / digest、usage observation ref、`U_anchor` / `E_anchor` / `E_current` / signed delta / `P_current`（适用时）、compatibility 或 fallback reason、policy ref 与本次 soft / hard threshold tokens；不得复制完整 messages、provider raw response 或 secret。recovery 只能从这些 refs 所指向的 digest-verified manifest、accepted iteration link 与 usage observation 重建 pairing，不能信任 projection-only copy。
+
+每个 ordinary / post-compact / dispatch-fallback 候选输入的 dispatch-relevant sizing decision 还必须提交 canonical `CONTEXT_BUDGET_EVALUATED`，并从同一个 typed sizing result 派生 public `HostContextUsageView`；不得在 public projection、Service 或 UI 中再次计算另一份 token estimate。该 fact 的 stable identity / idempotency 必须绑定 `run_id`、候选 input snapshot cursor / digest、sizing stage、policy snapshot 与 estimator contract；同一 decision 的 recovery / replay 不能追加第二条 utilization truth，不同 post-compact / fallback candidate 则必须有不同 identity。public `predicted_input_tokens` 在 anchored 路径等于 `P_current`，在 fallback 路径等于当前完整输入的 conservative estimate；两条路径都用同一个 `context_window_size` 计算 `utilization_basis_points`，并按同一 soft / hard thresholds 派生 `pressure_level`。该 public view 表达“本次准备治理 / dispatch 的当前候选输入占用”，不是上一轮账单 usage；原始 `prompt_tokens`、`U_anchor`、signed delta、manifest / observation refs 与 estimator diagnostic 只保留在 Host durable diagnostic / trace，不向 UI 暴露。Service 必须提供同形、typed `EntrypointContextUsage` 投影并通过既有 activity callback 交付，使未来 UI 无需新增 EventLog reader 即可展示例如“上下文约使用 62%”；具体 CLI / Web / WeChat 文案、进度条、颜色与小数位属于 UI 工作，不进入本能力。
+
+soft / hard policy 保持 ratio-first 且不自适应：Host 仍由固定 `soft_threshold_context_ratio`、`hard_threshold_context_ratio` 与 `context_window_size` 派生 thresholds，再用 `P_current` 或 fallback full estimate 比较。usage 动态改变的是 estimate anchoring，不是 policy threshold；不得训练全局 correction model、跨 provider / model 共享学习系数、动态改写 ratio，或用 usage 反向修改已经完成的判断。给定相同 durable manifests、usage observations、estimator version 与 policy，replay / recovery 必须得到相同 anchor compatibility、预测值和 decision。
+
+reactive provider context overflow 通常没有可靠 usage 或 budget state。它只能触发既有 reactive compact / recovery state machine，并作为“本次 proactive sizing 未能阻止 overflow”的 diagnostic / fallback signal；不能把失败请求伪装成带精确误差的 calibration sample，也不能用 compact 后另一份输入的 usage 反推失败输入的 token 数。
 
 第一版 policy 默认值与阈值语义：
 
@@ -3570,7 +3616,7 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
 - `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt、reactive material
   block pass proposal 与后续 whole-candidate semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
   调用总数；默认 packaged policy 为 5 次。代码 fallback 默认值与 execution profile 默认值必须保持一致，避免同一 Host 在不同装配路径下出现不同 compact retry 语义。该字段不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
-- 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
+- usage observation 可以按上述公式动态锚定后续 estimate，但不得动态修改 policy threshold。相同 policy ratio 下的行为差异只能来自 durable、可重建的 runner-call input lineage 与实际 usage presence；usage 不得回写已完成 dispatch decision。
 
 Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 ordinary RunInputBuilder 提供 `ConversationMemorySnapshotVNext`、snapshot cursor、policy digest 和 diagnostics。Context Governance 只负责读取同源 material view、估算预算、裁决 allow dispatch / compact / fallback / fail closed，并编排 bounded compaction operation；它不拥有 material 语义，不直接写 memory snapshot，不能让 session summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。
 
@@ -3800,7 +3846,7 @@ compact 不变量：
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。
 
-provider tokenizer adapter 是 Host 预算治理的后续精确能力，不进入第一版。第一版 proactive path 使用保守 token estimator，阈值必须留出 safety margin；provider 返回 context length exceeded 仍是 reactive fallback，不是 proactive compact 触发机制。reactive path 不依赖估算证明 compact 后一定可 dispatch，而是通过最多两次真实 recovery dispatch 闭环收敛，超过上限后 fail closed。
+Usage-Anchored Adaptive Context Sizing 是预算估算的稳定方向；不再把 provider tokenizer adapter 作为后续精确能力。proactive path 优先使用 compatible usage anchor 加 conservative-estimated signed delta，没有可证明锚点时对当前完整输入使用 conservative fallback；两条路径都使用相同 ratio-derived thresholds 与 safety policy。provider 返回 context length exceeded 仍是 reactive fallback，不是 proactive compact 触发机制或精确 calibration sample。reactive path 不依赖估算证明 compact 后一定可 dispatch，而是通过最多两次真实 recovery dispatch 闭环收敛，超过上限后 fail closed。
 
 ## 26. Evidence / Retrieval / Long-term Memory
 

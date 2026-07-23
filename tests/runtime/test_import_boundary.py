@@ -101,6 +101,17 @@ def test_runtime_import_boundary_scan_covers_filelock_module() -> None:
     assert "filelock.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_native_mutex_module() -> None:
+    """runtime import 边界扫描必须覆盖 strict-native ``native_mutex.py``。
+
+    :returns: ``None``。
+    :raises AssertionError: 新模块未进入递归扫描时抛出。
+    """
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "native_mutex.py" in scanned_names
+
+
 def test_runtime_import_boundary_scan_covers_config_loader_module() -> None:
     """runtime import 边界扫描必须覆盖 ``config_loader.py``。"""
 

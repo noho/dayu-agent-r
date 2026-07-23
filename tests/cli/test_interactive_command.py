@@ -54,6 +54,8 @@ from dayu.host.api import (
     HostReasoningDelta,
     HostSessionEvent,
     HostSessionEventIterator,
+    HostSessionAccessMode,
+    HostSessionAttachment,
     HostStreamCursor,
     HostTerminalStatus,
     HostTransientDelta,
@@ -190,6 +192,31 @@ class _FakeHostEventIterator:
         self._changed.set()
 
 
+class _FakeSessionAttachment:
+    """CLI interactive fake Host 返回的显式 RW attachment。"""
+
+    def __init__(self, session_id: str) -> None:
+        """初始化测试 attachment。
+
+        :param session_id: attachment 绑定的 Session id。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.session_id = session_id
+        self.access_mode = HostSessionAccessMode.READ_WRITE
+        self.close_count = 0
+
+    async def aclose(self) -> None:
+        """记录 attachment lexical close。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+
 class _FakeHost:
     """CLI interactive 测试用 Host public API 替身。"""
 
@@ -209,6 +236,8 @@ class _FakeHost:
     _run_status_index: int
     block_cancel_after_record: bool
     _create_error: HostApiError | None
+    attach_session_ids: list[str]
+    attachments: list[_FakeSessionAttachment]
 
     def __init__(
         self,
@@ -251,6 +280,21 @@ class _FakeHost:
         self._run_status_index = 0
         self.block_cancel_after_record = block_cancel_after_record
         self._create_error = create_error
+        self.attach_session_ids = []
+        self.attachments = []
+
+    async def attach_session(self, session_id: str) -> HostSessionAttachment:
+        """记录显式 Session attachment 并返回可关闭对象。
+
+        :param session_id: 目标 Session id。
+        :returns: 测试用 RW attachment。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        attachment = _FakeSessionAttachment(session_id)
+        self.attach_session_ids.append(session_id)
+        self.attachments.append(attachment)
+        return attachment
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 请求。
@@ -829,6 +873,8 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
     assert captured.out.splitlines() == ["answer for run-1", "answer for run-2"]
     assert fake_host.ensure_requests == []
     assert fake_host.create_requests == []
+    assert fake_host.attach_session_ids == ["session-existing"]
+    assert [attachment.close_count for attachment in fake_host.attachments] == [1]
     assert fake_host.calls == [
         "watch:session-existing",
         "read_outbox:session-existing",

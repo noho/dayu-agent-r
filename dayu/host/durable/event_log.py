@@ -414,6 +414,34 @@ class EventLogStore:
             event_type=event_type,
         )
 
+    def read_run_events_by_types_page(
+        self,
+        transaction: HostTransaction,
+        *,
+        run_id: str,
+        event_types: tuple[str, ...],
+        after_event_sequence: int,
+        limit: int,
+    ) -> tuple[EventLogRow, ...]:
+        """按 Run、event types 与 keyset cursor 读取有界 canonical page。
+
+        :param transaction: 调用方提供的 Host durable transaction。
+        :param run_id: 目标 Run id。
+        :param event_types: 非空且不重复的 canonical event type 集合。
+        :param after_event_sequence: 已消费的全局 event sequence。
+        :param limit: 最大返回 row 数。
+        :returns: 按 ``event_sequence`` 升序排列的 canonical rows。
+        :raises HostDurableError: 任一读取条件非法时抛出。
+        """
+
+        return read_run_events_by_types_page(
+            transaction,
+            run_id=run_id,
+            event_types=event_types,
+            after_event_sequence=after_event_sequence,
+            limit=limit,
+        )
+
     def count_committed_events_by_run_and_type(
         self,
         transaction: HostTransaction,
@@ -638,6 +666,81 @@ def read_events_after(
         LIMIT ?
         """,
         (cursor, limit),
+    )
+    return tuple(_event_log_row_from_host_row(row) for row in rows)
+
+
+def read_run_events_by_types_page(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    event_types: tuple[str, ...],
+    after_event_sequence: int,
+    limit: int,
+) -> tuple[EventLogRow, ...]:
+    """读取单个 Run 下指定 canonical event types 的有界 keyset page。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param run_id: 目标 Run id。
+    :param event_types: 非空且不重复的 event type 元组。
+    :param after_event_sequence: 已消费的全局 event sequence。
+    :param limit: 最大返回 row 数。
+    :returns: 按 ``event_sequence`` 升序排列的 EventLog rows。
+    :raises HostDurableError: 参数非法时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    if after_event_sequence < _MIN_EVENT_CURSOR:
+        raise HostDurableError("EventLog run-event cursor must be non-negative")
+    if limit < _MIN_READ_LIMIT:
+        raise HostDurableError("EventLog run-event read limit must be positive")
+    if len(event_types) == 0:
+        raise HostDurableError("EventLog run-event types cannot be empty")
+    seen: set[str] = set()
+    for event_type in event_types:
+        _require_non_empty_text(event_type, field_name="event_type")
+        if event_type in seen:
+            raise HostDurableError("EventLog run-event type is duplicated")
+        seen.add(event_type)
+    placeholders = ", ".join("?" for _event_type in event_types)
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          event_sequence,
+          event_id,
+          event_body_digest,
+          event_class,
+          session_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          event_type,
+          occurred_at,
+          actor,
+          source,
+          client_request_id,
+          idempotency_key,
+          policy_decision_json,
+          reason_json,
+          payload_json,
+          payload_ref,
+          payload_digest,
+          appended_at
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_class = ?
+          AND event_type IN ({placeholders})
+          AND event_sequence > ?
+        ORDER BY event_sequence ASC
+        LIMIT ?
+        """,
+        (
+            run_id,
+            EventClass.CANONICAL_FACT.value,
+            *event_types,
+            after_event_sequence,
+            limit,
+        ),
     )
     return tuple(_event_log_row_from_host_row(row) for row in rows)
 

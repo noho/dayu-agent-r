@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 
 import pytest
 
@@ -36,6 +37,7 @@ from dayu.host import (
 )
 from dayu.host.api import AuthorizationClaim
 from dayu.host.memory import default_memory_projection_policy
+from tests.host.public_smoke_support import close_attachment_shielded
 
 
 class _BlockingHandle:
@@ -149,8 +151,15 @@ async def test_close_session_host_close_and_cancel_are_distinct(
     handle = _BlockingHandle()
     options = _options(tmp_path, _BlockingWorkerFactory(handle))
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("lifecycle"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         first = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "first"),
@@ -210,8 +219,15 @@ async def test_host_close_does_not_close_open_session_or_write_terminal_facts(
     handle = _BlockingHandle()
     options = _options(tmp_path, _BlockingWorkerFactory(handle))
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("host-close"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         followup = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "host-close-running"),

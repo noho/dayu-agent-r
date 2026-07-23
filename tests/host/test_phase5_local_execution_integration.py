@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
+from tests.host.fake_session_access import ExplicitFakeSessionAccess
 
 import asyncio
 import json
@@ -1155,6 +1156,9 @@ async def _open_scheduler(
         transaction_runner=store.transaction_runner,
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         terminal_post_commit_port_factory=_TerminalPortFactory(),
+        session_new_work_access=ExplicitFakeSessionAccess(
+            allowed_session_ids=None
+        ),
         local_execution=HostLocalExecutionOptions(
             lane_db_path=tmp_path / "lane.sqlite3",
             lane_name=_LANE_NAME,

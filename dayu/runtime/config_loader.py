@@ -219,7 +219,6 @@ class ContextBudgetConfig:
 
     :param soft_threshold_context_ratio: soft threshold 占上下文比例。
     :param hard_threshold_context_ratio: hard threshold 占上下文比例。
-    :param max_proactive_compactions_per_run: 单个 Run proactive compact 上限。
     :param max_reactive_compactions_per_run: 单个 Run reactive compact 上限。
     :param max_compaction_attempts_per_operation: 单次 compact operation 尝试上限。
     :param policy_ref: policy snapshot / composition ref。
@@ -227,7 +226,6 @@ class ContextBudgetConfig:
 
     soft_threshold_context_ratio: float
     hard_threshold_context_ratio: float
-    max_proactive_compactions_per_run: int
     max_reactive_compactions_per_run: int
     max_compaction_attempts_per_operation: int
     policy_ref: str
@@ -1582,7 +1580,6 @@ def _parse_context_budget(record: JsonObject, *, context: str) -> ContextBudgetC
             {
                 "soft_threshold_context_ratio",
                 "hard_threshold_context_ratio",
-                "max_proactive_compactions_per_run",
                 "max_reactive_compactions_per_run",
                 "max_compaction_attempts_per_operation",
                 "policy_ref",
@@ -1593,7 +1590,6 @@ def _parse_context_budget(record: JsonObject, *, context: str) -> ContextBudgetC
     return ContextBudgetConfig(
         soft_threshold_context_ratio=_require_float_field(record, field_name="soft_threshold_context_ratio", context=context),
         hard_threshold_context_ratio=_require_float_field(record, field_name="hard_threshold_context_ratio", context=context),
-        max_proactive_compactions_per_run=_require_positive_int_field(record, field_name="max_proactive_compactions_per_run", context=context),
         max_reactive_compactions_per_run=_require_positive_int_field(record, field_name="max_reactive_compactions_per_run", context=context),
         max_compaction_attempts_per_operation=_require_positive_int_field(record, field_name="max_compaction_attempts_per_operation", context=context),
         policy_ref=_require_str_field(record, field_name="policy_ref", context=context),

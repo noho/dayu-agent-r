@@ -38,7 +38,11 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.errors import HostDurableError, HostRowDecodeError
 from dayu.host.durable.liveness import HostInstanceStatus
-from dayu.host.durable.schema import TABLE_HOST_ATTEMPTS, TABLE_HOST_RUNS
+from dayu.host.durable.schema import (
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_HOST_ATTEMPTS,
+    TABLE_HOST_RUNS,
+)
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     ActiveCancelCloseoutInput,
@@ -50,6 +54,7 @@ from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     ContextRecoveryCloseInput,
     PromoteQueuedRunInput,
+    OwnedAttemptCancelTarget,
     RunTransitionResult,
     StartupOrphanCloseInput,
     TerminalCloseoutInput,
@@ -64,11 +69,13 @@ from dayu.host.durable.run_transition import (
     create_running_run_with_starting_attempt_in_transaction,
     project_terminal_notice_from_exact_run_event,
     promote_queued_run_in_transaction,
+    read_exact_owned_attempt_cancel_targets,
     request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
+    AttemptExecutionIdentity,
     DispatchRecordStatus,
     RunMutationResult,
     RunStartReason,
@@ -83,7 +90,6 @@ from dayu.host.durable.state import (
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
     read_attempt_by_id,
-    read_dispatch_record_by_attempt_id,
     read_run_by_id,
     terminal_attempt_row,
     terminal_run_row,
@@ -97,6 +103,38 @@ from dayu.host.lifecycle_events import (
 _NOW = datetime(2026, 5, 14, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "run-transition-test"})
 _INPUT_DIGEST = sha256_digest_json({"input": "hello"})
+_EXACT_CANCEL_MULTI_BATCH_IDENTITY_COUNT = 205
+_EXACT_CANCEL_WRONG_OWNER_INDEX = 1
+_EXACT_CANCEL_STALE_CURRENT_ATTEMPT_INDEX = 202
+
+
+class _StaticEventLogStore(EventLogStore):
+    """为 strict linked-event 反例返回指定 EventLog row 的测试 store。"""
+
+    def __init__(self, row: EventLogRow | None) -> None:
+        """保存后续 read 返回值。
+
+        :param row: 要返回的 EventLog row；``None`` 表示 linked row 缺失。
+        :returns: ``None``。
+        """
+
+        self._row = row
+
+    def read_event_by_id(
+        self,
+        transaction: HostTransaction,
+        event_id: str,
+    ) -> EventLogRow | None:
+        """返回预先设置的 row。
+
+        :param transaction: 当前 Host transaction。
+        :param event_id: 调用方请求的 event id。
+        :returns: 预先设置的 EventLog row。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del transaction, event_id
+        return self._row
 
 
 @dataclass(frozen=True, slots=True)
@@ -2005,6 +2043,343 @@ def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
         )
 
 
+def test_exact_owned_cancel_query_keeps_terminal_control_truth_and_filters_stale(
+    tmp_path: Path,
+) -> None:
+    """exact query 不按 terminal status 过滤，且 stale identity/owner 不误匹配。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+        identity = AttemptExecutionIdentity(
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id=f"execution-{seeded.run_id}",
+        )
+        stale_identity = replace(identity, execution_id="execution-stale")
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[
+            tuple[OwnedAttemptCancelTarget, ...],
+            tuple[OwnedAttemptCancelTarget, ...],
+            tuple[OwnedAttemptCancelTarget, ...],
+        ]:
+            """接受 cancel、terminal closeout 并重复读取 exact target。
+
+            :param transaction: Host transaction。
+            :returns: cancelling、terminal 与错误 owner 三次查询结果。
+            """
+
+            _accept_and_request_active_cancel(transaction, seeded)
+            cancelling_targets = read_exact_owned_attempt_cancel_targets(
+                transaction,
+                EventLogStore(),
+                owner_host_instance_id="host-instance-1",
+                identities=(stale_identity, identity),
+            )
+            closeout = active_cancel_watchdog_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_watchdog_input(seeded),
+            )
+            assert closeout.status is StateMutationStatus.UPDATED
+            terminal_targets = read_exact_owned_attempt_cancel_targets(
+                transaction,
+                EventLogStore(),
+                owner_host_instance_id="host-instance-1",
+                identities=(identity,),
+            )
+            wrong_owner_targets = read_exact_owned_attempt_cancel_targets(
+                transaction,
+                EventLogStore(),
+                owner_host_instance_id="host-instance-other",
+                identities=(identity,),
+            )
+            return cancelling_targets, terminal_targets, wrong_owner_targets
+
+        expected = OwnedAttemptCancelTarget(
+            identity=identity,
+            cancel_request_event_id="event-active-cancel-requested-watchdog",
+        )
+        assert store.transaction_runner.run_write(operation) == (
+            (expected,),
+            (expected,),
+            (),
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match="attempt execution identities must be unique",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: read_exact_owned_attempt_cancel_targets(
+                    transaction,
+                    EventLogStore(),
+                    owner_host_instance_id="host-instance-1",
+                    identities=(identity, identity),
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "stale_field",
+    ("current_attempt", "dispatch_owner"),
+)
+def test_exact_owned_cancel_query_filters_durable_identity_change(
+    tmp_path: Path,
+    stale_field: str,
+) -> None:
+    """current Attempt 或 dispatch owner 变化均只过滤旧快照。
+
+    :param tmp_path: pytest 临时目录。
+    :param stale_field: 本 case 改写的 durable identity owner 字段。
+    :returns: ``None``。
+    :raises AssertionError: stale identity 仍被返回时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+        identity = AttemptExecutionIdentity(
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id=f"execution-{seeded.run_id}",
+        )
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[OwnedAttemptCancelTarget, ...]:
+            """写入 cancel 后改写单个 durable identity owner 字段并查询。
+
+            :param transaction: Host transaction。
+            :returns: exact query 结果。
+            """
+
+            _accept_and_request_active_cancel(transaction, seeded)
+            if stale_field == "current_attempt":
+                transaction.execute(
+                    f"UPDATE {TABLE_HOST_RUNS} SET current_attempt_id = NULL "
+                    "WHERE run_id = ?",
+                    (seeded.run_id,),
+                )
+            else:
+                transaction.execute(
+                    """
+                    INSERT INTO host_instances (
+                      host_instance_id,
+                      pid,
+                      process_start_token,
+                      boot_id,
+                      created_at,
+                      heartbeat_at,
+                      status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "host-instance-new",
+                        2,
+                        "process-start-token-new",
+                        None,
+                        "2026-05-14T01:02:03.000000Z",
+                        "2026-05-14T01:02:03.000000Z",
+                        "running",
+                    ),
+                )
+                transaction.execute(
+                    f"UPDATE {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} "
+                    "SET owner_host_instance_id = ? WHERE attempt_id = ?",
+                    ("host-instance-new", seeded.attempt_id),
+                )
+            return read_exact_owned_attempt_cancel_targets(
+                transaction,
+                EventLogStore(),
+                owner_host_instance_id="host-instance-1",
+                identities=(identity,),
+            )
+
+        assert store.transaction_runner.run_write(operation) == ()
+
+
+def test_exact_owned_cancel_query_batches_preserve_global_order_and_filter_stale(
+    tmp_path: Path,
+) -> None:
+    """超过单 batch 时仍保持输入顺序并精确过滤 owner/stale identity。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 分批顺序或 owner/stale 语义漂移时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_ids = _ensure_exact_cancel_batch_sessions(
+            store.transaction_runner,
+            count=_EXACT_CANCEL_MULTI_BATCH_IDENTITY_COUNT,
+        )
+        identities = store.transaction_runner.run_write(
+            lambda transaction: _seed_exact_cancel_batch(
+                transaction,
+                session_ids=session_ids,
+            )
+        )
+        reversed_identities = tuple(reversed(identities))
+        targets = store.transaction_runner.run_read(
+            lambda transaction: read_exact_owned_attempt_cancel_targets(
+                transaction,
+                EventLogStore(),
+                owner_host_instance_id="host-instance-1",
+                identities=reversed_identities,
+            )
+        )
+        excluded = {
+            identities[_EXACT_CANCEL_WRONG_OWNER_INDEX],
+            identities[_EXACT_CANCEL_STALE_CURRENT_ATTEMPT_INDEX],
+        }
+        assert targets == tuple(
+            OwnedAttemptCancelTarget(
+                identity=identity,
+                cancel_request_event_id=(
+                    f"event-active-cancel-requested-batch-"
+                    f"{identity.run_id.removeprefix('run-batch-')}"
+                ),
+            )
+            for identity in reversed_identities
+            if identity not in excluded
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "missing",
+        "event_class",
+        "event_type",
+        "session_id",
+        "run_id",
+        "attempt_id",
+        "execution_id",
+        "payload_ref",
+        "event_body_digest",
+        "payload_shape",
+    ),
+)
+def test_exact_owned_cancel_query_fails_closed_for_bad_linked_fact(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """linked cancel row 缺失、错链、坏 shape 或坏 digest 均 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param corruption: 本 case 注入的 linked fact 损坏类型。
+    :returns: ``None``。
+    :raises AssertionError: strict query 未抛 durable invariant error 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+        identity = AttemptExecutionIdentity(
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id=f"execution-{seeded.run_id}",
+        )
+
+        def seed_and_build_store(transaction: HostTransaction) -> EventLogStore:
+            """写入合法 cancel，并构造指定 linked-event 读取替身。
+
+            :param transaction: Host transaction。
+            :returns: 返回指定损坏 row 的 EventLog store。
+            """
+
+            _accept_and_request_active_cancel(transaction, seeded)
+            real_event = EventLogStore().read_event_by_id(
+                transaction,
+                "event-active-cancel-requested-watchdog",
+            )
+            assert real_event is not None
+            if corruption == "missing":
+                return _StaticEventLogStore(None)
+            if corruption == "event_class":
+                return _StaticEventLogStore(
+                    replace(real_event, event_class=EventClass.DIAGNOSTIC)
+                )
+            if corruption == "event_type":
+                return _StaticEventLogStore(
+                    replace(real_event, event_type="RUN_CANCELLING")
+                )
+            if corruption == "session_id":
+                return _StaticEventLogStore(
+                    replace(real_event, session_id="session-wrong")
+                )
+            if corruption == "run_id":
+                return _StaticEventLogStore(
+                    replace(real_event, run_id="run-wrong")
+                )
+            if corruption == "attempt_id":
+                return _StaticEventLogStore(
+                    replace(real_event, attempt_id=seeded.attempt_id)
+                )
+            if corruption == "execution_id":
+                return _StaticEventLogStore(
+                    replace(real_event, execution_id=identity.execution_id)
+                )
+            if corruption == "payload_ref":
+                return _StaticEventLogStore(
+                    replace(real_event, payload_ref="payload-invalid")
+                )
+            if corruption == "event_body_digest":
+                return _StaticEventLogStore(
+                    replace(real_event, event_body_digest=_INPUT_DIGEST)
+                )
+            invalid_payload_event = EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-invalid-cancel-payload",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="CANCEL_REQUESTED",
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    client_request_id="active-cancel-watchdog",
+                    idempotency_key="active-cancel-watchdog",
+                    policy_decision=None,
+                    reason={"reason": "user_cancel", "mode": "graceful"},
+                    payload_json={
+                        "run_id": seeded.run_id,
+                        "client_request_id": "active-cancel-watchdog",
+                        "reason": "user_cancel",
+                        "mode": "graceful",
+                        "target_status_at_accept": "running",
+                        "call_context_digest": _CALL_CONTEXT_DIGEST,
+                        "unexpected": "field",
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+            return _StaticEventLogStore(
+                replace(
+                    invalid_payload_event,
+                    event_id=real_event.event_id,
+                )
+            )
+
+        event_log_store = store.transaction_runner.run_write(seed_and_build_store)
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: read_exact_owned_attempt_cancel_targets(
+                    transaction,
+                    event_log_store,
+                    owner_host_instance_id="host-instance-1",
+                    identities=(identity,),
+                )
+            )
+
+
 def test_active_cancel_watchdog_closeout_writes_cancelled_terminal_facts(
     tmp_path: Path,
 ) -> None:
@@ -2921,6 +3296,168 @@ def _seed_running_run(
         )
 
     return store.transaction_runner.run_write(operation)
+
+
+def _ensure_exact_cancel_batch_sessions(
+    transaction_runner: HostTransactionRunner,
+    *,
+    count: int,
+) -> tuple[str, ...]:
+    """为 multi-batch exact cancel case 创建互不冲突的 Sessions。
+
+    :param transaction_runner: Host transaction runner。
+    :param count: 需要创建的 Session 数量。
+    :returns: 按创建顺序排列的 Session ids。
+    :raises ValueError: ``count`` 非正数时抛出。
+    :raises Exception: durable Session 创建失败时透传。
+    """
+
+    if count <= 0:
+        raise ValueError("count must be positive")
+    return tuple(
+        ensure_session(
+            transaction_runner,
+            EnsureSessionRequest(
+                scope="workspace",
+                slot_key=f"run-transition-batch-{index:03d}",
+                metadata=(),
+            ),
+        ).snapshot.session_id
+        for index in range(count)
+    )
+
+
+def _seed_exact_cancel_batch(
+    transaction: HostTransaction,
+    *,
+    session_ids: tuple[str, ...],
+) -> tuple[AttemptExecutionIdentity, ...]:
+    """在一个事务中构造跨 batch 的 exact owned cancel durable truth。
+
+    :param transaction: 当前 Host write transaction。
+    :param session_ids: 每个 target 对应的唯一 Session id。
+    :returns: 按输入 Session 顺序排列的 exact identities。
+    :raises AssertionError: 任一 transition 未按预期更新时抛出。
+    :raises Exception: durable 写入失败时透传。
+    """
+
+    _ensure_host_instance_tx(transaction)
+    _ensure_exact_cancel_other_owner_tx(transaction)
+    identities: list[AttemptExecutionIdentity] = []
+    for index, session_id in enumerate(session_ids):
+        suffix = f"batch-{index:03d}"
+        run_id = f"run-{suffix}"
+        attempt_id = f"attempt-{run_id}"
+        execution_id = f"execution-{run_id}"
+        input_event = _append_user_input(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            event_id=f"event-input-{suffix}",
+        )
+        created = create_running_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            _create_running_input(
+                session_id=session_id,
+                run_id=run_id,
+                input_event_sequence=input_event.event_sequence,
+            ),
+        )
+        assert created.status is StateMutationStatus.UPDATED
+        waiting = mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-instance-1",
+            lane_name="llm",
+            waiting_for_lane_at="2026-05-14T01:02:04.000000Z",
+        )
+        assert waiting.status is StateMutationStatus.UPDATED
+        dispatching = mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-instance-1",
+            lane_name="llm",
+            lane_claim_id=f"lane-claim-{suffix}",
+            lane_owner_id="lane-owner-1",
+            lane_acquired_at="2026-05-14T01:02:05.000000Z",
+            dispatching_at="2026-05-14T01:02:06.000000Z",
+        )
+        assert dispatching.status is StateMutationStatus.UPDATED
+        accepted = accept_worker_running_in_transaction(
+            transaction,
+            EventLogStore(),
+            AcceptWorkerRunningInput(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                attempt_running_event_id=f"event-attempt-running-{suffix}",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                worker_accept_reason="worker_accepted",
+                local_worker_id=f"local-worker-{suffix}",
+            ),
+        )
+        assert accepted.status is StateMutationStatus.UPDATED
+        cancelled = request_active_attempt_cancel_in_transaction(
+            transaction,
+            EventLogStore(),
+            _cancel_active_input(run_id=run_id, event_suffix=suffix),
+        )
+        assert cancelled.status is StateMutationStatus.UPDATED
+        identities.append(
+            AttemptExecutionIdentity(
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                execution_id=execution_id,
+            )
+        )
+
+    wrong_owner_identity = identities[_EXACT_CANCEL_WRONG_OWNER_INDEX]
+    transaction.execute(
+        f"UPDATE {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} "
+        "SET owner_host_instance_id = ? WHERE attempt_id = ?",
+        ("host-instance-other", wrong_owner_identity.attempt_id),
+    )
+    stale_identity = identities[_EXACT_CANCEL_STALE_CURRENT_ATTEMPT_INDEX]
+    transaction.execute(
+        f"UPDATE {TABLE_HOST_RUNS} SET current_attempt_id = NULL WHERE run_id = ?",
+        (stale_identity.run_id,),
+    )
+    return tuple(identities)
+
+
+def _ensure_exact_cancel_other_owner_tx(transaction: HostTransaction) -> None:
+    """写入 multi-batch owner 过滤 case 使用的另一个 Host instance。
+
+    :param transaction: 当前 Host transaction。
+    :returns: ``None``。
+    :raises Exception: SQLite 写入失败时透传。
+    """
+
+    transaction.execute(
+        """
+        INSERT OR IGNORE INTO host_instances (
+          host_instance_id,
+          pid,
+          process_start_token,
+          boot_id,
+          created_at,
+          heartbeat_at,
+          status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "host-instance-other",
+            2,
+            "process-start-token-other",
+            None,
+            "2026-05-14T01:02:03.000000Z",
+            "2026-05-14T01:02:03.000000Z",
+            "running",
+        ),
+    )
 
 
 def _append_user_input(

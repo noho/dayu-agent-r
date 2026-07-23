@@ -6,6 +6,7 @@ import asyncio
 import io
 import pathlib
 import threading
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from typing import cast
 
@@ -46,7 +47,12 @@ from dayu.service.entrypoint_runtime import (
     submit_entrypoint_turn_and_wait,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
-from tests.host.public_smoke_support import ensure_request, followup_request, host_context
+from tests.host.public_smoke_support import (
+    close_attachment_shielded,
+    ensure_request,
+    followup_request,
+    host_context,
+)
 from tests.host.transient_stream_support import (
     TransientStreamCounts,
     TransientStreamWorkerFactory,
@@ -335,8 +341,15 @@ async def test_real_delivery_interruption_recovers_once_and_renders_terminal_onc
     )
     activities: list[EntrypointActivity] = []
 
-    async with open_host(options) as real_host:
+    async with (
+        open_host(options) as real_host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await real_host.ensure_session(ensure_request("delivery-interruption-e2e"))
+        attachment = await real_host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
         independent_watcher = await real_host.watch_session_events(session.session_id)
         independent_consumer = asyncio.create_task(_collect_terminal_event_ids(independent_watcher, expected_count=2))
         probe = _SlowConsumerHostProbe(real_host)

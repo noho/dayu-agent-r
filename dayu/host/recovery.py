@@ -1,6 +1,6 @@
-"""Host startup recovery scan 编排。
+"""Host Session attachment target recovery scan 编排。
 
-本模块负责启动时读取 durable Run/Attempt/dispatch/liveness truth，调用
+本模块只读取目标 Session 的 durable Run/Attempt/dispatch/liveness truth，调用
 只读 orphan proof classifier，并在 positive proof 成立时通过 durable
 transition helper 完成旧 Attempt closeout。Slice 3 起，本模块还负责为
 可恢复 Run 创建 recovery Attempt、execution 与 pending dispatch record，
@@ -42,8 +42,8 @@ from dayu.host.durable.state import (
     WorkerKind,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
-    read_non_terminal_run_upper_watermark,
-    read_non_terminal_runs_keyset_page,
+    read_non_terminal_run_upper_watermark_for_session,
+    read_non_terminal_runs_for_session_keyset_page,
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -65,11 +65,11 @@ from dayu.host.recovery_process import (
 )
 
 _RECOVERY_ACTOR = "host_recovery"
-_RECOVERY_SOURCE = "startup_scan"
+_RECOVERY_SOURCE = "session_attachment_recovery"
 # heartbeat 周期必须显著小于 stale 阈值，避免破坏 positive orphan proof。
 _DEFAULT_STALE_AFTER_SECONDS = 30
 _DEFAULT_RECOVERY_DISPATCH_LIMIT = 1
-DEFAULT_STARTUP_RECOVERY_BATCH_SIZE: Final[int] = 64
+DEFAULT_SESSION_ATTACHMENT_RECOVERY_BATCH_SIZE: Final[int] = 64
 """单个 startup recovery write transaction 最多处理的 Run 数。"""
 _ATTEMPT_ID_PREFIX = "attempt-recovery"
 _EXECUTION_ID_PREFIX = "execution-recovery"
@@ -86,7 +86,7 @@ _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP = (
 _LOGGER = logging.getLogger(__name__)
 
 
-class StartupRecoveryDecision(StrEnum):
+class SessionAttachmentRecoveryDecision(StrEnum):
     """startup scan 对单个 Run 的分类决策。"""
 
     ACCEPTED_WAKE = "accepted_wake"
@@ -105,7 +105,7 @@ class StartupRecoveryDecision(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class StartupRecoveryPolicy:
+class SessionAttachmentRecoveryPolicy:
     """startup recovery scan 策略。
 
     :param now: 分类使用的策略时间。
@@ -119,7 +119,7 @@ class StartupRecoveryPolicy:
     recovery_dispatch_limit: int = _DEFAULT_RECOVERY_DISPATCH_LIMIT
 
     @classmethod
-    def default(cls) -> "StartupRecoveryPolicy":
+    def default(cls) -> "SessionAttachmentRecoveryPolicy":
         """构造默认 startup recovery 策略。
 
         :returns: 默认策略；stale 阈值大于 Slice 1 scheduler heartbeat 周期。
@@ -133,7 +133,7 @@ class StartupRecoveryPolicy:
 
 
 @dataclass(frozen=True, slots=True)
-class StartupRecoveryAction:
+class SessionAttachmentRecoveryAction:
     """单个 Run 的 startup recovery scan 结果。
 
     :param run_id: 目标 Run id。
@@ -144,12 +144,12 @@ class StartupRecoveryAction:
 
     run_id: str
     status: RunStatus
-    decision: StartupRecoveryDecision
+    decision: SessionAttachmentRecoveryDecision
     reason: str
 
 
 @dataclass(frozen=True, slots=True)
-class StartupRecoveryScanResult:
+class SessionAttachmentRecoveryScanResult:
     """startup recovery scan 汇总。
 
     :param actions: 按扫描顺序记录的每个 Run 分类结果。
@@ -159,14 +159,14 @@ class StartupRecoveryScanResult:
     :param terminal_notices: 本次 transaction 提交的 exact terminal notices。
     """
 
-    actions: tuple[StartupRecoveryAction, ...]
+    actions: tuple[SessionAttachmentRecoveryAction, ...]
     pending_dispatches: tuple[PendingDispatchRecord, ...] = ()
     queue_promotion_sessions: tuple[str, ...] = ()
     terminal_notices: tuple[TerminalPostCommitNotice, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class _StartupRecoveryBatchResult:
+class _SessionAttachmentRecoveryBatchResult:
     """单个已提交 recovery batch 的 immutable 结果。
 
     :param result: 本批 actions 与 commit 后 wakes。
@@ -174,13 +174,13 @@ class _StartupRecoveryBatchResult:
     :param page_size: 本批实际读取并分类的 Run row 数。
     """
 
-    result: StartupRecoveryScanResult
+    result: SessionAttachmentRecoveryScanResult
     next_cursor: NonTerminalRunKeysetCursor | None
     page_size: int
 
 
 @dataclass(frozen=True, slots=True)
-class _StartupRecoveryBatchOperation:
+class _SessionAttachmentRecoveryBatchOperation:
     """单个 bounded startup recovery write transaction body。
 
     :param scanner: 提供既有业务分类的 recovery owner。
@@ -192,15 +192,15 @@ class _StartupRecoveryBatchOperation:
     :param seen_queue_promotion_sessions: 先前已提交批次唤醒过的 Session ids。
     """
 
-    scanner: "StartupRecoveryScanner"
+    scanner: "SessionAttachmentRecoveryScanner"
     upper_watermark: NonTerminalRunKeysetCursor
     cursor: NonTerminalRunKeysetCursor | None
     batch_size: int
-    policy: StartupRecoveryPolicy
+    policy: SessionAttachmentRecoveryPolicy
     policy_now: datetime
     seen_queue_promotion_sessions: frozenset[str]
 
-    def __call__(self, transaction: HostTransaction) -> _StartupRecoveryBatchResult:
+    def __call__(self, transaction: HostTransaction) -> _SessionAttachmentRecoveryBatchResult:
         """读取一个 keyset page 并在同一 write transaction 分类/迁移。
 
         :param transaction: 当前 bounded Host write transaction。
@@ -211,13 +211,14 @@ class _StartupRecoveryBatchOperation:
 
         if self.policy.now != self.policy_now:
             raise RuntimeError("startup recovery policy time changed within scan")
-        runs = read_non_terminal_runs_keyset_page(
+        runs = read_non_terminal_runs_for_session_keyset_page(
             transaction,
+            session_id=self.scanner.session_id,
             upper_watermark=self.upper_watermark,
             cursor=self.cursor,
             batch_size=self.batch_size,
         )
-        actions: list[StartupRecoveryAction] = []
+        actions: list[SessionAttachmentRecoveryAction] = []
         pending_dispatches: list[PendingDispatchRecord] = []
         queue_promotion_sessions: list[str] = []
         terminal_notices: list[TerminalPostCommitNotice] = []
@@ -237,8 +238,8 @@ class _StartupRecoveryBatchOperation:
         next_cursor = self.cursor
         if runs:
             next_cursor = _keyset_cursor_from_run(runs[-1])
-        return _StartupRecoveryBatchResult(
-            result=StartupRecoveryScanResult(
+        return _SessionAttachmentRecoveryBatchResult(
+            result=SessionAttachmentRecoveryScanResult(
                 actions=tuple(actions),
                 pending_dispatches=tuple(pending_dispatches),
                 queue_promotion_sessions=tuple(queue_promotion_sessions),
@@ -255,9 +256,10 @@ class _StartupRecoveryBatchOperation:
 
 
 @dataclass(frozen=True, slots=True)
-class StartupRecoveryScanner:
-    """startup recovery scanner。
+class SessionAttachmentRecoveryScanner:
+    """目标 Session attachment recovery scanner。
 
+    :param session_id: 本次 scan 唯一允许读取与推进的目标 Session id。
     :param transaction_runner: Host durable transaction runner。
     :param event_log_store: EventLog primitive。
     :param process_probe: 本机进程证据 probe。
@@ -272,6 +274,7 @@ class StartupRecoveryScanner:
     :param batch_size: 单个 recovery write transaction 最大处理 Run row 数。
     """
 
+    session_id: str
     transaction_runner: HostTransactionRunner
     event_log_store: EventLogStore
     terminal_post_commit_port: TerminalPostCommitPort
@@ -279,37 +282,42 @@ class StartupRecoveryScanner:
     dispatch_wakeup_port: AdmissionWakeupPort | None = None
     recovery_owner_host_instance_id: str | None = None
     defer_accepted_cancel_to_watchdog: bool = False
-    batch_size: int = DEFAULT_STARTUP_RECOVERY_BATCH_SIZE
+    batch_size: int = DEFAULT_SESSION_ATTACHMENT_RECOVERY_BATCH_SIZE
 
     def scan(
-        self, policy: StartupRecoveryPolicy | None = None
-    ) -> StartupRecoveryScanResult:
-        """执行 startup recovery scan。
+        self, policy: SessionAttachmentRecoveryPolicy | None = None
+    ) -> SessionAttachmentRecoveryScanResult:
+        """执行 target-session attachment recovery scan。
 
         :param policy: 可选 scan 策略；未传时使用默认策略。
         :returns: scan 结果。
         :raises HostDurableError: durable 读取或写入失败时由底层抛出。
         """
 
-        effective_policy = policy if policy is not None else StartupRecoveryPolicy.default()
+        if self.session_id.strip() == "":
+            raise ValueError("session_id must be non-empty")
+        effective_policy = policy if policy is not None else SessionAttachmentRecoveryPolicy.default()
         _validate_policy(effective_policy)
         _validate_batch_size(self.batch_size)
         policy_now = effective_policy.now
         upper_watermark = self.transaction_runner.run_read(
-            read_non_terminal_run_upper_watermark
+            lambda transaction: read_non_terminal_run_upper_watermark_for_session(
+                transaction,
+                self.session_id,
+            )
         )
         if upper_watermark is None:
-            return StartupRecoveryScanResult(actions=())
+            return SessionAttachmentRecoveryScanResult(actions=())
 
         cursor: NonTerminalRunKeysetCursor | None = None
-        actions: list[StartupRecoveryAction] = []
+        actions: list[SessionAttachmentRecoveryAction] = []
         pending_dispatches: list[PendingDispatchRecord] = []
         queue_promotion_sessions: list[str] = []
         terminal_notices: list[TerminalPostCommitNotice] = []
         seen_queue_promotion_sessions: set[str] = set()
         while cursor != upper_watermark:
             batch = self.transaction_runner.run_write(
-                _StartupRecoveryBatchOperation(
+                _SessionAttachmentRecoveryBatchOperation(
                     scanner=self,
                     upper_watermark=upper_watermark,
                     cursor=cursor,
@@ -337,14 +345,14 @@ class StartupRecoveryScanner:
                 raise RuntimeError("startup recovery keyset cursor did not advance")
             cursor = batch.next_cursor
 
-        return StartupRecoveryScanResult(
+        return SessionAttachmentRecoveryScanResult(
             actions=tuple(actions),
             pending_dispatches=tuple(pending_dispatches),
             queue_promotion_sessions=tuple(queue_promotion_sessions),
             terminal_notices=tuple(terminal_notices),
         )
 
-    def _wake_after_committed_batch(self, result: StartupRecoveryScanResult) -> None:
+    def _wake_after_committed_batch(self, result: SessionAttachmentRecoveryScanResult) -> None:
         """只在当前 batch commit 成功后同步投递其 matching wake。
 
         :param result: 已提交 batch 返回的 immutable actions/wakes。
@@ -371,12 +379,12 @@ class StartupRecoveryScanner:
         self,
         transaction: HostTransaction,
         run: RunRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
         queue_promotion_sessions: list[str],
         seen_queue_promotion_sessions: set[str],
         terminal_notices: list[TerminalPostCommitNotice],
-    ) -> StartupRecoveryAction:
+    ) -> SessionAttachmentRecoveryAction:
         """分类单个非终态 Run。
 
         :param transaction: Host transaction。
@@ -392,14 +400,14 @@ class StartupRecoveryScanner:
         """
 
         if read_session_by_id(transaction, run.session_id) is None:
-            return _action(run, StartupRecoveryDecision.NOT_FOUND, "session_missing")
+            return _action(run, SessionAttachmentRecoveryDecision.NOT_FOUND, "session_missing")
         if run.status is RunStatus.ACCEPTED:
             _append_unseen_session_id(
                 queue_promotion_sessions,
                 seen_queue_promotion_sessions,
                 run.session_id,
             )
-            return _action(run, StartupRecoveryDecision.ACCEPTED_WAKE, "accepted")
+            return _action(run, SessionAttachmentRecoveryDecision.ACCEPTED_WAKE, "accepted")
         if run.status is RunStatus.QUEUED:
             _append_unseen_session_id(
                 queue_promotion_sessions,
@@ -408,13 +416,13 @@ class StartupRecoveryScanner:
             )
             return _action(
                 run,
-                StartupRecoveryDecision.QUEUE_PROMOTION_CHECK,
+                SessionAttachmentRecoveryDecision.QUEUE_PROMOTION_CHECK,
                 "queued",
             )
         if run.status is RunStatus.WAITING:
             return _action(
                 run,
-                StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
+                SessionAttachmentRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
                 "waiting_adapter_observation_unavailable",
             )
         if run.status is RunStatus.RECOVERING:
@@ -438,7 +446,7 @@ class StartupRecoveryScanner:
             ):
                 return _action(
                     run,
-                    StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+                    SessionAttachmentRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
                     "accepted_cancel_watchdog_owner",
                 )
             return self._classify_active_or_cancelling(
@@ -448,16 +456,16 @@ class StartupRecoveryScanner:
                 pending_dispatches,
                 terminal_notices,
             )
-        return _action(run, StartupRecoveryDecision.INVALID_STATE, "unsupported_status")
+        return _action(run, SessionAttachmentRecoveryDecision.INVALID_STATE, "unsupported_status")
 
     def _classify_recovering(
         self,
         transaction: HostTransaction,
         run: RunRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
         terminal_notices: list[TerminalPostCommitNotice],
-    ) -> StartupRecoveryAction:
+    ) -> SessionAttachmentRecoveryAction:
         """分类 recovering Run。
 
         :param transaction: Host transaction。
@@ -481,7 +489,7 @@ class StartupRecoveryScanner:
         if run.current_attempt_id is None:
             return _action(
                 run,
-                StartupRecoveryDecision.INVALID_STATE,
+                SessionAttachmentRecoveryDecision.INVALID_STATE,
                 "recovering_run_missing_source_attempt",
             )
         result = lose_recovering_run_in_transaction(
@@ -510,7 +518,7 @@ class StartupRecoveryScanner:
         return _action_from_mutation(
             run,
             result.status,
-            StartupRecoveryDecision.RUN_LOST,
+            SessionAttachmentRecoveryDecision.RUN_LOST,
             _REASON_RECOVERY_DISPATCH_LIMIT_EXCEEDED,
         )
 
@@ -518,10 +526,10 @@ class StartupRecoveryScanner:
         self,
         transaction: HostTransaction,
         run: RunRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
         terminal_notices: list[TerminalPostCommitNotice],
-    ) -> StartupRecoveryAction:
+    ) -> SessionAttachmentRecoveryAction:
         """分类 running 或 cancelling Run。
 
         :param transaction: Host transaction。
@@ -538,20 +546,20 @@ class StartupRecoveryScanner:
         if attempt is None or dispatch_record is None:
             return _action(
                 run,
-                StartupRecoveryDecision.ORPHAN_INCONCLUSIVE,
+                SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE,
                 "missing_current_attempt_or_dispatch",
             )
         classification = self._classify_owner(transaction, dispatch_record, policy)
         if isinstance(classification, OwnerStillLive):
             return _action(
                 run,
-                StartupRecoveryDecision.OWNER_STILL_LIVE,
+                SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,
                 classification.reason,
             )
         if isinstance(classification, OrphanProofInconclusive):
             return _action(
                 run,
-                StartupRecoveryDecision.ORPHAN_INCONCLUSIVE,
+                SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE,
                 classification.reason,
             )
         return self._close_positive_orphan(
@@ -569,7 +577,7 @@ class StartupRecoveryScanner:
         self,
         transaction: HostTransaction,
         dispatch_record: DispatchRecordRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
     ) -> OrphanClassification:
         """调用 Slice 1 classifier 分类 dispatch owner。
 
@@ -601,10 +609,10 @@ class StartupRecoveryScanner:
         attempt: AttemptRow,
         dispatch_record: DispatchRecordRow,
         proof: PositiveOrphanProof,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
         terminal_notices: list[TerminalPostCommitNotice],
-    ) -> StartupRecoveryAction:
+    ) -> SessionAttachmentRecoveryAction:
         """对 positive orphan proof 执行 CAS closeout。
 
         :param transaction: Host transaction。
@@ -658,9 +666,9 @@ class StartupRecoveryScanner:
         close_action = _action_from_mutation(
             run,
             result.status,
-            StartupRecoveryDecision.RUN_RECOVERING
+            SessionAttachmentRecoveryDecision.RUN_RECOVERING
             if recoverable
-            else StartupRecoveryDecision.RUN_LOST,
+            else SessionAttachmentRecoveryDecision.RUN_LOST,
             reason,
         )
         if not recoverable and result.status is StateMutationStatus.UPDATED:
@@ -688,10 +696,10 @@ class StartupRecoveryScanner:
             policy,
             pending_dispatches,
         )
-        if dispatch_action.decision is StartupRecoveryDecision.INVALID_STATE:
+        if dispatch_action.decision is SessionAttachmentRecoveryDecision.INVALID_STATE:
             return _action(
                 result.run,
-                StartupRecoveryDecision.RECOVERING_READY,
+                SessionAttachmentRecoveryDecision.RECOVERING_READY,
                 _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP,
             )
         return dispatch_action
@@ -700,9 +708,9 @@ class StartupRecoveryScanner:
         self,
         transaction: HostTransaction,
         run: RunRow,
-        policy: StartupRecoveryPolicy,
+        policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
-    ) -> StartupRecoveryAction:
+    ) -> SessionAttachmentRecoveryAction:
         """为 RECOVERING Run 创建新 Attempt 与 pending dispatch。
 
         :param transaction: Host transaction。
@@ -718,13 +726,13 @@ class StartupRecoveryScanner:
         ):
             return _action(
                 run,
-                StartupRecoveryDecision.RECOVERING_READY,
+                SessionAttachmentRecoveryDecision.RECOVERING_READY,
                 "recovery_dispatch_wakeup_unavailable",
             )
         if run.current_attempt_id is None:
             return _action(
                 run,
-                StartupRecoveryDecision.INVALID_STATE,
+                SessionAttachmentRecoveryDecision.INVALID_STATE,
                 "recovering_run_missing_source_attempt",
             )
         result = start_recovery_run_with_starting_attempt_in_transaction(
@@ -757,12 +765,12 @@ class StartupRecoveryScanner:
         return _action_from_mutation(
             run,
             result.status,
-            StartupRecoveryDecision.RECOVERY_DISPATCHED,
+            SessionAttachmentRecoveryDecision.RECOVERY_DISPATCHED,
             RunStartReason.RECOVERY.value,
         )
 
 
-def _validate_policy(policy: StartupRecoveryPolicy) -> None:
+def _validate_policy(policy: SessionAttachmentRecoveryPolicy) -> None:
     """校验 startup recovery policy。
 
     :param policy: 待校验策略。
@@ -902,8 +910,8 @@ def _startup_closeout_reason(status: RunStatus, recoverable: bool) -> str:
 
 
 def _action(
-    run: RunRow, decision: StartupRecoveryDecision, reason: str
-) -> StartupRecoveryAction:
+    run: RunRow, decision: SessionAttachmentRecoveryDecision, reason: str
+) -> SessionAttachmentRecoveryAction:
     """构造 scan action。
 
     :param run: 目标 Run row。
@@ -912,7 +920,7 @@ def _action(
     :returns: scan action。
     """
 
-    return StartupRecoveryAction(
+    return SessionAttachmentRecoveryAction(
         run_id=run.run_id,
         status=run.status,
         decision=decision,
@@ -923,9 +931,9 @@ def _action(
 def _action_from_mutation(
     run: RunRow,
     status: StateMutationStatus,
-    success_decision: StartupRecoveryDecision,
+    success_decision: SessionAttachmentRecoveryDecision,
     reason: str,
-) -> StartupRecoveryAction:
+) -> SessionAttachmentRecoveryAction:
     """根据 durable mutation 结果构造 scan action。
 
     :param run: 目标 Run row。
@@ -938,10 +946,10 @@ def _action_from_mutation(
     if status is StateMutationStatus.UPDATED:
         return _action(run, success_decision, reason)
     if status is StateMutationStatus.CAS_LOST:
-        return _action(run, StartupRecoveryDecision.CAS_LOST, reason)
+        return _action(run, SessionAttachmentRecoveryDecision.CAS_LOST, reason)
     if status is StateMutationStatus.NOT_FOUND:
-        return _action(run, StartupRecoveryDecision.NOT_FOUND, reason)
-    return _action(run, StartupRecoveryDecision.INVALID_STATE, reason)
+        return _action(run, SessionAttachmentRecoveryDecision.NOT_FOUND, reason)
+    return _action(run, SessionAttachmentRecoveryDecision.INVALID_STATE, reason)
 
 
 def _append_unseen_session_id(

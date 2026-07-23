@@ -852,9 +852,6 @@ def _compose_options(
             context_window_size=ordinary_selection.model.context_window_tokens,
             soft_threshold_context_ratio=(execution_profile.context_budget_policy.soft_threshold_context_ratio),
             hard_threshold_context_ratio=(execution_profile.context_budget_policy.hard_threshold_context_ratio),
-            max_proactive_compactions_per_run=(
-                execution_profile.context_budget_policy.max_proactive_compactions_per_run
-            ),
             max_reactive_compactions_per_run=(execution_profile.context_budget_policy.max_reactive_compactions_per_run),
             max_compaction_attempts_per_operation=(
                 execution_profile.context_budget_policy.max_compaction_attempts_per_operation

@@ -162,9 +162,10 @@ class ActiveCancelWatchdogWakeupPort(Protocol):
     该端口只表达低延迟 wakeup，不拥有 durable cancel truth。
     """
 
-    def wake_active_cancel_watchdog(self) -> None:
-        """唤醒 active cancel watchdog。
+    def wake_active_cancel_watchdog(self, session_id: str) -> None:
+        """唤醒目标 Session 的 active cancel watchdog。
 
+        :param session_id: 已提交 cancel command 的目标 Session id。
         :returns: ``None``。
         """
 
@@ -633,6 +634,7 @@ def _submit_followup_steer(host: HostCommandHandle, request: SubmitFollowupReque
             host,
             (
                 ActiveCancelMessage(
+                    session_id=result.run.session_id,
                     run_id=result.steered_cancel_target.run_id,
                     attempt_id=result.steered_cancel_target.attempt_id,
                     execution_id=result.steered_cancel_target.execution_id,
@@ -681,6 +683,7 @@ def cancel_run(host: HostCommandHandle, run_id: str, request: CancelRunRequest) 
         (
             (
                 ActiveCancelMessage(
+                    session_id=result.run.session_id,
                     run_id=result.active_cancel_target.run_id,
                     attempt_id=result.active_cancel_target.attempt_id,
                     execution_id=result.active_cancel_target.execution_id,
@@ -727,6 +730,7 @@ def cancel_session_runs(
         host,
         tuple(
             ActiveCancelMessage(
+                session_id=session_id,
                 run_id=target.run_id,
                 attempt_id=target.attempt_id,
                 execution_id=target.execution_id,
@@ -1644,23 +1648,24 @@ def _propagate_active_cancel_targets(
     :returns: ``None``。
     """
 
-    if targets:
-        _wake_active_cancel_watchdog(host)
     for target in targets:
         host._active_registry.cancel(target)
+    for session_id in sorted({target.session_id for target in targets}):
+        _wake_active_cancel_watchdog(host, session_id)
 
 
-def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
-    """唤醒 active cancel watchdog 并保留 bridge failure。
+def _wake_active_cancel_watchdog(host: HostCommandHandle, session_id: str) -> None:
+    """唤醒目标 Session active cancel watchdog 并保留 bridge failure。
 
     :param host: Host command handle。
+    :param session_id: 已提交 cancel command 的目标 Session id。
     :returns: ``None``。
     """
 
     wakeup_port = host._active_cancel_watchdog_wakeup_port
     if wakeup_port is None:
         return
-    wakeup_port.wake_active_cancel_watchdog()
+    wakeup_port.wake_active_cancel_watchdog(session_id)
 
 
 def _pending_dispatch_from_row(

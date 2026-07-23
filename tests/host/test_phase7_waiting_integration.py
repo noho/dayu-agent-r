@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
+from tests.host.fake_session_access import ExplicitFakeSessionAccess
 
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
@@ -521,6 +522,9 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
         local_execution=_local_execution_options(tmp_path, factory, tool),
         host_handle_id="phase7-awaiting-production",
         terminal_post_commit_port_factory=_TerminalPortFactory(),
+        session_new_work_access=ExplicitFakeSessionAccess(
+            allowed_session_ids=None
+        ),
     )
     try:
         session = ensure_public_session(
@@ -546,7 +550,17 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
                 queue_policy="queue",
             ),
         )
-        stage = await scheduler._run_pre_start_governance(session.session_id)
+        work_lease = scheduler._session_new_work_access.try_acquire_new_work_lease(
+            session.session_id
+        )
+        assert work_lease is not None
+        try:
+            stage = await scheduler._run_pre_start_governance(
+                session.session_id,
+                work_lease=work_lease,
+            )
+        finally:
+            work_lease.release()
         assert stage.pending_dispatch is not None
         pending = stage.pending_dispatch
         assert pending.run_id == started.run_id

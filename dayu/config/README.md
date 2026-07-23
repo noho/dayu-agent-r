@@ -119,6 +119,12 @@ dayu/config/
 - `tool_duplicate_governance_policy`：配置 attempt-scoped 重复工具调用治理，包含默认 duplicate decision、按工具名覆盖的 decision、require-justification 参数名映射，以及治理消息文本。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
 
+`context_budget_policy` 中，`max_reactive_compactions_per_run` 是单个 Run 可启动的
+reactive operation 上限；`max_compaction_attempts_per_operation` 是每个 proactive 或
+reactive operation 冻结的 semantic proposal attempt 预算。proactive 是否启动只由当前输入与
+预算事实决定，不提供单独的 proactive operation 次数配置；Runner transport retry 不计入
+semantic proposal attempt。
+
 `memory_projection_policy` 当前字段为：
 
 | 字段 | 含义 |

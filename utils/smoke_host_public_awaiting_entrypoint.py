@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,6 +52,7 @@ from dayu.host import (
     FollowupBehavior,
     HostCallContext,
     Host,
+    HostSessionAttachment,
     HostTerminalStatus,
     LocalEngineWorker,
     LocalWorkerHandle,
@@ -392,6 +394,19 @@ class _ExternalOperationController:
         self.operation_finished.set()
 
 
+async def _close_attachment_shielded(
+    attachment: HostSessionAttachment,
+) -> None:
+    """在调用方取消下仍收口 public attachment。
+
+    :param attachment: 当前 smoke lifecycle 唯一持有的 attachment。
+    :returns: ``None``。
+    :raises Exception: attachment cleanup 失败时透传。
+    """
+
+    await asyncio.shield(attachment.aclose())
+
+
 async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     """运行 public entrypoint awaiting smoke。
 
@@ -485,7 +500,10 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     print("SMOKE CONTRACT open_host -> ensure_session -> submit_entrypoint_turn_and_wait")
     print("SMOKE WAIT_RECOVERY production poller via public wait poll adapter registry")
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         phases.host = host
         session = await host.ensure_session(
             EnsureSessionRequest(
@@ -495,6 +513,10 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             )
         )
         phases.session_id = session.session_id
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            _close_attachment_shielded, attachment
+        )
         print(f"SMOKE SESSION_ID {session.session_id}")
 
         def on_activity(activity: EntrypointActivity) -> None:

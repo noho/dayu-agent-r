@@ -125,8 +125,13 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactionRequest,
     ConversationCompactOutputVNext,
+    ContextCompactor,
 )
-from dayu.host.compaction_operation import CompactorProposalRunInput
+from dayu.host.compaction_operation import (
+    CompactionOperationResult,
+    CompactorProposalManifestRecorder,
+    CompactorProposalRunInput,
+)
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
@@ -967,12 +972,71 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_context_compaction_requested_none_budget_uses_host_estimator_and_recovers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """provider overflow budget_state=None 使用 Host estimator 并进入 recovery。"""
+
+    original_run_compaction_operation = (
+        engine_ingest_module.run_compaction_operation
+    )
+    observed_attempt_ranges: list[tuple[int, int, str | None]] = []
+
+    async def observe_run_compaction_operation(
+        *,
+        request: CompactionRequest,
+        compactor: ContextCompactor,
+        first_attempt_number: int,
+        max_attempt_number: int,
+        cancellation_token: CancellationToken,
+        pass_queue: tuple[CompactionRequest, ...] = (),
+        compaction_operation_id: str | None = None,
+        proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+    ) -> CompactionOperationResult:
+        """记录 Engine ingest 传给 operation owner 的冻结 attempt range。
+
+        :param request: reactive root compaction request。
+        :param compactor: reactive compactor。
+        :param first_attempt_number: 首个全局 attempt number。
+        :param max_attempt_number: 冻结的 operation attempt 上限。
+        :param cancellation_token: Host cancellation token。
+        :param pass_queue: reactive pass queue。
+        :param compaction_operation_id: request event 同源 operation id。
+        :param proposal_manifest_recorder: durable manifest recorder。
+        :returns: 原 operation owner 的执行结果。
+        :raises Exception: 原 operation owner 异常时透传。
+        """
+
+        observed_attempt_ranges.append(
+            (
+                first_attempt_number,
+                max_attempt_number,
+                compaction_operation_id,
+            )
+        )
+        return await original_run_compaction_operation(
+            request=request,
+            compactor=compactor,
+            first_attempt_number=first_attempt_number,
+            max_attempt_number=max_attempt_number,
+            cancellation_token=cancellation_token,
+            pass_queue=pass_queue,
+            compaction_operation_id=compaction_operation_id,
+            proposal_manifest_recorder=proposal_manifest_recorder,
+        )
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "run_compaction_operation",
+        observe_run_compaction_operation,
+    )
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         wakeup = _WakeupSpy()
+        policy = replace(
+            _reactive_policy(),
+            max_compaction_attempts_per_operation=3,
+        )
         candidate = _candidate(
             seeded,
             worker_event_index=4,
@@ -991,7 +1055,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
-            context_budget_policy=_reactive_policy(),
+            context_budget_policy=policy,
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest_async(candidate)
@@ -1007,6 +1071,17 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             CONTEXT_COMPACTED,
         )
         requested_payload = _payload(result.events[0])
+        assert requested_payload["operation_id"] == result.events[0].event_id
+        assert requested_payload["max_compaction_attempts_per_operation"] == (
+            policy.max_compaction_attempts_per_operation
+        )
+        assert observed_attempt_ranges == [
+            (
+                1,
+                policy.max_compaction_attempts_per_operation,
+                result.events[0].event_id,
+            )
+        ]
         assert requested_payload["trigger_source"] == "reactive"
         assert requested_payload["provider_request_id"] == "req-overflow"
         assert requested_payload["client_correlation_id"] == "client-overflow"

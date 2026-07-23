@@ -14,7 +14,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
 from threading import Lock
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -50,7 +49,7 @@ from dayu.host.durable.event_log import (
     EventLogAppendRequest,
     EventLogStore,
 )
-from dayu.host.durable.payload import PayloadStore
+from dayu.host.durable.payload import BoundedJsonPayloadWriteRequest, PayloadStore
 from dayu.host.durable.schema import (
     PayloadDescriptorKind,
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
@@ -224,8 +223,6 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
 
     :param transaction_runner: Host durable transaction runner。
     :param event_log_store: EventLog store。
-    :param artifact_root: compact artifact root，也承载 compactor projection。
-    :param create_artifact_root: artifact root 缺失时是否创建。
     :param event_source: 写入 EventLog 的 Host source。
     """
 
@@ -234,26 +231,18 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
         *,
         transaction_runner: HostTransactionRunner,
         event_log_store: EventLogStore,
-        artifact_root: Path,
-        create_artifact_root: bool,
         event_source: str,
     ) -> None:
         """初始化 durable recorder。
 
         :param transaction_runner: Host durable transaction runner。
         :param event_log_store: EventLog store。
-        :param artifact_root: artifact root。
-        :param create_artifact_root: artifact root 缺失时是否创建。
         :param event_source: 写入 EventLog 的 Host source。
         :returns: ``None``。
         """
 
         self._transaction_runner = transaction_runner
         self._event_log_store = event_log_store
-        self._artifact_store = LocalArtifactStore(
-            artifact_root,
-            create_artifact_root=create_artifact_root,
-        )
         self._payload_store = PayloadStore()
         self._event_source = event_source
 
@@ -278,28 +267,30 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
 
         def _operation(transaction: HostTransaction) -> CompactorProposalManifestReference:
             projection_ref = _compactor_input_projection_ref(event_id)
-            projection_artifact_ref = self._artifact_store.write_artifact_bytes(
-                canonical_json_dumps(
-                    prepared_input.compactor_input_projection
-                ).encode("utf-8"),
-                expected_digest=prepared_input.compactor_input_projection_digest,
-            )
-            projection_descriptor = self._payload_store.write_payload_descriptor_for_artifact(
+            projection_descriptor = self._payload_store.write_bounded_json_payload(
                 transaction,
-                projection_ref,
-                projection_artifact_ref,
-                _COMPACTOR_INPUT_PROJECTION_MEDIA_TYPE,
-                payload_descriptor_metadata(
-                    PayloadDescriptorKind.COMPACTOR_INPUT_PROJECTION,
-                    {
-                        "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                        "event_id": event_id,
-                        "compaction_operation_id": compaction_operation_id,
-                        "compaction_attempt_number": compaction_attempt_number,
-                        "compaction_request_digest": (
-                            prepared_input.compaction_request_digest
-                        ),
-                    },
+                BoundedJsonPayloadWriteRequest(
+                    payload_ref=projection_ref,
+                    sqlite_payload_id=_compactor_input_projection_payload_id(
+                        event_id
+                    ),
+                    payload_json=prepared_input.compactor_input_projection,
+                    media_type=_COMPACTOR_INPUT_PROJECTION_MEDIA_TYPE,
+                    metadata=payload_descriptor_metadata(
+                        PayloadDescriptorKind.COMPACTOR_INPUT_PROJECTION,
+                        {
+                            "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                            "event_id": event_id,
+                            "compaction_operation_id": compaction_operation_id,
+                            "compaction_attempt_number": compaction_attempt_number,
+                            "compaction_request_digest": (
+                                prepared_input.compaction_request_digest
+                            ),
+                        },
+                    ),
+                    expected_digest=(
+                        prepared_input.compactor_input_projection_digest
+                    ),
                 ),
             )
             manifest = _compactor_runner_call_manifest_body(
@@ -311,25 +302,27 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 compactor_input_projection_ref=projection_descriptor.payload_ref,
             )
             manifest_digest = sha256_digest_json(manifest)
-            manifest_artifact_ref = self._artifact_store.write_artifact_bytes(
-                canonical_json_dumps(manifest).encode("utf-8"),
-                expected_digest=manifest_digest,
-            )
             manifest_payload_ref = _runner_call_manifest_payload_ref(event_id)
-            manifest_descriptor = self._payload_store.write_payload_descriptor_for_artifact(
+            manifest_descriptor = self._payload_store.write_bounded_json_payload(
                 transaction,
-                manifest_payload_ref,
-                manifest_artifact_ref,
-                RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
-                payload_descriptor_metadata(
-                    PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST,
-                    {
-                        "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                        "event_id": event_id,
-                        "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-                        "compaction_operation_id": compaction_operation_id,
-                        "compaction_attempt_number": compaction_attempt_number,
-                    },
+                BoundedJsonPayloadWriteRequest(
+                    payload_ref=manifest_payload_ref,
+                    sqlite_payload_id=_runner_call_manifest_payload_id(event_id),
+                    payload_json=manifest,
+                    media_type=RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
+                    metadata=payload_descriptor_metadata(
+                        PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST,
+                        {
+                            "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                            "event_id": event_id,
+                            "schema_version": (
+                                RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
+                            ),
+                            "compaction_operation_id": compaction_operation_id,
+                            "compaction_attempt_number": compaction_attempt_number,
+                        },
+                    ),
+                    expected_digest=manifest_digest,
                 ),
             )
             self._event_log_store.append_event(
@@ -510,6 +503,8 @@ class CompactionOperationResult:
     :param failure_reason: 最终失败原因；成功时为 ``None``。
     :param budget_after_attempted_compact: 最后一次 attempt 后预算；未知时为
         ``None``。
+    :param accepted_attempt_number: 被接受的全局 attempt number；失败时为
+        ``None``。
     :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
     :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
     """
@@ -519,6 +514,7 @@ class CompactionOperationResult:
     rejected_attempts: tuple[CompactionAttemptRejected, ...]
     failure_reason: str | None
     budget_after_attempted_compact: int | None
+    accepted_attempt_number: int | None
     accepted_proposal_manifest_ref: str | None = None
     accepted_proposal_manifest_digest: str | None = None
 
@@ -642,7 +638,8 @@ async def run_compaction_operation(
     *,
     request: CompactionRequest,
     compactor: ContextCompactor,
-    max_attempts: int,
+    first_attempt_number: int,
+    max_attempt_number: int,
     cancellation_token: CancellationToken,
     pass_queue: tuple[CompactionRequest, ...] = (),
     compaction_operation_id: str | None = None,
@@ -652,7 +649,8 @@ async def run_compaction_operation(
 
     :param request: Host compaction request。
     :param compactor: Host internal compactor seam。
-    :param max_attempts: proposal attempt 上限。
+    :param first_attempt_number: 本次执行的首个全局 proposal attempt number。
+    :param max_attempt_number: operation 冻结的全局 proposal attempt 上限。
     :param cancellation_token: Host 注入 compactor 的真实取消 token。
     :param pass_queue: 同一 operation 内的 pass request 队列；为空时使用
         ``request`` 作为单 pass。
@@ -661,18 +659,111 @@ async def run_compaction_operation(
     :returns: compaction operation 结果。
     """
 
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be positive")
+    return await _run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        first_attempt_number=first_attempt_number,
+        max_attempt_number=max_attempt_number,
+        last_execution_attempt_number=max_attempt_number,
+        cancellation_token=cancellation_token,
+        pass_queue=pass_queue,
+        compaction_operation_id=compaction_operation_id,
+        proposal_manifest_recorder=proposal_manifest_recorder,
+    )
+
+
+async def run_compaction_attempt(
+    *,
+    request: CompactionRequest,
+    compactor: ContextCompactor,
+    attempt_number: int,
+    max_attempt_number: int,
+    cancellation_token: CancellationToken,
+    compaction_operation_id: str | None = None,
+    proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+) -> CompactionOperationResult:
+    """执行 single-operation 全局预算内的精确一次 semantic attempt。
+
+    本 owner API 让 proactive dispatcher 为每个全局 attempt 选择对应 tier
+    request，同时仍以 operation 的冻结上限派生 ``repairable`` 与下一 policy
+    decision。reactive multi-pass 继续使用完整 ``run_compaction_operation``。
+
+    :param request: 当前全局 attempt 对应的 Host compaction request。
+    :param compactor: Host internal compactor seam。
+    :param attempt_number: 当前 operation 的全局 attempt number。
+    :param max_attempt_number: operation 冻结的全局 proposal attempt 上限。
+    :param cancellation_token: Host 注入 compactor 的真实取消 token。
+    :param compaction_operation_id: Host compaction operation id；生产路径必须传入。
+    :param proposal_manifest_recorder: compactor proposal manifest 记录器。
+    :returns: 只执行当前 attempt 的 operation result。
+    :raises ValueError: attempt range 非法时抛出。
+    """
+
+    return await _run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        first_attempt_number=attempt_number,
+        max_attempt_number=max_attempt_number,
+        last_execution_attempt_number=attempt_number,
+        cancellation_token=cancellation_token,
+        pass_queue=(),
+        compaction_operation_id=compaction_operation_id,
+        proposal_manifest_recorder=proposal_manifest_recorder,
+    )
+
+
+async def _run_compaction_operation(
+    *,
+    request: CompactionRequest,
+    compactor: ContextCompactor,
+    first_attempt_number: int,
+    max_attempt_number: int,
+    last_execution_attempt_number: int,
+    cancellation_token: CancellationToken,
+    pass_queue: tuple[CompactionRequest, ...],
+    compaction_operation_id: str | None,
+    proposal_manifest_recorder: CompactorProposalManifestRecorder | None,
+) -> CompactionOperationResult:
+    """执行共享的 semantic attempt loop。
+
+    :param request: Host compaction request。
+    :param compactor: Host internal compactor seam。
+    :param first_attempt_number: 本次 execution 首个全局 attempt number。
+    :param max_attempt_number: operation 冻结的全局上限。
+    :param last_execution_attempt_number: 当前调用允许执行的最后 attempt number。
+    :param cancellation_token: Host 注入的真实取消 token。
+    :param pass_queue: reactive multi-pass request 队列。
+    :param compaction_operation_id: durable operation id。
+    :param proposal_manifest_recorder: proposal manifest owner。
+    :returns: compaction operation 结果。
+    :raises ValueError: attempt range 非法时抛出。
+    """
+
+    if first_attempt_number <= 0:
+        raise ValueError("first_attempt_number must be positive")
+    if max_attempt_number <= 0:
+        raise ValueError("max_attempt_number must be positive")
+    if first_attempt_number > max_attempt_number:
+        raise ValueError("first_attempt_number must not exceed max_attempt_number")
+    if last_execution_attempt_number < first_attempt_number:
+        raise ValueError(
+            "last_execution_attempt_number must not precede first_attempt_number"
+        )
+    if last_execution_attempt_number > max_attempt_number:
+        raise ValueError(
+            "last_execution_attempt_number must not exceed max_attempt_number"
+        )
     requests = _operation_pass_requests(request=request, pass_queue=pass_queue)
     rejected: list[CompactionAttemptRejected] = []
     last_budget: int | None = None
     accepted_candidate: ConversationCompactOutputVNext | None = None
     accepted_quality: CompactQualityCheckResultVNext | None = None
     accepted_manifest_reference: CompactorProposalManifestReference | None = None
-    attempt_number = 1
+    accepted_attempt_number: int | None = None
+    attempt_number = first_attempt_number
     for pass_request in requests:
         pass_accepted = False
-        while attempt_number <= max_attempts and not pass_accepted:
+        while attempt_number <= last_execution_attempt_number and not pass_accepted:
             proposal_manifest_reference: CompactorProposalManifestReference | None = None
             if cancellation_token.is_cancelled():
                 rejected_attempt = _attempt_rejected(
@@ -697,10 +788,11 @@ async def run_compaction_operation(
                     rejected_attempts=tuple(rejected),
                     failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
+                    accepted_attempt_number=None,
                     accepted_proposal_manifest_ref=None,
                     accepted_proposal_manifest_digest=None,
                 )
-            repairable = attempt_number < max_attempts
+            repairable = attempt_number < max_attempt_number
             next_decision = _NEXT_DECISION_RETRY_REPAIR if repairable else _NEXT_DECISION_FAIL_COMPACTION
             attempt_cancellation_token = _CompactionAttemptCancellationToken(
                 cancellation_token
@@ -753,6 +845,7 @@ async def run_compaction_operation(
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
+                        accepted_attempt_number=None,
                         accepted_proposal_manifest_ref=None,
                         accepted_proposal_manifest_digest=None,
                     )
@@ -782,6 +875,7 @@ async def run_compaction_operation(
                     rejected_attempts=tuple(rejected),
                     failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
+                    accepted_attempt_number=None,
                     accepted_proposal_manifest_ref=None,
                     accepted_proposal_manifest_digest=None,
                 )
@@ -820,6 +914,7 @@ async def run_compaction_operation(
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
+                        accepted_attempt_number=None,
                         accepted_proposal_manifest_ref=None,
                         accepted_proposal_manifest_digest=None,
                     )
@@ -854,6 +949,7 @@ async def run_compaction_operation(
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_QUALITY_CHECK_REJECTED.value,
                         budget_after_attempted_compact=last_budget,
+                        accepted_attempt_number=None,
                         accepted_proposal_manifest_ref=None,
                         accepted_proposal_manifest_digest=None,
                     )
@@ -885,6 +981,7 @@ async def run_compaction_operation(
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT.value,
                         budget_after_attempted_compact=last_budget,
+                        accepted_attempt_number=None,
                         accepted_proposal_manifest_ref=None,
                         accepted_proposal_manifest_digest=None,
                     )
@@ -894,6 +991,7 @@ async def run_compaction_operation(
             accepted_candidate = candidate
             accepted_quality = quality
             accepted_manifest_reference = proposal_manifest_reference
+            accepted_attempt_number = attempt_number
             attempt_number += 1
         if not pass_accepted:
             return CompactionOperationResult(
@@ -902,6 +1000,7 @@ async def run_compaction_operation(
                 rejected_attempts=tuple(rejected),
                 failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
                 budget_after_attempted_compact=last_budget,
+                accepted_attempt_number=None,
                 accepted_proposal_manifest_ref=None,
                 accepted_proposal_manifest_digest=None,
             )
@@ -912,6 +1011,7 @@ async def run_compaction_operation(
             rejected_attempts=tuple(rejected),
             failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
             budget_after_attempted_compact=last_budget,
+            accepted_attempt_number=None,
             accepted_proposal_manifest_ref=None,
             accepted_proposal_manifest_digest=None,
         )
@@ -921,6 +1021,7 @@ async def run_compaction_operation(
         rejected_attempts=tuple(rejected),
         failure_reason=None,
         budget_after_attempted_compact=last_budget,
+        accepted_attempt_number=accepted_attempt_number,
         accepted_proposal_manifest_ref=(
             None
             if accepted_manifest_reference is None
@@ -1515,6 +1616,17 @@ def _compactor_input_projection_ref(event_id: str) -> str:
     return f"{_COMPACTOR_INPUT_PROJECTION_PAYLOAD_PREFIX}:{event_id}"
 
 
+def _compactor_input_projection_payload_id(event_id: str) -> str:
+    """派生 compactor input projection SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload row id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"sqlite:{_compactor_input_projection_ref(event_id)}"
+
+
 def _runner_call_manifest_payload_ref(event_id: str) -> str:
     """派生 compactor runner-call manifest descriptor ref。
 
@@ -1523,6 +1635,17 @@ def _runner_call_manifest_payload_ref(event_id: str) -> str:
     """
 
     return f"{_RUNNER_CALL_MANIFEST_PAYLOAD_PREFIX}:{event_id}"
+
+
+def _runner_call_manifest_payload_id(event_id: str) -> str:
+    """派生 compactor runner-call manifest SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload row id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"sqlite:{_runner_call_manifest_payload_ref(event_id)}"
 
 
 def _required_manifest_text(
@@ -1657,7 +1780,6 @@ def _proposal_failure_diagnostic_unchecked(
     """
 
     exception_message = _safe_exception_message(exception)
-    previous_blocks = request.material_pack.previous_compacted_view
     offending: CompactionRejectedAttemptOffendingBlock | None = None
     failure_stage, parser_or_validator = _proposal_failure_stage(
         exception_message=exception_message,
@@ -2076,5 +2198,6 @@ __all__ = [
     "CompactionFailureCategory",
     "CompactionNextPolicyDecision",
     "CompactionOperationResult",
+    "run_compaction_attempt",
     "run_compaction_operation",
 ]

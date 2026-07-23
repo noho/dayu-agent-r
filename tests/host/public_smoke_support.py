@@ -75,6 +75,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostSessionEvent,
+    HostSessionAttachment,
     HostTerminalStatus,
     HostToolingOptions,
     LocalEngineWorker,
@@ -200,7 +201,23 @@ def assert_at_most_one_system_message(
     if system_count == 1:
         assert messages[0].role is AgentMessageRole.SYSTEM, (
             f"{label} expected the only system message at index 0; roles={roles}"
-        )
+)
+
+
+async def close_attachment_shielded(
+    attachment: HostSessionAttachment,
+) -> None:
+    """屏蔽 caller cancellation 并关闭显式 attachment。
+
+    本 helper 只关闭调用点已创建并登记到 lexical ``AsyncExitStack`` 的对象，
+    不创建、缓存或推断 attachment ownership。
+
+    :param attachment: 调用点显式创建的 public Session attachment。
+    :returns: ``None``。
+    :raises Exception: attachment close 失败时透传。
+    """
+
+    await asyncio.shield(attachment.aclose())
 
 
 @dataclass(frozen=True, slots=True)

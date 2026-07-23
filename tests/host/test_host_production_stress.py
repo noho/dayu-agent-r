@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from multiprocessing import Process
 
@@ -26,6 +26,7 @@ from dayu.host import (
     open_host,
 )
 from tests.host.public_smoke_support import (
+    close_attachment_shielded,
     ensure_request,
     followup_request,
     host_context,
@@ -1106,7 +1107,14 @@ async def test_mixed_host_stress_deterministic_fault_injection(
             lane_timeout_seconds=_SLICE5_LANE_TIMEOUT_SECONDS,
         )
 
-        async with open_host(options) as host:
+        async with (
+            open_host(options) as host,
+            AsyncExitStack() as attachment_stack,
+        ):
+            crashed_attachment = await host.attach_session(crashed.session_id)
+            attachment_stack.push_async_callback(
+                close_attachment_shielded, crashed_attachment
+            )
             await wait_all_runs_terminal(
                 host,
                 (crashed.run_id,),
@@ -1118,6 +1126,13 @@ async def test_mixed_host_stress_deterministic_fault_injection(
                 await host.ensure_session(ensure_request("wu-stress-s5-session-2")),
             )
             session_ids = tuple(session.session_id for session in sessions)
+            for session_id in session_ids:
+                if session_id == crashed.session_id:
+                    continue
+                attachment = await host.attach_session(session_id)
+                attachment_stack.push_async_callback(
+                    close_attachment_shielded, attachment
+                )
             last_primary_terminal_counts = [
                 len(read_session_terminal_sequences(tmp_path, session_id)) for session_id in session_ids
             ]
@@ -1487,7 +1502,14 @@ async def test_scheduler_liveness_long_run_mixed_flow_stress(
     recovery_count_before_clean_reopen = 0
     attempt_lost_before_clean_reopen = 0
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
+        crashed_attachment = await host.attach_session(crashed.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, crashed_attachment
+        )
         await wait_all_runs_terminal(
             host,
             (crashed.run_id,),
@@ -1497,6 +1519,11 @@ async def test_scheduler_liveness_long_run_mixed_flow_stress(
         for index in range(_SLICE4_SESSION_COUNT):
             session_list.append(await host.ensure_session(ensure_request(f"wu-stress-s4-{index}")))
         sessions = tuple(session_list)
+        for session in sessions:
+            attachment = await host.attach_session(session.session_id)
+            attachment_stack.push_async_callback(
+                close_attachment_shielded, attachment
+            )
 
         active_success_run_id = await _submit_scripted_followup(
             host,
@@ -1671,7 +1698,14 @@ async def test_repeated_startup_recovery_crash_stress(
             timeout_seconds=_PROCESS_START_TIMEOUT_SECONDS,
         )
         recovery_factory = AsyncControlledFinalAnswerWorkerFactory(f"stress-recovered-final-{cycle_index}")
-        async with open_host(recovery_open_host_options(tmp_path, recovery_factory)) as host:
+        async with (
+            open_host(recovery_open_host_options(tmp_path, recovery_factory)) as host,
+            AsyncExitStack() as attachment_stack,
+        ):
+            attachment = await host.attach_session(accepted.session_id)
+            attachment_stack.push_async_callback(
+                close_attachment_shielded, attachment
+            )
             watcher = await host.watch_session_events(accepted.session_id)
             try:
                 await asyncio.wait_for(
@@ -1789,11 +1823,19 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
     worker_cancel_count_after_consumer_cancel = 0
     outbox_gap_run_count = 0
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session_list = []
         for index in range(_SLICE3_SESSION_COUNT):
             session_list.append(await host.ensure_session(ensure_request(f"wu-stress-s3-{index}")))
         sessions = tuple(session_list)
+        for session in sessions:
+            attachment = await host.attach_session(session.session_id)
+            attachment_stack.push_async_callback(
+                close_attachment_shielded, attachment
+            )
         session_ids = tuple(session.session_id for session in sessions)
         primary_watchers = tuple(
             [

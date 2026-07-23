@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeAlias, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -1381,6 +1381,118 @@ class HostApiErrorCode(StrEnum):
     INTERNAL_ERROR = "internal_error"
 
 
+class HostSessionAccessMode(StrEnum):
+    """Session attachment 生命周期内不可变的访问模式。"""
+
+    READ_WRITE = "read_write"
+    READ_ONLY = "read_only"
+
+
+class HostSessionMutationRejectionReason(StrEnum):
+    """用户发起 Session mutation 被 access owner 拒绝的封闭原因。"""
+
+    ATTACHMENT_REQUIRED = "attachment_required"
+    READ_ONLY = "read_only"
+    ATTACHMENT_CLOSING = "attachment_closing"
+
+
+class HostSessionAttachmentConflictReason(StrEnum):
+    """同一 Host handle 创建 Session attachment 冲突的封闭原因。"""
+
+    ALREADY_ATTACHED = "already_attached"
+
+
+@dataclass(frozen=True, slots=True)
+class HostSessionMutationErrorDetail:
+    """Session mutation access 拒绝的结构化详情。
+
+    :param kind: 固定为 ``session_mutation_access`` 的 detail 判别字段。
+    :param session_id: 被拒绝 mutation 对应的 Session id。
+    :param reason: registry access owner 产生的稳定拒绝原因。
+    :param required_mode: mutation 所需访问模式。
+    :param actual_mode: 当前 live attachment mode；无 ACTIVE attachment 时为
+        ``None``。
+    """
+
+    kind: Literal["session_mutation_access"]
+    session_id: str
+    reason: HostSessionMutationRejectionReason
+    required_mode: HostSessionAccessMode
+    actual_mode: HostSessionAccessMode | None
+
+    def __post_init__(self) -> None:
+        """校验 mutation access detail 的封闭字段。
+
+        :returns: ``None``。
+        :raises ValueError: kind 非法或 Session id 为空时抛出。
+        :raises TypeError: reason、required_mode 或 actual_mode 类型非法时抛出。
+        """
+
+        if self.kind != "session_mutation_access":
+            raise ValueError(
+                "HostSessionMutationErrorDetail.kind must be session_mutation_access"
+            )
+        _require_non_empty(
+            self.session_id,
+            field_name="HostSessionMutationErrorDetail.session_id",
+        )
+        if not isinstance(self.reason, HostSessionMutationRejectionReason):
+            raise TypeError(
+                "HostSessionMutationErrorDetail.reason must be "
+                "HostSessionMutationRejectionReason"
+            )
+        if not isinstance(self.required_mode, HostSessionAccessMode):
+            raise TypeError(
+                "HostSessionMutationErrorDetail.required_mode must be "
+                "HostSessionAccessMode"
+            )
+        if self.actual_mode is not None and not isinstance(
+            self.actual_mode,
+            HostSessionAccessMode,
+        ):
+            raise TypeError(
+                "HostSessionMutationErrorDetail.actual_mode must be "
+                "HostSessionAccessMode or None"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class HostSessionAttachmentConflictDetail:
+    """同一 Host handle 重复 attachment 的结构化冲突详情。
+
+    :param kind: 固定为 ``session_attachment_conflict`` 的 detail 判别字段。
+    :param session_id: 已存在 live attachment 的 Session id。
+    :param reason: registry uniqueness owner 产生的稳定冲突原因。
+    """
+
+    kind: Literal["session_attachment_conflict"]
+    session_id: str
+    reason: HostSessionAttachmentConflictReason
+
+    def __post_init__(self) -> None:
+        """校验 attachment conflict detail 的封闭字段。
+
+        :returns: ``None``。
+        :raises ValueError: kind 非法或 Session id 为空时抛出。
+        :raises TypeError: reason 类型非法时抛出。
+        """
+
+        if self.kind != "session_attachment_conflict":
+            raise ValueError(
+                "HostSessionAttachmentConflictDetail.kind must be "
+                "session_attachment_conflict"
+            )
+        _require_non_empty(
+            self.session_id,
+            field_name="HostSessionAttachmentConflictDetail.session_id",
+        )
+        if not isinstance(self.reason, HostSessionAttachmentConflictReason):
+            raise TypeError(
+                "HostSessionAttachmentConflictDetail.reason must be "
+                "HostSessionAttachmentConflictReason"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class SteerConflictDetail:
     """steer 前置条件冲突的结构化错误详情。
@@ -1411,7 +1523,45 @@ class SteerConflictDetail:
         _require_optional_non_empty(
             self.current_active_run_id,
             field_name="SteerConflictDetail.current_active_run_id",
-        )
+            )
+
+
+class HostSessionAttachment(Protocol):
+    """public Session attachment 资源协议。
+
+    attachment 的访问模式在 successful attach 后冻结；关闭 attachment 只释放
+    当前 Host handle 的运行态访问资格，不关闭 Session，也不隐式取消 Run。
+    """
+
+    @property
+    def session_id(self) -> str:
+        """返回 attachment 对应的稳定 Session id。
+
+        :returns: Session id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        ...
+
+    @property
+    def access_mode(self) -> HostSessionAccessMode:
+        """返回 attachment 生命周期内冻结的访问模式。
+
+        :returns: ``READ_WRITE`` 或 ``READ_ONLY``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        ...
+
+    async def aclose(self) -> None:
+        """关闭 attachment 并等待其已接受的新工作收口。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: 当前等待被取消时抛出；底层关闭继续。
+        :raises Exception: native resource 释放失败时透传 typed 错误。
+        """
+
+        ...
 
 
 class HostSessionEventDeliveryReason(StrEnum):
@@ -1502,6 +1652,8 @@ class HostUnavailableDetail:
 
 HostApiErrorDetail: TypeAlias = (
     SteerConflictDetail
+    | HostSessionMutationErrorDetail
+    | HostSessionAttachmentConflictDetail
     | HostSessionEventDeliveryDetail
     | HostSessionEventAdmissionDetail
     | HostUnavailableDetail
@@ -3877,6 +4029,21 @@ class Host(Protocol):
     store、scheduler、registry、dispatch row、wakeup port 或 ToolRuntime 内部对象。
     """
 
+    async def attach_session(self, session_id: str) -> HostSessionAttachment:
+        """显式 attach 一个已有 Session。
+
+        同一 Host handle 对同一 Session 同时只允许一个 live attachment；跨
+        opener 竞争由 strict-native per-Session mutex 决定不可变访问模式。
+
+        :param session_id: 目标 Session id。
+        :returns: successful return 后已生效的 Session attachment。
+        :raises HostClosedError: Host 正在关闭或已经关闭时抛出。
+        :raises HostApiError: Session 不存在、重复 attach 或 recovery 失败时抛出。
+        :raises Exception: strict-native mutex 或 durable recovery 失败时透传。
+        """
+
+        ...
+
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
 
@@ -4123,6 +4290,12 @@ __all__ = [
     "HostSessionEventDeliveryPolicy",
     "HostSessionEventDeliveryReason",
     "HostSessionEventIterator",
+    "HostSessionAccessMode",
+    "HostSessionAttachment",
+    "HostSessionAttachmentConflictDetail",
+    "HostSessionAttachmentConflictReason",
+    "HostSessionMutationErrorDetail",
+    "HostSessionMutationRejectionReason",
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostToolCallDelta",

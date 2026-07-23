@@ -135,7 +135,8 @@ async def test_attempt_timeout_does_not_cancel_parent_or_next_attempt(
     result = await run_compaction_operation(
         request=request,
         compactor=_compactor(),
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=parent,
     )
 
@@ -202,7 +203,8 @@ async def test_parent_cancel_after_timeout_wins_before_retry(
     result = await run_compaction_operation(
         request=request,
         compactor=_compactor(),
-        max_attempts=2,
+        first_attempt_number=1,
+        max_attempt_number=2,
         cancellation_token=parent,
     )
 
@@ -257,7 +259,8 @@ async def test_parent_cancel_is_visible_to_running_attempt_child(
         run_compaction_operation(
             request=_request(),
             compactor=_compactor(),
-            max_attempts=2,
+            first_attempt_number=1,
+            max_attempt_number=2,
             cancellation_token=parent,
         )
     )
@@ -311,7 +314,8 @@ async def test_outer_task_cancellation_is_not_reclassified(
         run_compaction_operation(
             request=_request(),
             compactor=_compactor(),
-            max_attempts=1,
+            first_attempt_number=1,
+            max_attempt_number=1,
             cancellation_token=parent,
         )
     )
@@ -357,7 +361,8 @@ async def test_manifest_post_write_recheck_blocks_provider_and_keeps_reference(
     result = await run_compaction_operation(
         request=_request(),
         compactor=_compactor(),
-        max_attempts=1,
+        first_attempt_number=1,
+        max_attempt_number=1,
         cancellation_token=parent,
         compaction_operation_id="operation-pre-call-recheck",
         proposal_manifest_recorder=recorder,

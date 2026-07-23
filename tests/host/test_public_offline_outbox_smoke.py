@@ -6,6 +6,7 @@ import json
 import pathlib
 import sqlite3
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import AsyncExitStack
 from typing import cast
 
 import pytest
@@ -44,8 +45,15 @@ async def test_offline_read_and_idempotent_drain_do_not_write_eventlog(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(smoke.ensure_request("outbox-offline"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         try:
             followup = await host.submit_followup(
@@ -146,8 +154,15 @@ async def test_live_first_seen_ids_filter_outbox_duplicate(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(smoke.ensure_request("outbox-live-first"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
+        )
         watcher = await host.watch_session_events(session.session_id)
         try:
             followup = await host.submit_followup(
@@ -203,8 +218,15 @@ async def test_drain_first_second_read_covers_live_attach_window(
         allow_tool_calls=False,
     )
 
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(smoke.ensure_request("outbox-drain-first"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            smoke.close_attachment_shielded, attachment
+        )
         first_followup = await host.submit_followup(
             session.session_id,
             smoke.followup_request(

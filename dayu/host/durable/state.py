@@ -139,6 +139,16 @@ SELECT
 FROM {TABLE_HOST_WAIT_RECORDS}
 """
 
+# SQLite 3.32.0 之前的默认 ``SQLITE_MAX_VARIABLE_NUMBER`` 为 999；采用该
+# legacy default 作为跨受支持 Python 3.11 构建的保守单 statement 参数预算。
+_SQLITE_LEGACY_DEFAULT_MAX_VARIABLE_NUMBER = 999
+_OWNED_CANCEL_IDENTITY_PARAMETER_COUNT = 5
+_OWNED_CANCEL_FIXED_PARAMETER_COUNT = 1
+_OWNED_CANCEL_QUERY_BATCH_SIZE = (
+    _SQLITE_LEGACY_DEFAULT_MAX_VARIABLE_NUMBER
+    - _OWNED_CANCEL_FIXED_PARAMETER_COUNT
+) // _OWNED_CANCEL_IDENTITY_PARAMETER_COUNT
+
 
 class DispatchRecordStatus(StrEnum):
     """Attempt dispatch record 状态。
@@ -343,6 +353,46 @@ class AttemptRow:
     created_at: str
     updated_at: str
     terminal_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptExecutionIdentity:
+    """本地 active worker 与 durable Attempt execution 共用的精确身份。
+
+    :param session_id: Attempt 所属 Session id。
+    :param run_id: Attempt 所属 Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    """
+
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+
+    def __post_init__(self) -> None:
+        """校验 exact identity 的全部文本字段。
+
+        :returns: ``None``。
+        :raises HostDurableError: 任一身份字段为空时抛出。
+        """
+
+        _require_non_empty_text(self.session_id, field_name="session_id")
+        _require_non_empty_text(self.run_id, field_name="run_id")
+        _require_non_empty_text(self.attempt_id, field_name="attempt_id")
+        _require_non_empty_text(self.execution_id, field_name="execution_id")
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedAttemptCancelCandidate:
+    """state owner 精确 join 后交给 cancel fact owner 校验的候选。
+
+    :param identity: 当前 Run / Attempt / execution 的精确身份。
+    :param cancel_request_event_id: Run row 保存的 cancel request event id。
+    """
+
+    identity: AttemptExecutionIdentity
+    cancel_request_event_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1923,66 +1973,24 @@ def read_non_terminal_runs_for_session(transaction: HostTransaction, session_id:
     return tuple(run_row_from_host_row(row) for row in rows)
 
 
-def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
-    """读取全部非终态 Run。
-
-    :param transaction: 调用方提供的 Host transaction。
-    :returns: 按 accepted event sequence 升序排列的非终态 Run row 元组。
-    :raises HostDurableError: row 字段无效时抛出。
-    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
-    """
-
-    status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
-    rows = transaction.fetchall(
-        f"""
-        SELECT
-          run_id,
-          session_id,
-          status,
-          client_request_id,
-          input_event_id,
-          input_event_sequence,
-          accepted_event_id,
-          accepted_event_sequence,
-          queued_event_id,
-          queued_event_sequence,
-          started_event_id,
-          started_event_sequence,
-          terminal_event_id,
-          terminal_event_sequence,
-          cancel_request_event_id,
-          current_attempt_id,
-          source_run_id,
-          source_run_relation,
-          execution_target,
-          queue_policy,
-          created_at,
-          updated_at,
-          terminal_at
-        FROM {TABLE_HOST_RUNS}
-        WHERE status {status_clause}
-        ORDER BY accepted_event_sequence ASC, run_id ASC
-        """,
-        status_params,
-    )
-    return tuple(run_row_from_host_row(row) for row in rows)
-
-
-def read_non_terminal_run_upper_watermark(
+def read_non_terminal_run_upper_watermark_for_session(
     transaction: HostTransaction,
+    session_id: str,
 ) -> NonTerminalRunKeysetCursor | None:
-    """读取 recovery scan 开始时固定的 non-terminal Run upper watermark。
+    """读取目标 Session recovery scan 的固定 non-terminal Run upper watermark。
 
     watermark 只来自 durable Run governance rows，并以
     ``(accepted_event_sequence, run_id)`` 全序确定边界；projection/read model
     不参与。
 
     :param transaction: 调用方提供的 Host read transaction。
+    :param session_id: recovery attachment 对应的目标 Session id。
     :returns: 当前最大 keyset；没有 non-terminal Run 时返回 ``None``。
     :raises HostDurableError: watermark row 字段无效时抛出。
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
+    _require_non_empty_text(session_id, field_name="session_id")
     status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
     row = transaction.fetchone(
         f"""
@@ -1990,11 +1998,12 @@ def read_non_terminal_run_upper_watermark(
           accepted_event_sequence,
           run_id
         FROM {TABLE_HOST_RUNS}
-        WHERE status {status_clause}
+        WHERE session_id = ?
+          AND status {status_clause}
         ORDER BY accepted_event_sequence DESC, run_id DESC
         LIMIT 1
         """,
-        status_params,
+        (session_id, *status_params),
     )
     if row is None:
         return None
@@ -2019,19 +2028,21 @@ def read_non_terminal_run_upper_watermark(
     )
 
 
-def read_non_terminal_runs_keyset_page(
+def read_non_terminal_runs_for_session_keyset_page(
     transaction: HostTransaction,
     *,
+    session_id: str,
     upper_watermark: NonTerminalRunKeysetCursor,
     cursor: NonTerminalRunKeysetCursor | None,
     batch_size: int,
 ) -> tuple[RunRow, ...]:
-    """读取 upper watermark 内下一页 non-terminal Run。
+    """读取目标 Session upper watermark 内下一页 non-terminal Run。
 
     查询严格使用 keyset，不使用 OFFSET。``fetchall`` 只消费带 ``LIMIT`` 的
     单个 bounded page。
 
     :param transaction: 调用方提供的 Host write transaction。
+    :param session_id: recovery attachment 对应的目标 Session id。
     :param upper_watermark: scan 开始时固定的最大 keyset。
     :param cursor: 上一批最后处理的 keyset；首批为 ``None``。
     :param batch_size: 本页最大 Run row 数。
@@ -2041,6 +2052,7 @@ def read_non_terminal_runs_keyset_page(
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
+    _require_non_empty_text(session_id, field_name="session_id")
     _validate_non_terminal_run_keyset(
         upper_watermark,
         field_name="upper_watermark",
@@ -2098,7 +2110,8 @@ def read_non_terminal_runs_keyset_page(
           updated_at,
           terminal_at
         FROM {TABLE_HOST_RUNS}
-        WHERE status {status_clause}
+        WHERE session_id = ?
+          AND status {status_clause}
           AND (
             accepted_event_sequence < ?
             OR (accepted_event_sequence = ? AND run_id <= ?)
@@ -2108,6 +2121,7 @@ def read_non_terminal_runs_keyset_page(
         LIMIT ?
         """,
         (
+            session_id,
             *status_params,
             upper_watermark.accepted_event_sequence,
             upper_watermark.accepted_event_sequence,
@@ -2161,15 +2175,20 @@ def _non_terminal_run_keyset_order(
     return keyset.accepted_event_sequence, keyset.run_id
 
 
-def read_cancelling_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
-    """读取全部 ``CANCELLING`` Run。
+def read_cancelling_runs_for_session(
+    transaction: HostTransaction,
+    session_id: str,
+) -> tuple[RunRow, ...]:
+    """读取目标 Session 的全部 ``CANCELLING`` Run。
 
     :param transaction: 调用方提供的 Host transaction。
+    :param session_id: 目标 Session id。
     :returns: 按 accepted event sequence 升序排列的 cancelling Run row 元组。
-    :raises HostDurableError: row 字段无效时抛出。
+    :raises HostDurableError: Session id 或 row 字段无效时抛出。
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
+    _require_non_empty_text(session_id, field_name="session_id")
     rows = transaction.fetchall(
         f"""
         SELECT
@@ -2197,12 +2216,134 @@ def read_cancelling_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
           updated_at,
           terminal_at
         FROM {TABLE_HOST_RUNS}
-        WHERE status = ?
+        WHERE session_id = ? AND status = ?
         ORDER BY accepted_event_sequence ASC, run_id ASC
         """,
-        (serialize_run_status(RunStatus.CANCELLING),),
+        (session_id, serialize_run_status(RunStatus.CANCELLING)),
     )
     return tuple(run_row_from_host_row(row) for row in rows)
+
+
+def read_owned_attempt_cancel_candidates(
+    transaction: HostTransaction,
+    *,
+    owner_host_instance_id: str,
+    identities: tuple[AttemptExecutionIdentity, ...],
+) -> tuple[OwnedAttemptCancelCandidate, ...]:
+    """按本地 worker 快照精确读取当前 execution owner 的 cancel 候选。
+
+    查询不使用 Run 或 Attempt 当前状态作为筛选条件；terminal closeout 不会抹掉
+    已接受的 cancel control truth。Run current Attempt、Attempt execution 或
+    dispatch owner 任一不再精确匹配时，该 stale identity 只会被过滤。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param owner_host_instance_id: 当前 scheduler 的 durable Host instance id。
+    :param identities: 本地 active registry 的有界 exact identity 快照。
+    :returns: 按输入 identity 顺序排列的候选。
+    :raises HostDurableError: owner id 为空、identity 重复或候选字段非法时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(
+        owner_host_instance_id,
+        field_name="owner_host_instance_id",
+    )
+    for identity in identities:
+        _require_non_empty_text(identity.session_id, field_name="session_id")
+        _require_non_empty_text(identity.run_id, field_name="run_id")
+        _require_non_empty_text(identity.attempt_id, field_name="attempt_id")
+        _require_non_empty_text(identity.execution_id, field_name="execution_id")
+    if len(set(identities)) != len(identities):
+        raise HostDurableError("attempt execution identities must be unique")
+    if len(identities) == 0:
+        return ()
+
+    candidates: list[OwnedAttemptCancelCandidate] = []
+    for batch_start in range(0, len(identities), _OWNED_CANCEL_QUERY_BATCH_SIZE):
+        batch = identities[
+            batch_start : batch_start + _OWNED_CANCEL_QUERY_BATCH_SIZE
+        ]
+        values_sql = ", ".join("(?, ?, ?, ?, ?)" for _identity in batch)
+        parameters: list[SQLiteScalar] = []
+        for request_order, identity in enumerate(batch, start=batch_start):
+            parameters.extend(
+                (
+                    request_order,
+                    identity.session_id,
+                    identity.run_id,
+                    identity.attempt_id,
+                    identity.execution_id,
+                )
+            )
+        parameters.append(owner_host_instance_id)
+        rows = transaction.fetchall(
+            f"""
+            WITH requested(
+              request_order,
+              session_id,
+              run_id,
+              attempt_id,
+              execution_id
+            ) AS (VALUES {values_sql})
+            SELECT
+              requested.request_order,
+              requested.session_id,
+              requested.run_id,
+              requested.attempt_id,
+              requested.execution_id,
+              runs.cancel_request_event_id
+            FROM requested
+            JOIN {TABLE_HOST_RUNS} AS runs
+              ON runs.session_id = requested.session_id
+             AND runs.run_id = requested.run_id
+             AND runs.current_attempt_id = requested.attempt_id
+            JOIN {TABLE_HOST_ATTEMPTS} AS attempts
+              ON attempts.run_id = requested.run_id
+             AND attempts.attempt_id = requested.attempt_id
+             AND attempts.execution_id = requested.execution_id
+            JOIN {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} AS dispatch_records
+              ON dispatch_records.run_id = requested.run_id
+             AND dispatch_records.attempt_id = requested.attempt_id
+             AND dispatch_records.execution_id = requested.execution_id
+             AND dispatch_records.owner_host_instance_id = ?
+            WHERE runs.cancel_request_event_id IS NOT NULL
+            ORDER BY requested.request_order ASC
+            """,
+            tuple(parameters),
+        )
+        candidates.extend(
+            OwnedAttemptCancelCandidate(
+                identity=AttemptExecutionIdentity(
+                    session_id=_decode_required_text(
+                        row,
+                        row_name="owned_attempt_cancel_candidate",
+                        column="session_id",
+                    ),
+                    run_id=_decode_required_text(
+                        row,
+                        row_name="owned_attempt_cancel_candidate",
+                        column="run_id",
+                    ),
+                    attempt_id=_decode_required_text(
+                        row,
+                        row_name="owned_attempt_cancel_candidate",
+                        column="attempt_id",
+                    ),
+                    execution_id=_decode_required_text(
+                        row,
+                        row_name="owned_attempt_cancel_candidate",
+                        column="execution_id",
+                    ),
+                ),
+                cancel_request_event_id=_decode_required_text(
+                    row,
+                    row_name="owned_attempt_cancel_candidate",
+                    column="cancel_request_event_id",
+                ),
+            )
+            for row in rows
+        )
+    return tuple(candidates)
 
 
 def count_runs_by_source_relation(

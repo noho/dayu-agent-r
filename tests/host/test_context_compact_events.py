@@ -65,6 +65,8 @@ def test_requested_payload_builder_accepts_proactive_without_attempt() -> None:
     """proactive requested payload 可以没有 attempt / execution。"""
 
     payload = build_context_compaction_requested_payload(
+        operation_id="event-context-requested-1",
+        max_compaction_attempts_per_operation=5,
         trigger_source=ContextCompactionTriggerSource.PROACTIVE,
         budget_reason="soft_threshold",
         budget_snapshot_ref="budget:snapshot-1",
@@ -75,6 +77,9 @@ def test_requested_payload_builder_accepts_proactive_without_attempt() -> None:
         provider_error_ref=None,
         attempt_id=None,
         execution_id=None,
+        client_correlation_id=None,
+        frozen_material_list_digest=_DIGEST_B,
+        frozen_material_refs=("event-input-1",),
     )
 
     validate_context_compaction_requested_payload(payload)
@@ -84,7 +89,7 @@ def test_requested_payload_builder_accepts_proactive_without_attempt() -> None:
 def test_requested_payload_rejects_missing_required_fields() -> None:
     """requested validator 拒绝缺少顶层必填字段的 payload。"""
 
-    with pytest.raises(ValueError, match="trigger_source is required"):
+    with pytest.raises(ValueError, match="operation_id is required"):
         validate_context_compaction_requested_payload({})
 
 
@@ -98,7 +103,7 @@ def test_requested_payload_rejects_untyped_metadata_for_required_fields() -> Non
         }
     }
 
-    with pytest.raises(ValueError, match="trigger_source is required"):
+    with pytest.raises(ValueError, match="operation_id is required"):
         validate_context_compaction_requested_payload(payload)
 
 
@@ -107,6 +112,8 @@ def test_reactive_requested_requires_attempt_and_execution() -> None:
 
     payload = dict(
         build_context_compaction_requested_payload(
+            operation_id="event-context-requested-2",
+            max_compaction_attempts_per_operation=5,
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
             budget_reason="provider_overflow",
             budget_snapshot_ref="budget:snapshot-1",
@@ -117,6 +124,9 @@ def test_reactive_requested_requires_attempt_and_execution() -> None:
             provider_error_ref="provider-error-1",
             attempt_id=None,
             execution_id=None,
+            client_correlation_id=None,
+            frozen_material_list_digest=_DIGEST_B,
+            frozen_material_refs=("event-input-1",),
         )
     )
     payload["trigger_source"] = "reactive"

@@ -154,11 +154,11 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-HOST-SESSION-EVENT-DELIVERY-01` 已通过 `final-closeout-pass` 并归档；Draft PR #181 仍等待用户手工 merge。 |
-| active work unit | None；`WU-CTX-04` 已由用户明确选为 PR #181 手工 merge 后的下一个 Work Unit，但尚未启动。 |
-| gate | `idle-awaiting-pr-181-manual-merge` |
-| blocking open questions | PR #181 必须已明确 `MERGED`，工作树必须干净，且本地 `main` 必须能从 `github/main` fast-forward；任一条件不满足都停止，不得覆盖现有改动。 |
-| next entry point | 用户手工 merge PR #181 后，对 `WU-CTX-04` 重新执行 preflight：核实 PR merge 状态，获取 `github/main`，fast-forward 本地 `main`，从最新 `main` 创建独立分支，再进入 goal confirmation；此前不得派发 plan 或实施。 |
+| phase | `WU-CTX-04` final closeout。 |
+| active work unit | `WU-CTX-04`；类型为 GitHub Issue #112 对应的 architecture-sensitive issue work unit。 |
+| gate | `final-closeout-pass` |
+| blocking open questions | None。 |
+| next entry point | Draft PR #182 已交付；等待用户 GitHub review / CI 处置与手工 merge，不自动 ready、merge、请求 reviewer 或关闭 Issue。用户完成 merge 后，先在目标 base 依次核对 merge 状态、工作树与 `main` fast-forward preflight；全部通过后才进入唯一 next Work Unit `WU-CTX-01` 的 goal confirmation。 |
 
 ## 推进规则
 
@@ -173,13 +173,13 @@ git push -u github <branch>
 
 ## 实施顺序
 
-用户已明确选择 `WU-CTX-04` 为 PR #181 手工 merge 后的唯一 next Work Unit；该选择不等于提前激活，PR #181 尚未 merge 时不得进入 `WU-CTX-04` goal confirmation、plan 或 implementation。其余 backlog 按以下依赖约束等待后续选择：
+用户已明确选择 `WU-CTX-01` 为 PR #182 手工 merge 后的唯一 next Work Unit；该选择不等于提前激活。PR #182 尚未 merge、目标 base preflight 尚未通过时，当前 phase / active work unit / gate 仍保持 `WU-CTX-04` / `WU-CTX-04` / `final-closeout-pass`，不得进入 `WU-CTX-01` goal confirmation、plan 或 implementation。
 
-1. PR #181 手工 merge 且 preflight 全部通过后，下一项固定为 `WU-CTX-04`；其设计入口引用 `docs/host/design.md` 的“Session attachment access ownership”与“Host Lifecycle / Recovery”。
-2. Tool Trace diagnostics lane 若后续被选择，先推进 `WU-OBS-00`；`WU-OBS-00A` / `WU-OBS-00B` 是其子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立。
-3. Retention lane 的固定顺序见“Retention Issue Dependency / Implementation Order”：`WU-RET-01` -> `WU-RET-03` -> `WU-RET-04` -> `WU-RET-02`。
-4. `WU-AUDIT-01`、`WU-AUDIT-02`、`WU-STRESS-SQLITE-01` 与 `WU-CTX-01` 均需由用户或主总控明确选定后再启动，不因本文档排序自动获得优先级。
-5. `WU-GOV-01`、`WU-CLI-SMOKE-01-R2`、`WU-CM-10` 与 `WU-CM-11` 保持 deferred；只有各自进入条件和用户决策满足后才可恢复。
+1. 用户手工 merge PR #182 后，先在目标 base 依次完成 merge 状态、工作树、`main` fast-forward preflight；三项全部通过后，进入 `WU-CTX-01` goal confirmation。其唯一设计入口是 `docs/host/design.md` §25 “Context Governance”中的 Usage-Anchored Adaptive Context Sizing。
+2. `WU-CTX-01` 是唯一 next Work Unit；其 goal confirmation 必须先完成全部 provider family 的真实流式调用证据与 GitHub Issue #20 scope 对齐，未通过不得进入 plan。
+3. Tool Trace diagnostics lane 若后续被选择，先推进 `WU-OBS-00`；`WU-OBS-00A` / `WU-OBS-00B` 是其子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立。
+4. Retention lane 的固定顺序见“Retention Issue Dependency / Implementation Order”：`WU-RET-01` -> `WU-RET-03` -> `WU-RET-04` -> `WU-RET-02`。
+5. `WU-AUDIT-01`、`WU-AUDIT-02` 与 `WU-STRESS-SQLITE-01` 等 backlog 继续等待用户或主总控后续选定，不因本文档排序自动获得优先级；`WU-GOV-01`、`WU-CLI-SMOKE-01-R2`、`WU-CM-10` 与 `WU-CM-11` 保持 deferred。
 
 ## Residual Risk / 遗留问题追踪
 
@@ -224,8 +224,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
-| WU-CTX-04 | selected-next-blocked-by-pr-181-merge | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 | 用户明确指定为 Draft PR #181 手工 merge 后的下一个 WU；设计真源为 `docs/host/design.md` 的“Session attachment access ownership”、attachment-aware recovery与每Run/input snapshot唯一proactive operation不变量。merge后重新preflight，再进入goal confirmation；此前不得派发plan或实施。 |
-| WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
+| WU-CTX-04 | draft-pr-open / final-closeout-pass | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 / draft PR #182 | accepted plan=`1f032b5e`；accepted Slice 1=`eda1d70e`；accepted Slice 2=`4ca0810b`；accepted Slice 3=`24dfcf37`；aggregate deepreview PASS；等待用户review/merge。 |
+| WU-CTX-01 | pending-next-after-merge | Usage-Anchored Adaptive Context Sizing | GitHub Issue #20；外部 body 待对齐 | PR #182 手工 merge 与目标 base preflight 通过后唯一 next Work Unit；实现 usage anchor + conservative-estimated delta，并在 goal confirmation 对全部 provider family 做真实流式调用核对 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
@@ -688,7 +688,116 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 
 ### 状态
 
-GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-181-merge`。用户已明确选择本 WU 作为 Draft PR #181 手工 merge 后的下一个 Work Unit；在 PR #181 明确 `MERGED`、工作树干净且本地 `main` 可从 `github/main` fast-forward 之前，本 WU 不得进入 goal confirmation、plan 或 implementation。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；后续 goal confirmation 必须以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。
+GitHub Issue #112 当前为 OPEN；本条状态为 `draft-pr-open / final-closeout-pass`。PR #181 已于 2026-07-22 明确 `MERGED`，merge commit 为 `974f9e16`；本地 `main` 已从 `github/main` fast-forward 到该提交，工作树干净，并已从该基线创建 `feat/wu-ctx-04`。设计裁决已经写入 `docs/host/design.md` 的“Session attachment access ownership”与 attachment-aware “Host Lifecycle / Recovery”；本轮 goal confirmation 以该设计为真源，不得重新退回 workspace-wide read-only、自动 promotion、lease/fence 或 proxy 方案。2026-07-22 用户已确认本节既定目标、非目标、scope boundary 与验收信号。accepted plan保护提交为`1f032b5e`；Slice 1 contract-only实现及review loop已通过，受保护本地commit为`eda1d70e`。Slice 2联合implementation、initial review、review fix与双路re-review均已闭环，Controller最终acceptance decision=`pass`；zero-request orphan/unknown proactive history现由projection owner严格fail closed，recovery nested work-lease contract与Host close mandatory/best-effort文档已同步。Slice 3 implementation、initial双路review、Controller adjudication、review fix与双路re-review均已完成；3项accepted findings全部fixed，两路均为`pass`且0个新actionable findings，Controller最终acceptance decision=`pass`，accepted Slice 3保护提交为`24dfcf37`。三个implementation slices均已保护。AgentMiMo与AgentDS相对main baseline执行aggregate deepreview后均判定PASS；Controller逐项裁决9个reviewer finding编号，接受0项、驳回9项，没有deferred/needs-more-evidence/blocking question。branch-wide diff、full pyright与publish preflight通过，feature branch已推送；draft PR #182为OPEN/draft，base=`main`、head=`feat/wu-ctx-04`。final closeout=`pass`，等待用户review/merge。
+
+### Gate artifacts
+
+- goal confirmation：2026-07-22 用户确认；decision=`pass`；blocking open questions=None。
+- plan：`docs/reviews/wu-ctx-04-plan-codex.md`；AgentCodex initial completion=`complete`；原4 slices经review fix后收敛为3 slices，其中attachment/target recovery与proactive crash resume因不存在稳定可发布checkpoint而合并为同一Slice 2原子闭环；artifact completeness、独立whitespace check与`git diff --check`通过；尚不等于accepted plan。
+- plan review：`docs/reviews/plan-review-20260722-110302.md`（AgentMiMo）与 `docs/reviews/plan-review-20260722-110343.md`（AgentDS），均为 `pass-with-risks`；总控裁决 artifact=`docs/reviews/wu-ctx-04-plan-review-controller-adjudication.md`，decision=`needs-fix`，accepted=8、rejected=3、deferred=1、needs-more-evidence=0。
+- plan fix：`docs/reviews/wu-ctx-04-plan-fix-codex.md`；AgentCodex completion=`complete`；7组accepted fix requirements均已逐项映射，MIMO-003保持deferred到implementation review，MIMO-005 / DS-F01 / DS-F07未扩scope；总控复读decision=`accepted-for-plan-re-review`，blocking open questions=None。
+- plan re-review：`docs/reviews/plan-review-20260722-113813.md`（AgentMiMo）与`docs/reviews/plan-review-20260722-113814.md`（AgentDS），均为`pass-with-risks`且确认原7组accepted findings已修复。总控裁决artifact=`docs/reviews/wu-ctx-04-plan-re-review-controller-adjudication.md`，decision=`needs-fix`：新接受`PRR-001` Host close在scheduler lifecycle quiesce前释放mutex的恢复竞态，以及`PRR-002` reactive `engine_ingest.py`生产调用点/测试遗漏；另有2项驳回、1项证据失效、0个blocking questions。
+- second plan fix：`docs/reviews/wu-ctx-04-plan-re-review-fix-codex.md`；AgentCodex completion=`complete`；`PRR-001`与`PRR-002`已分别映射到scheduler-before-unlock lifecycle barrier、cleanup fail-closed/retry contract、reactive producer/caller allowed scope与focused tests；原7组closure、3 slices及deferred/rejected裁决保持不变；总控复读decision=`accepted-for-second-plan-re-review`。
+- second plan re-review：`docs/reviews/plan-review-20260722-120429.md`（AgentMiMo，`pass-with-risks`）与`docs/reviews/plan-review-20260722-120430.md`（AgentDS，`pass`）；均判定`PRR-001`/`PRR-002`已修复、原7组closure与3-slice边界无回归。最终总控artifact=`docs/reviews/wu-ctx-04-plan-acceptance-controller.md`，decision=`pass`；MiMo新增Host级测试命名观察被驳回，`pending.policy=None`观察被直接类型/路径证据判为evidence-invalid。
+- accepted plan commit：`1f032b5e`（`gateflow: accept plan for WU-CTX-04`）。
+- Slice 1 implementation：`docs/reviews/wu-ctx-04-slice-1-implementation-codex.md`；
+  contract-only strict-native mutex、internal attachment registry与限定API value types完成；
+  focused pytest初次`43 passed`、runtime suite初次`594 passed`、全量pyright`0 errors`、
+  owner module coverage分别`91%`/`86%`。
+- Slice 1 code review：`docs/reviews/code-review-20260722-124340.md`（AgentMiMo）与
+  `docs/reviews/code-review-20260722-124418.md`（AgentDS）；总控裁决artifact=
+  `docs/reviews/wu-ctx-04-slice-1-code-review-controller-adjudication.md`，decision=`needs-fix`；
+  仅接受`CR-DS-001`为低风险双失败诊断链缺口，驳回4项findings并关闭recovery多lease open question。
+- Slice 1 fix：`docs/reviews/wu-ctx-04-slice-1-review-fix-codex.md`；外层typed unavailable
+  contract不变，以`ExceptionGroup` cause结构化保留prior native error与partial close error；
+  focused pytest增至`44 passed`、owner module coverage=`92%`/`86%`、targeted pyright=`0 errors`。
+- Slice 1 re-review：`docs/reviews/code-review-20260722-125826.md`（AgentMiMo）与
+  `docs/reviews/code-review-20260722-125901.md`（AgentDS）均判定`CR-DS-001 fixed`、无new
+  findings/blocking/open questions；最终总控artifact=
+  `docs/reviews/wu-ctx-04-slice-1-acceptance-controller.md`，decision=`pass`。Controller
+  post-fix runtime suite=`595 passed`、全量pyright=`0 errors`。
+- accepted Slice 1 commit：`eda1d70e`（`gateflow: accept WU-CTX-04 slice 1`）。
+- Slice 2 initial implementation audit：`docs/reviews/wu-ctx-04-slice-2-implementation-codex.md`
+  初始状态=`blocked`，production/test code未开始；B-001/B-002均为accepted plan漏列直接测试消费者。
+  Controller scope amendment=`docs/reviews/wu-ctx-04-slice-2-scope-amendment-controller.md`，
+  decision=`resume-with-narrow-test-only-amendment`；仅追加`test_public_host_admin.py`、
+  `test_active_cancel_dispatch.py`与同rename链的`test_terminal_post_commit.py`机械迁移，blocking
+  open questions=None。
+- Slice 2 implementation完成后双路code review：
+  `docs/reviews/code-review-20260722-161504-mimo.md`（AgentMiMo）与
+  `docs/reviews/code-review-20260723-000000-ds.md`（AgentDS）；Controller独立复核artifact=
+  `docs/reviews/wu-ctx-04-slice-2-code-review-controller-adjudication.md`，decision=`needs-fix`。
+  blocking finding=`CTRL-S2-001`：无proactive request时orphan/unknown compaction rows在strict
+  校验前被投影为`ABSENT`，可错误创建request/provider side effect；另接受recovery nested
+  work-lease contract/test与Host close mandatory/best-effort docstring澄清，blocking questions=None。
+- Slice 2 review fix：`docs/reviews/wu-ctx-04-slice-2-review-fix-codex.md`；
+  `CTRL-S2-001`、`F-DS-01`与Controller接受的close docstring correction均完成；focused
+  pytest=`153 passed`，Host suite=`2133 passed, 1 skipped, 6 deselected`，全量pyright=`0 errors`，
+  targeted ruff与`git diff --check`通过；completion=`pass-for-re-review`，未提交。
+- Slice 2 code re-review：`docs/reviews/wu-ctx-04-slice-2-re-review-mimo.md`（AgentMiMo）与
+  `docs/reviews/wu-ctx-04-slice-2-re-review-ds.md`（AgentDS）均判定accepted findings fixed并建议
+  pass；Controller最终artifact=`docs/reviews/wu-ctx-04-slice-2-acceptance-controller.md`，
+  decision=`pass`。DS新增identity observation被直接控制流反证为evidence-invalid，其余新增
+  observations均未形成actionable gap；blocking questions=None。
+- accepted Slice 2 commit：`4ca0810b`（`gateflow: accept WU-CTX-04 slice 2`）。
+- Slice 3 pre-edit audit：`docs/reviews/wu-ctx-04-slice-3-implementation-codex.md`初始
+  status=`blocked`；Controller直接核对确认严格`session_id`/target wake契约遗漏两个测试消费者。
+  scope amendment=`docs/reviews/wu-ctx-04-slice-3-scope-amendment-controller.md`，decision=
+  `resume-with-narrow-test-only-amendment`；仅追加`test_dispatch_scheduler.py`与
+  `test_admission_multiprocess.py`做required signature/obsolete global-watchdog机械迁移。
+- Slice 3 implementation：同一artifact=`docs/reviews/wu-ctx-04-slice-3-implementation-codex.md`
+  最终status=`complete`，并保留初始blocker与scope amendment历史。execution owner按本地exact
+  identity快照读取strict durable cancel link并传播token/hook；target watchdog不再做workspace-wide
+  scan，terminal closeout复用唯一producer。计划8.4=`325 passed`，amendment tests=`110 passed`，
+  最终全量=`5590 passed, 11 skipped, 6 deselected`，全量pyright=`0 errors`；21个变更production
+  Python文件逐文件coverage均>=80%，最低81%。
+- Slice 3 initial code review：`docs/reviews/wu-ctx-04-slice-3-code-review-mimo.md`
+  （AgentMiMo，`pass`，0 findings）与
+  `docs/reviews/wu-ctx-04-slice-3-code-review-ds.md`（AgentDS，`pass`，1 Medium + 3 Low）。
+  Controller adjudication=`docs/reviews/wu-ctx-04-slice-3-code-review-controller-adjudication.md`，
+  decision=`needs-fix`：接受独立execution-owner poll被proactive compactor阻塞、canonical cancel
+  reason被dispatch常量替代、dynamic VALUES bind可移植性3项；驳回workspace-wide safety scan、
+  LRU/size guard与无失败条件的monkeypatch观察。blocking questions=None。
+- Slice 3 review fix：`docs/reviews/wu-ctx-04-slice-3-review-fix-codex.md`；
+  `CTRL-S3-001`以独立health-supervised execution-owner cancel periodic task解除Session
+  reconcile/proactive compactor阻塞并覆盖open/failed-open/close；`CTRL-S3-002`由run-transition
+  typed delivery投影canonical cancel reason，dispatch不再生成替代常量；`CTRL-S3-003`在同一
+  transaction内按SQLite历史默认999 bind预算推导199条安全批次，先做完整输入校验并严格保持
+  全局输入顺序。focused matrix=`438 passed`，terminal producer manifest=`1 passed`，canonical
+  全量=`5593 passed, 11 skipped, 6 deselected`，全量pyright=`0 errors`；coverage测试面
+  `3542 passed, 9 skipped, 6 deselected`，21个变更production Python文件逐文件均>=80%。
+  Controller独立复跑4个根因反例=`4 passed`，fix相关production/tests pyright=`0 errors`；
+  blocking questions=None，下一步为双路re-review。
+- Slice 3 code re-review：`docs/reviews/wu-ctx-04-slice-3-re-review-mimo.md`（AgentMiMo）与
+  `docs/reviews/wu-ctx-04-slice-3-re-review-ds.md`（AgentDS）均判定`CTRL-S3-001/002/003`
+  已root-cause closure，verdict=`pass`，0个new actionable findings，blocking questions=None。
+  AgentMiMo独立full Host=`2150 passed, 2 skipped, 6 deselected`；AgentDS独立canonical
+  full suite=`5593 passed, 11 skipped, 6 deselected`，两路pyright均`0 errors`。
+- Slice 3最终Controller acceptance：
+  `docs/reviews/wu-ctx-04-slice-3-acceptance-controller.md`，decision=`pass`；Controller按
+  production owner、根因反例、唯一terminal producer、typed canonical reason与batch order
+  证据独立裁决，不按review票数接受。所有residual risk均已分类，blocking questions=None；
+  允许创建accepted Slice 3保护提交并进入aggregate deepreview。
+- accepted Slice 3 commit：`24dfcf37`（`gateflow: accept WU-CTX-04 slice 3`）。
+- aggregate deepreview：`docs/reviews/wu-ctx-04-aggregate-deepreview-mimo.md`（AgentMiMo，
+  `PASS`）与`docs/reviews/wu-ctx-04-aggregate-deepreview-ds.md`（AgentDS，`pass`）；两路均
+  确认跨3个slices的attachment ownership、native mutex、proactive recovery、close barrier、
+  target-only cancel/watchdog、canonical reason、terminal producer、SQLite batching、public/
+  LLM-facing/README一致性无blocking regression。
+- aggregate deepreview Controller adjudication：
+  `docs/reviews/wu-ctx-04-aggregate-deepreview-controller-adjudication.md`，decision=`pass`；
+  9个reviewer finding编号去重为7个语义观察后全部驳回。主要原因包括：与Slice 1已接受的
+  mutex release fail-closed contract冲突、无当前lease泄漏producer、typed/private调用图不可达、
+  already-done Future正确完成语义或纯未来假设。接受=0、deferred=0、needs-more-evidence=0、
+  blocking questions=None。
+- aggregate deepreview commit：`e7da8ed5`（`gateflow: pass WU-CTX-04 aggregate deepreview`）。
+- publish preflight：`github/main == main == 974f9e16`，full pyright=`0 errors`，整分支
+  `git diff --check`通过，工作树干净且不存在同head既有PR。review artifact纯机械whitespace
+  cleanup commit=`e421e4b0`。
+- draft PR：`https://github.com/noho/dayu-agent-r/pull/182`；state=`OPEN`、draft=`true`、
+  base=`main`、head=`feat/wu-ctx-04`。未ready、merge、请求reviewer、评论或修改Issue #112。
+- final closeout：`docs/reviews/wu-ctx-04-final-closeout-controller.md`；decision=
+  `final-closeout-pass`，所有residual risk已分类，blocking questions=None。
 
 ### 已确认问题与直接代码证据
 
@@ -768,46 +877,74 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `selected-next-blocked-by-pr-
 - `max_compaction_attempts_per_operation`与Runner`max_retries`的owner、默认值、字段说明和测试互不混淆；前者是同一durable compaction operation内所有semantic proposal attempts总预算，后者是每次Runner call的transport retry。不存在proactive operation count配置。
 - 受影响文件单文件覆盖率目标 `>=80%`，完整 pyright 与受影响测试通过；按触发规则完成 Host、Service/UI、runtime、config、tests与分层 README audit。
 
-## WU-CTX-01 Provider Tokenizer / Sizing Adapter
+## WU-CTX-01 Usage-Anchored Adaptive Context Sizing
 
 ### 状态
 
-GitHub Issue #20 当前仍为 OPEN，且 issue body 已对齐 WU-CTX-01 当前 scope。代码核对显示 Host 仍只有 conservative estimator，没有 provider/model-aware sizing adapter；本条仍有效。
+GitHub Issue #20 当前仍为 OPEN，但截至本次只读核对，其 title / body 仍以 provider tokenizer / provider-model sizing adapter 为 scope，已经与 `docs/host/design.md` §25 的 Usage-Anchored Adaptive Context Sizing 新设计不一致。本轮只更新本地设计真源与实施总控，没有修改 GitHub；Issue #20 外部 owner / body 必须在 goal confirmation 中核对，并在进入 plan 前获得授权后完成 scope 对齐。
+
+本条状态是 `pending-next-after-merge`，不是 active gate。PR #182 仍等待用户手工 merge；merge 状态、工作树与目标 base `main` fast-forward preflight 全部通过后，才允许进入 WU-CTX-01 goal confirmation。
 
 ### 设计与代码核对
 
-- `docs/host/design.md` 明确 provider tokenizer adapter 是 Host 预算治理的后续精确能力，第一版使用 conservative estimator 与 provider-aware configured limits。
-- `docs/host/design.md` 目前存在一处待收敛表述：配置章节说明 `ContextBudgetPolicy` 不暴露 `reserved_output_tokens`，但 Context Governance 章节仍写 `reserved_output_tokens` 是 Host context policy 的显式 typed input。当前代码实际是 ratio-first policy，没有 `reserved_output_tokens` 字段；进入 #20 plan 前必须先裁决并修正设计表述。
+- `docs/host/design.md` §25 已固定 usage-anchored 算法、owner、anchor compatibility / invalidation、durable pairing、fallback、threshold semantics、reactive 边界、非目标与确定性要求；provider tokenizer / provider count adapter 不再是目标。
 - `dayu/host/context_budget.py` 当前模块 docstring 明确是 conservative estimator，不读取 Engine spec、provider overflow payload、metadata 或 extra payload。
 - `estimate_context_budget(...)` 当前按文本长度、canonical JSON byte length、message overhead 和 tool schema overhead 估算 token。
-- `ContextBudgetPolicy` 当前只包含 `context_window_size`、soft / hard threshold ratio、compaction 次数上限和 `policy_ref`，没有 provider/model-aware tokenizer 或 sizing adapter 字段。
-- Engine README 明确 Engine 不做 proactive threshold compaction、provider-aware tokenizer 或 Host budget policy。
+- `ContextBudgetPolicy` 是 ratio-first policy：`context_window_size`、soft / hard threshold ratio、compaction 次数上限和 `policy_ref` 继续由既有 owner 管理；新算法不动态改写 ratio。
+- PR #182 建立的 `RUNNER_CALL_INPUT_ASSEMBLED` + `RUNNER_CALL_INPUT_ITERATION_LINKED` 与 iteration-scoped usage 是 pairing 的唯一直接证据入口。WU-CTX-01 必须验证现有 contract 足以把同一完整 input 的 `E_anchor` 与同一 iteration 的 `prompt_tokens` durable 配对；若不足，应在 goal confirmation 记录 blocking contract gap，不得从 provider request id、时间戳或 `USER_INPUT_ACCEPTED.display_text` 推断。
+- `RunnerSpec.supports_stream_usage` 只门控是否发送 OpenAI `stream_options.include_usage=true` 扩展，不是 usage availability predicate。Engine / Host 必须按实际合法 `USAGE_REPORTED` presence 建立 anchor；例如 MiMo 流式 chunk 可以自动返回 nullable usage，且不要求发送 `include_usage`，不需要 provider-name branch。
+- 当前 `USAGE_REPORTED` 已 durable 保存 `prompt_tokens` / `completion_tokens` / `total_tokens` 等内部 signal，但 Host public activity allowlist 没有 usage projection，Service 会丢弃 `activity=None` 的事件；当前 UI 至多能看到 compact activity，不能读取 typed context utilization。WU-CTX-01 必须修复 public contract 缺口，但不得把 raw `USAGE_REPORTED` payload、`payload_ref` 或 EventLog reader 泄漏给 UI。
 
 ### 目标
 
-- 为不同 provider / model 的 token / context sizing 建立 typed adapter 或 compatible estimator boundary。
-- 让 proactive compact、reactive compact、RunInputBuilder budget material、compact before / after estimate 和 usage-observation diagnostics 使用同一 sizing abstraction。
-- 支持 provider / model dimension selection，但不得在 Context Governance policy code 中硬编码 provider 名称分支。
-- 保留 conservative fallback estimator，并在 diagnostics / compact facts / budget traces 中记录 estimator / sizing adapter id 与版本。
-- 覆盖中文 / 英文混合财报文本、JSON / table-like excerpts、tool facts、citation / source refs、memory material、compact artifacts 和 tool schema overhead。
+- 对成功 ordinary runner call，在 dispatch 前用现有 conservative estimator 冻结同源完整 input 的 `E_anchor`，再把同一 iteration 实际出现并由 Engine 归一化的 `usage.prompt_tokens` durable 配对为 `U_anchor`。
+- 下一候选完整 input 使用同一 estimator / version 计算 `E_current`，预算预测固定为 `P_current = U_anchor + (E_current - E_anchor)`；signed delta 必须来自可证明的完整 input / manifest lineage。
+- proactive compact、hard budget decision、compact / fallback 前后 sizing 与相关 diagnostics 使用同一 sizing contract。动态的是 estimate anchoring，不是 `soft_threshold_context_ratio` / `hard_threshold_context_ratio`。
+- usage 缺失、非法、无法唯一关联，或 anchor 因 provider / model / context window / estimator / request semantics / accepted compact / lineage gap 不兼容时，对当前完整输入使用现有 conservative estimator。
+- 若较旧 compatible anchor 之后的全部输入变化仍可从 durable lineage 重建，允许继续从该 anchor 累计 delta；任一变化不可证明则整体 fallback。
+- 保持 provider-neutral：Host 只按 typed identity、manifest lineage 与实际 `USAGE_REPORTED` presence 判断，不硬编码 provider 名称。
+- 对每个 ordinary / post-compact / dispatch-fallback 候选输入的 dispatch-relevant sizing result，先 durable append canonical `CONTEXT_BUDGET_EVALUATED`，再执行由该 decision 驱动的 proactive compact 或 dispatch。Host 从该同一 result 投影 `HostActivityKind.CONTEXT_USAGE` + typed `HostContextUsageView`，Service 原样投影为 `EntrypointContextUsage` 并通过既有 activity callback 交付，供未来 UI 展示当前上下文占用。
+- typed public context-usage view 至少包含 `predicted_input_tokens`、`context_window_size`、未 clamp 的 `utilization_basis_points`、soft / hard threshold tokens、`estimate_method=usage_anchored|conservative_fallback` 与 `pressure_level=normal|soft_threshold_exceeded|hard_threshold_exceeded`。Host 拥有这些派生值；UI 只拥有“上下文约使用 62%”之类展示格式。
+
+### Goal confirmation 进入条件与证据
+
+- 在 PR #182 手工 merge 与目标 base preflight 通过后，读取当时有效的 `models.json`，对其覆盖的 DeepSeek、OpenAI、Anthropic、Gemini、MiMo、Qwen、Ollama 七个 provider family 分别执行至少一次真实流式 ordinary call。probe 必须走与生产 ordinary call 匹配的 Dayu Runner / SSE / Engine usage normalization 链路，不能只查厂商文档、直接用旁路 HTTP 得出结论，也不能用 mock 代替。
+- 每个 provider family 的 goal-confirmation artifact 至少记录实际 endpoint、实际 model、stream mode、response 中是否出现 usage、usage 位于哪个 response / chunk、是否需要 `stream_options.include_usage`、Dayu 是否产生归一 usage event，以及 usage 缺失 / 非法时实际进入的 fallback。artifact 只记录脱敏结构与计数，不得暴露 API key、authorization header、完整原始响应或其它敏感内容。
+- live probe 只提供 goal confirmation evidence，不等于 implementation。不得在 goal confirmation 修改 provider config、Runner parser、usage normalization 或其它生产行为来让 probe 通过。
+- 任一 provider 缺少凭据、有效 endpoint、可调用 model、网络，或 Ollama 缺少本地可用模型时，记为 blocking open question，goal confirmation 不得 pass、不得进入 plan；只有用户明确裁决调整 provider scope 后才能继续。
+- goal confirmation 必须验证 #182 的 complete runner-call manifest、accepted iteration link 与 iteration-scoped usage 是否足以形成直接同源 pairing。若 contract 不足，记录 blocking contract gap；不得侵入 WU-OBS-00B / GitHub Issue #119 的 analyzer correlation owner，也不得通过新增 provider request identity 推断关系。
+- GitHub Issue #20 的外部 tokenizer framing 必须在进入 plan 前与本节及 `docs/host/design.md` §25 对齐；本轮没有修改外部 Issue。
 
 ### 非目标
 
+- 不引入 provider tokenizer、provider/model sizing adapter、远程 token-count endpoint、tokenizer 下载或运行时 tokenizer 版本管理。
 - 不在 Context Governance 中硬编码 provider 名称分支。
 - 不让 Engine provider 实现反向依赖 Host。
 - 不把 compact / retry / proactive threshold governance 移入 Engine。
 - 不移除 conservative fallback behavior。
 - 不用 metadata 或 extra payload 夹带 sizing decision。
+- 不训练全局 correction model，不跨 provider / model 共享学习系数，不动态修改 soft / hard ratio。
+- 不按“上一次 usage 已超过 ratio，下一 Run 才 compact”的滞后规则执行；下一候选输入差量必须进入 dispatch 前预测。
+- 不让 compactor proposal usage 污染 ordinary anchor，不用 reactive overflow 或 compact 后另一份输入的 usage 伪造失败输入的精确误差。
+- 不实现具体 CLI / Web / WeChat 的进度条、颜色、文案、小数位或历史图表；本 Work Unit 只把 typed Host -> Service public contract 和既有 activity callback 交付路径准备完整。
+- 不把 raw provider usage、anchor refs / digests、provider request id、完整 messages、policy internal ref 或 estimator diagnostic 暴露给 UI，也不让 UI 从 `USAGE_REPORTED`、EventLog payload 或 summary 文本自行计算百分比。
 
 ### 验收信号
 
-- Host 有 typed provider/model-aware sizing adapter boundary，并保留 conservative fallback。
-- Proactive / reactive compact decisions 使用同一 sizing entrypoint。
-- RunInputBuilder budget material、compact before / after estimates 和 usage-observation diagnostics 能引用 estimator id / version。
-- Provider / model selection 与 fallback behavior 有明确测试。
-- 至少覆盖一个 provider-specific 或 provider-compatible sizing implementation 加 fallback。
-- 测试覆盖中文 / 英文混合财报文本、JSON / table-like excerpts、tool facts、citation / source refs 和 tool schema overhead。
-- Host / Engine layering tests 继续证明无反向依赖、无 Engine-owned Host compact policy。
+- 直接公式测试证明 compatible anchor 使用 `P_current = U_anchor + (E_current - E_anchor)`，包括 signed positive / negative delta；同源关系无法证明时不使用该公式。
+- `U_anchor / context_window_size = 62%` 且下一输入 delta 使 `P_current` 跨过 65% soft threshold 时，下一 Run 在 dispatch 前主动 compact；不能等到上一次 usage 自身越过 ratio。
+- usage 可用时建立 / 刷新 compatible anchor；usage 缺失、nullable、非法、iteration pairing 缺失或 manifest mismatch 时，对当前完整输入执行 deterministic conservative fallback，Run 不因 usage 缺失失败。
+- 较旧 compatible anchor 在中间一次或多次 usage 缺失、但全部输入变化可 durable 重建时继续累计 delta；任一 lineage gap 立即 fallback。
+- provider / model / context window / estimator id 或 version / request serialization semantics 切换使 anchor 失效；accepted compact 使旧基线失效，post-compact immediate sizing 先走完整 fallback，后续成功 ordinary call 才建立新 anchor。
+- compactor proposal usage 永不成为 ordinary anchor；reactive provider overflow 只触发现有 recovery / fallback，不生成伪造的 token delta 或 calibration sample。
+- dispatch 前 `E_anchor`、`RUNNER_CALL_INPUT_ASSEMBLED`、accepted `RUNNER_CALL_INPUT_ITERATION_LINKED` 与同 iteration `USAGE_REPORTED` 可以在 crash / replay 后 durable 重建并得到相同预测和 decision；不得从 display text、时间戳或 provider request id 反推。
+- soft / hard ratios 与由其派生的 thresholds 不被 usage 动态修改；usage 不回写已经完成的 dispatch decision。
+- anchored 路径的 public `predicted_input_tokens` 等于同一 decision 的 `P_current`；fallback 路径等于当前完整输入的 conservative estimate。两条路径的 `utilization_basis_points` 都严格按 `floor(predicted_input_tokens * 10000 / context_window_size)` 计算且不 clamp，pressure level 与真正驱动 compact / dispatch 的 soft / hard decision 一致。
+- `CONTEXT_BUDGET_EVALUATED` 在 durable event sequence 中先于由它驱动的 `CONTEXT_COMPACTION_REQUESTED` 或 `RUN_STARTED` / `ATTEMPT_STARTED`；stable identity / idempotency 绑定 Run、候选 input snapshot / digest、sizing stage、policy snapshot 与 estimator contract，重复 watch / reconciliation 不生成互相矛盾的 utilization activity。internal compactor proposal sizing 和刚返回但尚未形成下一候选输入的历史 usage 不产生 public context-usage activity。
+- Host public projection tests 覆盖 `HostActivityKind.CONTEXT_USAGE`、typed `HostContextUsageView`、anchored / fallback method、normal / soft / hard pressure、超过 100% 不 clamp、缺 policy 时 unavailable；Service tests 覆盖 `EntrypointContextUsage` 字段无重算透传和既有 activity callback 交付。raw `USAGE_REPORTED` 继续没有 public activity，UI 无需且不得读取 EventLog payload。
+- goal confirmation artifact 覆盖 DeepSeek、OpenAI、Anthropic、Gemini、MiMo、Qwen、Ollama 的真实流式 ordinary-call usage 行为和 fallback，且没有 secret / sensitive raw payload 泄漏。
+- Host / Engine layering tests 继续证明无反向依赖、无 Engine-owned Host compact policy、无 provider-name branch；完整 conservative fallback 继续覆盖中文 / 英文混合财报文本、JSON / table-like excerpts、tool facts、citation / source refs、memory / compact material与 tool schema overhead。
+- 实现改动触发的 Host、Service、CLI/UI、tests 与分层 README 必须按各自 README 约束审计；即使具体 UI 暂不渲染，也必须保证新增可选 typed 字段不会破坏既有 CLI activity formatter。
 
 ## WU-CM-10 Conversation Memory Eval Benchmark
 

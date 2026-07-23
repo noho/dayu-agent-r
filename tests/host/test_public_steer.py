@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+from contextlib import AsyncExitStack
 
 import pytest
 
@@ -18,6 +19,7 @@ from dayu.host import (
 from tests.host.public_smoke_support import (
     AwaitingThenFinalWorkerFactory,
     awaiting_tooling_options,
+    close_attachment_shielded,
     deterministic_runner_spec,
     open_host_options,
     wait_for_diagnostic_event_type_count,
@@ -42,8 +44,16 @@ async def test_steer_running_run_creates_new_attempt_public_path(
     """submit_followup(steer) 在同一 Run 上创建新 Attempt 并取消旧 worker。"""
 
     factory = _SequencedWorkerFactory([_BLOCK, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("steer"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded,
+            attachment,
+        )
         first = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "steer-source"),
@@ -98,8 +108,16 @@ async def test_steer_waiting_run_creates_new_attempt_public_path(
         allow_tool_calls=True,
         tooling_options=awaiting_tooling_options(),
     )
-    async with open_host(options) as host:
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("steer-waiting"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded,
+            attachment,
+        )
         first = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "steer-waiting-source"),
@@ -138,8 +156,16 @@ async def test_steer_replays_same_client_request_id_idempotently(
     """submit_followup(steer) 同 key 同语义重放返回同一 Run。"""
 
     factory = _SequencedWorkerFactory([_BLOCK, _FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("steer-idempotent"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded,
+            attachment,
+        )
         first = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "steer-idempotent-source"),
@@ -183,8 +209,16 @@ async def test_steer_terminal_race_rejects_non_active_target(
     """
 
     factory = _SequencedWorkerFactory([_FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
+    async with (
+        open_host(_options(tmp_path, factory)) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
         session = await host.ensure_session(_ensure_request("steer-terminal"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded,
+            attachment,
+        )
         source = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "steer-terminal-source"),
