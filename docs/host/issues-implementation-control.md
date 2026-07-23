@@ -158,7 +158,7 @@ git push -u github <branch>
 | active work unit | `WU-CTX-04`；类型为 GitHub Issue #112 对应的 architecture-sensitive issue work unit。 |
 | gate | `final-closeout-pass` |
 | blocking open questions | None。 |
-| next entry point | Draft PR #182已交付；等待用户GitHub review / CI处置与手工merge，不自动ready、merge、请求reviewer或关闭Issue。 |
+| next entry point | Draft PR #182 已交付；等待用户 GitHub review / CI 处置与手工 merge，不自动 ready、merge、请求 reviewer 或关闭 Issue。用户完成 merge 后，先在目标 base 依次核对 merge 状态、工作树与 `main` fast-forward preflight；全部通过后才进入唯一 next Work Unit `WU-CTX-01` 的 goal confirmation。 |
 
 ## 推进规则
 
@@ -173,13 +173,13 @@ git push -u github <branch>
 
 ## 实施顺序
 
-用户已明确选择 `WU-CTX-04` 为 PR #181 手工 merge 后的唯一 next Work Unit；该选择不等于提前激活，PR #181 尚未 merge 时不得进入 `WU-CTX-04` goal confirmation、plan 或 implementation。其余 backlog 按以下依赖约束等待后续选择：
+用户已明确选择 `WU-CTX-01` 为 PR #182 手工 merge 后的唯一 next Work Unit；该选择不等于提前激活。PR #182 尚未 merge、目标 base preflight 尚未通过时，当前 phase / active work unit / gate 仍保持 `WU-CTX-04` / `WU-CTX-04` / `final-closeout-pass`，不得进入 `WU-CTX-01` goal confirmation、plan 或 implementation。
 
-1. PR #181 手工 merge 且 preflight 全部通过后，下一项固定为 `WU-CTX-04`；其设计入口引用 `docs/host/design.md` 的“Session attachment access ownership”与“Host Lifecycle / Recovery”。
-2. Tool Trace diagnostics lane 若后续被选择，先推进 `WU-OBS-00`；`WU-OBS-00A` / `WU-OBS-00B` 是其子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立。
-3. Retention lane 的固定顺序见“Retention Issue Dependency / Implementation Order”：`WU-RET-01` -> `WU-RET-03` -> `WU-RET-04` -> `WU-RET-02`。
-4. `WU-AUDIT-01`、`WU-AUDIT-02`、`WU-STRESS-SQLITE-01` 与 `WU-CTX-01` 均需由用户或主总控明确选定后再启动，不因本文档排序自动获得优先级。
-5. `WU-GOV-01`、`WU-CLI-SMOKE-01-R2`、`WU-CM-10` 与 `WU-CM-11` 保持 deferred；只有各自进入条件和用户决策满足后才可恢复。
+1. 用户手工 merge PR #182 后，先在目标 base 依次完成 merge 状态、工作树、`main` fast-forward preflight；三项全部通过后，进入 `WU-CTX-01` goal confirmation。其唯一设计入口是 `docs/host/design.md` §25 “Context Governance”中的 Usage-Anchored Adaptive Context Sizing。
+2. `WU-CTX-01` 是唯一 next Work Unit；其 goal confirmation 必须先完成全部 provider family 的真实流式调用证据与 GitHub Issue #20 scope 对齐，未通过不得进入 plan。
+3. Tool Trace diagnostics lane 若后续被选择，先推进 `WU-OBS-00`；`WU-OBS-00A` / `WU-OBS-00B` 是其子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立。
+4. Retention lane 的固定顺序见“Retention Issue Dependency / Implementation Order”：`WU-RET-01` -> `WU-RET-03` -> `WU-RET-04` -> `WU-RET-02`。
+5. `WU-AUDIT-01`、`WU-AUDIT-02` 与 `WU-STRESS-SQLITE-01` 等 backlog 继续等待用户或主总控后续选定，不因本文档排序自动获得优先级；`WU-GOV-01`、`WU-CLI-SMOKE-01-R2`、`WU-CM-10` 与 `WU-CM-11` 保持 deferred。
 
 ## Residual Risk / 遗留问题追踪
 
@@ -225,7 +225,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
 | WU-CTX-04 | draft-pr-open / final-closeout-pass | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 / draft PR #182 | accepted plan=`1f032b5e`；accepted Slice 1=`eda1d70e`；accepted Slice 2=`4ca0810b`；accepted Slice 3=`24dfcf37`；aggregate deepreview PASS；等待用户review/merge。 |
-| WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
+| WU-CTX-01 | pending-next-after-merge | Usage-Anchored Adaptive Context Sizing | GitHub Issue #20；外部 body 待对齐 | PR #182 手工 merge 与目标 base preflight 通过后唯一 next Work Unit；实现 usage anchor + conservative-estimated delta，并在 goal confirmation 对全部 provider family 做真实流式调用核对 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
@@ -877,46 +877,74 @@ GitHub Issue #112 当前为 OPEN；本条状态为 `draft-pr-open / final-closeo
 - `max_compaction_attempts_per_operation`与Runner`max_retries`的owner、默认值、字段说明和测试互不混淆；前者是同一durable compaction operation内所有semantic proposal attempts总预算，后者是每次Runner call的transport retry。不存在proactive operation count配置。
 - 受影响文件单文件覆盖率目标 `>=80%`，完整 pyright 与受影响测试通过；按触发规则完成 Host、Service/UI、runtime、config、tests与分层 README audit。
 
-## WU-CTX-01 Provider Tokenizer / Sizing Adapter
+## WU-CTX-01 Usage-Anchored Adaptive Context Sizing
 
 ### 状态
 
-GitHub Issue #20 当前仍为 OPEN，且 issue body 已对齐 WU-CTX-01 当前 scope。代码核对显示 Host 仍只有 conservative estimator，没有 provider/model-aware sizing adapter；本条仍有效。
+GitHub Issue #20 当前仍为 OPEN，但截至本次只读核对，其 title / body 仍以 provider tokenizer / provider-model sizing adapter 为 scope，已经与 `docs/host/design.md` §25 的 Usage-Anchored Adaptive Context Sizing 新设计不一致。本轮只更新本地设计真源与实施总控，没有修改 GitHub；Issue #20 外部 owner / body 必须在 goal confirmation 中核对，并在进入 plan 前获得授权后完成 scope 对齐。
+
+本条状态是 `pending-next-after-merge`，不是 active gate。PR #182 仍等待用户手工 merge；merge 状态、工作树与目标 base `main` fast-forward preflight 全部通过后，才允许进入 WU-CTX-01 goal confirmation。
 
 ### 设计与代码核对
 
-- `docs/host/design.md` 明确 provider tokenizer adapter 是 Host 预算治理的后续精确能力，第一版使用 conservative estimator 与 provider-aware configured limits。
-- `docs/host/design.md` 目前存在一处待收敛表述：配置章节说明 `ContextBudgetPolicy` 不暴露 `reserved_output_tokens`，但 Context Governance 章节仍写 `reserved_output_tokens` 是 Host context policy 的显式 typed input。当前代码实际是 ratio-first policy，没有 `reserved_output_tokens` 字段；进入 #20 plan 前必须先裁决并修正设计表述。
+- `docs/host/design.md` §25 已固定 usage-anchored 算法、owner、anchor compatibility / invalidation、durable pairing、fallback、threshold semantics、reactive 边界、非目标与确定性要求；provider tokenizer / provider count adapter 不再是目标。
 - `dayu/host/context_budget.py` 当前模块 docstring 明确是 conservative estimator，不读取 Engine spec、provider overflow payload、metadata 或 extra payload。
 - `estimate_context_budget(...)` 当前按文本长度、canonical JSON byte length、message overhead 和 tool schema overhead 估算 token。
-- `ContextBudgetPolicy` 当前只包含 `context_window_size`、soft / hard threshold ratio、compaction 次数上限和 `policy_ref`，没有 provider/model-aware tokenizer 或 sizing adapter 字段。
-- Engine README 明确 Engine 不做 proactive threshold compaction、provider-aware tokenizer 或 Host budget policy。
+- `ContextBudgetPolicy` 是 ratio-first policy：`context_window_size`、soft / hard threshold ratio、compaction 次数上限和 `policy_ref` 继续由既有 owner 管理；新算法不动态改写 ratio。
+- PR #182 建立的 `RUNNER_CALL_INPUT_ASSEMBLED` + `RUNNER_CALL_INPUT_ITERATION_LINKED` 与 iteration-scoped usage 是 pairing 的唯一直接证据入口。WU-CTX-01 必须验证现有 contract 足以把同一完整 input 的 `E_anchor` 与同一 iteration 的 `prompt_tokens` durable 配对；若不足，应在 goal confirmation 记录 blocking contract gap，不得从 provider request id、时间戳或 `USER_INPUT_ACCEPTED.display_text` 推断。
+- `RunnerSpec.supports_stream_usage` 只门控是否发送 OpenAI `stream_options.include_usage=true` 扩展，不是 usage availability predicate。Engine / Host 必须按实际合法 `USAGE_REPORTED` presence 建立 anchor；例如 MiMo 流式 chunk 可以自动返回 nullable usage，且不要求发送 `include_usage`，不需要 provider-name branch。
+- 当前 `USAGE_REPORTED` 已 durable 保存 `prompt_tokens` / `completion_tokens` / `total_tokens` 等内部 signal，但 Host public activity allowlist 没有 usage projection，Service 会丢弃 `activity=None` 的事件；当前 UI 至多能看到 compact activity，不能读取 typed context utilization。WU-CTX-01 必须修复 public contract 缺口，但不得把 raw `USAGE_REPORTED` payload、`payload_ref` 或 EventLog reader 泄漏给 UI。
 
 ### 目标
 
-- 为不同 provider / model 的 token / context sizing 建立 typed adapter 或 compatible estimator boundary。
-- 让 proactive compact、reactive compact、RunInputBuilder budget material、compact before / after estimate 和 usage-observation diagnostics 使用同一 sizing abstraction。
-- 支持 provider / model dimension selection，但不得在 Context Governance policy code 中硬编码 provider 名称分支。
-- 保留 conservative fallback estimator，并在 diagnostics / compact facts / budget traces 中记录 estimator / sizing adapter id 与版本。
-- 覆盖中文 / 英文混合财报文本、JSON / table-like excerpts、tool facts、citation / source refs、memory material、compact artifacts 和 tool schema overhead。
+- 对成功 ordinary runner call，在 dispatch 前用现有 conservative estimator 冻结同源完整 input 的 `E_anchor`，再把同一 iteration 实际出现并由 Engine 归一化的 `usage.prompt_tokens` durable 配对为 `U_anchor`。
+- 下一候选完整 input 使用同一 estimator / version 计算 `E_current`，预算预测固定为 `P_current = U_anchor + (E_current - E_anchor)`；signed delta 必须来自可证明的完整 input / manifest lineage。
+- proactive compact、hard budget decision、compact / fallback 前后 sizing 与相关 diagnostics 使用同一 sizing contract。动态的是 estimate anchoring，不是 `soft_threshold_context_ratio` / `hard_threshold_context_ratio`。
+- usage 缺失、非法、无法唯一关联，或 anchor 因 provider / model / context window / estimator / request semantics / accepted compact / lineage gap 不兼容时，对当前完整输入使用现有 conservative estimator。
+- 若较旧 compatible anchor 之后的全部输入变化仍可从 durable lineage 重建，允许继续从该 anchor 累计 delta；任一变化不可证明则整体 fallback。
+- 保持 provider-neutral：Host 只按 typed identity、manifest lineage 与实际 `USAGE_REPORTED` presence 判断，不硬编码 provider 名称。
+- 对每个 ordinary / post-compact / dispatch-fallback 候选输入的 dispatch-relevant sizing result，先 durable append canonical `CONTEXT_BUDGET_EVALUATED`，再执行由该 decision 驱动的 proactive compact 或 dispatch。Host 从该同一 result 投影 `HostActivityKind.CONTEXT_USAGE` + typed `HostContextUsageView`，Service 原样投影为 `EntrypointContextUsage` 并通过既有 activity callback 交付，供未来 UI 展示当前上下文占用。
+- typed public context-usage view 至少包含 `predicted_input_tokens`、`context_window_size`、未 clamp 的 `utilization_basis_points`、soft / hard threshold tokens、`estimate_method=usage_anchored|conservative_fallback` 与 `pressure_level=normal|soft_threshold_exceeded|hard_threshold_exceeded`。Host 拥有这些派生值；UI 只拥有“上下文约使用 62%”之类展示格式。
+
+### Goal confirmation 进入条件与证据
+
+- 在 PR #182 手工 merge 与目标 base preflight 通过后，读取当时有效的 `models.json`，对其覆盖的 DeepSeek、OpenAI、Anthropic、Gemini、MiMo、Qwen、Ollama 七个 provider family 分别执行至少一次真实流式 ordinary call。probe 必须走与生产 ordinary call 匹配的 Dayu Runner / SSE / Engine usage normalization 链路，不能只查厂商文档、直接用旁路 HTTP 得出结论，也不能用 mock 代替。
+- 每个 provider family 的 goal-confirmation artifact 至少记录实际 endpoint、实际 model、stream mode、response 中是否出现 usage、usage 位于哪个 response / chunk、是否需要 `stream_options.include_usage`、Dayu 是否产生归一 usage event，以及 usage 缺失 / 非法时实际进入的 fallback。artifact 只记录脱敏结构与计数，不得暴露 API key、authorization header、完整原始响应或其它敏感内容。
+- live probe 只提供 goal confirmation evidence，不等于 implementation。不得在 goal confirmation 修改 provider config、Runner parser、usage normalization 或其它生产行为来让 probe 通过。
+- 任一 provider 缺少凭据、有效 endpoint、可调用 model、网络，或 Ollama 缺少本地可用模型时，记为 blocking open question，goal confirmation 不得 pass、不得进入 plan；只有用户明确裁决调整 provider scope 后才能继续。
+- goal confirmation 必须验证 #182 的 complete runner-call manifest、accepted iteration link 与 iteration-scoped usage 是否足以形成直接同源 pairing。若 contract 不足，记录 blocking contract gap；不得侵入 WU-OBS-00B / GitHub Issue #119 的 analyzer correlation owner，也不得通过新增 provider request identity 推断关系。
+- GitHub Issue #20 的外部 tokenizer framing 必须在进入 plan 前与本节及 `docs/host/design.md` §25 对齐；本轮没有修改外部 Issue。
 
 ### 非目标
 
+- 不引入 provider tokenizer、provider/model sizing adapter、远程 token-count endpoint、tokenizer 下载或运行时 tokenizer 版本管理。
 - 不在 Context Governance 中硬编码 provider 名称分支。
 - 不让 Engine provider 实现反向依赖 Host。
 - 不把 compact / retry / proactive threshold governance 移入 Engine。
 - 不移除 conservative fallback behavior。
 - 不用 metadata 或 extra payload 夹带 sizing decision。
+- 不训练全局 correction model，不跨 provider / model 共享学习系数，不动态修改 soft / hard ratio。
+- 不按“上一次 usage 已超过 ratio，下一 Run 才 compact”的滞后规则执行；下一候选输入差量必须进入 dispatch 前预测。
+- 不让 compactor proposal usage 污染 ordinary anchor，不用 reactive overflow 或 compact 后另一份输入的 usage 伪造失败输入的精确误差。
+- 不实现具体 CLI / Web / WeChat 的进度条、颜色、文案、小数位或历史图表；本 Work Unit 只把 typed Host -> Service public contract 和既有 activity callback 交付路径准备完整。
+- 不把 raw provider usage、anchor refs / digests、provider request id、完整 messages、policy internal ref 或 estimator diagnostic 暴露给 UI，也不让 UI 从 `USAGE_REPORTED`、EventLog payload 或 summary 文本自行计算百分比。
 
 ### 验收信号
 
-- Host 有 typed provider/model-aware sizing adapter boundary，并保留 conservative fallback。
-- Proactive / reactive compact decisions 使用同一 sizing entrypoint。
-- RunInputBuilder budget material、compact before / after estimates 和 usage-observation diagnostics 能引用 estimator id / version。
-- Provider / model selection 与 fallback behavior 有明确测试。
-- 至少覆盖一个 provider-specific 或 provider-compatible sizing implementation 加 fallback。
-- 测试覆盖中文 / 英文混合财报文本、JSON / table-like excerpts、tool facts、citation / source refs 和 tool schema overhead。
-- Host / Engine layering tests 继续证明无反向依赖、无 Engine-owned Host compact policy。
+- 直接公式测试证明 compatible anchor 使用 `P_current = U_anchor + (E_current - E_anchor)`，包括 signed positive / negative delta；同源关系无法证明时不使用该公式。
+- `U_anchor / context_window_size = 62%` 且下一输入 delta 使 `P_current` 跨过 65% soft threshold 时，下一 Run 在 dispatch 前主动 compact；不能等到上一次 usage 自身越过 ratio。
+- usage 可用时建立 / 刷新 compatible anchor；usage 缺失、nullable、非法、iteration pairing 缺失或 manifest mismatch 时，对当前完整输入执行 deterministic conservative fallback，Run 不因 usage 缺失失败。
+- 较旧 compatible anchor 在中间一次或多次 usage 缺失、但全部输入变化可 durable 重建时继续累计 delta；任一 lineage gap 立即 fallback。
+- provider / model / context window / estimator id 或 version / request serialization semantics 切换使 anchor 失效；accepted compact 使旧基线失效，post-compact immediate sizing 先走完整 fallback，后续成功 ordinary call 才建立新 anchor。
+- compactor proposal usage 永不成为 ordinary anchor；reactive provider overflow 只触发现有 recovery / fallback，不生成伪造的 token delta 或 calibration sample。
+- dispatch 前 `E_anchor`、`RUNNER_CALL_INPUT_ASSEMBLED`、accepted `RUNNER_CALL_INPUT_ITERATION_LINKED` 与同 iteration `USAGE_REPORTED` 可以在 crash / replay 后 durable 重建并得到相同预测和 decision；不得从 display text、时间戳或 provider request id 反推。
+- soft / hard ratios 与由其派生的 thresholds 不被 usage 动态修改；usage 不回写已经完成的 dispatch decision。
+- anchored 路径的 public `predicted_input_tokens` 等于同一 decision 的 `P_current`；fallback 路径等于当前完整输入的 conservative estimate。两条路径的 `utilization_basis_points` 都严格按 `floor(predicted_input_tokens * 10000 / context_window_size)` 计算且不 clamp，pressure level 与真正驱动 compact / dispatch 的 soft / hard decision 一致。
+- `CONTEXT_BUDGET_EVALUATED` 在 durable event sequence 中先于由它驱动的 `CONTEXT_COMPACTION_REQUESTED` 或 `RUN_STARTED` / `ATTEMPT_STARTED`；stable identity / idempotency 绑定 Run、候选 input snapshot / digest、sizing stage、policy snapshot 与 estimator contract，重复 watch / reconciliation 不生成互相矛盾的 utilization activity。internal compactor proposal sizing 和刚返回但尚未形成下一候选输入的历史 usage 不产生 public context-usage activity。
+- Host public projection tests 覆盖 `HostActivityKind.CONTEXT_USAGE`、typed `HostContextUsageView`、anchored / fallback method、normal / soft / hard pressure、超过 100% 不 clamp、缺 policy 时 unavailable；Service tests 覆盖 `EntrypointContextUsage` 字段无重算透传和既有 activity callback 交付。raw `USAGE_REPORTED` 继续没有 public activity，UI 无需且不得读取 EventLog payload。
+- goal confirmation artifact 覆盖 DeepSeek、OpenAI、Anthropic、Gemini、MiMo、Qwen、Ollama 的真实流式 ordinary-call usage 行为和 fallback，且没有 secret / sensitive raw payload 泄漏。
+- Host / Engine layering tests 继续证明无反向依赖、无 Engine-owned Host compact policy、无 provider-name branch；完整 conservative fallback 继续覆盖中文 / 英文混合财报文本、JSON / table-like excerpts、tool facts、citation / source refs、memory / compact material与 tool schema overhead。
+- 实现改动触发的 Host、Service、CLI/UI、tests 与分层 README 必须按各自 README 约束审计；即使具体 UI 暂不渲染，也必须保证新增可选 typed 字段不会破坏既有 CLI activity formatter。
 
 ## WU-CM-10 Conversation Memory Eval Benchmark
 
