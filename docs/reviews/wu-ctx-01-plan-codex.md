@@ -5,9 +5,9 @@
 - Work Unit：`WU-CTX-01 Usage-Anchored Adaptive Context Sizing`
 - Issue：GitHub Issue #20。
 - 类型：architecture-sensitive issue / public-contract change。
-- 当前 gate：`plan amendment`；本 artifact 只修复 Slice 1 stop condition 的
-  Controller accepted blocker，不进入 re-review、implementation、commit、push、PR
-  或 merge。
+- 当前 gate：`Slice 1 second plan amendment`；本 artifact 只修复 reactive
+  accepted post-compact stage / action / recovery ordering 的 Controller accepted
+  blocker，不进入 re-review、implementation、commit、push、PR 或 merge。
 - 设计真源：`docs/host/design.md` §25 `Context Governance`，唯一设计入口为
   `Usage-Anchored Adaptive Context Sizing`。
 - 控制真源：`docs/host/issues-implementation-control.md` 的 `Slice 切分原则` 与
@@ -17,10 +17,13 @@
   blocking open questions=`None`。
 - 原 plan finding 裁决真源：
   `docs/reviews/wu-ctx-01-plan-review-controller-adjudication.md`；
-  本次 amendment 裁决唯一真源：
+  第一次 amendment 裁决唯一真源：
   `docs/reviews/wu-ctx-01-slice-1-stop-controller-adjudication.md`，
+  第二次 amendment 裁决唯一真源：
+  `docs/reviews/wu-ctx-01-slice-1-reactive-stop-controller-adjudication.md`，
   decision=`accepted blocker / reopen plan`。两路 review 只提供证据，不得覆盖
-  Controller 对 owner、stage action、scope 与 partial implementation 的裁决。
+  Controller 对第四stage、reactive action、recovery ordering、scope 与 partial
+  implementation 的裁决。
 - 代码基线：branch=`feat/wu-ctx-01`，
   HEAD=`5afe71fefa2486ff0e0d9b2026fee23685d48c2e`。
 - preflight：当前不是 protected branch。worktree 已有大量 Slice 1 partial
@@ -28,10 +31,12 @@
   本 gate 不继续编辑。
 - 本 amendment gate 允许写入仅为：
   `docs/host/design.md`、`docs/reviews/wu-ctx-01-plan-codex.md` 与
-  `docs/reviews/wu-ctx-01-slice-1-plan-amendment-codex.md`。
-- amendment completion status：`complete`。accepted blocker 已在 compact payload
-  typed source boundary、Conversation Memory projection 与 stage-aware sizing action
-  owner处收敛；当前 partial implementation仍为`not accepted`，必须等
+  `docs/reviews/wu-ctx-01-slice-1-reactive-plan-amendment-codex.md`。
+- amendment completion status：`complete`。accepted blocker 已通过closed
+  `REACTIVE_POST_COMPACT`、reactive accepted candidate/manifest-before-start 与
+  actual request digest pairing收敛；第一次 amendment 的 compact payload typed
+  source boundary与Conversation Memory projection继续有效。当前 partial
+  implementation仍为`not accepted`，必须等
   AgentMiMo / AgentDS双路plan re-review通过后才可恢复。
 
 ## 1. Goal、motivation 与 success signal
@@ -56,8 +61,9 @@
      conservative estimator；Run 不因 usage 缺失或 usage 不可用失败。
 
 2. **durable context-budget fact 与 typed public projection**
-   - 每个 dispatch-relevant ordinary / post-compact / dispatch-fallback
-     候选输入先提交 canonical `CONTEXT_BUDGET_EVALUATED`，再执行该 decision
+   - 每个 dispatch-relevant ordinary / proactive post-compact / reactive accepted
+     post-compact / dispatch-fallback 候选输入先提交 canonical
+     `CONTEXT_BUDGET_EVALUATED`，再执行该 decision
      驱动的 compact、dispatch 或 fail-closed transition。
    - Host 从同一个 `ContextSizingResult` 投影
      `HostActivityKind.CONTEXT_USAGE` 与 `HostContextUsageView`。
@@ -136,7 +142,22 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 - `pressure_level`只由prediction与soft/hard thresholds决定；`budget_decision`还消费
   `ContextSizingStage`。`ORDINARY` soft触发唯一 proactive operation；
   `POST_COMPACT` / `DISPATCH_FALLBACK` soft如实保留soft pressure但允许dispatch；
-  三个stage的hard都禁止dispatch并显式fail closed，不留下silent accepted Run。
+  `ORDINARY`、`POST_COMPACT`与`DISPATCH_FALLBACK`的hard都禁止dispatch并由各自
+  合法owner显式fail closed；
+  `REACTIVE_POST_COMPACT` normal/soft/hard全部允许recovery dispatch，且soft/hard
+  pressure不改写。reactive accepted compact后不得因estimate hard追加
+  `CONTEXT_COMPACTION_FAILED`、`RUN_FAILED`或`RUN_LOST`。
+- reactive accepted compact在创建recovery Attempt前完成memory exact catch-up、
+  identity-free candidate freeze、`REACTIVE_POST_COMPACT` conservative sizing、
+  identity allocation和manifest写入；actual recovery request按同一
+  attempt/execution读取该manifest及digest-verified candidate，不得二次assembly。
+- recovery start前置条件miss或CAS/integrity failure使本事务candidate
+  payload/manifest/fact/start rows整体rollback；已提交accepted compact保持不变，
+  本调用不wake且不写矛盾terminal facts。没有并发winner时Run留在`RECOVERING`等待
+  reconciliation；存在winner时只信任winner committed state。
+- reactive hard + allow的反例必须继续真实dispatch；若provider再次overflow，在
+  `max_reactive_compactions_per_run`内进入下一条existing reactive operation，超过上限
+  才走真实`CONTEXT_COMPACTION_FAILED`与既有fallback/failure收口。
 - accepted compact的typed source boundary严格区分第一个`current_input_ref`与其余
   `compacted_source_refs`；memory projection删除covered older raw、保留current
   input、保留未covered protected raw，并让后续新material自然成为post-compact
@@ -158,7 +179,7 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 | 直接证据 | 当前事实 | 对实现的约束 |
 | --- | --- | --- |
 | `dayu/host/context_budget.py::estimate_context_budget` | conservative estimator 按 message text、canonical JSON bytes、message overhead 与 tool-schema overhead 估算；`estimator_digest` 是具体输入 digest，不是稳定 estimator identity/version。 | 保留现有估算公式与常量；新增显式 estimator id/version 和 exact-candidate adapter，不引入 tokenizer、动态 ratio 或 correction model。 |
-| `dayu/host/context_budget.py::ContextSizingResult` / `_pressure_and_decision` | 当前 partial implementation按prediction同时固定pressure与action；soft在所有stage都映射`COMPACT_SOFT_THRESHOLD`。 | pressure与action拆开判定：pressure仍纯阈值比较，action必须消费stage；post-compact/fallback soft允许dispatch，hard显式fail closed。 |
+| `dayu/host/context_budget.py::ContextSizingResult` / `_pressure_and_decision` | 当前 partial implementation缺少第四stage，把proactive与reactive accepted compact都归入`POST_COMPACT`。 | pressure与action拆开判定并扩为4-stage/12-cell；`REACTIVE_POST_COMPACT`三种pressure都allow recovery，pressure仍按阈值如实保留。 |
 | `dayu/host/compact_payload.py::ContextCompactedSemanticPayload` / `source_boundary_refs` | producer确定性写第一个`request.current_input_ref`与后续去重material/evidence/fact refs，但strict semantic parser没有读取 persisted `source_boundary_refs`。 | compact payload是唯一typed read owner；parser校验非空、非空字符串、全局唯一并投影`current_input_ref`与`compacted_source_refs`，consumer不得索引raw list。 |
 | `dayu/host/memory.py::project_conversation_memory_event` | `CONTEXT_COMPACTED`更新summary/facts/anchors/intents/reference continuity与latest compact ref，却没有移除已被accepted compact覆盖的`selected_recent_window`；`recent_evidence_items`随后仍从错误window派生。 | Conversation Memory projection按typed covered refs移除covered older raw，保留current input与未covered protected raw；rebuild/incremental/repair/persisted snapshot统一复用该owner rule。 |
 | `dayu/host/run_input.py::_memory_messages`与protected raw-tail assembly | 无条件渲染snapshot selected recent；既有raw-tail path已有source ref/content digest dedupe。 | 不在RunInput新增coverage filter；只消费修正后的typed memory view并保留现有raw-tail dedupe。 |
@@ -168,6 +189,10 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 | `dayu/host/durable/transaction.py::HostTransactionRunner.run_write` | transaction body正常返回即commit；任意异常会rollback并透传。 | CAS miss不得返回普通 `None`；`dispatch.py` transaction body必须抛出私有 `_StartCandidateCasMissRollback`，在 `run_write` 外捕获并转成无dispatch结果。不得修改通用 transaction runner或引入rollback sentinel返回协议。 |
 | `dayu/host/_runner_call_manifest.py` 与 `RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION` | manifest v1 有完整 projection/ref lineage，但没有 estimator id/version、`E_anchor`、context window 或 request semantics contract。 | manifest schema 直接切到 v2；complete ordinary manifest 必须有严格 typed sizing snapshot，v1 不兼容读取。 |
 | `dayu/host/engine_ingest.py::_estimate_usage_observation_input` | 从 `USER_INPUT_ACCEPTED.display_text` 重建估算；不是实际完整 runner input。 | 删除该重建路径。usage diagnostic/pairing 只能解析 accepted iteration link 指向的 digest-verified complete manifest。 |
+| `dayu/host/engine_ingest.py::_execute_reactive_compaction` / `_complete_reactive_recovery` / `_StartReactiveRecoveryOperation` | accepted branch先在一笔事务提交`CONTEXT_COMPACTED`，随后memory catch-up失败只告警，另起事务直接调用recovery start；当前没有freeze candidate或写manifest。 | accepted compact后必须先exact catch-up；start事务内按`REACTIVE_POST_COMPACT`冻结candidate、估算、写manifest，再调用existing recovery start。catch-up失败不得继续start。 |
+| `dayu/host/dispatch.py::_build_frozen_run_input` 与 `dayu/host/run_input.py::load_prepared_runner_call_candidate` | actual dispatch已按Attempt/execution查找pre-start manifest，再读取digest-verified prepared candidate构造`AgentRunRequest`；缺manifest会fail closed。 | reactive recovery无需新wakeup payload或第二套request builder；只需在Attempt start前写同源manifest，actual request继续复用existing strict loader。 |
+| `dayu/host/durable/run_transition.py::StartRecoveryRunInput` / `start_recovery_run_with_starting_attempt_in_transaction` | existing transition由caller提供新Attempt/execution/dispatch identities，并在`RECOVERING`前置条件下原样创建start facts与rows。 | `engine_ingest.py`在同一事务先记录candidate/manifest，再把同一identities交给existing transition；`run_transition.py`保持零diff。 |
+| `dayu/host/durable/run_transition.py::FailRecoveringRunInput` / `fail_recovering_run_in_transaction` | typed input必填`context_compaction_failed_event_id`，`RUN_FAILED` payload也承诺该真实failed fact；`RUN_LOST`属于startup orphan owner。 | 只用于真实reactive compact/fallback failure；accepted compact estimate hard不得伪造failed ref、追加矛盾failed fact或改用lost。 |
 | `dayu/host/engine_ingest.py::_runner_call_iteration_link_payload` | accepted link 已冻结 manifest event/ref/digest、iteration id/index、Engine message count/role digest 和 serializer schema。 | 该 link 是 iteration pairing 的唯一入口；禁止 request id、时间戳或 display text 推断。 |
 | `dayu/host/lifecycle_events.py::HostPreviewEventType.ITERATION_COMPLETED` 与 `engine_ingest.py::_preview_payload` | accepted Engine `iteration_completed` 已作为 durable preview保存 exact attempt/execution、iteration id与finish reason；它不是 canonical completion fact。 | 复用该现有 durable accepted Engine evidence作为 runner-call completion barrier，不新增 iteration completion canonical fact/state machine，也不从 Run terminal状态反推。 |
 | `dayu/engine/runners/openai/usage.py::coerce_usage` | provider usage 三字段只有在 non-bool、non-negative int 时才归一；缺失/非法返回 `None`。 | Engine production behavior 已符合 owner；不新增 Engine→Host 依赖。Host 仍须防御 injected/corrupt observation，但不能把 `supports_stream_usage` 当 presence predicate。 |
@@ -182,7 +207,8 @@ pairing 必须消费同一 complete candidate snapshot，否则会形成多个�
 Root cause 的逻辑/数据真源是：**完整 runner-call candidate、conservative
 estimate、iteration link 与 usage observation 尚未形成一个可校验的 durable
 lineage contract；同时 accepted compact 的 persisted coverage尚未进入Conversation
-Memory typed projection，且pressure被错误地当成stage-independent action**。
+Memory typed projection，且缺少reactive专属stage的action把proactive与reactive accepted
+post-compact错误合并**。
 display text、post-compact size不下降与accepted Run无dispatch都只是这些owner缺口的
 下游表现。修复必须建立owner级contract，不能在RunInput、read API、Service、UI、
 fixture或单入口用fallback shim补救。
@@ -191,8 +217,8 @@ fixture或单入口用fallback shim补救。
 
 ### 3.1 In scope
 
-- complete ordinary/post-compact/dispatch-fallback candidate 的单一 typed assembly
-  与 digest-verified projection。
+- complete ordinary/proactive-post-compact/reactive-post-compact/dispatch-fallback
+  candidate 的单一 typed assembly 与 digest-verified projection。
 - accepted compact `source_boundary_refs` 的strict typed read boundary，以及
   Conversation Memory对covered raw/post-compact delta的唯一projection rule。
 - conservative estimator stable identity/version 与 complete candidate adapter。
@@ -225,6 +251,11 @@ fixture或单入口用fallback shim补救。
 - 改动 WU-OBS-00B / Issue #119 analyzer correlation owner；不新增
   `client_correlation_id` / `provider_request_id` correlation contract。
 - 把 compactor proposal usage 或 provider overflow 当 calibration sample。
+- 用accepted compact后的conservative hard estimate追加
+  `CONTEXT_COMPACTION_FAILED`、`RUN_FAILED`、`RUN_LOST`，或修改
+  `run_transition.py`新增context-hard terminal transition。
+- 为reactive recovery另建request builder、把candidate塞入wakeup DTO，或在Attempt
+  start后重新assembly；actual request必须继续走existing manifest/candidate loader。
 - UI 文案、百分比格式、颜色、进度条、历史曲线。
 - 新 durable anchor table、learned model、background scheduler、remote state 或
   migration framework。
@@ -253,7 +284,8 @@ exact candidate assembly与memory boundary修正是避免多个输入/coverage�
 | actual usage legality | Engine Runner/parser | 只对实际出现且合法的 usage emit normalized observation | Host按 capability猜 usage |
 | manifest↔iteration↔usage pairing | Host Engine ingest + manifest parser | accepted link唯一定位 complete manifest；usage signal durable保存 pairing refs/status | request id、时间戳、display text |
 | compatible anchor选择与 lineage barrier | 新 `dayu.host.context_anchor` | 仅通过调用方显式传入的同一个 `HostTransaction` + `EventLogStore`，从该 consistent snapshot中的 committed manifests、links、usage、durable accepted iteration-completed preview与accepted compact boundary重建 | 自开transaction、跨transaction分页、模块可变状态/singleton/cache、Service/UI durable访问、projection copy、summary、日志、旧测试fixture |
-| predicted tokens/threshold/pressure/stage-aware action | `dayu.host.context_budget` 的 `ContextSizingResult` | anchored或fallback只产生一个typed result；pressure纯阈值派生，budget decision由stage+pressure派生 | context events/read API/Service/UI重算；把post-compact soft改写成normal |
+| predicted tokens/threshold/pressure/stage-aware action | `dayu.host.context_budget` 的 `ContextSizingResult` | anchored或fallback只产生一个typed result；pressure纯阈值派生，budget decision由4-stage/12-cell total function派生 | context events/read API/Service/UI重算；把post-compact soft或reactive hard改写成normal；用reactive hard触发failure |
+| reactive accepted recovery candidate/start | `dayu.host.engine_ingest` transaction orchestration + `dayu.host.run_input` candidate/manifest owner | accepted compact后exact memory catch-up；同一start transaction冻结candidate、写manifest、调用unchanged recovery transition；actual request strict load | catch-up失败仍start；Attempt-before-manifest；第二次assembly；accepted后补failed/lost facts |
 | context-budget durable truth | `dayu.host.context_events` + dispatch/ingest transaction owner | deterministic canonical fact append | 把 fact 作为 usage event副作用 |
 | public context usage | `HostContextUsageView` | Host从 canonical fact严格投影 | 暴露 anchor refs/raw usage/policy internal refs |
 | Service activity DTO | `dayu.service.entrypoint_runtime` | typed closed mapping逐字段透传 | basis points/percentage/pressure重算 |
@@ -294,6 +326,7 @@ class PreparedRunnerCallCandidate:
     messages: tuple[AgentMessage, ...]
     tool_schemas: tuple[ToolSchema, ...]
     disable_tools: bool
+    tool_execution_mode: ToolExecutionMode
     policy_snapshot: PolicySnapshot
     source_cursor_refs: tuple[str, ...]
     memory_snapshot_cursor_ref: str | None
@@ -312,6 +345,13 @@ candidate preparation 必须复用 RunInputBuilder 当前 normalization、memory
 protected raw tail、continuity、current user tail、scene 与 tool selection 规则。
 Attempt runtime-only 的 cancellation token、tool executor handle 与 worker handle
 不进入 candidate digest。
+
+`tool_execution_mode`必须进入candidate projection与`input_snapshot_digest`。reactive
+recovery不得从当前local config重选policy/tools/mode；它在start transaction内通过
+source Attempt/execution的strict manifest读取overflowed prepared candidate，并复用
+其中frozen `policy_snapshot/tool_schemas/disable_tools/tool_execution_mode`来重建compact
+后的candidate。`run_input.py`提供transaction-local strict loader供existing public
+loader与engine ingest共同复用，禁止engine ingest复制manifest/payload parsing。
 
 现有 memory projection catch-up / lag repair 必须移动到 candidate freeze 之前完成；
 不得先冻结旧 memory candidate，再在 `RUN_STARTED` 后修复并组装另一份 request。
@@ -386,6 +426,7 @@ manifest新增必填对象 `sizing_snapshot`，shape固定：
 | --- | --- | ---: | --- |
 | `status` | enum `complete/unavailable/not_applicable` | yes | estimator snapshot是否可用于ordinary anchor |
 | `reason` | closed string or `null` | yes | 非complete原因；complete必须null |
+| `sizing_stage` | closed `ordinary/post_compact/reactive_post_compact/dispatch_fallback` or `null` | yes | ordinary runner-call candidate的治理阶段；compactor proposal为null |
 | `estimator_id` | `str|null` | yes | complete时等于 frozen id |
 | `estimator_version` | `str|null` | yes | complete时等于 frozen version |
 | `estimator_digest` | sha256 digest or `null` | yes | complete candidate specific estimate digest |
@@ -401,7 +442,10 @@ manifest新增必填对象 `sizing_snapshot`，shape固定：
 validation invariant：
 
 - `status=complete` 时所有 nullable value字段必须非空且通过范围/digest校验；
-- `status=not_applicable` 仅允许 `compactor_proposal`，value字段全部为null；
+- ordinary `status=unavailable`仍必须保留closed `sizing_stage`，其它value字段不得被
+  anchor resolver部分信任；
+- `status=not_applicable` 仅允许 `compactor_proposal`，`sizing_stage`与其它
+  value字段全部为null；
 - `status=unavailable` 必须有 closed reason，value字段不得被 anchor resolver
   部分信任；closed reasons固定包含`context_policy_unavailable`及四个
   `continuation_*_unavailable`；
@@ -449,6 +493,36 @@ Slice 1 尚未引入 budget fact时，上述 allow sequence暂为
 同一transaction插入fact，不改变identity与start interface。actual
 `AgentRunRequest`随后消费已start Attempt snapshot时，必须读取这个pre-start frozen
 candidate/manifest并复核同一 attempt/execution/digest，不能重组第二份输入。
+
+reactive accepted compact 使用同一manifest contract，但顺序独立冻结为：
+
+```text
+CONTEXT_COMPACTED already committed
+-> Conversation Memory reaches exact compacted event sequence
+-> BEGIN IMMEDIATE
+   re-read RECOVERING Run + terminal source Attempt
+   -> strict-load source Attempt prepared candidate
+   -> reuse frozen policy/tool schemas/tool execution mode
+   -> freeze identity-free complete candidate
+   -> conservative sizing(stage=REACTIVE_POST_COMPACT)
+   -> allocate one StartRecoveryRunInput identity set
+   -> write prepared candidate payload
+   -> append RUNNER_CALL_INPUT_ASSEMBLED(
+        sizing_snapshot.sizing_stage=reactive_post_compact
+      )
+   -> Slice 2 only: append CONTEXT_BUDGET_EVALUATED
+   -> call existing start_recovery_run_with_starting_attempt_in_transaction
+   -> RUN_STARTED(start_reason=recovery)
+   -> ATTEMPT_STARTED + dispatch row
+   -> COMMIT
+```
+
+actual recovery request继续由existing
+`load_prepared_runner_call_candidate(attempt_id, execution_id)`读取上述manifest和
+candidate；不得扩充`PendingDispatchRecord`传递第二份candidate，也不得在worker侧
+rebuild。catch-up未达到目标、candidate/manifest失败、start precondition miss或CAS
+lost时不得wake；当前start transaction全部新增写入rollback，前一事务已提交的accepted
+compact保持不变。
 
 `dayu/host/durable/run_transition.py` **不修改**：其现有
 `StartGovernedRunInput` 已是exact typed interface，字段
@@ -656,6 +730,7 @@ class ContextPressureLevel(StrEnum):
 class ContextSizingStage(StrEnum):
     ORDINARY = "ordinary"
     POST_COMPACT = "post_compact"
+    REACTIVE_POST_COMPACT = "reactive_post_compact"
     DISPATCH_FALLBACK = "dispatch_fallback"
 ```
 
@@ -761,17 +836,33 @@ action(stage, pressure):
     normal -> ALLOW_DISPATCH
     soft   -> COMPACT_SOFT_THRESHOLD
     hard   -> BLOCK_HARD_THRESHOLD
-  POST_COMPACT | DISPATCH_FALLBACK:
+  POST_COMPACT:
     normal -> ALLOW_DISPATCH
     soft   -> ALLOW_DISPATCH
     hard   -> BLOCK_HARD_THRESHOLD
+  DISPATCH_FALLBACK:
+    normal -> ALLOW_DISPATCH
+    soft   -> ALLOW_DISPATCH
+    hard   -> BLOCK_HARD_THRESHOLD
+  REACTIVE_POST_COMPACT:
+    normal -> ALLOW_DISPATCH
+    soft   -> ALLOW_DISPATCH
+    hard   -> ALLOW_DISPATCH
 ```
 
 因此`ContextSizingResult.__post_init__`必须先仅由predicted/thresholds复核
 `pressure_level`，再由`stage + pressure_level`复核`budget_decision`。
 `POST_COMPACT` / `DISPATCH_FALLBACK` soft的pressure不得降为normal；public fact/view
-继续报告soft pressure，但Host允许dispatch。ratio与threshold仍由
+继续报告soft pressure，但Host允许dispatch。`REACTIVE_POST_COMPACT`的soft/hard也
+不得降为normal，三种pressure都必须allow recovery dispatch。ratio与threshold仍由
 `ContextBudgetPolicy`派生，不因usage或stage变化。
+
+第四stage只允许用于以下完整conjunction：trigger source为reactive、同operation已提交
+accepted `CONTEXT_COMPACTED`、Conversation Memory已覆盖该event sequence、Run仍为
+`RECOVERING`、source Attempt已terminal、recovery Attempt尚未创建。proactive accepted
+compact继续使用`POST_COMPACT`；真实compact failure后的tier 4/5继续使用
+`DISPATCH_FALLBACK`。stage不得由pressure、runner-call kind字符串或是否存在Attempt
+反推。
 
 ### 5.6 `CONTEXT_BUDGET_EVALUATED` canonical schema
 
@@ -786,7 +877,7 @@ payload schema version固定为 `context_budget_evaluated.v1`，required fields�
 | `candidate_input_cursor` | non-negative int | no | source watermark |
 | `candidate_input_projection_ref` | internal ref | no | exact candidate descriptor |
 | `candidate_input_digest` | sha256 digest | no | complete candidate identity |
-| `sizing_stage` | closed enum | no | ordinary/post-compact/dispatch-fallback |
+| `sizing_stage` | closed enum | no | ordinary/post-compact/reactive-post-compact/dispatch-fallback |
 | `policy_ref` | non-empty string | no | policy identity |
 | `policy_snapshot_digest` | sha256 digest | no | frozen ratio/window snapshot |
 | `estimator_id` | non-empty string | no | estimator identity |
@@ -844,7 +935,12 @@ ordinary soft/hard:
 post-compact allow:
   new candidate/manifest
   -> CONTEXT_BUDGET_EVALUATED(stage=post_compact)
-  -> RUN_STARTED / ATTEMPT_STARTED (or recovery ATTEMPT_STARTED)
+  -> RUN_STARTED / ATTEMPT_STARTED
+
+reactive accepted post-compact allow:
+  new candidate/manifest
+  -> CONTEXT_BUDGET_EVALUATED(stage=reactive_post_compact)
+  -> RUN_STARTED(start_reason=recovery) / ATTEMPT_STARTED
 
 dispatch fallback:
   new fallback candidate/manifest
@@ -883,6 +979,19 @@ CAS/precondition/rollback方案只允许以下一个：
 `ATTEMPT_STARTED`与dispatch/Attempt rows均为零；前者caller正常得到“本轮无dispatch”，
 后者caller收到既有`HostDurableError`。相反，已存在同identity且一致的fact只表示幂等
 复用，仍须在同transaction重新验证当前Run state后才能继续transition。
+
+reactive recovery start使用等价但owner-local的private rollback signal：
+`_ReactiveRecoveryStartCasMissRollback`只定义在`engine_ingest.py`。start事务先读取
+Run=`RECOVERING`、`current_attempt_id=source_attempt_id`且source Attempt terminal，
+然后freeze candidate、写payload/manifest（Slice 2再写fact）并调用existing recovery
+start transition。transition返回`NOT_FOUND|INVALID_STATE`或`UPDATED`却缺/错
+Run/Attempt/dispatch rows时抛该private signal；`run_write`外只把它收敛为“不wake、
+保留此前accepted compact结果”；若存在并发winner，以winner committed state为真源，
+否则后续reconciliation重试同一accepted outcome。底层CAS lost与digest/integrity
+错误继续以`HostDurableError`传播。两类失败都必须在新transaction验证prepared
+candidate payload descriptor、manifest、budget fact、`RUN_STARTED`、
+`ATTEMPT_STARTED`、Attempt和dispatch row零孤立写入；不得回滚更早已提交的
+`CONTEXT_COMPACTED`，不得post-commit猜测winner，也不得补写failed/lost terminal fact。
 
 policy缺失时没有合法 sizing result，不产生伪造 fact；existing Run行为保持
 “budget governance unavailable”。public activity中的 `context_usage` 为 `None`。
@@ -1060,8 +1169,9 @@ no actual legal USAGE_REPORTED
   fallback。
 - accepted compact是hard anchor baseline barrier；immediate post-compact candidate
   只能conservative fallback。memory projection必须先按typed source boundary移除
-  covered older raw，再freeze exact candidate；该call后出现新的合法paired usage，
-  后续candidate才可anchor。
+  covered older raw，再freeze exact candidate；reactive accepted compact使用
+  `REACTIVE_POST_COMPACT`且即使fallback prediction为hard也allow recovery dispatch。
+  该call后出现新的合法paired usage，后续candidate才可anchor。
 - reactive overflow只进入既有recovery state machine；它不写anchor correction。
 - recovery不能从public view、Tool Trace、memory或usage diagnostic copy恢复anchor。
 - terminal Run/Attempt状态不重建缺失的iteration completion；usage先到后failure、
@@ -1081,8 +1191,10 @@ no actual legal USAGE_REPORTED
 | conservative estimator/current policy invalid | existing governance fail closed |
 | fact identity conflict | fail closed，不执行矛盾decision |
 | post-compact/fallback soft pressure | 保留soft pressure并允许dispatch；不得第二次proactive compact |
-| post-compact hard pressure | 同transaction写显式Run failure transition；不得普通返回`None`留下accepted Run |
+| proactive post-compact hard pressure | 同transaction写未启动Run failure transition；不得普通返回`None`留下accepted Run |
+| reactive accepted post-compact normal/soft/hard | 全部允许recovery dispatch；如实保留pressure；不得追加`CONTEXT_COMPACTION_FAILED`、`RUN_FAILED`或`RUN_LOST` |
 | dispatch-fallback hard pressure | 沿既有compaction-failed/fallback failure policy写显式Run failure；不得dispatch或静默停留 |
+| reactive accepted compact后memory catch-up/candidate/start CAS失败 | 本调用不创建/不wake Attempt；start事务零孤立manifest/fact/rows；保留accepted compact；无winner时保持`RECOVERING`重试，有winner时只信任winner committed state |
 | public canonical payload corrupt | public projection fail closed，不下游重算 |
 | Service enum出现未覆盖Host值 | assertion/error fail closed，不透传raw字符串 |
 
@@ -1099,25 +1211,44 @@ ORDINARY exact candidate
 accepted compact
   -> compact payload typed boundary
   -> memory projection removes covered older raw
-  -> rebuild POST_COMPACT exact candidate
+  -> proactive accepted: rebuild POST_COMPACT exact candidate
   -> normal or soft: dispatch with original pressure preserved
   -> hard: explicit terminal Run failure
 
-compact failed + tier 4/5 selected
+reactive accepted compact
+  -> memory projection reaches exact CONTEXT_COMPACTED sequence
+  -> rebuild REACTIVE_POST_COMPACT exact candidate before recovery start
+  -> normal / soft / hard: allow recovery dispatch with original pressure preserved
+  -> same transaction: candidate payload -> manifest -> recovery start
+  -> actual request loads the same manifest/candidate
+  -> real next overflow: start next existing bounded reactive operation when budget remains
+
+real compact failed + tier 4/5 selected
   -> build DISPATCH_FALLBACK exact candidate
   -> normal or soft: dispatch with original pressure preserved
-  -> hard: existing fallback/failure policy terminal Run failure
+  -> hard: existing fallback/failure policy consumes the real
+     CONTEXT_COMPACTION_FAILED and terminally fails the Run
 ```
 
 Slice 1尚未写`CONTEXT_BUDGET_EVALUATED`，但stage action与terminal behavior必须先完整
 成立。实现应把post-compact/fallback helper的结果收敛为closed outcome：
 `pending dispatch`或`terminal notice`；不得继续用`PendingDispatchRecord | None`让
-hard与CAS/precondition miss共享模糊`None`。terminal outcome在当前write transaction内
-复用`fail_unstarted_run_in_transaction`；transaction commit后由现有notifier交付。
-`POST_COMPACT` hard不得为已经accepted的同一operation再追加一条矛盾
-`CONTEXT_COMPACTION_FAILED`，但必须有Run terminal fact；`DISPATCH_FALLBACK` hard复用
-此前已写/同事务将写的compact-failed diagnostic并追加Run terminal fact。Slice 2再在
-这些transition之前插入同一个sizing result的canonical budget fact。
+hard与CAS/precondition miss共享模糊`None`。proactive `POST_COMPACT` hard在当前write
+transaction复用`fail_unstarted_run_in_transaction`；`DISPATCH_FALLBACK` hard必须先
+证明真实`CONTEXT_COMPACTION_FAILED`，proactive caller复用unstarted failure owner，
+reactive caller复用existing`fail_recovering_run_in_transaction`。transaction commit后
+由现有notifier交付。`POST_COMPACT` hard不得为已经accepted的同一operation再追加一条
+矛盾`CONTEXT_COMPACTION_FAILED`；Slice 2再在这些transition之前插入同一个sizing
+result的canonical budget fact。
+
+reactive accepted branch不得复用上述`POST_COMPACT` hard terminal outcome；它必须
+产生`REACTIVE_POST_COMPACT` sizing result并无条件进入allow recovery start。accepted
+compact后任何normal/soft/hard estimate都不能调用
+`fail_recovering_run_in_transaction`，因为该owner只接受真实
+`CONTEXT_COMPACTION_FAILED`。若新的recovery dispatch再次收到provider overflow，
+existing `max_reactive_compactions_per_run`计数与状态机决定是否创建下一条reactive
+operation；超过上限后才写真实failed fact并可选tier 4/5，fallback hard再由existing
+recovering failure transition收口。整个路径不得写`RUN_LOST`。
 
 proactive projection中的existing operation identity仍是同一snapshot唯一operation
 真源。post-compact/fallback soft直接dispatch，不回到ordinary soft branch；replay或
@@ -1157,7 +1288,8 @@ Controller裁决。
     读取proposal manifest，ordinary manifest前移不得污染operation projection。
 - `dayu/host/engine_ingest.py`
   - direct manifest/link/usage pairing、删除display-text estimate、reactive
-    post-compact/fallback fact ordering、anchored sizing consumption。
+    accepted candidate/manifest-before-recovery-start、fallback fact ordering、
+    start transaction rollback与anchored sizing consumption。
 - `dayu/host/context_anchor.py`（新增）
   - durable anchor resolver与compatibility/lineage barriers。
 - `dayu/host/context_events.py`
@@ -1181,8 +1313,12 @@ Controller裁决。
 
 `dayu/host/durable/run_transition.py`明确**不修改**：existing
 `StartGovernedRunInput`已满足caller-generated identity contract，Slice 1只补owner
-tests。若implementation发现必须改变该typed input或transition写入语义，立即stop并
-回Controller，不得把它悄悄加入allowed production。
+tests；reactive recovery继续直接复用existing
+`StartRecoveryRunInput` / `start_recovery_run_with_starting_attempt_in_transaction`，
+真实failed fallback继续复用existing
+`FailRecoveringRunInput` / `fail_recovering_run_in_transaction`。若implementation发现
+必须改变任何typed input或transition写入语义，立即stop并回Controller，不得把它
+悄悄加入allowed production。
 
 ### 7.2 Service/UI boundary
 
@@ -1250,17 +1386,19 @@ scope，否则stop：
 | --- | --- | --- |
 | `compact_payload.py` | accepted compact persisted semantic/source boundary parser | strict typed投影current input与covered refs；不参与manifest ordering。 |
 | `memory.py` / `durable/memory.py` | compact event typed projection、incremental/rebuild/repair/snapshot persistence | 只在memory owner更新selected recent；durable adapter消费typed payload，不复制raw-list parsing。 |
-| `_runner_call_manifest.py` | manifest/hot strict schema owner | 直接切v2；不依赖start顺序。 |
+| `context_budget.py` | `ContextSizingStage`、pressure/action total function、result invariant | closed enum新增`REACTIVE_POST_COMPACT`；constructor/helper共同验证12-cell，不允许下游改写hard pressure。 |
+| `_runner_call_manifest.py` | manifest/hot strict schema owner | 直接切v2；strict sizing snapshot接受四stage，reactive manifest在start前写；unknown stage fail closed。 |
 | `run_input.py` | ordinary producer、runner-call index、actual request复核、memory/raw-tail dedupe | producer前移到allow transaction；actual request不再二次写manifest；不新增compact coverage filter。 |
-| `engine_ingest.py` | continuation producer、prepared manifest lookup/link、usage pairing | 同transaction commit后Run/Attempt/manifest同时可见；按exact identity找pre-start manifest，不依赖它晚于start。 |
+| `engine_ingest.py` | continuation producer、prepared manifest lookup/link、usage pairing、reactive recovery start | reactive accepted先exact catch-up，再在start transaction freeze candidate并写manifest；manifest/start同时commit，actual request按exact identity读取。真实failed fallback保持existing failure owner。 |
 | `compaction_operation.py` | compactor producer | proposal路径保持自身call前manifest时序，`sizing_snapshot=not_applicable`。 |
 | `proactive_compaction.py` | compactor manifest reader | 现有kind filter继续忽略ordinary manifest；增加ordinary-before-start反例。 |
 | `tool_trace.py` / `durable/tool_trace.py` | manifest projection与reconstruction query | 可以先于RUN_STARTED投影同一event；不得要求run-start trace先存在，不改correlation/public readable semantics。 |
 | `lifecycle_events.py` / `durable/schema.py` | event closed set/DDL | v2与新budget fact全新起库；不编码相对顺序。 |
-| `read_api.py` / Service activity callback | 通用EventLog public sequence | raw Host progress stream可先看到activity=None的manifest，再看到context usage与RUN_STARTED；Service仍丢弃activity=None，只交付typed context usage与run lifecycle。测试冻结此顺序。 |
+| `context_events.py` / `read_api.py` / Service activity callback | canonical stage parser与通用EventLog public sequence | payload stage闭集扩为四值；raw Host progress stream可先看到activity=None的manifest，再看到`reactive_post_compact`的context usage与RUN_STARTED；projector保留hard pressure但不公开重算action。Service仍丢弃activity=None，只交付typed context usage与run lifecycle。 |
 | projection runner / memory / audit / outbox | 按cursor顺序扫描并以class/type filter选择 | generic checkpoint必须跨过新前置event；memory/audit无新业务投影，outbox只消费terminal filter，不把manifest当terminal。 |
 | recovery / dispatch scan | Run/Attempt/dispatch state rows及canonical lifecycle refs | manifest/start/fact同transaction，crash后只可能全有或全无；recovery不得把manifest当started truth。CAS miss/rollback与restart tests证明零孤立event。 |
 | terminal/lifecycle consumers | `started_event_id/sequence`精确指向RUN_STARTED/ATTEMPT_STARTED；terminal按typed set | 前置event只改变全局sequence间隔，不改变row refs或terminal truth；禁止“前一条event就是start”的位置假设。 |
+| `run_transition.py` | recovery start与真实compact-failed terminal owner | 零diff；accepted branch只调用start transition，真实`CONTEXT_COMPACTION_FAILED`分支才调用fail transition，never lost。 |
 
 直接命中tests为
 `test_run_input_builder.py`、`test_engine_ingest_mapping.py`、
@@ -1295,13 +1433,15 @@ filter自然成立，必须stop并重新裁决。
 
 建立complete candidate单一真源，补齐accepted compact source-boundary →
 Conversation Memory post-compact delta projection，冻结estimator contract、
-stage-aware action和manifest v2 direct pairing；所有当前dispatch-relevant sizing
-仍先保持`conservative_fallback`，不实现canonical context-budget fact或public view。
+4-stage/12-cell action和manifest v2 direct pairing；reactive accepted compact在
+recovery Attempt前冻结exact candidate/manifest并由actual request消费。所有当前
+dispatch-relevant sizing仍先保持`conservative_fallback`，不实现canonical
+context-budget fact或public view。
 
 **Expected outcome**
 
-- pre-start、post-compact、fallback、reactive recovery与actual Runner request使用同一
-  candidate projection/digest。
+- pre-start、proactive post-compact、fallback、reactive accepted recovery与actual
+  Runner request使用同一candidate projection/digest。
 - accepted compact后，selected recent window只保留post-compact delta与未被selected
   compact覆盖的protected raw；current input保留一次，covered older raw不再进入exact
   candidate。
@@ -1312,7 +1452,12 @@ stage-aware action和manifest v2 direct pairing；所有当前dispatch-relevant 
 - sizing不依赖manifest；只有allow后分配并由manifest/start transition实际消费同一
   identity。ordinary soft/hard不写manifest或durable Attempt identity。
 - ordinary soft只启动同一snapshot唯一 proactive operation；post-compact/fallback
-  soft保留soft pressure但允许dispatch；hard显式terminal fail closed。
+  soft保留soft pressure但允许dispatch；其hard走各自合法failure owner。
+  `REACTIVE_POST_COMPACT` normal/soft/hard均保留真实pressure并允许recovery dispatch。
+- reactive accepted compact后memory必须exact catch-up；同一start transaction按
+  candidate payload -> manifest -> recovery start排序，actual worker用existing strict
+  loader读取同一candidate。rollback零孤立manifest/Attempt，accepted compact不被
+  contradictory terminal facts污染。
 
 **Allowed production files**
 
@@ -1372,8 +1517,9 @@ README、`dayu/README.md`与Service README当前无Slice 1职责变化，audit�
    recent evidence；incremental、rebuild、inline repair与persisted reload共享同一
    rule。`run_input.py`不得新增coverage filter。
 3. 冻结estimator id/version/range与conservative `ContextSizingResult` contract；新增
-   complete candidate adapter，不改公式常量；pressure纯阈值派生，action按stage
-   派生。
+   complete candidate adapter，不改公式常量；pressure纯阈值派生，action按
+   4-stage/12-cell total function派生。新增closed
+   `REACTIVE_POST_COMPACT="reactive_post_compact"`。
 4. 将RunInputBuilder的pure candidate assembly提取为可在Attempt start前调用的typed
    preparation；actual request只消费并验证frozen candidate。
 5. 把existing memory catch-up/lag repair前移到candidate freeze前；tool schema
@@ -1384,20 +1530,43 @@ README、`dayu/README.md`与Service README当前无Slice 1职责变化，audit�
 7. pre-start sizing先使用identity-free candidate；decision=allow后在同一transaction
    构造一个`StartGovernedRunInput`，manifest和existing durable transition消费其中
    同一attempt/execution identity。ordinary soft/hard不写manifest、不分配identity。
-8. ordinary soft进入唯一proactive operation；post-compact/fallback soft直接进入
-   allow start且pressure保持soft。post-compact/fallback hard返回closed terminal
-   outcome，在同一transaction复用既有unstarted Run failure transition；不得返回
-   ambiguous `None`或启动第二次proactive operation。
-9. manifest直接切v2，三个producer写strict `sizing_snapshot`；continuation只从
-   accepted Engine input projection、首个complete manifest的selected-tool descriptor
-   与admission-frozen policy/request semantics重建，crash缺源写closed unavailable。
-10. usage ingest通过accepted link读取manifest sizing snapshot，删除
+8. ordinary soft进入唯一proactive operation；proactive post-compact/fallback soft
+   直接进入allow start且pressure保持soft。`POST_COMPACT` hard复用既有unstarted Run
+   failure transition；真实`CONTEXT_COMPACTION_FAILED`后的`DISPATCH_FALLBACK` hard
+   复用existing fallback/recovering failure owner。不得返回ambiguous `None`或启动
+   第二次proactive operation。
+9. reactive accepted `CONTEXT_COMPACTED`提交后先要求Conversation Memory exact覆盖
+   compacted event sequence；失败时不得继续start。新的recovery start transaction
+   重验Run=`RECOVERING`/source Attempt terminal，通过`run_input.py`
+   transaction-local strict loader读取source Attempt frozen candidate，复用其
+   policy/tool schemas/disable-tools/tool-execution-mode，冻结compact后的complete
+   candidate并构造`REACTIVE_POST_COMPACT` sizing；normal/soft/hard全部allow。禁止读取
+   当前local config重选。
+10. reactive allow后才分配一次`StartRecoveryRunInput` identities，按prepared
+    candidate payload -> runner-call manifest -> existing recovery start transition
+    排序提交。actual request按新Attempt/execution通过existing strict loader读取同一
+    manifest/candidate；不得扩充wakeup DTO或二次assembly。
+11. reactive start `NOT_FOUND|INVALID_STATE`或rows不完整抛owner-local private rollback
+    signal，caller不wake并保留accepted result供reconciliation；low-level CAS lost与
+    digest/integrity错误传播`HostDurableError`。本start transaction两类失败均零孤立
+    payload/manifest/Attempt/dispatch；不得写`CONTEXT_COMPACTION_FAILED`、
+    `RUN_FAILED`或`RUN_LOST`。
+12. reactive Engine candidate duplicate/replay按deterministic operation/event identity
+    读取committed outcome：matching accepted compact + Run仍`RECOVERING` + 无recovery
+    Attempt时重入exact catch-up/start流程，不再调用compactor或追加accepted fact；
+    并发winner已start时只duplicate ack且不重复wake；matching真实failed outcome只恢复
+    existing fallback/failure分支。
+13. manifest直接切v2，三个producer写strict `sizing_snapshot`并接受四stage；
+    continuation只从
+    accepted Engine input projection、首个complete manifest的selected-tool descriptor
+    与admission-frozen policy/request semantics重建，crash缺源写closed unavailable。
+14. usage ingest通过accepted link读取manifest sizing snapshot，删除
    `_estimate_usage_observation_input`和`display_text` estimate。
-11. allow start precondition miss抛private rollback exception并由`run_write`外caller转为
+15. ordinary allow start precondition miss抛private rollback exception并由`run_write`外caller转为
    无dispatch；低层CAS_LOST沿existing HostDurableError传播；两者都零孤立manifest。
-12. 按§7.4适配全部direct manifest consumers并验证public/recovery/projection/Tool
+16. 按§7.4适配全部direct manifest/stage consumers并验证public/recovery/projection/Tool
    Trace/terminal ordering；不改变Issue #119 correlation。
-13. `supports_stream_usage`不进入usage availability分支；不增加anchor selection、
+17. `supports_stream_usage`不进入usage availability分支；不增加anchor selection、
     signed-delta公式或public activity。
 
 **Owner-level assertions**
@@ -1430,10 +1599,29 @@ README、`dayu/README.md`与Service README当前无Slice 1职责变化，audit�
 - allow path事件顺序为manifest→RUN_STARTED→ATTEMPT_STARTED并消费相同identity；
   ordinary soft/hard零manifest/Attempt identity；precondition miss与low-level CAS lost后
   EventLog/payload/state零孤立写入。
-- stage matrix精确覆盖9个组合：ordinary normal/soft/hard分别allow/compact/block；
-  post-compact与dispatch-fallback normal/soft/hard分别allow/allow/block。soft
-  pressure值不改写；post-compact/fallback hard均产生Run terminal fact，零silent
-  accepted Run；同一snapshot只有一条proactive request。
+- stage matrix精确覆盖12个组合：ordinary normal/soft/hard分别
+  allow/compact/block；post-compact与dispatch-fallback normal/soft/hard分别
+  allow/allow/block；reactive-post-compact normal/soft/hard均allow。所有soft/hard
+  pressure值不改写；proactive post-compact hard产生未启动Run terminal fact；
+  dispatch-fallback hard消费真实failed fact并产生合法Run terminal fact；
+  reactive hard创建recovery Attempt且零`CONTEXT_COMPACTION_FAILED`/`RUN_FAILED`/
+  `RUN_LOST`。同一snapshot只有一条proactive request。
+- reactive accepted owner test冻结顺序：
+  `CONTEXT_COMPACTED` commit -> exact memory catch-up -> candidate payload ->
+  manifest -> recovery `RUN_STARTED` -> `ATTEMPT_STARTED`；manifest在Attempt start前
+  已存在并绑定同一attempt/execution，worker strict loader得到与sizing完全同一
+  candidate。
+- source Attempt manifest/candidate缺失、digest mismatch或
+  `tool_execution_mode`非法时fail closed且不start；合法路径精确复用source frozen
+  policy/tool schema/mode，修改当前local config不改变recovery candidate。
+- catch-up failure断言不wake、accepted compact保持、Run仍为`RECOVERING`；
+  start precondition miss与low-level CAS lost分别断言本调用不wake、start transaction
+  零孤立candidate payload/manifest/Attempt/dispatch、零矛盾terminal facts，并用
+  并发winner/no-winner两类fixture冻结committed state owner。
+- reactive hard recovery真实再次overflow时，在remaining
+  `max_reactive_compactions_per_run`预算内追加下一条reactive request；超过上限才写
+  真实`CONTEXT_COMPACTION_FAILED`并进入tier 4/5。fallback hard使用existing
+  `fail_recovering_run_in_transaction`，不得lost。
 - Tool Trace correlation/public readable behavior无语义变化；public stream、
   projection checkpoint、recovery、outbox与terminal refs满足§7.4。
 
@@ -1481,8 +1669,12 @@ tests通过。
 - production证据表明compact coverage不能由`compact_payload` typed boundary与
   Conversation Memory projection唯一拥有，或必须在RunInput再建第二套filter；
 - protected recent raw是否被selected compact覆盖无法从typed canonical refs唯一判断；
-- post-compact/fallback hard无法通过既有Run failure owner显式收口，或需要第二次
-  proactive operation；
+- proactive post-compact/真实failed fallback hard无法通过既有Run failure owner显式
+  收口，或需要第二次proactive operation；
+- reactive accepted recovery无法在Attempt start前完成exact candidate/manifest，
+  actual request无法消费同一candidate，或实现需要修改`run_transition.py`；
+- reactive accepted hard必须写compact-failed/run-failed/run-lost才能继续，或再次
+  overflow无法复用existing bounded reactive loop；
 - 任何allowed files外production修改。
 
 ### 8.3 Slice 2 — Independent canonical fact 与 Host→Service typed projection
@@ -1550,8 +1742,10 @@ view、Service typed pass-through与稳定验证入口。
    resolver。
 2. 新增strict `CONTEXT_BUDGET_EVALUATED` schema、deterministic identity与append
    helper。
-3. ordinary、post-compact、reactive post-compact、tier fallback与hard-block路径先
-   append fact，再写driven transition；同transaction。
+3. ordinary、proactive post-compact、reactive accepted post-compact、tier fallback
+   与hard-block路径先append fact，再写driven transition；同transaction。
+   `REACTIVE_POST_COMPACT` fact无论normal/soft/hard都记录真实pressure与
+   `ALLOW_DISPATCH`，然后启动recovery。
 4. 复用§5.6唯一rollback方案：start precondition miss抛private rollback exception并
    由caller转成无dispatch；low-level CAS lost沿existing durable error传播；两者使
    同transaction内projection/manifest/fact整体rollback，不得留下孤立truth。
@@ -1566,7 +1760,7 @@ view、Service typed pass-through与稳定验证入口。
 - **policy存在但usage缺失**时conservative fact成立、typed context usage可用且method
   为fallback；policy缺失时不调用sizing、不产生fact/activity，Run保持既有
   allow-without-budget / no-budget governance path。
-- ordinary/post-compact/fallback各有独立identity。
+- ordinary/post-compact/reactive-post-compact/fallback各有独立identity。
 - exact event order先fact后compact/start/attempt。
 - CAS precondition miss与low-level CAS lost后，EventLog中零
   `RUNNER_CALL_INPUT_ASSEMBLED`/`CONTEXT_BUDGET_EVALUATED`孤立truth，payload/state
@@ -1575,7 +1769,11 @@ view、Service typed pass-through与稳定验证入口。
 - normal/soft/hard、basis points >10000不clamp。
 - canonical fact同时保存真实`pressure_level`与stage-aware`budget_decision`：
   post-compact/fallback soft的public pressure仍为soft且fact-before-dispatch；
-  hard fact-before-terminal failure，零silent accepted Run、零第二次proactive request。
+  其hard fact-before-terminal failure，零silent accepted Run、零第二次proactive
+  request；reactive-post-compact hard的public pressure仍为hard但decision为allow，
+  fact-before-recovery-start且零failed/lost terminal fact。
+- canonical parser、manifest strict parser、Host read projector与Service mapper都接受
+  第四stage；public DTO继续只公开既定七字段，不从hard pressure重算block action。
 - policy missing时不伪造fact，context usage unavailable。
 - Host activity只公开七个字段；不含raw usage、refs、delta、policy ref。
 - Service字段逐一相等；通过monkeypatch使任一重算会产生不同值的测试证明无重算。
@@ -1676,10 +1874,13 @@ dispatch-relevant sizing stage；完成全Work Unit acceptance与docs。
    terminal Run不替代completion。
 3. 实现provider/model/window/estimator/request-semantics compatibility。
 4. 实现signed delta与range validation；anchor问题统一返回closed fallback reason。
-5. ordinary/post-compact/fallback/reactive paths都调用相同sizing entry point。
+5. ordinary/post-compact/reactive-post-compact/fallback都调用相同sizing entry
+   point；accepted compact immediate candidate（包括
+   `REACTIVE_POST_COMPACT`）固定使用完整conservative fallback，不解析旧anchor。
 6. public fact/view继续只消费result；不新增anchor refs到public DTO。
 7. accepted compact immediate candidate强制fallback；新successful ordinary usage与
-   completion后才刷新。
+   completion后才刷新。`REACTIVE_POST_COMPACT`即使fallback prediction为hard仍由
+   stage action allow recovery dispatch。
 8. supports flag只作为request semantics snapshot，不作为presence判断。
 9. README只同步当前已实现owner/contract/validation入口，不写WU过程。
 
@@ -1753,15 +1954,15 @@ replay acceptance通过；README audit完成。
 | manifest v2 | exact fields、closed states、all producers、v1/unknown/partial拒绝、hot/descriptor/digest graph；continuation四类frozen source与closed unavailable |
 | direct pairing | unique accepted link；same iteration；missing/mismatch/ambiguous；无request id/time/display text |
 | anchor | 同transaction snapshot；positive/negative delta；tool loop；older anchor through completed missing-usage calls；usage-before-failure/crash-gap/terminal barriers；all compatibility dimensions |
-| policy/action | policy present + usage absent产生conservative fact；policy none保持no-budget/no-fact；fixed ratios/thresholds；>= comparison；9-cell stage matrix；soft pressure/action分离；hard terminal fail closed；over-100 utilization no clamp |
-| candidate stages | ordinary/post-compact/dispatch-fallback；internal compactor excluded |
+| policy/action | policy present + usage absent产生conservative fact；policy none保持no-budget/no-fact；fixed ratios/thresholds；>= comparison；12-cell stage matrix；soft/hard pressure与action分离；reactive hard allow；其它hard由合法owner terminal；over-100 utilization no clamp |
+| candidate stages | ordinary/proactive-post-compact/reactive-post-compact/dispatch-fallback；stage选择反例；internal compactor excluded |
 | compact size effect | covered material存在时exact size真实下降；无covered material时不丢current/protected raw、不伪造下降；memory/raw-tail source+digest去重 |
-| durability | allow后identity allocation/consumption；ordinary soft/hard零manifest/Attempt identity；precondition miss与CAS lost整笔rollback；fact identity/idempotency/conflict/order；replay/recovery determinism |
+| durability | allow后identity allocation/consumption；ordinary soft/hard零manifest/Attempt identity；ordinary与reactive start precondition miss/CAS lost整笔rollback；reactive manifest-before-start/actual request pairing；fact identity/idempotency/conflict/order；replay/recovery determinism |
 | Host public | kind/view/invariants；anchored/fallback；normal/soft/hard；policy unavailable；raw usage hidden |
 | Service | exact field pass-through；enum exhaustiveness；callback delivery |
 | CLI regression | optional context usage不破坏existing formatter；不新增具体display |
 | layering | Engine无Host import；Service无durable import；无weak typing/glue |
-| ordering consumers | public stream/activity、generic projection checkpoint、recovery scan、Tool Trace query、outbox terminal filter、lifecycle exact refs |
+| ordering consumers | public stream/activity、generic projection checkpoint、recovery scan、Tool Trace query、outbox terminal filter、lifecycle exact refs；reactive accepted零矛盾terminal facts与next-overflow bounded loop |
 
 ### 9.2 Required command sequence
 
@@ -1832,6 +2033,8 @@ rg -n "from dayu\\.host|import dayu\\.host" dayu/engine
 rg -n "dayu\\.host\\.durable" dayu/service
 rg -n "CONTEXT_BUDGET_EVALUATED|CONTEXT_USAGE|HostContextUsageView|EntrypointContextUsage" \
   dayu tests dayu/host/README.md dayu/service/README.md tests/README.md
+rg -n "ContextSizingStage|REACTIVE_POST_COMPACT|reactive_post_compact" \
+  dayu/host tests/host dayu/host/README.md tests/README.md
 rg -l "RUNNER_CALL_INPUT_ASSEMBLED|RUNNER_CALL_INPUT_ITERATION_LINKED" \
   dayu tests | sort
 git diff --exit-code -- dayu/host/durable/run_transition.py
@@ -1844,7 +2047,10 @@ raw-tail dedupe，若出现RunInput读取raw `source_boundary_refs`立即失败�
 零命中；changed owner新增weak-typing零命中；Engine→Host反向依赖零命中；Service
 durable依赖零命中。context contract grep与manifest consumer grep必须命中§7.4完整
 producer/consumer/tests/docs并由implementation artifact逐项对账；
-`run_transition.py`必须零diff；最后`diff --check`通过。
+stage audit必须证明enum、manifest strict schema、canonical payload parser、Host
+projector、Service mapper与12-cell tests全覆盖第四stage，且accepted hard路径没有
+compact-failed/run-failed/run-lost写入；`run_transition.py`必须零diff；最后
+`diff --check`通过。
 
 ## 10. Schema cutover decision
 
@@ -1890,8 +2096,10 @@ boundary；本计划没有需要implementation agent自行发明的契约。
 | pre-start exact candidate refactor已暴露accepted compact后memory selected window仍含covered raw | fixed in Slice 1；compact payload + memory owner | typed current/covered boundary；owner projection删除covered raw；RunInput不补偿 |
 | source boundary只含current input或covered refs未命中selected window时，测试可能错误要求size下降 | fixed in Slice 1 tests | 分离“确有covered material”和“无covered material”矩阵；后者禁止伪造下降 |
 | protected raw同时由memory selected与ordinary raw tail提供造成双计 | fixed in Slice 1 | 复用source-ref与content-digest去重；owner integration test冻结 |
-| post-compact/fallback soft若继续沿ordinary action会重复compact或静默不dispatch | fixed in Slice 1；ContextSizingResult/dispatch owner | 9-cell stage matrix；soft允许dispatch并保留pressure；同snapshot operation count=1 |
-| post-compact/fallback hard普通返回`None`会留下accepted Run | fixed in Slice 1；Host lifecycle owner | closed dispatch/terminal outcome；同transaction显式Run failure |
+| post-compact/fallback soft若继续沿ordinary action会重复compact或静默不dispatch | fixed in Slice 1；ContextSizingResult/dispatch owner | 12-cell stage matrix；soft允许dispatch并保留pressure；同snapshot operation count=1 |
+| proactive post-compact/fallback hard普通返回`None`会留下accepted Run | fixed in Slice 1；Host lifecycle owner | closed dispatch/terminal outcome；分别复用unstarted或真实compact-failed owner |
+| reactive accepted hard若沿POST_COMPACT block会伪造failure或不启动recovery | fixed in Slice 1；ContextSizingResult/engine ingest owner | fourth stage三pressure均allow；零矛盾terminal facts；真实next overflow进入bounded loop |
+| reactive recovery Attempt在manifest前创建会使worker strict loader fail closed | fixed in Slice 1；engine ingest/run input owner | exact catch-up；candidate/manifest-before-start；actual request digest pairing；CAS整笔rollback |
 | 当前worktree partial implementation尚未完成tests/type/coverage | not accepted；owned by resumed Slice 1 after plan re-review | amendment双路re-review pass前禁止继续implementation或commit |
 | session历史较长时anchor scan成本 | fixed in Slice 3 | indexed session/event-sequence keyset paging；遇latest accepted compact boundary停止；不加任意总cap |
 | usage合法但provider token口径与Host heuristic长期偏差 | accepted product property，属于本WU设计目标 | 只校正compatible anchor；不承诺billing-grade精确 |
@@ -1956,8 +2164,10 @@ Controller adjudication是唯一finding裁决真源。accepted findings全部在
 | MIMO-003 | fixed | §5.3、§8.2、§8.4：冻结continuation projection/selected schema/policy/request semantics唯一来源；四类crash缺源closed unavailable+fallback，禁止当前config重选。 |
 | MIMO-004 | rejected-with-reason | 不采纳。manifest`sizing_snapshot`只冻结conservative contract，不包含后选anchored/fallback method；`input_snapshot_digest`与manifest digest职责已分别定义，method变化不会重写manifest。 |
 | Slice 1 accepted blocker：compact coverage owner缺失 | fixed in amendment | §2、§4、§5.8、§6.3、§7、§8.2、§9：compact payload typed current/covered boundary + Conversation Memory唯一projection；禁止RunInput filter。 |
-| Slice 1 accepted blocker：pressure/action非stage-aware | fixed in amendment | §1.3、§4、§5.5、§6.4-§6.5、§8.2-§8.3、§9：9-cell matrix；post-compact/fallback soft allow且保留pressure，hard terminal fail closed。 |
+| Slice 1 accepted blocker：pressure/action非stage-aware | fixed in first amendment | §1.3、§4、§5.5、§6.4-§6.5、§8.2-§8.3、§9：stage-aware action foundation继续保留。 |
 | Slice 1 scope / verification reopening | fixed in amendment | §0、§7、§8.2、§11-§12：新增compact payload、memory与owner tests；partial implementation保持not accepted，双路re-review前不恢复。 |
+| Slice 1 second accepted blocker：proactive/reactive accepted post-compact错误合并 | fixed in second amendment | §1.3、§2、§5.3、§5.5、§6.3-§6.5、§7.4、§8.2-§8.4、§9：closed `REACTIVE_POST_COMPACT`与12-cell action；reactive hard allow且保留pressure。 |
+| Slice 1 second accepted blocker：recovery start早于candidate/manifest | fixed in second amendment | §2、§5.3、§5.6、§6.5、§7.4、§8.2、§9：exact catch-up、candidate/manifest-before-start、actual request同源、CAS rollback与零矛盾terminal facts。 |
 
 ## 15. Plan gate completion
 
@@ -1979,8 +2189,13 @@ Controller adjudication是唯一finding裁决真源。accepted findings全部在
   - Host ingest只拥有direct iteration pairing；accepted iteration-completed preview
     是successful runner-call所需的现有durable completion evidence，Run terminal不补洞；
   - Context Governance拥有anchor/prediction/threshold/pressure与stage-aware action；
-    post-compact/fallback soft允许dispatch且不改写pressure，hard显式terminal
-    fail closed，同snapshot不启动第二次proactive operation；
+    closed stage为ordinary/post-compact/reactive-post-compact/dispatch-fallback；
+    post-compact/fallback soft允许dispatch且不改写pressure，其hard由合法failure owner
+    收口；reactive-post-compact三种pressure都allow recovery且不改写pressure，同snapshot
+    不启动第二次proactive operation；
+  - Engine ingest在reactive accepted compact后先exact catch-up，再在recovery start
+    transaction冻结candidate、写manifest并调用unchanged recovery transition；actual
+    request读取同一candidate，rollback零孤立写入，accepted branch零failed/lost事实；
   - canonical fact与Host public view消费同一result；
   - Service只typed pass-through，UI不重算。
 - validation plan：每slice focused tests + full pyright；最终Host/Service/Engine/CLI与
