@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import partial
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -43,7 +44,6 @@ from dayu.host.api import (
 )
 from dayu.host.command import (
     HostCommandHandle,
-    create_host_command_handle,
     create_session as command_create_session,
     start_run,
 )
@@ -63,12 +63,26 @@ from dayu.host.durable.storage_lifecycle import (
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import open_host_admin
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
 _SQLITE_PAYLOAD_BYTES = b"sqlite-payload"
 _ORPHAN_SQLITE_PAYLOAD_BYTES = b"orphan-payload"
 _ARTIFACT_BYTES = b"artifact-payload"
 _STAT_TARGET_DB = "db"
 _STAT_TARGET_WAL = "wal"
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "storage-usage-report"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,7 +438,7 @@ def test_fresh_storage_usage_report_has_zero_counts_and_non_negative_file_sizes(
 ) -> None:
     """fresh durable DB report 的 row count 为零且文件大小非负。"""
 
-    host = create_host_command_handle(_command_options(tmp_path))
+    host = _create_execution_handle(_command_options(tmp_path))
     try:
         report = report_storage_usage(host)
         values = report.json_value()
@@ -448,7 +462,7 @@ def test_storage_usage_report_counts_rows_logical_bytes_and_orphans(
     """report 正确统计 Session/Run/payload row、logical bytes 与 orphan payload。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         _seed_session_run_and_payloads(host, options.artifact_root)
 
@@ -477,7 +491,7 @@ def test_report_storage_usage_wraps_file_stat_os_error(
     """public facade 将 DB/WAL stat 的非缺失 OSError 包装为 HostApiError。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     original_stat = Path.stat
     expected_error = PermissionError("storage usage stat denied")
     wal_path = options.db_path.with_name(f"{options.db_path.name}-wal")
@@ -542,7 +556,7 @@ def test_storage_usage_json_value_is_stable_self_explaining_and_non_negative(
 ) -> None:
     """json_value 返回稳定、自解释且非负的 JSON object。"""
 
-    host = create_host_command_handle(_command_options(tmp_path))
+    host = _create_execution_handle(_command_options(tmp_path))
     try:
         values = report_storage_usage(host).json_value()
     finally:

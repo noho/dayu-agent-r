@@ -23,7 +23,16 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.messages import AssistantMessage, ToolMessage, UserMessage
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host._execution_config_projection import (
+    effective_execution_config_json,
+    effective_execution_snapshot_from_json,
+)
+from dayu.host._runner_call_manifest import (
+    RunnerCallSizingUnavailableReason,
+    unavailable_runner_call_sizing_snapshot,
+)
 from dayu.host.queue_policy import RunQueuePolicy
+from dayu.host.admission import effective_tool_facts_json
 from dayu.host import (
     AttemptDispatchSnapshot,
     AuthorizationClaim,
@@ -42,8 +51,15 @@ from dayu.host import (
     get_run,
     resolve_wait,
 )
-from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, WaitAdapterKey
-from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host.api import (
+    EnsureSessionRequest,
+    HostCommandHandleOptions,
+    OrdinaryRunExecutionBaseline,
+    WaitAdapterKey,
+)
+from dayu.host.command import HostCommandHandle
+from dayu.host.tooling import HostToolingOptions
+from dayu.host.context_budget import ContextSizingStage
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
@@ -52,17 +68,23 @@ from dayu.host.durable.event_log import (
     EventLogStore,
 )
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.liveness import HostInstanceIdentity, register_current_instance
+from dayu.host.durable.idempotency import IdempotencyStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
+    CreateAcceptedRunInput,
     CreateRunningRunInput,
     ResumeRunFromWaitingInput,
+    StartGovernedRunInput,
     WaitingRunTerminalInput,
     accept_worker_running_in_transaction,
+    create_accepted_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     fail_run_from_waiting_in_transaction,
     resume_run_from_waiting_in_transaction,
+    start_governed_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
@@ -100,7 +122,14 @@ from dayu.host.memory import (
 )
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.projection import ProjectionCatchupPort
-from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
+from dayu.host.run_input import (
+    PolicySnapshot,
+    SessionContinuityView,
+    ToolExecutionMode,
+    create_no_tool_run_input_builder,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+)
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
     DefaultHostResolveWaitService,
@@ -111,6 +140,7 @@ from dayu.host.waiting import (
     _resolve_created_event_ref,
 )
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+from tests.host.execution_handle_support import create_execution_command_handle
 
 _NOW = datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC)
 _OBSERVED = datetime(2026, 5, 16, 1, 5, 7, tzinfo=UTC)
@@ -176,7 +206,7 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
 ) -> None:
     """completed outcome 关闭 wait 并创建 resume Attempt / dispatch record。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         request = _completed_request("resolve-completed")
@@ -243,12 +273,24 @@ def test_resolve_wait_survives_projection_catchup_failure(
 ) -> None:
     """resolve_wait commit 后 projection catch-up 失败不影响恢复结果。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     projection = _FailingProjectionCatchup()
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
         terminal_post_commit_port=host._terminal_post_commit_port,
+        payload_store=PayloadStore(),
+        event_log_store=None,
+        idempotency_store=None,
+        clock=None,
+        id_factory=None,
+        wakeup_port=None,
         projection_catchup_port=projection,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        tooling_options=None,
+        context_budget_policy=None,
+        memory_projection_policy=default_memory_projection_policy(),
+        enable_truncation_manager=False,
+        owner_host_instance_id=host.host_handle_id,
     )
     try:
         seeded = _seed_waiting_run(host)
@@ -266,7 +308,7 @@ def test_resolve_wait_rejects_expired_wait_from_common_owner(
 ) -> None:
     """过期 wait 由 common owner 收为 FAILED 后拒绝迟到结果。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline_text(
@@ -295,7 +337,7 @@ def test_resolve_wait_invalid_deadline_fails_closed_without_lost(
 ) -> None:
     """非法持久化 deadline fail closed，不能被转换成业务 LOST。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline_text(
@@ -325,7 +367,7 @@ def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
     """
 
     policy = default_memory_projection_policy()
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
 
@@ -379,12 +421,15 @@ def test_resolve_wait_uses_injected_event_log_store_for_request_atom(
 ) -> None:
     """resolve wait request atom 校验使用注入 EventLogStore，而非临时实例。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     event_log_store = _CountingEventLogStore()
     service = DefaultHostResolveWaitService(
         transaction_runner=host._transaction_runner(),
         terminal_post_commit_port=host._terminal_post_commit_port,
         event_log_store=event_log_store,
+        idempotency_store=IdempotencyStore(),
+        payload_store=PayloadStore(),
+        memory_projection_policy=default_memory_projection_policy(),
     )
     try:
         seeded = _seed_waiting_run(host)
@@ -416,7 +461,7 @@ def test_resolve_wait_rejects_request_atom_arguments_digest_mismatch(
     :raises AssertionError: digest mismatch 未被拒绝时抛出。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _rewrite_wait_request_atom_digest(host._transaction_runner(), seeded.wait_id)
@@ -451,7 +496,7 @@ def test_resolve_wait_rejects_broken_awaiting_request_link_without_mutation(
 ) -> None:
     """awaiting 显式 request ref 缺失或损坏时不写 resolution/resume facts。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _rewrite_wait_awaiting_request_link(
@@ -489,7 +534,7 @@ def test_resolve_wait_logs_ids_without_result_payload(
     :raises AssertionError: 日志缺少字段或泄漏 result payload 时抛出。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
 
@@ -514,7 +559,7 @@ def test_resolve_wait_same_key_same_outcome_replays_with_different_observed_at(
 ) -> None:
     """同 wait_id + idempotency_key + outcome 不因 observed_at 变化而冲突。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         request = _completed_request("resolve-replay")
@@ -540,7 +585,7 @@ def test_resolve_wait_same_key_different_outcome_conflicts(
 ) -> None:
     """同 key 不同 outcome 返回 idempotency_conflict 且不追加事实。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         request = _completed_request("resolve-conflict")
@@ -572,8 +617,8 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
 ) -> None:
     """failed / lost outcome 收口 Run 且不创建 resume dispatch。"""
 
-    failed_host = create_host_command_handle(_options(tmp_path / "failed"))
-    lost_host = create_host_command_handle(_options(tmp_path / "lost"))
+    failed_host = _create_execution_handle(_options(tmp_path / "failed"))
+    lost_host = _create_execution_handle(_options(tmp_path / "lost"))
     try:
         failed_seeded = _seed_waiting_run(failed_host)
         failed_before = _read_resolution_tables(failed_host._transaction_runner())
@@ -656,7 +701,7 @@ def test_waiting_resolution_transition_rejects_execution_identity_mismatch(
     :raises AssertionError: transition 未 fail closed 或 durable 表发生变化时抛出。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         auxiliary_execution_id = _seed_auxiliary_starting_attempt(
@@ -711,7 +756,7 @@ def test_waiting_resolution_transition_returns_not_found_without_mutation(
     :raises AssertionError: transition 未返回 NOT_FOUND 或 durable 表发生变化时抛出。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         before = _read_resolution_tables(host._transaction_runner())
@@ -764,7 +809,7 @@ def test_resolve_wait_lost_same_key_replays_terminal_snapshot(
 ) -> None:
     """lost outcome 同 key 重放返回终态 snapshot 且不追加事实。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         request = _lost_request("resolve-lost-replay")
@@ -787,7 +832,7 @@ def test_resolve_wait_tool_cancelled_resumes_as_resolved_wait(
 ) -> None:
     """工具级 cancelled outcome 按 resolved wait 恢复，而不是取消 wait record。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
 
@@ -1333,10 +1378,15 @@ def _set_wait_deadline_text(
     transaction_runner.run_write(_operation)
 
 
-def _seed_waiting_run(host: HostCommandHandle) -> _SeededWaitingRun:
+def _seed_waiting_run(
+    host: HostCommandHandle,
+    *,
+    tooling_options: HostToolingOptions | None = None,
+) -> _SeededWaitingRun:
     """创建已进入 WAITING/SUSPENDED 的 Run。
 
     :param host: Host command handle。
+    :param tooling_options: admission 时的 construction-time 工具真源。
     :returns: seeded waiting run。
     """
 
@@ -1353,7 +1403,11 @@ def _seed_waiting_run(host: HostCommandHandle) -> _SeededWaitingRun:
         dispatch_record_id="dispatch-resolve",
         wait_id="wait-pending",
     )
-    _seed_active_run(transaction_runner, base)
+    _seed_active_run(
+        transaction_runner,
+        base,
+        tooling_options=tooling_options,
+    )
     candidate = _awaiting_candidate(base)
     result = DefaultHostToolAwaitingAcceptPort(
         transaction_runner=transaction_runner
@@ -1453,12 +1507,16 @@ def _seed_auxiliary_starting_attempt(
 
 
 def _seed_active_run(
-    transaction_runner: HostTransactionRunner, seeded: _SeededWaitingRun
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededWaitingRun,
+    *,
+    tooling_options: HostToolingOptions | None = None,
 ) -> None:
     """创建已 worker accepted 的 active Run。
 
     :param transaction_runner: Host transaction runner。
     :param seeded: seeded run 引用。
+    :param tooling_options: admission 时的 construction-time 工具真源。
     :returns: ``None``。
     """
 
@@ -1478,6 +1536,7 @@ def _seed_active_run(
                 boot_id=None,
             ),
         )
+        execution_config = _execution_config()
         input_event = EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -1498,38 +1557,83 @@ def _seed_active_run(
                 payload_json={
                     "display_text": "hello",
                     "operation_kind": "test",
+                    "effective_execution_config": execution_config,
+                    "effective_tool_set": effective_tool_facts_json(
+                        frozenset(),
+                        tooling_options=tooling_options,
+                    ),
                 },
                 payload_ref=None,
                 payload_digest=None,
             ),
         ).row
-        create_running_run_with_starting_attempt_in_transaction(
+        accepted = create_accepted_run_in_transaction(
             transaction,
             EventLogStore(),
-            CreateRunningRunInput(
+            CreateAcceptedRunInput(
                 session_id=seeded.session_id,
                 run_id=seeded.run_id,
                 client_request_id="client-resolve",
                 input_event_id=input_event.event_id,
                 input_event_sequence=input_event.event_sequence,
                 run_accepted_event_id="event-run-accepted-resolve",
-                run_started_event_id="event-run-started-resolve",
-                attempt_started_event_id="event-attempt-started-resolve",
-                attempt_id=seeded.attempt_id,
-                execution_id=seeded.execution_id,
-                dispatch_record_id=seeded.dispatch_record_id,
                 occurred_at=_NOW,
                 actor="tester",
                 source="pytest",
                 idempotency_key="idem-resolve",
                 execution_target="target-resolve",
                 queue_policy=RunQueuePolicy.QUEUE,
-                start_reason=RunStartReason.INITIAL,
-                worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=None,
                 call_context_digest=_CALL_CONTEXT_DIGEST,
             ),
         )
+        assert accepted.run is not None
+        candidate = prepare_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            run=accepted.run,
+            current_input_event=input_event,
+            continuity=SessionContinuityView(messages=(), source_refs=()),
+            policy_snapshot=_policy_snapshot(),
+            tool_schemas=(),
+            disable_tools=True,
+            tool_execution_mode=ToolExecutionMode.NO_TOOL_DISABLED,
+            memory_projection_policy=default_memory_projection_policy(),
+        )
+        start_input = StartGovernedRunInput(
+            run_id=seeded.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            run_started_event_id="event-run-started-resolve",
+            attempt_started_event_id="event-attempt-started-resolve",
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            dispatch_record_id=seeded.dispatch_record_id,
+            occurred_at=_NOW,
+            actor="tester",
+            source="pytest",
+            start_reason=RunStartReason.INITIAL,
+            worker_kind=WorkerKind.LOCAL,
+            owner_host_instance_id=None,
+        )
+        record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            PayloadStore(),
+            run=accepted.run,
+            attempt_id=start_input.attempt_id,
+            execution_id=start_input.execution_id,
+            occurred_at=start_input.occurred_at,
+            candidate=candidate,
+            sizing_snapshot=unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
+            ),
+        )
+        started = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            start_input,
+        )
+        assert started.status is StateMutationStatus.UPDATED
         mark_dispatch_waiting_for_lane_row(
             transaction,
             attempt_id=seeded.attempt_id,
@@ -1758,7 +1862,7 @@ def _build_resume_request(
             execution_id=dispatch.execution_id,
             dispatch_record_id=dispatch.dispatch_record_id,
             execution_target=dispatch.execution_target,
-            policy_snapshot_ref="policy-resolve-wait",
+            policy_snapshot_ref=_policy_snapshot().policy_snapshot_ref,
             cancellation_token=_token(),
         )
     )
@@ -1779,7 +1883,24 @@ def _policy_snapshot() -> PolicySnapshot:
     :returns: PolicySnapshot。
     """
 
+    execution = effective_execution_snapshot_from_json(_execution_config())
     return PolicySnapshot(
+        runner_spec=execution.runner_spec,
+        runner_options=execution.runner_options,
+        agent_policy=execution.agent_policy,
+        policy_snapshot_ref=execution.policy_snapshot_ref,
+    )
+
+
+def _execution_config() -> JsonValue:
+    """构造 waiting source input 使用的 exact execution config。
+
+    :returns: 可由共享 strict parser 重建的 execution config JSON。
+    :raises TypeError: typed execution contract 非法时抛出。
+    :raises ValueError: typed execution contract 字段非法时抛出。
+    """
+
+    return effective_execution_config_json(
         runner_spec=RunnerSpec(
             provider="test",
             model="test-model",
@@ -1808,7 +1929,40 @@ def _policy_snapshot() -> PolicySnapshot:
             fallback_prompt="test fallback prompt",
             continuation_prompt="test continuation prompt",
         ),
-        policy_snapshot_ref="policy-resolve-wait",
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造 resolve-wait 测试的显式 execution baseline。
+
+    :returns: ordinary Run baseline。
+    :raises TypeError: typed execution contract 非法时抛出。
+    :raises ValueError: typed execution contract 字段非法时抛出。
+    """
+
+    policy = _policy_snapshot()
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=policy.runner_spec,
+        runner_options=policy.runner_options,
+        agent_policy=policy.agent_policy,
+    )
+
+
+def _create_execution_handle(options: HostCommandHandleOptions) -> HostCommandHandle:
+    """创建 resolve-wait 测试使用的 execution command handle。
+
+    :param options: durable command options。
+    :returns: 显式装配 execution admission 的 command handle。
+    :raises HostApiError: durable store 或 admission 装配失败时抛出。
+    """
+
+    return create_execution_command_handle(
+        options,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        memory_projection_policy=default_memory_projection_policy(),
     )
 
 

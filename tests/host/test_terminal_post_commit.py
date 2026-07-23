@@ -84,6 +84,10 @@ _EXPECTED_TERMINAL_PRODUCERS: dict[str, frozenset[tuple[str, str]]] = {
                 "EngineEventIngestor._fail_recovering_run",
                 "fail_recovering_run_in_transaction",
             ),
+            (
+                "_close_reactive_fallback_hard_in_transaction",
+                "fail_recovering_run_in_transaction",
+            ),
         }
     ),
     "dayu/host/recovery.py": frozenset(
@@ -95,6 +99,10 @@ _EXPECTED_TERMINAL_PRODUCERS: dict[str, frozenset[tuple[str, str]]] = {
             (
                 "SessionAttachmentRecoveryScanner._close_positive_orphan",
                 "close_startup_orphan_attempt_in_transaction",
+            ),
+            (
+                "SessionAttachmentRecoveryScanner._lose_unrecoverable_source",
+                "lose_recovering_run_in_transaction",
             ),
         }
     ),
@@ -122,7 +130,7 @@ _TERMINAL_TRANSITION_NAMES = frozenset(
     for _qualified_name, transition in producers
 )
 
-_EXPECTED_DIRECT_PROMOTION_CALLS = Counter(
+_EXPECTED_QUEUE_PROMOTION_WAKE_CALLS = Counter(
     {
         ("dayu/host/admission.py", "_wake_start_governance_if_needed"): 1,
         (
@@ -314,7 +322,7 @@ def test_static_terminal_producer_manifest_is_exact() -> None:
     assert actual == _EXPECTED_TERMINAL_PRODUCERS
 
 
-def test_direct_queue_promotion_allowlist_is_exact() -> None:
+def test_queue_promotion_wakeup_allowlist_is_exact() -> None:
     """terminal producers 不得重新引入 ordinary promotion 旁路。"""
 
     actual: Counter[tuple[str, str]] = Counter()
@@ -331,7 +339,7 @@ def test_direct_queue_promotion_allowlist_is_exact() -> None:
         for qualified_name, call_name in visitor.calls:
             if call_name == "wake_queue_promotion":
                 actual[(relative_path, qualified_name)] += 1
-    assert actual == _EXPECTED_DIRECT_PROMOTION_CALLS
+    assert actual == _EXPECTED_QUEUE_PROMOTION_WAKE_CALLS
 
 
 def test_terminal_notice_projection_has_single_durable_owner() -> None:

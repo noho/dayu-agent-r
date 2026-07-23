@@ -391,11 +391,13 @@ def _accepted_compact_payload(
     *,
     facts: list[EvidenceBackedFactCandidateVNext] | None = None,
     summary_text: str | None = "用户关注收入增速和毛利率变化。",
+    source_boundary_refs: tuple[str, ...] = ("event:user-1",),
 ) -> dict[str, JsonValue]:
     """构造 accepted vNext compact payload。
 
     :param facts: 可选 evidence-backed fact candidates。
     :param summary_text: session summary 文本；``None`` 表示 compact owner 未提供替换 summary。
+    :param source_boundary_refs: current input 在首位的 compact source boundary。
     :returns: CONTEXT_COMPACTED payload。
     """
 
@@ -456,7 +458,7 @@ def _accepted_compact_payload(
             ),
             budget_after_compact=512,
             prompt_local_label_mapping_refs=("prompt-label:u1", "prompt-label:e1"),
-            source_boundary_refs=("event:user-1",),
+            source_boundary_refs=source_boundary_refs,
             accepted_evidence_mapping_refs=("event:tool-1",),
             projection_signal="conversation_memory_projection_catchup",
         )
@@ -1241,6 +1243,165 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
     assert snapshot.trace_memory.reference_continuity_items[0].reason is (
         ReferenceContinuityReasonVNext.LOCAL_REFERENCE
     )
+
+
+def test_accepted_compact_prunes_covered_tool_raw_and_keeps_uncovered_and_new_delta() -> None:
+    """memory owner 删除 covered tool raw，并保留未覆盖 raw、current 与新 delta。"""
+
+    events = (
+        _event(
+            1,
+            "event-old-user",
+            "USER_INPUT_ACCEPTED",
+            {"display_text": "covered old user"},
+            run_id="run-old-user",
+        ),
+        _event(
+            2,
+            "event-old-assistant",
+            "RUN_SUCCEEDED",
+            {},
+            run_id="run-old-assistant",
+            assistant_final_answer_text="covered old assistant",
+        ),
+        _event(
+            3,
+            "event-old-evidence",
+            "TOOL_RESULT_ACCEPTED",
+            {},
+            run_id="run-old-evidence",
+            accepted_tool_evidence=_memory_tool_material("covered old evidence"),
+        ),
+        _event(
+            4,
+            "event-protected-user",
+            "USER_INPUT_ACCEPTED",
+            {"display_text": "uncovered protected user"},
+            run_id="run-protected",
+        ),
+        _event(
+            5,
+            "event-protected-evidence",
+            "TOOL_RESULT_ACCEPTED",
+            {},
+            run_id="run-protected",
+            accepted_tool_evidence=_memory_tool_material(
+                "uncovered protected evidence"
+            ),
+        ),
+        _event(
+            6,
+            "event-current-input",
+            "USER_INPUT_ACCEPTED",
+            {"display_text": "current input"},
+            run_id="run-current",
+        ),
+        _event(
+            7,
+            "event-compact",
+            CONTEXT_COMPACTED,
+            _accepted_compact_payload(
+                source_boundary_refs=(
+                    "event-current-input",
+                    "event-old-user",
+                    "event-old-assistant",
+                    "event-old-evidence",
+                )
+            ),
+            run_id="run-current",
+        ),
+        _event(
+            8,
+            "event-new-delta",
+            "USER_INPUT_ACCEPTED",
+            {"display_text": "new post compact delta"},
+            run_id="run-new",
+        ),
+    )
+    policy = _policy()
+    rebuilt = build_conversation_memory_snapshot_from_events(
+        events=events,
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+    incremental: ConversationMemorySnapshotVNext | None = None
+    for event in events:
+        incremental = project_conversation_memory_event(
+            previous_snapshot=incremental,
+            event=event,
+            policy=policy,
+            built_at=_NOW,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        )
+
+    assert incremental is not None
+    assert incremental == rebuilt
+    assert conversation_memory_snapshot_from_json_value(
+        conversation_memory_snapshot_to_json_value(rebuilt)
+    ) == rebuilt
+    selected = rebuilt.trace_memory.selected_recent_window
+    selected_ids = tuple(item.event_id for item in selected)
+    assert selected_ids == (
+        "event-protected-user",
+        "event-protected-evidence",
+        "event-current-input",
+        "event-new-delta",
+    )
+    assert "event-old-evidence" not in selected_ids
+    assert "event-protected-evidence" in selected_ids
+    assert "event-new-delta" in selected_ids
+    assert sum(
+        item.event_id == "event-current-input"
+        for item in selected
+    ) == 1
+    assert tuple(
+        item.event_id
+        for item in rebuilt.evidence_fact_memory.recent_evidence_items
+    ) == ("event-protected-evidence",)
+
+
+def test_accepted_compact_without_covered_refs_preserves_recent_window() -> None:
+    """只有 current input boundary 时不删除 protected raw 或伪造 compact 收缩。"""
+
+    events = (
+        _event(
+            1,
+            "event-protected",
+            "USER_INPUT_ACCEPTED",
+            {"display_text": "must remain"},
+            run_id="run-protected",
+        ),
+        _event(
+            2,
+            "event-current",
+            "USER_INPUT_ACCEPTED",
+            {"display_text": "current must remain"},
+            run_id="run-current",
+        ),
+        _event(
+            3,
+            "event-compact-current-only",
+            CONTEXT_COMPACTED,
+            _accepted_compact_payload(
+                source_boundary_refs=("event-current",)
+            ),
+            run_id="run-current",
+        ),
+    )
+
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=events,
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=_policy(),
+        built_at=_NOW,
+    )
+
+    assert tuple(
+        item.event_id for item in snapshot.trace_memory.selected_recent_window
+    ) == ("event-protected", "event-current")
 
 
 def test_accepted_compact_without_summary_preserves_prior_session_summary() -> None:

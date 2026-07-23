@@ -51,10 +51,11 @@ from dayu.host.api import (
     EnsureSessionRequest,
     HostCommandHandleOptions,
     HostLocalExecutionOptions,
+    OrdinaryRunExecutionBaseline,
     RunStatus,
     StartRunRequest,
 )
-from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.command import HostCommandHandle, start_run
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
@@ -101,6 +102,8 @@ from dayu.host.engine_ingest import (
     EngineIngestStatus,
     LocalEngineEnvelope,
 )
+from dayu.host.memory import default_memory_projection_policy
+from tests.host.execution_handle_support import create_execution_command_handle
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "phase5-integration-test"})
@@ -451,7 +454,7 @@ async def test_start_run_fake_worker_final_answer_succeeds(
     """public start_run 经 fake local worker final_answer 收口为 SUCCEEDED。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     handle = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-final-answer",
         mode=_WORKER_MODE_FINAL,
@@ -488,7 +491,7 @@ async def test_start_run_fake_worker_run_failed_fails(tmp_path: Path) -> None:
     """public start_run 经 fake worker run_failed 收口为 FAILED。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     handle = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-run-failed",
         mode=_WORKER_MODE_FAILED,
@@ -524,7 +527,7 @@ async def test_start_run_fake_worker_clean_eof_fails(tmp_path: Path) -> None:
     """public start_run 经 fake worker clean EOF 收口为 FAILED。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     handle = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-clean-eof",
         mode=_WORKER_MODE_EOF,
@@ -561,7 +564,7 @@ async def test_start_run_fake_worker_crash_loses(tmp_path: Path) -> None:
     """public start_run 经 fake worker stream crash 收口为 LOST。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     handle = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-crash",
         mode=_WORKER_MODE_CRASH,
@@ -599,7 +602,7 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
 
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
-    host = create_host_command_handle(options, active_registry=active_registry)
+    host = _create_execution_handle(options, active_registry=active_registry)
     handle = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-cancelled",
         mode=_WORKER_MODE_CANCELLED,
@@ -650,7 +653,7 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
     """terminal 与 cancel 释放 active slot 后继续唤醒 promoted dispatch。"""
 
     terminal_options = _command_options(tmp_path / "terminal")
-    terminal_host = create_host_command_handle(terminal_options)
+    terminal_host = _create_execution_handle(terminal_options)
     first_terminal = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-terminal-first",
         mode=_WORKER_MODE_FINAL,
@@ -700,7 +703,7 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
 
     cancel_options = _command_options(tmp_path / "cancel")
     active_registry = ActiveWorkerRegistry()
-    cancel_host = create_host_command_handle(
+    cancel_host = _create_execution_handle(
         cancel_options, active_registry=active_registry
     )
     first_cancel = _ScriptedLocalWorkerHandle(
@@ -1209,6 +1212,54 @@ def _runner_spec() -> RunnerSpec:
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造与测试 scheduler 一致的 ordinary Run baseline。
+
+    :returns: 显式 execution baseline。
+    :raises TypeError: typed execution contract 非法时抛出。
+    :raises ValueError: typed execution contract 字段非法时抛出。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
+        ),
+    )
+
+
+def _create_execution_handle(
+    options: HostCommandHandleOptions,
+    *,
+    active_registry: ActiveWorkerRegistry | None = None,
+) -> HostCommandHandle:
+    """创建与本文件 scheduler construction truth 一致的 command handle。
+
+    :param options: durable command options。
+    :param active_registry: 可选 active worker registry。
+    :returns: 显式装配 execution admission 的 handle。
+    :raises HostApiError: durable store 或 admission 装配失败时抛出。
+    """
+
+    return create_execution_command_handle(
+        options,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        memory_projection_policy=default_memory_projection_policy(),
+        active_registry=active_registry,
     )
 
 

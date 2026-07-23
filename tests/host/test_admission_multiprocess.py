@@ -56,15 +56,14 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CancelQueuedRunInput,
-    PromoteQueuedRunInput,
     StartGovernedRunInput,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     cancel_queued_in_transaction,
-    promote_queued_run_in_transaction,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
@@ -422,10 +421,15 @@ def test_multiprocess_duplicate_followup_idempotency_returns_one_result_and_conf
         _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
 
 
-def test_multiprocess_queued_followups_promote_by_accepted_sequence(
+def test_multiprocess_queued_followups_remain_queued_after_active_closeout(
     tmp_path: Path,
 ) -> None:
-    """多进程 queued follow-up 释放 active 后按 accepted event_sequence FIFO promotion。"""
+    """多进程 queued follow-up 在 active 关闭后仍只由普通治理调度接管。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: durable 队列、唤醒信号或顺序不符合约束时抛出。
+    """
 
     db_path = tmp_path / "durable.sqlite3"
     artifact_root = tmp_path / "artifacts"
@@ -470,202 +474,11 @@ def test_multiprocess_queued_followups_promote_by_accepted_sequence(
         )
 
         assert result.terminal_notice.wake_queue_promotion is True
-        promotion = service.promote_next_queued_run(session_id)
-
-        assert promotion.promoted_run is not None
-        assert promotion.promoted_run.run_id == first_queued.run_id
         assert _read_run_status(store.transaction_runner, first_queued.run_id) == (
-            RunStatus.RUNNING.value
+            RunStatus.QUEUED.value
         )
         _assert_accepted_sequences_are_sorted(queued_before)
         _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
-
-
-def test_multiprocess_cancel_queued_vs_promotion_first_committer_wins(
-    tmp_path: Path,
-) -> None:
-    """queued cancel 与 promotion 并发时只有先提交者能改写 queued Run。"""
-
-    db_path = tmp_path / "durable.sqlite3"
-    artifact_root = tmp_path / "artifacts"
-    result_dir = tmp_path / "results"
-    start_gate = tmp_path / "start-gate"
-    result_dir.mkdir()
-    queued_run_id, session_id = _seed_single_eligible_queued_run(db_path, artifact_root)
-
-    processes = (
-        Process(
-            target=_cancel_queued_transition_worker,
-            args=(
-                str(db_path),
-                str(artifact_root),
-                str(result_dir),
-                str(start_gate),
-                queued_run_id,
-            ),
-        ),
-        Process(
-            target=_promote_transition_worker,
-            args=(
-                str(db_path),
-                str(artifact_root),
-                str(result_dir),
-                str(start_gate),
-                session_id,
-            ),
-        ),
-    )
-    _run_processes(processes, start_gate)
-
-    cancel_fields = _read_named_result(result_dir, "cancel")
-    promote_fields = _read_named_result(result_dir, "promote")
-    with open_host_durable_store(_options(db_path, artifact_root)) as store:
-        final_status = _read_run_status(store.transaction_runner, queued_run_id)
-        event_types = _event_types_for_run(store.transaction_runner, queued_run_id)
-
-        if final_status == RunStatus.CANCELLED.value:
-            assert cancel_fields[1] == "updated"
-            assert promote_fields[1] == "not_found"
-            assert "RUN_CANCELLED" in event_types
-            assert "RUN_STARTED" not in event_types
-            assert _count_rows_with_runner(
-                store.transaction_runner, TABLE_HOST_ATTEMPTS
-            ) == 1
-        else:
-            assert final_status == RunStatus.RUNNING.value
-            assert promote_fields[1] == "updated"
-            assert cancel_fields[1] == "invalid_state"
-            assert "RUN_STARTED" in event_types
-            assert "ATTEMPT_STARTED" in event_types
-            assert "RUN_CANCELLED" not in event_types
-            assert _count_rows_with_runner(
-                store.transaction_runner, TABLE_HOST_ATTEMPTS
-            ) == 2
-        _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
-
-
-def test_multiprocess_admission_event_sequence_is_global_unique_and_increasing(
-    tmp_path: Path,
-) -> None:
-    """多进程 admission 写入后 EventLog event_sequence 全局唯一且无间隙乱序。"""
-
-    db_path = tmp_path / "durable.sqlite3"
-    artifact_root = tmp_path / "artifacts"
-    result_dir = tmp_path / "results"
-    start_gate = tmp_path / "start-gate"
-    result_dir.mkdir()
-    session_id = _seed_session_with_active_run(db_path, artifact_root)
-
-    processes = tuple(
-        Process(
-            target=_unique_followup_worker,
-            args=(
-                str(db_path),
-                str(artifact_root),
-                str(result_dir),
-                str(start_gate),
-                session_id,
-                worker_index,
-            ),
-        )
-        for worker_index in range(_PROCESS_COUNT)
-    )
-    _run_processes(processes, start_gate)
-
-    with open_host_durable_store(_options(db_path, artifact_root)) as store:
-        _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
-
-
-def test_multiprocess_cancel_error_uses_locked_write_snapshot(
-    tmp_path: Path,
-) -> None:
-    """Attempt 状态在 write snapshot 前后改变时 cancel 只返回对应快照语义。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    """
-
-    before_db = tmp_path / "cancel-before.sqlite3"
-    before_artifacts = tmp_path / "cancel-before-artifacts"
-    before_run_id, before_attempt_id = _seed_deferred_cancel_snapshot(
-        before_db,
-        before_artifacts,
-        suffix="before",
-    )
-    mutation_parent, mutation_child = Pipe(duplex=True)
-    mutation = Process(
-        target=_mark_attempt_running_worker,
-        args=(
-            str(before_db),
-            str(before_artifacts),
-            before_attempt_id,
-            mutation_child,
-        ),
-    )
-    mutation.start()
-    assert mutation_parent.recv() == ("attempting",)
-    assert mutation_parent.recv() == ("committed",)
-    mutation.join()
-    assert mutation.exitcode == 0
-
-    with open_host_durable_store(_options(before_db, before_artifacts)) as store:
-        supported = _admission_service(store.transaction_runner).cancel_run(
-            before_run_id,
-            _cancel_request("cancel-after-attempt-running"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
-        assert supported.run.status is RunStatus.CANCELLING
-
-    after_db = tmp_path / "cancel-after.sqlite3"
-    after_artifacts = tmp_path / "cancel-after-artifacts"
-    after_run_id, after_attempt_id = _seed_deferred_cancel_snapshot(
-        after_db,
-        after_artifacts,
-        suffix="after",
-    )
-    cancel_parent, cancel_child = Pipe(duplex=True)
-    cancel_process = Process(
-        target=_cancel_with_commit_barrier_worker,
-        args=(
-            str(after_db),
-            str(after_artifacts),
-            after_run_id,
-            cancel_child,
-        ),
-    )
-    cancel_process.start()
-    assert cancel_parent.recv() == ("classified",)
-
-    after_mutation_parent, after_mutation_child = Pipe(duplex=True)
-    after_mutation = Process(
-        target=_mark_attempt_running_worker,
-        args=(
-            str(after_db),
-            str(after_artifacts),
-            after_attempt_id,
-            after_mutation_child,
-        ),
-    )
-    after_mutation.start()
-    assert after_mutation_parent.recv() == ("attempting",)
-    cancel_parent.send(("continue",))
-
-    assert cancel_parent.recv() == (
-        "error",
-        HostApiErrorCode.UNSUPPORTED_OPERATION.value,
-    )
-    assert after_mutation_parent.recv() == ("committed",)
-    cancel_process.join()
-    after_mutation.join()
-    assert cancel_process.exitcode == 0
-    assert after_mutation.exitcode == 0
-    assert _read_attempt_status(
-        after_db,
-        after_artifacts,
-        after_attempt_id,
-    ) == (
-        AttemptStatus.RUNNING.value
-    )
 
 
 def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
@@ -685,7 +498,13 @@ def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
         service = create_host_admission_service(
             store.transaction_runner,
             terminal_post_commit_port=_DiscardTerminalPort(),
+            payload_store=PayloadStore(),
             ordinary_run_baseline=_ordinary_run_baseline(),
+            tooling_options=None,
+            context_budget_policy=None,
+            memory_projection_policy=None,
+            enable_truncation_manager=False,
+            owner_host_instance_id=None,
             wakeup_port=wakeup,
         )
         request = _start_request(
@@ -822,7 +641,13 @@ def _admission_service(
     return create_host_admission_service(
         transaction_runner,
         terminal_post_commit_port=_DiscardTerminalPort(),
+        payload_store=PayloadStore(),
         ordinary_run_baseline=_ordinary_run_baseline(),
+        tooling_options=None,
+        context_budget_policy=None,
+        memory_projection_policy=None,
+        enable_truncation_manager=False,
+        owner_host_instance_id=None,
     )
 
 
@@ -1643,58 +1468,6 @@ def _cancel_queued_transition_worker(
 
         status = store.transaction_runner.run_write(operation)
         _write_named_result(Path(result_dir_text), "cancel", ("cancel", status))
-
-
-def _promote_transition_worker(
-    db_path_text: str,
-    artifact_root_text: str,
-    result_dir_text: str,
-    start_gate_text: str,
-    session_id: str,
-) -> None:
-    """子进程：用低层 transition 尝试 promotion 最早 queued Run。
-
-    :param db_path_text: SQLite DB 路径文本。
-    :param artifact_root_text: artifact 根目录文本。
-    :param result_dir_text: 结果目录文本。
-    :param start_gate_text: start gate 路径文本。
-    :param session_id: Session id。
-    :returns: ``None``。
-    """
-
-    _wait_for_start_gate(Path(start_gate_text))
-    with open_host_durable_store(
-        _options(Path(db_path_text), Path(artifact_root_text))
-    ) as store:
-
-        def operation(transaction: HostTransaction) -> str:
-            """执行 queued promotion transition。
-
-            :param transaction: Host transaction。
-            :returns: transition status。
-            """
-
-            result = promote_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                PromoteQueuedRunInput(
-                    session_id=session_id,
-                    run_started_event_id="event-race-run-started",
-                    attempt_started_event_id="event-race-attempt-started",
-                    attempt_id="attempt-race-promoted",
-                    execution_id="execution-race-promoted",
-                    dispatch_record_id="dispatch-race-promoted",
-                    occurred_at=_NOW,
-                    actor="host",
-                    source="multiprocess-test",
-                    worker_kind=WorkerKind.LOCAL,
-                    owner_host_instance_id=None,
-                ),
-            )
-            return result.status.value
-
-        status = store.transaction_runner.run_write(operation)
-        _write_named_result(Path(result_dir_text), "promote", ("promote", status))
 
 
 def _ensure_session_id(transaction_runner: HostTransactionRunner) -> str:

@@ -239,6 +239,7 @@ class PayloadDescriptorKind(StrEnum):
     TOOL_CALL_SEMANTIC_QUERY_TEXT = "tool_call_semantic_query_text"
     RUNNER_CALL_INPUT_MANIFEST = "runner_call_input_manifest"
     RUNNER_CALL_INPUT_PROJECTION = "runner_call_input_projection"
+    RUNNER_CALL_PREPARED_CANDIDATE = "runner_call_prepared_candidate"
     SELECTED_TOOL_SCHEMA_SNAPSHOT = "selected_tool_schema_snapshot"
     COMPACTOR_INPUT_PROJECTION = "compactor_input_projection"
     COMPACTION_REJECTED_ATTEMPT_DIAGNOSTIC = (
@@ -327,7 +328,7 @@ RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND = (
 )
 """RUNNER_CALL_INPUT_ASSEMBLED manifest body payload descriptor kind。"""
 
-RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION = "runner_call_input_manifest.v1"
+RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION = "runner_call_input_manifest.v2"
 """RUNNER_CALL_INPUT_ASSEMBLED manifest body schema version。"""
 
 RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE = (

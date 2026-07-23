@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import NoReturn, Protocol
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest, GeminiToolCallState
@@ -24,7 +24,11 @@ from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
 )
-from dayu.contracts.tool_schema import ToolSchema
+from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
 from dayu.engine.contracts.engine_events import (
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     runner_role_sequence_digest,
@@ -43,10 +47,24 @@ from dayu.engine.contracts.messages import (
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
+    RunnerCallInputManifest,
     RunnerCallProjectorMetadata,
+    RunnerCallSizingSnapshot,
+    RunnerCallSizingStatus,
+    RunnerCallSizingUnavailableReason,
     complete_runner_call_hot_diagnostic,
+    complete_runner_call_sizing_snapshot,
     runner_call_hot_payload,
     runner_call_projector_metadata_descriptor,
+    runner_call_sizing_snapshot_json,
+    parse_runner_call_hot_payload,
+    parse_runner_call_manifest,
+    unavailable_runner_call_sizing_snapshot,
+)
+from dayu.host._execution_config_projection import (
+    effective_execution_snapshot_from_json,
+    provider_request_json,
+    runner_options_json,
 )
 from dayu.host._event_payload import (
     payload_object as _payload_object,
@@ -63,6 +81,7 @@ from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
     EventLogContextFallbackProvider,
     fallback_window_digest,
+    load_context_fallback_in_transaction,
 )
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
@@ -87,6 +106,17 @@ from dayu.host.compaction import (
     CompactMaterialSection,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_budget import (
+    CONTEXT_ESTIMATOR_CONTRACT,
+    BudgetEstimate,
+    BudgetEstimateInput,
+    BudgetJsonFragment,
+    BudgetTextFragment,
+    ContextSizingStage,
+    estimate_context_budget,
+    estimate_context_input,
+)
+from dayu.host.context_policy import ContextBudgetPolicy
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -132,11 +162,13 @@ from dayu.host.durable.state import (
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.accepted_result_projection import (
     AcceptedToolResultProjection,
+    AcceptedToolResultStatus,
     project_accepted_tool_result,
 )
 from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.payload_resolution import (
     event_payload_object,
+    sqlite_payload_object,
 )
 from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_payload import (
@@ -160,7 +192,8 @@ from dayu.host.memory import (
     memory_snapshot_with_cursor_and_diagnostics,
     project_conversation_memory_event,
 )
-from dayu.host.tool_runtime import ToolRuntimeHandle
+if TYPE_CHECKING:
+    from dayu.host.tool_runtime import ToolRuntimeHandle
 
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
@@ -182,6 +215,47 @@ _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
 _PAYLOAD_FIELD_TRIGGER_SOURCE = "trigger_source"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
+_PREPARED_CANDIDATE_SCHEMA_VERSION = "runner_call_prepared_candidate.v1"
+_PREPARED_CANDIDATE_MEDIA_TYPE = (
+    "application/vnd.dayu.runner-call-prepared-candidate+json"
+)
+_PREPARED_CANDIDATE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "session_id",
+        "host_run_id",
+        "candidate_input_cursor",
+        "messages",
+        "tool_schemas",
+        "disable_tools",
+        "tool_execution_mode",
+        "policy_snapshot_ref",
+        "policy_snapshot_digest",
+        "source_cursor_refs",
+        "memory_snapshot_cursor_ref",
+        "compact_artifact_refs",
+        "context_fallback_decision_ref",
+        "request_semantics_digest",
+        "estimator_id",
+        "estimator_version",
+    }
+)
+_PREPARED_CANDIDATE_POLICY_INDEPENDENT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "session_id",
+        "host_run_id",
+        "candidate_input_cursor",
+        "messages",
+        "tool_schemas",
+        "disable_tools",
+        "tool_execution_mode",
+        "source_cursor_refs",
+        "memory_snapshot_cursor_ref",
+        "compact_artifact_refs",
+        "context_fallback_decision_ref",
+    }
+)
 _SYSTEM_ENVELOPE_SEPARATOR = "\n\n"
 _SYSTEM_ENVELOPE_HEADER_PREFIX = "## "
 _SYSTEM_SECTION_TASK_INSTRUCTIONS = "Task Instructions"
@@ -241,9 +315,18 @@ _SELECTED_TOOL_SCHEMA_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-selected-tool-s
 _RUNNER_CALL_EVENT_ID_PREFIX = "event-runner-call-input-assembled"
 _RUNNER_CALL_EVENT_ACTOR = "host.run_input"
 _RUNNER_CALL_EVENT_SOURCE = "host.run_input.builder"
+_PREPARED_CANDIDATE_PROJECTION_REF_PREFIX = "runner-call-candidate-projection"
 _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH = "initial_user_dispatch"
 _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH = "followup_user_dispatch"
 _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH = "post_compaction_dispatch"
+_RUNNER_CALL_KIND_COMPACTOR_PROPOSAL = "compactor_proposal"
+_PRE_START_RUNNER_CALL_KINDS = frozenset(
+    {
+        _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH,
+        _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
+        _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
+    }
+)
 _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
 _RUNNER_CALL_TRIGGER_FOLLOWUP_USER_INPUT = "followup_user_input"
 _RUNNER_CALL_TRIGGER_HOST_RESUME = "host_resume"
@@ -304,9 +387,75 @@ class SessionContinuityView:
     """Session continuity provider 输出。
 
     :param messages: 由历史 canonical facts 投影出的 messages。
+    :param source_refs: continuity 对应的 canonical source refs。
     """
 
     messages: tuple[AgentMessage, ...]
+    source_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRunnerCallSource:
+    """strict-load 后的 prepared runner-call source。
+
+    :param manifest_event: source ``RUNNER_CALL_INPUT_ASSEMBLED`` event。
+    :param manifest: digest-verified strict manifest。
+    :param candidate: digest-verified complete candidate。
+    """
+
+    manifest_event: EventLogRow
+    manifest: RunnerCallInputManifest
+    candidate: PreparedRunnerCallCandidate
+
+
+class PreparedRunnerCallSourceFailureCategory(StrEnum):
+    """continuation source strict owner 的封闭失败类别。"""
+
+    TOOL_SCHEMA = "tool_schema"
+    POLICY = "policy"
+    REQUEST_SEMANTICS = "request_semantics"
+
+
+class PreparedRunnerCallSourceError(HostDurableError):
+    """prepared runner-call source 无法供 continuation 使用。
+
+    :param category: strict owner 判定的失败类别。
+    :param message: 不参与下游分类的诊断文本。
+    """
+
+    category: PreparedRunnerCallSourceFailureCategory
+
+    def __init__(
+        self,
+        category: PreparedRunnerCallSourceFailureCategory,
+        message: str,
+    ) -> None:
+        """初始化 typed source failure。
+
+        :param category: strict owner 判定的失败类别。
+        :param message: 非空诊断文本。
+        :returns: ``None``。
+        :raises ValueError: ``message`` 为空时抛出。
+        """
+
+        if message.strip() == "":
+            raise ValueError("PreparedRunnerCallSourceError.message must be non-empty")
+        self.category = category
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSourceToolFacts:
+    """prepared candidate 中不依赖 policy 的 strict tool facts。
+
+    :param tool_schemas: candidate 冻结的 exact selected schemas。
+    :param disable_tools: candidate 冻结的工具禁用标志。
+    :param tool_execution_mode: candidate 冻结的工具执行模式。
+    """
+
+    tool_schemas: tuple[ToolSchema, ...]
+    disable_tools: bool
+    tool_execution_mode: ToolExecutionMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +603,121 @@ class PolicySnapshot:
 
         if self.policy_snapshot_ref.strip() == "":
             raise ValueError("policy_snapshot_ref must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRunnerCallCandidate:
+    """Attempt identity-free 的 complete runner-call candidate。
+
+    :param session_id: Session id。
+    :param run_id: Host Run id。
+    :param candidate_input_cursor: 本次读取的最大 committed source watermark。
+    :param candidate_input_projection_ref: identity-free projection logical ref。
+    :param candidate_input_projection_digest: identity-free projection digest。
+    :param input_snapshot_digest: messages/tools/policy/request semantics digest。
+    :param messages: 完整 normalized Runner messages。
+    :param tool_schemas: selected tool schemas。
+    :param disable_tools: 是否禁用工具。
+    :param tool_execution_mode: frozen 工具执行模式。
+    :param policy_snapshot: admission-frozen Engine policy snapshot。
+    :param source_cursor_refs: complete candidate source refs。
+    :param memory_snapshot_cursor_ref: frozen memory cursor ref。
+    :param compact_artifact_refs: frozen compact artifact refs。
+    :param context_fallback_decision_ref: frozen fallback decision ref。
+    :param request_semantics_digest: request serialization compatibility digest。
+    """
+
+    session_id: str
+    run_id: str
+    candidate_input_cursor: int
+    candidate_input_projection_ref: str
+    candidate_input_projection_digest: str
+    input_snapshot_digest: str
+    messages: tuple[AgentMessage, ...]
+    tool_schemas: tuple[ToolSchema, ...]
+    disable_tools: bool
+    tool_execution_mode: ToolExecutionMode
+    policy_snapshot: PolicySnapshot
+    source_cursor_refs: tuple[str, ...]
+    memory_snapshot_cursor_ref: str | None
+    compact_artifact_refs: tuple[str, ...]
+    context_fallback_decision_ref: str | None
+    request_semantics_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 complete candidate contract。
+
+        :returns: ``None``。
+        :raises TypeError: tuple、bool 或 policy 类型非法时抛出。
+        :raises ValueError: identity/ref/digest/cursor 非法时抛出。
+        """
+
+        for field_name, value in (
+            ("PreparedRunnerCallCandidate.session_id", self.session_id),
+            ("PreparedRunnerCallCandidate.run_id", self.run_id),
+            (
+                "PreparedRunnerCallCandidate.candidate_input_projection_ref",
+                self.candidate_input_projection_ref,
+            ),
+            (
+                "PreparedRunnerCallCandidate.candidate_input_projection_digest",
+                self.candidate_input_projection_digest,
+            ),
+            (
+                "PreparedRunnerCallCandidate.input_snapshot_digest",
+                self.input_snapshot_digest,
+            ),
+            (
+                "PreparedRunnerCallCandidate.request_semantics_digest",
+                self.request_semantics_digest,
+            ),
+        ):
+            if not isinstance(value, str) or value.strip() == "":
+                raise ValueError(f"{field_name} must be non-empty")
+        if (
+            isinstance(self.candidate_input_cursor, bool)
+            or not isinstance(self.candidate_input_cursor, int)
+            or self.candidate_input_cursor < 0
+        ):
+            raise ValueError(
+                "PreparedRunnerCallCandidate.candidate_input_cursor must be "
+                "non-negative int"
+            )
+        if not isinstance(self.messages, tuple):
+            raise TypeError("PreparedRunnerCallCandidate.messages must be tuple")
+        if not isinstance(self.tool_schemas, tuple):
+            raise TypeError(
+                "PreparedRunnerCallCandidate.tool_schemas must be tuple"
+            )
+        if not isinstance(self.disable_tools, bool):
+            raise TypeError(
+                "PreparedRunnerCallCandidate.disable_tools must be bool"
+            )
+        if not isinstance(self.tool_execution_mode, ToolExecutionMode):
+            raise TypeError(
+                "PreparedRunnerCallCandidate.tool_execution_mode must be "
+                "ToolExecutionMode"
+            )
+        if not isinstance(self.policy_snapshot, PolicySnapshot):
+            raise TypeError(
+                "PreparedRunnerCallCandidate.policy_snapshot must be "
+                "PolicySnapshot"
+            )
+        for field_name, values in (
+            (
+                "PreparedRunnerCallCandidate.source_cursor_refs",
+                self.source_cursor_refs,
+            ),
+            (
+                "PreparedRunnerCallCandidate.compact_artifact_refs",
+                self.compact_artifact_refs,
+            ),
+        ):
+            if not isinstance(values, tuple):
+                raise TypeError(f"{field_name} must be tuple")
+            for value in values:
+                if not isinstance(value, str) or value.strip() == "":
+                    raise ValueError(f"{field_name} items must be non-empty")
 
 
 class CurrentRunFactProvider(Protocol):
@@ -752,7 +1016,7 @@ class DurableRunnerCallManifestRecorder:
 
         existing = _find_existing_runner_call_manifest_event(
             transaction,
-            run_id=record_input.current_facts.run.run_id,
+            run=record_input.current_facts.run,
             attempt_id=record_input.current_facts.attempt.attempt_id,
             execution_id=record_input.current_facts.attempt.execution_id,
         )
@@ -826,6 +1090,133 @@ class DurableRunnerCallManifestRecorder:
                 payload_digest=descriptor.payload_digest,
             ),
         )
+
+
+def record_prepared_runner_call_candidate_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    payload_store: PayloadStore,
+    *,
+    run: RunRow,
+    attempt_id: str,
+    execution_id: str,
+    occurred_at: datetime,
+    candidate: PreparedRunnerCallCandidate,
+    sizing_snapshot: RunnerCallSizingSnapshot,
+) -> EventLogRow:
+    """在 allow transaction 内先于 start transition 记录 frozen candidate。
+
+    manifest 与随后 durable start transition 必须消费调用方传入的同一个
+    producer 直接提供的 Attempt identity；本函数不生成或替换任何 start input。
+
+    :param transaction: 调用方 write transaction。
+    :param event_log_store: EventLog primitive。
+    :param payload_store: payload store primitive。
+    :param run: 当前 startable Run。
+    :param attempt_id: allow 后唯一生成的 Attempt id。
+    :param execution_id: allow 后唯一生成的 execution id。
+    :param occurred_at: manifest 与随后 start transition 共用的发生时间。
+    :param candidate: pre-start frozen identity-free candidate。
+    :param sizing_snapshot: complete 或 context-policy-unavailable snapshot。
+    :returns: committed 前 transaction 内可见的 manifest event row。
+    :raises HostDurableError: identity、descriptor、digest 或 manifest graph 非法时抛出。
+    """
+
+    if candidate.run_id != run.run_id or candidate.session_id != run.session_id:
+        raise HostDurableError("prepared candidate Run identity mismatch")
+    if attempt_id.strip() == "" or execution_id.strip() == "":
+        raise HostDurableError("prepared manifest identity must be non-empty")
+    runner_call_index = _next_runner_call_index(
+        transaction,
+        run_id=run.run_id,
+    )
+    event_id = _runner_call_manifest_event_id(
+        run.run_id,
+        attempt_id,
+        execution_id,
+        runner_call_index,
+    )
+    runner_call_kind, trigger_reason = _prepared_candidate_kind_and_trigger(
+        candidate,
+        sizing_snapshot=sizing_snapshot,
+    )
+    _write_prepared_candidate_payload(
+        transaction,
+        payload_store,
+        candidate=candidate,
+    )
+    projection = _prepared_runner_call_projection_body(
+        candidate=candidate,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        runner_call_index=runner_call_index,
+        projection_id=_runner_call_projection_id(event_id),
+        runner_call_kind=runner_call_kind,
+        trigger_reason=trigger_reason,
+    )
+    projection_digest = sha256_digest_json(projection)
+    projection_descriptor = _write_runner_call_projection_payload(
+        transaction,
+        payload_store,
+        event_id=event_id,
+        projection=projection,
+        projection_digest=projection_digest,
+    )
+    tool_schema_descriptor = _write_prepared_tool_schema_snapshot_payload(
+        transaction,
+        payload_store,
+        event_id=event_id,
+        candidate=candidate,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+    )
+    manifest = _prepared_runner_call_manifest_body(
+        candidate=candidate,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        runner_call_index=runner_call_index,
+        manifest_id=_runner_call_manifest_id(event_id),
+        projection_descriptor=projection_descriptor,
+        tool_schema_descriptor=tool_schema_descriptor,
+        runner_call_kind=runner_call_kind,
+        trigger_reason=trigger_reason,
+        sizing_snapshot=sizing_snapshot,
+    )
+    manifest_digest = sha256_digest_json(manifest)
+    descriptor = _write_runner_call_manifest_payload(
+        transaction,
+        payload_store,
+        event_id=event_id,
+        manifest=manifest,
+        manifest_digest=manifest_digest,
+    )
+    hot_payload = _runner_call_manifest_hot_payload(
+        manifest=manifest,
+        manifest_payload_ref=descriptor.payload_ref,
+        manifest_digest=manifest_digest,
+    )
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            event_type=_EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+            occurred_at=occurred_at,
+            actor=_RUNNER_CALL_EVENT_ACTOR,
+            source=_RUNNER_CALL_EVENT_SOURCE,
+            client_request_id=run.client_request_id,
+            idempotency_key=None,
+            policy_decision=None,
+            reason=None,
+            payload_json=hot_payload,
+            payload_ref=descriptor.payload_ref,
+            payload_digest=descriptor.payload_digest,
+        ),
+    ).row
 
 
 class DurableCurrentRunFactProvider:
@@ -961,10 +1352,10 @@ class DurableSessionContinuityProvider:
         """
 
         del snapshot
-        resume_messages = _resume_wait_messages_from_current_start(transaction, current_facts)
-        if len(resume_messages) == 0:
-            return SessionContinuityView(messages=())
-        return SessionContinuityView(messages=resume_messages)
+        return _resume_wait_continuity_from_current_start(
+            transaction,
+            current_facts,
+        )
 
 
 class NoopMemorySnapshotProvider:
@@ -1768,14 +2159,29 @@ class DefaultSceneParameterProvider:
 
         del snapshot
         del current_facts, policy_snapshot
-        content = "\n".join(
-            (
-                _EXECUTION_GUIDANCE_PREFIX,
-                "Use the available context and tools under the current run limits.",
-                _tools_scene_line(tool_execution_mode),
-            )
+        return _default_scene_messages(tool_execution_mode)
+
+
+def _default_scene_messages(
+    tool_execution_mode: ToolExecutionMode,
+) -> tuple[SystemMessage, ...]:
+    """构造 ordinary candidate 与 actual request 共享的 scene messages。
+
+    :param tool_execution_mode: frozen tool execution mode。
+    :returns: 单条 execution guidance system message。
+    :raises TypeError: tool mode 类型非法时抛出。
+    """
+
+    if not isinstance(tool_execution_mode, ToolExecutionMode):
+        raise TypeError("tool_execution_mode must be ToolExecutionMode")
+    content = "\n".join(
+        (
+            _EXECUTION_GUIDANCE_PREFIX,
+            "Use the available context and tools under the current run limits.",
+            _tools_scene_line(tool_execution_mode),
         )
-        return (SystemMessage(role=AgentMessageRole.SYSTEM, content=content),)
+    )
+    return (SystemMessage(role=AgentMessageRole.SYSTEM, content=content),)
 
 
 class StaticPolicySnapshotProvider:
@@ -1803,6 +2209,1506 @@ class StaticPolicySnapshotProvider:
         if snapshot.policy_snapshot_ref != self._policy_snapshot.policy_snapshot_ref:
             raise HostDurableError("policy snapshot ref does not match attempt snapshot")
         return self._policy_snapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _PreStartCandidateFacts:
+    """pre-start complete candidate 组装所需的 Attempt-free facts。
+
+    :param run: 当前 startable Run row。
+    :param user_input_event: 当前 USER_INPUT_ACCEPTED。
+    :param run_accepted_event: 当前 RUN_ACCEPTED。
+    :param user_prompt: 当前用户输入。
+    :param system_prompt: admission system prompt。
+    :param operation_kind: admission operation kind。
+    """
+
+    run: RunRow
+    user_input_event: EventLogRow
+    run_accepted_event: EventLogRow
+    user_prompt: str
+    system_prompt: str | None
+    operation_kind: str
+
+
+def prepare_runner_call_candidate_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+    current_input_event: EventLogRow,
+    continuity: SessionContinuityView,
+    policy_snapshot: PolicySnapshot,
+    tool_schemas: tuple[ToolSchema, ...],
+    disable_tools: bool,
+    tool_execution_mode: ToolExecutionMode,
+    memory_projection_policy: MemoryProjectionPolicy,
+) -> PreparedRunnerCallCandidate:
+    """在调用方 write transaction snapshot 内冻结 pre-start candidate。
+
+    本函数不创建 Attempt/execution/dispatch identity，不写 manifest，也不
+    创建 ToolRuntime handle。memory、compact、fallback、scene、selected tool
+    schemas 与 actual request 都在这里收敛为一个 immutable candidate。
+
+    :param transaction: 调用方 Host write transaction。
+    :param event_log_store: stateless EventLog primitive。
+    :param run: 当前 startable Run。
+    :param current_input_event: 本次 candidate 唯一 current input fact。
+    :param continuity: producer 已冻结的 typed continuation。
+    :param policy_snapshot: admission-frozen Engine policy。
+    :param tool_schemas: pre-start selected tool schemas。
+    :param disable_tools: 是否禁用工具。
+    :param tool_execution_mode: frozen tool execution mode。
+    :param memory_projection_policy: memory projection policy。
+    :returns: identity-free complete candidate。
+    :raises MemoryProjectionRepairRequired: memory snapshot 未覆盖 candidate cursor 时抛出。
+    :raises HostDurableError: durable input、compact、fallback 或 projection 非法时抛出。
+    """
+
+    user_input_event = _require_event(
+        current_input_event,
+        expected_type=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    if (
+        user_input_event.session_id != run.session_id
+        or user_input_event.run_id != run.run_id
+        or user_input_event.attempt_id is not None
+        or user_input_event.execution_id is not None
+    ):
+        raise HostDurableError(
+            "candidate current USER_INPUT_ACCEPTED identity mismatch"
+        )
+    run_accepted_event = _require_event(
+        event_log_store.read_event_by_id(transaction, run.accepted_event_id),
+        expected_type=_EVENT_TYPE_RUN_ACCEPTED,
+    )
+    input_payload = event_payload_object(
+        transaction,
+        user_input_event,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    facts = _PreStartCandidateFacts(
+        run=run,
+        user_input_event=user_input_event,
+        run_accepted_event=run_accepted_event,
+        user_prompt=_required_payload_text(
+            input_payload,
+            field_name=_PAYLOAD_FIELD_DISPLAY_TEXT,
+        ),
+        system_prompt=_optional_payload_text(
+            input_payload,
+            field_name=_PAYLOAD_FIELD_SYSTEM_PROMPT,
+        ),
+        operation_kind=_required_payload_text(
+            input_payload,
+            field_name=_PAYLOAD_FIELD_OPERATION_KIND,
+        ),
+    )
+    candidate_cursor = _candidate_input_cursor(transaction, run.session_id)
+    memory = _load_pre_start_memory_snapshot(
+        transaction,
+        event_log_store,
+        facts=facts,
+        required_event_sequence=candidate_cursor,
+        policy=memory_projection_policy,
+    )
+    compact, compacted_event = _load_pre_start_compact_artifact(
+        transaction,
+        event_log_store,
+        facts=facts,
+        before_event_sequence=candidate_cursor + 1,
+    )
+    fallback = load_context_fallback_in_transaction(
+        transaction,
+        event_log_store,
+        run_id=run.run_id,
+        before_event_sequence=candidate_cursor + 1,
+        current_input_ref=user_input_event.event_id,
+    )
+    if fallback is None:
+        raw_tail = _pre_start_protected_recent_raw_tail(
+            transaction,
+            event_log_store,
+            facts=facts,
+            memory=memory,
+            compact=compact,
+            compacted_event=compacted_event,
+            memory_projection_policy=memory_projection_policy,
+        )
+        bounded_context_messages = (
+            *memory.messages,
+            *raw_tail.messages,
+            *continuity.messages,
+        )
+    else:
+        material_blocks = (
+            fallback.material_blocks
+            if fallback.material_blocks is not None
+            else _pre_start_fallback_material_blocks(
+                transaction,
+                event_log_store,
+                facts=facts,
+                memory=memory,
+                continuity=continuity,
+                compact=compact,
+            )
+        )
+        bounded_context_messages = _fallback_context_messages(
+            fallback=fallback,
+            material_blocks=material_blocks,
+        )
+    candidate_messages = (
+        *_system_prompt_message(facts.system_prompt),
+        *_default_scene_messages(tool_execution_mode),
+        *bounded_context_messages,
+        *_pre_start_current_user_tail(facts, continuity),
+    )
+    messages = _normalize_ordinary_run_messages(candidate_messages)
+    source_refs = _pre_start_candidate_source_refs(
+        facts=facts,
+        memory=memory,
+        compact=compact,
+        fallback=fallback,
+        continuity=continuity,
+    )
+    return prepare_runner_call_candidate(
+        session_id=run.session_id,
+        run_id=run.run_id,
+        candidate_input_cursor=candidate_cursor,
+        messages=messages,
+        tool_schemas=tool_schemas,
+        disable_tools=disable_tools,
+        tool_execution_mode=tool_execution_mode,
+        policy_snapshot=policy_snapshot,
+        source_cursor_refs=source_refs,
+        memory_snapshot_cursor_ref=memory.memory_snapshot_cursor,
+        compact_artifact_refs=_compact_artifact_refs(compact),
+        context_fallback_decision_ref=_context_fallback_decision_ref(
+            fallback
+        ),
+    )
+
+
+def prepare_runner_call_candidate(
+    *,
+    session_id: str,
+    run_id: str,
+    candidate_input_cursor: int,
+    messages: tuple[AgentMessage, ...],
+    tool_schemas: tuple[ToolSchema, ...],
+    disable_tools: bool,
+    tool_execution_mode: ToolExecutionMode,
+    policy_snapshot: PolicySnapshot,
+    source_cursor_refs: tuple[str, ...],
+    memory_snapshot_cursor_ref: str | None,
+    compact_artifact_refs: tuple[str, ...],
+    context_fallback_decision_ref: str | None,
+) -> PreparedRunnerCallCandidate:
+    """冻结 identity-free complete runner-call candidate。
+
+    本 helper 是 complete messages、selected tool schemas、Engine policy 与
+    request serialization semantics 的唯一 digest owner；调用方不得再从
+    display text 或 material subset 重建另一个 candidate。
+
+    :param session_id: Session id。
+    :param run_id: Host Run id。
+    :param candidate_input_cursor: 最大 committed source watermark。
+    :param messages: 完整 normalized messages。
+    :param tool_schemas: selected tool schemas。
+    :param disable_tools: 是否禁用工具。
+    :param tool_execution_mode: frozen 工具执行模式。
+    :param policy_snapshot: admission-frozen Engine policy。
+    :param source_cursor_refs: complete candidate source refs。
+    :param memory_snapshot_cursor_ref: memory cursor ref。
+    :param compact_artifact_refs: compact artifact refs。
+    :param context_fallback_decision_ref: fallback decision ref。
+    :returns: identity-free prepared candidate。
+    :raises TypeError: typed 参数非法时抛出。
+    :raises ValueError: identity/ref/cursor 非法时抛出。
+    """
+
+    request_semantics_digest = runner_request_semantics_digest(policy_snapshot)
+    projection_body = _prepared_candidate_projection_body(
+        session_id=session_id,
+        run_id=run_id,
+        candidate_input_cursor=candidate_input_cursor,
+        messages=messages,
+        tool_schemas=tool_schemas,
+        disable_tools=disable_tools,
+        tool_execution_mode=tool_execution_mode,
+        policy_snapshot=policy_snapshot,
+        source_cursor_refs=source_cursor_refs,
+        memory_snapshot_cursor_ref=memory_snapshot_cursor_ref,
+        compact_artifact_refs=compact_artifact_refs,
+        context_fallback_decision_ref=context_fallback_decision_ref,
+        request_semantics_digest=request_semantics_digest,
+    )
+    projection_digest = sha256_digest_json(projection_body)
+    input_snapshot_digest = sha256_digest_json(
+        _prepared_candidate_input_snapshot_body(
+            messages=messages,
+            tool_schemas=tool_schemas,
+            disable_tools=disable_tools,
+            tool_execution_mode=tool_execution_mode,
+            policy_snapshot=policy_snapshot,
+            request_semantics_digest=request_semantics_digest,
+        )
+    )
+    projection_ref = _prepared_candidate_payload_ref(projection_digest)
+    return PreparedRunnerCallCandidate(
+        session_id=session_id,
+        run_id=run_id,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=projection_ref,
+        candidate_input_projection_digest=projection_digest,
+        input_snapshot_digest=input_snapshot_digest,
+        messages=messages,
+        tool_schemas=tool_schemas,
+        disable_tools=disable_tools,
+        tool_execution_mode=tool_execution_mode,
+        policy_snapshot=policy_snapshot,
+        source_cursor_refs=source_cursor_refs,
+        memory_snapshot_cursor_ref=memory_snapshot_cursor_ref,
+        compact_artifact_refs=compact_artifact_refs,
+        context_fallback_decision_ref=context_fallback_decision_ref,
+        request_semantics_digest=request_semantics_digest,
+    )
+
+
+def estimate_prepared_runner_call_candidate(
+    candidate: PreparedRunnerCallCandidate,
+    policy: ContextBudgetPolicy,
+) -> BudgetEstimate:
+    """对 complete candidate 调用唯一 conservative estimator。
+
+    :param candidate: identity-free complete candidate。
+    :param policy: Host context budget policy。
+    :returns: complete candidate conservative estimate。
+    :raises TypeError: candidate 或 policy 类型非法时抛出。
+    :raises ValueError: estimator 输入无法 canonical encode 时抛出。
+    """
+
+    if not isinstance(candidate, PreparedRunnerCallCandidate):
+        raise TypeError("candidate must be PreparedRunnerCallCandidate")
+    return estimate_context_budget(
+        policy,
+        _budget_estimate_input_from_prepared_candidate(candidate),
+    )
+
+
+def continuation_runner_call_sizing_snapshot(
+    candidate: PreparedRunnerCallCandidate,
+    source_sizing: RunnerCallSizingSnapshot,
+) -> RunnerCallSizingSnapshot:
+    """按 source compatibility atoms冻结新 continuation candidate sizing。
+
+    continuation 不读取当前 context policy；complete source只复用其
+    window/policy/provider/model/estimator compatibility atoms，并对新 candidate
+    执行同一无 policy conservative estimator。unavailable source保留原原因。
+
+    :param candidate: 本次 continuation complete candidate。
+    :param source_sizing: source pre-start manifest 的 strict sizing snapshot。
+    :returns: stage 为 ``CONTINUATION`` 的 complete 或 unavailable snapshot。
+    :raises HostDurableError: source atoms与candidate或当前estimator contract不一致时抛出。
+    """
+
+    if source_sizing.status is RunnerCallSizingStatus.UNAVAILABLE:
+        if source_sizing.reason is None:
+            raise HostDurableError(
+                "continuation source unavailable reason is missing"
+            )
+        return unavailable_runner_call_sizing_snapshot(
+            source_sizing.reason,
+            sizing_stage=ContextSizingStage.CONTINUATION,
+        )
+    if source_sizing.status is not RunnerCallSizingStatus.COMPLETE:
+        raise HostDurableError(
+            "continuation source sizing is not complete"
+        )
+    estimator_id = source_sizing.estimator_id
+    estimator_version = source_sizing.estimator_version
+    provider = source_sizing.provider
+    model = source_sizing.model
+    if (
+        estimator_id is None
+        or estimator_id != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+        or estimator_version is None
+        or estimator_version != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+        or source_sizing.context_window_size is None
+        or provider is None
+        or provider != candidate.policy_snapshot.runner_spec.provider
+        or model is None
+        or model != candidate.policy_snapshot.runner_spec.model
+        or source_sizing.request_semantics_digest
+        != candidate.request_semantics_digest
+        or source_sizing.policy_ref is None
+        or source_sizing.policy_snapshot_digest is None
+    ):
+        raise HostDurableError(
+            "continuation source sizing compatibility mismatch"
+        )
+    tokens, estimator_digest = estimate_context_input(
+        _budget_estimate_input_from_prepared_candidate(candidate)
+    )
+    return complete_runner_call_sizing_snapshot(
+        sizing_stage=ContextSizingStage.CONTINUATION,
+        estimator_id=estimator_id,
+        estimator_version=estimator_version,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=tokens,
+        context_window_size=source_sizing.context_window_size,
+        provider=provider,
+        model=model,
+        request_semantics_digest=candidate.request_semantics_digest,
+        input_snapshot_digest=candidate.input_snapshot_digest,
+        policy_ref=source_sizing.policy_ref,
+        policy_snapshot_digest=source_sizing.policy_snapshot_digest,
+    )
+
+
+def _budget_estimate_input_from_prepared_candidate(
+    candidate: PreparedRunnerCallCandidate,
+) -> BudgetEstimateInput:
+    """把 complete candidate 投影为层内中性的 conservative estimator 输入。
+
+    每条实际 message 只产生一次 message overhead；message 正文作为文本
+    fragment，assistant tool calls / reasoning 与 tool-call identity 作为独立
+    canonical JSON atom，避免正文重复计数。Engine message 联合只在
+    RunInput owner 内解释，context budget owner 只消费中性 fragments。
+
+    :param candidate: identity-free complete candidate。
+    :returns: 与 actual request 同源的 estimator input。
+    :raises TypeError: candidate message 或 tool schema 类型非法时抛出。
+    """
+
+    message_fragments: list[BudgetTextFragment] = []
+    json_fragments: list[BudgetJsonFragment] = []
+    for index, message in enumerate(candidate.messages):
+        message_fragments.append(
+            BudgetTextFragment(
+                fragment_ref=(
+                    f"candidate-message:{index}:{message.role.value}"
+                ),
+                text=_candidate_budget_message_text(message),
+            )
+        )
+        structured_atom = _candidate_budget_structured_atom(message)
+        if structured_atom is not None:
+            json_fragments.append(
+                BudgetJsonFragment(
+                    fragment_ref=(
+                        f"candidate-message-structured:{index}"
+                    ),
+                    value=structured_atom,
+                )
+            )
+    tool_fragments = tuple(
+        BudgetJsonFragment(
+            fragment_ref=f"candidate-tool-schema:{index}",
+            value=_tool_schema_json(schema),
+        )
+        for index, schema in enumerate(candidate.tool_schemas)
+    )
+    return BudgetEstimateInput(
+        session_id=candidate.session_id,
+        run_id=candidate.run_id,
+        message_fragments=tuple(message_fragments),
+        json_fragments=tuple(json_fragments),
+        tool_schema_fragments=tool_fragments,
+        compact_artifact_refs=candidate.compact_artifact_refs,
+        memory_snapshot_cursor=None,
+        current_prompt_ref=(
+            candidate.source_cursor_refs[-1]
+            if candidate.source_cursor_refs
+            else None
+        ),
+        input_snapshot_digest=candidate.input_snapshot_digest,
+    )
+
+
+def _candidate_budget_message_text(message: AgentMessage) -> str:
+    """读取 complete candidate message 的业务文本。
+
+    :param message: typed Agent message。
+    :returns: message 正文；assistant 空正文返回空串。
+    :raises TypeError: 遇到封闭联合外消息类型时抛出。
+    """
+
+    if isinstance(message, SystemMessage | UserMessage | ToolMessage):
+        return message.content
+    if isinstance(message, AssistantMessage):
+        return "" if message.content is None else message.content
+    raise TypeError("candidate message type is unsupported")
+
+
+def _candidate_budget_structured_atom(
+    message: AgentMessage,
+) -> Mapping[str, JsonValue] | None:
+    """投影 message 中未进入正文的 provider-neutral structured atoms。
+
+    :param message: typed Agent message。
+    :returns: canonical JSON atom；无 structured atom 时为 ``None``。
+    :raises TypeError: 遇到封闭联合外消息类型时抛出。
+    """
+
+    if isinstance(message, SystemMessage | UserMessage):
+        return None
+    if isinstance(message, ToolMessage):
+        return {
+            "role": message.role.value,
+            "tool_call_id": message.tool_call_id,
+        }
+    if isinstance(message, AssistantMessage):
+        if message.reasoning_content is None and not message.tool_calls:
+            return None
+        return {
+            "role": message.role.value,
+            "reasoning_content": message.reasoning_content,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": dict(call.arguments),
+                }
+                for call in message.tool_calls
+            ],
+        }
+    raise TypeError("candidate message type is unsupported")
+
+
+def runner_request_semantics_digest(policy_snapshot: PolicySnapshot) -> str:
+    """计算 provider-neutral Runner request serialization semantics digest。
+
+    endpoint、API key、headers、timeout 与 retry 不进入 digest；provider/model
+    仍作为 manifest 显式 compatibility atoms。
+
+    :param policy_snapshot: admission-frozen Engine policy snapshot。
+    :returns: canonical sha256 digest。
+    :raises TypeError: policy 或 provider extension 类型非法时抛出。
+    """
+
+    if not isinstance(policy_snapshot, PolicySnapshot):
+        raise TypeError("policy_snapshot must be PolicySnapshot")
+    spec = policy_snapshot.runner_spec
+    return sha256_digest_json(
+        {
+            "runner_input_serializer_schema_version": (
+                RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+            ),
+            "runner_call_input_projection_schema_version": (
+                RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION
+            ),
+            "runner_options": runner_options_json(
+                policy_snapshot.runner_options
+            ),
+            "provider_request": provider_request_json(spec.provider_request),
+            "supports_tool_calling": spec.supports_tool_calling,
+            "supports_streaming": spec.supports_streaming,
+            "supports_stream_usage": spec.supports_stream_usage,
+            "client_correlation_policy": spec.client_correlation_policy.value,
+        }
+    )
+
+
+def agent_run_request_from_prepared_candidate(
+    *,
+    candidate: PreparedRunnerCallCandidate,
+    attempt_snapshot: AttemptDispatchSnapshot,
+    tool_executor: ToolExecutor,
+) -> AgentRunRequest:
+    """从 frozen candidate 构造 actual AgentRunRequest。
+
+    本 helper 不调用任何 durable/material provider，不重新 assemble messages
+    或 tool schemas；它只复核 candidate/request identity 后绑定 Attempt runtime
+    handles。
+
+    :param candidate: pre-start frozen complete candidate。
+    :param attempt_snapshot: allow 后创建的 Attempt dispatch snapshot。
+    :param tool_executor: 与 frozen selected schema 同源的 runtime executor。
+    :returns: actual Engine AgentRunRequest。
+    :raises HostDurableError: Run/session/policy/request digest 不匹配时抛出。
+    """
+
+    if candidate.session_id != attempt_snapshot.session_id:
+        raise HostDurableError("frozen candidate session identity mismatch")
+    if candidate.run_id != attempt_snapshot.run_id:
+        raise HostDurableError("frozen candidate Run identity mismatch")
+    if (
+        candidate.policy_snapshot.policy_snapshot_ref
+        != attempt_snapshot.policy_snapshot_ref
+    ):
+        raise HostDurableError("frozen candidate policy identity mismatch")
+    if (
+        runner_request_semantics_digest(candidate.policy_snapshot)
+        != candidate.request_semantics_digest
+    ):
+        raise HostDurableError("frozen candidate request semantics mismatch")
+    rebuilt = prepare_runner_call_candidate(
+        session_id=candidate.session_id,
+        run_id=candidate.run_id,
+        candidate_input_cursor=candidate.candidate_input_cursor,
+        messages=candidate.messages,
+        tool_schemas=candidate.tool_schemas,
+        disable_tools=candidate.disable_tools,
+        tool_execution_mode=candidate.tool_execution_mode,
+        policy_snapshot=candidate.policy_snapshot,
+        source_cursor_refs=candidate.source_cursor_refs,
+        memory_snapshot_cursor_ref=candidate.memory_snapshot_cursor_ref,
+        compact_artifact_refs=candidate.compact_artifact_refs,
+        context_fallback_decision_ref=(
+            candidate.context_fallback_decision_ref
+        ),
+    )
+    if rebuilt.input_snapshot_digest != candidate.input_snapshot_digest:
+        raise HostDurableError("frozen candidate input snapshot digest mismatch")
+    return AgentRunRequest(
+        run_id=attempt_snapshot.run_id,
+        session_id=attempt_snapshot.session_id,
+        attempt_id=attempt_snapshot.attempt_id,
+        execution_id=attempt_snapshot.execution_id,
+        messages=candidate.messages,
+        disable_tools=candidate.disable_tools,
+        runner_spec=candidate.policy_snapshot.runner_spec,
+        runner_options=candidate.policy_snapshot.runner_options,
+        agent_policy=candidate.policy_snapshot.agent_policy,
+        tool_schemas=candidate.tool_schemas,
+        tool_executor=tool_executor,
+        cancellation_token=attempt_snapshot.cancellation_token,
+    )
+
+
+def load_run_input_policy_snapshot_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+) -> PolicySnapshot:
+    """从 source Run 的 exact input fact strict 重建 Engine policy。
+
+    :param transaction: 调用方现有 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param run: source Run row。
+    :returns: input fact 冻结的 typed policy snapshot。
+    :raises HostDurableError: event type、Session/Run identity 或 execution config
+        不完整、损坏时抛出。
+    """
+
+    event = event_log_store.read_event_by_id(
+        transaction,
+        run.input_event_id,
+    )
+    if (
+        event is None
+        or event.event_id != run.input_event_id
+        or event.event_type != _EVENT_TYPE_USER_INPUT_ACCEPTED
+        or event.session_id != run.session_id
+        or event.run_id != run.run_id
+        or event.attempt_id is not None
+        or event.execution_id is not None
+    ):
+        raise HostDurableError(
+            "source Run exact USER_INPUT_ACCEPTED fact is invalid"
+        )
+    payload = event_payload_object(
+        transaction,
+        event,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    execution_config = payload.get("effective_execution_config")
+    if execution_config is None:
+        raise HostDurableError(
+            "source Run effective execution config is missing"
+        )
+    snapshot = effective_execution_snapshot_from_json(execution_config)
+    return PolicySnapshot(
+        runner_spec=snapshot.runner_spec,
+        runner_options=snapshot.runner_options,
+        agent_policy=snapshot.agent_policy,
+        policy_snapshot_ref=snapshot.policy_snapshot_ref,
+    )
+
+
+def load_prepared_runner_call_source_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+) -> PreparedRunnerCallSource:
+    """在调用方 transaction 内 strict-load source manifest/candidate 超集。
+
+    :param transaction: 调用方现有 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param run_id: source Host Run id。
+    :param attempt_id: source Attempt id。
+    :param execution_id: source execution id。
+    :returns: digest-verified source manifest、event 与 candidate。
+    :raises PreparedRunnerCallSourceError: strict source owner 以 typed category
+        报告 tool schema、policy 或 request semantics 不可用。
+    """
+
+    run = read_run_by_id(transaction, run_id)
+    if run is None:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call source Run is missing",
+        )
+    try:
+        event = _find_existing_runner_call_manifest_event(
+            transaction,
+            run=run,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+        )
+    except HostDurableError as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call manifest identity is invalid",
+        ) from exc
+    if event is None:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call manifest is missing before dispatch",
+        )
+    try:
+        hot = parse_runner_call_hot_payload(_payload_object(event))
+        if (
+            hot.host_run_id != run_id
+            or hot.attempt_id != attempt_id
+            or hot.execution_id != execution_id
+        ):
+            raise HostDurableError("prepared manifest hot identity mismatch")
+        manifest_json = sqlite_payload_object(
+            transaction,
+            payload_ref=hot.manifest_payload_ref,
+            payload_digest=hot.manifest_digest,
+            payload_label="prepared runner-call manifest",
+        )
+        manifest = parse_runner_call_manifest(
+            manifest_json,
+            hot_payload=hot,
+        )
+        if (
+            manifest.identity.iteration_id is not None
+            or manifest.identity.iteration_index is not None
+            or manifest.compactor_identity is not None
+        ):
+            raise HostDurableError(
+                "prepared runner-call source is not a pre-start manifest"
+            )
+    except (HostDurableError, TypeError, ValueError) as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call manifest is invalid",
+        ) from exc
+    candidate_ref = _prepared_candidate_payload_ref(
+        manifest.input_projection_digest
+    )
+    try:
+        candidate_json = sqlite_payload_object(
+            transaction,
+            payload_ref=candidate_ref,
+            payload_digest=manifest.input_projection_digest,
+            payload_label="prepared runner-call candidate",
+        )
+    except HostDurableError as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call candidate payload is unavailable",
+        ) from exc
+    try:
+        tool_facts = _prepared_source_tool_facts(
+            candidate_json,
+            run=run,
+        )
+        _validate_prepared_tool_snapshot(
+            transaction,
+            manifest.source_refs.tool_schema_snapshot_refs,
+            tool_schemas=tool_facts.tool_schemas,
+            disable_tools=tool_facts.disable_tools,
+        )
+    except (HostDurableError, TypeError, ValueError) as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call tool snapshot is invalid",
+        ) from exc
+    try:
+        policy_snapshot = load_run_input_policy_snapshot_in_transaction(
+            transaction,
+            event_log_store,
+            run=run,
+        )
+    except (HostDurableError, TypeError, ValueError) as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.POLICY,
+            "prepared runner-call source policy is unavailable",
+        ) from exc
+    _validate_prepared_source_policy_fields(
+        candidate_json,
+        policy_snapshot=policy_snapshot,
+    )
+    _validate_prepared_source_request_fields(
+        candidate_json,
+        policy_snapshot=policy_snapshot,
+    )
+    try:
+        candidate = _prepared_candidate_from_json(
+            candidate_json,
+            policy_snapshot=policy_snapshot,
+        )
+        if candidate.run_id != run_id:
+            raise HostDurableError("prepared candidate Run identity mismatch")
+        if (
+            candidate.candidate_input_projection_ref != candidate_ref
+            or candidate.candidate_input_projection_digest
+            != manifest.input_projection_digest
+        ):
+            raise HostDurableError(
+                "prepared candidate manifest projection mismatch"
+            )
+    except (HostDurableError, TypeError, ValueError) as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
+            "prepared runner-call candidate is invalid",
+        ) from exc
+    sizing = manifest.sizing_snapshot
+    if sizing.status is RunnerCallSizingStatus.NOT_APPLICABLE:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.POLICY,
+            "prepared runner-call source sizing is not applicable",
+        )
+    if (
+        (
+            sizing.input_snapshot_digest is not None
+            and sizing.input_snapshot_digest != candidate.input_snapshot_digest
+        )
+        or (
+            sizing.request_semantics_digest is not None
+            and sizing.request_semantics_digest
+            != candidate.request_semantics_digest
+        )
+        or (
+            sizing.provider is not None
+            and sizing.provider
+            != candidate.policy_snapshot.runner_spec.provider
+        )
+        or (
+            sizing.model is not None
+            and sizing.model != candidate.policy_snapshot.runner_spec.model
+        )
+    ):
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.REQUEST_SEMANTICS,
+            "prepared runner-call source request semantics are inconsistent",
+        )
+    return PreparedRunnerCallSource(
+        manifest_event=event,
+        manifest=manifest,
+        candidate=candidate,
+    )
+
+
+def _prepared_source_tool_facts(
+    candidate_json: Mapping[str, JsonValue],
+    *,
+    run: RunRow,
+) -> _PreparedSourceToolFacts:
+    """先于 policy 读取验证 candidate 的 policy-independent tool facts。
+
+    此 helper 只消费 candidate 自身及 source Run identity；它复用 complete
+    parser 的字段解析 primitives，但不读取或推断 policy。这样 tool 与
+    policy 同时损坏时，strict owner 仍稳定返回 ``TOOL_SCHEMA``。
+
+    :param candidate_json: digest-verified durable prepared candidate JSON。
+    :param run: source Run durable row。
+    :returns: exact selected schemas、disable flag 与 tool mode。
+    :raises HostDurableError: candidate shape、identity、source refs 或 tool
+        facts 非法时抛出。
+    """
+
+    fields = frozenset(candidate_json)
+    if (
+        not fields.issubset(_PREPARED_CANDIDATE_FIELDS)
+        or not _PREPARED_CANDIDATE_POLICY_INDEPENDENT_FIELDS.issubset(fields)
+    ):
+        raise HostDurableError(
+            "prepared candidate policy-independent fields are invalid"
+        )
+    if (
+        _candidate_required_text(candidate_json, "schema_version")
+        != _PREPARED_CANDIDATE_SCHEMA_VERSION
+        or _candidate_required_text(candidate_json, "session_id")
+        != run.session_id
+        or _candidate_required_text(candidate_json, "host_run_id")
+        != run.run_id
+    ):
+        raise HostDurableError(
+            "prepared candidate policy-independent identity is invalid"
+        )
+    cursor = candidate_json.get("candidate_input_cursor")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        raise HostDurableError(
+            "prepared candidate input cursor is invalid"
+        )
+    _candidate_messages(candidate_json.get("messages"))
+    tool_schemas = _candidate_tool_schemas(
+        candidate_json.get("tool_schemas")
+    )
+    disable_tools = candidate_json.get("disable_tools")
+    if not isinstance(disable_tools, bool):
+        raise HostDurableError(
+            "prepared candidate disable_tools is invalid"
+        )
+    try:
+        tool_execution_mode = ToolExecutionMode(
+            _candidate_required_text(
+                candidate_json,
+                "tool_execution_mode",
+            )
+        )
+    except ValueError as exc:
+        raise HostDurableError(
+            "prepared candidate tool_execution_mode is invalid"
+        ) from exc
+    if tool_execution_mode is ToolExecutionMode.TOOL_ENABLED:
+        if disable_tools:
+            raise HostDurableError(
+                "tool-enabled candidate must not disable tools"
+            )
+    elif not disable_tools or tool_schemas:
+        raise HostDurableError(
+            "no-tool candidate must disable tools and omit schemas"
+        )
+    _candidate_text_tuple(
+        candidate_json.get("source_cursor_refs"),
+        field_name="source_cursor_refs",
+    )
+    _candidate_optional_text(
+        candidate_json.get("memory_snapshot_cursor_ref"),
+        field_name="memory_snapshot_cursor_ref",
+    )
+    _candidate_text_tuple(
+        candidate_json.get("compact_artifact_refs"),
+        field_name="compact_artifact_refs",
+    )
+    _candidate_optional_text(
+        candidate_json.get("context_fallback_decision_ref"),
+        field_name="context_fallback_decision_ref",
+    )
+    return _PreparedSourceToolFacts(
+        tool_schemas=tool_schemas,
+        disable_tools=disable_tools,
+        tool_execution_mode=tool_execution_mode,
+    )
+
+
+def _validate_prepared_source_policy_fields(
+    candidate_json: Mapping[str, JsonValue],
+    *,
+    policy_snapshot: PolicySnapshot,
+) -> None:
+    """在完整 candidate 解析前校验 policy-owned 字段。
+
+    :param candidate_json: durable prepared candidate JSON。
+    :param policy_snapshot: exact input fact 恢复的 typed policy。
+    :returns: ``None``。
+    :raises PreparedRunnerCallSourceError: policy ref/digest 缺失或漂移时抛出。
+    """
+
+    try:
+        valid = (
+            _candidate_required_text(candidate_json, "policy_snapshot_ref")
+            == policy_snapshot.policy_snapshot_ref
+            and _candidate_required_text(
+                candidate_json,
+                "policy_snapshot_digest",
+            )
+            == _engine_policy_snapshot_digest(policy_snapshot)
+        )
+    except HostDurableError as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.POLICY,
+            "prepared runner-call candidate policy fields are unavailable",
+        ) from exc
+    if not valid:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.POLICY,
+            "prepared runner-call candidate policy does not match exact input fact",
+        )
+
+
+def _validate_prepared_source_request_fields(
+    candidate_json: Mapping[str, JsonValue],
+    *,
+    policy_snapshot: PolicySnapshot,
+) -> None:
+    """在完整 candidate 解析前校验 request-semantics-owned 字段。
+
+    :param candidate_json: durable prepared candidate JSON。
+    :param policy_snapshot: exact input fact 恢复的 typed policy。
+    :returns: ``None``。
+    :raises PreparedRunnerCallSourceError: request digest 或 estimator contract
+        缺失、损坏或漂移时抛出。
+    """
+
+    try:
+        valid = (
+            _candidate_required_text(
+                candidate_json,
+                "request_semantics_digest",
+            )
+            == runner_request_semantics_digest(policy_snapshot)
+            and _candidate_required_text(candidate_json, "estimator_id")
+            == CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+            and _candidate_required_text(candidate_json, "estimator_version")
+            == CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+        )
+    except HostDurableError as exc:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.REQUEST_SEMANTICS,
+            "prepared runner-call request semantics fields are unavailable",
+        ) from exc
+    if not valid:
+        raise PreparedRunnerCallSourceError(
+            PreparedRunnerCallSourceFailureCategory.REQUEST_SEMANTICS,
+            "prepared runner-call request semantics do not match current contract",
+        )
+
+
+def load_prepared_runner_call_candidate_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    policy_snapshot: PolicySnapshot,
+) -> PreparedRunnerCallCandidate:
+    """strict-load frozen candidate 并核对 worker caller policy。
+
+    :param transaction: 调用方现有 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param run_id: source Host Run id。
+    :param attempt_id: source Attempt id。
+    :param execution_id: source execution id。
+    :param policy_snapshot: worker 从 exact input fact读取的 caller policy。
+    :returns: digest-verified identity-free candidate。
+    :raises HostDurableError: source 或 caller policy identity 不一致时抛出。
+    """
+
+    source = load_prepared_runner_call_source_in_transaction(
+        transaction,
+        event_log_store,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+    )
+    candidate = source.candidate
+    if (
+        candidate.policy_snapshot != policy_snapshot
+        or candidate.policy_snapshot.policy_snapshot_ref
+        != policy_snapshot.policy_snapshot_ref
+        or _engine_policy_snapshot_digest(candidate.policy_snapshot)
+        != _engine_policy_snapshot_digest(policy_snapshot)
+        or candidate.request_semantics_digest
+        != runner_request_semantics_digest(policy_snapshot)
+    ):
+        raise HostDurableError(
+            "prepared candidate caller policy identity mismatch"
+        )
+    return candidate
+
+
+def load_prepared_runner_call_candidate(
+    transaction_runner: HostTransactionRunner,
+    *,
+    attempt_snapshot: AttemptDispatchSnapshot,
+    policy_snapshot: PolicySnapshot,
+) -> PreparedRunnerCallCandidate:
+    """从 pre-start manifest 读取并验证 actual request 的 frozen candidate。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_snapshot: 当前 Attempt dispatch snapshot。
+    :param policy_snapshot: admission-frozen policy snapshot。
+    :returns: digest-verified identity-free candidate。
+    :raises HostDurableError: manifest、candidate、tool snapshot 或 policy 不一致时抛出。
+    """
+
+    return transaction_runner.run_read(
+        lambda transaction: load_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            run_id=attempt_snapshot.run_id,
+            attempt_id=attempt_snapshot.attempt_id,
+            execution_id=attempt_snapshot.execution_id,
+            policy_snapshot=policy_snapshot,
+        )
+    )
+
+
+def _prepared_candidate_from_json(
+    value: Mapping[str, JsonValue],
+    *,
+    policy_snapshot: PolicySnapshot,
+) -> PreparedRunnerCallCandidate:
+    """从 strict Host-private JSON 重建 frozen candidate。
+
+    :param value: candidate payload JSON。
+    :param policy_snapshot: admission-frozen typed policy。
+    :returns: 重建且重新摘要验证后的 candidate。
+    :raises HostDurableError: schema、字段或 digest 语义非法时抛出。
+    """
+
+    if frozenset(value) != _PREPARED_CANDIDATE_FIELDS:
+        raise HostDurableError(
+            "prepared candidate payload fields are invalid"
+        )
+    if (
+        _candidate_required_text(value, "schema_version")
+        != _PREPARED_CANDIDATE_SCHEMA_VERSION
+    ):
+        raise HostDurableError(
+            "prepared candidate schema version is unsupported"
+        )
+    if (
+        _candidate_required_text(value, "policy_snapshot_ref")
+        != policy_snapshot.policy_snapshot_ref
+        or _candidate_required_text(value, "policy_snapshot_digest")
+        != _engine_policy_snapshot_digest(policy_snapshot)
+    ):
+        raise HostDurableError("prepared candidate policy snapshot mismatch")
+    if (
+        _candidate_required_text(value, "request_semantics_digest")
+        != runner_request_semantics_digest(policy_snapshot)
+    ):
+        raise HostDurableError(
+            "prepared candidate request semantics mismatch"
+        )
+    if (
+        _candidate_required_text(value, "estimator_id")
+        != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+        or _candidate_required_text(value, "estimator_version")
+        != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+    ):
+        raise HostDurableError(
+            "prepared candidate estimator contract mismatch"
+        )
+    cursor = value.get("candidate_input_cursor")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        raise HostDurableError(
+            "prepared candidate input cursor is invalid"
+        )
+    disable_tools = value.get("disable_tools")
+    if not isinstance(disable_tools, bool):
+        raise HostDurableError(
+            "prepared candidate disable_tools is invalid"
+        )
+    mode_value = _candidate_required_text(value, "tool_execution_mode")
+    try:
+        tool_execution_mode = ToolExecutionMode(mode_value)
+    except ValueError as exc:
+        raise HostDurableError(
+            "prepared candidate tool_execution_mode is invalid"
+        ) from exc
+    candidate = prepare_runner_call_candidate(
+        session_id=_candidate_required_text(value, "session_id"),
+        run_id=_candidate_required_text(value, "host_run_id"),
+        candidate_input_cursor=cursor,
+        messages=_candidate_messages(value.get("messages")),
+        tool_schemas=_candidate_tool_schemas(value.get("tool_schemas")),
+        disable_tools=disable_tools,
+        tool_execution_mode=tool_execution_mode,
+        policy_snapshot=policy_snapshot,
+        source_cursor_refs=_candidate_text_tuple(
+            value.get("source_cursor_refs"),
+            field_name="source_cursor_refs",
+        ),
+        memory_snapshot_cursor_ref=_candidate_optional_text(
+            value.get("memory_snapshot_cursor_ref"),
+            field_name="memory_snapshot_cursor_ref",
+        ),
+        compact_artifact_refs=_candidate_text_tuple(
+            value.get("compact_artifact_refs"),
+            field_name="compact_artifact_refs",
+        ),
+        context_fallback_decision_ref=_candidate_optional_text(
+            value.get("context_fallback_decision_ref"),
+            field_name="context_fallback_decision_ref",
+        ),
+    )
+    if sha256_digest_json(value) != candidate.candidate_input_projection_digest:
+        raise HostDurableError("prepared candidate payload digest mismatch")
+    return candidate
+
+
+def _candidate_messages(value: JsonValue | None) -> tuple[AgentMessage, ...]:
+    """解析 candidate 的 exact ordered messages。
+
+    :param value: messages JSON。
+    :returns: typed Agent messages。
+    :raises HostDurableError: message shape 或 role 非法时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise HostDurableError("prepared candidate messages must be array")
+    messages: list[AgentMessage] = []
+    for expected_index, item in enumerate(value):
+        mapping = _candidate_mapping(item, field_name="message")
+        index = mapping.get("index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index != expected_index
+        ):
+            raise HostDurableError(
+                "prepared candidate message index is invalid"
+            )
+        role = _candidate_required_text(mapping, "role")
+        if role == AgentMessageRole.SYSTEM.value:
+            messages.append(
+                SystemMessage(
+                    role=AgentMessageRole.SYSTEM,
+                    content=_candidate_required_text(mapping, "content"),
+                )
+            )
+        elif role == AgentMessageRole.USER.value:
+            messages.append(
+                UserMessage(
+                    role=AgentMessageRole.USER,
+                    content=_candidate_required_text(mapping, "content"),
+                )
+            )
+        elif role == AgentMessageRole.TOOL.value:
+            messages.append(
+                ToolMessage(
+                    role=AgentMessageRole.TOOL,
+                    tool_call_id=_candidate_required_text(
+                        mapping,
+                        "tool_call_id",
+                    ),
+                    content=_candidate_required_text(mapping, "content"),
+                )
+            )
+        elif role == AgentMessageRole.ASSISTANT.value:
+            messages.append(_candidate_assistant_message(mapping))
+        else:
+            raise HostDurableError(
+                "prepared candidate message role is unsupported"
+            )
+    return tuple(messages)
+
+
+def _candidate_assistant_message(
+    value: Mapping[str, JsonValue],
+) -> AssistantMessage:
+    """解析 candidate assistant message。
+
+    :param value: assistant message JSON。
+    :returns: typed assistant message。
+    :raises HostDurableError: content、reasoning 或 tool calls 非法时抛出。
+    """
+
+    content = _candidate_optional_text(
+        value.get("content"),
+        field_name="assistant.content",
+        allow_empty=True,
+    )
+    reasoning = _candidate_optional_text(
+        value.get("reasoning_content"),
+        field_name="assistant.reasoning_content",
+        allow_empty=True,
+    )
+    calls_value = value.get("tool_calls")
+    if not isinstance(calls_value, list):
+        raise HostDurableError(
+            "prepared candidate assistant tool_calls must be array"
+        )
+    calls: list[AssistantToolCall] = []
+    for item in calls_value:
+        call = _candidate_mapping(item, field_name="assistant.tool_call")
+        arguments = _candidate_mapping(
+            call.get("arguments"),
+            field_name="assistant.tool_call.arguments",
+        )
+        calls.append(
+            AssistantToolCall(
+                id=_candidate_required_text(call, "id"),
+                name=_candidate_required_text(call, "name"),
+                arguments=arguments,
+                provider_state=_candidate_provider_state(
+                    call.get("provider_state")
+                ),
+            )
+        )
+    return AssistantMessage(
+        role=AgentMessageRole.ASSISTANT,
+        content=content,
+        reasoning_content=reasoning,
+        tool_calls=tuple(calls),
+    )
+
+
+def _candidate_provider_state(
+    value: JsonValue | None,
+) -> GeminiToolCallState | None:
+    """解析 candidate provider state closed union。
+
+    :param value: provider state JSON。
+    :returns: typed provider state；缺失时为 ``None``。
+    :raises HostDurableError: provider 或字段非法时抛出。
+    """
+
+    if value is None:
+        return None
+    mapping = _candidate_mapping(value, field_name="provider_state")
+    if set(mapping) != {"provider", "thought_signature"}:
+        raise HostDurableError(
+            "prepared candidate provider state fields are invalid"
+        )
+    if _candidate_required_text(mapping, "provider") != "gemini":
+        raise HostDurableError(
+            "prepared candidate provider state is unsupported"
+        )
+    return GeminiToolCallState(
+        thought_signature=_candidate_required_text(
+            mapping,
+            "thought_signature",
+        )
+    )
+
+
+def _candidate_tool_schemas(
+    value: JsonValue | None,
+) -> tuple[ToolSchema, ...]:
+    """解析 candidate selected tool schemas。
+
+    :param value: tool schema JSON array。
+    :returns: typed tool schemas。
+    :raises HostDurableError: schema shape 非法时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise HostDurableError(
+            "prepared candidate tool_schemas must be array"
+        )
+    schemas: list[ToolSchema] = []
+    for item in value:
+        schema = _candidate_mapping(item, field_name="tool_schema")
+        if set(schema) != {"type", "function"}:
+            raise HostDurableError(
+                "prepared candidate tool schema fields are invalid"
+            )
+        if _candidate_required_text(schema, "type") != "function":
+            raise HostDurableError(
+                "prepared candidate tool schema type is unsupported"
+            )
+        function = _candidate_mapping(
+            schema.get("function"),
+            field_name="tool_schema.function",
+        )
+        parameters = _candidate_mapping(
+            function.get("parameters"),
+            field_name="tool_schema.function.parameters",
+        )
+        properties = _candidate_mapping(
+            parameters.get("properties"),
+            field_name="tool_schema.function.parameters.properties",
+        )
+        required = _candidate_text_tuple(
+            parameters.get("required"),
+            field_name="tool_schema.function.parameters.required",
+        )
+        additional = parameters.get("additionalProperties")
+        if additional is not None and not isinstance(additional, bool):
+            raise HostDurableError(
+                "prepared candidate additionalProperties is invalid"
+            )
+        schemas.append(
+            ToolSchema(
+                type="function",
+                function=ToolFunctionSchema(
+                    name=_candidate_required_text(function, "name"),
+                    description=_candidate_required_text(
+                        function,
+                        "description",
+                        allow_empty=True,
+                    ),
+                    parameters=ToolParametersSchema(
+                        type="object",
+                        properties=properties,
+                        required=required,
+                        additional_properties=additional,
+                    ),
+                ),
+            )
+        )
+    return tuple(schemas)
+
+
+def _validate_prepared_tool_snapshot(
+    transaction: HostTransaction,
+    refs: tuple[str, ...],
+    *,
+    tool_schemas: tuple[ToolSchema, ...],
+    disable_tools: bool,
+) -> None:
+    """验证 selected-tool descriptor 与 candidate schemas 同源。
+
+    :param transaction: 当前 read transaction。
+    :param refs: manifest strict tool schema refs。
+    :param tool_schemas: candidate raw fields 解析出的 exact selected schemas。
+    :param disable_tools: candidate raw fields 解析出的工具禁用标志。
+    :returns: ``None``。
+    :raises HostDurableError: ref/digest/snapshot 与 candidate 不一致时抛出。
+    """
+
+    if not tool_schemas:
+        if refs:
+            raise HostDurableError(
+                "no-tool candidate must not reference tool schema snapshot"
+            )
+        return
+    ref = _candidate_prefixed_ref(
+        refs,
+        prefix="tool_schema_snapshot_ref:",
+    )
+    digest = _candidate_prefixed_ref(
+        refs,
+        prefix="tool_schema_snapshot_digest:",
+    )
+    snapshot = sqlite_payload_object(
+        transaction,
+        payload_ref=ref,
+        payload_digest=digest,
+        payload_label="prepared selected tool schema",
+    )
+    schemas = _candidate_tool_schemas(snapshot.get("tool_schemas"))
+    snapshot_disable_tools = snapshot.get("disable_tools")
+    if (
+        schemas != tool_schemas
+        or snapshot_disable_tools is not disable_tools
+    ):
+        raise HostDurableError(
+            "prepared selected tool schema snapshot mismatch"
+        )
+
+
+def _candidate_prefixed_ref(
+    refs: tuple[str, ...],
+    *,
+    prefix: str,
+) -> str:
+    """从 manifest ref 闭集中读取唯一指定前缀值。
+
+    :param refs: manifest refs。
+    :param prefix: required prefix。
+    :returns: 去前缀后的非空值。
+    :raises HostDurableError: 缺失、重复或空值时抛出。
+    """
+
+    values = tuple(ref.removeprefix(prefix) for ref in refs if ref.startswith(prefix))
+    if len(values) != 1 or values[0].strip() == "":
+        raise HostDurableError(
+            "prepared tool schema snapshot ref is incomplete"
+        )
+    return values[0]
+
+
+def _candidate_mapping(
+    value: JsonValue | None,
+    *,
+    field_name: str,
+) -> Mapping[str, JsonValue]:
+    """收窄 candidate JSON object。
+
+    :param value: 待收窄 JSON。
+    :param field_name: 错误定位字段。
+    :returns: typed JSON mapping。
+    :raises HostDurableError: 值不是 object 时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"{field_name} must be object")
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _candidate_required_text(
+    value: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    """读取 candidate required text。
+
+    :param value: source object。
+    :param field_name: 字段名。
+    :param allow_empty: 是否允许空字符串。
+    :returns: text value。
+    :raises HostDurableError: 字段不是文本或不允许的空文本时抛出。
+    """
+
+    item = value.get(field_name)
+    if not isinstance(item, str) or (
+        not allow_empty and item.strip() == ""
+    ):
+        raise HostDurableError(
+            f"prepared candidate {field_name} must be text"
+        )
+    return item
+
+
+def _candidate_optional_text(
+    value: JsonValue | None,
+    *,
+    field_name: str,
+    allow_empty: bool = False,
+) -> str | None:
+    """读取 candidate optional text。
+
+    :param value: optional JSON value。
+    :param field_name: 字段名。
+    :param allow_empty: 是否允许空字符串。
+    :returns: text 或 ``None``。
+    :raises HostDurableError: 非空值不是合法文本时抛出。
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or (
+        not allow_empty and value.strip() == ""
+    ):
+        raise HostDurableError(
+            f"prepared candidate {field_name} must be optional text"
+        )
+    return value
+
+
+def _candidate_text_tuple(
+    value: JsonValue | None,
+    *,
+    field_name: str,
+) -> tuple[str, ...]:
+    """读取 candidate text array。
+
+    :param value: JSON array。
+    :param field_name: 字段名。
+    :returns: ordered text tuple。
+    :raises HostDurableError: shape 或 item 非法时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise HostDurableError(
+            f"prepared candidate {field_name} must be array"
+        )
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise HostDurableError(
+                f"prepared candidate {field_name} items must be text"
+            )
+        items.append(item)
+    return tuple(items)
 
 
 class RunInputBuilder:
@@ -2207,6 +4113,552 @@ def _required_memory_event_sequence(current_facts: CurrentRunFacts) -> int:
     return required_event_sequence
 
 
+def _candidate_input_cursor(
+    transaction: HostTransaction,
+    session_id: str,
+) -> int:
+    """读取当前 transaction snapshot 的 Session source watermark。
+
+    :param transaction: Host transaction。
+    :param session_id: Session id。
+    :returns: 最大 EventLog sequence；无事件时返回 ``0``。
+    :raises HostDurableError: SQLite 返回类型非法时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT MAX(event_sequence) AS max_event_sequence
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+    if row is None:
+        raise HostDurableError("candidate cursor query returned no row")
+    value = row.get("max_event_sequence")
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError("candidate cursor is invalid")
+    return value
+
+
+def _load_pre_start_memory_snapshot(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    facts: _PreStartCandidateFacts,
+    required_event_sequence: int,
+    policy: MemoryProjectionPolicy,
+) -> MemorySnapshotView:
+    """读取并渲染 candidate cursor 对应的 memory snapshot。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param facts: Attempt-free current Run facts。
+    :param required_event_sequence: candidate source watermark。
+    :param policy: memory projection policy。
+    :returns: 与 actual request 同源的 memory view。
+    :raises MemoryProjectionRepairRequired: snapshot 缺失、损坏或滞后过大时抛出。
+    """
+
+    policy_digest = digest_memory_projection_policy(policy)
+    row = read_latest_memory_snapshot_at_or_before(
+        transaction,
+        session_id=facts.run.session_id,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy_digest=policy_digest,
+        max_checkpoint_event_sequence=required_event_sequence,
+    )
+    if row is None:
+        event_filter = event_log_read_filter_from_projection_filter(
+            conversation_memory_projection_event_filter()
+        )
+        page = event_log_store.read_events_after_matching(
+            transaction,
+            0,
+            event_filter=event_filter,
+            limit=policy.max_delta_repair_events,
+            max_event_sequence=required_event_sequence,
+            session_id=facts.run.session_id,
+        )
+        repaired_from_empty: ConversationMemorySnapshotVNext | None = None
+        for event in page.rows:
+            repaired_from_empty = project_conversation_memory_event(
+                previous_snapshot=repaired_from_empty,
+                event=_memory_projection_event_from_row(transaction, event),
+                policy=policy,
+                built_at=event.occurred_at,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            )
+        if (
+            repaired_from_empty is None
+            or page.covered_event_sequence != required_event_sequence
+            or page.covered_event_id is None
+        ):
+            raise MemoryProjectionRepairRequired(
+                MemoryRepairRequest(
+                    session_id=facts.run.session_id,
+                    reason=MemoryRepairReason.SNAPSHOT_MISSING,
+                    required_event_sequence=required_event_sequence,
+                    observed_cursor=None,
+                    policy_digest=policy_digest,
+                )
+            )
+        snapshot = memory_snapshot_with_cursor_and_diagnostics(
+            snapshot=repaired_from_empty,
+            cursor=MemorySnapshotCursor(
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                checkpoint_event_sequence=required_event_sequence,
+                checkpoint_event_id=page.covered_event_id,
+                session_id=facts.run.session_id,
+            ),
+            diagnostics=(
+                build_inline_delta_repair_diagnostic(
+                    event_sequence=required_event_sequence,
+                    policy_digest=policy_digest,
+                ),
+            ),
+        )
+    else:
+        snapshot = row.snapshot
+    cursor = snapshot.cursor
+    if cursor.checkpoint_event_sequence > 0:
+        cursor_event = (
+            None
+            if cursor.checkpoint_event_id is None
+            else read_event_by_id(transaction, cursor.checkpoint_event_id)
+        )
+        if (
+            cursor_event is None
+            or cursor_event.event_sequence != cursor.checkpoint_event_sequence
+            or cursor_event.session_id != facts.run.session_id
+        ):
+            raise MemoryProjectionRepairRequired(
+                MemoryRepairRequest(
+                    session_id=facts.run.session_id,
+                    reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                    required_event_sequence=required_event_sequence,
+                    observed_cursor=cursor,
+                    policy_digest=policy_digest,
+                )
+            )
+    lag_events = required_event_sequence - cursor.checkpoint_event_sequence
+    if lag_events < 0:
+        raise MemoryProjectionRepairRequired(
+            MemoryRepairRequest(
+                session_id=facts.run.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_AHEAD_OF_REQUIRED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=cursor,
+                policy_digest=policy_digest,
+            )
+        )
+    repaired = snapshot
+    if lag_events > 0:
+        inline_event_limit = min(
+            policy.max_lag_events_for_inline_delta,
+            policy.max_delta_repair_events,
+        )
+        event_filter = event_log_read_filter_from_projection_filter(
+            conversation_memory_projection_event_filter()
+        )
+        page = event_log_store.read_events_after_matching(
+            transaction,
+            cursor.checkpoint_event_sequence,
+            event_filter=event_filter,
+            limit=inline_event_limit + 1,
+            max_event_sequence=required_event_sequence,
+            session_id=facts.run.session_id,
+        )
+        if len(page.rows) > inline_event_limit:
+            raise MemoryProjectionRepairRequired(
+                MemoryRepairRequest(
+                    session_id=facts.run.session_id,
+                    reason=MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD,
+                    required_event_sequence=required_event_sequence,
+                    observed_cursor=cursor,
+                    policy_digest=policy_digest,
+                )
+            )
+        if page.covered_event_sequence != required_event_sequence:
+            raise MemoryProjectionRepairRequired(
+                MemoryRepairRequest(
+                    session_id=facts.run.session_id,
+                    reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                    required_event_sequence=required_event_sequence,
+                    observed_cursor=cursor,
+                    policy_digest=policy_digest,
+                )
+            )
+        for event in page.rows:
+            repaired = project_conversation_memory_event(
+                previous_snapshot=repaired,
+                event=_memory_projection_event_from_row(transaction, event),
+                policy=policy,
+                built_at=event.occurred_at,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            )
+        covered_event_id = page.covered_event_id
+        if covered_event_id is None:
+            raise HostDurableError(
+                "candidate memory delta covered event id is missing"
+            )
+        repaired = memory_snapshot_with_cursor_and_diagnostics(
+            snapshot=repaired,
+            cursor=MemorySnapshotCursor(
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                checkpoint_event_sequence=required_event_sequence,
+                checkpoint_event_id=covered_event_id,
+                session_id=facts.run.session_id,
+            ),
+            diagnostics=(
+                build_inline_delta_repair_diagnostic(
+                    event_sequence=required_event_sequence,
+                    policy_digest=policy_digest,
+                ),
+            ),
+        )
+    render_scope = _CurrentMemoryRenderScope(
+        run_id=facts.run.run_id,
+        user_input_event_id=facts.user_input_event.event_id,
+        user_prompt=facts.user_prompt,
+    )
+    rendered = _memory_messages(repaired, render_scope, policy)
+    return MemorySnapshotView(
+        messages=rendered.messages,
+        memory_snapshot_cursor=_memory_cursor_ref(repaired.cursor),
+        policy_digest=repaired.policy_digest,
+        diagnostics=repaired.diagnostics + rendered.diagnostics,
+        represented_evidence_refs=_memory_represented_evidence_refs(repaired),
+        latest_compaction_event_ref=repaired.latest_compaction_event_ref,
+        selected_recent_source_refs=_memory_selected_recent_source_refs(
+            repaired.trace_memory.selected_recent_window,
+            render_scope,
+        ),
+        selected_recent_content_digests=_memory_selected_recent_content_digests(
+            repaired.trace_memory.selected_recent_window,
+            render_scope,
+        ),
+    )
+
+
+def _load_pre_start_compact_artifact(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    facts: _PreStartCandidateFacts,
+    before_event_sequence: int,
+) -> tuple[CompactArtifactView, EventLogRow | None]:
+    """读取 candidate cursor 前 latest accepted compact artifact。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param facts: Attempt-free current Run facts。
+    :param before_event_sequence: exclusive EventLog cursor。
+    :returns: ``(compact view, compacted event)``。
+    :raises HostDurableError: compact payload 或 descriptor identity 非法时抛出。
+    """
+
+    compacted_event = _latest_compacted_event_before_cursor(
+        transaction,
+        event_log_store,
+        session_id=facts.run.session_id,
+        before_event_sequence=before_event_sequence,
+    )
+    if compacted_event is None:
+        return (
+            CompactArtifactView(
+                compaction_event_ref=None,
+                compact_artifact_ref=None,
+                compact_artifact_digest=None,
+            ),
+            None,
+        )
+    payload = _payload_object(compacted_event)
+    try:
+        semantic_payload = parse_context_compacted_semantic_payload(payload)
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("compact semantic payload is invalid") from exc
+    return (
+        CompactArtifactView(
+            compaction_event_ref=compacted_event.event_id,
+            compact_artifact_ref=semantic_payload.compact_artifact_ref,
+            compact_artifact_digest=_required_text_field(
+                payload,
+                _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST,
+            ),
+            represented_evidence_refs=(
+                semantic_payload.accepted_evidence_mapping_refs
+            ),
+        ),
+        compacted_event,
+    )
+
+
+def _latest_compacted_event_before_cursor(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    before_event_sequence: int,
+) -> EventLogRow | None:
+    """读取指定 Session/cursor 前 latest accepted compact event。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param session_id: Session id。
+    :param before_event_sequence: exclusive EventLog cursor。
+    :returns: latest compacted event；不存在时为 ``None``。
+    :raises HostDurableError: event id 或 row 缺失时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND event_type = ?
+          AND event_class = ?
+          AND event_sequence < ?
+        ORDER BY event_sequence DESC
+        LIMIT 1
+        """,
+        (
+            session_id,
+            CONTEXT_COMPACTED,
+            EventClass.CANONICAL_FACT.value,
+            before_event_sequence,
+        ),
+    )
+    if not rows:
+        return None
+    event_id = _required_host_row_text(rows[0], field_name="event_id")
+    event = event_log_store.read_event_by_id(transaction, event_id)
+    if event is None:
+        raise HostDurableError("CONTEXT_COMPACTED event disappeared during read")
+    return event
+
+
+def _pre_start_protected_recent_raw_tail(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    facts: _PreStartCandidateFacts,
+    memory: MemorySnapshotView,
+    compact: CompactArtifactView,
+    compacted_event: EventLogRow | None,
+    memory_projection_policy: MemoryProjectionPolicy,
+) -> CompactPipelineOrdinaryRawTailHandoff:
+    """构造 pre-start candidate 的 post-compact protected raw tail。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param facts: Attempt-free current Run facts。
+    :param memory: frozen memory view。
+    :param compact: frozen compact view。
+    :param compacted_event: compact view 的 source event。
+    :param memory_projection_policy: raw-tail floor policy。
+    :returns: ordinary protected raw-tail handoff。
+    :raises HostDurableError: compact provenance 或 material source 非法时抛出。
+    """
+
+    if compact.compact_artifact_ref is None:
+        return CompactPipelineOrdinaryRawTailHandoff(
+            messages=(),
+            material_blocks=(),
+            source_refs=(),
+            material_view_digest=selected_material_view_digest(()),
+            selected_recent_window_turn_floor=0,
+        )
+    if compacted_event is None:
+        raise HostDurableError("compact view source event is missing")
+    _validate_loaded_compact_view_matches_event(
+        compact=compact,
+        compacted_event=compacted_event,
+    )
+    material_view = build_pre_dispatch_compact_material_view(
+        transaction,
+        event_log_store,
+        run=facts.run,
+        current_display_text=facts.user_prompt,
+    )
+    source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
+        trigger_source=_compaction_trigger_source_for_compacted_event(
+            transaction,
+            compacted_event=compacted_event,
+        ),
+        run=facts.run,
+        material_view=material_view,
+    )
+    return select_ordinary_protected_raw_tail(
+        source_snapshot=source_snapshot,
+        selected_recent_window_turn_floor=(
+            memory_projection_policy.selected_recent_window_turn_floor
+        ),
+        memory=memory,
+    )
+
+
+def _pre_start_fallback_material_blocks(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    facts: _PreStartCandidateFacts,
+    memory: MemorySnapshotView,
+    continuity: SessionContinuityView,
+    compact: CompactArtifactView,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """构造 reactive fallback 所需的 complete material blocks。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param facts: Attempt-free current Run facts。
+    :param memory: frozen memory view。
+    :param continuity: frozen continuity view。
+    :param compact: frozen compact view。
+    :returns: fallback material blocks。
+    :raises HostDurableError: material source 非法时抛出。
+    """
+
+    material_view = build_pre_dispatch_compact_material_view(
+        transaction,
+        event_log_store,
+        run=facts.run,
+        current_display_text=facts.user_prompt,
+    )
+    represented = frozenset(_represented_evidence_refs(memory, compact))
+    accepted_evidence = tuple(
+        block
+        for block in material_view.material_blocks
+        if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        and block.accepted_evidence_id not in represented
+    )
+    return _pre_start_material_blocks(
+        facts=facts,
+        memory=memory,
+        continuity=continuity,
+        accepted_tool_evidence=accepted_evidence,
+    )
+
+
+def _pre_start_material_blocks(
+    *,
+    facts: _PreStartCandidateFacts,
+    memory: MemorySnapshotView,
+    continuity: SessionContinuityView,
+    accepted_tool_evidence: tuple[RunInputMaterialBlock, ...],
+) -> tuple[RunInputMaterialBlock, ...]:
+    """构造 Attempt-free candidate 的 shared material block list。
+
+    :param facts: Attempt-free current Run facts。
+    :param memory: frozen memory view。
+    :param continuity: frozen continuity view。
+    :param accepted_tool_evidence: accepted evidence blocks。
+    :returns: ordered material blocks。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    blocks: list[RunInputMaterialBlock] = []
+    for index, message in enumerate(memory.messages):
+        blocks.append(
+            run_input_material_block(
+                block_id=f"memory:{index}",
+                section=_material_section_for_message(message),
+                kind=_memory_material_kind(message),
+                text=_run_input_message_content(message),
+                canonical_source_refs=(_memory_material_source_ref(memory),),
+                event_sequence=None,
+                event_sub_index=index,
+            )
+        )
+    for index, message in enumerate(continuity.messages):
+        blocks.append(
+            run_input_material_block(
+                block_id=f"continuity:{index}",
+                section=CompactMaterialSection.TRACE_MATERIAL,
+                kind=_history_material_kind(message),
+                text=_run_input_message_content(message),
+                canonical_source_refs=continuity.source_refs,
+                event_sequence=None,
+                event_sub_index=index,
+            )
+        )
+    blocks.extend(accepted_tool_evidence)
+    blocks.append(
+        run_input_material_block(
+            block_id=f"current:{facts.user_input_event.event_id}",
+            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            text=facts.user_prompt,
+            canonical_source_refs=(facts.user_input_event.event_id,),
+            event_sequence=facts.user_input_event.event_sequence,
+            turn_group_id=facts.run.run_id,
+        )
+    )
+    return tuple(blocks)
+
+
+def _pre_start_candidate_source_refs(
+    *,
+    facts: _PreStartCandidateFacts,
+    memory: MemorySnapshotView,
+    compact: CompactArtifactView,
+    fallback: ActiveRecentWindowFallback | None,
+    continuity: SessionContinuityView,
+) -> tuple[str, ...]:
+    """构造 identity-free candidate 的 complete source refs。
+
+    :param facts: Attempt-free current Run facts。
+    :param memory: frozen memory view。
+    :param compact: frozen compact view。
+    :param fallback: frozen fallback view。
+    :param continuity: producer 冻结的 continuation source refs。
+    :returns: 去重 source refs。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    refs = [
+        f"event:{facts.user_input_event.event_id}",
+        f"event:{facts.run_accepted_event.event_id}",
+        facts.run.execution_target,
+    ]
+    if memory.memory_snapshot_cursor is not None:
+        refs.append(f"memory:{memory.memory_snapshot_cursor}")
+    refs.extend(_compact_artifact_refs(compact))
+    refs.extend(continuity.source_refs)
+    fallback_ref = _context_fallback_decision_ref(fallback)
+    if fallback_ref is not None:
+        refs.append(fallback_ref)
+    return tuple(dict.fromkeys(refs))
+
+
+def _pre_start_current_user_tail(
+    facts: _PreStartCandidateFacts,
+    continuity: SessionContinuityView,
+) -> tuple[UserMessage, ...]:
+    """为 pre-start candidate 追加且只追加一次 current user input。
+
+    :param facts: 本次 candidate 的 exact input fact。
+    :param continuity: producer 冻结的 continuation messages。
+    :returns: continuity 已包含 current user 时为空，否则为单条 user message。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for message in continuity.messages:
+        if (
+            isinstance(message, UserMessage)
+            and message.content == facts.user_prompt
+        ):
+            return ()
+    return (
+        UserMessage(
+            role=AgentMessageRole.USER,
+            content=facts.user_prompt,
+        ),
+    )
+
+
 def _memory_snapshot_view(
     snapshot: ConversationMemorySnapshotVNext,
     current_facts: CurrentRunFacts,
@@ -2498,7 +4950,7 @@ def build_run_input_material_blocks(
                 section=CompactMaterialSection.TRACE_MATERIAL,
                 kind=_history_material_kind(message),
                 text=_run_input_message_content(message),
-                canonical_source_refs=(f"message:continuity:{index}",),
+                canonical_source_refs=continuity.source_refs,
                 event_sequence=None,
                 event_sub_index=index,
             )
@@ -3455,21 +5907,21 @@ def _execution_target_from_accepted_event(event: EventLogRow, *, fallback: str) 
     return value
 
 
-def _resume_wait_messages_from_current_start(
+def _resume_wait_continuity_from_current_start(
     transaction: HostTransaction, current_facts: CurrentRunFacts
-) -> tuple[AgentMessage, ...]:
-    """从当前 resume ``RUN_STARTED`` 重建 wait result continuation messages。
+) -> SessionContinuityView:
+    """从当前 resume ``RUN_STARTED`` 重建 wait result continuation。
 
     :param transaction: Host durable transaction。
     :param current_facts: 当前 Run facts。
-    :returns: resume continuation messages；非 resume Attempt 返回空元组。
+    :returns: resume continuation；非 resume Attempt 返回显式空 view。
     :raises HostDurableError: resume payload 或引用事件无法投影时抛出。
     """
 
     start_payload = _payload_object(current_facts.run_started_event)
     started_payload = decode_run_started_payload(start_payload)
     if started_payload.start_reason is not RunStartReason.RESUME:
-        return ()
+        return SessionContinuityView(messages=(), source_refs=())
     tool_result_event_id = _event_id_from_payload_ref(start_payload, field_name=_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF)
     tool_result_event = read_event_by_id(transaction, tool_result_event_id)
     if tool_result_event is None:
@@ -3478,33 +5930,87 @@ def _resume_wait_messages_from_current_start(
         tool_result_event,
         expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-    payload = _payload_object(tool_result_event)
     projection = project_accepted_tool_result(transaction, tool_result_event)
-    accepted_arguments = _resume_wait_accepted_arguments(
-        projection=projection,
+    request_event_ref = projection.tool_call_requested_event_ref
+    if request_event_ref is None:
+        raise HostDurableError(
+            "resume wait tool-call requested event ref is missing"
+        )
+    return project_wait_resume_continuity(
+        user_prompt=current_facts.user_prompt,
+        accepted_result=projection,
+        source_refs=(request_event_ref, tool_result_event.event_id),
     )
-    tool_call_id = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_CALL_ID)
-    tool_name = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)
-    return (
-        UserMessage(role=AgentMessageRole.USER, content=current_facts.user_prompt),
-        AssistantMessage(
-            role=AgentMessageRole.ASSISTANT,
-            content=None,
-            reasoning_content=None,
-            tool_calls=(
-                AssistantToolCall(
-                    id=tool_call_id,
-                    name=tool_name,
-                    arguments=accepted_arguments,
-                    provider_state=None,
+
+
+def project_wait_resume_continuity(
+    *,
+    user_prompt: str,
+    accepted_result: AcceptedToolResultProjection,
+    source_refs: tuple[str, ...],
+) -> SessionContinuityView:
+    """把 typed completed/cancelled accepted result 投影为唯一 resume continuity。
+
+    :param user_prompt: source Run 当前用户输入。
+    :param accepted_result: accepted-result owner 产出的 strict typed projection。
+    :param source_refs: exact request/result canonical event refs。
+    :returns: ``user -> assistant(tool_call) -> tool(result)`` continuity。
+    :raises HostDurableError: status、工具 identity、request arguments、raw outcome
+        或 source refs 不完整时抛出。
+    """
+
+    if user_prompt.strip() == "":
+        raise HostDurableError("resume wait user prompt must be non-empty")
+    if accepted_result.status not in (
+        AcceptedToolResultStatus.COMPLETED,
+        AcceptedToolResultStatus.CANCELLED,
+    ):
+        raise HostDurableError("resume wait accepted result is not resumable")
+    if (
+        accepted_result.tool_call_id is None
+        or accepted_result.tool_call_id.strip() == ""
+        or accepted_result.tool_name is None
+        or accepted_result.tool_name.strip() == ""
+    ):
+        raise HostDurableError("resume wait tool identity is incomplete")
+    if (
+        len(source_refs) == 0
+        or len(set(source_refs)) != len(source_refs)
+        or any(ref.strip() == "" for ref in source_refs)
+    ):
+        raise HostDurableError("resume wait source refs are invalid")
+    if accepted_result.raw_outcome is None:
+        raise HostDurableError("resume wait raw outcome is missing")
+    accepted_arguments = _resume_wait_accepted_arguments(
+        projection=accepted_result,
+    )
+    tool_call_id = accepted_result.tool_call_id
+    tool_name = accepted_result.tool_name
+    return SessionContinuityView(
+        messages=(
+            UserMessage(role=AgentMessageRole.USER, content=user_prompt),
+            AssistantMessage(
+                role=AgentMessageRole.ASSISTANT,
+                content=None,
+                reasoning_content=None,
+                tool_calls=(
+                    AssistantToolCall(
+                        id=tool_call_id,
+                        name=tool_name,
+                        arguments=accepted_arguments,
+                        provider_state=None,
+                    ),
+                ),
+            ),
+            ToolMessage(
+                role=AgentMessageRole.TOOL,
+                tool_call_id=tool_call_id,
+                content=_resume_wait_tool_message_content(
+                    {"raw_tool_outcome": accepted_result.raw_outcome}
                 ),
             ),
         ),
-        ToolMessage(
-            role=AgentMessageRole.TOOL,
-            tool_call_id=tool_call_id,
-            content=_resume_wait_tool_message_content(payload),
-        ),
+        source_refs=source_refs,
     )
 
 
@@ -3715,18 +6221,19 @@ def _validate_tool_enabled_snapshot(
 def _find_existing_runner_call_manifest_event(
     transaction: HostTransaction,
     *,
-    run_id: str,
+    run: RunRow,
     attempt_id: str,
     execution_id: str,
 ) -> EventLogRow | None:
     """查找同一 attempt/execution 已写入的 runner-call manifest event。
 
     :param transaction: 当前 Host transaction。
-    :param run_id: 当前 Run id。
+    :param run: 当前 source Run row。
     :param attempt_id: 当前 Attempt id。
     :param execution_id: 当前 execution id。
     :returns: 已存在的 manifest event；不存在时返回 ``None``。
-    :raises HostDurableError: 既有 event hot payload 非法时抛出。
+    :raises HostDurableError: EventLog row、hot payload、caller 或 source
+        identity 不同源，或同一 identity 出现重复 manifest 时抛出。
     """
 
     rows = transaction.fetchall(
@@ -3737,9 +6244,10 @@ def _find_existing_runner_call_manifest_event(
           AND event_type = ?
         ORDER BY event_sequence ASC
         """,
-        (run_id, _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED),
+        (run.run_id, _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED),
     )
     event_log_store = EventLogStore()
+    matched: EventLogRow | None = None
     for row in rows:
         event_id = row.get("event_id")
         if not isinstance(event_id, str):
@@ -3747,10 +6255,48 @@ def _find_existing_runner_call_manifest_event(
         event = event_log_store.read_event_by_id(transaction, event_id)
         if event is None:
             raise HostDurableError("runner-call manifest event row is missing")
-        payload = _payload_object(event)
-        if payload.get("attempt_id") == attempt_id and payload.get("execution_id") == execution_id:
-            return event
-    return None
+        if (
+            event.event_class is not EventClass.CANONICAL_FACT
+            or event.event_type != _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED
+            or event.session_id != run.session_id
+            or event.run_id != run.run_id
+        ):
+            raise HostDurableError("runner-call manifest EventLog identity is invalid")
+        try:
+            hot = parse_runner_call_hot_payload(_payload_object(event))
+        except (HostDurableError, TypeError, ValueError) as exc:
+            raise HostDurableError(
+                "runner-call manifest hot payload is invalid"
+            ) from exc
+        if (
+            hot.session_id != run.session_id
+            or hot.host_run_id != run.run_id
+            or hot.attempt_id != event.attempt_id
+            or hot.execution_id != event.execution_id
+        ):
+            raise HostDurableError(
+                "runner-call manifest EventLog and hot identity mismatch"
+            )
+        if hot.runner_call_kind == _RUNNER_CALL_KIND_COMPACTOR_PROPOSAL:
+            continue
+        if event.attempt_id is None or event.execution_id is None:
+            raise HostDurableError(
+                "runner-call dispatch manifest EventLog identity is incomplete"
+            )
+        if hot.attempt_id != attempt_id or hot.execution_id != execution_id:
+            continue
+        if hot.iteration_id is not None or hot.iteration_index is not None:
+            continue
+        if hot.runner_call_kind not in _PRE_START_RUNNER_CALL_KINDS:
+            raise HostDurableError(
+                "runner-call manifest pre-start kind is unsupported"
+            )
+        if matched is not None:
+            raise HostDurableError(
+                "runner-call manifest identity has duplicate canonical events"
+            )
+        matched = event
+    return matched
 
 
 def _next_runner_call_index(transaction: HostTransaction, *, run_id: str) -> int:
@@ -3815,6 +6361,34 @@ def _runner_call_manifest_id(event_id: str) -> str:
     return f"runner-call-manifest:{event_id}"
 
 
+def _prepared_candidate_payload_ref(candidate_digest: str) -> str:
+    """从 candidate digest 派生 Host-private payload ref。
+
+    :param candidate_digest: candidate projection sha256 digest。
+    :returns: deterministic payload ref。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        f"{_PREPARED_CANDIDATE_PROJECTION_REF_PREFIX}:"
+        f"{candidate_digest.removeprefix('sha256:')}"
+    )
+
+
+def _prepared_candidate_sqlite_payload_id(candidate_digest: str) -> str:
+    """从 candidate digest 派生 SQLite payload id。
+
+    :param candidate_digest: candidate projection sha256 digest。
+    :returns: deterministic SQLite payload id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        "sqlite-runner-call-prepared-candidate:"
+        f"{candidate_digest.removeprefix('sha256:')}"
+    )
+
+
 def _runner_call_projection_id(event_id: str) -> str:
     """派生 runner-call projection logical id。
 
@@ -3823,6 +6397,648 @@ def _runner_call_projection_id(event_id: str) -> str:
     """
 
     return f"runner-call-projection:{event_id}"
+
+
+def _prepared_candidate_projection_body(
+    *,
+    session_id: str,
+    run_id: str,
+    candidate_input_cursor: int,
+    messages: tuple[AgentMessage, ...],
+    tool_schemas: tuple[ToolSchema, ...],
+    disable_tools: bool,
+    tool_execution_mode: ToolExecutionMode,
+    policy_snapshot: PolicySnapshot,
+    source_cursor_refs: tuple[str, ...],
+    memory_snapshot_cursor_ref: str | None,
+    compact_artifact_refs: tuple[str, ...],
+    context_fallback_decision_ref: str | None,
+    request_semantics_digest: str,
+) -> Mapping[str, JsonValue]:
+    """构造 identity-free complete candidate digest preimage。
+
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param candidate_input_cursor: committed source watermark。
+    :param messages: complete normalized messages。
+    :param tool_schemas: selected tool schemas。
+    :param disable_tools: 是否禁用工具。
+    :param tool_execution_mode: frozen 工具执行模式。
+    :param policy_snapshot: admission-frozen Engine policy。
+    :param source_cursor_refs: source refs。
+    :param memory_snapshot_cursor_ref: memory cursor ref。
+    :param compact_artifact_refs: compact refs。
+    :param context_fallback_decision_ref: fallback ref。
+    :param request_semantics_digest: request semantics digest。
+    :returns: canonical JSON digest preimage。
+    """
+
+    return {
+        "schema_version": _PREPARED_CANDIDATE_SCHEMA_VERSION,
+        "session_id": session_id,
+        "host_run_id": run_id,
+        "candidate_input_cursor": candidate_input_cursor,
+        "messages": [
+            _prepared_candidate_message_body(index, message)
+            for index, message in enumerate(messages)
+        ],
+        "tool_schemas": [_tool_schema_json(schema) for schema in tool_schemas],
+        "disable_tools": disable_tools,
+        "tool_execution_mode": tool_execution_mode.value,
+        "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
+        "policy_snapshot_digest": _engine_policy_snapshot_digest(
+            policy_snapshot
+        ),
+        "source_cursor_refs": list(source_cursor_refs),
+        "memory_snapshot_cursor_ref": memory_snapshot_cursor_ref,
+        "compact_artifact_refs": list(compact_artifact_refs),
+        "context_fallback_decision_ref": context_fallback_decision_ref,
+        "request_semantics_digest": request_semantics_digest,
+        "estimator_id": CONTEXT_ESTIMATOR_CONTRACT.estimator_id,
+        "estimator_version": CONTEXT_ESTIMATOR_CONTRACT.estimator_version,
+    }
+
+
+def _prepared_candidate_input_snapshot_body(
+    *,
+    messages: tuple[AgentMessage, ...],
+    tool_schemas: tuple[ToolSchema, ...],
+    disable_tools: bool,
+    tool_execution_mode: ToolExecutionMode,
+    policy_snapshot: PolicySnapshot,
+    request_semantics_digest: str,
+) -> Mapping[str, JsonValue]:
+    """构造 actual runner logical input 的稳定 digest preimage。
+
+    source cursor、payload ref 与 governance event sequence 只属于 projection
+    lineage，不得让同一 messages/tools/policy snapshot 变成另一份 logical input。
+
+    :param messages: complete normalized messages。
+    :param tool_schemas: selected tool schemas。
+    :param disable_tools: 是否禁用工具。
+    :param tool_execution_mode: frozen 工具执行模式。
+    :param policy_snapshot: admission-frozen Engine policy。
+    :param request_semantics_digest: request serialization compatibility digest。
+    :returns: messages、tools、policy与request semantics的canonical JSON。
+    :raises TypeError: message closed union 出现非法成员时抛出。
+    """
+
+    return {
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
+        "messages": [
+            _prepared_candidate_message_body(index, message)
+            for index, message in enumerate(messages)
+        ],
+        "tool_schemas": [_tool_schema_json(schema) for schema in tool_schemas],
+        "disable_tools": disable_tools,
+        "tool_execution_mode": tool_execution_mode.value,
+        "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
+        "policy_snapshot_digest": _engine_policy_snapshot_digest(
+            policy_snapshot
+        ),
+        "request_semantics_digest": request_semantics_digest,
+    }
+
+
+def _prepared_candidate_message_body(
+    index: int,
+    message: AgentMessage,
+) -> Mapping[str, JsonValue]:
+    """构造 candidate digest 使用的 exact message atom。
+
+    :param index: message 顺序。
+    :param message: typed Agent message。
+    :returns: canonical message object。
+    :raises TypeError: 遇到封闭联合外消息类型时抛出。
+    """
+
+    base: dict[str, JsonValue] = {
+        "index": index,
+        "role": message.role.value,
+        "content": _message_content_text(message),
+    }
+    if isinstance(message, ToolMessage):
+        base["tool_call_id"] = message.tool_call_id
+        return base
+    if isinstance(message, AssistantMessage):
+        base["content"] = message.content
+        base["reasoning_content"] = message.reasoning_content
+        base["tool_calls"] = [
+            {
+                "id": call.id,
+                "name": call.name,
+                "arguments": dict(call.arguments),
+                "provider_state": _prepared_candidate_provider_state(
+                    call.provider_state
+                ),
+            }
+            for call in message.tool_calls
+        ]
+        return base
+    if isinstance(message, SystemMessage | UserMessage):
+        return base
+    raise TypeError("prepared candidate message type is unsupported")
+
+
+def _prepared_candidate_provider_state(
+    provider_state: GeminiToolCallState | None,
+) -> Mapping[str, JsonValue] | None:
+    """把 provider tool-call state 无损写入 Host-private candidate。
+
+    :param provider_state: typed provider state。
+    :returns: 可逆的 Host-private JSON；缺失时返回 ``None``。
+    :raises TypeError: 遇到封闭联合外状态时抛出。
+    """
+
+    if provider_state is None:
+        return None
+    if isinstance(provider_state, GeminiToolCallState):
+        return {
+            "provider": "gemini",
+            "thought_signature": provider_state.thought_signature,
+        }
+    raise TypeError("prepared candidate provider state is unsupported")
+
+
+def _engine_policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:
+    """计算 complete candidate 的 Engine policy digest。
+
+    :param policy_snapshot: admission-frozen Engine policy。
+    :returns: canonical sha256 digest。
+    :raises Exception: provider request extension 非法时由 typed projector 抛出。
+    """
+
+    policy = policy_snapshot.agent_policy
+    return sha256_digest_json(
+        {
+            "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
+            "request_semantics_digest": runner_request_semantics_digest(
+                policy_snapshot
+            ),
+            "agent_policy": {
+                "max_iterations": policy.max_iterations,
+                "continuation_max_attempts": policy.continuation_max_attempts,
+                "allow_tool_calls": policy.allow_tool_calls,
+                "tool_execution_timeout_seconds": (
+                    policy.tool_execution_timeout_seconds
+                ),
+                "fallback_mode": policy.fallback_mode.value,
+                "fallback_prompt": policy.fallback_prompt,
+                "continuation_prompt": policy.continuation_prompt,
+                "max_consecutive_failed_tool_batches": (
+                    policy.max_consecutive_failed_tool_batches
+                ),
+            },
+        }
+    )
+
+
+def _prepared_candidate_kind_and_trigger(
+    candidate: PreparedRunnerCallCandidate,
+    *,
+    sizing_snapshot: RunnerCallSizingSnapshot,
+) -> tuple[str, str]:
+    """从 frozen candidate provenance 判定 ordinary manifest kind。
+
+    :param candidate: frozen complete candidate。
+    :param sizing_snapshot: producer 显式给出的 sizing stage。
+    :returns: ``(runner_call_kind, trigger_reason)``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if sizing_snapshot.sizing_stage is ContextSizingStage.CONTINUATION:
+        return (
+            _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
+            _RUNNER_CALL_TRIGGER_HOST_RESUME,
+        )
+    if (
+        candidate.context_fallback_decision_ref is not None
+        or candidate.compact_artifact_refs
+    ):
+        return (
+            _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
+            _RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED,
+        )
+    return (
+        _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH,
+        _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT,
+    )
+
+
+def _prepared_runner_call_projection_body(
+    *,
+    candidate: PreparedRunnerCallCandidate,
+    attempt_id: str,
+    execution_id: str,
+    runner_call_index: int,
+    projection_id: str,
+    runner_call_kind: str,
+    trigger_reason: str,
+) -> Mapping[str, JsonValue]:
+    """构造 allow transaction 内 persisted runner input projection。
+
+    :param candidate: frozen complete candidate。
+    :param attempt_id: 同一 allow Attempt id。
+    :param execution_id: 同一 allow execution id。
+    :param runner_call_index: Host-owned call index。
+    :param projection_id: projection logical id。
+    :param runner_call_kind: runner call kind。
+    :param trigger_reason: runner call trigger。
+    :returns: LLM-readable complete projection body。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+        "projection_id": projection_id,
+        "session_id": candidate.session_id,
+        "host_run_id": candidate.run_id,
+        "attempt_id": attempt_id,
+        "execution_id": execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": runner_call_kind,
+        "runner_call_trigger_reason": trigger_reason,
+        "iteration_id": None,
+        "iteration_index": None,
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
+        "message_count": len(candidate.messages),
+        "role_sequence_digest": runner_role_sequence_digest(
+            _message_role_values(candidate.messages)
+        ),
+        "messages": [
+            _prepared_runner_call_projection_message(
+                candidate,
+                index=index,
+                message=message,
+            )
+            for index, message in enumerate(candidate.messages)
+        ],
+    }
+
+
+def _prepared_runner_call_projection_message(
+    candidate: PreparedRunnerCallCandidate,
+    *,
+    index: int,
+    message: AgentMessage,
+) -> Mapping[str, JsonValue]:
+    """构造 persisted projection 的单条 frozen message。
+
+    :param candidate: frozen complete candidate。
+    :param index: message 顺序。
+    :param message: exact message。
+    :returns: projection message JSON。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    base = dict(_prepared_candidate_message_body(index, message))
+    base["content_digest"] = _message_content_digest(message)
+    base["content_size_bytes"] = _message_content_size_bytes(message)
+    base["source_refs"] = list(candidate.source_cursor_refs)
+    base["projector_metadata_id"] = _prepared_projector_metadata_id(
+        index,
+        message,
+    )
+    return base
+
+
+def _write_prepared_tool_schema_snapshot_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    event_id: str,
+    candidate: PreparedRunnerCallCandidate,
+    attempt_id: str,
+    execution_id: str,
+) -> PayloadDescriptor | None:
+    """写入 frozen candidate 的 selected tool schema snapshot。
+
+    :param transaction: Host transaction。
+    :param payload_store: payload store primitive。
+    :param event_id: manifest event id。
+    :param candidate: frozen complete candidate。
+    :param attempt_id: same start Attempt id。
+    :param execution_id: same start execution id。
+    :returns: 有 selected tools 时返回 descriptor，否则返回 ``None``。
+    :raises HostDurableError: descriptor digest 冲突时抛出。
+    """
+
+    if not candidate.tool_schemas:
+        return None
+    snapshot: Mapping[str, JsonValue] = {
+        "schema_version": SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
+        "session_id": candidate.session_id,
+        "host_run_id": candidate.run_id,
+        "attempt_id": attempt_id,
+        "execution_id": execution_id,
+        "disable_tools": candidate.disable_tools,
+        "tool_schema_count": len(candidate.tool_schemas),
+        "tool_schemas": [
+            _tool_schema_json(schema) for schema in candidate.tool_schemas
+        ],
+    }
+    snapshot_digest = sha256_digest_json(snapshot)
+    payload_ref = _selected_tool_schema_payload_ref(event_id)
+    existing = payload_store.read_payload_descriptor(transaction, payload_ref)
+    if existing is not None:
+        if existing.payload_digest != snapshot_digest:
+            raise HostDurableError(
+                "selected tool schema snapshot digest mismatch"
+            )
+        return existing
+    return payload_store.write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=_selected_tool_schema_sqlite_payload_id(event_id),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=snapshot,
+            media_type=SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE,
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.SELECTED_TOOL_SCHEMA_SNAPSHOT,
+                {
+                    "schema_version": (
+                        SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION
+                    ),
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
+            expected_digest=snapshot_digest,
+        ),
+    )
+
+
+def _write_prepared_candidate_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    candidate: PreparedRunnerCallCandidate,
+) -> PayloadDescriptor:
+    """持久化 actual request 唯一可消费的 Host-private frozen candidate。
+
+    :param transaction: allow write transaction。
+    :param payload_store: payload store primitive。
+    :param candidate: identity-free complete candidate。
+    :returns: candidate payload descriptor。
+    :raises HostDurableError: body、ref 或 digest 与 frozen candidate 不一致时抛出。
+    """
+
+    body = _prepared_candidate_projection_body(
+        session_id=candidate.session_id,
+        run_id=candidate.run_id,
+        candidate_input_cursor=candidate.candidate_input_cursor,
+        messages=candidate.messages,
+        tool_schemas=candidate.tool_schemas,
+        disable_tools=candidate.disable_tools,
+        tool_execution_mode=candidate.tool_execution_mode,
+        policy_snapshot=candidate.policy_snapshot,
+        source_cursor_refs=candidate.source_cursor_refs,
+        memory_snapshot_cursor_ref=candidate.memory_snapshot_cursor_ref,
+        compact_artifact_refs=candidate.compact_artifact_refs,
+        context_fallback_decision_ref=(
+            candidate.context_fallback_decision_ref
+        ),
+        request_semantics_digest=candidate.request_semantics_digest,
+    )
+    digest = sha256_digest_json(body)
+    if digest != candidate.candidate_input_projection_digest:
+        raise HostDurableError("prepared candidate payload digest mismatch")
+    if (
+        _prepared_candidate_payload_ref(digest)
+        != candidate.candidate_input_projection_ref
+    ):
+        raise HostDurableError("prepared candidate payload ref mismatch")
+    existing = payload_store.read_payload_descriptor(
+        transaction,
+        candidate.candidate_input_projection_ref,
+    )
+    if existing is not None:
+        if existing.payload_digest != digest:
+            raise HostDurableError(
+                "prepared candidate descriptor digest mismatch"
+            )
+        return existing
+    return payload_store.write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=candidate.candidate_input_projection_ref,
+            payload_id=_prepared_candidate_sqlite_payload_id(digest),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=body,
+            media_type=_PREPARED_CANDIDATE_MEDIA_TYPE,
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_PREPARED_CANDIDATE,
+                {
+                    "schema_version": _PREPARED_CANDIDATE_SCHEMA_VERSION,
+                    "host_run_id": candidate.run_id,
+                },
+            ),
+            expected_digest=digest,
+        ),
+    )
+
+
+def _prepared_runner_call_manifest_body(
+    *,
+    candidate: PreparedRunnerCallCandidate,
+    attempt_id: str,
+    execution_id: str,
+    runner_call_index: int,
+    manifest_id: str,
+    projection_descriptor: PayloadDescriptor,
+    tool_schema_descriptor: PayloadDescriptor | None,
+    runner_call_kind: str,
+    trigger_reason: str,
+    sizing_snapshot: RunnerCallSizingSnapshot,
+) -> Mapping[str, JsonValue]:
+    """构造 pre-start ordinary manifest v2 body。
+
+    :param candidate: frozen complete candidate。
+    :param attempt_id: same start Attempt id。
+    :param execution_id: same start execution id。
+    :param runner_call_index: Host-owned call index。
+    :param manifest_id: manifest logical id。
+    :param projection_descriptor: persisted complete projection descriptor。
+    :param tool_schema_descriptor: selected tool schema descriptor。
+    :param runner_call_kind: runner call kind。
+    :param trigger_reason: runner call trigger。
+    :param sizing_snapshot: strict sizing snapshot。
+    :returns: manifest v2 canonical JSON。
+    :raises HostDurableError: sizing snapshot 或 graph 非法时由 shared parser 抛出。
+    """
+
+    message_entries = tuple(
+        _prepared_manifest_message_entry(
+            candidate,
+            index=index,
+            message=message,
+            projection_descriptor=projection_descriptor,
+        )
+        for index, message in enumerate(candidate.messages)
+    )
+    projector_metadata = _prepared_projector_metadata(candidate)
+    return {
+        "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+        "manifest_id": manifest_id,
+        "session_id": candidate.session_id,
+        "host_run_id": candidate.run_id,
+        "attempt_id": attempt_id,
+        "execution_id": execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": runner_call_kind,
+        "runner_call_trigger_reason": trigger_reason,
+        "iteration_id": None,
+        "iteration_index": None,
+        "message_count": len(candidate.messages),
+        "role_sequence_digest": runner_role_sequence_digest(
+            _message_role_values(candidate.messages)
+        ),
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
+        "input_projection_digest": (
+            candidate.candidate_input_projection_digest
+        ),
+        "runner_call_projection_artifact_ref": (
+            projection_descriptor.payload_ref
+        ),
+        "runner_call_projection_artifact_digest": (
+            projection_descriptor.payload_digest
+        ),
+        "runner_call_projection_artifact_size_bytes": (
+            projection_descriptor.payload_size_bytes
+        ),
+        "message_entries": list(message_entries),
+        "source_cursor_refs": list(candidate.source_cursor_refs),
+        "tool_schema_snapshot_refs": list(
+            _tool_schema_snapshot_refs(tool_schema_descriptor)
+        ),
+        "memory_snapshot_cursor_ref": candidate.memory_snapshot_cursor_ref,
+        "compact_artifact_refs": list(candidate.compact_artifact_refs),
+        "context_fallback_decision_ref": (
+            candidate.context_fallback_decision_ref
+        ),
+        "projector_metadata": list(projector_metadata),
+        "compactor_identity": None,
+        "sizing_snapshot": runner_call_sizing_snapshot_json(sizing_snapshot),
+        "diagnostic": None,
+    }
+
+
+def _prepared_manifest_message_entry(
+    candidate: PreparedRunnerCallCandidate,
+    *,
+    index: int,
+    message: AgentMessage,
+    projection_descriptor: PayloadDescriptor,
+) -> Mapping[str, JsonValue]:
+    """构造 prepared manifest 的单条 message provenance。
+
+    :param candidate: frozen candidate。
+    :param index: message 顺序。
+    :param message: exact message。
+    :param projection_descriptor: complete projection descriptor。
+    :returns: manifest message entry。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "index": index,
+        "role": message.role.value,
+        "content_digest": _message_content_digest(message),
+        "content_size_bytes": _message_content_size_bytes(message),
+        "source_refs": list(candidate.source_cursor_refs),
+        "projection_artifact_ref": projection_descriptor.payload_ref,
+        "projection_artifact_digest": projection_descriptor.payload_digest,
+        "projector_metadata_id": _prepared_projector_metadata_id(
+            index,
+            message,
+        ),
+        "provider_tool_calls_digest": _assistant_tool_calls_digest(message),
+        "reasoning_content_digest": _assistant_reasoning_content_digest(
+            message
+        ),
+    }
+
+
+def _prepared_projector_metadata(
+    candidate: PreparedRunnerCallCandidate,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """构造 prepared candidate 的 per-message projector metadata。
+
+    :param candidate: frozen complete candidate。
+    :returns: ordered projector metadata descriptors。
+    :raises HostDurableError: shared descriptor contract 非法时抛出。
+    """
+
+    purpose = (
+        _PROJECTOR_PURPOSE_POST_COMPACTION
+        if candidate.compact_artifact_refs
+        or candidate.context_fallback_decision_ref is not None
+        else _PROJECTOR_PURPOSE_ORDINARY
+    )
+    return tuple(
+        runner_call_projector_metadata_descriptor(
+            RunnerCallProjectorMetadata(
+                projector_metadata_id=_prepared_projector_metadata_id(
+                    index,
+                    message,
+                ),
+                projector_id=_prepared_projector_id(message),
+                projector_schema_version=_PROJECTOR_SCHEMA_VERSION,
+                projector_digest=sha256_digest_json(
+                    {
+                        "message_index": index,
+                        "message_digest": _message_content_digest(message),
+                        "source_refs": list(candidate.source_cursor_refs),
+                        "purpose": purpose,
+                    }
+                ),
+                purpose=purpose,
+                source_contract_refs=candidate.source_cursor_refs,
+            )
+        )
+        for index, message in enumerate(candidate.messages)
+    )
+
+
+def _prepared_projector_metadata_id(
+    index: int,
+    message: AgentMessage,
+) -> str:
+    """派生 prepared message 的 projector metadata id。
+
+    :param index: message 顺序。
+    :param message: exact message。
+    :returns: manifest-local metadata id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"projector:{index}:{message.role.value}"
+
+
+def _prepared_projector_id(message: AgentMessage) -> str:
+    """把 AgentMessage role 映射到 shared projector id closed set。
+
+    :param message: exact message。
+    :returns: shared projector id。
+    :raises TypeError: 遇到封闭联合外消息类型时抛出。
+    """
+
+    if isinstance(message, SystemMessage):
+        return _PROJECTOR_ID_SYSTEM_CONTEXT
+    if isinstance(message, UserMessage):
+        return _PROJECTOR_ID_USER_INPUT
+    if isinstance(message, AssistantMessage):
+        return _PROJECTOR_ID_ASSISTANT_HISTORY
+    if isinstance(message, ToolMessage):
+        return _PROJECTOR_ID_TOOL_RESULT
+    raise TypeError("prepared projector message type is unsupported")
 
 
 def _runner_call_projection_body(
@@ -4103,6 +7319,12 @@ def _runner_call_manifest_body(
         "context_fallback_decision_ref": _context_fallback_decision_ref(record_input.fallback),
         "projector_metadata": list(projector_metadata),
         "compactor_identity": None,
+        "sizing_snapshot": runner_call_sizing_snapshot_json(
+            unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
+            )
+        ),
         "diagnostic": None,
     }
 
@@ -4805,6 +8027,10 @@ __all__ = [
     "NoopToolSchemaSnapshotProvider",
     "PolicySnapshot",
     "PolicySnapshotProvider",
+    "PreparedRunnerCallCandidate",
+    "PreparedRunnerCallSource",
+    "PreparedRunnerCallSourceError",
+    "PreparedRunnerCallSourceFailureCategory",
     "RunInputBuilder",
     "SceneParameterProvider",
     "SessionContinuityProvider",
@@ -4819,6 +8045,14 @@ __all__ = [
     "ToolSchemaSnapshot",
     "ToolSchemaSnapshotProvider",
     "build_run_input_material_blocks",
+    "agent_run_request_from_prepared_candidate",
     "create_no_tool_run_input_builder",
     "create_tool_enabled_run_input_builder",
+    "estimate_prepared_runner_call_candidate",
+    "load_prepared_runner_call_candidate",
+    "load_prepared_runner_call_candidate_in_transaction",
+    "prepare_runner_call_candidate",
+    "prepare_runner_call_candidate_in_transaction",
+    "record_prepared_runner_call_candidate_in_transaction",
+    "runner_request_semantics_digest",
 ]

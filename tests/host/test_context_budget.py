@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import dayu.host.context_budget as context_budget_module
 from dayu.host.context_budget import (
     BudgetEstimate,
     BudgetEstimateInput,
@@ -15,6 +17,8 @@ from dayu.host.context_budget import (
     BudgetTextFragment,
     ContextBudgetDecision,
     ContextBudgetOverageReason,
+    ContextPressureLevel,
+    ContextSizingStage,
     DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
@@ -24,6 +28,7 @@ from dayu.host.context_budget import (
     UsageObservation,
     USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
     USAGE_OBSERVATION_STATUS_OBSERVED,
+    build_conservative_context_sizing_result,
     build_usage_observation_diagnostic,
     decide_context_budget,
     estimate_budget_text_tokens,
@@ -56,6 +61,168 @@ from dayu.host.durable.transaction import HostTransaction
 
 _NOW = datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC)
 _TRIGGER_SOURCE_VALUES = tuple(source.value for source in ContextCompactionTriggerSource)
+
+
+@pytest.mark.parametrize(
+    ("stage", "estimated_tokens", "expected_pressure", "expected_decision"),
+    (
+        (
+            ContextSizingStage.ORDINARY,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.ORDINARY,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.COMPACT_SOFT_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.ORDINARY,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.POST_COMPACT,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.POST_COMPACT,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.POST_COMPACT,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.REACTIVE_POST_COMPACT,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.REACTIVE_POST_COMPACT,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.REACTIVE_POST_COMPACT,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.DISPATCH_FALLBACK,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.DISPATCH_FALLBACK,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.DISPATCH_FALLBACK,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.CONTINUATION,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.CONTINUATION,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.CONTINUATION,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+    ),
+)
+def test_context_sizing_stage_matrix_separates_pressure_from_action(
+    stage: ContextSizingStage,
+    estimated_tokens: int,
+    expected_pressure: ContextPressureLevel,
+    expected_decision: ContextBudgetDecision,
+) -> None:
+    """producer与result invariant共同冻结5x3 stage-aware action矩阵。
+
+    :param stage: 当前治理阶段。
+    :param estimated_tokens: normal、soft或hard区间的预测值。
+    :param expected_pressure: 只由阈值决定的压力。
+    :param expected_decision: 由stage与压力共同决定的动作。
+    """
+
+    policy = default_context_budget_policy(context_window_size=1024)
+    estimate = BudgetEstimate(
+        estimated_input_tokens=estimated_tokens,
+        input_budget_tokens=1024,
+        soft_threshold_tokens=819,
+        hard_threshold_tokens=921,
+        safety_margin_tokens=205,
+        estimator_digest=f"estimate:{stage.value}:{estimated_tokens}",
+        overage_reason=None,
+    )
+
+    sizing = build_conservative_context_sizing_result(
+        stage=stage,
+        candidate_input_cursor=1,
+        candidate_input_projection_ref="candidate:projection",
+        candidate_input_digest="candidate:digest",
+        policy=policy,
+        estimate=estimate,
+    )
+
+    assert sizing.pressure_level is expected_pressure
+    assert sizing.budget_decision is expected_decision
+    with pytest.raises(ValueError, match="budget_decision mismatch"):
+        replace(
+            sizing,
+            budget_decision=(
+                ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+                if expected_decision is not ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+                else ContextBudgetDecision.ALLOW_DISPATCH
+            ),
+        )
+
+
+def test_context_sizing_matrix_rejects_unknown_stage() -> None:
+    """五阶段矩阵对未知 stage fail closed。"""
+
+    with pytest.raises(AssertionError, match="matrix is not exhaustive"):
+        context_budget_module._stage_pressure_action(
+            cast(ContextSizingStage, "unknown-stage"),
+            ContextPressureLevel.NORMAL,
+        )
+
+
+def test_context_sizing_matrix_rejects_unknown_pressure() -> None:
+    """三压力矩阵对未知 pressure fail closed。"""
+
+    with pytest.raises(AssertionError, match="matrix is not exhaustive"):
+        context_budget_module._stage_pressure_action(
+            ContextSizingStage.ORDINARY,
+            cast(ContextPressureLevel, "unknown-pressure"),
+        )
 
 
 def test_default_policy_computes_budget_thresholds_and_digest() -> None:

@@ -339,7 +339,35 @@ class EventLogContextFallbackProvider:
         :returns: active fallback view；不存在时返回 ``None``。
         """
 
-        row = transaction.fetchone(
+        return load_context_fallback_in_transaction(
+            transaction,
+            self._event_log_store,
+            run_id=run_id,
+            before_event_sequence=run_started_event_sequence,
+            current_input_ref=current_input_ref,
+        )
+
+
+def load_context_fallback_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run_id: str,
+    before_event_sequence: int,
+    current_input_ref: str,
+) -> ActiveRecentWindowFallback | None:
+    """在调用方 transaction snapshot 内读取 active fallback。
+
+    :param transaction: 调用方 Host transaction。
+    :param event_log_store: stateless EventLog primitive。
+    :param run_id: 当前 Run id。
+    :param before_event_sequence: 只读取该 cursor 之前的 fallback fact。
+    :param current_input_ref: 当前用户输入 event id。
+    :returns: active fallback view；不存在时返回 ``None``。
+    :raises HostDurableError: fallback payload、digest 或 current input ref 非法时抛出。
+    """
+
+    row = transaction.fetchone(
             f"""
             SELECT event_id
             FROM {TABLE_EVENT_LOG}
@@ -349,62 +377,64 @@ class EventLogContextFallbackProvider:
             ORDER BY event_sequence DESC
             LIMIT 1
             """,
-            (run_id, CONTEXT_COMPACTION_FAILED, run_started_event_sequence),
-        )
-        if row is None:
-            return None
-        event_id = _required_row_text(row, "event_id")
-        event = self._event_log_store.read_event_by_id(transaction, event_id)
-        if event is None:
-            return None
-        payload = event_payload_object(
+            (run_id, CONTEXT_COMPACTION_FAILED, before_event_sequence),
+    )
+    if row is None:
+        return None
+    event_id = _required_row_text(row, "event_id")
+    event = event_log_store.read_event_by_id(transaction, event_id)
+    if event is None:
+        return None
+    payload = event_payload_object(
+        transaction,
+        event,
+        payload_label=CONTEXT_COMPACTION_FAILED,
+    )
+    if payload.get(_FIELD_FALLBACK_ACTION) != FALLBACK_ACTION_DISPATCH:
+        return None
+    window = _optional_mapping(payload, _FIELD_FALLBACK_INPUT_WINDOW)
+    digest = _optional_text(payload, _FIELD_FALLBACK_INPUT_DIGEST)
+    if window is None or digest is None:
+        raise HostDurableError("active fallback input window is missing")
+    if fallback_window_digest(window) != digest:
+        raise HostDurableError("fallback input digest mismatch")
+    window_current_ref = _optional_text(window, _FIELD_CURRENT_INPUT_REF)
+    if window_current_ref is None:
+        raise HostDurableError("fallback current_input_ref is missing")
+    if window_current_ref != current_input_ref:
+        raise HostDurableError("fallback current_input_ref mismatch")
+    trigger_source = _required_text(window, _FIELD_TRIGGER_SOURCE)
+    material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
+    if trigger_source == ContextCompactionTriggerSource.PROACTIVE.value:
+        material_blocks = _proactive_material_blocks_for_window(
             transaction,
-            event,
-            payload_label=CONTEXT_COMPACTION_FAILED,
+            event_log_store,
+            run_id=run_id,
+            current_input_ref=window_current_ref,
         )
-        if payload.get(_FIELD_FALLBACK_ACTION) != FALLBACK_ACTION_DISPATCH:
-            return None
-        window = _optional_mapping(payload, _FIELD_FALLBACK_INPUT_WINDOW)
-        digest = _optional_text(payload, _FIELD_FALLBACK_INPUT_DIGEST)
-        if window is None or digest is None:
-            raise HostDurableError("active fallback input window is missing")
-        if fallback_window_digest(window) != digest:
-            raise HostDurableError("fallback input digest mismatch")
-        window_current_ref = _optional_text(window, _FIELD_CURRENT_INPUT_REF)
-        if window_current_ref is None:
-            raise HostDurableError("fallback current_input_ref is missing")
-        if window_current_ref != current_input_ref:
-            raise HostDurableError("fallback current_input_ref mismatch")
-        actual_current_input_ref = window_current_ref
-        trigger_source = _required_text(window, _FIELD_TRIGGER_SOURCE)
-        material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
-        if trigger_source == ContextCompactionTriggerSource.PROACTIVE.value:
-            material_blocks = _proactive_material_blocks_for_window(
-                transaction,
-                self._event_log_store,
-                run_id=run_id,
-                current_input_ref=actual_current_input_ref,
-            )
-        return ActiveRecentWindowFallback(
-            selected_block_ids=_required_text_tuple(window, _FIELD_SELECTED_BLOCK_IDS),
-            current_input_ref=actual_current_input_ref,
-            source_refs=_required_text_tuple(window, _FIELD_SOURCE_REFS),
-            fallback_input_digest=digest,
-            selected_recent_window_turn_floor=_required_non_negative_int(
-                window,
-                _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR,
-            ),
-            selected_raw_turn_count=_required_non_negative_int(
-                window,
-                _FIELD_SELECTED_RAW_TURN_COUNT,
-            ),
-            selected_material_view_digest=_required_text(
-                window,
-                _FIELD_SELECTED_MATERIAL_VIEW_DIGEST,
-            ),
-            fallback_input_window=window,
-            material_blocks=material_blocks,
-        )
+    return ActiveRecentWindowFallback(
+        selected_block_ids=_required_text_tuple(
+            window,
+            _FIELD_SELECTED_BLOCK_IDS,
+        ),
+        current_input_ref=window_current_ref,
+        source_refs=_required_text_tuple(window, _FIELD_SOURCE_REFS),
+        fallback_input_digest=digest,
+        selected_recent_window_turn_floor=_required_non_negative_int(
+            window,
+            _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR,
+        ),
+        selected_raw_turn_count=_required_non_negative_int(
+            window,
+            _FIELD_SELECTED_RAW_TURN_COUNT,
+        ),
+        selected_material_view_digest=_required_text(
+            window,
+            _FIELD_SELECTED_MATERIAL_VIEW_DIGEST,
+        ),
+        fallback_input_window=window,
+        material_blocks=material_blocks,
+    )
 
 
 def _proactive_material_blocks_for_window(

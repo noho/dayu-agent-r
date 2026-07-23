@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     StartRunRequest,
 )
-from dayu.host.command import create_host_command_handle, start_run
+from dayu.host.command import start_run
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -41,10 +42,22 @@ from dayu.host.memory import default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import NoToolExecutor
 from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
 _SECRET_PROMPT = "SECRET_FULL_PROMPT_DO_NOT_LOG"
 _SECRET_AUTH = "SECRET_AUTH_CLAIM_DO_NOT_LOG"
 _CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline("logging"),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 
 class _OpenCancellationToken(CancellationToken):
@@ -86,7 +99,7 @@ def test_command_logs_verbose_ids_without_prompt_or_auth_claims(
     :raises AssertionError: 日志级别、字段或脱敏不符合预期时抛出。
     """
 
-    host = create_host_command_handle(_command_options(tmp_path))
+    host = _create_execution_handle(_command_options(tmp_path))
     try:
         session = ensure_session(
             host,

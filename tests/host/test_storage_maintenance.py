@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import partial
 from collections.abc import AsyncIterator, Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,7 +45,6 @@ from dayu.host.api import (
 )
 from dayu.host.command import (
     HostCommandHandle,
-    create_host_command_handle,
     create_session as command_create_session,
     start_run,
 )
@@ -62,8 +62,22 @@ from dayu.host.open_host import open_host_admin
 from dayu.host.read_api import get_run, get_session
 from dayu.host import storage_maintenance as storage_maintenance_module
 from dayu.host.storage_maintenance import report_storage_usage
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
 _OLD_TIMESTAMP_SECONDS = 1_700_000_000
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "storage-maintenance"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,7 +370,7 @@ def test_storage_maintenance_dry_run_reports_candidates_without_deleting(
     """dry-run 返回候选和物理 size，但不删除文件或 descriptor row。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session = command_create_session(host, _create_request())
         run = start_run(host, _start_request(session.session_id))
@@ -403,7 +417,7 @@ def test_storage_maintenance_wal_checkpoint_true_returns_result(
 ) -> None:
     """默认 maintenance 用独立 connection 返回 WAL checkpoint 诊断。"""
 
-    host = create_host_command_handle(_command_options(tmp_path))
+    host = _create_execution_handle(_command_options(tmp_path))
     try:
         result = run_storage_maintenance(host, HostStorageMaintenanceRequest())
     finally:
@@ -418,7 +432,7 @@ def test_storage_maintenance_reports_memory_snapshot_integrity_issue(
 ) -> None:
     """maintenance result 暴露 memory snapshot integrity 只读诊断。"""
 
-    host = create_host_command_handle(_command_options(tmp_path))
+    host = _create_execution_handle(_command_options(tmp_path))
     try:
         _insert_invalid_memory_snapshot_json(host)
 
@@ -443,7 +457,7 @@ def test_storage_maintenance_reclaim_true_deletes_orphan_without_db_row_changes(
     """opt-in reclaim 删除 orphan 物理文件，不删除 SQLite row 或被引用文件。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session = command_create_session(host, _create_request())
         run = start_run(host, _start_request(session.session_id))
@@ -486,7 +500,7 @@ def test_storage_maintenance_reclaim_keeps_shared_referenced_artifact(
     """同一物理 artifact 仍有其它 descriptor 引用时不进入回收候选。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         artifact_ref = _write_referenced_artifact_with_ref(
             host,
@@ -523,7 +537,7 @@ def test_storage_maintenance_reclaim_recheck_hit_skips_delete(
     """public maintenance recheck 看见 scan 后新增 descriptor 并跳过删除。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         artifact_ref = _write_orphan_artifact_ref(options.artifact_root, b"recheck")
         _set_old_mtime(options.artifact_root / artifact_ref.artifact_relative_path)
@@ -587,7 +601,7 @@ def test_storage_maintenance_recheck_durable_error_fails_safe(
     """recheck 的 durable 错误经 public facade fail-safe 传播。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         orphan_path = _write_orphan_artifact(options.artifact_root, b"recheck-error")
         _set_old_mtime(options.artifact_root / orphan_path)
@@ -636,7 +650,7 @@ def test_storage_maintenance_reclaim_file_error_keeps_processing(
     """单文件删除失败进入 file_errors，其它候选仍继续回收。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         failing_path = _write_orphan_artifact(options.artifact_root, b"fail-delete")
         deleted_path = _write_orphan_artifact(options.artifact_root, b"delete-ok")
@@ -686,7 +700,7 @@ def test_storage_maintenance_reclaim_is_idempotent(tmp_path: Path) -> None:
     """连续两次 opt-in reclaim 时，第二次无候选且不抛错。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         orphan_path = _write_orphan_artifact(options.artifact_root, b"idempotent")
         _set_old_mtime(options.artifact_root / orphan_path)
@@ -714,7 +728,7 @@ def test_storage_maintenance_result_json_value_is_stable_self_explaining_and_non
     """maintenance result json_value 返回稳定、自解释且非负的 JSON object。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         orphan_path = _write_orphan_artifact(options.artifact_root, b"json-value")
         _set_old_mtime(options.artifact_root / orphan_path)

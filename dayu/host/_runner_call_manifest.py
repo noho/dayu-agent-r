@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
@@ -20,6 +21,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.schema import RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
+from dayu.host.context_budget import ContextSizingStage, MAX_CONTEXT_TOKEN_COUNT
 
 _RUNNER_CALL_HOT_FIELDS = frozenset(
     {
@@ -84,6 +86,7 @@ _RUNNER_CALL_MANIFEST_REQUIRED_FIELDS = frozenset(
         "context_fallback_decision_ref",
         "projector_metadata",
         "compactor_identity",
+        "sizing_snapshot",
         "diagnostic",
     }
 )
@@ -214,6 +217,80 @@ _RUNNER_CALL_MISSING_ATOM_KINDS = frozenset(
 _RUNNER_CALL_MISSING_REF_KINDS = frozenset(
     {"payload_ref", "artifact_ref", "event_ref", "cursor_ref"}
 )
+_RUNNER_CALL_SIZING_FIELDS = frozenset(
+    {
+        "status",
+        "reason",
+        "sizing_stage",
+        "estimator_id",
+        "estimator_version",
+        "estimator_digest",
+        "conservative_input_tokens",
+        "context_window_size",
+        "provider",
+        "model",
+        "request_semantics_digest",
+        "input_snapshot_digest",
+        "policy_ref",
+        "policy_snapshot_digest",
+    }
+)
+
+
+class RunnerCallSizingStatus(StrEnum):
+    """runner-call manifest sizing snapshot 状态。"""
+
+    COMPLETE = "complete"
+    UNAVAILABLE = "unavailable"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class RunnerCallSizingUnavailableReason(StrEnum):
+    """runner-call sizing snapshot unavailable 的封闭原因。"""
+
+    CONTEXT_POLICY_UNAVAILABLE = "context_policy_unavailable"
+    CONTINUATION_PROJECTION_UNAVAILABLE = "continuation_projection_unavailable"
+    CONTINUATION_TOOL_SCHEMA_UNAVAILABLE = "continuation_tool_schema_unavailable"
+    CONTINUATION_POLICY_UNAVAILABLE = "continuation_policy_unavailable"
+    CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE = (
+        "continuation_request_semantics_unavailable"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerCallSizingSnapshot:
+    """runner-call manifest v2 的 strict sizing snapshot。
+
+    :param status: complete / unavailable / not_applicable。
+    :param reason: unavailable 原因；其它状态为 ``None``。
+    :param sizing_stage: dispatch-relevant candidate 的治理阶段。
+    :param estimator_id: stable estimator id。
+    :param estimator_version: stable estimator version。
+    :param estimator_digest: candidate-specific estimator digest。
+    :param conservative_input_tokens: candidate conservative tokens。
+    :param context_window_size: frozen context window。
+    :param provider: frozen provider identity。
+    :param model: frozen model identity。
+    :param request_semantics_digest: frozen request serialization digest。
+    :param input_snapshot_digest: complete input snapshot digest。
+    :param policy_ref: Host context policy ref。
+    :param policy_snapshot_digest: Host context policy snapshot digest。
+    """
+
+    status: RunnerCallSizingStatus
+    reason: RunnerCallSizingUnavailableReason | None
+    sizing_stage: ContextSizingStage | None
+    estimator_id: str | None
+    estimator_version: str | None
+    estimator_digest: str | None
+    conservative_input_tokens: int | None
+    context_window_size: int | None
+    provider: str | None
+    model: str | None
+    request_semantics_digest: str | None
+    input_snapshot_digest: str | None
+    policy_ref: str | None
+    policy_snapshot_digest: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +515,7 @@ class RunnerCallInputManifest:
     :param source_refs: typed source/ref 集合。
     :param projector_metadata: typed projector metadata。
     :param compactor_identity: 可选 compactor identity。
+    :param sizing_snapshot: manifest v2 strict sizing snapshot。
     :param diagnostic: 非 complete manifest diagnostic；complete 时为 ``None``。
     """
 
@@ -451,6 +529,7 @@ class RunnerCallInputManifest:
     source_refs: RunnerCallManifestSourceRefs
     projector_metadata: tuple[RunnerCallProjectorMetadata, ...]
     compactor_identity: RunnerCallCompactorIdentity | None
+    sizing_snapshot: RunnerCallSizingSnapshot
     diagnostic: RunnerCallHotDiagnostic | None
 
 
@@ -688,6 +767,150 @@ def runner_call_projector_metadata_descriptor(
     }
 
 
+def complete_runner_call_sizing_snapshot(
+    *,
+    sizing_stage: ContextSizingStage,
+    estimator_id: str,
+    estimator_version: str,
+    estimator_digest: str,
+    conservative_input_tokens: int,
+    context_window_size: int,
+    provider: str,
+    model: str,
+    request_semantics_digest: str,
+    input_snapshot_digest: str,
+    policy_ref: str,
+    policy_snapshot_digest: str,
+) -> RunnerCallSizingSnapshot:
+    """构造并校验 complete runner-call sizing snapshot。
+
+    :param sizing_stage: dispatch-relevant candidate 的治理阶段。
+    :param estimator_id: stable estimator id。
+    :param estimator_version: stable estimator version。
+    :param estimator_digest: candidate estimate digest。
+    :param conservative_input_tokens: candidate conservative tokens。
+    :param context_window_size: frozen context window。
+    :param provider: frozen provider。
+    :param model: frozen model。
+    :param request_semantics_digest: request serialization digest。
+    :param input_snapshot_digest: complete input snapshot digest。
+    :param policy_ref: Host context policy ref。
+    :param policy_snapshot_digest: Host context policy digest。
+    :returns: strict complete snapshot。
+    :raises HostDurableError: 任一字段非法时抛出。
+    """
+
+    snapshot = RunnerCallSizingSnapshot(
+        status=RunnerCallSizingStatus.COMPLETE,
+        reason=None,
+        sizing_stage=sizing_stage,
+        estimator_id=estimator_id,
+        estimator_version=estimator_version,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=conservative_input_tokens,
+        context_window_size=context_window_size,
+        provider=provider,
+        model=model,
+        request_semantics_digest=request_semantics_digest,
+        input_snapshot_digest=input_snapshot_digest,
+        policy_ref=policy_ref,
+        policy_snapshot_digest=policy_snapshot_digest,
+    )
+    _validate_sizing_snapshot(snapshot, runner_call_kind=None)
+    return snapshot
+
+
+def unavailable_runner_call_sizing_snapshot(
+    reason: RunnerCallSizingUnavailableReason,
+    *,
+    sizing_stage: ContextSizingStage,
+) -> RunnerCallSizingSnapshot:
+    """构造 strict unavailable runner-call sizing snapshot。
+
+    :param reason: closed unavailable reason。
+    :param sizing_stage: ordinary candidate 的治理阶段。
+    :returns: value atoms 全为空的 unavailable snapshot。
+    :raises TypeError: ``reason`` 类型非法时抛出。
+    """
+
+    if not isinstance(reason, RunnerCallSizingUnavailableReason):
+        raise TypeError("reason must be RunnerCallSizingUnavailableReason")
+    return RunnerCallSizingSnapshot(
+        status=RunnerCallSizingStatus.UNAVAILABLE,
+        reason=reason,
+        sizing_stage=sizing_stage,
+        estimator_id=None,
+        estimator_version=None,
+        estimator_digest=None,
+        conservative_input_tokens=None,
+        context_window_size=None,
+        provider=None,
+        model=None,
+        request_semantics_digest=None,
+        input_snapshot_digest=None,
+        policy_ref=None,
+        policy_snapshot_digest=None,
+    )
+
+
+def not_applicable_runner_call_sizing_snapshot() -> RunnerCallSizingSnapshot:
+    """构造 compactor proposal 专用 not-applicable sizing snapshot。
+
+    :returns: value atoms 全为空的 not-applicable snapshot。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return RunnerCallSizingSnapshot(
+        status=RunnerCallSizingStatus.NOT_APPLICABLE,
+        reason=None,
+        sizing_stage=None,
+        estimator_id=None,
+        estimator_version=None,
+        estimator_digest=None,
+        conservative_input_tokens=None,
+        context_window_size=None,
+        provider=None,
+        model=None,
+        request_semantics_digest=None,
+        input_snapshot_digest=None,
+        policy_ref=None,
+        policy_snapshot_digest=None,
+    )
+
+
+def runner_call_sizing_snapshot_json(
+    snapshot: RunnerCallSizingSnapshot,
+) -> Mapping[str, JsonValue]:
+    """把 typed sizing snapshot 投影为 manifest v2 strict JSON。
+
+    :param snapshot: typed sizing snapshot。
+    :returns: 固定十四字段 JSON object。
+    :raises HostDurableError: snapshot 字段组合非法时抛出。
+    """
+
+    _validate_sizing_snapshot(snapshot, runner_call_kind=None)
+    return {
+        "status": snapshot.status.value,
+        "reason": None if snapshot.reason is None else snapshot.reason.value,
+        "sizing_stage": (
+            None
+            if snapshot.sizing_stage is None
+            else snapshot.sizing_stage.value
+        ),
+        "estimator_id": snapshot.estimator_id,
+        "estimator_version": snapshot.estimator_version,
+        "estimator_digest": snapshot.estimator_digest,
+        "conservative_input_tokens": snapshot.conservative_input_tokens,
+        "context_window_size": snapshot.context_window_size,
+        "provider": snapshot.provider,
+        "model": snapshot.model,
+        "request_semantics_digest": snapshot.request_semantics_digest,
+        "input_snapshot_digest": snapshot.input_snapshot_digest,
+        "policy_ref": snapshot.policy_ref,
+        "policy_snapshot_digest": snapshot.policy_snapshot_digest,
+    }
+
+
 def parse_runner_call_manifest(
     value: Mapping[str, JsonValue],
     *,
@@ -722,6 +945,7 @@ def parse_runner_call_manifest(
     message_entries = _parse_manifest_message_entries(value)
     projector_metadata = _parse_manifest_projector_metadata(value)
     source_refs = _parse_manifest_source_refs(value)
+    sizing_snapshot = _parse_sizing_snapshot(value)
     validation_status, diagnostic = _parse_manifest_diagnostic(value)
     compactor_identity = _parse_compactor_identity(value)
     manifest = RunnerCallInputManifest(
@@ -735,6 +959,7 @@ def parse_runner_call_manifest(
         source_refs=source_refs,
         projector_metadata=projector_metadata,
         compactor_identity=compactor_identity,
+        sizing_snapshot=sizing_snapshot,
         diagnostic=diagnostic,
     )
     _validate_manifest_graph(manifest)
@@ -1045,6 +1270,167 @@ def _parse_manifest_source_refs(
             "context_fallback_decision_ref",
         ),
     )
+
+
+def _parse_sizing_snapshot(
+    value: Mapping[str, JsonValue],
+) -> RunnerCallSizingSnapshot:
+    """解析 manifest v2 strict sizing snapshot。
+
+    :param value: manifest JSON object。
+    :returns: typed sizing snapshot。
+    :raises HostDurableError: 字段集、状态或 value atoms 非法时抛出。
+    """
+
+    raw_snapshot = value.get("sizing_snapshot")
+    snapshot_object = _required_object(
+        raw_snapshot,
+        field_name="sizing_snapshot",
+    )
+    _require_exact_fields(
+        snapshot_object,
+        expected_fields=_RUNNER_CALL_SIZING_FIELDS,
+        field_name="runner-call sizing snapshot",
+    )
+    status_text = _required_text(snapshot_object, "status")
+    try:
+        status = RunnerCallSizingStatus(status_text)
+    except ValueError as exc:
+        raise HostDurableError("runner-call sizing status is unsupported") from exc
+    reason_text = _optional_text(snapshot_object, "reason")
+    reason: RunnerCallSizingUnavailableReason | None = None
+    if reason_text is not None:
+        try:
+            reason = RunnerCallSizingUnavailableReason(reason_text)
+        except ValueError as exc:
+            raise HostDurableError(
+                "runner-call sizing unavailable reason is unsupported"
+            ) from exc
+    sizing_stage_text = _optional_text(snapshot_object, "sizing_stage")
+    sizing_stage: ContextSizingStage | None = None
+    if sizing_stage_text is not None:
+        try:
+            sizing_stage = ContextSizingStage(sizing_stage_text)
+        except ValueError as exc:
+            raise HostDurableError(
+                "runner-call sizing stage is unsupported"
+            ) from exc
+    snapshot = RunnerCallSizingSnapshot(
+        status=status,
+        reason=reason,
+        sizing_stage=sizing_stage,
+        estimator_id=_optional_text(snapshot_object, "estimator_id"),
+        estimator_version=_optional_text(snapshot_object, "estimator_version"),
+        estimator_digest=_optional_digest(snapshot_object, "estimator_digest"),
+        conservative_input_tokens=_optional_non_negative_int(
+            snapshot_object,
+            "conservative_input_tokens",
+        ),
+        context_window_size=_optional_positive_int(
+            snapshot_object,
+            "context_window_size",
+        ),
+        provider=_optional_text(snapshot_object, "provider"),
+        model=_optional_text(snapshot_object, "model"),
+        request_semantics_digest=_optional_digest(
+            snapshot_object,
+            "request_semantics_digest",
+        ),
+        input_snapshot_digest=_optional_digest(
+            snapshot_object,
+            "input_snapshot_digest",
+        ),
+        policy_ref=_optional_text(snapshot_object, "policy_ref"),
+        policy_snapshot_digest=_optional_digest(
+            snapshot_object,
+            "policy_snapshot_digest",
+        ),
+    )
+    runner_call_kind = _required_text(value, "runner_call_kind")
+    _validate_sizing_snapshot(snapshot, runner_call_kind=runner_call_kind)
+    return snapshot
+
+
+def _validate_sizing_snapshot(
+    snapshot: RunnerCallSizingSnapshot,
+    *,
+    runner_call_kind: str | None,
+) -> None:
+    """校验 manifest v2 sizing snapshot 的 closed state invariants。
+
+    :param snapshot: typed sizing snapshot。
+    :param runner_call_kind: manifest runner-call kind；builder 阶段未知时为
+        ``None``。
+    :returns: ``None``。
+    :raises HostDurableError: 状态、reason、范围或 kind 不变量非法时抛出。
+    """
+
+    if not isinstance(snapshot.status, RunnerCallSizingStatus):
+        raise HostDurableError("runner-call sizing status is invalid")
+    value_atoms = (
+        snapshot.estimator_id,
+        snapshot.estimator_version,
+        snapshot.estimator_digest,
+        snapshot.conservative_input_tokens,
+        snapshot.context_window_size,
+        snapshot.provider,
+        snapshot.model,
+        snapshot.request_semantics_digest,
+        snapshot.input_snapshot_digest,
+        snapshot.policy_ref,
+        snapshot.policy_snapshot_digest,
+    )
+    if snapshot.status is RunnerCallSizingStatus.COMPLETE:
+        if runner_call_kind == "compactor_proposal":
+            raise HostDurableError(
+                "compactor proposal sizing must be not_applicable"
+            )
+        if (
+            snapshot.reason is not None
+            or not isinstance(snapshot.sizing_stage, ContextSizingStage)
+            or any(atom is None for atom in value_atoms)
+        ):
+            raise HostDurableError(
+                "complete runner-call sizing snapshot is incomplete"
+            )
+        if (
+            snapshot.conservative_input_tokens is None
+            or snapshot.conservative_input_tokens > MAX_CONTEXT_TOKEN_COUNT
+        ):
+            raise HostDurableError(
+                "runner-call conservative_input_tokens is out of range"
+            )
+        if snapshot.context_window_size is None or snapshot.context_window_size <= 0:
+            raise HostDurableError(
+                "runner-call context_window_size must be positive"
+            )
+        return
+    if any(atom is not None for atom in value_atoms):
+        raise HostDurableError(
+            "non-complete runner-call sizing snapshot cannot carry value atoms"
+        )
+    if snapshot.status is RunnerCallSizingStatus.UNAVAILABLE:
+        if not isinstance(snapshot.reason, RunnerCallSizingUnavailableReason):
+            raise HostDurableError(
+                "unavailable runner-call sizing reason is required"
+            )
+        if not isinstance(snapshot.sizing_stage, ContextSizingStage):
+            raise HostDurableError(
+                "unavailable runner-call sizing stage is required"
+            )
+        if runner_call_kind == "compactor_proposal":
+            raise HostDurableError(
+                "compactor proposal sizing must be not_applicable"
+            )
+        return
+    if snapshot.reason is not None or snapshot.sizing_stage is not None:
+        raise HostDurableError(
+            "not-applicable runner-call sizing reason and stage must be null"
+        )
+    if runner_call_kind is not None and runner_call_kind != "compactor_proposal":
+        raise HostDurableError(
+            "not-applicable runner-call sizing requires compactor proposal"
+        )
 
 
 def _parse_manifest_diagnostic(
@@ -1685,6 +2071,25 @@ def _optional_non_negative_int(
     return item
 
 
+def _optional_positive_int(
+    value: Mapping[str, JsonValue], field_name: str
+) -> int | None:
+    """读取 JSON object 的可选正整数。
+
+    :param value: JSON object。
+    :param field_name: 字段名。
+    :returns: 正整数或 ``None``。
+    :raises HostDurableError: 字段存在但不是正整数时抛出。
+    """
+
+    item = value.get(field_name)
+    if item is None:
+        return None
+    if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+        raise HostDurableError(f"{field_name} must be positive integer")
+    return item
+
+
 def _optional_digest(
     value: Mapping[str, JsonValue], field_name: str
 ) -> str | None:
@@ -1772,9 +2177,12 @@ def _require_digest(value: str, *, field_name: str) -> None:
 
 
 __all__ = [
+    "complete_runner_call_sizing_snapshot",
     "complete_runner_call_hot_diagnostic",
+    "not_applicable_runner_call_sizing_snapshot",
     "parse_runner_call_hot_payload",
     "parse_runner_call_manifest",
+    "runner_call_sizing_snapshot_json",
     "runner_call_hot_diagnostic_from_json",
     "runner_call_hot_payload",
     "runner_call_projector_metadata_descriptor",
@@ -1785,4 +2193,8 @@ __all__ = [
     "RunnerCallMessageEntry",
     "RunnerCallProjectorMetadata",
     "RunnerCallProjectionDescriptor",
+    "RunnerCallSizingSnapshot",
+    "RunnerCallSizingStatus",
+    "RunnerCallSizingUnavailableReason",
+    "unavailable_runner_call_sizing_snapshot",
 ]

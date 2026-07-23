@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import json
 import multiprocessing
 from datetime import UTC, datetime
@@ -18,7 +19,7 @@ from dayu.host import (
     get_run,
 )
 from dayu.host.admission import PendingDispatchRecord, create_host_admission_service
-from dayu.host.command import create_host_command_handle, expire_wait, start_run
+from dayu.host.command import expire_wait, start_run
 from dayu.host.durable.state import (
     StateMutationStatus,
     WaitRecordStatus,
@@ -27,6 +28,11 @@ from dayu.host.durable.state import (
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 from dayu.host.waiting import ExpireWaitInput, _expire_wait_in_transaction
+from dayu.host.memory import default_memory_projection_policy
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 from tests.host.test_command_handle import _start_request
 from tests.host.test_resolve_wait_command import (
     _context,
@@ -38,6 +44,16 @@ from tests.host.test_resolve_wait_command import (
     _set_wait_deadline_text,
 )
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "wait-expiry-closeout"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 _EXPIRED_AT = datetime(2026, 5, 16, 2, 0, 0, tzinfo=UTC)
 
@@ -141,7 +157,7 @@ def test_expiry_helper_owns_failed_terminal_and_stable_replay(
 ) -> None:
     """helper 只消费 caller transaction，并以 durable boundary 稳定重放。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline_text(
@@ -215,17 +231,29 @@ def test_expiry_wakes_queue_only_after_commit_and_projection(
 ) -> None:
     """expiry terminal commit 后先交付 exact notice，再执行 projection。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     order: list[str] = []
     wakeup = _RecordingWakeup(order)
     projection = _RecordingProjection(order)
     terminal_port = _RecordingTerminalPort(order)
     host._terminal_post_commit_port = terminal_port
+    previous = host._admission_service
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
         terminal_post_commit_port=terminal_port,
+        payload_store=previous.payload_store,
+        event_log_store=previous.event_log_store,
+        idempotency_store=previous.idempotency_store,
+        clock=previous.clock,
+        id_factory=previous.id_factory,
         wakeup_port=wakeup,
         projection_catchup_port=projection,
+        ordinary_run_baseline=previous.ordinary_run_baseline,
+        tooling_options=previous.tooling_options,
+        context_budget_policy=previous.context_budget_policy,
+        memory_projection_policy=previous.memory_projection_policy,
+        enable_truncation_manager=previous.enable_truncation_manager,
+        owner_host_instance_id=previous.owner_host_instance_id,
     )
     try:
         seeded = _seed_waiting_run(host)
@@ -266,7 +294,7 @@ def test_result_cancel_expiry_multiprocess_first_committer_wins(
 ) -> None:
     """result、cancel、expiry 同 barrier 竞争时只有一个 terminal fact 获胜。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     seeded = _seed_waiting_run(host)
     _set_wait_deadline_text(
         host._transaction_runner(),
@@ -298,7 +326,7 @@ def test_result_cancel_expiry_multiprocess_first_committer_wins(
         process.join(10.0)
         assert process.exitcode == 0
 
-    reader = create_host_command_handle(_options(tmp_path))
+    reader = _create_execution_handle(_options(tmp_path))
     try:
         events = _events(reader._transaction_runner())
         terminal = tuple(
@@ -339,7 +367,7 @@ def _resolve_failed_worker(
 
     from dayu.host import resolve_wait
 
-    host = create_host_command_handle(_options(Path(root)))
+    host = _create_execution_handle(_options(Path(root)))
     try:
         barrier.wait(timeout=5.0)
         try:
@@ -359,7 +387,7 @@ def _cancel_worker(root: str, run_id: str, barrier: _BarrierPort) -> None:
     :returns: ``None``。
     """
 
-    host = create_host_command_handle(_options(Path(root)))
+    host = _create_execution_handle(_options(Path(root)))
     try:
         barrier.wait(timeout=5.0)
         try:
@@ -388,7 +416,7 @@ def _expire_worker(root: str, wait_id: str, barrier: _BarrierPort) -> None:
     :returns: ``None``。
     """
 
-    host = create_host_command_handle(_options(Path(root)))
+    host = _create_execution_handle(_options(Path(root)))
     try:
         barrier.wait(timeout=5.0)
         try:

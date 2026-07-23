@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import logging
 import math
 import inspect
@@ -22,7 +23,8 @@ from dayu.host import (
     resolve_wait,
 )
 from dayu.host.api import HostCommandHandleOptions
-from dayu.host.command import HostCommandHandle, create_host_command_handle, expire_wait
+from dayu.host.command import HostCommandHandle, expire_wait
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host._wait_observation import WaitObservationRunner
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordStatus
 from dayu.host.wait_adapter import (
@@ -52,7 +54,21 @@ from tests.host.test_resolve_wait_command import (
     _read_wait,
     _seed_waiting_run,
 )
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "wait-poller-runtime"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 _POLL_NOW = datetime(2026, 5, 16, 2, 0, 0, tzinfo=UTC)
 
 
@@ -224,7 +240,7 @@ class _HandlePollerFactory:
         :returns: wait poller。
         """
 
-        host = create_host_command_handle(self._options)
+        host = _create_execution_handle(self._options)
         poller = WaitPoller(
             transaction_runner=host._transaction_runner(),
             adapter_registry=self._adapter_registry,
@@ -571,8 +587,8 @@ def test_drain_once_for_test_processes_ready_and_not_ready(
 
     ready_options = _options(tmp_path / "ready")
     not_ready_options = _options(tmp_path / "not-ready")
-    ready_host = create_host_command_handle(ready_options)
-    not_ready_host = create_host_command_handle(not_ready_options)
+    ready_host = _create_execution_handle(ready_options)
+    not_ready_host = _create_execution_handle(not_ready_options)
     try:
         ready_seeded = _seed_waiting_run(ready_host)
         ready_adapter = _SequenceAdapter((_ready_result(),))
@@ -612,7 +628,7 @@ def test_background_loop_respects_durable_backoff(tmp_path: Path) -> None:
     """background loop 重复运行但会跳过未到期 durable backoff。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter((WaitPollNotReady(), WaitPollNotReady()))
@@ -635,7 +651,7 @@ def test_close_wakes_idle_sleep_promptly(tmp_path: Path) -> None:
     """close 会唤醒 idle sleep，不等待完整 poll interval。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         supervisor = _supervisor_without_wait(
             host, _SequenceAdapter((WaitPollNotReady(),)), options=options
@@ -661,7 +677,7 @@ def test_background_loop_uses_idle_interval_after_empty_round(tmp_path: Path) ->
     policy_values["poll_interval_seconds"] = 0.01
     policy_values["idle_poll_interval_seconds"] = 0.2
     policy = WaitPollerRuntimePolicy(**policy_values)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     supervisor: WaitPollerSupervisor | None = None
     try:
         supervisor = _supervisor_without_wait(
@@ -689,7 +705,7 @@ def test_wakeup_interrupts_idle_after_new_wait_is_created(tmp_path: Path) -> Non
     policy_values = _policy_kwargs()
     policy_values["idle_poll_interval_seconds"] = 0.5
     policy = WaitPollerRuntimePolicy(**policy_values)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     adapter = _SequenceAdapter((WaitPollNotReady(),))
     adapter_registry = WaitPollAdapterRegistry(
         (
@@ -736,7 +752,7 @@ def test_pure_poll_observes_ready_after_not_ready_policy_cadence(
     policy_values["idle_poll_interval_seconds"] = 0.5
     policy = WaitPollerRuntimePolicy(**policy_values)
     clock = _ManualClock()
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     supervisor: WaitPollerSupervisor | None = None
     try:
         seeded = _seed_waiting_run(host)
@@ -779,7 +795,7 @@ def test_background_loop_uses_not_ready_due_before_poll_interval(
     policy_values["not_ready_observe_interval_seconds"] = 0.01
     policy_values["idle_poll_interval_seconds"] = 0.5
     policy = WaitPollerRuntimePolicy(**policy_values)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     supervisor: WaitPollerSupervisor | None = None
     try:
         seeded = _seed_waiting_run(host)
@@ -814,7 +830,7 @@ def test_close_is_idempotent(tmp_path: Path) -> None:
     """close 可重复调用。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         supervisor = _supervisor_without_wait(
             host, _SequenceAdapter((WaitPollNotReady(),)), options=options
@@ -838,7 +854,7 @@ def test_close_before_resolve_skips_result_and_leaves_wait_retryable(
     """adapter 返回后 close gate 已关闭时跳过 resolve 并释放为 retryable。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         seeded = _seed_waiting_run(host)
         adapter = _BlockingReadyAdapter()
@@ -871,7 +887,7 @@ def test_close_drain_timeout_records_and_waits_for_inflight_poll(
     """close shared budget 到期后有界返回并保持 CLOSING。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         seeded = _seed_waiting_run(host)
         adapter = _BlockingReadyAdapter()
@@ -910,7 +926,7 @@ def test_close_with_finite_budget_after_inflight_release_has_no_timeout_diagnost
     """in-flight 已释放时 finite close budget 不产生 timeout diagnostic。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         seeded = _seed_waiting_run(host)
         adapter = _BlockingReadyAdapter()

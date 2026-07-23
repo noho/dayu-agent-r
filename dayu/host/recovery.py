@@ -20,6 +20,8 @@ from uuid import uuid4
 from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.liveness import HostInstanceRow, read_host_instance
 from dayu.host.durable.run_transition import (
     RunTransitionResult,
@@ -47,6 +49,18 @@ from dayu.host.durable.state import (
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host._runner_call_manifest import (
+    RunnerCallSizingSnapshot,
+    RunnerCallSizingStatus,
+    complete_runner_call_sizing_snapshot,
+    unavailable_runner_call_sizing_snapshot,
+)
+from dayu.host.context_budget import ContextSizingStage
+from dayu.host.run_input import (
+    PreparedRunnerCallSource,
+    load_prepared_runner_call_source_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+)
 from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
@@ -84,6 +98,10 @@ _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP = (
     "startup_recovery_dispatch_pending_follow_up"
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+class _StartupRecoveryStartRollback(HostDurableError):
+    """startup recovery manifest 写入后的 start CAS 失败回滚信号。"""
 
 
 class SessionAttachmentRecoveryDecision(StrEnum):
@@ -277,6 +295,7 @@ class SessionAttachmentRecoveryScanner:
     session_id: str
     transaction_runner: HostTransactionRunner
     event_log_store: EventLogStore
+    payload_store: PayloadStore
     terminal_post_commit_port: TerminalPostCommitPort
     process_probe: ProcessLivenessProbe = StdlibPidLivenessProbe()
     dispatch_wakeup_port: AdmissionWakeupPort | None = None
@@ -485,6 +504,7 @@ class SessionAttachmentRecoveryScanner:
                 run,
                 policy,
                 pending_dispatches,
+                terminal_notices,
             )
         if run.current_attempt_id is None:
             return _action(
@@ -629,6 +649,11 @@ class SessionAttachmentRecoveryScanner:
         recoverable = (
             run.status is RunStatus.RUNNING
             and _run_has_recoverable_facts(run, attempt, dispatch_record)
+            and self._has_recoverable_prepared_source(
+                transaction,
+                run=run,
+                attempt=attempt,
+            )
             and self.event_log_store.count_recovery_dispatches_for_run(
                 transaction, run_id=run.run_id
             )
@@ -695,6 +720,7 @@ class SessionAttachmentRecoveryScanner:
             result.run,
             policy,
             pending_dispatches,
+            terminal_notices,
         )
         if dispatch_action.decision is SessionAttachmentRecoveryDecision.INVALID_STATE:
             return _action(
@@ -704,12 +730,40 @@ class SessionAttachmentRecoveryScanner:
             )
         return dispatch_action
 
+    def _has_recoverable_prepared_source(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        attempt: AttemptRow,
+    ) -> bool:
+        """校验 active orphan 是否具备 startup exact replay source。
+
+        :param transaction: 当前 Host transaction。
+        :param run: active source Run。
+        :param attempt: source Attempt。
+        :returns: strict source candidate/sizing 完整时返回 ``True``。
+        """
+
+        try:
+            load_prepared_runner_call_source_in_transaction(
+                transaction,
+                self.event_log_store,
+                run_id=run.run_id,
+                attempt_id=attempt.attempt_id,
+                execution_id=attempt.execution_id,
+            )
+        except HostDurableError:
+            return False
+        return True
+
     def _start_recovery_dispatch_or_ready(
         self,
         transaction: HostTransaction,
         run: RunRow,
         policy: SessionAttachmentRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
+        terminal_notices: list[TerminalPostCommitNotice],
     ) -> SessionAttachmentRecoveryAction:
         """为 RECOVERING Run 创建新 Attempt 与 pending dispatch。
 
@@ -717,6 +771,7 @@ class SessionAttachmentRecoveryScanner:
         :param run: recovering Run row。
         :param policy: scan 策略。
         :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
+        :param terminal_notices: 当前 batch 的 exact terminal notices。
         :returns: startup recovery action。
         """
 
@@ -735,25 +790,65 @@ class SessionAttachmentRecoveryScanner:
                 SessionAttachmentRecoveryDecision.INVALID_STATE,
                 "recovering_run_missing_source_attempt",
             )
+        source_attempt = read_attempt_by_id(
+            transaction,
+            run.current_attempt_id,
+        )
+        if source_attempt is None:
+            return self._lose_unrecoverable_source(
+                transaction,
+                run,
+                policy,
+                terminal_notices,
+            )
+        try:
+            source = load_prepared_runner_call_source_in_transaction(
+                transaction,
+                self.event_log_store,
+                run_id=run.run_id,
+                attempt_id=source_attempt.attempt_id,
+                execution_id=source_attempt.execution_id,
+            )
+        except HostDurableError:
+            return self._lose_unrecoverable_source(
+                transaction,
+                run,
+                policy,
+                terminal_notices,
+            )
+        attempt_id = _new_id(_ATTEMPT_ID_PREFIX)
+        execution_id = _new_id(_EXECUTION_ID_PREFIX)
+        start_input = StartRecoveryRunInput(
+            run_id=run.run_id,
+            source_attempt_id=source_attempt.attempt_id,
+            run_started_event_id=_event_id("run-started-recovery"),
+            attempt_started_event_id=_event_id("attempt-started-recovery"),
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            dispatch_record_id=_new_id(_DISPATCH_RECORD_ID_PREFIX),
+            occurred_at=policy.now,
+            actor=_RECOVERY_ACTOR,
+            source=_RECOVERY_SOURCE,
+            worker_kind=WorkerKind.LOCAL,
+            owner_host_instance_id=self.recovery_owner_host_instance_id,
+            context_compacted_event_id=None,
+            context_compacted_event_sequence=None,
+        )
+        record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            self.event_log_store,
+            self.payload_store,
+            run=run,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            occurred_at=policy.now,
+            candidate=source.candidate,
+            sizing_snapshot=_startup_continuation_sizing(source),
+        )
         result = start_recovery_run_with_starting_attempt_in_transaction(
             transaction,
             self.event_log_store,
-            StartRecoveryRunInput(
-                run_id=run.run_id,
-                source_attempt_id=run.current_attempt_id,
-                run_started_event_id=_event_id("run-started-recovery"),
-                attempt_started_event_id=_event_id("attempt-started-recovery"),
-                attempt_id=_new_id(_ATTEMPT_ID_PREFIX),
-                execution_id=_new_id(_EXECUTION_ID_PREFIX),
-                dispatch_record_id=_new_id(_DISPATCH_RECORD_ID_PREFIX),
-                occurred_at=policy.now,
-                actor=_RECOVERY_ACTOR,
-                source=_RECOVERY_SOURCE,
-                worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=self.recovery_owner_host_instance_id,
-                context_compacted_event_id=None,
-                context_compacted_event_sequence=None,
-            ),
+            start_input,
         )
         if (
             result.status is StateMutationStatus.UPDATED
@@ -762,12 +857,136 @@ class SessionAttachmentRecoveryScanner:
             and result.dispatch_record is not None
         ):
             pending_dispatches.append(_pending_dispatch_from_transition(result))
+        elif result.status in (
+            StateMutationStatus.NOT_FOUND,
+            StateMutationStatus.INVALID_STATE,
+        ):
+            raise _StartupRecoveryStartRollback(
+                "startup recovery start precondition changed"
+            )
         return _action_from_mutation(
             run,
             result.status,
             SessionAttachmentRecoveryDecision.RECOVERY_DISPATCHED,
             RunStartReason.RECOVERY.value,
         )
+
+    def _lose_unrecoverable_source(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+        policy: SessionAttachmentRecoveryPolicy,
+        terminal_notices: list[TerminalPostCommitNotice],
+    ) -> SessionAttachmentRecoveryAction:
+        """用 existing startup owner 收口损坏的 recovering source。
+
+        :param transaction: 当前 Host transaction。
+        :param run: recovering Run。
+        :param policy: startup recovery policy。
+        :param terminal_notices: 当前 batch 的 exact terminal notices。
+        :returns: 对应 LOST/CAS action。
+        """
+
+        if run.current_attempt_id is None:
+            return _action(
+                run,
+                SessionAttachmentRecoveryDecision.INVALID_STATE,
+                "recovering_run_missing_source_attempt",
+            )
+        result = lose_recovering_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            StartupRecoveringLostInput(
+                run_id=run.run_id,
+                source_attempt_id=run.current_attempt_id,
+                run_lost_event_id=_event_id("run-lost-recovering"),
+                occurred_at=policy.now,
+                actor=_RECOVERY_ACTOR,
+                source=_RECOVERY_SOURCE,
+                reason=_REASON_UNRECOVERABLE_FACTS,
+                recovery_dispatch_count=(
+                    self.event_log_store.count_recovery_dispatches_for_run(
+                        transaction,
+                        run_id=run.run_id,
+                    )
+                ),
+                recovery_dispatch_limit=policy.recovery_dispatch_limit,
+            ),
+        )
+        if (
+            result.status is StateMutationStatus.UPDATED
+            and result.run is not None
+            and result.run_event is not None
+        ):
+            terminal_notices.append(
+                project_terminal_notice_from_exact_run_event(
+                    result.run,
+                    result.run_event,
+                    wake_queue_promotion=True,
+                )
+            )
+        return _action_from_mutation(
+            run,
+            result.status,
+            SessionAttachmentRecoveryDecision.RUN_LOST,
+            _REASON_UNRECOVERABLE_FACTS,
+        )
+
+
+def _startup_continuation_sizing(
+    source: PreparedRunnerCallSource,
+) -> RunnerCallSizingSnapshot:
+    """复制 startup source sizing atoms并重绑定 continuation stage。
+
+    :param source: strict prepared runner-call source。
+    :returns: 不重估、不读取当前配置的 continuation sizing snapshot。
+    :raises HostDurableError: source sizing 状态或 atoms 非法时抛出。
+    """
+
+    sizing = source.manifest.sizing_snapshot
+    if sizing.status is RunnerCallSizingStatus.UNAVAILABLE:
+        if sizing.reason is None:
+            raise HostDurableError(
+                "startup source unavailable sizing reason is missing"
+            )
+        return unavailable_runner_call_sizing_snapshot(
+            sizing.reason,
+            sizing_stage=ContextSizingStage.CONTINUATION,
+        )
+    if sizing.status is not RunnerCallSizingStatus.COMPLETE:
+        raise HostDurableError(
+            "startup source sizing is not replayable"
+        )
+    if (
+        sizing.estimator_id is None
+        or sizing.estimator_version is None
+        or sizing.estimator_digest is None
+        or sizing.context_window_size is None
+        or sizing.provider is None
+        or sizing.model is None
+        or sizing.request_semantics_digest is None
+        or sizing.input_snapshot_digest is None
+        or sizing.policy_ref is None
+        or sizing.policy_snapshot_digest is None
+        or sizing.conservative_input_tokens is None
+    ):
+        raise HostDurableError(
+            "startup source complete sizing atoms are incomplete"
+        )
+    return complete_runner_call_sizing_snapshot(
+        sizing_stage=ContextSizingStage.CONTINUATION,
+        estimator_id=sizing.estimator_id,
+        estimator_version=sizing.estimator_version,
+        estimator_digest=sizing.estimator_digest,
+        conservative_input_tokens=sizing.conservative_input_tokens,
+        context_window_size=sizing.context_window_size,
+        provider=sizing.provider,
+        model=sizing.model,
+        request_semantics_digest=sizing.request_semantics_digest,
+        input_snapshot_digest=sizing.input_snapshot_digest,
+        policy_ref=sizing.policy_ref,
+        policy_snapshot_digest=sizing.policy_snapshot_digest,
+    )
 
 
 def _validate_policy(policy: SessionAttachmentRecoveryPolicy) -> None:

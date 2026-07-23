@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from functools import partial
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from dayu.host import (
 )
 from dayu.host.api import HostInput
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
-from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.command import HostCommandHandle, start_run
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.durable.liveness import (
@@ -49,6 +50,11 @@ from dayu.host.durable.state import (
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.memory import default_memory_projection_policy
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
@@ -56,6 +62,16 @@ _EVENT_COUNT_READ_LIMIT = 1000
 _EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
 _EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "public-cancel-session-runs"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -488,7 +504,7 @@ def test_cancel_session_runs_cancels_queued_and_predispatch_subset(
     """cancel_session_runs 一次取消同 Session 多个 queued 与 pre-dispatch active。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         other_session_id = _session_id(host, "slot-b")
@@ -517,7 +533,7 @@ def test_cancel_session_runs_idempotent_replay_does_not_cancel_new_run(
     """同 key 重放不取消首次操作后新接受的 Run。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
@@ -540,7 +556,7 @@ def test_cancel_run_recovering_appends_no_attempt_terminal(
     """cancel_run 取消 RECOVERING Run 时不追加 Attempt terminal fact。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         run = start_run(host, _start_request(session_id, "start-recovering"))
@@ -577,7 +593,7 @@ def test_cancel_run_recovering_replay_is_idempotent_per_run_id(
     """cancel_run 取消 RECOVERING Run 时按 run_id 隔离幂等重放。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         peer_session_id = _session_id(host, "slot-b")
@@ -630,7 +646,7 @@ def test_cancel_session_runs_includes_recovering_without_fail_closed(
     """session-scope cancel 覆盖 RECOVERING 且不会阻断同批 queued Run。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         recovering = start_run(host, _start_request(session_id, "start-active"))
@@ -662,7 +678,7 @@ def test_cancel_session_runs_cancels_queued_and_active_worker(
     """cancel_session_runs 支持 queued 与 active worker 子集。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
@@ -698,7 +714,7 @@ def test_cancel_session_runs_active_replay_does_not_append_facts(
     """active session cancel replay 不重复追加 CANCEL_REQUESTED / RUN_CANCELLING。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
@@ -733,7 +749,7 @@ def test_cancel_session_runs_no_supported_run_records_idempotency_without_event(
     """没有 supported non-terminal Run 时只记录幂等结果，不追加 cancel fact。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         before_cancel = _event_count(host)

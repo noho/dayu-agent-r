@@ -38,6 +38,7 @@ _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
 _FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
 _FIELD_SCHEMA_VERSION = "schema_version"
 _FIELD_SESSION_SUMMARY = "session_summary"
 _FIELD_SUMMARY_TEXT = "summary_text"
@@ -99,12 +100,16 @@ class ContextCompactedSemanticPayload:
     :param accepted_candidate_digest: candidate canonical digest。
     :param accepted_evidence_mapping_refs: candidate 绑定的 accepted evidence refs。
     :param compact_artifact_ref: compact artifact ref。
+    :param current_input_ref: 本次 compact 所属 current input boundary ref。
+    :param compacted_source_refs: 本次 accepted compact 覆盖的 canonical source refs。
     """
 
     accepted_candidate: ConversationCompactOutputVNext
     accepted_candidate_digest: str
     accepted_evidence_mapping_refs: tuple[str, ...]
     compact_artifact_ref: str
+    current_input_ref: str
+    compacted_source_refs: tuple[str, ...]
 
     def __post_init__(self) -> None:
         """校验 typed semantic view 的内部一致性。
@@ -128,6 +133,20 @@ class ContextCompactedSemanticPayload:
             self.compact_artifact_ref,
             field_name=_FIELD_COMPACT_ARTIFACT_REF,
         )
+        _require_runtime_text(
+            self.current_input_ref,
+            field_name="current_input_ref",
+        )
+        _require_runtime_text_tuple(
+            self.compacted_source_refs,
+            field_name="compacted_source_refs",
+        )
+        source_boundary_refs = (
+            self.current_input_ref,
+            *self.compacted_source_refs,
+        )
+        if len(frozenset(source_boundary_refs)) != len(source_boundary_refs):
+            raise ValueError("compact source boundary refs must be unique")
 
 
 def parse_context_compacted_semantic_payload(
@@ -143,6 +162,11 @@ def parse_context_compacted_semantic_payload(
     candidate_mapping = _required_mapping(payload, _FIELD_ACCEPTED_CANDIDATE)
     candidate = _parse_persisted_candidate(candidate_mapping)
     candidate_digest = _required_text(payload, _FIELD_ACCEPTED_CANDIDATE_DIGEST)
+    source_refs = _required_unique_text_list(
+        payload,
+        _FIELD_SOURCE_BOUNDARY_REFS,
+        path=_FIELD_SOURCE_BOUNDARY_REFS,
+    )
     return ContextCompactedSemanticPayload(
         accepted_candidate=candidate,
         accepted_candidate_digest=candidate_digest,
@@ -152,6 +176,8 @@ def parse_context_compacted_semantic_payload(
             path=_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
         ),
         compact_artifact_ref=_required_text(payload, _FIELD_COMPACT_ARTIFACT_REF),
+        current_input_ref=source_refs[0],
+        compacted_source_refs=source_refs[1:],
     )
 
 

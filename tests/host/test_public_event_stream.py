@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from functools import partial
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,7 +26,7 @@ from dayu.host import (
 )
 from dayu.host.api import HostInput
 from dayu.host.api import HostCommandHandleOptions, HostEventView, StartRunRequest
-from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.command import HostCommandHandle, start_run
 from dayu.host.read_api import stream_run_events
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
@@ -40,10 +41,25 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.read_api import _event_view_from_row
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
 _PROJECTION_CONSUMER_ID = "phase8-stream-boundary"
 _PROJECTION_TEST_NOW = "2026-05-16T00:00:00Z"
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "public-event-stream"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -76,7 +92,7 @@ def _open_handle(tmp_path: Path) -> HostCommandHandle:
     :returns: Host command handle。
     """
 
-    return create_host_command_handle(_options(tmp_path))
+    return _create_execution_handle(_options(tmp_path))
 
 
 def test_event_view_mapping_covers_current_event_classes() -> None:
@@ -577,7 +593,7 @@ def test_stream_run_events_returns_only_target_run_events(
     """stream_run_events 只返回目标 Run 的 EventLog rows。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         target_session_id = _session_id(host, "target")
         other_session_id = _session_id(host, "other")
@@ -607,7 +623,7 @@ def test_stream_run_events_exposes_event_class_for_preview_rows(
     """stream_run_events 必须暴露 EventLog row 的 public event class。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "target")
         target = start_run(host, _start_request(session_id, "target-run"))
@@ -666,7 +682,7 @@ def test_stream_run_events_ignores_projection_checkpoint_lag(
     """projection checkpoint 落后 EventLog 时 stream 仍按 EventLog cursor 补读。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         target_session_id = _session_id(host, "target")
         other_session_id = _session_id(host, "other")
@@ -705,7 +721,7 @@ def test_stream_run_events_ignores_projection_failure_row(
     """projection failure row 存在时 stream 仍返回 EventLog rows 与正确 cursor。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         target_session_id = _session_id(host, "target")
         other_session_id = _session_id(host, "other")
@@ -740,7 +756,7 @@ def test_stream_run_events_ignores_missing_minimal_read_model(
     """minimal read model 缺失时 stream 仍只读取 EventLog truth。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "target")
         target = start_run(host, _start_request(session_id, "target-run"))
@@ -770,7 +786,7 @@ def test_stream_run_events_does_not_write_projection_tables(
     """stream_run_events 不推进 checkpoint、不修复 failure、不写 projection 表。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "target")
         target = start_run(host, _start_request(session_id, "target-run"))
@@ -804,7 +820,7 @@ def test_stream_run_events_advances_cursor_for_unrelated_scanned_rows(
     """扫描窗口只有无关事件时返回空 events 但推进 next_cursor。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         target_session_id = _session_id(host, "target")
         other_session_id = _session_id(host, "other")
@@ -831,7 +847,7 @@ def test_stream_run_events_no_scanned_rows_returns_input_cursor(
     """没有 EventLog row 被扫描时 next_cursor 等于输入 cursor。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host, "target")
         target = start_run(host, _start_request(session_id, "target-run"))
@@ -906,7 +922,7 @@ def test_stream_run_events_default_limit_is_scan_window(
     """limit=None 使用 HOST_EVENT_STREAM_DEFAULT_LIMIT 作为扫描窗口。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         target_session_id = _session_id(host, "target")
         target = start_run(host, _start_request(target_session_id, "target-run"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from functools import partial
 import sqlite3
 from pathlib import Path
 from typing import cast
@@ -52,16 +53,29 @@ from dayu.host.api import (
     StartRunRequest,
 )
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.read_api import stream_run_events
 from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
+)
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
 )
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "dayu.fins",
     "dayu.service",
     "dayu.ui",
+)
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline("command-handle"),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
 )
 
 
@@ -670,7 +684,7 @@ def test_standalone_factory_delivers_exact_terminal_notice_after_commit(
         "_NoLocalDeliveryTerminalPostCommitPort",
         lambda: terminal_port,
     )
-    command_handle = create_host_command_handle(options)
+    command_handle = _create_execution_handle(options)
     try:
         session = ensure_session(command_handle, _ensure_request())
         started = start_run(
@@ -759,7 +773,7 @@ def test_session_and_read_facades_fail_closed_before_durable(
     """关闭后 session/read public facade 先返回 lifecycle 错误。"""
 
     options = _options(tmp_path)
-    command_handle = create_host_command_handle(options)
+    command_handle = _create_execution_handle(options)
     session_id = ensure_session(command_handle, _ensure_request()).session_id
     run = start_run(command_handle, _start_request(session_id, "start-open"))
     before_events = _event_count(options.db_path)
@@ -812,7 +826,7 @@ def test_admission_backed_facades_fail_closed_before_public_branches(
     """
 
     options = _options(tmp_path)
-    command_handle = create_host_command_handle(options)
+    command_handle = _create_execution_handle(options)
     session_id = ensure_session(command_handle, _ensure_request()).session_id
     active = start_run(command_handle, _start_request(session_id, "start-open"))
     before_events = _event_count(options.db_path)
@@ -870,7 +884,7 @@ def test_deferred_public_facades_fail_closed_before_unsupported(
     """关闭后 deferred public facade 先返回 handle lifecycle 错误。"""
 
     options = _options(tmp_path)
-    command_handle = create_host_command_handle(options)
+    command_handle = _create_execution_handle(options)
     session_id = ensure_session(command_handle, _ensure_request()).session_id
     run = start_run(command_handle, _start_request(session_id, "start-open"))
     before_events = _event_count(options.db_path)

@@ -77,13 +77,11 @@ from dayu.host.durable.state import (
     mark_dispatch_worker_accepted_row,
     mark_running_run_recovering_row,
     mark_run_cancelling_row,
-    promote_queued_run_row,
     read_active_run_for_session,
     read_active_wait_records_for_run,
     read_attempt_by_id,
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
-    read_earliest_queued_run,
     read_owned_attempt_cancel_candidates,
     read_run_by_id,
     read_wait_record_by_id,
@@ -125,15 +123,6 @@ _CANCEL_REQUESTED_PAYLOAD_FIELDS = frozenset(
         "call_context_digest",
     }
 )
-
-
-class PromotionSkipReason(StrEnum):
-    """queue promotion 跳过原因文本常量。"""
-
-    NO_QUEUED_RUN = "no_queued_run"
-    ACTIVE_RUN_EXISTS = "active_run_exists"
-    CAS_LOST_OR_NO_LONGER_ELIGIBLE = "cas_lost_or_no_longer_eligible"
-    DELEGATED_TO_GOVERNANCE = "delegated_to_governance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,36 +340,6 @@ class FailUnstartedRunInput:
     reason: str
     error_code: str
     message: str
-
-
-@dataclass(frozen=True, slots=True)
-class PromoteQueuedRunInput:
-    """promotion 最早 queued Run 的输入。
-
-    :param session_id: 目标 Session id。
-    :param run_started_event_id: 调用方生成的 ``RUN_STARTED`` event id。
-    :param attempt_started_event_id: 调用方生成的 ``ATTEMPT_STARTED`` event id。
-    :param attempt_id: 调用方生成的 Attempt id。
-    :param execution_id: 调用方生成的 execution id。
-    :param dispatch_record_id: 调用方生成的 dispatch record id。
-    :param occurred_at: canonical facts 的发生时间。
-    :param actor: 事件 actor。
-    :param source: 事件 source。
-    :param worker_kind: worker 类型。
-    :param owner_host_instance_id: owner Host instance id；Phase 3 可为 ``None``。
-    """
-
-    session_id: str
-    run_started_event_id: str
-    attempt_started_event_id: str
-    attempt_id: str
-    execution_id: str
-    dispatch_record_id: str
-    occurred_at: datetime
-    actor: str
-    source: str
-    worker_kind: WorkerKind
-    owner_host_instance_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,24 +968,6 @@ def project_terminal_notice_from_exact_run_event(
         terminal_event_sequence=exact_run_event.event_sequence,
         wake_queue_promotion=wake_queue_promotion,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class PromotionResult:
-    """queued Run promotion 结果。
-
-    :param status: mutation 结果分类。
-    :param promoted_run: 成功 promotion 的 Run row。
-    :param attempt: 新建 Attempt row。
-    :param dispatch_record: 新建 dispatch record row。
-    :param skip_reason: 未 promotion 时的跳过原因。
-    """
-
-    status: StateMutationStatus
-    promoted_run: RunRow | None
-    attempt: AttemptRow | None
-    dispatch_record: DispatchRecordRow | None
-    skip_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1778,88 +1719,6 @@ def fail_recovering_run_in_transaction(
             transaction, request.source_attempt_id
         ),
         run_event=failed_event,
-    )
-
-
-def promote_queued_run_in_transaction(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    request: PromoteQueuedRunInput,
-) -> PromotionResult:
-    """将最早 queued Run promotion 为 running 并创建 STARTING Attempt。
-
-    :param transaction: 调用方提供的 Host transaction。
-    :param event_log_store: EventLog append primitive。
-    :param request: promotion 输入。
-    :returns: promotion 结果，未满足前置条件时返回 skip reason。
-    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
-    """
-
-    _validate_promote_input(request)
-    if read_active_run_for_session(transaction, request.session_id) is not None:
-        return PromotionResult(
-            status=StateMutationStatus.INVALID_STATE,
-            promoted_run=None,
-            attempt=None,
-            dispatch_record=None,
-            skip_reason=PromotionSkipReason.ACTIVE_RUN_EXISTS,
-        )
-    queued = read_earliest_queued_run(transaction, request.session_id)
-    if queued is None:
-        return PromotionResult(
-            status=StateMutationStatus.NOT_FOUND,
-            promoted_run=None,
-            attempt=None,
-            dispatch_record=None,
-            skip_reason=PromotionSkipReason.NO_QUEUED_RUN,
-        )
-
-    started_event = event_log_store.append_event(
-        transaction, _promotion_run_started_event_request(request, queued)
-    ).row
-    promoted = promote_queued_run_row(
-        transaction,
-        session_id=request.session_id,
-        run_id=queued.run_id,
-        started_event_id=started_event.event_id,
-        started_event_sequence=started_event.event_sequence,
-        current_attempt_id=request.attempt_id,
-        updated_at=format_utc_timestamp(request.occurred_at),
-    )
-    promoted = _require_run_mutation_updated(
-        promoted,
-        mutation_name="promote queued Run",
-    )
-
-    attempt_started_event = event_log_store.append_event(
-        transaction, _promotion_attempt_started_event_request(request, queued)
-    ).row
-    created_at = format_utc_timestamp(request.occurred_at)
-    attempt = _promotion_attempt_row(
-        request=request,
-        run_id=queued.run_id,
-        started_event_id=attempt_started_event.event_id,
-        started_event_sequence=attempt_started_event.event_sequence,
-        created_at=created_at,
-    )
-    dispatch_record = _promotion_dispatch_record_row(
-        request=request,
-        run_id=queued.run_id,
-        execution_target=queued.execution_target,
-        created_event_id=attempt_started_event.event_id,
-        created_event_sequence=attempt_started_event.event_sequence,
-        created_at=created_at,
-    )
-    insert_attempt(transaction, attempt)
-    insert_dispatch_record(transaction, dispatch_record)
-    return PromotionResult(
-        status=StateMutationStatus.UPDATED,
-        promoted_run=read_run_by_id(transaction, queued.run_id),
-        attempt=read_attempt_by_id(transaction, request.attempt_id),
-        dispatch_record=read_dispatch_record_by_attempt_id(
-            transaction, request.attempt_id
-        ),
-        skip_reason=None,
     )
 
 
@@ -3579,82 +3438,6 @@ def _attempt_started_event_request(
     )
 
 
-def _promotion_run_started_event_request(
-    request: PromoteQueuedRunInput, queued: RunRow
-) -> EventLogAppendRequest:
-    """构造 promotion ``RUN_STARTED`` EventLog append request。
-
-    :param request: promotion 输入。
-    :param queued: 被 promotion 的 queued Run row。
-    :returns: EventLog append request。
-    """
-
-    return EventLogAppendRequest(
-        event_id=request.run_started_event_id,
-        event_class=EventClass.CANONICAL_FACT,
-        session_id=request.session_id,
-        run_id=queued.run_id,
-        attempt_id=None,
-        execution_id=None,
-        event_type=_EVENT_TYPE_RUN_STARTED,
-        occurred_at=request.occurred_at,
-        actor=request.actor,
-        source=request.source,
-        client_request_id=None,
-        idempotency_key=None,
-        policy_decision=None,
-        reason={"start_reason": RunStartReason.QUEUE_PROMOTION.value},
-        payload_json={
-            "run_id": queued.run_id,
-            "start_reason": RunStartReason.QUEUE_PROMOTION.value,
-            "accepted_event_id": queued.accepted_event_id,
-            "accepted_event_sequence": queued.accepted_event_sequence,
-            "attempt_id": request.attempt_id,
-            "dispatch_record_id": request.dispatch_record_id,
-        },
-        payload_ref=None,
-        payload_digest=None,
-    )
-
-
-def _promotion_attempt_started_event_request(
-    request: PromoteQueuedRunInput, queued: RunRow
-) -> EventLogAppendRequest:
-    """构造 promotion ``ATTEMPT_STARTED`` EventLog append request。
-
-    :param request: promotion 输入。
-    :param queued: 被 promotion 的 queued Run row。
-    :returns: EventLog append request。
-    """
-
-    return EventLogAppendRequest(
-        event_id=request.attempt_started_event_id,
-        event_class=EventClass.CANONICAL_FACT,
-        session_id=request.session_id,
-        run_id=queued.run_id,
-        attempt_id=request.attempt_id,
-        execution_id=request.execution_id,
-        event_type=_EVENT_TYPE_ATTEMPT_STARTED,
-        occurred_at=request.occurred_at,
-        actor=request.actor,
-        source=request.source,
-        client_request_id=None,
-        idempotency_key=None,
-        policy_decision=None,
-        reason=None,
-        payload_json={
-            "attempt_id": request.attempt_id,
-            "execution_id": request.execution_id,
-            "dispatch_record_id": request.dispatch_record_id,
-            "worker_kind": request.worker_kind.value,
-            "execution_target": queued.execution_target,
-            "owner_host_instance_id": request.owner_host_instance_id,
-        },
-        payload_ref=None,
-        payload_digest=None,
-    )
-
-
 def _governed_run_started_event_request(
     request: StartGovernedRunInput, run: RunRow
 ) -> EventLogAppendRequest:
@@ -5145,87 +4928,6 @@ def _pending_dispatch_record_row(
     )
 
 
-def _promotion_attempt_row(
-    *,
-    request: PromoteQueuedRunInput,
-    run_id: str,
-    started_event_id: str,
-    started_event_sequence: int,
-    created_at: str,
-) -> AttemptRow:
-    """构造 promotion STARTING Attempt row。
-
-    :param request: promotion 输入。
-    :param run_id: 被 promotion 的 Run id。
-    :param started_event_id: ATTEMPT_STARTED event id。
-    :param started_event_sequence: ATTEMPT_STARTED event sequence。
-    :param created_at: 创建 timestamp。
-    :returns: Attempt row。
-    """
-
-    return AttemptRow(
-        attempt_id=request.attempt_id,
-        run_id=run_id,
-        execution_id=request.execution_id,
-        status=AttemptStatus.STARTING,
-        started_event_id=started_event_id,
-        started_event_sequence=started_event_sequence,
-        terminal_event_id=None,
-        terminal_event_sequence=None,
-        created_at=created_at,
-        updated_at=created_at,
-        terminal_at=None,
-    )
-
-
-def _promotion_dispatch_record_row(
-    *,
-    request: PromoteQueuedRunInput,
-    run_id: str,
-    execution_target: str,
-    created_event_id: str,
-    created_event_sequence: int,
-    created_at: str,
-) -> DispatchRecordRow:
-    """构造 promotion pending dispatch record row。
-
-    :param request: promotion 输入。
-    :param run_id: 被 promotion 的 Run id。
-    :param execution_target: Run 持久化的 execution target。
-    :param created_event_id: ATTEMPT_STARTED event id。
-    :param created_event_sequence: ATTEMPT_STARTED event sequence。
-    :param created_at: 创建 timestamp。
-    :returns: dispatch record row。
-    """
-
-    return DispatchRecordRow(
-        dispatch_record_id=request.dispatch_record_id,
-        run_id=run_id,
-        attempt_id=request.attempt_id,
-        execution_id=request.execution_id,
-        status=DispatchRecordStatus.PENDING,
-        worker_kind=request.worker_kind,
-        execution_target=execution_target,
-        owner_host_instance_id=request.owner_host_instance_id,
-        created_event_id=created_event_id,
-        created_event_sequence=created_event_sequence,
-        waiting_for_lane_at=None,
-        lane_name=None,
-        lane_claim_id=None,
-        lane_owner_id=None,
-        lane_acquired_at=None,
-        dispatching_at=None,
-        worker_accepted_at=None,
-        worker_accept_event_id=None,
-        worker_accept_event_sequence=None,
-        cancelled_event_id=None,
-        cancelled_event_sequence=None,
-        created_at=created_at,
-        updated_at=created_at,
-        cancelled_at=None,
-    )
-
-
 def _governed_attempt_row(
     *,
     request: StartGovernedRunInput,
@@ -6484,33 +6186,6 @@ def _validate_common_create_input(
     if not isinstance(queue_policy, RunQueuePolicy):
         raise HostDurableError("queue_policy is invalid")
     _require_sha256_digest(call_context_digest, field_name="call_context_digest")
-
-
-def _validate_promote_input(request: PromoteQueuedRunInput) -> None:
-    """校验 promotion 输入。
-
-    :param request: promotion 输入。
-    :returns: ``None``。
-    :raises HostDurableError: 任一字段无效时抛出。
-    """
-
-    _require_non_empty_text(request.session_id, field_name="session_id")
-    _require_non_empty_text(
-        request.run_started_event_id, field_name="run_started_event_id"
-    )
-    _require_non_empty_text(
-        request.attempt_started_event_id, field_name="attempt_started_event_id"
-    )
-    _require_non_empty_text(request.attempt_id, field_name="attempt_id")
-    _require_non_empty_text(request.execution_id, field_name="execution_id")
-    _require_non_empty_text(request.dispatch_record_id, field_name="dispatch_record_id")
-    _require_non_empty_text(request.actor, field_name="actor")
-    _require_non_empty_text(request.source, field_name="source")
-    if not isinstance(request.worker_kind, WorkerKind):
-        raise ValueError("worker_kind is invalid")
-    _require_optional_non_empty_text(
-        request.owner_host_instance_id, field_name="owner_host_instance_id"
-    )
 
 
 def _validate_resume_waiting_input(request: ResumeRunFromWaitingInput) -> None:

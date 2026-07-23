@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import logging
 from dataclasses import fields
 from datetime import UTC, datetime
@@ -26,7 +27,6 @@ from dayu.host import (
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import (
     HostCommandHandle,
-    create_host_command_handle,
     expire_wait,
 )
 from dayu.host.durable.codec import (
@@ -60,7 +60,12 @@ from dayu.host.wait_adapter import (
     WaitResolvePort,
 )
 from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
+from dayu.host.memory import default_memory_projection_policy
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 from tests.host.test_resolve_wait_command import (
     _context,
     _options,
@@ -68,6 +73,16 @@ from tests.host.test_resolve_wait_command import (
     _seed_waiting_run,
 )
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "wait-adapter-polling"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 _POLL_NOW = datetime(2026, 5, 16, 2, 0, 0, tzinfo=UTC)
 
 
@@ -489,7 +504,7 @@ class _AbandonClaimStealingAdapter:
                 ),
             )
 
-        thread_host = create_host_command_handle(self._options)
+        thread_host = _create_execution_handle(self._options)
         try:
             thread_host._transaction_runner().run_write(operation)
         finally:
@@ -549,7 +564,7 @@ class _AbandonAlreadyMarkedAdapter:
                 ("2026-05-16T02:00:01.000000Z", self._wait_id),
             )
 
-        thread_host = create_host_command_handle(self._options)
+        thread_host = _create_execution_handle(self._options)
         try:
             thread_host._transaction_runner().run_write(operation)
         finally:
@@ -625,7 +640,7 @@ def test_poll_adapter_ready_result_resolves_wait(
 ) -> None:
     """poll adapter ready 结果通过 resolve_wait 恢复 Run。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter(
@@ -655,7 +670,7 @@ def test_poll_adapter_ready_result_logs_status_chain_without_payload(
 ) -> None:
     """poller 在正常 ready 路径输出排障状态链且不记录结果正文。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter(
@@ -696,7 +711,7 @@ def test_poll_adapter_not_ready_leaves_wait_active(
 ) -> None:
     """poll adapter not-ready 不调用 resolve_wait，并安排短间隔复查。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter((WaitPollNotReady(),))
@@ -720,7 +735,7 @@ def test_poll_adapter_not_ready_leaves_wait_active(
 def test_poll_adapter_receives_minimal_host_snapshot(tmp_path: Path) -> None:
     """poll adapter 只能收到 Host 投影的三字段 snapshot。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SnapshotRecordingAdapter()
@@ -771,7 +786,7 @@ def test_poll_adapter_snapshot_projection_failure_releases_with_backoff(
 ) -> None:
     """非法 Host durable snapshot 字段必须在 adapter 调用前 fail closed。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_field_text(host, seeded.wait_id, field_name, field_value)
@@ -804,7 +819,7 @@ def test_abandon_adapter_snapshot_projection_failure_releases_with_backoff(
 ) -> None:
     """cancelled wait 的非法 snapshot 字段不得进入 abandon adapter。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -838,7 +853,7 @@ def test_poll_adapter_empty_round_does_not_log_poll_summary(
 ) -> None:
     """poller 无可处理 wait 时不刷逐轮空摘要日志。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         poller = WaitPoller(
             transaction_runner=host._transaction_runner(),
@@ -864,7 +879,7 @@ def test_poll_adapter_lost_result_closes_run(
 ) -> None:
     """poll adapter lost 结果通过 resolve_wait 收口 Run。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter(
@@ -910,7 +925,7 @@ def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
 ) -> None:
     """cancelled poll wait durable abandon 后新 poller 不重复 abandon。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -955,7 +970,7 @@ def test_cancelled_poll_wait_unsupported_marks_terminal_without_resolve(
 ) -> None:
     """unsupported lifecycle result 写入 terminal diagnostic 且不调用 resolve_wait。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -996,7 +1011,7 @@ def test_cancelled_poll_wait_noop_marks_terminal_without_resolve(
 ) -> None:
     """noop lifecycle result 写入 terminal diagnostic 且不调用 resolve_wait。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1037,7 +1052,7 @@ def test_cancelled_abandon_success_marks_abandoned_when_close_gate_closes(
 ) -> None:
     """abandon 外部成功后 close gate 关闭也必须先写 durable abandoned mark。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1080,7 +1095,7 @@ def test_missing_poll_adapter_registration_logs_warning(
 ) -> None:
     """poll adapter 未注册时记录 wait id 与 adapter key。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
@@ -1115,7 +1130,7 @@ def test_cancelled_poll_wait_missing_adapter_stays_retryable(
 ) -> None:
     """cancelled wait 缺失 poll adapter 时只写 retry backoff。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1164,7 +1179,7 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
 ) -> None:
     """adapter 普通异常只影响单条 wait record，后续记录继续处理。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1201,7 +1216,7 @@ def test_resolve_wait_exception_isolated_per_wait_record(
 ) -> None:
     """resolve_wait 普通异常只影响单条 wait record，后续记录继续处理。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter(
@@ -1258,7 +1273,7 @@ def test_resolve_wait_exception_readback_failure_isolated(
 ) -> None:
     """resolve_wait 失败后的 read-back 再失败也不能冒泡到 supervisor。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter(
@@ -1330,7 +1345,7 @@ def test_failed_cancelled_wait_abandon_is_retried_next_poll(
 ) -> None:
     """cancelled wait abandon 失败时不写入已 abandon 记忆，下一轮继续重试。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1364,7 +1379,7 @@ def test_active_poll_claim_suppresses_second_poller_adapter_call(
 ) -> None:
     """未过期 poll claim 存在时，另一个 poller 不调用 adapter。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_poll_claim(
@@ -1387,7 +1402,7 @@ def test_active_poll_claim_suppresses_second_poller_adapter_call(
 def test_expired_poll_claim_allows_retry(tmp_path: Path) -> None:
     """已过期 poll claim 可被新 poller 接管并调用 adapter。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_poll_claim(
@@ -1413,7 +1428,7 @@ def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
 ) -> None:
     """resolve 失败释放 claim；到期后重试使用同一 poll idempotency key。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _SequenceAdapter(
@@ -1505,7 +1520,7 @@ def test_expired_poll_wait_is_released_before_provider_observation(
 ) -> None:
     """expired wait 由 Host poll owner 拦截，ready/pending/error 不分裂终态。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline(
@@ -1542,7 +1557,7 @@ def test_invalid_poll_deadline_fails_closed_without_business_lost(
 ) -> None:
     """非法 poll deadline fail closed，不调用 provider，也不写业务 LOST。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline_text(host, seeded.wait_id, "not-a-timestamp")
@@ -1578,7 +1593,7 @@ def test_abandon_cas_conflict_leaves_cancelled_wait_retryable(
 ) -> None:
     """abandon CAS 冲突不写 poll_abandoned_at，后续仍可重试 cancelled wait。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1611,7 +1626,7 @@ def test_abandon_cas_lost_releases_current_claim(
 ) -> None:
     """abandon marker CAS_LOST 时释放当前 claim，避免等待 claim TTL。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -1660,7 +1675,7 @@ def test_terminal_abandon_cas_conflict_leaves_cancelled_wait_retryable(
 ) -> None:
     """unsupported / noop terminal marker CAS 冲突时不终止 wait retry。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(

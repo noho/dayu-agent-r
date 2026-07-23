@@ -158,10 +158,58 @@ def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
     assert semantic.accepted_candidate_digest == _candidate().digest()
     assert semantic.accepted_evidence_mapping_refs == ("evidence:accepted-1",)
     assert semantic.compact_artifact_ref == "compact-artifact:abc"
+    assert semantic.current_input_ref == "event-user-1"
+    assert semantic.compacted_source_refs == ("evidence:accepted-1",)
     assert semantic.accepted_candidate.answer_anchors[0].anchor_items == (
         AnswerAnchorChildVNext(display_text="Revenue increased.", ordinal=1),
         AnswerAnchorChildVNext(display_text="Margin also expanded.", ordinal=2),
     )
+
+
+@pytest.mark.parametrize(
+    "invalid_source_boundary_refs",
+    (
+        [],
+        ["event-user-1", "event-user-1"],
+        ["event-user-1", ""],
+        ["event-user-1", 7],
+    ),
+)
+def test_compacted_semantic_parser_rejects_invalid_source_boundary_refs(
+    invalid_source_boundary_refs: list[JsonValue],
+) -> None:
+    """persisted parser 在唯一 owner boundary 拒绝非法 source refs。
+
+    :param invalid_source_boundary_refs: 非空、唯一文本 list contract 的反例。
+    """
+
+    payload = _valid_compacted_payload()
+    payload["source_boundary_refs"] = invalid_source_boundary_refs
+
+    with pytest.raises(ValueError, match="source_boundary_refs"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_rejects_missing_source_boundary_refs() -> None:
+    """persisted parser 拒绝缺失 source boundary，不提供旧 payload 兼容。"""
+
+    payload = _valid_compacted_payload()
+    del payload["source_boundary_refs"]
+
+    with pytest.raises(ValueError, match="source_boundary_refs"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_accepts_current_input_only_boundary() -> None:
+    """只有 current input 的 boundary 合法且不伪造 covered refs。"""
+
+    payload = _valid_compacted_payload()
+    payload["source_boundary_refs"] = ["event-user-1"]
+
+    semantic = parse_context_compacted_semantic_payload(payload)
+
+    assert semantic.current_input_ref == "event-user-1"
+    assert semantic.compacted_source_refs == ()
 
 
 @pytest.mark.parametrize(

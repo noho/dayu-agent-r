@@ -1,256 +1,273 @@
-# WU-CTX-01 Slice 1 Implementation Resume Handoff
+# WU-CTX-01 Slice 1 Implementation Resume
 
 ## 0. Gate metadata
 
 - Work Unit：`WU-CTX-01 Usage-Anchored Adaptive Context Sizing`
 - gate：`implementation / Slice 1 resume`
 - lane：`AgentCodex implement`
-- accepted plan amendment commit：`ff28cbc4`
-- status：`blocked`
-- decision：`revised stop condition reached`
-- next entry point：只交回 Gateflow Controller 裁决 reactive post-compact hard 的
-  terminal owner / allowlist；未进入 dual code review、commit、push 或 PR
+- accepted first-call producer plan commit：`ed43bcf2`
+- Controller final pass：
+  `docs/reviews/wu-ctx-01-slice-1-first-call-producer-plan-rereview-controller-adjudication.md`
+- 真源：主 plan 与 `docs/host/design.md` §25
+- status：`implementation complete / ready for implementation review`
+- commit / push / PR：均未执行
 
-本轮完整读取了 revised plan、plan amendment、plan amendment re-review Controller
-adjudication、Slice 1 stop Controller adjudication、已提交的 blocked implementation
-handoff及相关 production 直接证据。当前 partial production/tests、Controller
-`docs/host/issues-implementation-control.md` 改动均保留；未回退或编辑 Controller
-改动，未编辑 design、plan或既有 review artifacts。
+本轮只完成 Slice 1。未实现 `CONTEXT_BUDGET_EVALUATED`、public projection、usage
+anchor、provider usage prediction或 correlation。既有 Controller-owned
+`docs/host/issues-implementation-control.md` diff 原样保留，未纳入本轮编辑；未修改
+其它 review artifact。
 
 ## 1. First-principles judgment
 
-原 blocker 与 amendment 动机成立。compact coverage、Conversation Memory selected
-recent projection以及 stage-aware pressure/action 都有唯一清晰 owner，本轮已能在
-Slice 1 allowlist内继续实现。
+Slice 1 动机成立。原实现只有 ordinary / reactive 局部 candidate 或 manifest producer，
+但 Attempt start 的语义 owner 分散在 admission、scheduler、wait resume、startup /
+attachment recovery 与 Engine continuation。只修单一入口会允许以下真实错误：
 
-恢复过程中出现一条 revised plan 未覆盖的 production 直接证据：proactive
-post-compact hard 与 reactive post-compact hard 所处 Run state不同。前者 Run仍为
-`ACCEPTED/QUEUED`，可以复用 plan冻结的
-`fail_unstarted_run_in_transaction`；后者在 Engine ingest关闭旧Attempt后已经是
-`RECOVERING`，该 transition拒绝此状态。
+- startup 从 current config 重建历史输入，而不是 exact replay；
+- steer / wait resume 在 `RUN_STARTED` 后才补写 manifest；
+- failed / lost wait 产生伪 resume artifacts；
+- admission / terminal owner 直接把 queued Run 提升，绕过 ordinary governance；
+- Engine continuation 误用 pre-start recorder；
+- source Run policy 或 worker delegate identity 漂移后仍继续执行。
 
-`RECOVERING`现有唯一失败 transition是
-`fail_recovering_run_in_transaction(FailRecoveringRunInput)`，但 exact typed input
-强制要求`context_compaction_failed_event_id`，其 RUN_FAILED payload语义也明确引用
-`CONTEXT_COMPACTION_FAILED`。reactive accepted compact 后若complete candidate仍为
-hard，当前operation已经提交`CONTEXT_COMPACTED`；为调用该transition伪造或再追加
-`CONTEXT_COMPACTION_FAILED`，会违反 revised plan §6.5：
+正确 owner 是：strict source fact reader 负责 exact input policy；RunInput owner 负责
+完整 candidate；`ContextSizingStage × ContextPressureLevel` closed matrix 负责 action；
+manifest owner 负责 exact runner input；各 lifecycle owner 只能在 manifest 已提交后
+执行 start transition。实现沿这些 owner boundary 收口，没有引入 loader/current-config
+fallback、start 后补写、fixture-only compatibility 或 loose parsing。
 
-- accepted operation不得再写矛盾failed fact；
-- hard必须在当前transaction显式Run terminal failure；
-- 不得由下游直接改state/event绕过lifecycle owner。
+## 2. 初始 18 个 full Host failures 定位
 
-因此无法同时满足“reactive exact candidate参与同一stage action”“post-compact hard
-显式terminal”“不写矛盾failed fact”“不修改`run_transition.py`”。这不是fixture或
-adapter问题，已命中 §8.2：
+恢复时先运行 full Host，得到 18 failures。直接堆栈与 durable rows 将其归为以下
+同源迁移问题，而非新的 plan 外 production owner：
 
-> post-compact/fallback hard无法通过既有Run failure owner显式收口，或需要allowed
-> files外production修改。
+1. 多个测试从
+   `tests.host.test_resolve_wait_command._create_execution_handle` 间接取得固定 baseline，
+   与各自 scheduler / opener 的 execution、memory、tool、context truth 不同源；
+2. recovery / wait / open-host fixtures 直接制造 `RUNNING` 或 recovery state，缺少新
+   contract 要求的 candidate / manifest-before-start；
+3. `create_host_admission_service(...)` 的新增语义依赖仍在部分 construction site
+   隐式缺失；
+4. open-host ordering 断言仍假设两个 terminal/start fact 相邻，没有容纳必须先提交的
+   `RUNNER_CALL_INPUT_ASSEMBLED`；
+5. legacy direct-promotion tests/imports 仍冻结已删除的 admission/durable 旁路。
 
-## 2. Direct production evidence
+修复落在 owner 或直接上游输入边界：
 
-| evidence | observed truth | consequence |
-| --- | --- | --- |
-| `dayu/host/engine_ingest.py::_execute_reactive_compaction` | accepted compact先写`CONTEXT_COMPACTED`，随后返回`_ReactiveRecoveryAccepted` | exact post-compact candidate只能在accepted fact与memory catch-up之后形成 |
-| `dayu/host/engine_ingest.py::_StartReactiveRecoveryOperation` | recovery start读取`RECOVERING` Run并调用`start_recovery_run_with_starting_attempt_in_transaction` | reactive dispatch不是unstarted `ACCEPTED/QUEUED` flow |
-| `dayu/host/durable/run_transition.py::fail_unstarted_run_in_transaction` | 只拥有未启动Run failure语义 | 不能收口`RECOVERING` |
-| `dayu/host/durable/run_transition.py::FailRecoveringRunInput` / `fail_recovering_run_in_transaction` | typed input必填`context_compaction_failed_event_id`，RUN_FAILED语义绑定compact failed fact | accepted post-compact hard不能无损复用 |
-| revised plan §6.5 / §8.2 | accepted post-compact不得追加矛盾failed fact；若existing failure owner不能收口则stop | 禁止在`engine_ingest.py`局部直写state/event或伪造ref |
+- 新增 `tests/host/execution_handle_support.py` 公共 helper；
+- 每个测试或专属 support 显式传入与被测 scheduler/open options 同源的
+  `OrdinaryRunExecutionBaseline`、memory/tool/context truth；
+- recovery / wait fixtures 改为真实 governed start 流；
+- construction site 显式装配所有语义依赖；
+- ordering 断言改为验证 manifest-before-start；
+- 删除 direct-promotion 专属 tests/imports，而不是给 production 加兼容分支。
 
-没有发现可在当前allowlist内复用的另一条`RECOVERING -> FAILED` typed transition。
-`lose_recovering_run_in_transaction`属于startup orphan的`RUN_LOST`语义，不是context
-hard failure owner，不能挪用。
+最终审计确认没有测试导入
+`tests.host.test_resolve_wait_command._create_execution_handle`，也没有通过该文件复用
+固定 baseline。
 
-## 3. Resumed partial changes
+## 3. Production implementation evidence
 
-以下修改均为当前 partial implementation，尚未完成最终 tests/type/coverage，不应进入
-review或commit：
-
-1. `dayu/host/compact_payload.py`
-   - strict parser成为raw `source_boundary_refs`唯一reader；
-   - 非空、非空字符串、全局唯一校验；
-   - typed投影`current_input_ref`与`compacted_source_refs`；
-   - `[current_input_ref]`合法表示无covered material。
-2. `dayu/host/memory.py`
-   - accepted compact按`event_id + source_refs`过滤selected recent；
-   - current input优先保留；
-   - covered older raw删除，uncovered protected raw保留；
-   - existing bounded policy之后同源重建recent evidence；
-   - RunInput未新增coverage filter。
-3. `dayu/host/context_budget.py`
-   - producer与`ContextSizingResult.__post_init__`复用同一stage-aware
-     pressure/action helper；
-   - ordinary normal/soft/hard为allow/compact/block；
-   - post-compact/fallback normal/soft/hard为allow/allow/block；
-   - soft pressure未改写为normal。
-4. `dayu/host/dispatch.py`
-   - proactive post-compact/fallback候选使用封闭
-     `pending_dispatch | terminal_notice` private outcome；
-   - hard在同一transaction复用`fail_unstarted_run_in_transaction`；
-   - commit后交付typed terminal notice；
-   - soft直接dispatch且不启动第二次proactive operation。
-5. `dayu/host/run_input.py`
-   - 修正logical `input_snapshot_digest` owner：只覆盖messages、selected tools、
-     policy与request semantics；
-   - source cursor/ref/governance sequence只属于candidate projection lineage；
-   - 同一logical snapshot恢复既有proactive operation时不因新manifest event改变
-     estimator/input identity。
-6. tests
-   - compact parser current/covered roles与invalid matrix；
-   - memory covered/current/uncovered/new delta/recent evidence及
-     rebuild/incremental/persisted reload一致性；
-   - 9-cell stage matrix及`__post_init__`反例；
-   - partial dispatch fixture按complete candidate阈值语义迁移。
-
-`CONTEXT_BUDGET_EVALUATED`、anchor resolver、signed delta、provider usage prediction与
-Issue #119 correlation仍未进入Slice 1。
-
-## 4. Validation evidence
-
-### 4.1 Tests
-
-恢复前owner baseline：
-
-```bash
-source .venv/bin/activate
-pytest -q tests/host/test_context_budget.py \
-  tests/host/test_context_compact_events.py \
-  tests/host/test_memory_projection.py \
-  tests/host/test_memory_repair.py --maxfail=30 --tb=short
-```
-
-结果：`152 passed`。
-
-新增parser/memory/stage tests后同一suite结果：`169 passed`。
-
-dispatch全文件中间结果：
-
-```bash
-source .venv/bin/activate
-pytest -q tests/host/test_dispatch_scheduler.py --maxfail=30 --tb=short
-```
-
-结果：`90 passed, 12 failed`。其中：
-
-- 已修复/局部复验：governed-start helper返回类型、complete candidate阈值fixture、
-  proactive resume logical digest漂移；
-- reactive recovery三项失败直接暴露“新Attempt已有state但缺pre-start frozen
-  candidate/manifest”，继续正确修复必须让reactive recovery消费同一exact candidate
-  与stage action，进而触发本artifact blocker；
-- 其余fixture migration与memory catch-up failure expectation尚未收敛。
-
-定点复验：
-
-```bash
-source .venv/bin/activate
-pytest -q \
-  tests/host/test_dispatch_scheduler.py::test_second_proactive_compact_uses_previous_view_without_old_raw_replay \
-  'tests/host/test_dispatch_scheduler.py::test_proactive_manifest_crash_resumes_deterministic_next_stage[1-root_repair]' \
-  --tb=short
-```
-
-结果：`2 passed`，证明logical input digest不再因governance event cursor变化而使同一
-snapshot启动/转入另一operation。
-
-### 4.2 Type check
-
-scoped命令：
-
-```bash
-source .venv/bin/activate
-python -m pyright \
-  dayu/host/dispatch.py dayu/host/context_budget.py \
-  dayu/host/compact_payload.py dayu/host/memory.py \
-  tests/host/test_context_budget.py \
-  tests/host/test_context_compact_events.py \
-  tests/host/test_memory_projection.py
-```
-
-结果：`0 errors, 0 warnings, 0 informations`。
-
-命中stop condition后未运行full
-`python -m pyright dayu/ tests/ utils/`，不能声明full pyright通过。
-
-### 4.3 Coverage
-
-focused suite尚未完成，未生成可接受的per-file coverage。所有新增/修改production
-文件coverage状态为`not measured / blocked`，不能声明达到`>=80%`。
-
-### 4.4 Static / diff
-
-- `git diff --check`：通过。
-- `git diff --exit-code -- dayu/host/durable/run_transition.py`：通过，零diff。
-- 当前production/tests diff均在 revised Slice 1 allowlist内。
-- `docs/host/issues-implementation-control.md`为既有Controller diff，本Agent未编辑。
-- 未commit、push或创建PR。
-
-## 5. README audit
-
-已读取：
-
-- `dayu/host/README.md`的`Agent更新约束【必须遵守】`；
-- `tests/README.md`的`README 更新边界`。
-
-当前实现被stop且尚无可交付稳定contract、focused suite/full pyright/coverage均未完成，
-因此不把partial过程状态写入README。本轮README零diff；Controller解除blocker并完成
-Slice 1后，仍需按plan §11更新Host稳定owner contract与tests现有验证入口。
-
-## 6. Diff scope
-
-本轮新增允许production diff：
-
-- `dayu/host/compact_payload.py`
-- `dayu/host/memory.py`
-
-本轮继续修改既有partial allowed production：
+### 3.1 Candidate、sizing、action 与 manifest
 
 - `dayu/host/context_budget.py`
-- `dayu/host/dispatch.py`
+  - `ContextSizingStage` 闭集为 `ORDINARY`、`POST_COMPACT`、
+    `DISPATCH_FALLBACK`、`REACTIVE_POST_COMPACT`、`CONTINUATION`；
+  - 五 stage × 三 pressure 共十五格以显式 closed match 穷举；
+  - candidate sizing 使用完整 messages / selected tools / policy 与 conservative
+    atoms；diagnostic metadata 不参与预算；
+  - `CONTINUATION` 保持 limited manifest stage，并对三种 pressure 返回允许动作。
+- `dayu/host/_runner_call_manifest.py`
+  - candidate、projection descriptor graph、hot payload 与 manifest identity 共用唯一
+    strict owner；
+  - 所有新 Attempt producer 在 start transition 前提交 manifest；
+  - CAS / state precondition 失败不留下孤立 start artifacts。
+- `dayu/host/compact_payload.py`、`compaction_operation.py`、
+  `context_fallback.py`、`memory.py`
+  - strict compact source boundary 与 covered/current refs 同源；
+  - 保留 reactive exact catch-up 与 manifest-before-recovery-start；
+  - post-compact / fallback / reactive candidate 使用同一 sizing/action contract。
+
+### 3.2 Exact input fact 与 continuity
+
 - `dayu/host/run_input.py`
+  - source Run exact input fact 由共享 strict helper 读取；
+  - exact policy parser 同时服务 source loader 与 worker delegate；
+  - delegate 后再次校验 caller/source run、attempt、execution identity；
+  - startup replay 不读取 current baseline/tooling/config；
+  - running / waiting steer 对同一 payload strict parse；
+  - `SessionContinuityView.source_refs` 为必填，全部 production/test construction site
+    显式提供；
+  - ordinary continuity 使用 `()`；wait continuity 使用 request/result exact refs。
 
-本轮新增/继续修改allowed tests：
+### 3.3 Admission、dispatch、wait 与 recovery
 
-- `tests/host/test_context_budget.py`
-- `tests/host/test_context_compact_events.py`
-- `tests/host/test_memory_projection.py`
-- `tests/host/test_dispatch_scheduler.py`
+- `dayu/host/admission.py`
+  - first call 与 queued admission 冻结 exact effective execution/tool facts；
+  - idempotent replay 先判定既有结果，再读取新 admission baseline；
+  - running / waiting steer 构造 exact candidate 并在 start 前提交 manifest；
+  - admission 只发送 queue governance wakeup，不直接 promotion。
+- `dayu/host/dispatch.py`
+  - ordinary accepted / queued pickup 统一走 scheduler governance；
+  - proactive、post-compact、fallback 与 startup replay 都保持
+    candidate/action/manifest-before-start；
+  - reactive recovery 保留 exact catch-up 与 pre-start manifest。
+- `dayu/host/accepted_result_projection.py`、`waiting.py`
+  - completed / cancelled wait 先通过 accepted-result projection 同一 strict core
+    形成 planned typed continuity；
+  - planned result event id 与 committed row exact 相等；
+  - resume candidate 与 manifest 在 start 前完成；
+  - failed / lost 直接终态，零 resume candidate、manifest、Attempt、dispatch。
+- `dayu/host/recovery.py`
+  - startup / attachment recovery 只从 durable source exact replay；
+  - source 缺失或非法 fail closed 为既有 typed lost owner；
+  - manifest-before-recovery-start，CAS 失败不遗留孤立 artifacts。
+- `dayu/host/engine_ingest.py`
+  - continuation 只使用 `CONTINUATION` stage；
+  - 直接记录实际 continuation input 的 limited manifest；
+  - 不调用 pre-start candidate recorder。
+- `dayu/host/command.py`、`open_host.py`
+  - `PayloadStore`、ordinary baseline、tooling、context policy、memory policy、
+    truncation flag 与 owner host id 均逐项显式装配；
+  - admin-only handle 明确传 `None`，运行路径不使用 fallback。
 
-worktree中其它Slice 1 partial production/tests来自blocked implementation并继续保留。
-唯一新增交付artifact为本文件。
+### 3.4 Direct promotion 删除
 
-## 7. Blocking question and required adjudication
+从 `admission.py`、`durable/state.py`、`durable/run_transition.py` 及 tests 删除：
 
-Controller需要选择并冻结以下之一；implementation agent不能自行扩大权限：
+- `promote_next_queued_run`
+- `promote_queued_run_in_transaction`
+- `PromoteQueuedRunInput`
+- `PromotionSkipReason`
+- `promote_queued_run_row`
+- `_validate_promote_input`
+- 对应 state mutation、private helpers、imports 与专属 fixture/tests
 
-1. 扩充Slice 1 production allowlist，允许在`dayu/host/durable/run_transition.py`
-   增加不依赖`CONTEXT_COMPACTION_FAILED`的typed
-   `RECOVERING -> RUN_FAILED` context-hard closeout input/transition，并补owner tests；
-2. 明确提供另一个现有typed owner及其exact语义，证明accepted
-   `CONTEXT_COMPACTED`之后可以无矛盾收口reactive post-compact hard；
-3. 修订Slice 1目标，明确reactive recovery不消费exact stage-aware sizing/action。
-   该选择会违反当前complete candidate与all dispatch-relevant stage目标，不能由本
-   Agent默认采用。
+保留的 `promotion` 文本只属于 scheduler ordinary queue governance、post-commit wakeup
+与其 lifecycle tests；admission、terminal closeout、cancel、recovery 都是 wake-only，
+没有 durable direct promotion 调用。
 
-禁止的局部方案：
+## 4. Diff scope
 
-- 把accepted compact event id写进名为
-  `context_compaction_failed_event_id`的字段；
-- accepted后追加矛盾`CONTEXT_COMPACTION_FAILED`；
-- 在`engine_ingest.py`直接写Run terminal row/event绕过transition owner；
-- 用`RUN_LOST` startup orphan语义冒充context hard failure；
-- reactive recovery仍创建无candidate/manifest的新Attempt；
-- 跳过reactive exact sizing而声称Slice 1 complete。
+实际修改 18 个 production Python 文件：
 
-## 8. Residual risks
+- candidate / manifest：
+  `_runner_call_manifest.py`、`context_budget.py`、`compact_payload.py`、
+  `compaction_operation.py`、`context_fallback.py`
+- input / projection：
+  `run_input.py`、`accepted_result_projection.py`、`memory.py`
+- lifecycle producers：
+  `admission.py`、`dispatch.py`、`waiting.py`、`recovery.py`、
+  `engine_ingest.py`
+- durable deletion / schema：
+  `durable/state.py`、`durable/run_transition.py`、`durable/schema.py`
+- composition：
+  `command.py`、`open_host.py`
 
-| risk | classification / owner |
-| --- | --- |
-| reactive recovery新Attempt当前缺pre-start candidate/manifest，worker fail closed | blocking；Controller需裁决recovery start/terminal owner |
-| reactive accepted compact后exact hard无合法terminal owner | blocking；本artifact核心stop condition |
-| dispatch仍有未收敛fixture、memory catch-up与reactive tests | resumed Slice 1 after adjudication |
-| manifest v2 rejection/continuation/rollback/integration matrix未完整 | resumed Slice 1 after adjudication |
-| full focused suite/full pyright/per-file coverage/static audits未完成 | resumed Slice 1 after adjudication |
-| README稳定contract与测试入口未同步 | resumed Slice 1 completion audit |
+tests 覆盖 owner contract、十五格 matrix、ordinary/startup/steer/wait/recovery/
+continuation producer、rollback、schema/import/static guards；新增
+`tests/host/execution_handle_support.py` 作为显式语义输入的公共测试 support。
 
-除上述blocking owner question外，没有新增未分类risk。当前状态不是ready for dual code
-review。
+README 按触发规则更新：
+
+- `dayu/host/README.md`：记录 exact production stage 术语、十五格 action、
+  manifest-before-start、exact replay、wait continuity 与 queue wake-only 稳定边界；
+- `tests/README.md`：增加当前 Slice 1 focused 验证入口；
+- `dayu/engine/README.md`、`dayu/README.md`、根 `README.md`：production layering、
+  Engine public contract与用户工作流均未改变，不更新；
+- Service / CLI / Fins production 未修改。
+
+## 5. Validation evidence
+
+### 5.1 Tests
+
+计划列出的 focused Slice 1 suite：
+
+```text
+986 passed in 12.74s
+```
+
+最后两处 strict owner 修改的定向回归：
+
+```text
+206 passed in 5.98s
+35 passed in 0.49s
+```
+
+完整 Host gate：
+
+```text
+2173 passed, 2 skipped, 6 deselected in 51.71s
+```
+
+两个 skip 均为既有外部环境 gate：
+
+- real compactor smoke 需要显式设置 `DAYU_RUN_REAL_COMPACTOR_SMOKE=1`；
+- Gemini real-runner smoke 因 provider quota / rate limit 明确 skip。
+
+6 个 deselected 来自项目默认 marker 配置，不属于 Slice 1 failure。
+
+最终 schema / import boundary / package export / weak typing / terminal static gate：
+
+```text
+164 passed in 3.50s
+```
+
+使用最终生产源码重建 coverage 的 full Host run：
+
+```text
+2173 passed, 2 skipped, 6 deselected in 72.74s
+```
+
+### 5.2 Per-file line coverage
+
+| production file | line coverage |
+| --- | ---: |
+| `_runner_call_manifest.py` | 89% |
+| `accepted_result_projection.py` | 95% |
+| `admission.py` | 90% |
+| `command.py` | 88% |
+| `compact_payload.py` | 91% |
+| `compaction_operation.py` | 94% |
+| `context_budget.py` | 90% |
+| `context_fallback.py` | 91% |
+| `dispatch.py` | 88% |
+| `durable/run_transition.py` | 92% |
+| `durable/schema.py` | 97% |
+| `durable/state.py` | 88% |
+| `engine_ingest.py` | 89% |
+| `memory.py` | 92% |
+| `open_host.py` | 89% |
+| `recovery.py` | 86% |
+| `run_input.py` | 87% |
+| `waiting.py` | 88% |
+
+18 个 changed production 文件全部 `>=80%`；合计为 `90%`。
+
+### 5.3 Type、diff 与 static audits
+
+- `python -m pyright dayu/ tests/ utils/`：
+  `0 errors, 0 warnings, 0 informations`
+- `git diff --check`：通过
+- direct-promotion 上述六个 legacy symbols：零引用
+- `SessionContinuityView(` construction sites：全部显式 `source_refs`
+- 私有测试 helper
+  `tests.host.test_resolve_wait_command._create_execution_handle`：零 import
+- `CONTEXT_BUDGET_EVALUATED`、`context_anchor`、
+  `_estimate_usage_observation_input`：production/tests 零引用
+- `USAGE_ANCHORED`：仅保留已冻结 enum contract，未接入算法、producer 或 consumer
+- admission factory 全 construction sites：显式语义依赖并通过 strict pyright
+- manifest/schema/import/package/weak-typing static tests：通过
+- README stage 术语已与 production `ContextSizingStage` exact 对齐
+- 当前 `HEAD` 仍为 accepted plan commit
+  `ed43bcf271968a39b2692ed637cca8a8355feec0`；未创建新 commit
+
+## 6. Residual risks
+
+- optional real compactor smoke 未启用；这是既有显式 opt-in 外部 gate。
+- Gemini real-runner smoke 本次受外部 quota 限制，未提供成功调用证据。
+- 项目默认排除的 stress marker 未在本轮额外启用；Slice 1 owner、focused、full Host、
+  type、coverage与静态门禁均已通过。
+
+未发现 plan 外 production owner 需求或 full Host 新 blocker。当前实现可进入
+implementation review；尚未由 Controller 接受。

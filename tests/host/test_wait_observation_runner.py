@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import threading
 import time
 from datetime import datetime, timedelta
@@ -22,7 +23,8 @@ from dayu.host._wait_observation import (
     WaitObservationRunner,
     WaitObservationTimedOut,
 )
-from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host.command import HostCommandHandle
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordStatus
 from dayu.host.wait_adapter import (
@@ -50,12 +52,26 @@ from tests.host.test_resolve_wait_command import (
     _read_wait,
     _seed_waiting_run,
 )
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 from tests.host.test_wait_adapter_polling import (
     _FixedClock,
     _NoResolveResolver,
     _RecordingPublicCommandResolver,
 )
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "wait-observation-runner"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 
 class _BlockingAdapter:
     """poll/abandon 都由显式 barrier 控制的同步 adapter。"""
@@ -349,7 +365,7 @@ def test_poll_observation_timeout_releases_with_backoff_and_late_result_cannot_r
 ) -> None:
     """poll observation timeout 释放 claim，迟到 Ready 无 durable authority。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     runner = WaitObservationRunner(
         max_outstanding_adapter_calls=1,
         thread_name_prefix="wait-observation-poll-timeout",
@@ -415,7 +431,7 @@ def test_cancelled_abandon_timeout_releases_with_backoff_and_late_result_cannot_
 ) -> None:
     """abandon timeout 保持 CANCELLED retryable，迟到 Applied 不写终态。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     runner = WaitObservationRunner(
         max_outstanding_adapter_calls=1,
         thread_name_prefix="wait-observation-abandon-timeout",

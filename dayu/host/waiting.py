@@ -56,6 +56,7 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictError
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
@@ -110,6 +111,18 @@ from dayu.host.evidence import (
 from dayu.host.accepted_tool_outcome import (
     accepted_tool_outcome_digest,
     accepted_tool_outcome_json,
+)
+from dayu.host.accepted_result_projection import (
+    project_planned_accepted_tool_result,
+)
+from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.run_input import (
+    SessionContinuityView,
+    continuation_runner_call_sizing_snapshot,
+    load_prepared_runner_call_source_in_transaction,
+    prepare_runner_call_candidate_in_transaction,
+    project_wait_resume_continuity,
+    record_prepared_runner_call_candidate_in_transaction,
 )
 from dayu.host.durable.wait_resolution_digest import (
     WAIT_RESOLUTION_OUTCOME_KIND_CANCELLED as _TOOL_FACT_KIND_CANCELLED,
@@ -711,8 +724,10 @@ class DefaultHostResolveWaitService:
         *,
         transaction_runner: HostTransactionRunner,
         terminal_post_commit_port: TerminalPostCommitPort,
-        event_log_store: EventLogStore | None = None,
-        idempotency_store: IdempotencyStore | None = None,
+        event_log_store: EventLogStore,
+        idempotency_store: IdempotencyStore,
+        payload_store: PayloadStore,
+        memory_projection_policy: MemoryProjectionPolicy,
         projection_catchup_port: ProjectionCatchupPort | None = None,
     ) -> None:
         """初始化默认 resolve wait service。
@@ -721,20 +736,18 @@ class DefaultHostResolveWaitService:
         :param terminal_post_commit_port: commit 后消费 exact terminal notice 的端口。
         :param event_log_store: EventLog primitive；无则创建默认实现。
         :param idempotency_store: Idempotency primitive；无则创建默认实现。
+        :param payload_store: runner-call manifest payload primitive。
+        :param memory_projection_policy: candidate 使用的 memory policy。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :returns: ``None``。
         """
 
         self._transaction_runner = transaction_runner
         self._terminal_post_commit_port = terminal_post_commit_port
-        self._event_log_store = (
-            event_log_store if event_log_store is not None else EventLogStore()
-        )
-        self._idempotency_store = (
-            idempotency_store
-            if idempotency_store is not None
-            else IdempotencyStore()
-        )
+        self._event_log_store = event_log_store
+        self._idempotency_store = idempotency_store
+        self._payload_store = payload_store
+        self._memory_projection_policy = memory_projection_policy
         self._projection_catchup_port = projection_catchup_port
 
     def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> ResolveWaitResult:
@@ -1140,6 +1153,92 @@ class DefaultHostResolveWaitService:
         :returns: resolve 结果。
         """
 
+        run = read_run_by_id(transaction, wait_record.run_id)
+        if (
+            run is None
+            or run.status is not RunStatus.WAITING
+            or run.current_attempt_id != wait_record.attempt_id
+        ):
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait owner run is no longer resumable",
+                retryable=True,
+            )
+        source = load_prepared_runner_call_source_in_transaction(
+            transaction,
+            self._event_log_store,
+            run_id=run.run_id,
+            attempt_id=wait_record.attempt_id,
+            execution_id=wait_record.execution_id,
+        )
+        request_fact = _wait_tool_call_requested_event(
+            transaction,
+            wait_record,
+            event_log_store=self._event_log_store,
+        )
+        planned_payload = _tool_result_resolution_payload(
+            wait_record=wait_record,
+            request=request,
+            payload_plan=payload_plan,
+            event_plan=event_plan,
+            wait_status_after=WaitRecordStatus.RESOLVED,
+            resume=True,
+            tool_call_request=request_fact,
+        )
+        if not isinstance(planned_payload, Mapping):
+            raise HostDurableError(
+                "planned accepted result payload must be object"
+            )
+        planned_result = project_planned_accepted_tool_result(
+            transaction,
+            event_id=event_plan.tool_result_event_id,
+            session_id=wait_record.session_id,
+            run_id=wait_record.run_id,
+            attempt_id=wait_record.attempt_id,
+            execution_id=wait_record.execution_id,
+            occurred_at=request.observed_at.isoformat(),
+            payload=planned_payload,
+        )
+        continuity = project_wait_resume_continuity(
+            user_prompt=_run_input_prompt(transaction, self._event_log_store, run),
+            accepted_result=planned_result,
+            source_refs=(
+                request_fact.row.event_id,
+                event_plan.tool_result_event_id,
+            ),
+        )
+        current_input_event = self._event_log_store.read_event_by_id(
+            transaction,
+            run.input_event_id,
+        )
+        if current_input_event is None:
+            raise HostDurableError("wait resume input event is missing")
+        candidate = prepare_runner_call_candidate_in_transaction(
+            transaction,
+            self._event_log_store,
+            run=run,
+            current_input_event=current_input_event,
+            continuity=continuity,
+            policy_snapshot=source.candidate.policy_snapshot,
+            tool_schemas=source.candidate.tool_schemas,
+            disable_tools=source.candidate.disable_tools,
+            tool_execution_mode=source.candidate.tool_execution_mode,
+            memory_projection_policy=self._memory_projection_policy,
+        )
+        record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            self._event_log_store,
+            self._payload_store,
+            run=run,
+            attempt_id=event_plan.resume_attempt_id,
+            execution_id=event_plan.resume_execution_id,
+            occurred_at=request.observed_at,
+            candidate=candidate,
+            sizing_snapshot=continuation_runner_call_sizing_snapshot(
+                candidate,
+                source.manifest.sizing_snapshot,
+            ),
+        )
         transition = resume_run_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1165,16 +1264,7 @@ class DefaultHostResolveWaitService:
                     payload_plan=payload_plan,
                     event_plan=event_plan,
                 ),
-                tool_result_payload=_tool_result_resolution_payload(
-                    transaction=transaction,
-                    event_log_store=self._event_log_store,
-                    wait_record=wait_record,
-                    request=request,
-                    payload_plan=payload_plan,
-                    event_plan=event_plan,
-                    wait_status_after=WaitRecordStatus.RESOLVED,
-                    resume=True,
-                ),
+                tool_result_payload=planned_payload,
                 tool_result_payload_ref=_payload_ref_text(payload_plan.payload_ref),
                 tool_result_payload_digest=_event_payload_digest(payload_plan),
                 worker_kind=WorkerKind.LOCAL,
@@ -1186,6 +1276,14 @@ class DefaultHostResolveWaitService:
                 code=HostApiErrorCode.INVALID_STATE,
                 message="wait record is no longer resolvable",
                 retryable=True,
+            )
+        if (
+            transition.tool_result_event is None
+            or transition.tool_result_event.event_id
+            != event_plan.tool_result_event_id
+        ):
+            raise HostDurableError(
+                "wait committed result event does not match planned identity"
             )
         return ResolveWaitResult(
             run=transition.run,
@@ -1218,6 +1316,11 @@ class DefaultHostResolveWaitService:
         outcome = request.outcome
         if not isinstance(outcome, ResolveWaitFailedOutcome):
             raise TypeError("resolve wait failed path received non-failed outcome")
+        tool_call_request = _wait_tool_call_requested_event(
+            transaction,
+            wait_record,
+            event_log_store=self._event_log_store,
+        )
         transition = fail_run_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1237,14 +1340,13 @@ class DefaultHostResolveWaitService:
                 resolution_idempotency_key=request.idempotency_key,
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
-                    transaction=transaction,
-                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
                     event_plan=event_plan,
                     wait_status_after=WaitRecordStatus.FAILED,
                     resume=False,
+                    tool_call_request=tool_call_request,
                 ),
                 tool_result_payload_ref=_payload_ref_text(payload_plan.payload_ref),
                 tool_result_payload_digest=_event_payload_digest(payload_plan),
@@ -1291,6 +1393,11 @@ class DefaultHostResolveWaitService:
         outcome = request.outcome
         if not isinstance(outcome, ResolveWaitLostOutcome):
             raise TypeError("resolve wait lost path received non-lost outcome")
+        tool_call_request = _wait_tool_call_requested_event(
+            transaction,
+            wait_record,
+            event_log_store=self._event_log_store,
+        )
         transition = mark_run_lost_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1310,14 +1417,13 @@ class DefaultHostResolveWaitService:
                 resolution_idempotency_key=request.idempotency_key,
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
-                    transaction=transaction,
-                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
                     event_plan=event_plan,
                     wait_status_after=WaitRecordStatus.LOST,
                     resume=False,
+                    tool_call_request=tool_call_request,
                 ),
                 tool_result_payload_ref=_payload_ref_text(payload_plan.payload_ref),
                 tool_result_payload_digest=_event_payload_digest(payload_plan),
@@ -1480,6 +1586,11 @@ def _expire_wait_in_transaction(
     )
     payload_plan = _wait_resolution_payload_plan(request)
     event_plan = _resolve_wait_event_plan(expiry_digest)
+    tool_call_request = _wait_tool_call_requested_event(
+        transaction,
+        wait_record,
+        event_log_store=event_log_store,
+    )
     transition = fail_run_from_waiting_in_transaction(
         transaction,
         event_log_store,
@@ -1499,14 +1610,13 @@ def _expire_wait_in_transaction(
             resolution_idempotency_key=expiry_key,
             resolution_digest=expiry_digest,
             tool_result_payload=_tool_result_resolution_payload(
-                transaction=transaction,
-                event_log_store=event_log_store,
                 wait_record=wait_record,
                 request=request,
                 payload_plan=payload_plan,
                 event_plan=event_plan,
                 wait_status_after=WaitRecordStatus.FAILED,
                 resume=False,
+                tool_call_request=tool_call_request,
             ),
             tool_result_payload_ref=None,
             tool_result_payload_digest=None,
@@ -1859,31 +1969,26 @@ def _resume_requested_payload(
 
 def _tool_result_resolution_payload(
     *,
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
     wait_record: WaitRecordRow,
     request: ResolveWaitRequest,
     payload_plan: _WaitResolutionPayloadPlan,
     event_plan: _ResolveWaitEventPlan,
     wait_status_after: WaitRecordStatus,
     resume: bool,
+    tool_call_request: _WaitToolCallRequest,
 ) -> JsonValue:
     """构造 resolve wait ``TOOL_RESULT_ACCEPTED`` payload。
 
-    :param transaction: 当前 Host transaction。
-    :param event_log_store: 注入的 EventLog store。
     :param wait_record: active wait record。
     :param request: resolve wait 请求。
     :param payload_plan: payload 规划。
     :param event_plan: 稳定 id 规划。
     :param wait_status_after: 本次更新后的 wait 状态。
     :param resume: 是否创建 resume Attempt。
+    :param tool_call_request: 本次 owner path 已严格解析一次的 request fact。
     :returns: JSON payload。
     """
 
-    tool_call_request = _wait_tool_call_requested_event(
-        transaction, wait_record, event_log_store=event_log_store
-    )
     request_payload = payload_object(tool_call_request.row)
     accepted_evidence_envelope = _wait_resolution_evidence_envelope(
         wait_record=wait_record,
@@ -1938,6 +2043,39 @@ def _tool_result_resolution_payload(
             accepted_evidence_envelope
         ),
         raw_tool_outcome=payload_plan.result_json,
+    )
+
+
+def _run_input_prompt(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    run: RunRow,
+) -> str:
+    """从 Run exact input fact读取 wait resume 用户 prompt。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param run: wait owner Run。
+    :returns: exact ``USER_INPUT_ACCEPTED.display_text``。
+    :raises HostDurableError: event identity或payload损坏时抛出。
+    """
+
+    event = event_log_store.read_event_by_id(
+        transaction,
+        run.input_event_id,
+    )
+    if (
+        event is None
+        or event.event_type != "USER_INPUT_ACCEPTED"
+        or event.session_id != run.session_id
+        or event.run_id != run.run_id
+        or event.attempt_id is not None
+        or event.execution_id is not None
+    ):
+        raise HostDurableError("wait resume exact input fact is invalid")
+    return required_payload_text(
+        payload_object(event),
+        field_name="display_text",
     )
 
 

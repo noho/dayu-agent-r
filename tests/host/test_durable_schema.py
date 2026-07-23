@@ -924,9 +924,10 @@ def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
     assert payload_descriptor_kind_values() == (
         "tool_call_arguments_json",
         "tool_call_semantic_query_text",
-        "runner_call_input_manifest",
-        "runner_call_input_projection",
-        "selected_tool_schema_snapshot",
+            "runner_call_input_manifest",
+            "runner_call_input_projection",
+            "runner_call_prepared_candidate",
+            "selected_tool_schema_snapshot",
         "compactor_input_projection",
         "compaction_rejected_attempt_diagnostic",
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -20,13 +21,17 @@ from dayu.host import (
     cancel_session_runs,
     resolve_wait,
 )
-from dayu.host.command import create_host_command_handle
 from dayu.host.admission import create_host_admission_service
 from dayu.host.durable.event_log import EventLogRow
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitRecordStatus
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.memory import default_memory_projection_policy
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 from tests.host.test_resolve_wait_command import (
     _completed_request,
     _context,
@@ -37,6 +42,16 @@ from tests.host.test_resolve_wait_command import (
     _seed_waiting_run,
 )
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline(
+        "wait-cancel-late-result"
+    ),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 _ATTEMPT_COUNT_SQL = "SELECT COUNT(*) AS total FROM host_attempts"
 
 
@@ -60,7 +75,7 @@ def test_cancel_run_cancels_waiting_run_without_resume_attempt(
 ) -> None:
     """cancel_run 取消 WAITING Run 和 active wait，不创建 resume Attempt。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
 
@@ -91,7 +106,7 @@ def test_cancel_run_allows_resolved_wait_record_while_run_still_waiting(
 ) -> None:
     """wait record 已 resolved 但 Run 仍 WAITING 时，cancel_run 仍可取消 Run。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _mark_wait_record_resolved_without_resume(
@@ -121,7 +136,7 @@ def test_cancel_session_runs_cancels_waiting_run(
 ) -> None:
     """cancel_session_runs 复用 WAITING cancel transition。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
 
@@ -155,12 +170,25 @@ def test_late_result_after_cancel_writes_bounded_diagnostic(
     :returns: ``None``。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     projection = _CountingProjectionCatchup()
+    previous = host._admission_service
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
         terminal_post_commit_port=host._terminal_post_commit_port,
+        payload_store=previous.payload_store,
+        event_log_store=previous.event_log_store,
+        idempotency_store=previous.idempotency_store,
+        clock=previous.clock,
+        id_factory=previous.id_factory,
+        wakeup_port=previous.wakeup_port,
         projection_catchup_port=projection,
+        ordinary_run_baseline=previous.ordinary_run_baseline,
+        tooling_options=previous.tooling_options,
+        context_budget_policy=previous.context_budget_policy,
+        memory_projection_policy=previous.memory_projection_policy,
+        enable_truncation_manager=previous.enable_truncation_manager,
+        owner_host_instance_id=previous.owner_host_instance_id,
     )
     try:
         seeded = _seed_waiting_run(host)
@@ -218,8 +246,8 @@ def test_different_key_after_resolved_or_failed_does_not_write_late_diagnostic(
 ) -> None:
     """resolved / failed 终态不同 key 请求只拒绝，不写 late diagnostic。"""
 
-    resolved_host = create_host_command_handle(_options(tmp_path / "resolved"))
-    failed_host = create_host_command_handle(_options(tmp_path / "failed"))
+    resolved_host = _create_execution_handle(_options(tmp_path / "resolved"))
+    failed_host = _create_execution_handle(_options(tmp_path / "failed"))
     try:
         resolved_seeded = _seed_waiting_run(resolved_host)
         failed_seeded = _seed_waiting_run(failed_host)

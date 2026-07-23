@@ -16,23 +16,29 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.host.admission import PendingDispatchRecord
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions
+from dayu.host.admission import PendingDispatchRecord, effective_tool_facts_json
 from dayu.host.api import EnsureSessionRequest, HostMetadataEntry, RunStatus
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.run_transition import (
-    CreateRunningRunInput,
+    CreateAcceptedRunInput,
     RunTransitionResult,
+    StartGovernedRunInput,
     StartRecoveryRunInput,
-    create_running_run_with_starting_attempt_in_transaction,
+    create_accepted_run_in_transaction,
+    start_governed_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
@@ -53,6 +59,23 @@ from dayu.host.engine_ingest import (
     EngineEventIngestor,
     LocalEngineEnvelope,
 )
+from dayu.host._execution_config_projection import (
+    effective_execution_config_json,
+    effective_execution_snapshot_from_json,
+)
+from dayu.host._runner_call_manifest import (
+    RunnerCallSizingUnavailableReason,
+    unavailable_runner_call_sizing_snapshot,
+)
+from dayu.host.context_budget import ContextSizingStage
+from dayu.host.memory import default_memory_projection_policy
+from dayu.host.run_input import (
+    PolicySnapshot,
+    SessionContinuityView,
+    ToolExecutionMode,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+)
 from dayu.host.recovery import (
     SessionAttachmentRecoveryDecision,
     SessionAttachmentRecoveryPolicy,
@@ -61,6 +84,7 @@ from dayu.host.recovery import (
 from dayu.host.recovery_process import ProcessEvidence
 from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
+from tests.host.public_smoke_support import deterministic_runner_spec
 
 _NOW = datetime(2026, 5, 19, 4, 5, 6, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "recovery-dispatch-test"})
@@ -193,6 +217,7 @@ def test_recovering_scan_creates_new_attempt_dispatch_and_wakes_scheduler(
             session_id=old.session_id,
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
@@ -214,6 +239,7 @@ def test_recovering_scan_creates_new_attempt_dispatch_and_wakes_scheduler(
         assert observation.event_suffix == (
             "ATTEMPT_LOST",
             "RUN_RECOVERING",
+            "RUNNER_CALL_INPUT_ASSEMBLED",
             "RUN_STARTED",
             "ATTEMPT_STARTED",
         )
@@ -231,6 +257,7 @@ def test_late_old_execution_event_after_recovery_dispatch_is_rejected(
             session_id=old.session_id,
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
             terminal_post_commit_port=_RecordingTerminalPort(),
             process_probe=_PidMissingProbe(),
             dispatch_wakeup_port=wakeup,
@@ -249,10 +276,10 @@ def test_late_old_execution_event_after_recovery_dispatch_is_rejected(
         assert _run_status(store.transaction_runner, old.run_id) is RunStatus.RUNNING
 
 
-def test_orphan_closeout_dispatch_invalid_state_reports_recovering_ready(
+def test_orphan_closeout_dispatch_invalid_state_rolls_back_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """orphan closeout 成功后 dispatch INVALID_STATE 返回 recovering ready。"""
+    """startup start INVALID_STATE 回滚本页closeout与prepared manifest。"""
 
     wakeup = _RecordingWakeup()
     monkeypatch.setattr(
@@ -262,25 +289,22 @@ def test_orphan_closeout_dispatch_invalid_state_reports_recovering_ready(
     with open_host_durable_store(_options(tmp_path)) as store:
         old = _seed_running_dispatching_run(store.transaction_runner)
 
-        result = SessionAttachmentRecoveryScanner(
-            session_id=old.session_id,
-            transaction_runner=store.transaction_runner,
-            event_log_store=EventLogStore(),
-            terminal_post_commit_port=_RecordingTerminalPort(),
-            process_probe=_PidMissingProbe(),
-            dispatch_wakeup_port=wakeup,
-            recovery_owner_host_instance_id="host-instance-new",
-        ).scan(_policy())
+        with pytest.raises(HostDurableError):
+            SessionAttachmentRecoveryScanner(
+                session_id=old.session_id,
+                transaction_runner=store.transaction_runner,
+                event_log_store=EventLogStore(),
+                payload_store=PayloadStore(),
+                terminal_post_commit_port=_RecordingTerminalPort(),
+                process_probe=_PidMissingProbe(),
+                dispatch_wakeup_port=wakeup,
+                recovery_owner_host_instance_id="host-instance-new",
+            ).scan(_policy())
 
-        assert tuple(action.decision for action in result.actions) == (
-            SessionAttachmentRecoveryDecision.RECOVERING_READY,
-        )
-        assert result.actions[0].status is RunStatus.RECOVERING
-        assert result.pending_dispatches == ()
         assert wakeup.dispatches == []
-        assert _run_status(store.transaction_runner, old.run_id) is RunStatus.RECOVERING
-        assert _event_count(store.transaction_runner, "ATTEMPT_LOST") == 1
-        assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 1
+        assert _run_status(store.transaction_runner, old.run_id) is RunStatus.RUNNING
+        assert _event_count(store.transaction_runner, "ATTEMPT_LOST") == 0
+        assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
         assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
 
 
@@ -293,7 +317,7 @@ class _RecoveryObservation:
     current_dispatch_record_id: str
     dispatch_status: DispatchRecordStatus
     dispatch_owner_host_instance_id: str | None
-    event_suffix: tuple[str, str, str, str]
+    event_suffix: tuple[str, str, str, str, str]
 
 
 def _return_invalid_recovery_dispatch(
@@ -369,6 +393,28 @@ def _seed_running_dispatching_run(
         :returns: seeded Run 引用。
         """
 
+        runner_options = RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        )
+        agent_policy = AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+            fallback_prompt="fallback",
+            continuation_prompt="continue",
+        )
+        execution_config = effective_execution_config_json(
+            runner_spec=deterministic_runner_spec("recovery-source"),
+            runner_options=runner_options,
+            agent_policy=agent_policy,
+            runner_spec_source="test",
+            runner_options_source="test",
+            agent_policy_source="test",
+        )
         input_event = EventLogStore().append_event(
             transaction,
             _event(
@@ -384,19 +430,59 @@ def _seed_running_dispatching_run(
                     "payload_digest": None,
                     "operation_kind": "start_run",
                     "call_context_digest": _CALL_CONTEXT_DIGEST,
+                    "effective_execution_config": execution_config,
+                    "effective_tool_set": effective_tool_facts_json(
+                        frozenset(),
+                        tooling_options=None,
+                    ),
                 },
             ),
         ).row
-        create_running_run_with_starting_attempt_in_transaction(
+        accepted = create_accepted_run_in_transaction(
             transaction,
             EventLogStore(),
-            CreateRunningRunInput(
+            CreateAcceptedRunInput(
                 session_id=session_id,
                 run_id="run-recovery-dispatch",
                 client_request_id="request-recovery-dispatch",
                 input_event_id=input_event.event_id,
                 input_event_sequence=input_event.event_sequence,
                 run_accepted_event_id="event-run-accepted-recovery-dispatch",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                idempotency_key="request-recovery-dispatch",
+                execution_target="local-default",
+                queue_policy=RunQueuePolicy.QUEUE,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+        assert accepted.run is not None
+        execution = effective_execution_snapshot_from_json(execution_config)
+        policy_snapshot = PolicySnapshot(
+            runner_spec=execution.runner_spec,
+            runner_options=execution.runner_options,
+            agent_policy=execution.agent_policy,
+            policy_snapshot_ref=execution.policy_snapshot_ref,
+        )
+        candidate = prepare_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            run=accepted.run,
+            current_input_event=input_event,
+            continuity=SessionContinuityView(
+                messages=(),
+                source_refs=(),
+            ),
+            policy_snapshot=policy_snapshot,
+            tool_schemas=(),
+            disable_tools=True,
+            tool_execution_mode=ToolExecutionMode.NO_TOOL_DISABLED,
+            memory_projection_policy=default_memory_projection_policy(),
+        )
+        start_input = StartGovernedRunInput(
+                run_id="run-recovery-dispatch",
+                expected_status=RunStatus.ACCEPTED,
                 run_started_event_id="event-run-started-recovery-dispatch",
                 attempt_started_event_id="event-attempt-started-recovery-dispatch",
                 attempt_id="attempt-recovery-dispatch-old",
@@ -405,14 +491,28 @@ def _seed_running_dispatching_run(
                 occurred_at=_NOW,
                 actor="analyst",
                 source="pytest",
-                idempotency_key="request-recovery-dispatch",
-                execution_target="local-default",
-                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
-                call_context_digest=_CALL_CONTEXT_DIGEST,
+        )
+        record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            PayloadStore(),
+            run=accepted.run,
+            attempt_id=start_input.attempt_id,
+            execution_id=start_input.execution_id,
+            occurred_at=start_input.occurred_at,
+            candidate=candidate,
+            sizing_snapshot=unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
             ),
+        )
+        start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            start_input,
         )
         _insert_stale_host_instance(transaction)
         _insert_new_host_instance(transaction)
@@ -502,11 +602,13 @@ def _recovery_observation(
     return transaction_runner.run_read(operation)
 
 
-def _event_type_suffix(transaction: HostTransaction) -> tuple[str, str, str, str]:
-    """读取最后四个 EventLog event_type。
+def _event_type_suffix(
+    transaction: HostTransaction,
+) -> tuple[str, str, str, str, str]:
+    """读取最后五个 EventLog event_type。
 
     :param transaction: Host transaction。
-    :returns: 最后四个 event type。
+    :returns: 最后五个 event type。
     """
 
     rows = transaction.fetchall(
@@ -514,13 +616,19 @@ def _event_type_suffix(transaction: HostTransaction) -> tuple[str, str, str, str
         SELECT event_type
         FROM {TABLE_EVENT_LOG}
         ORDER BY event_sequence DESC
-        LIMIT 4
+        LIMIT 5
         """,
         (),
     )
     event_types = tuple(reversed(tuple(_row_text(row, "event_type") for row in rows)))
-    assert len(event_types) == 4
-    return (event_types[0], event_types[1], event_types[2], event_types[3])
+    assert len(event_types) == 5
+    return (
+        event_types[0],
+        event_types[1],
+        event_types[2],
+        event_types[3],
+        event_types[4],
+    )
 
 
 def _old_final_answer_candidate(old: _SeededRun) -> EngineEventCandidate:
