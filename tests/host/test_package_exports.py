@@ -194,9 +194,29 @@ EXPECTED_STORAGE_MAINTENANCE_EXPORTS: frozenset[str] = frozenset(
 
 EXPECTED_TOOL_TRACE_ANALYSIS_EXPORTS: frozenset[str] = frozenset(
     {
+        "ToolTraceAnalysisCapabilities",
+        "ToolTraceAnalysisInputSummary",
+        "ToolTraceAnalysisLayer",
         "ToolTraceAnalysisPolicy",
+        "ToolTraceAnalysisReport",
         "ToolTraceAnalysisSource",
+        "ToolTraceAnalysisSummary",
+        "ToolTraceEvidence",
+        "ToolTraceEvidenceKind",
+        "ToolTraceFinding",
+        "ToolTraceFindingPriority",
+        "ToolTraceFindingSeverity",
         "ToolTraceInputMode",
+        "ToolTraceLimitation",
+        "ToolTracePayloadMeasurementSource",
+        "ToolTracePayloadMeasure",
+        "ToolTraceRunSummary",
+        "ToolTraceSignalCoverage",
+        "ToolTraceSignalStatus",
+        "ToolTraceVendorDebuggingBlock",
+        "analyze_tool_trace",
+        "render_tool_trace_analysis_markdown",
+        "tool_trace_analysis_report_to_json",
     }
 )
 
