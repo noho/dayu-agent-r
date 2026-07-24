@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-OBS-00` Tool Trace Analyzer。 |
 | active work unit | `WU-OBS-00`；类型为 GitHub Issue #70 对应的 observability / debug tooling issue。 |
-| gate | `aggregate deepreview pass / protected commit pending` |
+| gate | `ready-to-open-draft-PR pass / readiness protected commit pending` |
 | blocking open questions | None。 |
-| next entry point | 第二轮双路aggregate re-review均为PASS且0个新actionable finding；Controller final adjudication=`docs/reviews/wu-obs-00-aggregate-deepreview-final-controller-adjudication.md`，decision=`pass`。下一步创建accepted aggregate protected commit，再进入ready-to-open-draft-PR preflight。 |
+| next entry point | accepted aggregate protected commit=`29da5d1c`；fresh fetch、base/merge、Issue #70、重复PR与whole-range preflight均通过，artifact=`docs/reviews/wu-obs-00-ready-to-open-draft-pr-controller.md`，decision=`pass`。下一步创建readiness protected commit，复核远端后push并创建draft PR。 |
 
 ## 推进规则
 
@@ -217,7 +217,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-OBS-00 | aggregate deepreview pass / protected commit pending | Tool Trace analyzer | GitHub Issue #70 | `CTRL-AGG-01..02`与`CTRL-RR-01`已关闭；第二轮双路re-review PASS且0新finding；Controller final PASS |
+| WU-OBS-00 | ready-to-open-draft-PR pass / readiness commit pending | Tool Trace analyzer | GitHub Issue #70 | aggregate protected commit=`29da5d1c`；base/Issue/duplicate PR/whole-range preflight PASS；待readiness commit、push、draft PR |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
@@ -250,6 +250,8 @@ Whole-WU aggregate双路deepreview=`docs/reviews/code-review-20260724-163910.md`
 AgentCodex第二次fix artifact=`docs/reviews/wu-obs-00-aggregate-deepreview-rereview-fix-codex.md`：replace phase任意中断逃逸前清理pending temp，同时保持既有`OSError` typed partial-publication truth；first/second replace × `KeyboardInterrupt`/`SystemExit`四个owner case均覆盖。focused=`19 passed`、affected=`241 passed`、full pyright=`0 errors`、changed production branch coverage=`92%`，两种只读smoke前后hash与`9/7/9`计数不变。Controller implementation review=`docs/reviews/wu-obs-00-aggregate-deepreview-second-fix-controller-adjudication.md`，decision=`pass-to-second-dual-rereview`。
 
 第二轮aggregate re-review artifacts=`docs/reviews/wu-obs-00-aggregate-deepreview-second-rereview-mimo.md`与`docs/reviews/wu-obs-00-aggregate-deepreview-second-rereview-ds.md`，两路均为PASS，确认`CTRL-AGG-01..02`与`CTRL-RR-01`全部关闭、既有typed partial-publication truth无回归且0个新actionable finding。Controller final adjudication=`docs/reviews/wu-obs-00-aggregate-deepreview-final-controller-adjudication.md`，decision=`pass`；下一步创建accepted aggregate protected commit。
+
+accepted aggregate protected commit=`29da5d1c`。fresh fetch确认local `main`、`github/main`与`FETCH_HEAD`均为`9588ee7a`，feature branch ahead 6 / behind 0，Issue #70仍OPEN且scope一致，同head不存在历史或当前PR。ready-to-open-draft-PR preflight=`docs/reviews/wu-obs-00-ready-to-open-draft-pr-controller.md`，decision=`pass`；whole-range check发现的Slice 3早期review artifact EOF多余空行已在readiness gate做纯格式删除，待readiness protected commit后复核。
 
 ### Goal confirmation 前置检查：现有 Tool Trace 的日常分析充分性
 
