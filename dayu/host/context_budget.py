@@ -54,6 +54,7 @@ DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS = 16
 CONTEXT_ESTIMATOR_ID = "dayu.host.conservative_context_budget"
 CONTEXT_ESTIMATOR_VERSION = "1"
 MAX_CONTEXT_TOKEN_COUNT = 2**63 - 1
+_UTILIZATION_BASIS_POINTS_SCALE = 10_000
 # Post-compact ordinary dispatch 固定为一条 system envelope 加当前输入 user message。
 POST_COMPACT_BASE_MESSAGE_COUNT = 2
 USAGE_OBSERVATION_STATUS_OBSERVED = "observed"
@@ -115,12 +116,6 @@ class ContextSizingFallbackReason(StrEnum):
     ITERATION_LINK_INVALID = "iteration_link_invalid"
     MANIFEST_INCOMPLETE = "manifest_incomplete"
     MANIFEST_MISMATCH = "manifest_mismatch"
-    CONTINUATION_PROJECTION_UNAVAILABLE = "continuation_projection_unavailable"
-    CONTINUATION_TOOL_SCHEMA_UNAVAILABLE = "continuation_tool_schema_unavailable"
-    CONTINUATION_POLICY_UNAVAILABLE = "continuation_policy_unavailable"
-    CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE = (
-        "continuation_request_semantics_unavailable"
-    )
     RUNNER_CALL_KIND_INELIGIBLE = "runner_call_kind_ineligible"
     PROVIDER_MISMATCH = "provider_mismatch"
     MODEL_MISMATCH = "model_mismatch"
@@ -572,12 +567,13 @@ class ContextSizingResult:
                 raise ValueError("anchored sizing diagnostic mismatch")
         else:
             raise AssertionError("context estimate method is not exhaustive")
-        if self.soft_threshold_tokens > self.hard_threshold_tokens:
-            raise ValueError(
-                "soft_threshold_tokens must not exceed hard_threshold_tokens"
-            )
-        expected_utilization = (
-            self.predicted_input_tokens * 10_000 // self.context_window_size
+        validate_context_threshold_ordering(
+            soft_threshold_tokens=self.soft_threshold_tokens,
+            hard_threshold_tokens=self.hard_threshold_tokens,
+        )
+        expected_utilization = context_utilization_basis_points(
+            predicted_input_tokens=self.predicted_input_tokens,
+            context_window_size=self.context_window_size,
         )
         if self.utilization_basis_points != expected_utilization:
             raise ValueError("ContextSizingResult.utilization_basis_points mismatch")
@@ -1053,7 +1049,10 @@ def build_context_sizing_result_from_atoms(
         context_window_size=context_window_size,
         soft_threshold_tokens=soft_threshold_tokens,
         hard_threshold_tokens=hard_threshold_tokens,
-        utilization_basis_points=predicted * 10_000 // context_window_size,
+        utilization_basis_points=context_utilization_basis_points(
+            predicted_input_tokens=predicted,
+            context_window_size=context_window_size,
+        ),
         pressure_level=pressure,
         budget_decision=decision,
         policy_ref=policy_ref,
@@ -1134,8 +1133,9 @@ def build_frozen_context_sizing_result_from_atoms(
         context_window_size=context_window_size,
         soft_threshold_tokens=soft_threshold_tokens,
         hard_threshold_tokens=hard_threshold_tokens,
-        utilization_basis_points=(
-            predicted_input_tokens * 10_000 // context_window_size
+        utilization_basis_points=context_utilization_basis_points(
+            predicted_input_tokens=predicted_input_tokens,
+            context_window_size=context_window_size,
         ),
         pressure_level=pressure,
         budget_decision=decision,
@@ -1357,6 +1357,32 @@ def context_sizing_pressure_and_decision(
         predicted_input_tokens,
         field_name="predicted_input_tokens",
     )
+    validate_context_threshold_ordering(
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+    return _pressure_and_decision(
+        stage=stage,
+        predicted_input_tokens=predicted_input_tokens,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+
+
+def validate_context_threshold_ordering(
+    *,
+    soft_threshold_tokens: int,
+    hard_threshold_tokens: int,
+) -> None:
+    """校验 context soft/hard token threshold 的严格顺序。
+
+    :param soft_threshold_tokens: soft threshold token 数。
+    :param hard_threshold_tokens: hard threshold token 数。
+    :returns: ``None``。
+    :raises TypeError: threshold 不是严格整数时抛出。
+    :raises ValueError: threshold 非正或 soft 不小于 hard 时抛出。
+    """
+
     _require_positive_int(
         soft_threshold_tokens,
         field_name="soft_threshold_tokens",
@@ -1365,15 +1391,38 @@ def context_sizing_pressure_and_decision(
         hard_threshold_tokens,
         field_name="hard_threshold_tokens",
     )
-    if soft_threshold_tokens > hard_threshold_tokens:
+    if soft_threshold_tokens >= hard_threshold_tokens:
         raise ValueError(
-            "soft_threshold_tokens must not exceed hard_threshold_tokens"
+            "soft_threshold_tokens must be less than hard_threshold_tokens"
         )
-    return _pressure_and_decision(
-        stage=stage,
-        predicted_input_tokens=predicted_input_tokens,
-        soft_threshold_tokens=soft_threshold_tokens,
-        hard_threshold_tokens=hard_threshold_tokens,
+
+
+def context_utilization_basis_points(
+    *,
+    predicted_input_tokens: int,
+    context_window_size: int,
+) -> int:
+    """按 Host 唯一比例计算未 clamp 的 context utilization basis points。
+
+    :param predicted_input_tokens: 当前 candidate 的预测输入 token 数。
+    :param context_window_size: frozen context window token 数。
+    :returns: 未 clamp 的整数 basis points。
+    :raises TypeError: token 或 window 不是严格整数时抛出。
+    :raises ValueError: token 为负或 window 非正时抛出。
+    """
+
+    _require_non_negative_int(
+        predicted_input_tokens,
+        field_name="predicted_input_tokens",
+    )
+    _require_positive_int(
+        context_window_size,
+        field_name="context_window_size",
+    )
+    return (
+        predicted_input_tokens
+        * _UTILIZATION_BASIS_POINTS_SCALE
+        // context_window_size
     )
 
 
@@ -1827,10 +1876,12 @@ __all__ = [
     "build_frozen_context_sizing_result_from_atoms",
     "context_budget_policy_snapshot_digest",
     "context_sizing_pressure_and_decision",
+    "context_utilization_basis_points",
     "decide_context_budget",
     "estimate_budget_text_tokens",
     "estimate_context_budget",
     "estimate_context_input",
     "estimate_post_compact_budget",
     "rebind_frozen_context_sizing_result",
+    "validate_context_threshold_ordering",
 ]

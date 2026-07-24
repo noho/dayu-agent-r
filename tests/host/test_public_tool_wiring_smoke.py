@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
+import sqlite3
 from contextlib import AsyncExitStack
+from dataclasses import replace
+from typing import cast
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.messages import ToolMessage
 from dayu.host import HostEventKind, open_host
+from dayu.host.context_budget import (
+    ContextEstimateMethod,
+    ContextSizingFallbackReason,
+)
+from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
+    parse_context_budget_evaluated_payload,
+)
+from dayu.host.context_policy import default_context_budget_policy
 from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
     ToolCallingWorkerFactory,
@@ -22,6 +36,82 @@ from tests.host.public_smoke_support import (
     next_terminal_for_run,
     open_host_options,
 )
+
+
+@pytest.mark.asyncio
+async def test_scripted_runner_without_usage_emits_conservative_fact_and_succeeds(
+    tmp_path: pathlib.Path,
+) -> None:
+    """合法scripted runner不发usage时仍以保守预算事实完成Run。
+
+    :param tmp_path: pytest临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Host因缺usage失败或未持久化保守事实时抛出。
+    """
+
+    factory = ToolCallingWorkerFactory()
+    options = replace(
+        open_host_options(
+            tmp_path,
+            runner_spec=deterministic_runner_spec("no-usage-model"),
+            worker_factory=factory,
+            allow_tool_calls=True,
+            tooling_options=mock_tooling_options(),
+        ),
+        context_budget_policy=default_context_budget_policy(
+            context_window_size=100_000
+        ),
+    )
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
+        session = await host.ensure_session(ensure_request("no-usage"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded, attachment
+        )
+        watcher = await host.watch_session_events(session.session_id)
+        submitted = await host.submit_followup(
+            session.session_id,
+            followup_request(
+                session.session_id,
+                "no-usage-followup",
+                "调用 lookup_mock_fact 查询无 usage 路径。",
+            ),
+        )
+        terminal = await next_terminal_for_run(
+            watcher,
+            submitted.accepted_run_id,
+        )
+
+    with sqlite3.connect(tmp_path / "host.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT event_type, payload_json
+            FROM event_log
+            WHERE run_id = ?
+            ORDER BY event_sequence ASC
+            """,
+            (submitted.accepted_run_id,),
+        ).fetchall()
+
+    assert terminal.kind is HostEventKind.SUCCEEDED
+    event_types = tuple(str(row[0]) for row in rows)
+    assert "USAGE_REPORTED" not in event_types
+    budget_payloads = tuple(
+        parse_context_budget_evaluated_payload(
+            cast(dict[str, JsonValue], json.loads(str(payload_json)))
+        )
+        for event_type, payload_json in rows
+        if str(event_type) == CONTEXT_BUDGET_EVALUATED
+    )
+    assert budget_payloads
+    assert all(
+        payload.estimate_method is ContextEstimateMethod.CONSERVATIVE_FALLBACK
+        and payload.fallback_reason is ContextSizingFallbackReason.USAGE_MISSING
+        for payload in budget_payloads
+    )
 
 
 @pytest.mark.asyncio

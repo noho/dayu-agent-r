@@ -29,6 +29,8 @@ from dayu.host.context_budget import (
     ContextSizingResult,
     ContextSizingStage,
     context_sizing_pressure_and_decision,
+    context_utilization_basis_points,
+    validate_context_threshold_ordering,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
@@ -385,10 +387,13 @@ def parse_context_budget_evaluated_payload(
         or predicted_input_tokens > MAX_CONTEXT_TOKEN_COUNT
     ):
         raise ValueError("context budget token count exceeds supported range")
-    if soft_threshold_tokens > hard_threshold_tokens:
-        raise ValueError("context budget thresholds are out of order")
-    if utilization_basis_points != (
-        predicted_input_tokens * 10_000 // context_window_size
+    validate_context_threshold_ordering(
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+    if utilization_basis_points != context_utilization_basis_points(
+        predicted_input_tokens=predicted_input_tokens,
+        context_window_size=context_window_size,
     ):
         raise ValueError("context budget utilization mismatch")
     expected_pressure, expected_decision = context_sizing_pressure_and_decision(

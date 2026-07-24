@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-CTX-01` Usage-Anchored Adaptive Context Sizing。 |
 | active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
-| gate | `Slice 3 acceptance / protected commit` |
+| gate | `accepted aggregate deepreview commit` |
 | blocking open questions | None。 |
-| next entry point | Slice 3双路re-review artifacts=`docs/reviews/wu-ctx-01-slice-3-implementation-re-review-mimo.md`与`docs/reviews/wu-ctx-01-slice-3-implementation-review-fix-ds-rereview-20260724.md`，均为`PASS`且0 findings。Controller final adjudication=`docs/reviews/wu-ctx-01-slice-3-implementation-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted Slice 3 protected commit，随后进入whole-WU aggregate deepreview。 |
+| next entry point | AgentMiMo/AgentDS aggregate re-review均为`pass`且0个新actionable findings；Controller final adjudication=`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted aggregate deepreview protected commit，再进入ready-to-open-draft-PR preflight。 |
 
 ## 推进规则
 
@@ -888,6 +888,14 @@ GitHub Issue #20 当前为 OPEN，title / body 已与 `docs/host/design.md` §25
 Slice 3双路implementation review artifacts=`docs/reviews/code-review-20260724-071249.md`与`docs/reviews/code-review-20260724-071353.md`，两路均为`PASS`。Controller在`docs/reviews/wu-ctx-01-slice-3-implementation-review-controller-adjudication.md`裁决为`needs-fix`：只接受`CTRL-S3-IMPL-01`，解除EventLog cursor错误复用token ceiling的owner耦合并澄清query identity atoms；拒绝input digest相等比较、额外overload、不可达sequence=0 fallback及损坏link loose parsing。完成最小fix后进入双路implementation re-review。
 
 AgentCodex Slice 3 review fix artifact=`docs/reviews/wu-ctx-01-slice-3-implementation-review-fix-codex.md`，owner tests=`21 passed`、full pyright=`0 errors, 0 warnings`、coverage suite=`2272 passed, 2 skipped, 6 deselected`，10个changed production Python文件branch coverage均`>=82%`。双路implementation re-review artifacts=`docs/reviews/wu-ctx-01-slice-3-implementation-re-review-mimo.md`与`docs/reviews/wu-ctx-01-slice-3-implementation-review-fix-ds-rereview-20260724.md`均为`PASS`且0 findings；Controller final adjudication=`docs/reviews/wu-ctx-01-slice-3-implementation-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted Slice 3 protected commit并进入whole-WU aggregate deepreview。
+
+accepted Slice 3 protected commit=`fad15d39`。三个implementation slices均已accepted，whole-WU aggregate deepreview base固定为merge commit `5afe71fe`；下一步由AgentMiMo/AgentDS并行执行aggregate deepreview。
+
+AgentMiMo/AgentDS aggregate deepreview artifacts=`docs/reviews/code-review-20260724-074017.md`与`docs/reviews/code-review-20260724-073108.md`。Controller在`docs/reviews/wu-ctx-01-aggregate-deepreview-controller-adjudication.md`裁决为`needs-fix`：接受typed usage pairing、continuation frozen source判别联合、reactive recovery God method拆分、provider无usage仍走conservative fallback并成功终态的public Host组合测试、steer estimate单真源、strict soft<hard不变量、utilization basis-point单真源、删除错误owner下的4个continuation dead fallback reasons及compactor manifest anchor exclusion direct test，共`CTRL-AGG-01..09`。其余finding因类型前提错误、owner抽象错误、原子事务下不可达、事实证据错误、纯未来假设或重复测试而驳回。下一步由AgentCodex完成aggregate review fix，再进入AgentMiMo/AgentDS双路aggregate re-review。
+
+AgentCodex aggregate review fix artifact=`docs/reviews/wu-ctx-01-aggregate-deepreview-review-fix-codex.md`，`CTRL-AGG-01..09`均已关闭；聚焦tests=`209 passed`，clean full Host=`2259 passed, 2 skipped, 6 deselected`，项目标准suite=`5704 passed, 11 skipped, 6 deselected`，full pyright=`0 errors, 0 warnings`。相对WU base=`5afe71fe`到最终working tree的25个production Python文件已由同一次branch-enabled标准suite逐文件验证，全部`>=80%`，最低`run_input.py=82%`，union总覆盖率`86%`。下一步进入AgentMiMo/AgentDS双路aggregate re-review。
+
+AgentMiMo/AgentDS aggregate re-review artifacts=`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-mimo.md`与`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-ds.md`，两路均为`pass`，确认`CTRL-AGG-01..09`全部关闭且0个新actionable findings；两路各自复跑focused=`209 passed`、full Host=`2259 passed, 2 skipped, 6 deselected`与pyright=`0 errors`。Controller final adjudication=`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted aggregate deepreview protected commit并进入ready-to-open-draft-PR preflight。
 
 ### 设计与代码核对
 

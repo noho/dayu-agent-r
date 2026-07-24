@@ -23,6 +23,7 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.context_budget import (
+    BudgetEstimate,
     ContextBudgetDecision,
     ContextEstimateMethod,
     ContextPressureLevel,
@@ -40,7 +41,10 @@ from dayu.host.context_events import (
     CONTEXT_BUDGET_EVALUATED,
     parse_context_budget_evaluated_payload,
 )
-from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    context_budget_policy_from_threshold_tokens,
+)
 from tests.host.public_smoke_support import (
     AwaitingThenFinalWorkerFactory,
     awaiting_tooling_options,
@@ -127,6 +131,31 @@ async def test_steer_hard_continuation_orders_fact_before_new_attempt(
     :raises AssertionError: manifest/fact/start顺序或decision错误时抛出。
     """
 
+    estimate_call_count = 0
+    original_estimator = admission_module.estimate_prepared_runner_call_candidate
+
+    def count_estimate(
+        candidate: PreparedRunnerCallCandidate,
+        policy: ContextBudgetPolicy,
+    ) -> BudgetEstimate:
+        """记录public steer一次candidate sizing所调用的estimate次数。
+
+        :param candidate: 已冻结的runner-call candidate。
+        :param policy: context budget policy。
+        :returns: production estimator结果。
+        :raises Exception: production estimator错误时透传。
+        """
+
+        nonlocal estimate_call_count
+        estimate_call_count += 1
+        return original_estimator(candidate, policy)
+
+    monkeypatch.setattr(
+        admission_module,
+        "estimate_prepared_runner_call_candidate",
+        count_estimate,
+    )
+
     def resolve_anchor(
         transaction: HostTransaction,
         event_log_store: EventLogStore,
@@ -200,6 +229,7 @@ async def test_steer_hard_continuation_orders_fact_before_new_attempt(
             "ATTEMPT_RUNNING",
             1,
         )
+        calls_before_steer = estimate_call_count
 
         await host.submit_followup(
             session.session_id,
@@ -219,6 +249,7 @@ async def test_steer_hard_continuation_orders_fact_before_new_attempt(
         )
         await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
 
+    assert estimate_call_count - calls_before_steer == 1
     with sqlite3.connect(tmp_path / "host.sqlite3") as connection:
         rows = connection.execute(
             """

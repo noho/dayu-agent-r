@@ -483,6 +483,54 @@ def test_supports_flag_does_not_invent_missing_usage(
         )
 
 
+def test_compactor_manifest_usage_is_excluded_without_orphan_barrier(
+    tmp_path: Path,
+) -> None:
+    """compactor manifest/link/usage/completion整体排除且不阻断普通anchor。
+
+    :param tmp_path: pytest临时目录。
+    :returns: ``None``。
+    :raises AssertionError: compactor usage 被选中或形成 orphan barrier 时抛出。
+    """
+
+    def operation(
+        transaction: HostTransaction,
+    ) -> tuple[_CallRows, _CallRows, ContextAnchorResolution]:
+        """先写普通anchor，再写更近的compactor call并解析。
+
+        :param transaction: 当前write transaction。
+        :returns: ordinary/compactor rows与resolver结果。
+        :raises Exception: durable fixture或resolver错误时透传。
+        """
+
+        ordinary = _append_call(
+            transaction,
+            call_index=0,
+            conservative_tokens=6_000,
+            prompt_tokens=6_200,
+        )
+        compactor = _append_call(
+            transaction,
+            call_index=1,
+            conservative_tokens=6_100,
+            prompt_tokens=9_900,
+            compactor=True,
+        )
+        return ordinary, compactor, _resolve(transaction)
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        ordinary, compactor, resolution = store.transaction_runner.run_write(
+            operation
+        )
+        assert resolution.fallback_reason is None
+        assert resolution.anchor is not None
+        assert resolution.anchor.manifest_event_id == ordinary.manifest.event_id
+        assert resolution.anchor.usage_anchor_tokens == 6_200
+        assert resolution.anchor.manifest_event_id != compactor.manifest.event_id
+        assert compactor.usage is not None
+        assert resolution.anchor.usage_event_id != compactor.usage.event_id
+
+
 def _append_and_resolve(
     transaction: HostTransaction,
     *,
@@ -564,6 +612,7 @@ def _append_call(
     duplicate_link: bool = False,
     link_mismatch: bool = False,
     duplicate_completion: bool = False,
+    compactor: bool = False,
 ) -> _CallRows:
     """追加一个可定向损坏的runner-call lineage。
 
@@ -584,6 +633,7 @@ def _append_call(
     :param duplicate_link: 是否追加同identity第二条accepted link。
     :param link_mismatch: 是否篡改link的runner-call identity。
     :param duplicate_completion: 是否追加同identity第二条completion。
+    :param compactor: 是否构造应被anchor resolver整体排除的compactor call。
     :returns: 已追加的evidence rows。
     """
 
@@ -611,6 +661,7 @@ def _append_call(
         request_digest=request_digest,
         input_digest=input_digest,
         projection_digest=projection_digest,
+        compactor=compactor,
     )
     manifest_digest = sha256_digest_json(manifest)
     descriptor = PayloadStore().write_sqlite_payload(
@@ -633,14 +684,22 @@ def _append_call(
             execution_id=execution_id,
             runner_call_index=call_index,
             runner_call_kind=(
-                "initial_user_dispatch"
-                if call_index == 0
-                else "tool_result_continuation"
+                "compactor_proposal"
+                if compactor
+                else (
+                    "initial_user_dispatch"
+                    if call_index == 0
+                    else "tool_result_continuation"
+                )
             ),
             runner_call_trigger_reason=(
-                "initial_user_input"
-                if call_index == 0
-                else "tool_results_available"
+                "context_compaction_initial_proposal"
+                if compactor
+                else (
+                    "initial_user_input"
+                    if call_index == 0
+                    else "tool_results_available"
+                )
             ),
             iteration_id=None if call_index == 0 else iteration_id,
             iteration_index=None if call_index == 0 else call_index,
@@ -685,6 +744,7 @@ def _append_call(
         iteration_id=iteration_id,
         manifest_row=manifest_row,
         role_digest=role_digest,
+        compactor=compactor,
     )
     if link_mismatch:
         link_payload = {
@@ -808,6 +868,7 @@ def _manifest_payload(
     request_digest: str,
     input_digest: str,
     projection_digest: str,
+    compactor: bool = False,
 ) -> Mapping[str, JsonValue]:
     """构造strict complete manifest body。
 
@@ -816,19 +877,33 @@ def _manifest_payload(
     """
 
     runner_call_kind = (
-        "initial_user_dispatch"
-        if call_index == 0
-        else "tool_result_continuation"
+        "compactor_proposal"
+        if compactor
+        else (
+            "initial_user_dispatch"
+            if call_index == 0
+            else "tool_result_continuation"
+        )
     )
     trigger = (
-        "initial_user_input"
-        if call_index == 0
-        else "tool_results_available"
+        "context_compaction_initial_proposal"
+        if compactor
+        else (
+            "initial_user_input"
+            if call_index == 0
+            else "tool_results_available"
+        )
     )
     metadata_id = f"projector:{call_index}:user"
-    projector_id = "user_input_message"
-    projector_schema = "run_input_projector.v1"
-    purpose = "ordinary_run_input"
+    projector_id = (
+        "compactor_user_prompt" if compactor else "user_input_message"
+    )
+    projector_schema = (
+        "compactor_projector.v1" if compactor else "run_input_projector.v1"
+    )
+    purpose = (
+        "compactor_proposal_input" if compactor else "ordinary_run_input"
+    )
     source_refs: list[JsonValue] = [f"event:input:{call_index}"]
     projector_digest = sha256_digest_json(
         {
@@ -888,27 +963,62 @@ def _manifest_payload(
                 "source_contract_refs": source_refs,
             }
         ],
-        "compactor_identity": None,
-        "sizing_snapshot": {
-            "status": "complete",
-            "reason": None,
-            "sizing_stage": (
-                "ordinary" if call_index == 0 else "continuation"
-            ),
-            "estimator_id": CONTEXT_ESTIMATOR_CONTRACT.estimator_id,
-            "estimator_version": estimator_version,
-            "estimator_digest": estimator_digest,
-            "conservative_input_tokens": conservative_tokens,
-            "context_window_size": window,
-            "provider": provider,
-            "model": model,
-            "request_semantics_digest": request_digest,
-            "input_snapshot_digest": input_digest,
-            "policy_ref": "policy-anchor",
-            "policy_snapshot_digest": sha256_digest_json(
-                {"policy": "anchor"}
-            ),
-        },
+        "compactor_identity": (
+            {
+                "parent_host_run_id": run_id,
+                "parent_session_id": _SESSION_ID,
+                "compaction_operation_id": f"operation-{call_index}",
+                "compactor_engine_run_id": f"compactor-engine-{call_index}",
+                "compaction_attempt_number": call_index + 1,
+                "compaction_request_digest": sha256_digest_json(
+                    {"compaction_request": call_index}
+                ),
+                "compactor_input_projection_ref": (
+                    f"payload-projection:{call_index}"
+                ),
+            }
+            if compactor
+            else None
+        ),
+        "sizing_snapshot": (
+            {
+                "status": "not_applicable",
+                "reason": None,
+                "sizing_stage": None,
+                "estimator_id": None,
+                "estimator_version": None,
+                "estimator_digest": None,
+                "conservative_input_tokens": None,
+                "context_window_size": None,
+                "provider": None,
+                "model": None,
+                "request_semantics_digest": None,
+                "input_snapshot_digest": None,
+                "policy_ref": None,
+                "policy_snapshot_digest": None,
+            }
+            if compactor
+            else {
+                "status": "complete",
+                "reason": None,
+                "sizing_stage": (
+                    "ordinary" if call_index == 0 else "continuation"
+                ),
+                "estimator_id": CONTEXT_ESTIMATOR_CONTRACT.estimator_id,
+                "estimator_version": estimator_version,
+                "estimator_digest": estimator_digest,
+                "conservative_input_tokens": conservative_tokens,
+                "context_window_size": window,
+                "provider": provider,
+                "model": model,
+                "request_semantics_digest": request_digest,
+                "input_snapshot_digest": input_digest,
+                "policy_ref": "policy-anchor",
+                "policy_snapshot_digest": sha256_digest_json(
+                    {"policy": "anchor"}
+                ),
+            }
+        ),
         "diagnostic": None,
     }
 
@@ -922,9 +1032,11 @@ def _link_payload(
     iteration_id: str,
     manifest_row: EventLogRow,
     role_digest: str,
+    compactor: bool = False,
 ) -> Mapping[str, JsonValue]:
     """构造strict accepted iteration link。
 
+    :param compactor: 是否构造应被anchor resolver整体排除的compactor link。
     :returns: canonical link payload。
     :raises AssertionError: manifest descriptor缺失时抛出。
     """
@@ -942,14 +1054,22 @@ def _link_payload(
         "manifest_schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
         "runner_call_index": call_index,
         "runner_call_kind": (
-            "initial_user_dispatch"
-            if call_index == 0
-            else "tool_result_continuation"
+            "compactor_proposal"
+            if compactor
+            else (
+                "initial_user_dispatch"
+                if call_index == 0
+                else "tool_result_continuation"
+            )
         ),
         "runner_call_trigger_reason": (
-            "initial_user_input"
-            if call_index == 0
-            else "tool_results_available"
+            "context_compaction_initial_proposal"
+            if compactor
+            else (
+                "initial_user_input"
+                if call_index == 0
+                else "tool_results_available"
+            )
         ),
         "iteration_id": iteration_id,
         "iteration_index": call_index,

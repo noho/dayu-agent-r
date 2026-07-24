@@ -132,6 +132,7 @@ from dayu.host.context_budget import (
     ContextBudgetDecision,
     ContextEstimatorContract,
     ContextSizingFallbackReason,
+    ContextSizingResult,
     ContextSizingStage,
     build_conservative_context_sizing_result,
     build_context_sizing_result,
@@ -339,11 +340,6 @@ _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
 _CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED = "USAGE_REPORTED"
 _CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN = "unknown"
-_USAGE_PAIRING_STATUS_COMPLETE = "complete"
-_USAGE_PAIRING_STATUS_UNAVAILABLE = "unavailable"
-_USAGE_PAIRING_REASON_LINK_MISSING = "iteration_link_missing"
-_USAGE_PAIRING_REASON_LINK_INVALID = "iteration_link_invalid"
-_USAGE_PAIRING_REASON_MANIFEST_INCOMPLETE = "manifest_incomplete"
 _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
 _RUNNER_CALL_MANIFEST_STATUS_COMPLETE = "complete"
 _RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL = "limited_signal"
@@ -390,6 +386,21 @@ class _HostLifecycleSource(StrEnum):
 
     WORKER_CLEAN_EOF = "worker_clean_eof"
     WORKER_LOST = "worker_lost"
+
+
+class _UsagePairingStatus(StrEnum):
+    """usage 与 runner-call manifest pairing 的封闭状态。"""
+
+    COMPLETE = "complete"
+    UNAVAILABLE = "unavailable"
+
+
+class _UsagePairingReason(StrEnum):
+    """usage pairing unavailable 的封闭原因。"""
+
+    ITERATION_LINK_MISSING = "iteration_link_missing"
+    ITERATION_LINK_INVALID = "iteration_link_invalid"
+    MANIFEST_INCOMPLETE = "manifest_incomplete"
 
 
 class _TerminalCloseoutRollback(Exception):
@@ -669,8 +680,8 @@ class _UsageManifestPairing:
     :param policy_ref: manifest frozen policy ref。
     """
 
-    status: str
-    reason: str | None
+    status: _UsagePairingStatus
+    reason: _UsagePairingReason | None
     manifest_event_id: str | None
     manifest_payload_ref: str | None
     manifest_digest: str | None
@@ -682,10 +693,23 @@ class _UsageManifestPairing:
 
 
 @dataclass(frozen=True, slots=True)
-class _ContinuationFrozenSources:
-    """continuation manifest可复用的四项frozen source。
+class _UnavailableContinuationFrozenSources:
+    """continuation manifest 不完整 frozen source。
 
-    :param unavailable_reason: 首个缺失source的closed reason。
+    :param unavailable_reason: 首个缺失 source 的 closed reason。
+    :param tool_schema_snapshot_refs: pre-start manifest exact refs。
+    :param tool_schema_fragments: digest-verified selected schema JSON atoms。
+    """
+
+    unavailable_reason: RunnerCallSizingUnavailableReason
+    tool_schema_snapshot_refs: tuple[str, ...]
+    tool_schema_fragments: tuple[BudgetJsonFragment, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompleteContinuationFrozenSources:
+    """continuation manifest 完整 frozen source。
+
     :param tool_schema_snapshot_refs: pre-start manifest exact refs。
     :param tool_schema_fragments: digest-verified selected schema JSON atoms。
     :param context_window_size: frozen context window。
@@ -696,21 +720,25 @@ class _ContinuationFrozenSources:
     :param estimator_version: frozen estimator version。
     :param policy_ref: frozen policy ref。
     :param policy_snapshot_digest: frozen policy digest。
-    :param source_budget: matching source canonical fact；source不可用时为``None``。
+    :param source_budget: matching source canonical fact。
     """
 
-    unavailable_reason: RunnerCallSizingUnavailableReason | None
     tool_schema_snapshot_refs: tuple[str, ...]
     tool_schema_fragments: tuple[BudgetJsonFragment, ...]
-    context_window_size: int | None
-    provider: str | None
-    model: str | None
-    request_semantics_digest: str | None
-    estimator_id: str | None
-    estimator_version: str | None
-    policy_ref: str | None
-    policy_snapshot_digest: str | None
-    source_budget: ContextBudgetEvaluatedPayload | None
+    context_window_size: int
+    provider: str
+    model: str
+    request_semantics_digest: str
+    estimator_id: str
+    estimator_version: str
+    policy_ref: str
+    policy_snapshot_digest: str
+    source_budget: ContextBudgetEvaluatedPayload
+
+
+_ContinuationFrozenSources = (
+    _UnavailableContinuationFrozenSources | _CompleteContinuationFrozenSources
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,6 +754,36 @@ class _ReactiveRecoveryTerminal:
     """真实 fallback hard pressure 的 terminal closeout 摘要。"""
 
     result: EngineIngestResult
+
+
+@dataclass(frozen=True, slots=True)
+class _ReactiveRecoverySource:
+    """通过 recovery start 前置校验的 durable source。
+
+    :param run: 当前 ``RECOVERING`` Run。
+    :param attempt: 已终态 source Attempt。
+    :param candidate: source Attempt 的 strict frozen candidate。
+    """
+
+    run: RunRow
+    attempt: AttemptRow
+    candidate: PreparedRunnerCallCandidate
+
+
+@dataclass(frozen=True, slots=True)
+class _ReactiveRecoveryStartTruth:
+    """同一 transaction 写入的 reactive recovery start truths。
+
+    :param manifest: 新 Attempt 的 runner-call manifest。
+    :param budget_fact: 与 manifest 同源的 budget fact。
+    :param start_rows: ``RUN_STARTED`` 与 ``ATTEMPT_STARTED`` rows。
+    :param pending_dispatch: commit 后可唤醒的 pending dispatch。
+    """
+
+    manifest: EventLogRow
+    budget_fact: EventLogRow
+    start_rows: tuple[EventLogRow, EventLogRow]
+    pending_dispatch: PendingDispatchRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -750,238 +808,428 @@ class _StartReactiveRecoveryOperation:
         :raises HostDurableError: durable source、candidate 或 digest 非法时抛出。
         """
 
-        run = read_run_by_id(transaction, self.accepted.run_id)
-        source_attempt = read_attempt_by_id(
-            transaction,
-            self.accepted.source_attempt_id,
-        )
-        if (
-            run is None
-            or run.status is not RunStatus.RECOVERING
-            or run.current_attempt_id != self.accepted.source_attempt_id
-            or source_attempt is None
-            or source_attempt.run_id != self.accepted.run_id
-            or not is_terminal_attempt_status(source_attempt.status)
-        ):
-            raise _ReactiveRecoveryStartCasMissRollback()
-        _validate_reactive_recovery_outcome_event(
+        source = _load_reactive_recovery_source(
             transaction,
             self.event_log_store,
             accepted=self.accepted,
-            source_attempt=source_attempt,
         )
-        source = load_prepared_runner_call_source_in_transaction(
+        candidate = _prepare_reactive_recovery_candidate(
             transaction,
             self.event_log_store,
-            run_id=run.run_id,
-            attempt_id=source_attempt.attempt_id,
-            execution_id=source_attempt.execution_id,
-        )
-        source_candidate = source.candidate
-        current_input_event = self.event_log_store.read_event_by_id(
-            transaction,
-            run.input_event_id,
-        )
-        if current_input_event is None:
-            raise HostDurableError(
-                "reactive recovery current input event is missing"
-            )
-        candidate = prepare_runner_call_candidate_in_transaction(
-            transaction,
-            self.event_log_store,
-            run=run,
-            current_input_event=current_input_event,
-            continuity=SessionContinuityView(
-                messages=(),
-                source_refs=(),
-            ),
-            policy_snapshot=source_candidate.policy_snapshot,
-            tool_schemas=source_candidate.tool_schemas,
-            disable_tools=source_candidate.disable_tools,
-            tool_execution_mode=source_candidate.tool_execution_mode,
             memory_projection_policy=self.memory_projection_policy,
+            source=source,
         )
-        stage = (
-            ContextSizingStage.REACTIVE_POST_COMPACT
-            if self.accepted.compacted_event_id is not None
-            else ContextSizingStage.DISPATCH_FALLBACK
+        sizing = _build_reactive_recovery_sizing(
+            transaction,
+            self.event_log_store,
+            accepted=self.accepted,
+            candidate=candidate,
+            context_budget_policy=self.context_budget_policy,
         )
-        estimate = estimate_prepared_runner_call_candidate(
-            candidate,
-            self.context_budget_policy,
+        terminal = _close_reactive_fallback_hard_if_required(
+            transaction,
+            self.event_log_store,
+            accepted=self.accepted,
+            source=source,
+            sizing=sizing,
         )
-        if stage is ContextSizingStage.REACTIVE_POST_COMPACT:
-            sizing = build_conservative_context_sizing_result(
-                stage=stage,
-                candidate_input_cursor=candidate.candidate_input_cursor,
-                candidate_input_projection_ref=(
-                    candidate.candidate_input_projection_ref
-                ),
-                candidate_input_digest=candidate.input_snapshot_digest,
-                policy=self.context_budget_policy,
-                estimate=estimate,
-                fallback_reason=(
-                    ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
-                ),
-            )
-        else:
-            anchor_resolution = (
-                resolve_prepared_runner_call_context_anchor_in_transaction(
-                    transaction,
-                    self.event_log_store,
-                    candidate=candidate,
-                    context_window_size=(
-                        self.context_budget_policy.context_window_size
-                    ),
-                )
-            )
-            sizing = build_context_sizing_result(
-                stage=stage,
-                candidate_input_cursor=candidate.candidate_input_cursor,
-                candidate_input_projection_ref=(
-                    candidate.candidate_input_projection_ref
-                ),
-                candidate_input_digest=candidate.input_snapshot_digest,
-                policy=self.context_budget_policy,
-                estimate=estimate,
-                anchor_resolution=anchor_resolution,
-            )
-        if (
-            stage is ContextSizingStage.DISPATCH_FALLBACK
-            and sizing.budget_decision
-            is ContextBudgetDecision.BLOCK_HARD_THRESHOLD
-        ):
-            append_context_budget_evaluated_in_transaction(
-                transaction,
-                self.event_log_store,
-                session_id=run.session_id,
-                run_id=run.run_id,
-                attempt_id=None,
-                execution_id=None,
-                occurred_at=datetime.now(UTC),
-                result=sizing,
-            )
-            return _close_reactive_fallback_hard_in_transaction(
-                transaction,
-                self.event_log_store,
-                accepted=self.accepted,
-                run=run,
-                source_attempt=source_attempt,
-            )
-        occurred_at = datetime.now(UTC)
-        start_input = StartRecoveryRunInput(
-            run_id=self.accepted.run_id,
-            source_attempt_id=self.accepted.source_attempt_id,
-            run_started_event_id=_new_id("event-run-started-recovery"),
-            attempt_started_event_id=_new_id(
-                "event-attempt-started-recovery"
-            ),
-            attempt_id=_new_id("attempt-recovery"),
-            execution_id=_new_id("execution-recovery"),
-            dispatch_record_id=_new_id("dispatch-recovery"),
-            occurred_at=occurred_at,
-            actor=_EVENT_ACTOR,
-            source=_EVENT_SOURCE,
-            worker_kind=WorkerKind.LOCAL,
-            owner_host_instance_id=None,
-            context_compacted_event_id=self.accepted.compacted_event_id,
-            context_compacted_event_sequence=(
-                self.accepted.compacted_event_sequence
-            ),
-        )
-        manifest = record_prepared_runner_call_candidate_in_transaction(
+        if terminal is not None:
+            return terminal
+        start_input = _reactive_recovery_start_input(self.accepted)
+        truth = _commit_reactive_recovery_start_truths(
             transaction,
             self.event_log_store,
             self.payload_store,
-            run=run,
-            attempt_id=start_input.attempt_id,
-            execution_id=start_input.execution_id,
-            occurred_at=start_input.occurred_at,
+            source=source,
             candidate=candidate,
-            sizing_snapshot=complete_runner_call_sizing_snapshot(
-                sizing_stage=sizing.stage,
-                estimator_id=sizing.estimator_contract.estimator_id,
-                estimator_version=(
-                    sizing.estimator_contract.estimator_version
-                ),
-                estimator_digest=sizing.estimator_digest,
-                conservative_input_tokens=(
-                    sizing.conservative_input_tokens
-                ),
-                context_window_size=sizing.context_window_size,
-                provider=candidate.policy_snapshot.runner_spec.provider,
-                model=candidate.policy_snapshot.runner_spec.model,
-                request_semantics_digest=(
-                    candidate.request_semantics_digest
-                ),
-                input_snapshot_digest=candidate.input_snapshot_digest,
-                policy_ref=sizing.policy_ref,
-                policy_snapshot_digest=sizing.policy_snapshot_digest,
+            sizing=sizing,
+            start_input=start_input,
+        )
+        return _reactive_recovery_started(
+            accepted=self.accepted,
+            truth=truth,
+        )
+
+
+def _load_reactive_recovery_source(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+) -> _ReactiveRecoverySource:
+    """校验 recovery start 前置状态并 strict-load source candidate。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :returns: Run、source Attempt 与 frozen candidate。
+    :raises _ReactiveRecoveryStartCasMissRollback: lifecycle 前置条件竞争时抛出。
+    :raises HostDurableError: outcome 或 source candidate 非法时抛出。
+    """
+
+    run = read_run_by_id(transaction, accepted.run_id)
+    source_attempt = read_attempt_by_id(
+        transaction,
+        accepted.source_attempt_id,
+    )
+    if (
+        run is None
+        or run.status is not RunStatus.RECOVERING
+        or run.current_attempt_id != accepted.source_attempt_id
+        or source_attempt is None
+        or source_attempt.run_id != accepted.run_id
+        or not is_terminal_attempt_status(source_attempt.status)
+    ):
+        raise _ReactiveRecoveryStartCasMissRollback()
+    _validate_reactive_recovery_outcome_event(
+        transaction,
+        event_log_store,
+        accepted=accepted,
+        source_attempt=source_attempt,
+    )
+    prepared_source = load_prepared_runner_call_source_in_transaction(
+        transaction,
+        event_log_store,
+        run_id=run.run_id,
+        attempt_id=source_attempt.attempt_id,
+        execution_id=source_attempt.execution_id,
+    )
+    return _ReactiveRecoverySource(
+        run=run,
+        attempt=source_attempt,
+        candidate=prepared_source.candidate,
+    )
+
+
+def _prepare_reactive_recovery_candidate(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    memory_projection_policy: MemoryProjectionPolicy,
+    source: _ReactiveRecoverySource,
+) -> PreparedRunnerCallCandidate:
+    """从 source frozen execution truth 组装 recovery complete candidate。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param memory_projection_policy: candidate memory policy。
+    :param source: 已校验的 recovery source。
+    :returns: identity-free complete candidate。
+    :raises HostDurableError: current input 缺失或 candidate source 非法时抛出。
+    """
+
+    current_input_event = event_log_store.read_event_by_id(
+        transaction,
+        source.run.input_event_id,
+    )
+    if current_input_event is None:
+        raise HostDurableError(
+            "reactive recovery current input event is missing"
+        )
+    source_candidate = source.candidate
+    return prepare_runner_call_candidate_in_transaction(
+        transaction,
+        event_log_store,
+        run=source.run,
+        current_input_event=current_input_event,
+        continuity=SessionContinuityView(
+            messages=(),
+            source_refs=(),
+        ),
+        policy_snapshot=source_candidate.policy_snapshot,
+        tool_schemas=source_candidate.tool_schemas,
+        disable_tools=source_candidate.disable_tools,
+        tool_execution_mode=source_candidate.tool_execution_mode,
+        memory_projection_policy=memory_projection_policy,
+    )
+
+
+def _build_reactive_recovery_sizing(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    candidate: PreparedRunnerCallCandidate,
+    context_budget_policy: ContextBudgetPolicy,
+) -> ContextSizingResult:
+    """为 reactive accepted/fallback candidate 构造同源 sizing result。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param candidate: complete recovery candidate。
+    :param context_budget_policy: frozen Host context policy。
+    :returns: stage-aware sizing result。
+    :raises HostDurableError: anchor durable truth 损坏时抛出。
+    :raises TypeError: candidate 或 policy atoms 非法时抛出。
+    :raises ValueError: sizing invariant 非法时抛出。
+    """
+
+    stage = (
+        ContextSizingStage.REACTIVE_POST_COMPACT
+        if accepted.compacted_event_id is not None
+        else ContextSizingStage.DISPATCH_FALLBACK
+    )
+    estimate = estimate_prepared_runner_call_candidate(
+        candidate,
+        context_budget_policy,
+    )
+    if stage is ContextSizingStage.REACTIVE_POST_COMPACT:
+        return build_conservative_context_sizing_result(
+            stage=stage,
+            candidate_input_cursor=candidate.candidate_input_cursor,
+            candidate_input_projection_ref=(
+                candidate.candidate_input_projection_ref
+            ),
+            candidate_input_digest=candidate.input_snapshot_digest,
+            policy=context_budget_policy,
+            estimate=estimate,
+            fallback_reason=(
+                ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
             ),
         )
-        budget_fact = append_context_budget_evaluated_in_transaction(
+    anchor_resolution = (
+        resolve_prepared_runner_call_context_anchor_in_transaction(
             transaction,
-            self.event_log_store,
-            session_id=run.session_id,
-            run_id=run.run_id,
-            attempt_id=start_input.attempt_id,
-            execution_id=start_input.execution_id,
-            occurred_at=start_input.occurred_at,
-            result=sizing,
+            event_log_store,
+            candidate=candidate,
+            context_window_size=context_budget_policy.context_window_size,
         )
-        result = start_recovery_run_with_starting_attempt_in_transaction(
-            transaction,
-            self.event_log_store,
-            start_input,
-        )
-        if (
-            result.status is not StateMutationStatus.UPDATED
-            or result.run is None
-            or result.attempt is None
-            or result.dispatch_record is None
-        ):
-            raise _ReactiveRecoveryStartCasMissRollback()
-        if (
-            result.attempt.attempt_id != start_input.attempt_id
-            or result.attempt.execution_id != start_input.execution_id
-            or result.dispatch_record.dispatch_record_id
-            != start_input.dispatch_record_id
-        ):
-            raise _ReactiveRecoveryStartCasMissRollback()
-        rows = _existing_rows(
-            self.event_log_store,
-            transaction,
-            (
-                start_input.run_started_event_id,
-                start_input.attempt_started_event_id,
-            ),
-        )
-        if len(rows) != 2:
-            raise _ReactiveRecoveryStartCasMissRollback()
-        pending_dispatch = PendingDispatchRecord(
+    )
+    return build_context_sizing_result(
+        stage=stage,
+        candidate_input_cursor=candidate.candidate_input_cursor,
+        candidate_input_projection_ref=(
+            candidate.candidate_input_projection_ref
+        ),
+        candidate_input_digest=candidate.input_snapshot_digest,
+        policy=context_budget_policy,
+        estimate=estimate,
+        anchor_resolution=anchor_resolution,
+    )
+
+
+def _close_reactive_fallback_hard_if_required(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    source: _ReactiveRecoverySource,
+    sizing: ContextSizingResult,
+) -> _ReactiveRecoveryTerminal | None:
+    """在真实 dispatch fallback 达到 hard 时提交 fact 并收口 Run。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param source: 已校验的 recovery source。
+    :param sizing: 当前 candidate sizing truth。
+    :returns: hard closeout 摘要；无需收口时返回 ``None``。
+    :raises _ReactiveRecoveryStartCasMissRollback: terminal transition 竞争时抛出。
+    :raises HostDurableError: failed fact 或 durable row 非法时抛出。
+    """
+
+    if (
+        sizing.stage is not ContextSizingStage.DISPATCH_FALLBACK
+        or sizing.budget_decision
+        is not ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+    ):
+        return None
+    append_context_budget_evaluated_in_transaction(
+        transaction,
+        event_log_store,
+        session_id=source.run.session_id,
+        run_id=source.run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        occurred_at=datetime.now(UTC),
+        result=sizing,
+    )
+    return _close_reactive_fallback_hard_in_transaction(
+        transaction,
+        event_log_store,
+        accepted=accepted,
+        run=source.run,
+        source_attempt=source.attempt,
+    )
+
+
+def _reactive_recovery_start_input(
+    accepted: _ReactiveRecoveryAccepted,
+) -> StartRecoveryRunInput:
+    """分配 reactive recovery 新 Attempt 的唯一 start identity。
+
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :returns: existing recovery transition 的 typed input。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    occurred_at = datetime.now(UTC)
+    return StartRecoveryRunInput(
+        run_id=accepted.run_id,
+        source_attempt_id=accepted.source_attempt_id,
+        run_started_event_id=_new_id("event-run-started-recovery"),
+        attempt_started_event_id=_new_id("event-attempt-started-recovery"),
+        attempt_id=_new_id("attempt-recovery"),
+        execution_id=_new_id("execution-recovery"),
+        dispatch_record_id=_new_id("dispatch-recovery"),
+        occurred_at=occurred_at,
+        actor=_EVENT_ACTOR,
+        source=_EVENT_SOURCE,
+        worker_kind=WorkerKind.LOCAL,
+        owner_host_instance_id=None,
+        context_compacted_event_id=accepted.compacted_event_id,
+        context_compacted_event_sequence=accepted.compacted_event_sequence,
+    )
+
+
+def _commit_reactive_recovery_start_truths(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    payload_store: PayloadStore,
+    *,
+    source: _ReactiveRecoverySource,
+    candidate: PreparedRunnerCallCandidate,
+    sizing: ContextSizingResult,
+    start_input: StartRecoveryRunInput,
+) -> _ReactiveRecoveryStartTruth:
+    """按 manifest、budget fact、start rows 顺序提交 recovery truths。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param payload_store: candidate/manifest payload primitive。
+    :param source: 已校验的 recovery source。
+    :param candidate: complete recovery candidate。
+    :param sizing: 与 candidate 同源的 sizing result。
+    :param start_input: 唯一 recovery start identity。
+    :returns: 同 transaction 写入的 start truths。
+    :raises _ReactiveRecoveryStartCasMissRollback: transition 或 identity 竞争时抛出。
+    :raises HostDurableError: payload、manifest 或 durable write 非法时抛出。
+    """
+
+    manifest = record_prepared_runner_call_candidate_in_transaction(
+        transaction,
+        event_log_store,
+        payload_store,
+        run=source.run,
+        attempt_id=start_input.attempt_id,
+        execution_id=start_input.execution_id,
+        occurred_at=start_input.occurred_at,
+        candidate=candidate,
+        sizing_snapshot=_reactive_recovery_sizing_snapshot(
+            candidate,
+            sizing,
+        ),
+    )
+    budget_fact = append_context_budget_evaluated_in_transaction(
+        transaction,
+        event_log_store,
+        session_id=source.run.session_id,
+        run_id=source.run.run_id,
+        attempt_id=start_input.attempt_id,
+        execution_id=start_input.execution_id,
+        occurred_at=start_input.occurred_at,
+        result=sizing,
+    )
+    result = start_recovery_run_with_starting_attempt_in_transaction(
+        transaction,
+        event_log_store,
+        start_input,
+    )
+    if (
+        result.status is not StateMutationStatus.UPDATED
+        or result.run is None
+        or result.attempt is None
+        or result.dispatch_record is None
+        or result.attempt.attempt_id != start_input.attempt_id
+        or result.attempt.execution_id != start_input.execution_id
+        or result.dispatch_record.dispatch_record_id
+        != start_input.dispatch_record_id
+    ):
+        raise _ReactiveRecoveryStartCasMissRollback()
+    rows = _existing_rows(
+        event_log_store,
+        transaction,
+        (
+            start_input.run_started_event_id,
+            start_input.attempt_started_event_id,
+        ),
+    )
+    if len(rows) != 2:
+        raise _ReactiveRecoveryStartCasMissRollback()
+    return _ReactiveRecoveryStartTruth(
+        manifest=manifest,
+        budget_fact=budget_fact,
+        start_rows=(rows[0], rows[1]),
+        pending_dispatch=PendingDispatchRecord(
             dispatch_record_id=result.dispatch_record.dispatch_record_id,
             run_id=result.run.run_id,
             attempt_id=result.attempt.attempt_id,
             execution_id=result.attempt.execution_id,
             execution_target=result.dispatch_record.execution_target,
             worker_kind=result.dispatch_record.worker_kind,
-        )
-        return _ReactiveRecoveryStarted(
-            result=EngineIngestResult(
-                status=EngineIngestStatus.ACCEPTED,
-                events=(
-                    self.accepted.result.events
-                    + (manifest, budget_fact)
-                    + rows
-                ),
-                terminal_closeout=False,
-                terminal_notice=None,
-                reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
-                transient_delta=None,
-                stop_worker_stream=True,
+        ),
+    )
+
+
+def _reactive_recovery_sizing_snapshot(
+    candidate: PreparedRunnerCallCandidate,
+    sizing: ContextSizingResult,
+) -> RunnerCallSizingSnapshot:
+    """把 recovery sizing result 投影为 complete manifest snapshot。
+
+    :param candidate: complete recovery candidate。
+    :param sizing: 同源 sizing result。
+    :returns: complete runner-call sizing snapshot。
+    :raises TypeError: typed atoms 非法时由 manifest owner 抛出。
+    :raises ValueError: snapshot invariant 非法时由 manifest owner 抛出。
+    """
+
+    return complete_runner_call_sizing_snapshot(
+        sizing_stage=sizing.stage,
+        estimator_id=sizing.estimator_contract.estimator_id,
+        estimator_version=sizing.estimator_contract.estimator_version,
+        estimator_digest=sizing.estimator_digest,
+        conservative_input_tokens=sizing.conservative_input_tokens,
+        context_window_size=sizing.context_window_size,
+        provider=candidate.policy_snapshot.runner_spec.provider,
+        model=candidate.policy_snapshot.runner_spec.model,
+        request_semantics_digest=candidate.request_semantics_digest,
+        input_snapshot_digest=candidate.input_snapshot_digest,
+        policy_ref=sizing.policy_ref,
+        policy_snapshot_digest=sizing.policy_snapshot_digest,
+    )
+
+
+def _reactive_recovery_started(
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    truth: _ReactiveRecoveryStartTruth,
+) -> _ReactiveRecoveryStarted:
+    """构造 transaction-local reactive recovery started 摘要。
+
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param truth: 本 transaction 新增的 manifest/fact/start truths。
+    :returns: commit 后可 dispatch 的 typed 摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _ReactiveRecoveryStarted(
+        result=EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=(
+                accepted.result.events
+                + (truth.manifest, truth.budget_fact)
+                + truth.start_rows
             ),
-            pending_dispatch=pending_dispatch,
-        )
+            terminal_closeout=False,
+            terminal_notice=None,
+            reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+            transient_delta=None,
+            stop_worker_stream=True,
+        ),
+        pending_dispatch=truth.pending_dispatch,
+    )
 
 
 def _validate_reactive_recovery_outcome_event(
@@ -3798,11 +4046,17 @@ class EngineEventIngestor:
         sizing = typed_manifest.sizing_snapshot
         if sizing.status is not RunnerCallSizingStatus.COMPLETE:
             return (manifest_event, None)
+        if not isinstance(
+            frozen_sources,
+            _CompleteContinuationFrozenSources,
+        ):
+            raise AssertionError(
+                "complete continuation sizing requires complete frozen sources"
+            )
         source_budget = frozen_sources.source_budget
         projection = typed_manifest.projection_descriptor
         if (
-            source_budget is None
-            or projection is None
+            projection is None
             or sizing.estimator_id is None
             or sizing.estimator_version is None
             or sizing.estimator_digest is None
@@ -4000,7 +4254,7 @@ class EngineEventIngestor:
         estimated_input_tokens = pairing.conservative_input_tokens
         status = (
             USAGE_OBSERVATION_STATUS_OBSERVED
-            if pairing.status == _USAGE_PAIRING_STATUS_COMPLETE
+            if pairing.status is _UsagePairingStatus.COMPLETE
             else USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE
         )
         try:
@@ -6429,8 +6683,7 @@ def _continuation_frozen_sources(
             tool_schema_snapshot_refs=tool_refs,
             tool_schema_fragments=tool_fragments,
         )
-    return _ContinuationFrozenSources(
-        unavailable_reason=None,
+    return _CompleteContinuationFrozenSources(
         tool_schema_snapshot_refs=tool_refs,
         tool_schema_fragments=tool_fragments,
         context_window_size=sizing.context_window_size,
@@ -6473,7 +6726,7 @@ def _unavailable_continuation_sources(
     *,
     tool_schema_snapshot_refs: tuple[str, ...] = (),
     tool_schema_fragments: tuple[BudgetJsonFragment, ...] = (),
-) -> _ContinuationFrozenSources:
+) -> _UnavailableContinuationFrozenSources:
     """构造closed unavailable continuation sources。
 
     :param reason: 首个不可用source原因。
@@ -6483,19 +6736,10 @@ def _unavailable_continuation_sources(
     :raises Exception: 不主动抛出异常。
     """
 
-    return _ContinuationFrozenSources(
+    return _UnavailableContinuationFrozenSources(
         unavailable_reason=reason,
         tool_schema_snapshot_refs=tool_schema_snapshot_refs,
         tool_schema_fragments=tool_schema_fragments,
-        context_window_size=None,
-        provider=None,
-        model=None,
-        request_semantics_digest=None,
-        estimator_id=None,
-        estimator_version=None,
-        policy_ref=None,
-        policy_snapshot_digest=None,
-        source_budget=None,
     )
 
 
@@ -6590,7 +6834,7 @@ def _continuation_sizing_snapshot(
             RunnerCallSizingUnavailableReason.CONTINUATION_PROJECTION_UNAVAILABLE,
             sizing_stage=ContextSizingStage.CONTINUATION,
         )
-    if frozen_sources.unavailable_reason is not None:
+    if isinstance(frozen_sources, _UnavailableContinuationFrozenSources):
         return unavailable_runner_call_sizing_snapshot(
             frozen_sources.unavailable_reason,
             sizing_stage=ContextSizingStage.CONTINUATION,
@@ -6636,23 +6880,17 @@ def _continuation_sizing_snapshot(
     )
     return complete_runner_call_sizing_snapshot(
         sizing_stage=ContextSizingStage.CONTINUATION,
-        estimator_id=cast(str, frozen_sources.estimator_id),
-        estimator_version=cast(str, frozen_sources.estimator_version),
+        estimator_id=frozen_sources.estimator_id,
+        estimator_version=frozen_sources.estimator_version,
         estimator_digest=estimator_digest,
         conservative_input_tokens=tokens,
-        context_window_size=cast(int, frozen_sources.context_window_size),
-        provider=cast(str, frozen_sources.provider),
-        model=cast(str, frozen_sources.model),
-        request_semantics_digest=cast(
-            str,
-            frozen_sources.request_semantics_digest,
-        ),
+        context_window_size=frozen_sources.context_window_size,
+        provider=frozen_sources.provider,
+        model=frozen_sources.model,
+        request_semantics_digest=frozen_sources.request_semantics_digest,
         input_snapshot_digest=input_snapshot_digest,
-        policy_ref=cast(str, frozen_sources.policy_ref),
-        policy_snapshot_digest=cast(
-            str,
-            frozen_sources.policy_snapshot_digest,
-        ),
+        policy_ref=frozen_sources.policy_ref,
+        policy_snapshot_digest=frozen_sources.policy_snapshot_digest,
     )
 
 
@@ -7410,11 +7648,11 @@ def _usage_manifest_pairing(
             matching.append(event)
     if not matching:
         return _unavailable_usage_manifest_pairing(
-            _USAGE_PAIRING_REASON_LINK_MISSING
+            _UsagePairingReason.ITERATION_LINK_MISSING
         )
     if len(matching) != 1:
         return _unavailable_usage_manifest_pairing(
-            _USAGE_PAIRING_REASON_LINK_INVALID
+            _UsagePairingReason.ITERATION_LINK_INVALID
         )
     link_event = matching[0]
     link = _payload_object(link_event)
@@ -7423,7 +7661,7 @@ def _usage_manifest_pairing(
         != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
     ):
         return _unavailable_usage_manifest_pairing(
-            _USAGE_PAIRING_REASON_LINK_INVALID,
+            _UsagePairingReason.ITERATION_LINK_INVALID,
             iteration_link_event_id=link_event.event_id,
         )
     manifest_event_id = _manifest_text(link, "manifest_event_id")
@@ -7439,7 +7677,7 @@ def _usage_manifest_pairing(
         or manifest_event.payload_digest != manifest_digest
     ):
         return _unavailable_usage_manifest_pairing(
-            _USAGE_PAIRING_REASON_MANIFEST_INCOMPLETE,
+            _UsagePairingReason.MANIFEST_INCOMPLETE,
             manifest_event_id=manifest_event_id,
             manifest_payload_ref=manifest_ref,
             manifest_digest=manifest_digest,
@@ -7451,7 +7689,7 @@ def _usage_manifest_pairing(
         or hot.manifest_digest != manifest_digest
     ):
         return _unavailable_usage_manifest_pairing(
-            _USAGE_PAIRING_REASON_MANIFEST_INCOMPLETE,
+            _UsagePairingReason.MANIFEST_INCOMPLETE,
             manifest_event_id=manifest_event_id,
             manifest_payload_ref=manifest_ref,
             manifest_digest=manifest_digest,
@@ -7479,14 +7717,14 @@ def _usage_manifest_pairing(
         or sizing.policy_ref is None
     ):
         return _unavailable_usage_manifest_pairing(
-            _USAGE_PAIRING_REASON_MANIFEST_INCOMPLETE,
+            _UsagePairingReason.MANIFEST_INCOMPLETE,
             manifest_event_id=manifest_event_id,
             manifest_payload_ref=manifest_ref,
             manifest_digest=manifest_digest,
             iteration_link_event_id=link_event.event_id,
         )
     return _UsageManifestPairing(
-        status=_USAGE_PAIRING_STATUS_COMPLETE,
+        status=_UsagePairingStatus.COMPLETE,
         reason=None,
         manifest_event_id=manifest_event_id,
         manifest_payload_ref=manifest_ref,
@@ -7500,7 +7738,7 @@ def _usage_manifest_pairing(
 
 
 def _unavailable_usage_manifest_pairing(
-    reason: str,
+    reason: _UsagePairingReason,
     *,
     manifest_event_id: str | None = None,
     manifest_payload_ref: str | None = None,
@@ -7519,7 +7757,7 @@ def _unavailable_usage_manifest_pairing(
     """
 
     return _UsageManifestPairing(
-        status=_USAGE_PAIRING_STATUS_UNAVAILABLE,
+        status=_UsagePairingStatus.UNAVAILABLE,
         reason=reason,
         manifest_event_id=manifest_event_id,
         manifest_payload_ref=manifest_payload_ref,
@@ -7546,8 +7784,8 @@ def _usage_pairing_payload(
     """
 
     return {
-        "status": pairing.status,
-        "reason": pairing.reason,
+        "status": pairing.status.value,
+        "reason": pairing.reason.value if pairing.reason is not None else None,
         "manifest_event_id": pairing.manifest_event_id,
         "manifest_payload_ref": pairing.manifest_payload_ref,
         "manifest_digest": pairing.manifest_digest,

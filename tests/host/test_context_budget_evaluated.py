@@ -26,6 +26,7 @@ from dayu.host.context_budget import (
     ContextSizingStage,
     build_conservative_context_sizing_result,
     build_context_sizing_result,
+    context_sizing_pressure_and_decision,
 )
 from dayu.host.context_events import (
     CONTEXT_BUDGET_EVALUATED,
@@ -63,6 +64,40 @@ _ESTIMATOR_DIGEST = (
 _OTHER_ESTIMATOR_DIGEST = (
     "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 )
+
+
+def test_soft_threshold_must_be_strictly_less_than_hard_across_boundaries() -> None:
+    """typed result、decision matrix与durable parser统一拒绝相等阈值。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一owner boundary接受``soft == hard``时抛出。
+    """
+
+    result = _sizing(stage=ContextSizingStage.ORDINARY, tokens=100)
+    with pytest.raises(ValueError, match="less than"):
+        replace(
+            result,
+            soft_threshold_tokens=result.hard_threshold_tokens,
+        )
+    with pytest.raises(ValueError, match="less than"):
+        context_sizing_pressure_and_decision(
+            stage=ContextSizingStage.ORDINARY,
+            predicted_input_tokens=100,
+            soft_threshold_tokens=900,
+            hard_threshold_tokens=900,
+        )
+
+    durable_payload = dict(
+        build_context_budget_evaluated_payload(
+            run_id="run-budget",
+            result=result,
+        )
+    )
+    durable_payload["soft_threshold_tokens"] = durable_payload[
+        "hard_threshold_tokens"
+    ]
+    with pytest.raises(ValueError, match="less than"):
+        parse_context_budget_evaluated_payload(durable_payload)
 
 
 @pytest.mark.parametrize(

@@ -71,6 +71,42 @@ _NOW = datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC)
 _TRIGGER_SOURCE_VALUES = tuple(source.value for source in ContextCompactionTriggerSource)
 
 
+def test_context_sizing_fallback_reason_has_only_sizing_owner_members() -> None:
+    """fallback reason只保留sizing owner实际产生的封闭成员。
+
+    :returns: ``None``。
+    :raises AssertionError: 错误owner的continuation source原因重新进入时抛出。
+    """
+
+    assert frozenset(reason.value for reason in ContextSizingFallbackReason) == (
+        frozenset(
+            {
+                "usage_missing",
+                "usage_invalid",
+                "usage_ambiguous",
+                "iteration_incomplete",
+                "iteration_completion_ambiguous",
+                "iteration_finish_reason_ineligible",
+                "iteration_link_missing",
+                "iteration_link_invalid",
+                "manifest_incomplete",
+                "manifest_mismatch",
+                "runner_call_kind_ineligible",
+                "provider_mismatch",
+                "model_mismatch",
+                "context_window_mismatch",
+                "estimator_contract_mismatch",
+                "request_semantics_mismatch",
+                "accepted_compact_invalidated",
+                "lineage_gap",
+                "anchor_value_invalid",
+                "prediction_non_positive",
+                "arithmetic_range_invalid",
+            }
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("stage", "estimated_tokens", "expected_pressure", "expected_decision"),
     (

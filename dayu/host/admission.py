@@ -79,6 +79,7 @@ from dayu.host._runner_call_manifest import (
     unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.context_budget import (
+    BudgetEstimate,
     ContextBudgetPolicy,
     ContextSizingResult,
     ContextSizingStage,
@@ -3074,6 +3075,7 @@ def _create_steer_attempt_result(
         memory_projection_policy=memory_projection_policy,
     )
     sizing: ContextSizingResult | None = None
+    estimate: BudgetEstimate | None = None
     if context_budget_policy is None:
         sizing_snapshot = unavailable_runner_call_sizing_snapshot(
             RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
@@ -3120,9 +3122,9 @@ def _create_steer_attempt_result(
         sizing_snapshot=sizing_snapshot,
     )
     if sizing is not None:
-        if context_budget_policy is None:
+        if context_budget_policy is None or estimate is None:
             raise HostDurableError(
-                "steer sizing exists without context budget policy"
+                "steer sizing exists without context budget estimate"
             )
         anchor_resolution = (
             resolve_prepared_runner_call_context_anchor_in_transaction(
@@ -3142,10 +3144,7 @@ def _create_steer_attempt_result(
             ),
             candidate_input_digest=sizing.candidate_input_digest,
             policy=context_budget_policy,
-            estimate=estimate_prepared_runner_call_candidate(
-                candidate,
-                context_budget_policy,
-            ),
+            estimate=estimate,
             anchor_resolution=anchor_resolution,
         )
         append_context_budget_evaluated_in_transaction(
