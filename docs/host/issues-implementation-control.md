@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-CTX-01` Usage-Anchored Adaptive Context Sizing。 |
 | active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
-| gate | `accepted PR review commit` |
+| gate | `draft-pr-open / final-closeout-pass` |
 | blocking open questions | None。 |
-| next entry point | AgentMiMo/AgentDS PR review-fix re-review artifacts=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-mimo.md`与`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-ds.md`，两路均为`PASS`且0个新actionable findings；Controller final adjudication=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted PR review protected commit并push，保持PR #183为draft，等待新head checks后进入final closeout。 |
+| next entry point | accepted PR review protected commit=`e2a627a2`已push；PR #183保持OPEN/draft且mergeable，R11/R12新head checks均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`。下一步由用户GitHub review并手工merge；Controller不mark ready、不请求reviewer、不merge。 |
 
 ## 推进规则
 
@@ -225,7 +225,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
 | WU-CLI-SMOKE-01-R2 | deferred | Expandable CLI thinking runtime display | CLI UI adapter lane / user decision；无 GitHub Issue | 等待明确用户 UX 要求；先裁决累计行上限、滚动/展开语义、TTY/非 TTY 与历史保留边界，不是当前 implementation entry point。 |
 | WU-CTX-04 | draft-pr-open / final-closeout-pass | Per-Session attachment ownership and proactive governance single-operation boundary | GitHub Issue #112 / draft PR #182 | accepted plan=`1f032b5e`；accepted Slice 1=`eda1d70e`；accepted Slice 2=`4ca0810b`；accepted Slice 3=`24dfcf37`；aggregate deepreview PASS；等待用户review/merge。 |
-| WU-CTX-01 | pending-next-after-merge | Usage-Anchored Adaptive Context Sizing | GitHub Issue #20；外部 body 待对齐 | PR #182 手工 merge 与目标 base preflight 通过后唯一 next Work Unit；实现 usage anchor + conservative-estimated delta，并在 goal confirmation 对全部 provider family 做真实流式调用核对 |
+| WU-CTX-01 | draft-pr-open / final-closeout-pass | Usage-Anchored Adaptive Context Sizing | GitHub Issue #20 / draft PR #183 | accepted plan=`06c143f2`；accepted Slice 1=`b6f297b4`；accepted Slice 2=`126e67ca`；accepted Slice 3=`fad15d39`；aggregate与PR review均PASS；等待用户review/merge。 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
@@ -906,6 +906,8 @@ AgentMiMo/AgentDS PR #183 whole-PR deepreview artifacts=`docs/reviews/wu-ctx-01-
 AgentCodex PR review fix artifact=`docs/reviews/wu-ctx-01-pr-183-review-fix-codex.md`；`CTRL-PR-01`已关闭：`HostContextUsageView`与`EntrypointContextUsage`均在typed public boundary拒绝`soft_threshold_tokens >= hard_threshold_tokens`，错误文本明确strict ordering，并分别补direct equality rejection与合法strict ordering测试。focused owner files=`76 passed`；clean full Host+Service=`2501 passed, 2 skipped, 6 deselected`；changed production branch coverage为Host `90%`、Service `83%`；full pyright=`0 errors, 0 warnings`；diff/allowlist/stale/README audit通过。下一步进入AgentMiMo/AgentDS双路PR review-fix re-review。
 
 AgentMiMo/AgentDS PR review-fix re-review artifacts=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-mimo.md`与`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-ds.md`，两路均为`PASS`，确认`CTRL-PR-01`关闭且0个新actionable findings。Controller final adjudication=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-controller-adjudication.md`，decision=`pass`；legacy recorder observation维持`reject-nondefect`。下一步创建accepted PR review protected commit并push；PR #183保持draft，等待新head checks通过后进入`draft-PR-pass / final closeout`。
+
+accepted PR review protected commit=`e2a627a2`已push到`github/feat/wu-ctx-01`。fresh fetch确认`main == github/main == 5afe71fe`，feature branch ahead 10 / behind 0；PR #183为OPEN/draft、mergeable=`MERGEABLE`，base=`main@5afe71fe`、accepted review head=`e2a627a2`。PR body已补充review-fix验证且保持`CONTEXT_BUDGET_EVALUATED`与adaptive estimator两个独立修改、missing provider usage回退不劣于原算法的说明；R11 `windows-upload-script`与R12 `windows-init-transaction`在该code head均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`；等待用户GitHub review/手工merge，Controller未mark ready、请求reviewer、merge、评论或修改Issue #20。
 
 ### 设计与代码核对
 
