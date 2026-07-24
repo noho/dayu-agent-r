@@ -158,7 +158,7 @@ git push -u github <branch>
 | active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
 | gate | `draft-pr-open / final-closeout-pass` |
 | blocking open questions | None。 |
-| next entry point | accepted PR review protected commit=`e2a627a2`已push；PR #183保持OPEN/draft且mergeable，R11/R12新head checks均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`。下一步由用户GitHub review并手工merge；Controller不mark ready、不请求reviewer、不merge。 |
+| next entry point | accepted PR review protected commit=`e2a627a2`已push；PR #183保持OPEN/draft且mergeable，R11/R12新head checks均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`。用户手工merge后，先在目标base完成merge状态、工作树与`main` fast-forward preflight，再进入已选定的`WU-OBS-00` goal confirmation；其第一项必须完成“现有Tool Trace是否足够支持日常分析”的证据检查。Controller不mark ready、不请求reviewer、不merge。 |
 
 ## 推进规则
 
@@ -173,11 +173,16 @@ git push -u github <branch>
 
 ## 实施顺序
 
-用户已明确选择并确认 `WU-CTX-01`。PR #182 已合并，目标 base merge 状态、工作树与 `main` fast-forward preflight 均已通过；`WU-CTX-01` 已激活并进入固定 gate workflow。
+用户已明确选择下一个 Work Unit 为 `WU-OBS-00`。当前 `WU-CTX-01` 已完成
+`draft-pr-open / final-closeout-pass`；PR #183 手工 merge 后，必须先在目标 base 依次完成
+merge 状态、工作树与 `main` fast-forward preflight，再进入 `WU-OBS-00` goal confirmation。
 
-1. 用户手工 merge PR #182 后，先在目标 base 依次完成 merge 状态、工作树、`main` fast-forward preflight；三项全部通过后，进入 `WU-CTX-01` goal confirmation。其唯一设计入口是 `docs/host/design.md` §25 “Context Governance”中的 Usage-Anchored Adaptive Context Sizing。
-2. `WU-CTX-01` 的 GitHub Issue #20 title / body 已与设计真源对齐。provider live evidence 不是进入 plan 的前置条件；usage 缺失、非法或 pairing 不可信时必须回退到当前完整输入的 conservative estimate，provider 不返回 usage 不得导致 Run 失败。
-3. Tool Trace diagnostics lane 若后续被选择，先推进 `WU-OBS-00`；`WU-OBS-00A` / `WU-OBS-00B` 是其子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立。
+1. `WU-OBS-00` goal confirmation 的第一项是“现有 Tool Trace 是否足够支持日常分析”的前置证据检查；检查结论必须先区分
+   trace signal 缺口与 analyzer / operator ergonomics 缺口，再判断本 Work Unit 的动机、范围和是否值得实施。
+2. `WU-OBS-00A` / `WU-OBS-00B` 是 `WU-OBS-00` 子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立；不得在 goal confirmation
+   前置检查中无证扩展子项或提前实现 producer/schema 变更。
+3. `WU-CTX-01` 的 GitHub Issue #20 title / body 已与设计真源对齐；PR #183 merge 后由
+   `Closes #20` 自动关闭。
 4. Retention lane 的固定顺序见“Retention Issue Dependency / Implementation Order”：`WU-RET-01` -> `WU-RET-03` -> `WU-RET-04` -> `WU-RET-02`。
 5. `WU-AUDIT-01`、`WU-AUDIT-02` 与 `WU-STRESS-SQLITE-01` 等 backlog 继续等待用户或主总控后续选定，不因本文档排序自动获得优先级；`WU-GOV-01`、`WU-CLI-SMOKE-01-R2`、`WU-CM-10` 与 `WU-CM-11` 保持 deferred。
 
@@ -211,7 +216,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
+| WU-OBS-00 | selected-next-after-merge | Tool Trace analyzer | GitHub Issue #70 | PR #183 merge与目标base preflight后进入goal confirmation；第一项先验证现有Tool Trace是否已足够支持日常分析，再裁决analyzer/producer真实缺口 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
@@ -233,7 +238,52 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。WU-OBS-P00 / #70 + #117 与 WU-OBS-SIGNALS-01 已完成 analyzer 所需的前置核心 trace signals；本条状态为 pending，可进入 GitHub Issue / dependency / code scope 核对与 discussion gate。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
+GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。WU-OBS-P00 / #70 + #117 与 WU-OBS-SIGNALS-01 已完成 analyzer 所需的前置核心 trace signals；本条状态为 `selected-next-after-merge`，在 PR #183 merge与目标base preflight后进入goal confirmation。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
+
+### Goal confirmation 前置检查：现有 Tool Trace 的日常分析充分性
+
+进入 plan 前，Controller 必须先回答：**目前生产代码实际生成的 Tool Trace，是否已经足够支持日常分析？**
+不得因为“尚无 analyzer 命令”就预设 trace signal 不足，也不得只凭 schema、类型或单元测试宣称 trace 已足够。
+
+检查必须：
+
+1. 先从设计真源提炼日常分析的最小问题集。至少验证当前 Tool Trace 能否直接解释：
+   - 模型请求了什么工具、业务参数是什么；
+   - Host 接受了什么 request / governance outcome；
+   - 工具最终返回了什么状态和业务可读结果；
+   - 哪些结果可进入 memory / 下一轮上下文；
+   - 常见失败、重复、等待 / 恢复、截断 / `fetch_more`、provider / protocol diagnostic
+     能否定位到 Host / Engine / Tool owner 与直接证据。
+2. 读取当前 production projection 代码，并抽样检查当前版本真实生成的代表性 hot
+   `trace_summary_json`、cold JSONL 与可解析 payload refs。优先使用实际运行产生的 trace；
+   若 workspace 没有足够样本，可通过现有生产接线生成最小本地样本，但不得先修改生产代码、
+   fixture 或 schema 来让检查通过。
+3. 产出“日常问题 -> 所需语义 -> 当前 trace 直接证据 -> `available / partial / missing /
+   not-evaluated` -> operator 需要的额外 join / code knowledge”矩阵。仅有 digest、ref、event id、
+   cursor 或必须人工联查 EventLog / SQLite / 源码才能理解时，不得判定为业务可读充分。
+4. 将结论明确分类为：
+   - `sufficient`：现有 trace signal 与日常可读入口都足够；
+   - `signal-sufficient-analyzer-missing`：信号足够，但缺少聚合、分层归因或可用入口；
+   - `signal-gap`：存在由真实样本证明的 producer / projection 语义缺口；
+   - `not-evaluable`：缺少代表性样本或证据，阻塞进入 plan。
+5. 对 `signal-gap` 逐项判定唯一语义 owner，并区分 analyzer 解析 / 展示缺口与
+   Tool Trace producer / projection contract 缺口。只有真实 trace 直接证据证明 producer
+   无法表达必要语义时，goal confirmation 才能提议修改 producer/schema；不得在 analyzer、
+   adapter、fixture 或报告层用 fallback、重算或 loose parsing 补偿。
+
+前置检查 artifact 放在
+`docs/reviews/wu-obs-00-goal-confirmation-tool-trace-sufficiency-controller.md`，必须记录样本来源、
+问题矩阵、结论、直接证据、owner 裁决、未覆盖场景与 blocking questions。
+
+裁决规则：
+
+- 若结论为 `sufficient`，goal confirmation 必须重新质疑 WU-OBS-00 的动机，证明仍存在独立且
+  值得实现的 analyzer 价值，否则缩小、defer 或取消本 Work Unit，不得机械进入 plan；
+- 若结论为 `signal-sufficient-analyzer-missing`，WU-OBS-00 默认只实现 analyzer /
+  operator-facing 入口，不修改 Tool Trace producer/schema；
+- 若结论为 `signal-gap`，只把证据成立且 owner 明确的缺口纳入 goal confirmation，并重新核对
+  GitHub Issue #70 / 子项 owner 与 scope；
+- 若结论为 `not-evaluable`，停止在 goal confirmation，不派发 plan。
 
 ### 设计与代码核对
 

@@ -108,7 +108,21 @@
 - merge、关闭或修改 Issue #20；
 - 删除分支、部署或发布 release。
 
+## Next entry point
+
+用户已选定下一个 Work Unit 为 `WU-OBS-00`。PR #183 手工 merge 后：
+
+1. 切回目标 base，拉取最新 `main`；
+2. 依次完成 merge 状态、工作树与 `main` fast-forward preflight；
+3. 进入 `WU-OBS-00` goal confirmation；
+4. goal confirmation 第一项先按
+   `docs/host/issues-implementation-control.md` 的约束检查“当前实际 Tool Trace 是否已经
+   足够支持日常分析”，并产出
+   `docs/reviews/wu-obs-00-goal-confirmation-tool-trace-sufficiency-controller.md`；
+5. 只有前置检查能区分真实 trace signal 缺口与 analyzer / operator ergonomics 缺口，且
+   Work Unit 动机仍成立时，才进入 plan。
+
 ## Final decision
 
 `final-closeout-pass`。WU-CTX-01 已完成到 draft PR handoff；下一步由用户进行 GitHub review
-与手工 merge。Controller 不自动扩大权限。
+与手工 merge，随后从最新 `main` 按上述入口启动 `WU-OBS-00`。Controller 不自动扩大权限。
