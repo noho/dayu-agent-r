@@ -117,10 +117,11 @@
 3. 进入 `WU-OBS-00` goal confirmation；
 4. goal confirmation 第一项先按
    `docs/host/issues-implementation-control.md` 的约束检查“当前实际 Tool Trace 是否已经
-   足够支持日常分析”，并产出
+   具备日常 analyzer 所需项目/字段”，并产出
    `docs/reviews/wu-obs-00-goal-confirmation-tool-trace-sufficiency-controller.md`；
-5. 只有前置检查能区分真实 trace signal 缺口与 analyzer / operator ergonomics 缺口，且
-   Work Unit 动机仍成立时，才进入 plan。
+5. 前置检查区分真实 trace signal 缺口与 analyzer / operator ergonomics 缺口：若 signal
+   足够则直接规划 analyzer；若项目/字段不足，则在同一 WU-OBS-00 先规划 Tool Trace contract /
+   producer / projection completion，再规划 analyzer。该检查不取消或 defer analyzer。
 
 ## Final decision
 

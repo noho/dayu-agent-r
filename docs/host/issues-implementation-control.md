@@ -158,7 +158,7 @@ git push -u github <branch>
 | active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
 | gate | `draft-pr-open / final-closeout-pass` |
 | blocking open questions | None。 |
-| next entry point | accepted PR review protected commit=`e2a627a2`已push；PR #183保持OPEN/draft且mergeable，R11/R12新head checks均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`。用户手工merge后，先在目标base完成merge状态、工作树与`main` fast-forward preflight，再进入已选定的`WU-OBS-00` goal confirmation；其第一项必须完成“现有Tool Trace是否足够支持日常分析”的证据检查。Controller不mark ready、不请求reviewer、不merge。 |
+| next entry point | accepted PR review protected commit=`e2a627a2`已push；PR #183保持OPEN/draft且mergeable，R11/R12新head checks均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`。用户手工merge后，先在目标base完成merge状态、工作树与`main` fast-forward preflight，再进入已选定的`WU-OBS-00` goal confirmation；其第一项检查现有Tool Trace项目/字段是否足够支撑日常analyzer，不足项在同一WU补齐后交付analyzer。Controller不mark ready、不请求reviewer、不merge。 |
 
 ## 推进规则
 
@@ -177,8 +177,9 @@ git push -u github <branch>
 `draft-pr-open / final-closeout-pass`；PR #183 手工 merge 后，必须先在目标 base 依次完成
 merge 状态、工作树与 `main` fast-forward preflight，再进入 `WU-OBS-00` goal confirmation。
 
-1. `WU-OBS-00` goal confirmation 的第一项是“现有 Tool Trace 是否足够支持日常分析”的前置证据检查；检查结论必须先区分
-   trace signal 缺口与 analyzer / operator ergonomics 缺口，再判断本 Work Unit 的动机、范围和是否值得实施。
+1. `WU-OBS-00` goal confirmation 的第一项是“现有 Tool Trace 项目/字段是否足够支持日常 analyzer”的前置证据检查；
+   检查结论必须先区分 trace signal 缺口与 analyzer / operator ergonomics 缺口，再决定同一 Work Unit 内是否需要先补
+   Tool Trace contract / producer / projection，不能据此取消 analyzer。
 2. `WU-OBS-00A` / `WU-OBS-00B` 是 `WU-OBS-00` 子项，`WU-OBS-01` 必须等待 analyzer 基础能力成立；不得在 goal confirmation
    前置检查中无证扩展子项或提前实现 producer/schema 变更。
 3. `WU-CTX-01` 的 GitHub Issue #20 title / body 已与设计真源对齐；PR #183 merge 后由
@@ -216,7 +217,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-OBS-00 | selected-next-after-merge | Tool Trace analyzer | GitHub Issue #70 | PR #183 merge与目标base preflight后进入goal confirmation；第一项先验证现有Tool Trace是否已足够支持日常分析，再裁决analyzer/producer真实缺口 |
+| WU-OBS-00 | selected-next-after-merge | Tool Trace analyzer | GitHub Issue #70 | PR #183 merge与目标base preflight后进入goal confirmation；先验证现有Tool Trace项目/字段是否足够，不足项在同一WU补齐后交付analyzer |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
@@ -242,7 +243,19 @@ GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug too
 
 ### Goal confirmation 前置检查：现有 Tool Trace 的日常分析充分性
 
-进入 plan 前，Controller 必须先回答：**目前生产代码实际生成的 Tool Trace，是否已经足够支持日常分析？**
+进入 plan 前，Controller 必须先回答：**目前生产代码实际生成的 Tool Trace 项目/字段，是否已经足够支撑日常
+Tool Trace Analyzer？** 该检查用于决定 WU-OBS-00 的内部实施顺序与 trace completion scope，不是
+WU-OBS-00 是否实施的 go / no-go gate。WU-OBS-00 的确定性交付目标始终包含 analyzer；若 trace 项目/字段缺失或
+语义不足，必须在同一 Work Unit 先补足正确 owner 的 contract / producer / projection，再实现 analyzer。
+
+OLD 仓库 `/Users/leo/workspace/dayu-agent` 中的
+`utils/analyze_tool_trace.py` 是可参考的简化 analyzer：它读取 Tool Trace JSONL 文件或目录，按
+run / iteration / tool call 聚合，并输出成功率、重复调用、截断 / `fetch_more`、payload 大小、
+失败签名、SSE protocol error、context pressure、trace integrity、run 调用链与 Markdown 建议。
+它只提供“日常 analyzer 应回答什么”的问题集与报告结构参考；OLD 的 `tool_trace_v2` schema、Engine-owned recorder、
+raw payload 布局、类型签名和代码实现都不是当前项目真源，不得复制成兼容路径或反向改变当前
+EventLog -> Host Tool Trace hot / cold projection owner。
+
 不得因为“尚无 analyzer 命令”就预设 trace signal 不足，也不得只凭 schema、类型或单元测试宣称 trace 已足够。
 
 检查必须：
@@ -262,11 +275,13 @@ GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug too
    not-evaluated` -> operator 需要的额外 join / code knowledge”矩阵。仅有 digest、ref、event id、
    cursor 或必须人工联查 EventLog / SQLite / 源码才能理解时，不得判定为业务可读充分。
 4. 将结论明确分类为：
-   - `sufficient`：现有 trace signal 与日常可读入口都足够；
-   - `signal-sufficient-analyzer-missing`：信号足够，但缺少聚合、分层归因或可用入口；
-   - `signal-gap`：存在由真实样本证明的 producer / projection 语义缺口；
-   - `not-evaluable`：缺少代表性样本或证据，阻塞进入 plan。
-5. 对 `signal-gap` 逐项判定唯一语义 owner，并区分 analyzer 解析 / 展示缺口与
+   - `analyzer-ready`：现有 trace 项目/字段足以支撑日常 analyzer，WU-OBS-00 可直接实施
+     analyzer / operator-facing 入口；
+   - `needs-trace-completion`：存在由真实样本证明的 producer / projection 项目、字段或业务可读语义缺口，
+     WU-OBS-00 plan 必须先安排 trace completion slice，再安排 analyzer slice；
+   - `not-evaluable`：缺少代表性样本或证据；继续在 goal confirmation 内生成/收集样本，证据完成前阻塞 plan，
+     但不取消或 defer WU-OBS-00。
+5. 对 `needs-trace-completion` 逐项判定唯一语义 owner，并区分 analyzer 解析 / 展示缺口与
    Tool Trace producer / projection contract 缺口。只有真实 trace 直接证据证明 producer
    无法表达必要语义时，goal confirmation 才能提议修改 producer/schema；不得在 analyzer、
    adapter、fixture 或报告层用 fallback、重算或 loose parsing 补偿。
@@ -277,13 +292,15 @@ GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug too
 
 裁决规则：
 
-- 若结论为 `sufficient`，goal confirmation 必须重新质疑 WU-OBS-00 的动机，证明仍存在独立且
-  值得实现的 analyzer 价值，否则缩小、defer 或取消本 Work Unit，不得机械进入 plan；
-- 若结论为 `signal-sufficient-analyzer-missing`，WU-OBS-00 默认只实现 analyzer /
-  operator-facing 入口，不修改 Tool Trace producer/schema；
-- 若结论为 `signal-gap`，只把证据成立且 owner 明确的缺口纳入 goal confirmation，并重新核对
-  GitHub Issue #70 / 子项 owner 与 scope；
-- 若结论为 `not-evaluable`，停止在 goal confirmation，不派发 plan。
+- 若结论为 `analyzer-ready`，WU-OBS-00 默认只实现 analyzer / operator-facing 入口，不修改
+  Tool Trace producer/schema；
+- 若结论为 `needs-trace-completion`，把证据成立且 owner 明确的缺口纳入同一 WU-OBS-00：
+  先补 Tool Trace contract / producer / projection 与 owner-level tests，再实现 analyzer；不得把
+  必需信号拆到未来 WU 后交付一个明知输入不足的 analyzer；
+- 若结论为 `not-evaluable`，停止在 goal confirmation 并补齐样本证据，不派发 plan；证据完成后仍继续
+  WU-OBS-00，不把该状态解释为取消、defer 或转移 analyzer；
+- 无论上述哪种结论，最终 success signal 都必须包含可运行的 Tool Trace analyzer；前置检查只决定是否增加
+  trace completion slice，不改变 WU-OBS-00 的交付目标。
 
 ### 设计与代码核对
 
