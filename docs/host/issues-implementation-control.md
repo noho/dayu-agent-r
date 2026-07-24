@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-OBS-00` Tool Trace Analyzer。 |
 | active work unit | `WU-OBS-00`；类型为 GitHub Issue #70 对应的 observability / debug tooling issue。 |
-| gate | `whole-PR deepreview pass / protected commit pending` |
+| gate | `draft-PR open / final-closeout-pass` |
 | blocking open questions | None。 |
-| next entry point | whole-PR fix双路re-review均PASS且0新actionable finding；Controller final adjudication=`docs/reviews/wu-obs-00-whole-pr-deepreview-final-controller-adjudication.md`，decision=`pass`。下一步创建whole-PR review protected commit、push并进入final closeout preflight。 |
+| next entry point | whole-PR review protected commit=`80914ba1`已推送；draft PR #186为OPEN/draft/MERGEABLE/CLEAN，final closeout artifact=`docs/reviews/wu-obs-00-final-closeout-controller.md`，decision=`pass`。等待用户review/merge；不得自行ready或merge。 |
 
 ## 推进规则
 
@@ -209,7 +209,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | ID | 状态 | Owner / Destination | 下一步 |
 |---|---|---|---|
-| WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-CLI-SMOKE-01-R2 | deferred-with-owner | CLI UI adapter lane / user decision；无 GitHub Issue | `CliThinkingRenderer` 当前把每个 delta 单行化并按 160 字符截断后持续追加到同一运行态行；累计行并非 160 字符总上限，也没有可展开 panel/history。仅在用户提出明确 thinking UX、累计缓冲上限与终端交互要求后进入 goal confirmation。不得修改 Host transient/durable contract、持久化 thinking、增加 replay，或改变 provider reasoning 开关。 |
 
@@ -217,9 +216,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-OBS-00 | whole-PR deepreview pass / protected commit pending | Tool Trace analyzer | GitHub Issue #70 / draft PR #186 | `PR-CTRL-01`与`PR-FIX-CTRL-01`已关闭；双路re-review PASS、0新finding；Controller final PASS |
-| WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
-| WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
+| WU-OBS-00 | draft-PR open / final-closeout-pass | Tool Trace analyzer | GitHub Issue #70 / draft PR #186 | accepted plan=`e1799abc`；Slices 1-4与aggregate/whole-PR review均PASS；等待用户review/merge |
+| WU-OBS-00A | delivered-by-parent / closes-on-merge | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / PR #186 | integrity/large-payload diagnostics已由WU-OBS-00实现；PR含`Closes #34` |
+| WU-OBS-00B | decision-complete / closes-on-merge | Usage observation projection correlation boundary | GitHub Issue #119 / PR #186 | 决策为不扩展usage correlation；usage只作post-call pressure；PR含`Closes #119` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
 | WU-AUDIT-01 | pending | Audit Ledger viewer and integrity report | GitHub Issue #72 | read-only audit JSONL ledger viewer；审计责任链 / 完整性校验，不做 Tool Trace root-cause analyzer |
 | WU-AUDIT-02 | pending | External audit delivery contract with local validation adapters | GitHub Issue #75 | async external audit delivery 语义；无真实外部系统时先用 Noop / FileMirror adapter 验证 contract |
@@ -262,6 +261,8 @@ AgentCodex首版whole-PR fix artifact=`docs/reviews/wu-obs-00-whole-pr-deeprevie
 AgentCodex correction保留`PR-CTRL-01`并关闭`PR-FIX-CTRL-01`：operation phase任意`BaseException`后均尝试close，operation primary优先；OSError仍映射typed read error，KeyboardInterrupt/SystemExit保持同一实例，close-only仍fatal。focused=`30 passed`、affected=`244 passed`、full pyright=`0 errors`、changed production branch coverage=`81%`，两种只读smoke七项前后不变。Controller final implementation review=`docs/reviews/wu-obs-00-whole-pr-deepreview-fix-final-controller-adjudication.md`，decision=`pass-to-dual-rereview`。
 
 whole-PR fix re-review artifacts=`docs/reviews/wu-obs-00-whole-pr-deepreview-rereview-mimo.md`与`docs/reviews/wu-obs-00-whole-pr-deepreview-rereview-ds.md`，两路均为PASS且0个新actionable finding；MiMo复跑full Host=`2328 passed, 1 skipped, 6 deselected`，DS复跑affected=`244 passed`，两路full pyright均0 errors。Controller final adjudication=`docs/reviews/wu-obs-00-whole-pr-deepreview-final-controller-adjudication.md`，decision=`pass`；下一步whole-PR review protected commit、push与final closeout preflight。
+
+whole-PR review protected commit=`80914ba1`已推送。fresh fetch确认main/FETCH_HEAD仍为`9588ee7a`、feature ahead 9 / behind 0、whole-range `diff --check`通过；PR #186为OPEN/draft/MERGEABLE/CLEAN，base/head SHA一致，reviews/comments/checks均为空。PR body已同步最终验证数字并设置`Closes #70`、`Closes #34`、`Closes #119`；#34完整性/大payload已交付，#119已裁决为不扩展usage producer，原`WU-ENG-02-S3-R1`从active residual table删除。#64、#36、#71继续作为明确后续owner。final closeout=`docs/reviews/wu-obs-00-final-closeout-controller.md`，decision=`pass`；等待用户review/merge，不自行ready或merge。
 
 ### Goal confirmation 前置检查：现有 Tool Trace 的日常分析充分性
 
