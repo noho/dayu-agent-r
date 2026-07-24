@@ -59,6 +59,8 @@ _FIXED_NOW = datetime(2026, 7, 24, 8, 0, tzinfo=UTC)
 class _FailingCloseReader(io.BufferedReader):
     """用于证明 cold handle close failure fatal 的 binary reader。"""
 
+    close_calls: int = 0
+
     def close(self) -> None:
         """模拟 close 失败。
 
@@ -66,10 +68,36 @@ class _FailingCloseReader(io.BufferedReader):
         :raises OSError: 始终抛出。
         """
 
+        self.close_calls += 1
         raise OSError("close failed")
 
     def force_close(self) -> None:
         """绕过模拟 override 关闭底层 reader。
+
+        :returns: ``None``。
+        :raises OSError: 真实 close 失败时抛出。
+        """
+
+        super().close()
+
+
+class _TrackingCloseReader(io.BufferedReader):
+    """用于观察 cold handle close lifecycle 的 binary reader。"""
+
+    close_calls: int = 0
+
+    def close(self) -> None:
+        """记录并执行真实 close。
+
+        :returns: ``None``。
+        :raises OSError: 真实 close 失败时抛出。
+        """
+
+        self.close_calls += 1
+        super().close()
+
+    def force_close(self) -> None:
+        """确保底层 reader 已关闭。
 
         :returns: ``None``。
         :raises OSError: 真实 close 失败时抛出。
@@ -869,6 +897,140 @@ def test_cold_handle_close_failure_is_fatal(
         with pytest.raises(ToolTraceAnalysisInputError) as captured:
             _load(_workspace_source(tmp_path))
         assert captured.value.reason is ToolTraceAnalysisInputFailureReason.COLD_SNAPSHOT_READ_FAILED
+        assert captured.value.summary == "关闭 cold snapshot handle 失败。"
+        assert isinstance(captured.value.__cause__, OSError)
+        assert str(captured.value.__cause__) == "close failed"
+    finally:
+        for reader in readers:
+            reader.force_close()
+
+
+def test_cold_prefix_read_failure_is_not_masked_by_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """exact read 与 close 同时失败时，读取失败必须保持 primary。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises OSError: 真实底层 reader 清理失败时抛出。
+    """
+
+    _build_workspace_baseline(tmp_path)
+    readers: list[_FailingCloseReader] = []
+    read_failure = OSError("primary exact read failed")
+
+    def open_failing_close(path: Path) -> BinaryIO:
+        """打开 close 会失败的真实 binary reader。
+
+        :param path: cold JSONL 路径。
+        :returns: failing-close buffered reader。
+        :raises OSError: raw file 无法打开时抛出。
+        """
+
+        raw = path.open("rb", buffering=0)
+        reader = _FailingCloseReader(raw)
+        readers.append(reader)
+        return reader
+
+    def fail_exact_read(handle: BinaryIO, length: int) -> NoReturn:
+        """模拟 exact-prefix read 直接失败。
+
+        :param handle: 已打开的同一 cold handle。
+        :param length: captured prefix 长度。
+        :returns: 永不返回。
+        :raises OSError: 始终抛出预先构造的读取失败。
+        """
+
+        del handle, length
+        raise read_failure
+
+    monkeypatch.setattr(
+        input_module,
+        "_open_cold_binary_file",
+        open_failing_close,
+    )
+    monkeypatch.setattr(input_module, "_read_exact_prefix", fail_exact_read)
+    try:
+        with pytest.raises(ToolTraceAnalysisInputError) as captured:
+            _load(_workspace_source(tmp_path))
+        assert captured.value.reason is ToolTraceAnalysisInputFailureReason.COLD_SNAPSHOT_READ_FAILED
+        assert captured.value.summary == "无法从同一 handle 读取完整 cold snapshot prefix。"
+        assert captured.value.__cause__ is read_failure
+        assert str(captured.value.__cause__) == "primary exact read failed"
+    finally:
+        for reader in readers:
+            reader.force_close()
+
+
+@pytest.mark.parametrize(
+    ("operation_failure", "close_fails"),
+    (
+        (KeyboardInterrupt("read interrupted"), False),
+        (SystemExit("read exited"), True),
+    ),
+)
+def test_non_os_operation_failure_closes_handle_and_preserves_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation_failure: BaseException,
+    close_fails: bool,
+) -> None:
+    """非 OSError operation failure 必须先 close 再原实例传播。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param operation_failure: 预先构造的 operation primary。
+    :param close_fails: close 是否同时抛出 secondary OSError。
+    :returns: ``None``。
+    :raises OSError: 真实底层 reader 清理失败时抛出。
+    """
+
+    _build_workspace_baseline(tmp_path)
+    readers: list[_FailingCloseReader | _TrackingCloseReader] = []
+
+    def open_tracking_reader(path: Path) -> BinaryIO:
+        """打开可观察 close lifecycle 的真实 binary reader。
+
+        :param path: cold JSONL 路径。
+        :returns: tracking 或 failing-close buffered reader。
+        :raises OSError: raw file 无法打开时抛出。
+        """
+
+        raw = path.open("rb", buffering=0)
+        reader: _FailingCloseReader | _TrackingCloseReader
+        if close_fails:
+            reader = _FailingCloseReader(raw)
+        else:
+            reader = _TrackingCloseReader(raw)
+        readers.append(reader)
+        return reader
+
+    def fail_operation(handle: BinaryIO, length: int) -> NoReturn:
+        """模拟 exact-prefix operation 抛出非 OSError primary。
+
+        :param handle: 已打开的同一 cold handle。
+        :param length: captured prefix 长度。
+        :returns: 永不返回。
+        :raises BaseException: 始终抛出预先构造的 operation failure。
+        """
+
+        del handle, length
+        raise operation_failure
+
+    monkeypatch.setattr(
+        input_module,
+        "_open_cold_binary_file",
+        open_tracking_reader,
+    )
+    monkeypatch.setattr(input_module, "_read_exact_prefix", fail_operation)
+    try:
+        with pytest.raises(type(operation_failure)) as captured:
+            _load(_workspace_source(tmp_path))
+        assert captured.value is operation_failure
+        assert len(readers) == 1
+        assert readers[0].close_calls == 1
     finally:
         for reader in readers:
             reader.force_close()

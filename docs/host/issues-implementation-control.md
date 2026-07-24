@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-OBS-00` Tool Trace Analyzer。 |
 | active work unit | `WU-OBS-00`；类型为 GitHub Issue #70 对应的 observability / debug tooling issue。 |
-| gate | `draft-PR open / whole-PR dual deepreview in-flight` |
+| gate | `whole-PR deepreview pass / protected commit pending` |
 | blocking open questions | None。 |
-| next entry point | readiness protected commit=`406dbe50`已推送；draft PR #186为OPEN/draft、base=`main`、head=`work/wu-obs-00`、GitHub merge state=`CLEAN`。下一步由AgentMiMo/AgentDS针对PR #186执行whole-PR双路deepreview。 |
+| next entry point | whole-PR fix双路re-review均PASS且0新actionable finding；Controller final adjudication=`docs/reviews/wu-obs-00-whole-pr-deepreview-final-controller-adjudication.md`，decision=`pass`。下一步创建whole-PR review protected commit、push并进入final closeout preflight。 |
 
 ## 推进规则
 
@@ -217,7 +217,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-OBS-00 | draft-PR open / whole-PR dual deepreview in-flight | Tool Trace analyzer | GitHub Issue #70 / draft PR #186 | readiness commit=`406dbe50`；PR OPEN/draft/CLEAN；等待whole-PR双路deepreview |
+| WU-OBS-00 | whole-PR deepreview pass / protected commit pending | Tool Trace analyzer | GitHub Issue #70 / draft PR #186 | `PR-CTRL-01`与`PR-FIX-CTRL-01`已关闭；双路re-review PASS、0新finding；Controller final PASS |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
@@ -254,6 +254,14 @@ AgentCodex第二次fix artifact=`docs/reviews/wu-obs-00-aggregate-deepreview-rer
 accepted aggregate protected commit=`29da5d1c`。fresh fetch确认local `main`、`github/main`与`FETCH_HEAD`均为`9588ee7a`，feature branch ahead 6 / behind 0，Issue #70仍OPEN且scope一致，同head不存在历史或当前PR。ready-to-open-draft-PR preflight=`docs/reviews/wu-obs-00-ready-to-open-draft-pr-controller.md`，decision=`pass`；whole-range check发现的Slice 3早期review artifact EOF多余空行已在readiness gate做纯格式删除，待readiness protected commit后复核。
 
 readiness protected commit=`406dbe50`；fresh fetch复核main仍为`9588ee7a`、feature ahead 7 / behind 0、whole-range `diff --check`通过且同head无重复PR。分支已推送，draft PR #186=`https://github.com/noho/dayu-agent-r/pull/186`，state=`OPEN`、draft=`true`、base/head=`main`/`work/wu-obs-00`、GitHub merge state=`CLEAN`。draft PR open artifact=`docs/reviews/wu-obs-00-draft-pr-open-controller.md`；下一步whole-PR双路deepreview。
+
+whole-PR deepreview artifacts=`docs/reviews/wu-obs-00-whole-pr-deepreview-mimo.md`与`docs/reviews/wu-obs-00-whole-pr-deepreview-ds.md`；MiMo=`pass`，DS=`needs-fix`。Controller在`docs/reviews/wu-obs-00-whole-pr-deepreview-controller-adjudication.md`接受cold exact-prefix read/identity失败被finally close失败覆盖的primary-error masking为`PR-CTRL-01`；修复必须保留read primary，同时保持close-only failure fatal。rules/open_host直接复用Host Tool Trace唯一私有lock-path owner helper没有复制语义或跨层暴露，驳回扩充dataset contract的建议。下一步AgentCodex fix。
+
+AgentCodex首版whole-PR fix artifact=`docs/reviews/wu-obs-00-whole-pr-deepreview-fix-codex.md`，read+close OSError已保留read primary且close-only仍fatal；但Controller直接注入`KeyboardInterrupt`复现`handle_closed=False`，证明删除finally后非OSError可在close前逃逸。fix Controller review=`docs/reviews/wu-obs-00-whole-pr-deepreview-fix-controller-adjudication.md`，decision=`needs-fix`，接受为`PR-FIX-CTRL-01`；下一步AgentCodex在同一owner补齐任意异常close与primary优先级。
+
+AgentCodex correction保留`PR-CTRL-01`并关闭`PR-FIX-CTRL-01`：operation phase任意`BaseException`后均尝试close，operation primary优先；OSError仍映射typed read error，KeyboardInterrupt/SystemExit保持同一实例，close-only仍fatal。focused=`30 passed`、affected=`244 passed`、full pyright=`0 errors`、changed production branch coverage=`81%`，两种只读smoke七项前后不变。Controller final implementation review=`docs/reviews/wu-obs-00-whole-pr-deepreview-fix-final-controller-adjudication.md`，decision=`pass-to-dual-rereview`。
+
+whole-PR fix re-review artifacts=`docs/reviews/wu-obs-00-whole-pr-deepreview-rereview-mimo.md`与`docs/reviews/wu-obs-00-whole-pr-deepreview-rereview-ds.md`，两路均为PASS且0个新actionable finding；MiMo复跑full Host=`2328 passed, 1 skipped, 6 deselected`，DS复跑affected=`244 passed`，两路full pyright均0 errors。Controller final adjudication=`docs/reviews/wu-obs-00-whole-pr-deepreview-final-controller-adjudication.md`，decision=`pass`；下一步whole-PR review protected commit、push与final closeout preflight。
 
 ### Goal confirmation 前置检查：现有 Tool Trace 的日常分析充分性
 

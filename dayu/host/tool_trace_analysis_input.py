@@ -789,6 +789,9 @@ def _capture_cold_prefix(cold_path: Path) -> _CapturedColdPrefix:
         prefix_byte_length=initial_stat.st_size,
         file_identity=identity,
     )
+    operation_failure: BaseException | None = None
+    close_failure: BaseException | None = None
+    content = b""
     try:
         content = _read_exact_prefix(handle, snapshot.prefix_byte_length)
         final_stat = os.fstat(handle.fileno())
@@ -798,23 +801,37 @@ def _capture_cold_prefix(cold_path: Path) -> _CapturedColdPrefix:
             or final_stat.st_size < snapshot.prefix_byte_length
         ):
             raise OSError("cold snapshot handle identity or size changed")
-    except OSError as exc:
-        raise ToolTraceAnalysisInputError(
-            reason=(ToolTraceAnalysisInputFailureReason.COLD_SNAPSHOT_READ_FAILED),
-            source_path=cold_path,
-            summary="无法从同一 handle 读取完整 cold snapshot prefix。",
-            cause_type=type(exc).__name__,
-        ) from exc
-    finally:
-        try:
-            handle.close()
-        except OSError as exc:
+    except BaseException as exc:
+        operation_failure = exc
+
+    try:
+        handle.close()
+    except BaseException as exc:
+        close_failure = exc
+
+    # operation 是本次 snapshot lifecycle 的 primary；close failure 只能在无 primary 时接管。
+    if operation_failure is not None:
+        if isinstance(operation_failure, OSError):
             raise ToolTraceAnalysisInputError(
-                reason=(ToolTraceAnalysisInputFailureReason.COLD_SNAPSHOT_READ_FAILED),
+                reason=(
+                    ToolTraceAnalysisInputFailureReason.COLD_SNAPSHOT_READ_FAILED
+                ),
+                source_path=cold_path,
+                summary="无法从同一 handle 读取完整 cold snapshot prefix。",
+                cause_type=type(operation_failure).__name__,
+            ) from operation_failure
+        raise operation_failure
+    if close_failure is not None:
+        if isinstance(close_failure, OSError):
+            raise ToolTraceAnalysisInputError(
+                reason=(
+                    ToolTraceAnalysisInputFailureReason.COLD_SNAPSHOT_READ_FAILED
+                ),
                 source_path=cold_path,
                 summary="关闭 cold snapshot handle 失败。",
-                cause_type=type(exc).__name__,
-            ) from exc
+                cause_type=type(close_failure).__name__,
+            ) from close_failure
+        raise close_failure
     return _CapturedColdPrefix(snapshot=snapshot, content=content)
 
 
