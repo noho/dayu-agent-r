@@ -154,11 +154,11 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | `WU-CTX-01` Usage-Anchored Adaptive Context Sizing。 |
-| active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
-| gate | `draft-pr-open / final-closeout-pass` |
+| phase | `WU-OBS-00` Tool Trace Analyzer。 |
+| active work unit | `WU-OBS-00`；类型为 GitHub Issue #70 对应的 observability / debug tooling issue。 |
+| gate | `implementation / Slice 1 / AgentCodex in-flight` |
 | blocking open questions | None。 |
-| next entry point | accepted PR review protected commit=`e2a627a2`已push；PR #183保持OPEN/draft且mergeable，R11/R12新head checks均为`SUCCESS`。final closeout=`docs/reviews/wu-ctx-01-final-closeout-controller.md`，decision=`final-closeout-pass`。用户手工merge后，先在目标base完成merge状态、工作树与`main` fast-forward preflight，再进入已选定的`WU-OBS-00` goal confirmation；其第一项检查现有Tool Trace项目/字段是否足够支撑日常analyzer，不足项在同一WU补齐后交付analyzer。Controller不mark ready、不请求reviewer、不merge。 |
+| next entry point | 第二次双路plan re-review artifacts=`docs/reviews/plan-review-20260724-115418.md`与`docs/reviews/plan-review-20260724-115105.md`均为`pass`且0 actionable findings。Controller final adjudication=`docs/reviews/wu-obs-00-plan-second-rereview-controller-adjudication.md`，decision=`pass / accepted-plan-ready`。创建accepted plan保护提交后，由AgentCodex只实施Slice 1 trusted input snapshot/integrity boundary；完成后进入AgentMiMo/AgentDS双路code review，不得提前Slice 2。 |
 
 ## 推进规则
 
@@ -217,7 +217,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-OBS-00 | selected-next-after-merge | Tool Trace analyzer | GitHub Issue #70 | PR #183 merge与目标base preflight后进入goal confirmation；先验证现有Tool Trace项目/字段是否足够，不足项在同一WU补齐后交付analyzer |
+| WU-OBS-00 | implementation / Slice 1 in-flight | Tool Trace analyzer | GitHub Issue #70 | second re-review双路PASS；Controller final adjudication PASS；accepted plan commit后AgentCodex实施Slice 1 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
@@ -239,7 +239,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。WU-OBS-P00 / #70 + #117 与 WU-OBS-SIGNALS-01 已完成 analyzer 所需的前置核心 trace signals；本条状态为 `selected-next-after-merge`，在 PR #183 merge与目标base preflight后进入goal confirmation。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
+GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。WU-OBS-P00 / #70 + #117 与 WU-OBS-SIGNALS-01 已完成 analyzer 所需的前置核心 trace signals；PR #183 merge与目标base preflight已经通过，goal confirmation已由用户确认。Tool Trace充分性artifact=`docs/reviews/wu-obs-00-goal-confirmation-tool-trace-sufficiency-controller.md`，结论=`analyzer-ready`；AgentCodex plan artifact=`docs/host/wu-obs-00-plan.md`。首轮双路review、两次plan fix与两轮双路re-review均已完成；最终re-review artifacts=`docs/reviews/plan-review-20260724-115418.md`与`docs/reviews/plan-review-20260724-115105.md`均为`pass`且0 actionable findings，Controller final adjudication=`docs/reviews/wu-obs-00-plan-second-rereview-controller-adjudication.md`，decision=`pass / accepted-plan-ready`。当前进入AgentCodex Slice 1 implementation。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
 
 ### Goal confirmation 前置检查：现有 Tool Trace 的日常分析充分性
 
