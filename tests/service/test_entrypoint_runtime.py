@@ -6,7 +6,7 @@ import ast
 import asyncio
 import json
 from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -1350,6 +1350,37 @@ async def test_submit_entrypoint_turn_maps_context_usage_without_recalculation(
         estimate_method=EntrypointContextEstimateMethod.CONSERVATIVE_FALLBACK,
         pressure_level=EntrypointContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
     )
+
+
+def test_entrypoint_context_usage_requires_strict_threshold_ordering() -> None:
+    """Service public DTO接受严格顺序并直接拒绝相等阈值。
+
+    :returns: ``None``。
+    :raises AssertionError: entrypoint boundary未保持``soft < hard``时抛出。
+    """
+
+    usage = EntrypointContextUsage(
+        predicted_input_tokens=700,
+        context_window_size=1_000,
+        utilization_basis_points=7_000,
+        soft_threshold_tokens=800,
+        hard_threshold_tokens=900,
+        estimate_method=EntrypointContextEstimateMethod.CONSERVATIVE_FALLBACK,
+        pressure_level=EntrypointContextPressureLevel.NORMAL,
+    )
+
+    assert usage.soft_threshold_tokens < usage.hard_threshold_tokens
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"EntrypointContextUsage\.soft_threshold_tokens must be less than "
+            r"hard_threshold_tokens"
+        ),
+    ):
+        replace(
+            usage,
+            soft_threshold_tokens=usage.hard_threshold_tokens,
+        )
 
 
 @pytest.mark.asyncio

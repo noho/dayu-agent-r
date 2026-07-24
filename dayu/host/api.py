@@ -3104,9 +3104,10 @@ class HostContextUsageView:
             self.hard_threshold_tokens,
             field_name="HostContextUsageView.hard_threshold_tokens",
         )
-        if self.soft_threshold_tokens > self.hard_threshold_tokens:
+        if self.soft_threshold_tokens >= self.hard_threshold_tokens:
             raise ValueError(
-                "HostContextUsageView thresholds are out of order"
+                "HostContextUsageView.soft_threshold_tokens must be less than "
+                "hard_threshold_tokens"
             )
         if not isinstance(self.estimate_method, ContextEstimateMethod):
             raise TypeError(

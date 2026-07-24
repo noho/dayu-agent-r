@@ -229,9 +229,10 @@ class EntrypointContextUsage:
             self.hard_threshold_tokens,
             field_name="EntrypointContextUsage.hard_threshold_tokens",
         )
-        if self.soft_threshold_tokens > self.hard_threshold_tokens:
+        if self.soft_threshold_tokens >= self.hard_threshold_tokens:
             raise ValueError(
-                "EntrypointContextUsage thresholds are out of order"
+                "EntrypointContextUsage.soft_threshold_tokens must be less than "
+                "hard_threshold_tokens"
             )
         if not isinstance(
             self.estimate_method,

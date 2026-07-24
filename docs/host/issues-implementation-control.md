@@ -156,9 +156,9 @@ git push -u github <branch>
 |---|---|
 | phase | `WU-CTX-01` Usage-Anchored Adaptive Context Sizing。 |
 | active work unit | `WU-CTX-01`；类型为 GitHub Issue #20 对应的 architecture-sensitive issue / public-contract change。 |
-| gate | `ready-to-open-draft-PR / pass` |
+| gate | `accepted PR review commit` |
 | blocking open questions | None。 |
-| next entry point | accepted aggregate deepreview commit=`798ba977`。ready-to-open-draft-PR preflight=`docs/reviews/wu-ctx-01-ready-to-open-draft-pr-controller.md`，decision=`pass`；远端base同步、Issue #20 scope、重复PR、commit range与最终publish diff均通过。下一步创建readiness protected commit、push feature branch并创建draft PR。 |
+| next entry point | AgentMiMo/AgentDS PR review-fix re-review artifacts=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-mimo.md`与`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-ds.md`，两路均为`PASS`且0个新actionable findings；Controller final adjudication=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted PR review protected commit并push，保持PR #183为draft，等待新head checks后进入final closeout。 |
 
 ## 推进规则
 
@@ -898,6 +898,14 @@ AgentCodex aggregate review fix artifact=`docs/reviews/wu-ctx-01-aggregate-deepr
 AgentMiMo/AgentDS aggregate re-review artifacts=`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-mimo.md`与`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-ds.md`，两路均为`pass`，确认`CTRL-AGG-01..09`全部关闭且0个新actionable findings；两路各自复跑focused=`209 passed`、full Host=`2259 passed, 2 skipped, 6 deselected`与pyright=`0 errors`。Controller final adjudication=`docs/reviews/wu-ctx-01-aggregate-deepreview-rereview-controller-adjudication.md`，decision=`pass`。下一步创建accepted aggregate deepreview protected commit并进入ready-to-open-draft-PR preflight。
 
 accepted aggregate deepreview protected commit=`798ba977`。fresh fetch确认local `main`、`github/main`与`FETCH_HEAD`均为`5afe71fe`，feature branch ahead 8 / behind 0，Issue #20仍OPEN且scope一致，同head不存在历史或当前PR。ready-to-open-draft-PR preflight=`docs/reviews/wu-ctx-01-ready-to-open-draft-pr-controller.md`，decision=`pass`；全range diff-check发现的两份早期artifact EOF多余空行已在readiness gate最小修复，最终working range `git diff --check github/main`通过。下一步创建readiness protected commit、push并创建draft PR。
+
+readiness protected commit=`ae524fe0`。feature branch已push到`github/feat/wu-ctx-01`；draft PR #183（`feat(host): add usage-anchored adaptive context sizing`）为OPEN/draft，base=`main`、head=`feat/wu-ctx-01`，创建后mergeable=`MERGEABLE`，R11/R12 Windows checks初始状态为`IN_PROGRESS`。下一步由AgentMiMo/AgentDS并行执行whole-PR deepreview，Controller裁决；不得在PR review gate通过前标记ready或请求外部reviewer。
+
+AgentMiMo/AgentDS PR #183 whole-PR deepreview artifacts=`docs/reviews/wu-ctx-01-pr-183-deepreview-mimo.md`与`docs/reviews/wu-ctx-01-pr-183-deepreview-ds.md`，两路总体均为`PASS`；R11/R12 Windows checks均为`SUCCESS`。Controller在`docs/reviews/wu-ctx-01-pr-183-review-controller-adjudication.md`裁决为`needs-fix`：接受唯一`CTRL-PR-01`，因为canonical sizing/fact严格要求`soft_threshold_tokens < hard_threshold_tokens`，而Host/Service public context-usage DTO仍允许equality，属于public projection contract与owner invariant漂移；DS的legacy recorder observation维持aggregate rejection，不是defect。下一步由AgentCodex最小修复两处public boundary与direct tests，再进入双路PR re-review。
+
+AgentCodex PR review fix artifact=`docs/reviews/wu-ctx-01-pr-183-review-fix-codex.md`；`CTRL-PR-01`已关闭：`HostContextUsageView`与`EntrypointContextUsage`均在typed public boundary拒绝`soft_threshold_tokens >= hard_threshold_tokens`，错误文本明确strict ordering，并分别补direct equality rejection与合法strict ordering测试。focused owner files=`76 passed`；clean full Host+Service=`2501 passed, 2 skipped, 6 deselected`；changed production branch coverage为Host `90%`、Service `83%`；full pyright=`0 errors, 0 warnings`；diff/allowlist/stale/README audit通过。下一步进入AgentMiMo/AgentDS双路PR review-fix re-review。
+
+AgentMiMo/AgentDS PR review-fix re-review artifacts=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-mimo.md`与`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-ds.md`，两路均为`PASS`，确认`CTRL-PR-01`关闭且0个新actionable findings。Controller final adjudication=`docs/reviews/wu-ctx-01-pr-183-review-fix-rereview-controller-adjudication.md`，decision=`pass`；legacy recorder observation维持`reject-nondefect`。下一步创建accepted PR review protected commit并push；PR #183保持draft，等待新head checks通过后进入`draft-PR-pass / final closeout`。
 
 ### 设计与代码核对
 

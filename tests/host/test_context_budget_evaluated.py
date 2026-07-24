@@ -15,6 +15,7 @@ from dayu.host.context_anchor import (
 from dayu.host.api import (
     HostActivityKind,
     HostActivityStatus,
+    HostContextUsageView,
 )
 from dayu.host.context_budget import (
     BudgetEstimate,
@@ -98,6 +99,37 @@ def test_soft_threshold_must_be_strictly_less_than_hard_across_boundaries() -> N
     ]
     with pytest.raises(ValueError, match="less than"):
         parse_context_budget_evaluated_payload(durable_payload)
+
+
+def test_host_context_usage_view_requires_strict_threshold_ordering() -> None:
+    """Host public DTO接受严格顺序并直接拒绝相等阈值。
+
+    :returns: ``None``。
+    :raises AssertionError: public boundary未保持``soft < hard``时抛出。
+    """
+
+    usage = HostContextUsageView(
+        predicted_input_tokens=700,
+        context_window_size=1_000,
+        utilization_basis_points=7_000,
+        soft_threshold_tokens=800,
+        hard_threshold_tokens=900,
+        estimate_method=ContextEstimateMethod.CONSERVATIVE_FALLBACK,
+        pressure_level=ContextPressureLevel.NORMAL,
+    )
+
+    assert usage.soft_threshold_tokens < usage.hard_threshold_tokens
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"HostContextUsageView\.soft_threshold_tokens must be less than "
+            r"hard_threshold_tokens"
+        ),
+    ):
+        replace(
+            usage,
+            soft_threshold_tokens=usage.hard_threshold_tokens,
+        )
 
 
 @pytest.mark.parametrize(
