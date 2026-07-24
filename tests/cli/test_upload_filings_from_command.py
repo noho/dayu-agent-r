@@ -57,12 +57,6 @@ _WINDOWS_POST_COMMAND_LINES: Final[tuple[str, ...]] = (
     "exit /b 0",
 )
 _WINDOWS_REAL_SMOKE_COMPANY_NAME: Final[str] = "Apple Inc."
-_R11_WINDOWS_WORKFLOW_PATH: Final[Path] = (
-    Path(__file__).resolve().parents[2]
-    / ".github"
-    / "workflows"
-    / "r11-upload-script-windows.yml"
-)
 _CAPTURED_BATCH_REQUESTS: list[UploadBatchPlanRequest] = []
 
 
@@ -585,28 +579,6 @@ def test_windows_renderer_rejects_arguments_that_escape_one_batch_line(
             regeneration_argv=("python", forbidden),
             platform="windows",
         )
-
-
-def test_r11_workflow_uses_fail_closed_exact_cmd_process_probe() -> None:
-    """R11 必须按进程精确捕获 ver/help exit，且不得全局忽略 native failure。
-
-    :returns: ``None``。
-    :raises AssertionError: workflow 恢复 native pipeline 或弱化 exact exit 时抛出。
-    """
-
-    workflow = _R11_WINDOWS_WORKFLOW_PATH.read_text(encoding="utf-8")
-
-    assert "[System.Diagnostics.ProcessStartInfo]::new()" in workflow
-    assert "$startInfo.UseShellExecute = $false" in workflow
-    assert "$startInfo.RedirectStandardOutput = $true" in workflow
-    assert "$startInfo.RedirectStandardError = $true" in workflow
-    assert '-ArgumentList @("/d", "/c", "ver")' in workflow
-    assert '-ArgumentList @("/?")' in workflow
-    assert "if ($verExitCode -ne 0)" in workflow
-    assert "if ($cmdHelpExitCode -ne 1)" in workflow
-    assert "cmd.exe /? 2>&1 |" not in workflow
-    assert "$PSNativeCommandUseErrorActionPreference" not in workflow
-    assert "$ErrorActionPreference" not in workflow
 
 
 def test_publisher_preserves_old_target_and_cleans_temp_on_replace_failure(

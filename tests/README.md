@@ -60,40 +60,24 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
   tests/cli/test_public_package_entrypoints.py -q
 ```
 
-真实 Windows gate 由 `.github/workflows/r11-upload-script-windows.yml` 在 Python 3.11 / `windows-latest` 上运行。
-workflow 用独立 `System.Diagnostics.Process` 精确捕获 stdout/stderr 与 exit code，先以
-`cmd.exe /d /c ver` 的 exact exit 0 证明真实 cmd execution capability，再要求 `cmd.exe /?` 的
-真实 help exit exact 1；它不全局忽略 PowerShell native failure，help exit 也不代替 execution gate：
+仓库当前不配置 GitHub Actions workflow；跨平台 CI 重建由
+[GitHub Issue #184](https://github.com/noho/dayu-agent-r/issues/184) 跟踪。以下真实 Windows nodes 保留为
+后续 CI 的验收资产：
 
 ```bash
 python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_noop_for_non_posix_tty tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete -q
 ```
 
 其中两个 upload nodes 必须实际经过 `cmd.exe /d /c`，分别验证对抗参数逐元素恢复和
-`python -m dayu.cli -> Service -> Fins -> temp storage` 闭环；非 Windows 本地环境只会明确 skip，不能替代 workflow 的
-真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境、
-`cmd.exe /d /c ver` 输出与 `cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
+`python -m dayu.cli -> Service -> Fins -> temp storage` 闭环；非 Windows 本地环境只会明确 skip，不能替代真实
+Windows runner 证据。
 CLI process owner 会在解析参数和输出前，把真实 stdout/stderr `TextIOWrapper` 明确配置为 strict UTF-8，保证 redirected
 init/upload 中文输出仍可编码；直接消费 Dayu CLI 或生成脚本所转发输出的测试 subprocess 同样显式使用
 `encoding="utf-8", errors="strict"` 解码，不依赖 Windows ambient code page。内存 capture 等非 OS wrapper 保持调用方自己的
 语义，纯 recorder、`reg.exe` 与 junction native 命令继续使用各自的平台输出契约。产品 `setx` persistence 调用的 native
-output 没有消费者，因此不由产品捕获；real-init gate 的 outer CLI 仍通过 anonymous binary handles 捕获 stdout/stderr，并在
-process 成功结束后 strict UTF-8 解码。
-
-真实 init Windows gate 由 `.github/workflows/r12-init-windows.yml` 使用 Python 3.11 与
-`constraints/lock-windows-x64-py311.txt` 运行。它执行真实 FIRST→PRESERVE→OVERWRITE→
-RESET No→RESET Yes 与 `ConfigLoader`/scene 重载，验证 ordinary Windows transaction 不依赖
-POSIX directory fsync；还覆盖真实 nested junction/reparse 外部 sentinel、普通 symlink 的精确
-privilege skip、workspace root identity、replace rollback、scan-delete race、真实 `setx` 用户环境
-round-trip/幂等 absent cleanup、非 POSIX TTY no-op owner boundary，以及 R11 的两个真实 cmd/upload nodes。
-real-init 的 secret 输入 owner 按 stdin capability 分流：TTY 继续使用隐藏输入，redirected stdin 把提示写到 stderr 后
-逐项读取一行，避免 Windows console path 忽略重定向输入。跨平台 owner tests 固定覆盖 TTY/redirected 分流、LF/CRLF/
-bare CR、prompt flush、EOF 收敛、KeyboardInterrupt、required/optional/confirmation 顺序以及值不进入公开输出；真实
-Windows redirected-handle 组合仍由本 workflow 验收。
-outer CLI timeout 失败只投影 `category`、`timeout_seconds`、`returncode_at_timeout`、`cleanup`、
-`cleanup_returncode`，cleanup timeout 时再投影 `process_state_after_cleanup_timeout`；artifact 可记录环境变量名，但不记录
-stdin input value。上传 artifact 只包含 JUnit、版本、capability、source hashes 和环境变量名，不保存
-environment/registry values。
+output 没有消费者，因此不由产品捕获。真实 init Windows tests 继续覆盖 FIRST→PRESERVE→OVERWRITE→
+RESET No→RESET Yes、`ConfigLoader`/scene 重载、junction/reparse、rollback/race、`setx` round-trip、
+redirected stdin 与非 POSIX TTY owner boundary；新 CI 必须在 Windows runner 上调度这些现有测试。
 
 默认 pytest 配置会排除 `stress` marker，因此常规命令不会运行 Host production stress suite 或 transient delta stress。显式运行时需要覆盖默认 `addopts`：
 
