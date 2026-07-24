@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.tool_trace import ToolTraceHotRow
+from dayu.host.durable.tool_trace import (
+    ToolTraceHotRow,
+    ToolTraceResolvedRowPayloads,
+)
 from dayu.host.tool_trace_analysis import render_tool_trace_analysis_markdown
 from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceAnalysisLayer,
@@ -27,6 +30,7 @@ from dayu.host.tool_trace_analysis_input import (
     ToolTraceColdSnapshot,
     ToolTraceInputDiagnostic,
     ToolTraceInputDiagnosticCode,
+    ToolTraceJoinedRecord,
     ToolTracePayloadCategory,
     ToolTraceResolvedPayloadMeasure,
 )
@@ -101,6 +105,9 @@ def _record(
     normalized_arguments_digest: str | None = None,
     attempt_id: str | None = "attempt-1",
     execution_id: str | None = "execution-1",
+    provider_request_id: str | None = None,
+    client_correlation_id: str | None = None,
+    diagnostic_refs: tuple[str, ...] = (),
     trace_summary: Mapping[str, JsonValue] | None = None,
 ) -> ToolTraceColdRecord:
     """构造规则层已接受的 typed cold record。
@@ -114,6 +121,9 @@ def _record(
     :param normalized_arguments_digest: 可选 normalized digest。
     :param attempt_id: 可选 Attempt id。
     :param execution_id: 可选 execution id。
+    :param provider_request_id: 可选 provider-native request id。
+    :param client_correlation_id: 可选 client correlation id。
+    :param diagnostic_refs: source-owned diagnostic refs。
     :param trace_summary: source-owned structured summary。
     :returns: typed cold record。
     :raises: 无。
@@ -128,9 +138,9 @@ def _record(
         "execution_id": execution_id,
         "tool_call_id": tool_call_id,
         "tool_name": tool_name,
-        "provider_request_id": None,
-        "client_correlation_id": None,
-        "diagnostic_refs": [],
+        "provider_request_id": provider_request_id,
+        "client_correlation_id": client_correlation_id,
+        "diagnostic_refs": list(diagnostic_refs),
         "normalized_arguments_digest": normalized_arguments_digest,
         "payload_ref": None,
         "trace_summary": summary,
@@ -159,6 +169,16 @@ def _hot_row(record: ToolTraceColdRecord) -> ToolTraceHotRow:
     :raises: 无。
     """
 
+    provider_request_id = record.fields["provider_request_id"]
+    diagnostic_refs = record.fields["diagnostic_refs"]
+    trace_summary = record.fields["trace_summary"]
+    assert provider_request_id is None or isinstance(provider_request_id, str)
+    assert isinstance(diagnostic_refs, list)
+    assert all(isinstance(item, str) for item in diagnostic_refs)
+    assert isinstance(trace_summary, Mapping)
+    typed_diagnostic_refs = tuple(
+        item for item in diagnostic_refs if isinstance(item, str)
+    )
     return ToolTraceHotRow(
         trace_id=record.event_id,
         event_id=record.event_id,
@@ -171,19 +191,47 @@ def _hot_row(record: ToolTraceColdRecord) -> ToolTraceHotRow:
         execution_id="execution-1",
         tool_call_id=None,
         tool_name=None,
-        provider_request_id=None,
-        diagnostic_ref=None,
+        provider_request_id=provider_request_id,
+        diagnostic_ref=(
+            typed_diagnostic_refs[0] if typed_diagnostic_refs else None
+        ),
         normalized_arguments_digest=None,
         semantic_input_digest=None,
         result_digest=None,
         payload_ref=None,
         payload_digest=None,
         policy_decision_json=None,
-        trace_summary={},
+        trace_summary=trace_summary,
         cold_trace_ref=record.cold_trace_ref,
         cold_trace_digest=record.line_digest,
         projected_at="2026-07-24T00:00:00+00:00",
         updated_at="2026-07-24T00:00:00+00:00",
+    )
+
+
+def _joined_record(
+    record: ToolTraceColdRecord,
+    *,
+    source_event_payload: Mapping[str, JsonValue],
+) -> ToolTraceJoinedRecord:
+    """构造 resolver 已证明 source EventLog payload 的 joined record。
+
+    :param record: strict cold record。
+    :param source_event_payload: 模拟 resolver 校验通过的 source payload。
+    :returns: hot/cold/resolver joined record。
+    :raises: 无。
+    """
+
+    hot_row = _hot_row(record)
+    return ToolTraceJoinedRecord(
+        hot_row=hot_row,
+        cold_record=record,
+        resolved_payloads=ToolTraceResolvedRowPayloads(
+            row=hot_row,
+            source_event_payload=source_event_payload,
+            descriptor_payload=None,
+        ),
+        runner_call_projection=None,
     )
 
 
@@ -195,6 +243,7 @@ def _dataset(
     measures: tuple[ToolTraceResolvedPayloadMeasure, ...] = (),
     hot_store_available: bool = False,
     hot_rows: tuple[ToolTraceHotRow, ...] = (),
+    joined_records: tuple[ToolTraceJoinedRecord, ...] = (),
     cold_snapshot_available: bool = True,
 ) -> ToolTraceAnalysisDataset:
     """构造可信 normalized dataset。
@@ -205,6 +254,7 @@ def _dataset(
     :param measures: verified byte measures。
     :param hot_store_available: 是否已取得 hot snapshot。
     :param hot_rows: hot snapshot owner rows。
+    :param joined_records: resolver 校验通过的 hot/cold joins。
     :param cold_snapshot_available: 是否已取得 cold snapshot。
     :returns: immutable dataset。
     :raises: 无。
@@ -232,7 +282,7 @@ def _dataset(
         ),
         hot_rows=hot_rows,
         cold_records=records,
-        joined_records=(),
+        joined_records=joined_records,
         input_diagnostics=diagnostics,
         limitations=(),
         payload_measures=measures,
@@ -249,6 +299,437 @@ def _rules(report_rule_ids: tuple[str, ...], expected: str) -> bool:
     """
 
     return expected in report_rule_ids
+
+
+def _partial_signal(status: str) -> Mapping[str, JsonValue]:
+    """构造 producer contract 对齐的 partial signal。
+
+    :param status: ``none`` 或 ``present``。
+    :returns: typed partial signal JSON object。
+    :raises ValueError: status 不受支持时抛出。
+    """
+
+    if status == "none":
+        return {
+            "schema_version": 1,
+            "signal_source": "PROVIDER_PROTOCOL_ERROR",
+            "partial_tool_call_count": 0,
+            "summary_status": "none",
+            "raw_payload_present": True,
+            "partial_tool_calls": [],
+        }
+    if status == "present":
+        return {
+            "schema_version": 1,
+            "signal_source": "PROVIDER_PROTOCOL_ERROR",
+            "partial_tool_call_count": 1,
+            "summary_status": "present",
+            "raw_payload_present": True,
+            "partial_tool_calls": [
+                {
+                    "tool_call_index": 0,
+                    "tool_call_id": "call-partial",
+                    "name_fragment": "lookup",
+                    "arguments_byte_size": 4,
+                    "arguments_sha256": "a" * 64,
+                    "arguments_present": True,
+                }
+            ],
+        }
+    raise ValueError("unsupported partial signal status")
+
+
+def test_engine_provider_rules_build_complete_group_from_direct_identities(
+    tmp_path: Path,
+) -> None:
+    """Provider/protocol/terminal direct refs 形成一个 complete vendor block。"""
+
+    source = _workspace_source(tmp_path)
+    protocol = _record(
+        source,
+        sequence=1,
+        event_type="PROVIDER_PROTOCOL_ERROR",
+        provider_request_id="provider-1",
+        client_correlation_id="client-1",
+        diagnostic_refs=("raw-1", "provider-1"),
+        trace_summary={
+            "partial_tool_call_signal": _partial_signal("none"),
+            "failure_metadata": {
+                "failure_kind": "provider_protocol_error",
+                "provider_error_code": "invalid_stream",
+            },
+        },
+    )
+    diagnostic = _record(
+        source,
+        sequence=2,
+        event_type="PROVIDER_DIAGNOSTIC",
+        provider_request_id="provider-1",
+        client_correlation_id="client-1",
+        diagnostic_refs=("diag-1", "provider-1"),
+    )
+    terminal = _record(
+        source,
+        sequence=3,
+        event_type="RUN_FAILED",
+        provider_request_id="provider-1",
+        client_correlation_id="client-1",
+        diagnostic_refs=("engine-terminal",),
+        trace_summary={"engine_event_ref": "engine-terminal"},
+    )
+    records = (protocol, diagnostic, terminal)
+    joined = tuple(
+        _joined_record(
+            record,
+            source_event_payload={
+                "iteration_id": "iteration-1",
+                "error_code": (
+                    "invalid_stream"
+                    if record.event_type == "PROVIDER_PROTOCOL_ERROR"
+                    else None
+                ),
+                "diagnostic_code": (
+                    "usage_field_malformed"
+                    if record.event_type == "PROVIDER_DIAGNOSTIC"
+                    else None
+                ),
+            },
+        )
+        for record in records
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            records,
+            hot_store_available=True,
+            hot_rows=tuple(_hot_row(record) for record in records),
+            joined_records=joined,
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+    by_rule = {item.rule_id: item for item in report.findings}
+    block = report.vendor_debugging[0]
+
+    assert set(by_rule) >= {
+        "engine.provider_diagnostic",
+        "engine.provider_protocol_error",
+    }
+    assert block.status.value == "available"
+    assert block.provider_request_id == "provider-1"
+    assert block.client_correlation_id == "client-1"
+    assert block.attempt_ids == ("attempt-1",)
+    assert block.execution_ids == ("execution-1",)
+    assert block.iteration_ids == ("iteration-1",)
+    assert tuple(item.event_id for item in block.tool_trace_refs) == (
+        "event-1",
+        "event-2",
+        "event-3",
+    )
+    assert block.partial_tool_call_signal.value == "available"
+    assert block.limitations == ()
+
+
+def test_vendor_grouping_uses_client_only_and_keeps_missing_ids_per_event(
+    tmp_path: Path,
+) -> None:
+    """无 provider id 只按 client id 分组；两者皆缺时每 event 独立。"""
+
+    source = _workspace_source(tmp_path)
+    client_only_records = (
+        _record(
+            source,
+            sequence=1,
+            event_type="PROVIDER_DIAGNOSTIC",
+            client_correlation_id="client-only",
+        ),
+        _record(
+            source,
+            sequence=2,
+            event_type="RUN_FAILED",
+            client_correlation_id="client-only",
+            trace_summary={"engine_event_ref": "engine-2"},
+        ),
+    )
+    no_id_records = (
+        _record(
+            source,
+            sequence=3,
+            event_type="PROVIDER_DIAGNOSTIC",
+        ),
+        _record(
+            source,
+            sequence=4,
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            trace_summary={"partial_tool_call_signal": _partial_signal("none")},
+        ),
+    )
+    records = client_only_records + no_id_records
+    joined = tuple(
+        _joined_record(
+            record,
+            source_event_payload={"iteration_id": f"iteration-{record.event_sequence}"},
+        )
+        for record in records
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            records,
+            hot_store_available=True,
+            hot_rows=tuple(_hot_row(record) for record in records),
+            joined_records=joined,
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+    client_blocks = [
+        block
+        for block in report.vendor_debugging
+        if block.client_correlation_id == "client-only"
+    ]
+    no_id_blocks = [
+        block
+        for block in report.vendor_debugging
+        if block.client_correlation_id is None
+    ]
+
+    assert len(client_blocks) == 1
+    assert client_blocks[0].provider_request_id is None
+    assert len(client_blocks[0].tool_trace_refs) == 2
+    assert len(no_id_blocks) == 2
+    assert all(len(block.tool_trace_refs) == 1 for block in no_id_blocks)
+    issue_64 = [
+        limitation.summary
+        for block in report.vendor_debugging
+        for limitation in block.limitations
+        if limitation.reason_code == "provider_request_id_unavailable"
+    ]
+    assert issue_64
+    assert all(
+        "native Anthropic / Claude Code gateway-specific signal" in summary
+        and "未推断 adapter/provider family" in summary
+        for summary in issue_64
+    )
+
+
+def test_same_provider_id_conflicting_client_and_local_refs_is_finding(
+    tmp_path: Path,
+) -> None:
+    """同 provider id 的 client/local refs 冲突必须显式 finding。"""
+
+    source = _workspace_source(tmp_path)
+    first = _record(
+        source,
+        sequence=1,
+        event_type="PROVIDER_DIAGNOSTIC",
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        provider_request_id="provider-conflict",
+        client_correlation_id="client-a",
+    )
+    second = _record(
+        source,
+        sequence=2,
+        event_type="PROVIDER_PROTOCOL_ERROR",
+        attempt_id="attempt-2",
+        execution_id="execution-2",
+        provider_request_id="provider-conflict",
+        client_correlation_id="client-b",
+        trace_summary={"partial_tool_call_signal": _partial_signal("none")},
+    )
+    records = (first, second)
+    joined = (
+        _joined_record(
+            first,
+            source_event_payload={"iteration_id": "iteration-a"},
+        ),
+        _joined_record(
+            second,
+            source_event_payload={"iteration_id": "iteration-b"},
+        ),
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            records,
+            hot_store_available=True,
+            hot_rows=(_hot_row(first), _hot_row(second)),
+            joined_records=joined,
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+    conflict = next(
+        item
+        for item in report.findings
+        if item.rule_id == "engine.vendor_correlation_conflict"
+    )
+
+    assert conflict.layer is ToolTraceAnalysisLayer.ENGINE
+    assert conflict.severity is ToolTraceFindingSeverity.ERROR
+    assert conflict.priority is ToolTraceFindingPriority.MEDIUM
+    assert len(conflict.evidence) == 2
+    conflict_fields = conflict.evidence[0].observed["conflict_fields"]
+    assert isinstance(conflict_fields, list)
+    assert all(isinstance(item, str) for item in conflict_fields)
+    assert {
+        "client_correlation_id",
+        "attempt_id",
+        "execution_id",
+        "iteration_id",
+    }.issubset(conflict_fields)
+    assert report.vendor_debugging[0].status.value == "limited_signal"
+    assert any(
+        item.reason_code == "vendor_correlation_conflict"
+        for item in report.vendor_debugging[0].limitations
+    )
+
+
+def test_partial_signal_absent_none_and_present_remain_distinct(
+    tmp_path: Path,
+) -> None:
+    """Absent signal 是 limited；explicit none/present 都是 available signal。"""
+
+    source = _source(tmp_path)
+    records = (
+        _record(
+            source,
+            sequence=1,
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            provider_request_id="provider-absent",
+            client_correlation_id="client-absent",
+        ),
+        _record(
+            source,
+            sequence=2,
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            provider_request_id="provider-none",
+            client_correlation_id="client-none",
+            trace_summary={"partial_tool_call_signal": _partial_signal("none")},
+        ),
+        _record(
+            source,
+            sequence=3,
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            provider_request_id="provider-present",
+            client_correlation_id="client-present",
+            trace_summary={
+                "partial_tool_call_signal": _partial_signal("present")
+            },
+        ),
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(source, records),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+    blocks = {
+        block.provider_request_id: block for block in report.vendor_debugging
+    }
+    rule_ids = tuple(item.rule_id for item in report.findings)
+
+    assert blocks["provider-absent"].partial_tool_call_signal.value == (
+        "limited_signal"
+    )
+    assert blocks["provider-none"].partial_tool_call_signal.value == "available"
+    assert blocks["provider-present"].partial_tool_call_signal.value == (
+        "available"
+    )
+    assert rule_ids.count("engine.partial_tool_call_signal_missing") == 1
+    assert rule_ids.count("engine.partial_tool_call_present") == 1
+    assert any(
+        item.reason_code == "partial_tool_call_signal_missing"
+        for item in blocks["provider-absent"].limitations
+    )
+
+
+def test_file_only_provider_signal_is_limited_and_usage_never_joins(
+    tmp_path: Path,
+) -> None:
+    """File-only 缺 payload/iteration 明确 limited；usage 零参与 vendor grouping。"""
+
+    source = _source(tmp_path)
+    protocol = _record(
+        source,
+        sequence=1,
+        event_type="PROVIDER_PROTOCOL_ERROR",
+        provider_request_id="provider-1",
+        client_correlation_id="client-1",
+        trace_summary={"partial_tool_call_signal": _partial_signal("none")},
+    )
+    usage = _record(
+        source,
+        sequence=2,
+        event_type="USAGE_REPORTED",
+        provider_request_id="provider-1",
+        client_correlation_id="client-1",
+        trace_summary={
+            "iteration_id": "usage-iteration",
+            "context_pressure": {"status": "observed"},
+        },
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(source, (protocol, usage)),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+    block = report.vendor_debugging[0]
+    reason_codes = {item.reason_code for item in block.limitations}
+
+    assert len(report.vendor_debugging) == 1
+    assert tuple(item.event_id for item in block.tool_trace_refs) == ("event-1",)
+    assert block.iteration_ids == ()
+    assert {
+        "vendor_iteration_id_unavailable",
+        "vendor_source_payload_unavailable",
+    }.issubset(reason_codes)
+    assert block.status.value == "limited_signal"
+
+
+def test_runner_observation_mismatch_is_engine_finding(
+    tmp_path: Path,
+) -> None:
+    """Runner prepared/observed count/digest mismatch 归 Engine finding。"""
+
+    source = _source(tmp_path)
+    record = _record(
+        source,
+        sequence=1,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        trace_summary={
+            "iteration_id": "iteration-1",
+            "diagnostic": {
+                "status": "mismatch",
+                "reason": "role_sequence_digest_mismatch",
+                "observed_count": 3,
+                "expected_count": 2,
+                "observed_digest": "sha256:" + "b" * 64,
+                "expected_digest": "sha256:" + "c" * 64,
+                "consumer_boundary": "tool_trace_query",
+            },
+        },
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(source, (record,)),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+    finding = next(
+        item
+        for item in report.findings
+        if item.rule_id == "engine.runner_observation_mismatch"
+    )
+
+    assert finding.layer is ToolTraceAnalysisLayer.ENGINE
+    assert finding.evidence[0].observed["observed_count"] == 3
+    assert finding.evidence[0].observed["expected_count"] == 2
 
 
 def test_duplicate_governance_and_repeated_request_have_distinct_owners(

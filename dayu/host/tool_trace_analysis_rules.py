@@ -1,8 +1,8 @@
-"""Tool Trace Analyzer 的确定性聚合与 Host/Tool 诊断规则。
+"""Tool Trace Analyzer 的确定性聚合与分层诊断规则。
 
 本模块只消费 Slice 1 已建立的可信 typed dataset。它拥有 run/tool 聚合、
-confirmed finding、limitation、payload ranking、稳定排序与 finding id；
-不读取文件、不修改 Host truth，也不实现 provider/vendor 规则。
+confirmed finding、limitation、provider/vendor correlation、payload ranking、
+稳定排序与 finding id；不读取文件，也不修改 Host truth。
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceRunSummary,
     ToolTraceSignalCoverage,
     ToolTraceSignalStatus,
+    ToolTraceVendorDebuggingBlock,
 )
 from dayu.host.tool_trace_analysis_input import (
     ToolTraceAnalysisDataset,
@@ -58,6 +59,12 @@ _EVENT_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
     "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 )
+_EVENT_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
+_EVENT_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
+_EVENT_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
+_VENDOR_TERMINAL_EVENT_TYPES = frozenset(
+    ("RUN_SUCCEEDED", "RUN_FAILED", "RUN_CANCELLED", "RUN_LOST")
+)
 _FETCH_MORE_TOOL_NAME = FrameworkToolName.FETCH_MORE.value
 _FIELD_TRACE_SUMMARY = "trace_summary"
 _FIELD_FAILURE_METADATA = "failure_metadata"
@@ -76,6 +83,16 @@ _FIELD_DUPLICATE_SCOPE = "duplicate_scope"
 _FIELD_REUSE_PRIOR_EVENT_REFS = "reuse_prior_event_refs"
 _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
+_FIELD_PARTIAL_TOOL_CALL_SIGNAL = "partial_tool_call_signal"
+_FIELD_SUMMARY_STATUS = "summary_status"
+_FIELD_PARTIAL_TOOL_CALL_COUNT = "partial_tool_call_count"
+_FIELD_ITERATION_ID = "iteration_id"
+_FIELD_DIAGNOSTIC = "diagnostic"
+_FIELD_STATUS = "status"
+_FIELD_PROVIDER_ERROR_REF = "provider_error_ref"
+_FIELD_ENGINE_EVENT_REF = "engine_event_ref"
+_RUNNER_DIAGNOSTIC_MISMATCH = "mismatch"
+_PARTIAL_STATUS_PRESENT = "present"
 _TIMING_AVAILABLE = "available"
 _TIMING_MISSING = "missing_tool_result_meta"
 _TIMING_SOURCE = "tool_result_meta"
@@ -96,6 +113,15 @@ _FETCH_MORE_ARGUMENTS_UNAVAILABLE_REASON = (
     f"{FrameworkToolName.FETCH_MORE.value}_arguments_unavailable"
 )
 _TRUNCATION_FOLLOWUP_UNVERIFIED_REASON = "truncation_followup_unverified"
+_VENDOR_PROVIDER_ID_UNAVAILABLE_REASON = "provider_request_id_unavailable"
+_VENDOR_CLIENT_ID_UNAVAILABLE_REASON = "client_correlation_id_unavailable"
+_VENDOR_ATTEMPT_ID_UNAVAILABLE_REASON = "vendor_attempt_id_unavailable"
+_VENDOR_EXECUTION_ID_UNAVAILABLE_REASON = "vendor_execution_id_unavailable"
+_VENDOR_ITERATION_ID_UNAVAILABLE_REASON = "vendor_iteration_id_unavailable"
+_VENDOR_SOURCE_PAYLOAD_UNAVAILABLE_REASON = "vendor_source_payload_unavailable"
+_VENDOR_RUN_ID_UNAVAILABLE_REASON = "vendor_run_id_unavailable"
+_VENDOR_CORRELATION_CONFLICT_REASON = "vendor_correlation_conflict"
+_PARTIAL_SIGNAL_MISSING_REASON = "partial_tool_call_signal_missing"
 _LAYER_ORDER = {
     ToolTraceAnalysisLayer.HOST: 0,
     ToolTraceAnalysisLayer.ENGINE: 1,
@@ -141,6 +167,8 @@ class _RuleRecord:
     payload_ref: str | None
     diagnostic_refs: tuple[str, ...]
     trace_summary: Mapping[str, JsonValue]
+    iteration_id: str | None
+    source_event_payload: Mapping[str, JsonValue] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +234,11 @@ def build_tool_trace_analysis_report(
     context_findings, context_limitations = _context_results(records)
     findings.extend(context_findings)
     limitations.extend(context_limitations)
+    engine_findings, vendor_debugging, vendor_limitations = _engine_vendor_results(
+        records
+    )
+    findings.extend(engine_findings)
+    limitations.extend(vendor_limitations)
 
     payload_rankings = _payload_rankings(dataset, policy)
     findings.extend(_large_payload_findings(payload_rankings, policy))
@@ -236,10 +269,11 @@ def build_tool_trace_analysis_report(
             records,
             payload_rankings,
             ordered_limitations,
+            vendor_debugging,
         ),
         runs=runs,
         payload_rankings=payload_rankings,
-        vendor_debugging=(),
+        vendor_debugging=vendor_debugging,
         findings=ordered_findings,
         limitations=ordered_limitations,
     )
@@ -253,7 +287,18 @@ def _rule_records(dataset: ToolTraceAnalysisDataset) -> tuple[_RuleRecord, ...]:
     :raises: 无。
     """
 
-    records = [_rule_record_from_cold(record) for record in dataset.cold_records]
+    source_payloads = {
+        joined.cold_record.event_id: joined.resolved_payloads.source_event_payload
+        for joined in dataset.joined_records
+        if joined.resolved_payloads is not None
+    }
+    records = [
+        _rule_record_from_cold(
+            record,
+            source_event_payload=source_payloads.get(record.event_id),
+        )
+        for record in dataset.cold_records
+    ]
     cold_event_ids = {record.event_id for record in dataset.cold_records}
     hot_path = dataset.source.hot_db_path
     if hot_path is not None:
@@ -288,6 +333,8 @@ def _rule_records(dataset: ToolTraceAnalysisDataset) -> tuple[_RuleRecord, ...]:
                         _FIELD_DIAGNOSTIC_REFS,
                     ),
                     trace_summary=summary,
+                    iteration_id=_optional_text(summary, _FIELD_ITERATION_ID),
+                    source_event_payload=None,
                 )
             )
     return tuple(
@@ -303,10 +350,16 @@ def _rule_records(dataset: ToolTraceAnalysisDataset) -> tuple[_RuleRecord, ...]:
     )
 
 
-def _rule_record_from_cold(record: ToolTraceColdRecord) -> _RuleRecord:
+def _rule_record_from_cold(
+    record: ToolTraceColdRecord,
+    *,
+    source_event_payload: Mapping[str, JsonValue] | None,
+) -> _RuleRecord:
     """把 strict cold record 投影为规则输入。
 
     :param record: strict current-schema cold record。
+    :param source_event_payload: resolver 校验通过的 source EventLog payload；
+        file-only 或 resolver 不可用时为 ``None``。
     :returns: 规则输入。
     :raises: 无。
     """
@@ -342,6 +395,11 @@ def _rule_record_from_cold(record: ToolTraceColdRecord) -> _RuleRecord:
         payload_ref=_optional_text(fields, "payload_ref"),
         diagnostic_refs=_text_tuple(fields, _FIELD_DIAGNOSTIC_REFS),
         trace_summary=trace_summary,
+        iteration_id=_direct_iteration_id(
+            source_event_payload,
+            trace_summary,
+        ),
+        source_event_payload=source_event_payload,
     )
 
 
@@ -988,6 +1046,624 @@ def _context_finding(
     )
 
 
+def _engine_vendor_results(
+    records: tuple[_RuleRecord, ...],
+) -> tuple[
+    tuple[_FindingDraft, ...],
+    tuple[ToolTraceVendorDebuggingBlock, ...],
+    tuple[ToolTraceLimitation, ...],
+]:
+    """投影 Engine findings、vendor blocks 与 identity limitations。
+
+    :param records: 可信规则 records。
+    :returns: Engine finding drafts、vendor blocks、top-level limitations。
+    :raises: 无。
+    """
+
+    findings: list[_FindingDraft] = []
+    for record in records:
+        findings.extend(_engine_record_findings(record))
+
+    trigger_records = tuple(
+        record for record in records if _is_vendor_trigger(record)
+    )
+    grouped: dict[tuple[str, str], list[_RuleRecord]] = defaultdict(list)
+    limitations: list[ToolTraceLimitation] = []
+    for record in trigger_records:
+        if record.run_id is None:
+            limitations.append(
+                _record_limitation(
+                    _VENDOR_RUN_ID_UNAVAILABLE_REASON,
+                    "vendor diagnostic 缺少 direct run_id，无法构造冻结 block identity。",
+                    record,
+                )
+            )
+            continue
+        grouped[_vendor_group_key(record)].append(record)
+
+    blocks: list[ToolTraceVendorDebuggingBlock] = []
+    for group_key in sorted(
+        grouped,
+        key=lambda key: _record_sort_key(min(grouped[key], key=_record_sort_key)),
+    ):
+        group_records = tuple(sorted(grouped[group_key], key=_record_sort_key))
+        conflict_fields = _vendor_conflict_fields(group_records)
+        if conflict_fields:
+            findings.append(
+                _vendor_conflict_finding(group_records, conflict_fields)
+            )
+        block_limitations = _vendor_group_limitations(
+            group_records,
+            conflict_fields=conflict_fields,
+        )
+        limitations.extend(block_limitations)
+        blocks.append(
+            _vendor_block(
+                group_records,
+                limitations=block_limitations,
+            )
+        )
+    return tuple(findings), tuple(blocks), tuple(limitations)
+
+
+def _engine_record_findings(
+    record: _RuleRecord,
+) -> tuple[_FindingDraft, ...]:
+    """从单条 direct record 产生 Engine-owned findings。
+
+    :param record: 可信规则 record。
+    :returns: 本 record 确认的 Engine finding drafts。
+    :raises: 无。
+    """
+
+    findings: list[_FindingDraft] = []
+    if record.event_type == _EVENT_PROVIDER_DIAGNOSTIC:
+        findings.append(
+            _finding(
+                rule_id="engine.provider_diagnostic",
+                layer=ToolTraceAnalysisLayer.ENGINE,
+                severity=ToolTraceFindingSeverity.WARNING,
+                priority=ToolTraceFindingPriority.MEDIUM,
+                title="Provider diagnostic",
+                summary="当前 trace 明确记录了非致命 provider diagnostic。",
+                recommendation="使用 vendor debugging block 的 provider/local refs 核对 adapter。",
+                evidence=(
+                    _record_evidence(record, _provider_observed(record)),
+                ),
+            )
+        )
+    if record.event_type == _EVENT_PROVIDER_PROTOCOL_ERROR:
+        findings.append(
+            _finding(
+                rule_id="engine.provider_protocol_error",
+                layer=ToolTraceAnalysisLayer.ENGINE,
+                severity=ToolTraceFindingSeverity.ERROR,
+                priority=ToolTraceFindingPriority.HIGH,
+                title="Provider protocol error",
+                summary="当前 trace 明确记录了 provider protocol error。",
+                recommendation="使用 vendor debugging block 中的 request/local refs 报障。",
+                evidence=(
+                    _record_evidence(record, _provider_observed(record)),
+                ),
+            )
+        )
+        partial_signal = _mapping(
+            record.trace_summary,
+            _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
+        )
+        if partial_signal is None:
+            findings.append(
+                _finding(
+                    rule_id="engine.partial_tool_call_signal_missing",
+                    layer=ToolTraceAnalysisLayer.ENGINE,
+                    severity=ToolTraceFindingSeverity.WARNING,
+                    priority=ToolTraceFindingPriority.MEDIUM,
+                    title="Partial tool-call signal missing",
+                    summary=(
+                        "provider protocol error 没有 typed partial tool-call signal；"
+                        "不能解释为明确无 partial。"
+                    ),
+                    recommendation="检查 Engine provider protocol signal producer。",
+                    evidence=(_record_evidence(record, {}),),
+                )
+            )
+        elif (
+            _optional_text(partial_signal, _FIELD_SUMMARY_STATUS)
+            == _PARTIAL_STATUS_PRESENT
+        ):
+            findings.append(
+                _finding(
+                    rule_id="engine.partial_tool_call_present",
+                    layer=ToolTraceAnalysisLayer.ENGINE,
+                    severity=ToolTraceFindingSeverity.WARNING,
+                    priority=ToolTraceFindingPriority.MEDIUM,
+                    title="Partial tool-call present",
+                    summary="provider protocol signal 明确记录未完成工具调用摘要。",
+                    recommendation="核对 provider stream/tool-call parser 的增量组装边界。",
+                    evidence=(
+                        _record_evidence(
+                            record,
+                            _partial_signal_observed(partial_signal),
+                        ),
+                    ),
+                )
+            )
+    diagnostic = _mapping(record.trace_summary, _FIELD_DIAGNOSTIC)
+    if (
+        record.event_type == _EVENT_RUNNER_CALL_INPUT_ASSEMBLED
+        and diagnostic is not None
+        and _optional_text(diagnostic, _FIELD_STATUS)
+        == _RUNNER_DIAGNOSTIC_MISMATCH
+    ):
+        findings.append(
+            _finding(
+                rule_id="engine.runner_observation_mismatch",
+                layer=ToolTraceAnalysisLayer.ENGINE,
+                severity=ToolTraceFindingSeverity.ERROR,
+                priority=ToolTraceFindingPriority.MEDIUM,
+                title="Runner observation mismatch",
+                summary="Engine observed runner input 与 Host prepared manifest 直接冲突。",
+                recommendation="检查 runner observation 与 prepared input manifest 的同源关联。",
+                evidence=(
+                    _record_evidence(
+                        record,
+                        _runner_diagnostic_observed(diagnostic),
+                    ),
+                ),
+            )
+        )
+    return tuple(findings)
+
+
+def _is_vendor_trigger(record: _RuleRecord) -> bool:
+    """判断 record 是否是 vendor debugging 的直接触发事实。
+
+    :param record: 可信规则 record。
+    :returns: provider/protocol diagnostic 或带 direct provider refs 的 Run
+        terminal 时为 ``True``。
+    :raises: 无。
+    """
+
+    if record.event_type in (
+        _EVENT_PROVIDER_DIAGNOSTIC,
+        _EVENT_PROVIDER_PROTOCOL_ERROR,
+    ):
+        return True
+    if record.event_type not in _VENDOR_TERMINAL_EVENT_TYPES:
+        return False
+    return any(
+        (
+            record.provider_request_id is not None,
+            record.client_correlation_id is not None,
+            bool(record.diagnostic_refs),
+            _optional_text(
+                record.trace_summary,
+                _FIELD_PROVIDER_ERROR_REF,
+            )
+            is not None,
+            _optional_text(record.trace_summary, _FIELD_ENGINE_EVENT_REF)
+            is not None,
+        )
+    )
+
+
+def _vendor_group_key(record: _RuleRecord) -> tuple[str, str]:
+    """返回不使用 run/time 补偿的 vendor grouping key。
+
+    :param record: vendor trigger record。
+    :returns: provider id、client-only id 或 direct event identity key。
+    :raises: 无。
+    """
+
+    if record.provider_request_id is not None:
+        return "provider", record.provider_request_id
+    if record.client_correlation_id is not None:
+        return "client", record.client_correlation_id
+    return ("event", f"{record.source_path}\0{record.event_id}")
+
+
+def _vendor_conflict_fields(
+    records: tuple[_RuleRecord, ...],
+) -> tuple[str, ...]:
+    """找出同 provider id group 中互相冲突的 client/local identities。
+
+    :param records: 同一 vendor group 的 direct records。
+    :returns: 冲突字段名的 lexical tuple；非 provider group 返回空。
+    :raises: 无。
+    """
+
+    provider_ids = _sorted_values(item.provider_request_id for item in records)
+    if len(provider_ids) != 1:
+        return ()
+    identity_values = (
+        (
+            _FIELD_CLIENT_CORRELATION_ID,
+            _sorted_values(item.client_correlation_id for item in records),
+        ),
+        ("session_id", _sorted_values(item.session_id for item in records)),
+        ("run_id", _sorted_values(item.run_id for item in records)),
+        ("attempt_id", _sorted_values(item.attempt_id for item in records)),
+        (
+            "execution_id",
+            _sorted_values(item.execution_id for item in records),
+        ),
+        (
+            _FIELD_ITERATION_ID,
+            _sorted_values(item.iteration_id for item in records),
+        ),
+    )
+    return tuple(
+        field_name
+        for field_name, values in identity_values
+        if len(values) > 1
+    )
+
+
+def _vendor_conflict_finding(
+    records: tuple[_RuleRecord, ...],
+    conflict_fields: tuple[str, ...],
+) -> _FindingDraft:
+    """构造同 provider id 的 correlation conflict finding。
+
+    :param records: 同 provider id 的 direct records。
+    :param conflict_fields: 已确认冲突的 client/local 字段。
+    :returns: Engine correlation conflict finding draft。
+    :raises: 无。
+    """
+
+    return _finding(
+        rule_id="engine.vendor_correlation_conflict",
+        layer=ToolTraceAnalysisLayer.ENGINE,
+        severity=ToolTraceFindingSeverity.ERROR,
+        priority=ToolTraceFindingPriority.MEDIUM,
+        title="Vendor correlation conflict",
+        summary="同一 provider request id 出现互相冲突的 client/local refs。",
+        recommendation="检查 Engine provider correlation producer；不要按顺序或时间合并。",
+        evidence=tuple(
+            _record_evidence(
+                record,
+                {
+                    "provider_request_id": record.provider_request_id,
+                    "client_correlation_id": record.client_correlation_id,
+                    "session_id": record.session_id,
+                    "run_id": record.run_id,
+                    "attempt_id": record.attempt_id,
+                    "execution_id": record.execution_id,
+                    "iteration_id": record.iteration_id,
+                    "conflict_fields": list(conflict_fields),
+                },
+            )
+            for record in records
+        ),
+    )
+
+
+def _vendor_group_limitations(
+    records: tuple[_RuleRecord, ...],
+    *,
+    conflict_fields: tuple[str, ...],
+) -> tuple[ToolTraceLimitation, ...]:
+    """构造 vendor group 的精确 limited-signal reasons。
+
+    :param records: 同一 vendor group 的 direct records。
+    :param conflict_fields: 已确认冲突字段。
+    :returns: block-local limitations。
+    :raises: 无。
+    """
+
+    limitations: list[ToolTraceLimitation] = []
+    provider_ids = _sorted_values(item.provider_request_id for item in records)
+    client_ids = _sorted_values(item.client_correlation_id for item in records)
+    attempt_ids = _sorted_values(item.attempt_id for item in records)
+    execution_ids = _sorted_values(item.execution_id for item in records)
+    iteration_ids = _sorted_values(item.iteration_id for item in records)
+    if not provider_ids:
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_PROVIDER_ID_UNAVAILABLE_REASON,
+                (
+                    "provider-native request id 不可验证；native Anthropic / "
+                    "Claude Code gateway-specific signal 无法由当前 trace 验证"
+                    "（Issue #64），未推断 adapter/provider family。"
+                ),
+                records,
+            )
+        )
+    if not client_ids:
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_CLIENT_ID_UNAVAILABLE_REASON,
+                "typed client correlation id 不可验证；未用 provider/local id 补偿。",
+                records,
+            )
+        )
+    if not attempt_ids:
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_ATTEMPT_ID_UNAVAILABLE_REASON,
+                "direct Attempt identity 不可验证。",
+                records,
+            )
+        )
+    if not execution_ids:
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_EXECUTION_ID_UNAVAILABLE_REASON,
+                "direct execution identity 不可验证。",
+                records,
+            )
+        )
+    if not iteration_ids:
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_ITERATION_ID_UNAVAILABLE_REASON,
+                "typed iteration id 不可验证；未按 event 顺序或时间补偿。",
+                records,
+            )
+        )
+    if any(item.source_event_payload is None for item in records):
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_SOURCE_PAYLOAD_UNAVAILABLE_REASON,
+                "source EventLog payload 未经 resolver 证明，无法验证 payload-local signal。",
+                records,
+            )
+        )
+    if conflict_fields:
+        limitations.append(
+            _vendor_group_limitation(
+                _VENDOR_CORRELATION_CONFLICT_REASON,
+                "同 provider request id 的 client/local refs 冲突，block 仅作定位。",
+                records,
+            )
+        )
+    missing_partial = tuple(
+        item
+        for item in records
+        if item.event_type == _EVENT_PROVIDER_PROTOCOL_ERROR
+        and _mapping(
+            item.trace_summary,
+            _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
+        )
+        is None
+    )
+    if missing_partial:
+        limitations.append(
+            _vendor_group_limitation(
+                _PARTIAL_SIGNAL_MISSING_REASON,
+                "protocol error 缺少 typed partial signal；absent 不等于 explicit none。",
+                missing_partial,
+            )
+        )
+    return tuple(limitations)
+
+
+def _vendor_group_limitation(
+    reason_code: str,
+    summary: str,
+    records: tuple[_RuleRecord, ...],
+) -> ToolTraceLimitation:
+    """构造 vendor group-scoped limitation。
+
+    :param reason_code: 稳定 limited-signal reason。
+    :param summary: operator-readable 中文摘要。
+    :param records: direct vendor evidence records。
+    :returns: structured limitation。
+    :raises: 无。
+    """
+
+    return ToolTraceLimitation(
+        reason_code=reason_code,
+        signal_status=ToolTraceSignalStatus.LIMITED_SIGNAL,
+        summary=summary,
+        evidence=tuple(
+            _record_evidence(record, _provider_observed(record))
+            for record in records
+        ),
+    )
+
+
+def _vendor_block(
+    records: tuple[_RuleRecord, ...],
+    *,
+    limitations: tuple[ToolTraceLimitation, ...],
+) -> ToolTraceVendorDebuggingBlock:
+    """从同一合法 group 构造冻结 vendor block instance。
+
+    :param records: 非空、均有 direct run identity 的 vendor records。
+    :param limitations: 本 block 的精确 limitations。
+    :returns: frozen-shape vendor debugging block。
+    :raises ValueError: records 为空或 run identity 缺失时抛出。
+    """
+
+    if not records:
+        raise ValueError("vendor block records must not be empty")
+    run_ids = _sorted_values(item.run_id for item in records)
+    if not run_ids:
+        raise ValueError("vendor block requires direct run identity")
+    provider_ids = _sorted_values(item.provider_request_id for item in records)
+    client_ids = _sorted_values(item.client_correlation_id for item in records)
+    session_ids = _sorted_values(item.session_id for item in records)
+    return ToolTraceVendorDebuggingBlock(
+        status=(
+            ToolTraceSignalStatus.LIMITED_SIGNAL
+            if limitations
+            else ToolTraceSignalStatus.AVAILABLE
+        ),
+        provider_request_id=provider_ids[0] if provider_ids else None,
+        client_correlation_id=client_ids[0] if client_ids else None,
+        session_id=session_ids[0],
+        run_id=run_ids[0],
+        attempt_ids=_sorted_values(item.attempt_id for item in records),
+        execution_ids=_sorted_values(item.execution_id for item in records),
+        iteration_ids=_sorted_values(item.iteration_id for item in records),
+        tool_trace_refs=tuple(
+            _record_evidence(record, _provider_observed(record))
+            for record in records
+        ),
+        diagnostic_refs=_sorted_values(
+            ref for item in records for ref in item.diagnostic_refs
+        ),
+        partial_tool_call_signal=_vendor_partial_signal_status(records),
+        limitations=limitations,
+    )
+
+
+def _vendor_partial_signal_status(
+    records: tuple[_RuleRecord, ...],
+) -> ToolTraceSignalStatus:
+    """投影 vendor block 的 partial tool-call signal coverage。
+
+    :param records: 同一 vendor group 的 direct records。
+    :returns: absent protocol signal 为 ``limited_signal``；explicit none/present
+        为 ``available``；无 partial 触发时为 ``not_applicable``。
+    :raises: 无。
+    """
+
+    protocol_records = tuple(
+        item
+        for item in records
+        if item.event_type == _EVENT_PROVIDER_PROTOCOL_ERROR
+    )
+    signals = tuple(
+        signal
+        for item in records
+        if (
+            signal := _mapping(
+                item.trace_summary,
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
+            )
+        )
+        is not None
+    )
+    if any(
+        _mapping(item.trace_summary, _FIELD_PARTIAL_TOOL_CALL_SIGNAL) is None
+        for item in protocol_records
+    ):
+        return ToolTraceSignalStatus.LIMITED_SIGNAL
+    if signals:
+        return ToolTraceSignalStatus.AVAILABLE
+    return ToolTraceSignalStatus.NOT_APPLICABLE
+
+
+def _provider_observed(record: _RuleRecord) -> Mapping[str, JsonValue]:
+    """白名单投影 provider/vendor direct observations。
+
+    :param record: direct provider/vendor record。
+    :returns: 不含 raw payload/message 的 bounded observation。
+    :raises: 无。
+    """
+
+    observed: dict[str, JsonValue] = {
+        "provider_request_id": record.provider_request_id,
+        "client_correlation_id": record.client_correlation_id,
+        "iteration_id": record.iteration_id,
+    }
+    payload = record.source_event_payload
+    if payload is not None:
+        for field_name in (
+            "error_code",
+            "diagnostic_code",
+            "severity",
+            "diagnostic_source",
+        ):
+            if field_name in payload:
+                observed[field_name] = payload[field_name]
+    partial_signal = _mapping(
+        record.trace_summary,
+        _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
+    )
+    if partial_signal is not None:
+        observed.update(_partial_signal_observed(partial_signal))
+    return observed
+
+
+def _partial_signal_observed(
+    signal: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """白名单投影 partial signal 的状态与计数。
+
+    :param signal: producer 已校验的 partial signal object。
+    :returns: 不含 arguments/name fragment 的 bounded observation。
+    :raises: 无。
+    """
+
+    return {
+        field_name: signal[field_name]
+        for field_name in (
+            _FIELD_SUMMARY_STATUS,
+            _FIELD_PARTIAL_TOOL_CALL_COUNT,
+            "raw_payload_present",
+        )
+        if field_name in signal
+    }
+
+
+def _runner_diagnostic_observed(
+    diagnostic: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """白名单投影 runner observation mismatch 证据。
+
+    :param diagnostic: producer 已校验的 runner diagnostic。
+    :returns: count/digest/reason 的 bounded observation。
+    :raises: 无。
+    """
+
+    return {
+        field_name: diagnostic[field_name]
+        for field_name in (
+            "status",
+            "reason",
+            "observed_count",
+            "expected_count",
+            "observed_digest",
+            "expected_digest",
+            "consumer_boundary",
+        )
+        if field_name in diagnostic
+    }
+
+
+def _direct_iteration_id(
+    source_event_payload: Mapping[str, JsonValue] | None,
+    trace_summary: Mapping[str, JsonValue],
+) -> str | None:
+    """读取 resolver 证明的 iteration id，不从时间/顺序推断。
+
+    :param source_event_payload: resolver 校验过的 source EventLog payload。
+    :param trace_summary: producer 已校验的 bounded trace summary。
+    :returns: direct typed iteration id；不存在时为 ``None``。
+    :raises: 无。
+    """
+
+    if source_event_payload is not None:
+        iteration_id = _optional_text(
+            source_event_payload,
+            _FIELD_ITERATION_ID,
+        )
+        if iteration_id is not None:
+            return iteration_id
+    return _optional_text(trace_summary, _FIELD_ITERATION_ID)
+
+
+def _record_sort_key(
+    record: _RuleRecord,
+) -> tuple[int, str, int, str]:
+    """返回 direct record 的稳定排序 key。
+
+    :param record: 可信规则 record。
+    :returns: sequence/path/line/event identity key。
+    :raises: 无。
+    """
+
+    return (
+        record.event_sequence,
+        str(record.source_path),
+        record.line_number or 0,
+        record.event_id,
+    )
+
+
 def _payload_rankings(
     dataset: ToolTraceAnalysisDataset,
     policy: ToolTraceAnalysisPolicy,
@@ -1040,7 +1716,10 @@ def _public_payload_measure(
                 "cold-line measure requires matching cold record owner"
             )
         evidence = _record_evidence(
-            _rule_record_from_cold(cold),
+            _rule_record_from_cold(
+                cold,
+                source_event_payload=None,
+            ),
             {
                 "category": measure.category.value,
                 "size_bytes": measure.payload_size_bytes,
@@ -1304,12 +1983,14 @@ def _signal_coverage(
     records: tuple[_RuleRecord, ...],
     measures: tuple[ToolTracePayloadMeasure, ...],
     limitations: tuple[ToolTraceLimitation, ...],
+    vendor_debugging: tuple[ToolTraceVendorDebuggingBlock, ...],
 ) -> tuple[ToolTraceSignalCoverage, ...]:
     """从报告事实投影稳定 signal coverage。
 
     :param records: 可信规则 records。
     :param measures: verified payload measures。
     :param limitations: ordered limitations。
+    :param vendor_debugging: 已构造的 vendor blocks。
     :returns: 固定 signal name 顺序的 coverage。
     :raises: 无。
     """
@@ -1335,6 +2016,12 @@ def _signal_coverage(
         )
         for item in records
     )
+    vendor_trigger = any(_is_vendor_trigger(item) for item in records)
+    vendor_reason_codes = {
+        limitation.reason_code
+        for block in vendor_debugging
+        for limitation in block.limitations
+    }
     return (
         ToolTraceSignalCoverage(
             signal_name="integrity",
@@ -1382,8 +2069,15 @@ def _signal_coverage(
         ),
         ToolTraceSignalCoverage(
             signal_name="vendor_debugging",
-            status=ToolTraceSignalStatus.NOT_APPLICABLE,
-            reason_codes=(),
+            status=_coverage_status(
+                present=bool(vendor_debugging),
+                triggered=vendor_trigger,
+                limited=any(
+                    block.status is ToolTraceSignalStatus.LIMITED_SIGNAL
+                    for block in vendor_debugging
+                ),
+            ),
+            reason_codes=tuple(sorted(vendor_reason_codes)),
         ),
     )
 

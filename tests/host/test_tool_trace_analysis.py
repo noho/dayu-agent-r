@@ -405,6 +405,12 @@ def test_nonempty_report_json_and_markdown_render_all_structured_sections(
         tool_awaiting_count=0,
         run_waiting_count=0,
     )
+    vendor_limitation = ToolTraceLimitation(
+        reason_code="provider_request_id_unavailable",
+        signal_status=ToolTraceSignalStatus.LIMITED_SIGNAL,
+        summary="provider-native request id 无法验证。",
+        evidence=(evidence,),
+    )
     vendor = ToolTraceVendorDebuggingBlock(
         status=ToolTraceSignalStatus.LIMITED_SIGNAL,
         provider_request_id=None,
@@ -417,7 +423,7 @@ def test_nonempty_report_json_and_markdown_render_all_structured_sections(
         tool_trace_refs=(evidence,),
         diagnostic_refs=(),
         partial_tool_call_signal=ToolTraceSignalStatus.NOT_APPLICABLE,
-        limitations=(),
+        limitations=(vendor_limitation,),
     )
     nonempty = replace(
         report,
@@ -451,6 +457,9 @@ def test_nonempty_report_json_and_markdown_render_all_structured_sections(
     assert serialized["input"]["hot_db_path"].endswith("host.sqlite3")
     assert "TT-HOST-0001" in markdown
     assert "client_correlation_id=`client-1`" in markdown
+    assert "attempts=`attempt-1`" in markdown
+    assert "partial_tool_call_signal=`not_applicable`" in markdown
+    assert "provider_request_id_unavailable" in markdown
     assert "run=`run-1`" in markdown
     assert "123 bytes" in markdown
     assert "检查 Host policy。" in markdown

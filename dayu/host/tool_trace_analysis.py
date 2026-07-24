@@ -488,7 +488,7 @@ def _render_vendor_debugging(
 
     lines = [f"## {_MARKDOWN_SECTIONS[5]}", ""]
     if not blocks:
-        lines.append("- 当前 Slice 未产生 vendor debugging block。")
+        lines.append("- 当前输入没有 provider/protocol/terminal diagnostic trigger。")
         return "\n".join(lines)
     for block in blocks:
         lines.append(
@@ -497,7 +497,40 @@ def _render_vendor_debugging(
             f"provider_request_id=`{_markdown_escape(block.provider_request_id or 'null')}`, "
             f"client_correlation_id=`{_markdown_escape(block.client_correlation_id or 'null')}`"
         )
+        lines.append(
+            "  - local refs："
+            f"session=`{_markdown_escape(block.session_id)}`, "
+            f"run=`{_markdown_escape(block.run_id)}`, "
+            f"attempts=`{_markdown_text_tuple(block.attempt_ids)}`, "
+            f"executions=`{_markdown_text_tuple(block.execution_ids)}`, "
+            f"iterations=`{_markdown_text_tuple(block.iteration_ids)}`"
+        )
+        lines.append(
+            "  - "
+            f"partial_tool_call_signal=`{block.partial_tool_call_signal.value}`, "
+            f"diagnostic_refs=`{_markdown_text_tuple(block.diagnostic_refs)}`"
+        )
+        for evidence in block.tool_trace_refs:
+            lines.append(f"  - trace：{_evidence_markdown(evidence)}")
+        for limitation in block.limitations:
+            lines.append(
+                f"  - limitation `{limitation.reason_code}`："
+                f"无法证明。{_markdown_escape(limitation.summary)}"
+            )
     return "\n".join(lines)
+
+
+def _markdown_text_tuple(values: tuple[str, ...]) -> str:
+    """把稳定文本元组渲染为 bounded Markdown 内联值。
+
+    :param values: 已由 public contract 校验的文本元组。
+    :returns: escaped 逗号分隔文本；空元组返回 ``-``。
+    :raises: 无。
+    """
+
+    if not values:
+        return "-"
+    return _markdown_escape(",".join(values))
 
 
 def _render_payload_rankings(
