@@ -105,4 +105,3 @@ protected local plan-amendment commit；不得把 partial production/tests 混�
 | README职责是否实际命中 | Slice 1先读目标README约束后裁决并记录 |
 
 没有未分类 residual risk，没有 blocking question。
-
