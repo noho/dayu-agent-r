@@ -192,6 +192,14 @@ EXPECTED_STORAGE_MAINTENANCE_EXPORTS: frozenset[str] = frozenset(
     }
 )
 
+EXPECTED_TOOL_TRACE_ANALYSIS_EXPORTS: frozenset[str] = frozenset(
+    {
+        "ToolTraceAnalysisPolicy",
+        "ToolTraceAnalysisSource",
+        "ToolTraceInputMode",
+    }
+)
+
 ROOT_INTERNAL_API_NAMES: frozenset[str] = frozenset(
     {
         "HostCommandFacet",
@@ -210,6 +218,7 @@ EXPECTED_HOST_EXPORTS: frozenset[str] = (
     | EXPECTED_COMMAND_EXPORTS
     | EXPECTED_WAIT_CALLBACK_EXPORTS
     | EXPECTED_STORAGE_MAINTENANCE_EXPORTS
+    | EXPECTED_TOOL_TRACE_ANALYSIS_EXPORTS
 )
 
 FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(

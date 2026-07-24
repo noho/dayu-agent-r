@@ -28,10 +28,7 @@ from dayu.host.durable._validation import (
     require_optional_non_empty_text as _require_optional_non_empty_text,
     require_text as _require_text,
 )
-from dayu.host.durable.codec import (
-    canonical_json_dumps,
-    sha256_digest_json,
-)
+from dayu.host.durable.codec import canonical_json_dumps
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.payload_resolution import resolve_json_payload
 from dayu.host.durable.schema import (
@@ -774,6 +771,29 @@ def read_tool_trace_by_run(
     )
 
 
+def read_tool_trace_page(
+    transaction: HostTransaction,
+    after_event_sequence: int,
+    limit: int,
+) -> ToolTraceQueryPage:
+    """无过滤分页读取 Tool Trace hot rows。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param after_event_sequence: 严格大于该 cursor 的 event sequence。
+    :param limit: 返回行数上限，必须为正数且不超过模块上限。
+    :returns: 按 ``event_sequence ASC`` 排列的查询页。
+    :raises HostDurableError: 输入非法或 durable row 类型不符合预期时抛出。
+    """
+
+    return _query_page(
+        transaction,
+        where_sql="1 = 1",
+        parameters=(),
+        after_event_sequence=after_event_sequence,
+        limit=limit,
+    )
+
+
 def find_tool_trace_by_tool_call_id(
     transaction: HostTransaction,
     tool_call_id: str,
@@ -1421,6 +1441,7 @@ __all__ = [
     "read_tool_trace_json_payload",
     "read_tool_trace_by_run",
     "read_tool_trace_hot_row",
+    "read_tool_trace_page",
     "resolve_runner_call_projection_from_signal",
     "resolve_tool_trace_hot_row_payloads",
 ]

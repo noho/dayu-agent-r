@@ -65,6 +65,8 @@ from dayu.host.tool_trace import (
     TOOL_TRACE_CONSUMER_ID,
     ToolTraceProjectionConsumer,
     ToolTraceSinkOptions,
+    _LOCK_TIMEOUT_SECONDS,
+    _tool_trace_cold_lock_path,
     catch_up_tool_trace_projection,
 )
 from dayu.host.tool_call_request import (
@@ -1936,10 +1938,7 @@ def test_tool_trace_rejects_malformed_tool_timing_signal(
                 "error_code": "lookup_failed",
                 "repair_hint": "x" * 513,
                 "repair_hint_truncated": False,
-                "repair_hint_sha256": (
-                    "sha256:"
-                    + hashlib.sha256(("x" * 513).encode("utf-8")).hexdigest()
-                ),
+                "repair_hint_sha256": ("sha256:" + hashlib.sha256(("x" * 513).encode("utf-8")).hexdigest()),
                 "diagnostic_refs": [],
             },
             "repair_hint",
@@ -2002,10 +2001,7 @@ def test_tool_trace_rejects_malformed_failure_metadata_signal(
                         "tool_call_id": "call-bounded",
                         "name_fragment": "lookup_filing",
                         "arguments_byte_size": 42,
-                        "arguments_sha256": (
-                            "0123456789abcdef0123456789abcdef"
-                            "0123456789abcdef0123456789abcdef"
-                        ),
+                        "arguments_sha256": ("0123456789abcdef0123456789abcdef" "0123456789abcdef0123456789abcdef"),
                         "arguments_present": True,
                     }
                 ],
@@ -2974,6 +2970,23 @@ def test_default_tool_trace_path_is_derived_from_artifact_root(
     assert _default_tool_trace_cold_jsonl_path(tmp_path / "artifacts") == (
         tmp_path / "artifacts" / "tool-trace" / "tool-trace-cold.jsonl"
     )
+
+
+def test_tool_trace_producer_and_reader_share_adjacent_lock_owner(
+    tmp_path: Path,
+) -> None:
+    """producer/reader 必须复用 Tool Trace owner 的相邻锁路径与既有 timeout。"""
+
+    cold_path = tmp_path / "artifacts" / "tool-trace" / "trace.jsonl"
+    lock_path = _tool_trace_cold_lock_path(cold_path)
+    options = ToolTraceSinkOptions(
+        cold_jsonl_path=cold_path,
+        lock_path=lock_path,
+    )
+
+    assert lock_path == cold_path.with_name("trace.jsonl.lock")
+    assert options.lock_path == lock_path
+    assert _LOCK_TIMEOUT_SECONDS == 5.0
 
 
 def _text_sha256(value: str) -> str:

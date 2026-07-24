@@ -58,6 +58,7 @@ from dayu.host.durable.tool_trace import (
     find_tool_trace_by_tool_call_id,
     read_runner_call_reconstruction_signals_by_run,
     read_tool_trace_by_run,
+    read_tool_trace_page,
     resolve_runner_call_projection_from_signal,
     resolve_tool_trace_hot_row_payloads,
 )
@@ -1121,17 +1122,13 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
                 "engine_event_ref": "event-engine-terminal",
                 "terminal_summary_ref": "summary-ref",
                 "terminal_summary_digest": "sha256:summary",
-                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: (
-                    signal_objects[_FIELD_PARTIAL_TOOL_CALL_SIGNAL]
-                ),
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: (signal_objects[_FIELD_PARTIAL_TOOL_CALL_SIGNAL]),
             },
         )
         _catch_up(store.transaction_runner, tmp_path)
 
         by_run = store.transaction_runner.run_read(
-            lambda transaction: read_tool_trace_by_run(
-                transaction, "run-1", after_event_sequence=0, limit=2
-            )
+            lambda transaction: read_tool_trace_by_run(transaction, "run-1", after_event_sequence=0, limit=2)
         )
         by_run_next = store.transaction_runner.run_read(
             lambda transaction: read_tool_trace_by_run(
@@ -1156,6 +1153,20 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
                 transaction, "diag-shared", after_event_sequence=0, limit=10
             )
         )
+        unfiltered = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_page(
+                transaction,
+                after_event_sequence=0,
+                limit=2,
+            )
+        )
+        unfiltered_next = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_page(
+                transaction,
+                after_event_sequence=unfiltered.next_event_sequence,
+                limit=2,
+            )
+        )
 
         assert [row.event_id for row in by_run.rows] == ["event-1", "event-2"]
         assert by_run.has_more is True
@@ -1167,11 +1178,15 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
         ]
         assert [row.event_id for row in by_provider.rows] == ["event-3"]
         assert by_provider.rows[0].provider_request_id == "req-terminal"
-        assert (
-            by_provider.rows[0].trace_summary["client_correlation_id"]
-            == "client-terminal"
-        )
+        assert by_provider.rows[0].trace_summary["client_correlation_id"] == "client-terminal"
         assert [row.event_id for row in by_diagnostic.rows] == ["event-2"]
+        assert [row.event_id for row in unfiltered.rows] == [
+            "event-1",
+            "event-2",
+        ]
+        assert unfiltered.has_more is True
+        assert [row.event_id for row in unfiltered_next.rows] == ["event-3"]
+        assert unfiltered_next.has_more is False
         _assert_trace_summary_signals(
             by_run.rows[1].trace_summary,
             signal_objects,

@@ -222,6 +222,7 @@ _DIAGNOSTIC_EVENT_TYPES: tuple[str, ...] = (
 _PROJECTION_SIGNAL_EVENT_TYPES: tuple[str, ...] = (_EVENT_TYPE_USAGE_REPORTED,)
 _JSONL_LINE_SEPARATOR = "\n"
 _LOCK_TIMEOUT_SECONDS = 5.0
+_TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
 _TOOL_TRACE_READABLE_SCHEMA_VERSION = 1
 _TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS = 1200
 _TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS = 800
@@ -257,6 +258,22 @@ class ToolTraceSinkOptions:
             raise TypeError("create_parent_dirs must be bool")
         if self.lock_path is not None:
             _require_path(self.lock_path, field_name="lock_path")
+
+
+def _tool_trace_cold_lock_path(cold_jsonl_path: Path) -> Path:
+    """从 cold JSONL 路径派生 Tool Trace 相邻锁路径。
+
+    该 helper 是 Host Tool Trace projection owner 的内部契约，producer 与
+    Analyzer reader 必须复用它；它不属于 Host package public surface。
+
+    :param cold_jsonl_path: Tool Trace cold JSONL 文件路径。
+    :returns: 相邻 ``<cold-file-name>.lock`` 路径。
+    :raises TypeError: ``cold_jsonl_path`` 不是 ``Path`` 时抛出。
+    :raises ValueError: 路径不包含文件名时抛出。
+    """
+
+    _require_path(cold_jsonl_path, field_name="cold_jsonl_path")
+    return cold_jsonl_path.with_name(cold_jsonl_path.name + _TOOL_TRACE_LOCK_FILE_SUFFIX)
 
 
 @dataclass(frozen=True, slots=True)

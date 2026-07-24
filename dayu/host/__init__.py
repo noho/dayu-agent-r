@@ -168,6 +168,11 @@ from dayu.host.tooling import (
     ProcessCapsuleInterruptPolicy,
     default_framework_tool_policy_view,
 )
+from dayu.host.tool_trace_analysis_contracts import (
+    ToolTraceAnalysisPolicy,
+    ToolTraceAnalysisSource,
+    ToolTraceInputMode,
+)
 
 __all__ = [
     "AttemptDispatchSnapshot",
@@ -290,6 +295,9 @@ __all__ = [
     "SteerConflictDetail",
     "SubmitFollowupRequest",
     "TerminalResultSummary",
+    "ToolTraceAnalysisPolicy",
+    "ToolTraceAnalysisSource",
+    "ToolTraceInputMode",
     "WaitAdapterKey",
     "WaitCallbackAdapterResult",
     "WaitCallbackAdapterStatus",

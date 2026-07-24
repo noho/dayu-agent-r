@@ -470,6 +470,69 @@ def configure_connection_pragmas(connection: sqlite3.Connection, sqlite_policy: 
     connection.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT_PAGES}")
 
 
+def configure_read_only_connection_pragmas(
+    connection: sqlite3.Connection,
+    sqlite_policy: HostSQLiteStoragePolicy,
+) -> None:
+    """配置并校验 Host durable 只读 SQLite connection。
+
+    本 helper 只消费 ``busy_timeout_seconds``；write retry/backoff 与 WAL
+    初始化仍由写侧 transaction owner 管理。
+
+    :param connection: 物理只读 SQLite connection。
+    :param sqlite_policy: durable SQLite policy；只读取 busy timeout。
+    :returns: ``None``。
+    :raises sqlite3.Error: PRAGMA 设置或校验失败时抛出。
+    :raises HostDurableError: SQLite 未接受 required read-only PRAGMA 时抛出。
+    """
+
+    busy_timeout_ms = int(sqlite_policy.busy_timeout_seconds * _SQLITE_MILLISECONDS_PER_SECOND)
+    connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA query_only=ON")
+    _require_pragma_integer(
+        connection,
+        pragma_name="busy_timeout",
+        expected_value=busy_timeout_ms,
+    )
+    _require_pragma_integer(
+        connection,
+        pragma_name="foreign_keys",
+        expected_value=1,
+    )
+    _require_pragma_integer(
+        connection,
+        pragma_name="query_only",
+        expected_value=1,
+    )
+
+
+def _require_pragma_integer(
+    connection: sqlite3.Connection,
+    *,
+    pragma_name: str,
+    expected_value: int,
+) -> None:
+    """校验 SQLite integer PRAGMA 当前值。
+
+    :param connection: 已配置的 SQLite connection。
+    :param pragma_name: 受信任模块常量传入的 PRAGMA 名称。
+    :param expected_value: 预期整数值。
+    :returns: ``None``。
+    :raises sqlite3.Error: PRAGMA 查询失败时抛出。
+    :raises HostDurableError: PRAGMA 缺失、类型错误或值不匹配时抛出。
+    """
+
+    row = connection.execute(f"PRAGMA {pragma_name}").fetchone()
+    if row is None or len(row) != 1:
+        raise HostDurableError(f"SQLite PRAGMA {pragma_name} is unavailable")
+    value = row[0]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HostDurableError(f"SQLite PRAGMA {pragma_name} must be integer")
+    if value != expected_value:
+        raise HostDurableError(f"SQLite PRAGMA {pragma_name} mismatch")
+
+
 def _build_host_row(cursor: sqlite3.Cursor, row: sqlite3.Row) -> HostRow:
     """把 SQLite row 转换为 ``HostRow``。
 
