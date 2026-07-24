@@ -834,10 +834,10 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
     )
 
 
-def test_host_schema_version_is_queue_policy_check_version() -> None:
-    """当前 committed Host schema version 是 queue policy CHECK schema 23。"""
+def test_host_schema_version_is_context_budget_canonical_fact_version() -> None:
+    """当前 committed Host schema version 是 context budget canonical fact schema 24。"""
 
-    assert HOST_SCHEMA_VERSION == 23
+    assert HOST_SCHEMA_VERSION == 24
 
 
 def test_host_runs_queue_policy_check_uses_owner_values(tmp_path: Path) -> None:
@@ -924,9 +924,10 @@ def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
     assert payload_descriptor_kind_values() == (
         "tool_call_arguments_json",
         "tool_call_semantic_query_text",
-        "runner_call_input_manifest",
-        "runner_call_input_projection",
-        "selected_tool_schema_snapshot",
+            "runner_call_input_manifest",
+            "runner_call_input_projection",
+            "runner_call_prepared_candidate",
+            "selected_tool_schema_snapshot",
         "compactor_input_projection",
         "compaction_rejected_attempt_diagnostic",
     )

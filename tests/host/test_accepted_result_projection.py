@@ -22,6 +22,7 @@ from dayu.host.accepted_result_projection import (
     AcceptedToolResultSourceState,
     AcceptedToolResultStatus,
     project_accepted_tool_result,
+    project_planned_accepted_tool_result,
 )
 from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
@@ -117,6 +118,71 @@ _OPAQUE_SENTINEL_REFS = (
         digest=None,
     ),
 )
+
+
+def test_planned_and_committed_projection_share_one_owner_contract(
+    tmp_path: Path,
+) -> None:
+    """planned wait payload 与 committed canonical fact 产生完全相同的投影。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: planned/committed owner contract 漂移时抛出。
+    """
+
+    event_log = EventLogStore()
+    projections: tuple[
+        AcceptedToolResultProjection | None,
+        AcceptedToolResultProjection,
+    ] | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def operation(transaction: HostTransaction) -> tuple[
+            AcceptedToolResultProjection | None,
+            AcceptedToolResultProjection,
+        ]:
+            """在同一 transaction 中比较 committed 与 planned 投影。
+
+            :param transaction: 当前 Host transaction。
+            :returns: committed 与 planned 投影。
+            :raises HostDurableError: canonical payload 无法严格投影时抛出。
+            """
+
+            row = _append_tool_result_with_request(
+                transaction,
+                event_log,
+                event_id="event-planned-committed-equivalence",
+                tool_call_id="tool-call-planned-committed-equivalence",
+                tool_fact_kind="completed",
+                raw_tool_outcome=_completed_outcome_json(
+                    {"summary": "Equivalent projection"}
+                ),
+                source_refs=_OPAQUE_SENTINEL_REFS,
+            )
+            payload = event_payload_object(
+                transaction,
+                row,
+                payload_label="planned accepted tool result",
+            )
+            return (
+                project_accepted_tool_result(transaction, row),
+                project_planned_accepted_tool_result(
+                    transaction,
+                    event_id=row.event_id,
+                    session_id=row.session_id,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    occurred_at=row.occurred_at,
+                    payload=payload,
+                ),
+            )
+
+        projections = store.transaction_runner.run_write(operation)
+
+    assert projections is not None
+    committed, planned = projections
+    assert committed is not None
+    assert planned == committed
 
 
 class _ColdResultDescriptorFailure(StrEnum):

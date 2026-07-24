@@ -2415,7 +2415,7 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "iteration_index": 0,
                 "manifest_payload_ref": "payload-runner-call-manifest",
                 "manifest_digest": manifest_digest,
-                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "manifest_schema_version": "runner_call_input_manifest.v2",
                 "validation_status": "complete",
                 "message_count": 2,
                 "role_sequence_digest": role_digest,
@@ -2506,7 +2506,7 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
                 "iteration_index": 1,
                 "manifest_payload_ref": "payload-runner-call-manifest-limited",
                 "manifest_digest": manifest_digest,
-                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "manifest_schema_version": "runner_call_input_manifest.v2",
                 "validation_status": "limited_signal",
                 "message_count": 3,
                 "role_sequence_digest": role_digest,
@@ -2568,7 +2568,7 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
                 "manifest_digest": sha256_digest_json(
                     {"manifest": "runner-call-missing-diagnostic"}
                 ),
-                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "manifest_schema_version": "runner_call_input_manifest.v2",
                 "validation_status": "limited_signal",
                 "message_count": 1,
                 "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
@@ -2621,7 +2621,7 @@ def test_tool_trace_projects_mismatch_runner_call_diagnostic(
                 "manifest_digest": sha256_digest_json(
                     {"manifest": "runner-call-mismatch"}
                 ),
-                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "manifest_schema_version": "runner_call_input_manifest.v2",
                 "validation_status": "mismatch",
                 "message_count": 3,
                 "role_sequence_digest": observed_digest,

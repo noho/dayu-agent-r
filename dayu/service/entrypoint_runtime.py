@@ -27,6 +27,9 @@ from dayu.host.api import (
     HostActivityKind,
     HostActivitySeverity,
     HostActivityStatus,
+    HostContextUsageView,
+    ContextEstimateMethod,
+    ContextPressureLevel,
     HostCallContext,
     HostContentDelta,
     HostEvent,
@@ -99,6 +102,7 @@ class EntrypointActivityKind(StrEnum):
     TOOL_RESULT = "tool_result"
     TOOL_BATCH = "tool_batch"
     TOOL_AWAITING = "tool_awaiting"
+    CONTEXT_USAGE = "context_usage"
     CONTEXT_COMPACTION = "context_compaction"
     PROVIDER_DIAGNOSTIC = "provider_diagnostic"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
@@ -132,6 +136,21 @@ class EntrypointActivitySeverity(StrEnum):
     ERROR = "error"
 
 
+class EntrypointContextEstimateMethod(StrEnum):
+    """entrypoint公开的context estimate方法。"""
+
+    USAGE_ANCHORED = "usage_anchored"
+    CONSERVATIVE_FALLBACK = "conservative_fallback"
+
+
+class EntrypointContextPressureLevel(StrEnum):
+    """entrypoint公开的context pressure等级。"""
+
+    NORMAL = "normal"
+    SOFT_THRESHOLD_EXCEEDED = "soft_threshold_exceeded"
+    HARD_THRESHOLD_EXCEEDED = "hard_threshold_exceeded"
+
+
 @dataclass(frozen=True, slots=True)
 class EntrypointActivityCounts:
     """entrypoint activity 的固定计数字段。
@@ -162,6 +181,78 @@ class EntrypointActivityCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class EntrypointContextUsage:
+    """Service向UI adapter交付的context usage七字段DTO。
+
+    :param predicted_input_tokens: Host canonical prediction。
+    :param context_window_size: Host canonical context window。
+    :param utilization_basis_points: Host canonical未clamp利用率基点。
+    :param soft_threshold_tokens: Host canonical soft threshold。
+    :param hard_threshold_tokens: Host canonical hard threshold。
+    :param estimate_method: exhaustive mapped estimate method。
+    :param pressure_level: exhaustive mapped pressure level。
+    """
+
+    predicted_input_tokens: int
+    context_window_size: int
+    utilization_basis_points: int
+    soft_threshold_tokens: int
+    hard_threshold_tokens: int
+    estimate_method: EntrypointContextEstimateMethod
+    pressure_level: EntrypointContextPressureLevel
+
+    def __post_init__(self) -> None:
+        """校验entrypoint context usage字段。
+
+        :returns: ``None``。
+        :raises TypeError: 数字或enum类型非法时抛出。
+        :raises ValueError: token/window/threshold范围非法时抛出。
+        """
+
+        _require_non_negative_int(
+            self.predicted_input_tokens,
+            field_name="EntrypointContextUsage.predicted_input_tokens",
+        )
+        _require_positive_int(
+            self.context_window_size,
+            field_name="EntrypointContextUsage.context_window_size",
+        )
+        _require_non_negative_int(
+            self.utilization_basis_points,
+            field_name="EntrypointContextUsage.utilization_basis_points",
+        )
+        _require_positive_int(
+            self.soft_threshold_tokens,
+            field_name="EntrypointContextUsage.soft_threshold_tokens",
+        )
+        _require_positive_int(
+            self.hard_threshold_tokens,
+            field_name="EntrypointContextUsage.hard_threshold_tokens",
+        )
+        if self.soft_threshold_tokens >= self.hard_threshold_tokens:
+            raise ValueError(
+                "EntrypointContextUsage.soft_threshold_tokens must be less than "
+                "hard_threshold_tokens"
+            )
+        if not isinstance(
+            self.estimate_method,
+            EntrypointContextEstimateMethod,
+        ):
+            raise TypeError(
+                "EntrypointContextUsage.estimate_method must be "
+                "EntrypointContextEstimateMethod"
+            )
+        if not isinstance(
+            self.pressure_level,
+            EntrypointContextPressureLevel,
+        ):
+            raise TypeError(
+                "EntrypointContextUsage.pressure_level must be "
+                "EntrypointContextPressureLevel"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class EntrypointActivity:
     """entrypoint runtime 传给 UI adapter 的安全 activity。
 
@@ -176,6 +267,7 @@ class EntrypointActivity:
     :param tool_name: 稳定工具名；非工具 activity 为 ``None``。
     :param tool_display_name: Host-owned 工具展示名；缺失时为 ``None``。
     :param counts: 固定计数视图；无计数时为 ``None``。
+    :param context_usage: Host canonical七字段逐项映射；仅context activity非空。
     """
 
     kind: EntrypointActivityKind
@@ -189,6 +281,7 @@ class EntrypointActivity:
     tool_name: str | None
     tool_display_name: str | None
     counts: EntrypointActivityCounts | None
+    context_usage: EntrypointContextUsage | None = None
 
     def __post_init__(self) -> None:
         """校验 activity 字段。
@@ -214,6 +307,27 @@ class EntrypointActivity:
         _require_optional_non_empty(self.tool_display_name, field_name="EntrypointActivity.tool_display_name")
         if self.counts is not None and not isinstance(self.counts, EntrypointActivityCounts):
             raise TypeError("EntrypointActivity.counts must be EntrypointActivityCounts")
+        if self.context_usage is not None and not isinstance(
+            self.context_usage,
+            EntrypointContextUsage,
+        ):
+            raise TypeError(
+                "EntrypointActivity.context_usage must be EntrypointContextUsage"
+            )
+        if self.kind is EntrypointActivityKind.CONTEXT_USAGE:
+            if (
+                self.context_usage is None
+                or self.tool_name is not None
+                or self.tool_display_name is not None
+                or self.counts is not None
+            ):
+                raise ValueError(
+                    "entrypoint context usage activity fields are inconsistent"
+                )
+        elif self.context_usage is not None:
+            raise ValueError(
+                "non-context entrypoint activity must not include context_usage"
+            )
 
 
 EntrypointActivityCallback = Callable[[EntrypointActivity], None]
@@ -1958,6 +2072,9 @@ def _entrypoint_activity_from_host_event(event: HostEvent) -> EntrypointActivity
         tool_name=activity.tool_name,
         tool_display_name=activity.tool_display_name,
         counts=_entrypoint_activity_counts_from_host(activity.counts),
+        context_usage=_entrypoint_context_usage_from_host(
+            activity.context_usage
+        ),
     )
 
 
@@ -2000,6 +2117,8 @@ def _entrypoint_activity_kind_from_host(kind: HostActivityKind) -> EntrypointAct
         return EntrypointActivityKind.TOOL_BATCH
     if kind is HostActivityKind.TOOL_AWAITING:
         return EntrypointActivityKind.TOOL_AWAITING
+    if kind is HostActivityKind.CONTEXT_USAGE:
+        return EntrypointActivityKind.CONTEXT_USAGE
     if kind is HostActivityKind.CONTEXT_COMPACTION:
         return EntrypointActivityKind.CONTEXT_COMPACTION
     if kind is HostActivityKind.PROVIDER_DIAGNOSTIC:
@@ -2073,6 +2192,69 @@ def _entrypoint_activity_counts_from_host(
         failed=counts.failed,
         cancelled=counts.cancelled,
     )
+
+
+def _entrypoint_context_usage_from_host(
+    usage: HostContextUsageView | None,
+) -> EntrypointContextUsage | None:
+    """逐字段复制Host context usage，不执行算术或decision重算。
+
+    :param usage: Host public context usage；无时为``None``。
+    :returns: Service同形typed DTO或``None``。
+    :raises AssertionError: Host enum出现未覆盖成员时抛出。
+    """
+
+    if usage is None:
+        return None
+    return EntrypointContextUsage(
+        predicted_input_tokens=usage.predicted_input_tokens,
+        context_window_size=usage.context_window_size,
+        utilization_basis_points=usage.utilization_basis_points,
+        soft_threshold_tokens=usage.soft_threshold_tokens,
+        hard_threshold_tokens=usage.hard_threshold_tokens,
+        estimate_method=_entrypoint_context_estimate_method_from_host(
+            usage.estimate_method
+        ),
+        pressure_level=_entrypoint_context_pressure_from_host(
+            usage.pressure_level
+        ),
+    )
+
+
+def _entrypoint_context_estimate_method_from_host(
+    method: ContextEstimateMethod,
+) -> EntrypointContextEstimateMethod:
+    """穷举映射Host estimate method。
+
+    :param method: Host typed estimate method。
+    :returns: Service对应enum。
+    :raises AssertionError: Host出现未覆盖成员时抛出。
+    """
+
+    if method is ContextEstimateMethod.USAGE_ANCHORED:
+        return EntrypointContextEstimateMethod.USAGE_ANCHORED
+    if method is ContextEstimateMethod.CONSERVATIVE_FALLBACK:
+        return EntrypointContextEstimateMethod.CONSERVATIVE_FALLBACK
+    raise AssertionError(f"unexpected ContextEstimateMethod: {method}")
+
+
+def _entrypoint_context_pressure_from_host(
+    pressure: ContextPressureLevel,
+) -> EntrypointContextPressureLevel:
+    """穷举映射Host pressure level。
+
+    :param pressure: Host typed pressure。
+    :returns: Service对应enum。
+    :raises AssertionError: Host出现未覆盖成员时抛出。
+    """
+
+    if pressure is ContextPressureLevel.NORMAL:
+        return EntrypointContextPressureLevel.NORMAL
+    if pressure is ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED:
+        return EntrypointContextPressureLevel.SOFT_THRESHOLD_EXCEEDED
+    if pressure is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED:
+        return EntrypointContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+    raise AssertionError(f"unexpected ContextPressureLevel: {pressure}")
 
 
 def _terminal_result_from_live_event(

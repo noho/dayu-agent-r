@@ -33,6 +33,10 @@ from dayu.host.context_policy import (
     DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
     context_budget_policy_from_threshold_tokens,
 )
+from dayu.host.context_budget import (
+    ContextEstimateMethod,
+    ContextPressureLevel,
+)
 from dayu.host.compaction import ContextCompactor
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
@@ -2986,6 +2990,7 @@ class HostActivityKind(StrEnum):
     TOOL_RESULT = "tool_result"
     TOOL_BATCH = "tool_batch"
     TOOL_AWAITING = "tool_awaiting"
+    CONTEXT_USAGE = "context_usage"
     CONTEXT_COMPACTION = "context_compaction"
     PROVIDER_DIAGNOSTIC = "provider_diagnostic"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
@@ -3051,6 +3056,70 @@ class HostActivityCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class HostContextUsageView:
+    """Host public context usage七字段视图。
+
+    :param predicted_input_tokens: 当前candidate的预算decision basis。
+    :param context_window_size: frozen policy context window。
+    :param utilization_basis_points: 未clamp的利用率基点。
+    :param soft_threshold_tokens: frozen soft threshold。
+    :param hard_threshold_tokens: frozen hard threshold。
+    :param estimate_method: Host canonical estimate方法。
+    :param pressure_level: Host canonical真实压力。
+    """
+
+    predicted_input_tokens: int
+    context_window_size: int
+    utilization_basis_points: int
+    soft_threshold_tokens: int
+    hard_threshold_tokens: int
+    estimate_method: ContextEstimateMethod
+    pressure_level: ContextPressureLevel
+
+    def __post_init__(self) -> None:
+        """校验public context usage字段。
+
+        :returns: ``None``。
+        :raises TypeError: 整数或enum类型非法时抛出。
+        :raises ValueError: token/window/threshold范围非法时抛出。
+        """
+
+        _require_non_negative_int(
+            self.predicted_input_tokens,
+            field_name="HostContextUsageView.predicted_input_tokens",
+        )
+        _require_positive_int(
+            self.context_window_size,
+            field_name="HostContextUsageView.context_window_size",
+        )
+        _require_non_negative_int(
+            self.utilization_basis_points,
+            field_name="HostContextUsageView.utilization_basis_points",
+        )
+        _require_positive_int(
+            self.soft_threshold_tokens,
+            field_name="HostContextUsageView.soft_threshold_tokens",
+        )
+        _require_positive_int(
+            self.hard_threshold_tokens,
+            field_name="HostContextUsageView.hard_threshold_tokens",
+        )
+        if self.soft_threshold_tokens >= self.hard_threshold_tokens:
+            raise ValueError(
+                "HostContextUsageView.soft_threshold_tokens must be less than "
+                "hard_threshold_tokens"
+            )
+        if not isinstance(self.estimate_method, ContextEstimateMethod):
+            raise TypeError(
+                "HostContextUsageView.estimate_method must be ContextEstimateMethod"
+            )
+        if not isinstance(self.pressure_level, ContextPressureLevel):
+            raise TypeError(
+                "HostContextUsageView.pressure_level must be ContextPressureLevel"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class HostActivityView:
     """Host public event 的安全 activity 展示视图。
 
@@ -3062,6 +3131,7 @@ class HostActivityView:
     :param tool_name: 稳定工具名；非工具 activity 为 ``None``。
     :param tool_display_name: Host-owned 工具展示名；缺失时为 ``None``。
     :param counts: 固定计数视图；无计数时为 ``None``。
+    :param context_usage: canonical context usage七字段视图；仅context activity非空。
     """
 
     kind: HostActivityKind
@@ -3072,6 +3142,7 @@ class HostActivityView:
     tool_name: str | None
     tool_display_name: str | None
     counts: HostActivityCounts | None
+    context_usage: HostContextUsageView | None = None
 
     def __post_init__(self) -> None:
         """校验 activity 展示视图字段。
@@ -3098,6 +3169,27 @@ class HostActivityView:
         )
         if self.counts is not None and not isinstance(self.counts, HostActivityCounts):
             raise TypeError("HostActivityView.counts must be HostActivityCounts")
+        if self.context_usage is not None and not isinstance(
+            self.context_usage,
+            HostContextUsageView,
+        ):
+            raise TypeError(
+                "HostActivityView.context_usage must be HostContextUsageView"
+            )
+        if self.kind is HostActivityKind.CONTEXT_USAGE:
+            if (
+                self.context_usage is None
+                or self.tool_name is not None
+                or self.tool_display_name is not None
+                or self.counts is not None
+            ):
+                raise ValueError(
+                    "context usage activity fields are inconsistent"
+                )
+        elif self.context_usage is not None:
+            raise ValueError(
+                "non-context activity must not include context_usage"
+            )
 
 
 class HostTransientDeltaType(StrEnum):
@@ -4275,6 +4367,9 @@ __all__ = [
     "HostActivitySeverity",
     "HostActivityStatus",
     "HostActivityView",
+    "HostContextUsageView",
+    "ContextEstimateMethod",
+    "ContextPressureLevel",
     "HostContentDelta",
     "HostEvent",
     "HostEventClass",

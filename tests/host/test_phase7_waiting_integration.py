@@ -59,11 +59,13 @@ from dayu.host.api import (
     HostInput,
     AttemptDispatchSnapshot,
     EnsureSessionRequest,
+    HostCommandHandleOptions,
     HostLocalExecutionOptions,
+    OrdinaryRunExecutionBaseline,
     StartRunRequest,
     WaitAdapterKey,
 )
-from dayu.host.command import create_host_command_handle, start_run
+from dayu.host.command import HostCommandHandle, start_run
 from dayu.host._wait_observation import WaitObservationRunner
 from dayu.host.dispatch import HostDispatchScheduler
 from dayu.host.durable.session_lifecycle import ensure_session
@@ -99,6 +101,7 @@ from dayu.host.wait_adapter import (
     WaitExternalJobRefSource,
 )
 from dayu.host.waiting import DefaultHostToolAwaitingAcceptPort
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
@@ -117,6 +120,7 @@ from tests.host.test_wait_observation_runner import (
     _poller as _bounded_wait_poller,
     _wait_for_runner_count,
 )
+from tests.host.execution_handle_support import create_execution_command_handle
 
 _ITERATION_ID = "iteration-phase7-waiting-integration"
 _POLICY_DIGEST = "sha256:7777777777777777777777777777777777777777777777777777777777777777"
@@ -349,7 +353,7 @@ def test_local_awaiting_tool_manual_resolve_resumes_run(
     异常：断言失败时由 pytest 报告；Host durable 写入异常透传。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_active_integration_run(host._transaction_runner())
         tool = _AwaitingBusinessTool()
@@ -432,7 +436,7 @@ def test_poll_observation_timeout_keeps_waiting_then_ready_resumes_run(
 ) -> None:
     """真实 awaiting durable record 在 poll timeout 后仍可由下一轮 Ready 恢复。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     runner = WaitObservationRunner(
         max_outstanding_adapter_calls=1,
         thread_name_prefix="phase7-poll-observation-timeout",
@@ -513,9 +517,9 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
 ) -> None:
     """真实 scheduler 生产 ToolRuntime wiring 支持 awaiting -> WAITING -> resume。"""
 
-    host = create_host_command_handle(_options(tmp_path))
     factory = _CapturingWorkerFactory()
     tool = _AwaitingBusinessTool()
+    host = _create_execution_handle(_options(tmp_path), tool=tool)
     scheduler = await HostDispatchScheduler.open(
         transaction_runner=host._transaction_runner(),
         transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
@@ -894,6 +898,64 @@ def _runner_spec() -> RunnerSpec:
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造与 waiting integration scheduler 一致的 execution baseline。
+
+    :returns: ordinary Run baseline。
+    :raises TypeError: typed execution contract 非法时抛出。
+    :raises ValueError: typed execution contract 字段非法时抛出。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=True,
+            tool_execution_timeout_seconds=10.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
+        ),
+    )
+
+
+def _create_execution_handle(
+    options: HostCommandHandleOptions,
+    *,
+    tool: _AwaitingBusinessTool | None = None,
+) -> HostCommandHandle:
+    """创建显式装配 waiting execution truth 的 command handle。
+
+    :param options: durable command options。
+    :param tool: scheduler production 场景使用的 awaiting 工具。
+    :returns: execution command handle。
+    :raises HostApiError: durable store 或 admission 装配失败时抛出。
+    """
+
+    tooling_options = (
+        None
+        if tool is None
+        else HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition(tool),)),
+            source_refs=(_source_ref(),),
+            framework_tool_policy=default_framework_tool_policy_view(),
+            wait_adapter_registry=_wait_adapter_registry(),
+        )
+    )
+    return create_execution_command_handle(
+        options,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        memory_projection_policy=default_memory_projection_policy(),
+        tooling_options=tooling_options,
     )
 
 

@@ -1,14 +1,17 @@
-"""Host context compaction canonical event payload helpers。
+"""Host context governance canonical event payload helpers。
 
-本模块集中定义 Context Governance compact 相关 canonical fact 的 payload
-builder 与 validator。EventLog primitive 只保存通用 ledger row；compact
-业务语义、必填字段、触发来源约束与 accepted candidate 结构校验都在本模块
-完成。
+本模块集中定义 Context Governance budget / compact canonical fact 的 payload
+builder、strict parser 与 deterministic append。EventLog primitive 只保存通用
+ledger row；业务语义、稳定 identity 与结果一致性都由本模块拥有。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING, TypeVar
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
@@ -16,9 +19,803 @@ from dayu.host.compaction import (
     ConversationCompactOutputVNext,
 )
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
-from dayu.host.context_budget import ContextBudgetDecision
+from dayu.host.context_budget import (
+    MAX_CONTEXT_TOKEN_COUNT,
+    ContextAnchorDiagnostic,
+    ContextBudgetDecision,
+    ContextEstimateMethod,
+    ContextPressureLevel,
+    ContextSizingFallbackReason,
+    ContextSizingResult,
+    ContextSizingStage,
+    context_sizing_pressure_and_decision,
+    context_utilization_basis_points,
+    validate_context_threshold_ordering,
+)
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.codec import is_sha256_digest
+from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
+from dayu.host.durable.errors import (
+    HostDurableError,
+    HostEventIdentityConflictError,
+)
+if TYPE_CHECKING:
+    from dayu.host.durable.event_log import EventLogRow, EventLogStore
+    from dayu.host.durable.transaction import HostTransaction
+
+_EnumT = TypeVar("_EnumT", bound=StrEnum)
+
+CONTEXT_BUDGET_EVALUATED = "CONTEXT_BUDGET_EVALUATED"
+"""单个 dispatch-relevant candidate 的 canonical budget truth。"""
+
+CONTEXT_BUDGET_EVALUATED_SCHEMA_VERSION = "context_budget_evaluated.v1"
+"""Context budget canonical payload fresh schema。"""
+
+_CONTEXT_BUDGET_EVENT_ID_PREFIX = "event-context-budget-evaluated-"
+_CONTEXT_BUDGET_EVENT_ACTOR = "host.context_governance"
+_CONTEXT_BUDGET_EVENT_SOURCE = "host.context_budget"
+
+_BUDGET_EVALUATED_FIELDS = (
+    "schema_version",
+    "decision_id",
+    "run_id",
+    "candidate_input_cursor",
+    "candidate_input_projection_ref",
+    "candidate_input_digest",
+    "sizing_stage",
+    "policy_ref",
+    "policy_snapshot_digest",
+    "estimator_id",
+    "estimator_version",
+    "estimator_digest",
+    "conservative_input_tokens",
+    "estimate_method",
+    "predicted_input_tokens",
+    "context_window_size",
+    "utilization_basis_points",
+    "soft_threshold_tokens",
+    "hard_threshold_tokens",
+    "pressure_level",
+    "budget_decision",
+    "fallback_reason",
+    "anchor_diagnostic",
+)
+_ANCHOR_DIAGNOSTIC_FIELDS = (
+    "manifest_event_id",
+    "manifest_payload_ref",
+    "manifest_digest",
+    "iteration_link_event_id",
+    "usage_event_id",
+    "usage_observation_digest",
+    "iteration_completed_event_id",
+    "usage_anchor_tokens",
+    "conservative_anchor_tokens",
+    "conservative_current_tokens",
+    "signed_delta_tokens",
+    "predicted_input_tokens",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBudgetEvaluatedPayload:
+    """Strict-parsed ``CONTEXT_BUDGET_EVALUATED`` canonical payload。
+
+    字段与 durable v1 schema 一一对应；public projection只能读取其中明确允许的
+    七字段，不能直接暴露本对象。
+    """
+
+    decision_id: str
+    run_id: str
+    candidate_input_cursor: int
+    candidate_input_projection_ref: str
+    candidate_input_digest: str
+    sizing_stage: ContextSizingStage
+    policy_ref: str
+    policy_snapshot_digest: str
+    estimator_id: str
+    estimator_version: str
+    estimator_digest: str
+    conservative_input_tokens: int
+    estimate_method: ContextEstimateMethod
+    predicted_input_tokens: int
+    context_window_size: int
+    utilization_basis_points: int
+    soft_threshold_tokens: int
+    hard_threshold_tokens: int
+    pressure_level: ContextPressureLevel
+    budget_decision: ContextBudgetDecision
+    fallback_reason: ContextSizingFallbackReason | None
+    anchor_diagnostic: ContextAnchorDiagnostic | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBudgetEvaluationIdentity:
+    """Canonical fact deterministic identity atoms。
+
+    :param run_id: owning Run id。
+    :param candidate_input_cursor: candidate source watermark。
+    :param candidate_input_digest: complete candidate digest。
+    :param sizing_stage: producer-owned closed stage。
+    :param policy_snapshot_digest: frozen policy identity。
+    :param estimator_id: estimator id。
+    :param estimator_version: estimator version。
+    """
+
+    run_id: str
+    candidate_input_cursor: int
+    candidate_input_digest: str
+    sizing_stage: ContextSizingStage
+    policy_snapshot_digest: str
+    estimator_id: str
+    estimator_version: str
+
+
+def context_budget_evaluation_identity(
+    run_id: str,
+    result: ContextSizingResult,
+) -> ContextBudgetEvaluationIdentity:
+    """从 sizing result 提取 canonical identity atoms。
+
+    :param run_id: owning Host Run id。
+    :param result: Host-owned sizing truth。
+    :returns: 不含 occurrence/Attempt 随机量的 stable identity。
+    :raises TypeError: ``result`` 类型非法时抛出。
+    """
+
+    if not isinstance(result, ContextSizingResult):
+        raise TypeError("result must be ContextSizingResult")
+    return ContextBudgetEvaluationIdentity(
+        run_id=run_id,
+        candidate_input_cursor=result.candidate_input_cursor,
+        candidate_input_digest=result.candidate_input_digest,
+        sizing_stage=result.stage,
+        policy_snapshot_digest=result.policy_snapshot_digest,
+        estimator_id=result.estimator_contract.estimator_id,
+        estimator_version=result.estimator_contract.estimator_version,
+    )
+
+
+def context_budget_evaluated_decision_id(
+    identity: ContextBudgetEvaluationIdentity,
+) -> str:
+    """计算 canonical budget decision digest。
+
+    :param identity: plan冻结的完整 stable identity atoms。
+    :returns: ``sha256:`` canonical digest。
+    :raises TypeError: identity enum/type非法时抛出。
+    :raises ValueError: identity 文本、cursor或digest非法时抛出。
+    """
+
+    _validate_context_budget_identity(identity)
+    return sha256_digest_json(
+        {
+            "run_id": identity.run_id,
+            "candidate_input_cursor": identity.candidate_input_cursor,
+            "candidate_input_digest": identity.candidate_input_digest,
+            "sizing_stage": identity.sizing_stage.value,
+            "policy_snapshot_digest": identity.policy_snapshot_digest,
+            "estimator_id": identity.estimator_id,
+            "estimator_version": identity.estimator_version,
+        }
+    )
+
+
+def context_budget_evaluated_event_id(
+    identity: ContextBudgetEvaluationIdentity,
+) -> str:
+    """从 canonical decision identity 派生稳定 EventLog id。
+
+    :param identity: 完整 stable identity atoms。
+    :returns: deterministic EventLog event id。
+    :raises TypeError: identity 类型非法时抛出。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    decision_id = context_budget_evaluated_decision_id(identity)
+    return _CONTEXT_BUDGET_EVENT_ID_PREFIX + decision_id.removeprefix("sha256:")
+
+
+def build_context_budget_evaluated_payload(
+    *,
+    run_id: str,
+    result: ContextSizingResult,
+) -> Mapping[str, JsonValue]:
+    """从唯一 sizing truth 构造 canonical payload。
+
+    本 builder不选择usage、不读取EventLog anchor，也不改变result中的
+    pressure/action。
+
+    :param run_id: owning Host Run id。
+    :param result: complete conservative sizing truth。
+    :returns: strict v1 canonical JSON payload。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: result或identity不满足canonical contract时抛出。
+    """
+
+    if not isinstance(result, ContextSizingResult):
+        raise TypeError("result must be ContextSizingResult")
+    identity = ContextBudgetEvaluationIdentity(
+        run_id=run_id,
+        candidate_input_cursor=result.candidate_input_cursor,
+        candidate_input_digest=result.candidate_input_digest,
+        sizing_stage=result.stage,
+        policy_snapshot_digest=result.policy_snapshot_digest,
+        estimator_id=result.estimator_contract.estimator_id,
+        estimator_version=result.estimator_contract.estimator_version,
+    )
+    payload: Mapping[str, JsonValue] = {
+        "schema_version": CONTEXT_BUDGET_EVALUATED_SCHEMA_VERSION,
+        "decision_id": context_budget_evaluated_decision_id(identity),
+        "run_id": run_id,
+        "candidate_input_cursor": result.candidate_input_cursor,
+        "candidate_input_projection_ref": (
+            result.candidate_input_projection_ref
+        ),
+        "candidate_input_digest": result.candidate_input_digest,
+        "sizing_stage": result.stage.value,
+        "policy_ref": result.policy_ref,
+        "policy_snapshot_digest": result.policy_snapshot_digest,
+        "estimator_id": result.estimator_contract.estimator_id,
+        "estimator_version": result.estimator_contract.estimator_version,
+        "estimator_digest": result.estimator_digest,
+        "conservative_input_tokens": result.conservative_input_tokens,
+        "estimate_method": result.estimate_method.value,
+        "predicted_input_tokens": result.predicted_input_tokens,
+        "context_window_size": result.context_window_size,
+        "utilization_basis_points": result.utilization_basis_points,
+        "soft_threshold_tokens": result.soft_threshold_tokens,
+        "hard_threshold_tokens": result.hard_threshold_tokens,
+        "pressure_level": result.pressure_level.value,
+        "budget_decision": result.budget_decision.value,
+        "fallback_reason": (
+            result.fallback_reason.value
+            if result.fallback_reason is not None
+            else None
+        ),
+        "anchor_diagnostic": _anchor_diagnostic_payload(
+            result.anchor_diagnostic
+        ),
+    }
+    parse_context_budget_evaluated_payload(payload)
+    return payload
+
+
+def parse_context_budget_evaluated_payload(
+    payload: Mapping[str, JsonValue],
+) -> ContextBudgetEvaluatedPayload:
+    """Strict parse canonical budget payload。
+
+    :param payload: EventLog inline JSON object。
+    :returns: 完整 typed canonical payload。
+    :raises TypeError: ``payload`` 不是mapping时抛出。
+    :raises ValueError: schema、enum、identity、range或结果不变量非法时抛出。
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be mapping")
+    _require_exact_fields(payload, _BUDGET_EVALUATED_FIELDS)
+    if _required_text(payload, "schema_version") != (
+        CONTEXT_BUDGET_EVALUATED_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported context budget evaluated schema")
+    decision_id = _required_digest(payload, "decision_id")
+    run_id = _required_text(payload, "run_id")
+    candidate_input_cursor = _required_non_negative_int(
+        payload,
+        "candidate_input_cursor",
+    )
+    candidate_input_projection_ref = _required_text(
+        payload,
+        "candidate_input_projection_ref",
+    )
+    candidate_input_digest = _required_digest(
+        payload,
+        "candidate_input_digest",
+    )
+    sizing_stage = _required_enum(
+        payload,
+        "sizing_stage",
+        ContextSizingStage,
+    )
+    policy_ref = _required_text(payload, "policy_ref")
+    policy_snapshot_digest = _required_digest(
+        payload,
+        "policy_snapshot_digest",
+    )
+    estimator_id = _required_text(payload, "estimator_id")
+    estimator_version = _required_text(payload, "estimator_version")
+    estimator_digest = _required_digest(payload, "estimator_digest")
+    conservative_input_tokens = _required_non_negative_int(
+        payload,
+        "conservative_input_tokens",
+    )
+    estimate_method = _required_enum(
+        payload,
+        "estimate_method",
+        ContextEstimateMethod,
+    )
+    predicted_input_tokens = _required_non_negative_int(
+        payload,
+        "predicted_input_tokens",
+    )
+    context_window_size = _required_positive_int(
+        payload,
+        "context_window_size",
+    )
+    utilization_basis_points = _required_non_negative_int(
+        payload,
+        "utilization_basis_points",
+    )
+    soft_threshold_tokens = _required_positive_int(
+        payload,
+        "soft_threshold_tokens",
+    )
+    hard_threshold_tokens = _required_positive_int(
+        payload,
+        "hard_threshold_tokens",
+    )
+    pressure_level = _required_enum(
+        payload,
+        "pressure_level",
+        ContextPressureLevel,
+    )
+    budget_decision = _required_enum(
+        payload,
+        "budget_decision",
+        ContextBudgetDecision,
+    )
+    fallback_reason = _optional_enum(
+        payload,
+        "fallback_reason",
+        ContextSizingFallbackReason,
+    )
+    anchor_diagnostic = _parse_anchor_diagnostic(
+        payload.get("anchor_diagnostic")
+    )
+    identity = ContextBudgetEvaluationIdentity(
+        run_id=run_id,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_digest=candidate_input_digest,
+        sizing_stage=sizing_stage,
+        policy_snapshot_digest=policy_snapshot_digest,
+        estimator_id=estimator_id,
+        estimator_version=estimator_version,
+    )
+    if decision_id != context_budget_evaluated_decision_id(identity):
+        raise ValueError("context budget decision identity mismatch")
+    if (
+        conservative_input_tokens > MAX_CONTEXT_TOKEN_COUNT
+        or predicted_input_tokens > MAX_CONTEXT_TOKEN_COUNT
+    ):
+        raise ValueError("context budget token count exceeds supported range")
+    validate_context_threshold_ordering(
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+    if utilization_basis_points != context_utilization_basis_points(
+        predicted_input_tokens=predicted_input_tokens,
+        context_window_size=context_window_size,
+    ):
+        raise ValueError("context budget utilization mismatch")
+    expected_pressure, expected_decision = context_sizing_pressure_and_decision(
+        stage=sizing_stage,
+        predicted_input_tokens=predicted_input_tokens,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+    if pressure_level is not expected_pressure:
+        raise ValueError("context budget pressure mismatch")
+    if budget_decision is not expected_decision:
+        raise ValueError("context budget decision mismatch")
+    if estimate_method is ContextEstimateMethod.CONSERVATIVE_FALLBACK:
+        if (
+            fallback_reason is None
+            or anchor_diagnostic is not None
+            or predicted_input_tokens != conservative_input_tokens
+        ):
+            raise ValueError("conservative context budget diagnostic mismatch")
+    elif estimate_method is ContextEstimateMethod.USAGE_ANCHORED:
+        if fallback_reason is not None or anchor_diagnostic is None:
+            raise ValueError("anchored context budget diagnostic mismatch")
+        if (
+            anchor_diagnostic.conservative_current_tokens
+            != conservative_input_tokens
+            or anchor_diagnostic.predicted_input_tokens
+            != predicted_input_tokens
+        ):
+            raise ValueError("anchored context budget result mismatch")
+    else:
+        raise AssertionError("context estimate method is not exhaustive")
+    return ContextBudgetEvaluatedPayload(
+        decision_id=decision_id,
+        run_id=run_id,
+        candidate_input_cursor=candidate_input_cursor,
+        candidate_input_projection_ref=candidate_input_projection_ref,
+        candidate_input_digest=candidate_input_digest,
+        sizing_stage=sizing_stage,
+        policy_ref=policy_ref,
+        policy_snapshot_digest=policy_snapshot_digest,
+        estimator_id=estimator_id,
+        estimator_version=estimator_version,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=conservative_input_tokens,
+        estimate_method=estimate_method,
+        predicted_input_tokens=predicted_input_tokens,
+        context_window_size=context_window_size,
+        utilization_basis_points=utilization_basis_points,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+        pressure_level=pressure_level,
+        budget_decision=budget_decision,
+        fallback_reason=fallback_reason,
+        anchor_diagnostic=anchor_diagnostic,
+    )
+
+
+def append_context_budget_evaluated_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    run_id: str,
+    attempt_id: str | None,
+    execution_id: str | None,
+    occurred_at: datetime,
+    result: ContextSizingResult,
+) -> EventLogRow:
+    """幂等追加 canonical context budget fact。
+
+    已存在同identity row时strict校验row identity与payload；完全一致才复用。
+    任何矛盾都以identity conflict fail closed，不执行下游transition。
+
+    :param transaction: caller现有write transaction。
+    :param event_log_store: EventLog primitive。
+    :param session_id: owning Session id。
+    :param run_id: owning Run id。
+    :param attempt_id: allow/continuation candidate绑定的Attempt；ordinary
+        soft/hard为``None``。
+    :param execution_id: allow/continuation candidate绑定的execution；ordinary
+        soft/hard为``None``。
+    :param occurred_at: 首次append occurrence time。
+    :param result: 唯一Host sizing truth。
+    :returns: 新增或幂等复用的EventLog row。
+    :raises HostEventIdentityConflictError: stable identity已有矛盾row时抛出。
+    :raises HostDurableError: durable payload无法strict解析时抛出。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: canonical payload或identity非法时抛出。
+    """
+
+    # api -> memory -> context_events 的初始化链早于 durable schema 完成；
+    # durable primitives只能在实际append边界加载，避免公共契约导入形成环。
+    from dayu.host.durable.event_log import (
+        EventClass,
+        EventLogAppendRequest,
+    )
+
+    payload = build_context_budget_evaluated_payload(
+        run_id=run_id,
+        result=result,
+    )
+    parsed = parse_context_budget_evaluated_payload(payload)
+    identity = _identity_from_payload(parsed)
+    event_id = context_budget_evaluated_event_id(identity)
+    existing = event_log_store.read_event_by_id(transaction, event_id)
+    if existing is not None:
+        _require_matching_context_budget_row(
+            transaction,
+            existing,
+            session_id=session_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            expected=parsed,
+            conflict=True,
+        )
+        return existing
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            event_type=CONTEXT_BUDGET_EVALUATED,
+            occurred_at=occurred_at,
+            actor=_CONTEXT_BUDGET_EVENT_ACTOR,
+            source=_CONTEXT_BUDGET_EVENT_SOURCE,
+            client_request_id=None,
+            idempotency_key=parsed.decision_id,
+            policy_decision=None,
+            reason=None,
+            payload_json=payload,
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def load_matching_context_budget_evaluation_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    attempt_id: str,
+    execution_id: str,
+    identity: ContextBudgetEvaluationIdentity,
+    candidate_input_projection_ref: str,
+    estimator_digest: str,
+    conservative_input_tokens: int,
+    context_window_size: int,
+    policy_ref: str,
+) -> ContextBudgetEvaluatedPayload:
+    """按manifest/candidate atoms strict读取matching source budget fact。
+
+    :param transaction: caller现有transaction。
+    :param event_log_store: EventLog primitive。
+    :param session_id: source Session id。
+    :param attempt_id: source Attempt id。
+    :param execution_id: source execution id。
+    :param identity: source manifest/candidate stable identity atoms。
+    :param candidate_input_projection_ref: source exact candidate ref。
+    :param estimator_digest: source conservative estimate digest。
+    :param conservative_input_tokens: source conservative tokens。
+    :param context_window_size: source frozen context window。
+    :param policy_ref: source frozen policy ref。
+    :returns: strict typed matching canonical payload。
+    :raises HostDurableError: source fact缺失、损坏或与manifest/candidate不一致时抛出。
+    """
+
+    event_id = context_budget_evaluated_event_id(identity)
+    row = event_log_store.read_event_by_id(transaction, event_id)
+    if row is None:
+        raise HostDurableError("source context budget fact is missing")
+    parsed = _require_matching_context_budget_row(
+        transaction,
+        row,
+        session_id=session_id,
+        run_id=identity.run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        expected=None,
+        conflict=False,
+    )
+    if (
+        _identity_from_payload(parsed) != identity
+        or parsed.candidate_input_projection_ref
+        != candidate_input_projection_ref
+        or parsed.estimator_digest != estimator_digest
+        or parsed.conservative_input_tokens != conservative_input_tokens
+        or parsed.context_window_size != context_window_size
+        or parsed.policy_ref != policy_ref
+    ):
+        raise HostDurableError(
+            "source context budget fact does not match frozen manifest"
+        )
+    return parsed
+
+
+def _identity_from_payload(
+    payload: ContextBudgetEvaluatedPayload,
+) -> ContextBudgetEvaluationIdentity:
+    """从strict payload提取stable identity。
+
+    :param payload: strict canonical payload。
+    :returns: stable identity atoms。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ContextBudgetEvaluationIdentity(
+        run_id=payload.run_id,
+        candidate_input_cursor=payload.candidate_input_cursor,
+        candidate_input_digest=payload.candidate_input_digest,
+        sizing_stage=payload.sizing_stage,
+        policy_snapshot_digest=payload.policy_snapshot_digest,
+        estimator_id=payload.estimator_id,
+        estimator_version=payload.estimator_version,
+    )
+
+
+def _validate_context_budget_identity(
+    identity: ContextBudgetEvaluationIdentity,
+) -> None:
+    """校验stable identity atoms。
+
+    :param identity: 待校验identity。
+    :returns: ``None``。
+    :raises TypeError: dataclass或stage类型非法时抛出。
+    :raises ValueError: 文本、cursor或digest非法时抛出。
+    """
+
+    if not isinstance(identity, ContextBudgetEvaluationIdentity):
+        raise TypeError("identity must be ContextBudgetEvaluationIdentity")
+    if not isinstance(identity.sizing_stage, ContextSizingStage):
+        raise TypeError("identity.sizing_stage must be ContextSizingStage")
+    _require_non_empty_text_value(identity.run_id, "identity.run_id")
+    if (
+        isinstance(identity.candidate_input_cursor, bool)
+        or not isinstance(identity.candidate_input_cursor, int)
+        or identity.candidate_input_cursor < 0
+    ):
+        raise ValueError("identity.candidate_input_cursor must be non-negative int")
+    for field_name, value in (
+        ("identity.candidate_input_digest", identity.candidate_input_digest),
+        ("identity.policy_snapshot_digest", identity.policy_snapshot_digest),
+    ):
+        if not is_sha256_digest(value):
+            raise ValueError(f"{field_name} must be sha256 digest")
+    _require_non_empty_text_value(identity.estimator_id, "identity.estimator_id")
+    _require_non_empty_text_value(
+        identity.estimator_version,
+        "identity.estimator_version",
+    )
+
+
+def _require_matching_context_budget_row(
+    transaction: HostTransaction,
+    row: EventLogRow,
+    *,
+    session_id: str,
+    run_id: str,
+    attempt_id: str | None,
+    execution_id: str | None,
+    expected: ContextBudgetEvaluatedPayload | None,
+    conflict: bool,
+) -> ContextBudgetEvaluatedPayload:
+    """校验deterministic event id指向exact canonical row。
+
+    :param transaction: 当前transaction。
+    :param row: 待校验EventLog row。
+    :param session_id: expected Session id。
+    :param run_id: expected Run id。
+    :param attempt_id: expected Attempt id。
+    :param execution_id: expected execution id。
+    :param expected: append幂等路径的expected payload；source读取时为``None``。
+    :param conflict: 是否把不一致分类为identity conflict。
+    :returns: strict parsed payload。
+    :raises HostEventIdentityConflictError: append幂等identity矛盾时抛出。
+    :raises HostDurableError: source durable row损坏或不匹配时抛出。
+    """
+
+    from dayu.host.durable.event_log import EventClass
+    from dayu.host.payload_resolution import event_payload_object
+
+    try:
+        if (
+            row.event_class is not EventClass.CANONICAL_FACT
+            or row.session_id != session_id
+            or row.run_id != run_id
+            or row.attempt_id != attempt_id
+            or row.execution_id != execution_id
+            or row.event_type != CONTEXT_BUDGET_EVALUATED
+            or row.actor != _CONTEXT_BUDGET_EVENT_ACTOR
+            or row.source != _CONTEXT_BUDGET_EVENT_SOURCE
+            or row.client_request_id is not None
+            or row.policy_decision_json is not None
+            or row.reason_json is not None
+            or row.payload_ref is not None
+            or row.payload_digest is not None
+        ):
+            raise ValueError("context budget EventLog row identity mismatch")
+        parsed = parse_context_budget_evaluated_payload(
+            event_payload_object(
+                transaction,
+                row,
+                payload_label=CONTEXT_BUDGET_EVALUATED,
+            )
+        )
+        if row.idempotency_key != parsed.decision_id:
+            raise ValueError("context budget EventLog idempotency mismatch")
+        if row.event_id != context_budget_evaluated_event_id(
+            _identity_from_payload(parsed)
+        ):
+            raise ValueError("context budget EventLog event id mismatch")
+        if expected is not None and parsed != expected:
+            raise ValueError("context budget canonical result mismatch")
+        return parsed
+    except (HostDurableError, TypeError, ValueError) as exc:
+        if conflict:
+            raise HostEventIdentityConflictError(
+                "context budget decision identity already has conflicting truth"
+            ) from exc
+        raise HostDurableError("source context budget fact is invalid") from exc
+
+
+def _parse_anchor_diagnostic(value: JsonValue) -> ContextAnchorDiagnostic | None:
+    """Strict parse Host-only anchor diagnostic。
+
+    :param value: canonical JSON value。
+    :returns: typed diagnostic或``None``。
+    :raises ValueError: shape、ref、digest或整数范围非法时抛出。
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("anchor_diagnostic must be object or null")
+    _require_exact_fields(value, _ANCHOR_DIAGNOSTIC_FIELDS)
+    diagnostic = ContextAnchorDiagnostic(
+        manifest_event_id=_required_text(value, "manifest_event_id"),
+        manifest_payload_ref=_required_text(value, "manifest_payload_ref"),
+        manifest_digest=_required_digest(value, "manifest_digest"),
+        iteration_link_event_id=_required_text(
+            value,
+            "iteration_link_event_id",
+        ),
+        usage_event_id=_required_text(value, "usage_event_id"),
+        usage_observation_digest=_required_digest(
+            value,
+            "usage_observation_digest",
+        ),
+        iteration_completed_event_id=_required_text(
+            value,
+            "iteration_completed_event_id",
+        ),
+        usage_anchor_tokens=_required_non_negative_int(
+            value,
+            "usage_anchor_tokens",
+        ),
+        conservative_anchor_tokens=_required_non_negative_int(
+            value,
+            "conservative_anchor_tokens",
+        ),
+        conservative_current_tokens=_required_non_negative_int(
+            value,
+            "conservative_current_tokens",
+        ),
+        signed_delta_tokens=_required_int(value, "signed_delta_tokens"),
+        predicted_input_tokens=_required_positive_int(
+            value,
+            "predicted_input_tokens",
+        ),
+    )
+    for token_count in (
+        diagnostic.usage_anchor_tokens,
+        diagnostic.conservative_anchor_tokens,
+        diagnostic.conservative_current_tokens,
+        diagnostic.predicted_input_tokens,
+    ):
+        if token_count > MAX_CONTEXT_TOKEN_COUNT:
+            raise ValueError("anchor diagnostic token count exceeds supported range")
+    if abs(diagnostic.signed_delta_tokens) > MAX_CONTEXT_TOKEN_COUNT:
+        raise ValueError("anchor signed delta exceeds supported range")
+    return diagnostic
+
+
+def _anchor_diagnostic_payload(
+    diagnostic: ContextAnchorDiagnostic | None,
+) -> Mapping[str, JsonValue] | None:
+    """把typed anchor diagnostic序列化为canonical nested object。
+
+    :param diagnostic: Host-private anchor诊断；fallback时为``None``。
+    :returns: canonical JSON object或``None``。
+    :raises TypeError: diagnostic类型非法时抛出。
+    """
+
+    if diagnostic is None:
+        return None
+    if not isinstance(diagnostic, ContextAnchorDiagnostic):
+        raise TypeError("anchor diagnostic must be ContextAnchorDiagnostic")
+    return {
+        "manifest_event_id": diagnostic.manifest_event_id,
+        "manifest_payload_ref": diagnostic.manifest_payload_ref,
+        "manifest_digest": diagnostic.manifest_digest,
+        "iteration_link_event_id": diagnostic.iteration_link_event_id,
+        "usage_event_id": diagnostic.usage_event_id,
+        "usage_observation_digest": diagnostic.usage_observation_digest,
+        "iteration_completed_event_id": (
+            diagnostic.iteration_completed_event_id
+        ),
+        "usage_anchor_tokens": diagnostic.usage_anchor_tokens,
+        "conservative_anchor_tokens": (
+            diagnostic.conservative_anchor_tokens
+        ),
+        "conservative_current_tokens": (
+            diagnostic.conservative_current_tokens
+        ),
+        "signed_delta_tokens": diagnostic.signed_delta_tokens,
+        "predicted_input_tokens": diagnostic.predicted_input_tokens,
+    }
 
 CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 """Context compaction requested canonical event type。"""
@@ -840,6 +1637,67 @@ def _required_positive_int(
     return value
 
 
+def _required_int(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> int:
+    """读取必填严格整数字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 整数值。
+    :raises ValueError: 字段缺失、为bool或不是int时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be int")
+    return value
+
+
+def _required_enum(
+    payload: Mapping[str, JsonValue],
+    field_name: str,
+    enum_type: type[_EnumT],
+) -> _EnumT:
+    """读取必填closed string enum。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :param enum_type: 目标``StrEnum``类型。
+    :returns: typed enum成员。
+    :raises ValueError: 字段不是非空文本或unknown value时抛出。
+    """
+
+    value = _required_text(payload, field_name)
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} has unsupported value") from exc
+
+
+def _optional_enum(
+    payload: Mapping[str, JsonValue],
+    field_name: str,
+    enum_type: type[_EnumT],
+) -> _EnumT | None:
+    """读取nullable closed string enum。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :param enum_type: 目标``StrEnum``类型。
+    :returns: typed enum成员或``None``。
+    :raises ValueError: 非null字段不是closed enum成员时抛出。
+    """
+
+    value = _optional_text(payload, field_name)
+    if value is None:
+        return None
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} has unsupported value") from exc
+
+
 def _optional_non_negative_int(
     payload: Mapping[str, JsonValue], field_name: str
 ) -> int | None:
@@ -987,14 +1845,25 @@ def _require_non_empty_text_value(value: JsonValue, field_name: str) -> str:
 
 
 __all__ = [
+    "CONTEXT_BUDGET_EVALUATED",
+    "CONTEXT_BUDGET_EVALUATED_SCHEMA_VERSION",
     "CONTEXT_COMPACTED",
     "CONTEXT_COMPACTION_ATTEMPT_REJECTED",
     "CONTEXT_COMPACTION_FAILED",
     "CONTEXT_COMPACTION_REQUESTED",
+    "ContextBudgetEvaluatedPayload",
+    "ContextBudgetEvaluationIdentity",
+    "append_context_budget_evaluated_in_transaction",
+    "build_context_budget_evaluated_payload",
     "build_context_compaction_attempt_rejected_payload",
     "build_context_compacted_payload",
     "build_context_compaction_failed_payload",
     "build_context_compaction_requested_payload",
+    "context_budget_evaluated_decision_id",
+    "context_budget_evaluated_event_id",
+    "context_budget_evaluation_identity",
+    "load_matching_context_budget_evaluation_in_transaction",
+    "parse_context_budget_evaluated_payload",
     "validate_context_compaction_attempt_rejected_payload",
     "validate_context_compacted_payload",
     "validate_context_compaction_failed_payload",

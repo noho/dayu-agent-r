@@ -226,6 +226,82 @@ def project_accepted_tool_result(
     )
 
 
+def project_planned_accepted_tool_result(
+    transaction: HostTransaction,
+    *,
+    event_id: str,
+    session_id: str,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    occurred_at: str,
+    payload: Mapping[str, JsonValue],
+) -> AcceptedToolResultProjection:
+    """投影同事务稍后将提交的确定性 accepted-result payload。
+
+    planned 与 committed path 共用 :func:`project_accepted_tool_result` 的
+    strict core；本函数只构造尚未分配 sequence 的 typed event identity，不持久化
+    第二份结果事实。
+
+    :param transaction: 当前 wait resolution write transaction。
+    :param event_id: transition 稍后必须逐字提交的确定性 event id。
+    :param session_id: accepted result Session id。
+    :param run_id: accepted result Run id。
+    :param attempt_id: source suspended Attempt id。
+    :param execution_id: source suspended execution id。
+    :param occurred_at: wait result 观察时间的 UTC 文本。
+    :param payload: transition 将提交的 exact payload。
+    :returns: 与 committed row 同源的 typed projection。
+    :raises HostDurableError: identity 为空或 payload 违反 accepted-result contract 时抛出。
+    """
+
+    for field_name, value in (
+        ("event_id", event_id),
+        ("session_id", session_id),
+        ("run_id", run_id),
+        ("attempt_id", attempt_id),
+        ("execution_id", execution_id),
+        ("occurred_at", occurred_at),
+    ):
+        if value.strip() == "":
+            raise HostDurableError(
+                f"planned accepted result {field_name} must be non-empty"
+            )
+    payload_json = canonical_json_dumps(payload)
+    planned_row = EventLogRow(
+        event_sequence=0,
+        event_id=event_id,
+        event_body_digest=sha256_digest_json(
+            {
+                "event_id": event_id,
+                "payload": payload,
+            }
+        ),
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=session_id,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+        occurred_at=occurred_at,
+        actor="host",
+        source="host.resolve_wait",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json=payload_json,
+        payload_ref=None,
+        payload_digest=None,
+        appended_at=occurred_at,
+    )
+    return project_accepted_tool_result(
+        transaction,
+        planned_row,
+        resolved_payload=payload,
+    )
+
+
 def _result_event_payload(
     transaction: HostTransaction,
     result_row: EventLogRow,

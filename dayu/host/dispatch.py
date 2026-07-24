@@ -16,11 +16,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
-from typing import Protocol
+from typing import Protocol, TypeAlias
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_schema import ToolSchema
+from dayu.contracts.tool_executor import ToolExecutor
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
@@ -29,7 +31,10 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.host.admission import (
     AdmissionWakeupPort,
+    EffectiveToolFacts,
     PendingDispatchRecord,
+    parse_effective_tool_facts,
+    validate_effective_tool_facts_runtime,
 )
 from dayu.host.api import (
     AttemptDispatchSnapshot,
@@ -108,8 +113,6 @@ from dayu.host.session_attachment import (
 )
 from dayu.host._execution_config_projection import (
     effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
-    required_json_mapping as _required_json_mapping,
-    required_json_text as _required_json_text,
 )
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
@@ -129,23 +132,27 @@ from dayu.host.terminal_post_commit import (
 )
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
-    DurableCompactArtifactProvider,
-    DurableMemorySnapshotProvider,
-    MemoryProjectionRepairRequired,
+    NoToolExecutor,
     PolicySnapshot,
-    RunInputBuilder,
+    PreparedRunnerCallCandidate,
+    SessionContinuityView,
     ToolExecutionMode,
-    create_no_tool_run_input_builder,
-    create_tool_enabled_run_input_builder,
+    agent_run_request_from_prepared_candidate,
+    estimate_prepared_runner_call_candidate,
+    load_prepared_runner_call_candidate,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
 )
-from dayu.host.memory import (
-    MemoryRepairReason,
-    digest_memory_projection_policy,
+from dayu.host._runner_call_manifest import (
+    RunnerCallSizingUnavailableReason,
+    complete_runner_call_sizing_snapshot,
+    unavailable_runner_call_sizing_snapshot,
 )
+from dayu.host.memory import digest_memory_projection_policy
 from dayu.host.memory_repair import (
     ConversationMemoryProjectionRepairResult,
     catch_up_conversation_memory_projection,
-    rebuild_conversation_memory_projection,
 )
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
@@ -187,25 +194,33 @@ from dayu.host.context_budget import (
     BudgetEstimateInput,
     BudgetTextFragment,
     ContextBudgetDecision,
+    ContextSizingFallbackReason,
+    ContextSizingResult,
+    ContextSizingStage,
+    build_conservative_context_sizing_result,
+    build_context_sizing_result,
     decide_context_budget,
     estimate_context_budget,
 )
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
     FALLBACK_ACTION_NOT_APPLICABLE,
-    EventLogContextFallbackProvider,
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    append_context_budget_evaluated_in_transaction,
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
 )
-from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    ContextCompactionTriggerSource,
+)
 from dayu.host.proactive_compaction import (
     ProactiveCompactionAttemptPlan,
     ProactiveCompactionAttemptStage,
@@ -218,6 +233,7 @@ from dayu.host.proactive_compaction import (
 )
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.payload import PayloadStore
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DefaultToolRuntimeFactory,
@@ -263,6 +279,11 @@ _EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX = "event-context-compaction
 _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
+_CONTEXT_HARD_THRESHOLD_BEFORE_DISPATCH = "context_hard_threshold_before_dispatch"
+_CONTEXT_HARD_THRESHOLD_AFTER_COMPACTION = (
+    "context_hard_threshold_after_compaction"
+)
+_CONTEXT_HARD_THRESHOLD_AFTER_FALLBACK = "context_hard_threshold_after_fallback"
 _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
 _PROACTIVE_INVALID_OR_EXHAUSTED_REASON = (
     "proactive_operation_invalid_or_exhausted"
@@ -694,6 +715,154 @@ class _GovernanceStageResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BudgetedDispatchStart:
+    """有 Host context policy 的 allow start plan。
+
+    :param start_input: allow 后唯一生成的 durable start input。
+    :param sizing: complete candidate conservative sizing truth。
+    """
+
+    start_input: StartGovernedRunInput
+    sizing: ContextSizingResult
+
+
+@dataclass(frozen=True, slots=True)
+class NoBudgetDispatchStart:
+    """context policy unavailable 的 allow-without-budget start plan。
+
+    :param start_input: allow 后唯一生成的 durable start input。
+    :param stage: 当前 candidate 的实际 sizing stage。
+    """
+
+    start_input: StartGovernedRunInput
+    stage: ContextSizingStage
+
+
+DispatchStartPlan: TypeAlias = BudgetedDispatchStart | NoBudgetDispatchStart
+
+
+class _StartCandidateCasMissRollback(Exception):
+    """start precondition miss 的 transaction-private rollback 信号。"""
+
+
+def _build_candidate_sizing_result(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    stage: ContextSizingStage,
+    candidate: PreparedRunnerCallCandidate,
+    policy: ContextBudgetPolicy,
+    estimate: BudgetEstimate,
+) -> ContextSizingResult:
+    """在当前 dispatch transaction 内构造唯一 candidate sizing 结果。
+
+    accepted compact 后的 immediate candidate 没有可证明的普通 lineage
+    continuity，因此固定使用完整 conservative estimate；其余 dispatch
+    candidate 在同一 snapshot 内解析 durable anchor，再交给 budget owner
+    计算预测与五阶段动作。
+
+    :param transaction: 调用方当前 Host transaction。
+    :param event_log_store: stateless EventLog primitive。
+    :param stage: 当前 candidate sizing stage。
+    :param candidate: complete prepared runner-call candidate。
+    :param policy: frozen context budget policy。
+    :param estimate: 当前 complete candidate 的 conservative estimate。
+    :returns: anchored 或 conservative sizing result。
+    :raises TypeError: typed 参数非法时抛出。
+    :raises ValueError: candidate、policy、estimate 或 resolver atoms 不一致时抛出。
+    """
+
+    if stage in (
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.REACTIVE_POST_COMPACT,
+    ):
+        return build_conservative_context_sizing_result(
+            stage=stage,
+            candidate_input_cursor=candidate.candidate_input_cursor,
+            candidate_input_projection_ref=(
+                candidate.candidate_input_projection_ref
+            ),
+            candidate_input_digest=candidate.input_snapshot_digest,
+            policy=policy,
+            estimate=estimate,
+            fallback_reason=(
+                ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
+            ),
+        )
+    anchor_resolution = (
+        resolve_prepared_runner_call_context_anchor_in_transaction(
+            transaction,
+            event_log_store,
+            candidate=candidate,
+            context_window_size=policy.context_window_size,
+        )
+    )
+    return build_context_sizing_result(
+        stage=stage,
+        candidate_input_cursor=candidate.candidate_input_cursor,
+        candidate_input_projection_ref=(
+            candidate.candidate_input_projection_ref
+        ),
+        candidate_input_digest=candidate.input_snapshot_digest,
+        policy=policy,
+        estimate=estimate,
+        anchor_resolution=anchor_resolution,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchCandidateOutcome:
+    """post-compact / fallback candidate 的封闭事务结果。
+
+    :param pending_dispatch: allow 后创建的唯一 pending dispatch。
+    :param terminal_notice: hard pressure closeout 的精确 terminal notice。
+    """
+
+    pending_dispatch: PendingDispatchRecord | None
+    terminal_notice: TerminalPostCommitNotice | None
+
+    def __post_init__(self) -> None:
+        """校验 pending 与 terminal 恰有一个成立。
+
+        :returns: ``None``。
+        :raises ValueError: 两个结果同时存在或同时缺失时抛出。
+        """
+
+        if (self.pending_dispatch is None) == (self.terminal_notice is None):
+            raise ValueError(
+                "dispatch candidate outcome requires exactly one result"
+            )
+
+
+def _hard_threshold_closeout(
+    stage: ContextSizingStage,
+) -> tuple[str, str]:
+    """返回各 sizing stage 的 hard closeout 错误语义。
+
+    :param stage: 当前 candidate sizing stage。
+    :returns: ``(error_code, message)``。
+    :raises ValueError: stage 不是已冻结的三种治理阶段时抛出。
+    """
+
+    if stage is ContextSizingStage.ORDINARY:
+        return (
+            _CONTEXT_HARD_THRESHOLD_BEFORE_DISPATCH,
+            "Context estimate exceeds hard threshold before dispatch",
+        )
+    if stage is ContextSizingStage.POST_COMPACT:
+        return (
+            _CONTEXT_HARD_THRESHOLD_AFTER_COMPACTION,
+            "Context estimate exceeds hard threshold after compaction",
+        )
+    if stage is ContextSizingStage.DISPATCH_FALLBACK:
+        return (
+            _CONTEXT_HARD_THRESHOLD_AFTER_FALLBACK,
+            "Context estimate exceeds hard threshold after fallback",
+        )
+    raise ValueError("unsupported context sizing stage")
+
+
+@dataclass(frozen=True, slots=True)
 class _ProactiveCompactionExecutionResult:
     """proactive compaction 事务外执行后的 Host 后续动作。
 
@@ -712,11 +881,25 @@ class _EffectiveDispatchDecision:
     """一次 dispatch 从 durable input event 读取的冻结决策。
 
     :param policy_snapshot: effective runner / agent policy snapshot。
-    :param selected_business_tool_names: effective 业务工具名集合；``None`` 表示全量。
+    :param effective_tool_facts: admission 冻结的完整 exact tool facts。
     """
 
     policy_snapshot: PolicySnapshot
-    selected_business_tool_names: frozenset[str] | None
+    effective_tool_facts: EffectiveToolFacts
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateToolSelection:
+    """pre-start candidate 的 Attempt-free selected tool snapshot。
+
+    :param tool_schemas: frozen selected schemas。
+    :param disable_tools: 是否禁用工具。
+    :param execution_mode: scene 与 actual runtime 共用的工具模式。
+    """
+
+    tool_schemas: tuple[ToolSchema, ...]
+    disable_tools: bool
+    execution_mode: ToolExecutionMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -731,29 +914,6 @@ class _ActiveWorkerEntry:
     identity: AttemptExecutionIdentity
     handle: LocalWorkerHandle
     cancellation_token: "_HostCancellationToken"
-
-
-@dataclass(frozen=True, slots=True)
-class _IsReplayRunOperation:
-    """读取 Run source relation 以识别 replay 关联 Run。
-
-    :param run_id: 目标 Run id。
-    """
-
-    run_id: str
-
-    def __call__(self, transaction: HostTransaction) -> bool:
-        """执行 replay Run 判定读事务。
-
-        :param transaction: 当前 Host 读事务。
-        :returns: Run source relation 为 replay 时返回 ``True``。
-        :raises RuntimeError: durable Run 缺失时抛出。
-        """
-
-        run = read_run_by_id(transaction, self.run_id)
-        if run is None:
-            raise RuntimeError("dispatch Run is missing")
-        return run.source_run_relation is SourceRunRelation.REPLAY
 
 
 class ActiveWorkerRegistry:
@@ -1647,6 +1807,7 @@ class HostDispatchScheduler:
         """
 
         del work_lease
+        self._catch_up_memory_projection_before_candidate(session_id)
 
         def _operation(transaction: HostTransaction) -> _GovernanceStageResult:
             run = _read_startable_run(transaction, session_id)
@@ -1656,19 +1817,6 @@ class HostDispatchScheduler:
                     session_id,
                 )
                 return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
-            policy = self._local_execution.context_budget_policy
-            if policy is None:
-                _LOGGER.log(
-                    VERBOSE_LOG_LEVEL,
-                    "dispatch.governance.allow_without_budget session_id=%s " "run_id=%s run_status=%s",
-                    run.session_id,
-                    run.run_id,
-                    run.status.value,
-                )
-                return _GovernanceStageResult(
-                    pending_dispatch=self._start_governed_in_transaction(transaction, run),
-                    compact_accepted=None,
-                )
             input_event = self._event_log_store.read_event_by_id(transaction, run.input_event_id)
             if input_event is None:
                 _LOGGER.critical(
@@ -1688,49 +1836,44 @@ class HostDispatchScheduler:
                         message="Input event is missing before dispatch",
                     ),
                 )
-            display_text = _display_text_from_input_event(transaction, input_event)
+            input_payload = event_payload_object(
+                transaction,
+                input_event,
+                payload_label="USER_INPUT_ACCEPTED",
+            )
+            effective_decision = _effective_dispatch_decision_from_payload(
+                input_payload,
+            )
+            tool_selection = self._candidate_tool_selection(
+                run,
+                effective_decision=effective_decision,
+            )
             try:
-                material_view = build_pre_dispatch_compact_material_view(
+                candidate = prepare_runner_call_candidate_in_transaction(
                     transaction,
                     self._event_log_store,
                     run=run,
-                    current_display_text=display_text,
+                    current_input_event=input_event,
+                    continuity=SessionContinuityView(
+                        messages=(),
+                        source_refs=(),
+                    ),
+                    policy_snapshot=effective_decision.policy_snapshot,
+                    tool_schemas=tool_selection.tool_schemas,
+                    disable_tools=tool_selection.disable_tools,
+                    tool_execution_mode=tool_selection.execution_mode,
+                    memory_projection_policy=(
+                        self._local_execution.memory_projection_policy
+                    ),
                 )
             except Exception as exc:
                 _LOGGER.error(
-                    "dispatch.governance.material_source_failed session_id=%s "
+                    "dispatch.governance.candidate_source_failed session_id=%s "
                     "run_id=%s failure_reason=%s",
                     run.session_id,
                     run.run_id,
                     exc.__class__.__name__,
                     exc_info=True,
-                )
-                estimate = estimate_context_budget(
-                    policy,
-                    BudgetEstimateInput(
-                        session_id=run.session_id,
-                        run_id=run.run_id,
-                        message_fragments=(
-                            BudgetTextFragment(
-                                fragment_ref="current-input:source-failure-diagnostic",
-                                text=display_text,
-                            ),
-                        ),
-                        current_prompt_ref=run.input_event_id,
-                    ),
-                )
-                self._append_compaction_failed_event(
-                    transaction,
-                    run=run,
-                    estimate=estimate,
-                    decision=decide_context_budget(estimate),
-                    operation_id=_precondition_compaction_operation_id(
-                        failure_reason="material_source_failed",
-                        estimate=estimate,
-                    ),
-                    failure_reason="material_source_failed",
-                    attempt_count=0,
-                    retry_repair_budget_exhausted=False,
                 )
                 return _GovernanceStageResult(
                     pending_dispatch=None,
@@ -1738,21 +1881,49 @@ class HostDispatchScheduler:
                     terminal_notice=self._fail_unstarted_in_transaction(
                         transaction,
                         run,
-                        reason=_GOVERNANCE_FAILURE_REASON,
-                        error_code="context_compaction_failed",
-                        message="Context compaction material source failed before dispatch",
+                        reason="runner_candidate_invalid",
+                        error_code="runner_candidate_invalid",
+                        message="Runner input candidate could not be frozen before dispatch",
                     ),
                 )
-            estimate = estimate_context_budget(
+            policy = self._local_execution.context_budget_policy
+            if policy is None:
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
+                    "dispatch.governance.allow_without_budget session_id=%s "
+                    "run_id=%s run_status=%s",
+                    run.session_id,
+                    run.run_id,
+                    run.status.value,
+                )
+                start_plan = NoBudgetDispatchStart(
+                    start_input=self._new_governed_start_input(run),
+                    stage=ContextSizingStage.ORDINARY,
+                )
+                return _GovernanceStageResult(
+                    pending_dispatch=(
+                        self._commit_dispatch_candidate_in_transaction(
+                            transaction,
+                            run,
+                            candidate,
+                            start_plan,
+                        )
+                    ),
+                    compact_accepted=None,
+                )
+            estimate = estimate_prepared_runner_call_candidate(
+                candidate,
                 policy,
-                BudgetEstimateInput(
-                    session_id=run.session_id,
-                    run_id=run.run_id,
-                    message_fragments=material_view.budget_fragments,
-                    current_prompt_ref=run.input_event_id,
-                ),
             )
-            decision = decide_context_budget(estimate)
+            sizing = _build_candidate_sizing_result(
+                transaction,
+                self._event_log_store,
+                stage=ContextSizingStage.ORDINARY,
+                candidate=candidate,
+                policy=policy,
+                estimate=estimate,
+            )
+            decision = sizing.budget_decision
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
                 "dispatch.governance.decision session_id=%s run_id=%s " "decision=%s policy_ref=%s",
@@ -1773,10 +1944,31 @@ class HostDispatchScheduler:
                 estimate.estimator_digest,
             )
             if decision is ContextBudgetDecision.ALLOW_DISPATCH:
+                start_plan = BudgetedDispatchStart(
+                    start_input=self._new_governed_start_input(run),
+                    sizing=sizing,
+                )
                 return _GovernanceStageResult(
-                    pending_dispatch=self._start_governed_in_transaction(transaction, run),
+                    pending_dispatch=(
+                        self._commit_dispatch_candidate_in_transaction(
+                            transaction,
+                            run,
+                            candidate,
+                            start_plan,
+                        )
+                    ),
                     compact_accepted=None,
                 )
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                occurred_at=datetime.now(UTC),
+                result=sizing,
+            )
             if decision is ContextBudgetDecision.BLOCK_HARD_THRESHOLD:
                 _LOGGER.error(
                     "dispatch.governance.failed session_id=%s run_id=%s "
@@ -1814,6 +2006,53 @@ class HostDispatchScheduler:
                         message="Context estimate exceeds hard threshold before dispatch",
                     ),
                 )
+            display_text = _display_text_from_input_event(
+                transaction,
+                input_event,
+            )
+            try:
+                material_view = build_pre_dispatch_compact_material_view(
+                    transaction,
+                    self._event_log_store,
+                    run=run,
+                    current_display_text=display_text,
+                )
+            except Exception as exc:
+                _LOGGER.error(
+                    "dispatch.governance.material_source_failed session_id=%s "
+                    "run_id=%s failure_reason=%s",
+                    run.session_id,
+                    run.run_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=estimate,
+                    decision=decision,
+                    operation_id=_precondition_compaction_operation_id(
+                        failure_reason="material_source_failed",
+                        estimate=estimate,
+                    ),
+                    failure_reason="material_source_failed",
+                    attempt_count=0,
+                    retry_repair_budget_exhausted=False,
+                )
+                return _GovernanceStageResult(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                    terminal_notice=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="context_compaction_failed",
+                        message=(
+                            "Context compaction material source failed before "
+                            "dispatch"
+                        ),
+                    ),
+                )
             projection = read_proactive_compaction_projection(
                 transaction,
                 self._event_log_store,
@@ -1834,12 +2073,15 @@ class HostDispatchScheduler:
                     ),
                 )
             if projection.decision is ProactiveCompactionDecision.USE_FAILED_FALLBACK:
+                outcome = self._prepare_and_commit_start_in_transaction(
+                    transaction,
+                    run,
+                    stage=ContextSizingStage.DISPATCH_FALLBACK,
+                )
                 return _GovernanceStageResult(
-                    pending_dispatch=self._start_governed_in_transaction(
-                        transaction,
-                        run,
-                    ),
+                    pending_dispatch=outcome.pending_dispatch,
                     compact_accepted=None,
+                    terminal_notice=outcome.terminal_notice,
                 )
             if projection.decision is ProactiveCompactionDecision.FAIL_EXISTING_OPERATION:
                 operation_id = projection.state.operation_id
@@ -1876,7 +2118,7 @@ class HostDispatchScheduler:
                             ),
                         ),
                     )
-                fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
+                fallback_outcome = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
                     material_view=material_view,
@@ -1894,10 +2136,11 @@ class HostDispatchScheduler:
                     ),
                     retry_repair_budget_exhausted=True,
                 )
-                if fallback_dispatch is not None:
+                if fallback_outcome is not None:
                     return _GovernanceStageResult(
-                        pending_dispatch=fallback_dispatch,
+                        pending_dispatch=fallback_outcome.pending_dispatch,
                         compact_accepted=None,
+                        terminal_notice=fallback_outcome.terminal_notice,
                     )
                 return _GovernanceStageResult(
                     pending_dispatch=None,
@@ -1925,7 +2168,18 @@ class HostDispatchScheduler:
             )
             return prepared
 
-        stage = self._transaction_runner.run_write(_operation)
+        try:
+            stage = self._transaction_runner.run_write(_operation)
+        except _StartCandidateCasMissRollback:
+            _LOGGER.debug(
+                "dispatch.governance.start_precondition_miss_rolled_back "
+                "session_id=%s",
+                session_id,
+            )
+            return _GovernanceStageResult(
+                pending_dispatch=None,
+                compact_accepted=None,
+            )
         if stage.terminal_notice is not None:
             self._notify_terminal_post_commit(stage.terminal_notice)
         if stage.compact_pending is None:
@@ -2081,7 +2335,7 @@ class HostDispatchScheduler:
                     pending_dispatch=None,
                 )
             if not _compaction_result_accepted(accepted_result):
-                fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
+                fallback_outcome = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
                     material_view=pending.material_view,
@@ -2095,10 +2349,11 @@ class HostDispatchScheduler:
                     ),
                     budget_after_attempted_compact=budget_after_attempted_compact,
                 )
-                if fallback_dispatch is not None:
+                if fallback_outcome is not None:
                     return _ProactiveCompactionExecutionResult(
                         compacted_event_sequence=None,
-                        pending_dispatch=fallback_dispatch,
+                        pending_dispatch=fallback_outcome.pending_dispatch,
+                        terminal_notice=fallback_outcome.terminal_notice,
                     )
                 return _ProactiveCompactionExecutionResult(
                     compacted_event_sequence=None,
@@ -2217,14 +2472,23 @@ class HostDispatchScheduler:
             event_source=_EVENT_SOURCE,
         )
 
-    def _start_governed_after_compact(self, accepted: _GovernanceCompactAccepted) -> PendingDispatchRecord | None:
+    def _start_governed_after_compact(
+        self,
+        accepted: _GovernanceCompactAccepted,
+    ) -> PendingDispatchRecord | None:
         """compact catch-up 后启动同一个未启动 Run。
 
         :param accepted: compact accepted 摘要。
         :returns: pending dispatch 摘要；状态已变化时返回 ``None``。
         """
 
-        def _operation(transaction: HostTransaction) -> PendingDispatchRecord | None:
+        self._catch_up_memory_projection_before_candidate(
+            accepted.session_id
+        )
+
+        def _operation(
+            transaction: HostTransaction,
+        ) -> _DispatchCandidateOutcome | None:
             run = read_run_by_id(transaction, accepted.run_id)
             if run is None or run.status != accepted.expected_status:
                 _LOGGER.debug(
@@ -2234,66 +2498,402 @@ class HostDispatchScheduler:
                     accepted.expected_status.value,
                 )
                 return None
-            return self._start_governed_in_transaction(transaction, run)
+            return self._prepare_and_commit_start_in_transaction(
+                transaction,
+                run,
+                stage=ContextSizingStage.POST_COMPACT,
+            )
 
-        return self._transaction_runner.run_write(_operation)
+        try:
+            outcome = self._transaction_runner.run_write(_operation)
+        except _StartCandidateCasMissRollback:
+            _LOGGER.debug(
+                "dispatch.governance.post_compact_start_precondition_miss "
+                "session_id=%s run_id=%s",
+                accepted.session_id,
+                accepted.run_id,
+            )
+            return None
+        if outcome is None:
+            return None
+        if outcome.terminal_notice is not None:
+            self._notify_terminal_post_commit(outcome.terminal_notice)
+        return outcome.pending_dispatch
 
-    def _start_governed_in_transaction(self, transaction: HostTransaction, run: RunRow) -> PendingDispatchRecord | None:
-        """在当前事务内启动 accepted/queued Run。
+    def _prepare_and_commit_start_in_transaction(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+        *,
+        stage: ContextSizingStage,
+    ) -> _DispatchCandidateOutcome:
+        """为 post-compact/fallback 冻结新 candidate 并按 decision 提交。
 
-        :param transaction: 当前 Host transaction。
-        :param run: 待启动 Run。
-        :returns: pending dispatch 摘要；CAS 失败时返回 ``None``。
+        :param transaction: 当前 write transaction。
+        :param run: 当前 startable Run。
+        :param stage: 本次 conservative sizing stage。
+        :returns: allow 的 pending dispatch 或 hard closeout terminal notice。
+        :raises _StartCandidateCasMissRollback: start precondition miss时抛出。
+        :raises HostDurableError: candidate、manifest 或 transition integrity失败时抛出。
         """
 
+        input_event = self._event_log_store.read_event_by_id(
+            transaction,
+            run.input_event_id,
+        )
+        if input_event is None:
+            raise HostDurableError(
+                "dispatch candidate input event is missing"
+            )
+        input_payload = event_payload_object(
+            transaction,
+            input_event,
+            payload_label="USER_INPUT_ACCEPTED",
+        )
+        effective_decision = _effective_dispatch_decision_from_payload(
+            input_payload,
+        )
+        tool_selection = self._candidate_tool_selection(
+            run,
+            effective_decision=effective_decision,
+        )
+        candidate = prepare_runner_call_candidate_in_transaction(
+            transaction,
+            self._event_log_store,
+            run=run,
+            current_input_event=input_event,
+            continuity=SessionContinuityView(
+                messages=(),
+                source_refs=(),
+            ),
+            policy_snapshot=effective_decision.policy_snapshot,
+            tool_schemas=tool_selection.tool_schemas,
+            disable_tools=tool_selection.disable_tools,
+            tool_execution_mode=tool_selection.execution_mode,
+            memory_projection_policy=(
+                self._local_execution.memory_projection_policy
+            ),
+        )
+        policy = self._local_execution.context_budget_policy
+        if policy is None:
+            return _DispatchCandidateOutcome(
+                pending_dispatch=self._commit_dispatch_candidate_in_transaction(
+                    transaction,
+                    run,
+                    candidate,
+                    NoBudgetDispatchStart(
+                        start_input=self._new_governed_start_input(run),
+                        stage=stage,
+                    ),
+                ),
+                terminal_notice=None,
+            )
+        estimate = estimate_prepared_runner_call_candidate(candidate, policy)
+        sizing = _build_candidate_sizing_result(
+            transaction,
+            self._event_log_store,
+            stage=stage,
+            candidate=candidate,
+            policy=policy,
+            estimate=estimate,
+        )
+        if sizing.budget_decision is ContextBudgetDecision.ALLOW_DISPATCH:
+            return _DispatchCandidateOutcome(
+                pending_dispatch=self._commit_dispatch_candidate_in_transaction(
+                    transaction,
+                    run,
+                    candidate,
+                    BudgetedDispatchStart(
+                        start_input=self._new_governed_start_input(run),
+                        sizing=sizing,
+                    ),
+                ),
+                terminal_notice=None,
+            )
+        append_context_budget_evaluated_in_transaction(
+            transaction,
+            self._event_log_store,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=None,
+            execution_id=None,
+            occurred_at=datetime.now(UTC),
+            result=sizing,
+        )
+        error_code, message = _hard_threshold_closeout(stage)
+        terminal_notice = self._fail_unstarted_in_transaction(
+            transaction,
+            run,
+            reason=_GOVERNANCE_FAILURE_REASON,
+            error_code=error_code,
+            message=message,
+        )
+        if terminal_notice is None:
+            raise _StartCandidateCasMissRollback()
+        return _DispatchCandidateOutcome(
+            pending_dispatch=None,
+            terminal_notice=terminal_notice,
+        )
+
+    def _new_governed_start_input(
+        self,
+        run: RunRow,
+    ) -> StartGovernedRunInput:
+        """仅在 allow decision 后生成唯一 governed start identity。
+
+        :param run: 当前 startable Run。
+        :returns: caller-owned exact start input。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return StartGovernedRunInput(
+            run_id=run.run_id,
+            expected_status=run.status,
+            run_started_event_id=_new_event_id("event-run-started"),
+            attempt_started_event_id=_new_event_id("event-attempt-started"),
+            attempt_id=_new_event_id("attempt"),
+            execution_id=_new_event_id("execution"),
+            dispatch_record_id=_new_event_id("dispatch"),
+            occurred_at=datetime.now(UTC),
+            actor=_EVENT_ACTOR,
+            source=_EVENT_SOURCE,
+            start_reason=(
+                RunStartReason.INITIAL
+                if run.status is RunStatus.ACCEPTED
+                else RunStartReason.QUEUE_PROMOTION
+            ),
+            worker_kind=WorkerKind.LOCAL,
+            owner_host_instance_id=(
+                self._host_instance_identity.host_instance_id
+            ),
+        )
+
+    def _candidate_tool_selection(
+        self,
+        run: RunRow,
+        *,
+        effective_decision: _EffectiveDispatchDecision,
+    ) -> _CandidateToolSelection:
+        """在 Attempt identity 生成前冻结 candidate 的工具 schema。
+
+        :param run: 当前 startable Run。
+        :param effective_decision: admission 已冻结的执行与工具选择。
+        :returns: identity-free selected tool snapshot。
+        :raises ValueError: effective tool bundle 配置非法时抛出。
+        """
+
+        policy_snapshot = effective_decision.policy_snapshot
+        tooling_options = (
+            None
+            if run.source_run_relation is SourceRunRelation.REPLAY
+            else self._local_execution.tooling_options
+        )
+        selected_business_tool_names = validate_effective_tool_facts_runtime(
+            effective_decision.effective_tool_facts,
+            tooling_options=tooling_options,
+        )
+        if (
+            tooling_options is None
+            or not policy_snapshot.agent_policy.allow_tool_calls
+        ):
+            return _CandidateToolSelection(
+                tool_schemas=(),
+                disable_tools=True,
+                execution_mode=(
+                    ToolExecutionMode.NO_TOOL_REPLAY
+                    if run.source_run_relation is SourceRunRelation.REPLAY
+                    else ToolExecutionMode.NO_TOOL_DISABLED
+                ),
+            )
+        effective_bundle = EffectiveToolBundleBuilder().build(
+            EffectiveToolBundleBuildRequest(
+                business_tool_bundle=tooling_options.business_tool_bundle,
+                source_refs=tooling_options.source_refs,
+                framework_tool_policy=tooling_options.framework_tool_policy,
+                policy_snapshot_digest=_policy_snapshot_digest(policy_snapshot),
+                selected_business_tool_names=selected_business_tool_names,
+                enable_truncation_manager=(
+                    self._local_execution.enable_truncation_manager
+                ),
+            )
+        )
+        return _CandidateToolSelection(
+            tool_schemas=effective_bundle.tool_schemas,
+            disable_tools=False,
+            execution_mode=ToolExecutionMode.TOOL_ENABLED,
+        )
+
+    def _catch_up_memory_projection_before_candidate(
+        self,
+        session_id: str,
+    ) -> None:
+        """在 candidate transaction 前追平该 Session 的 memory projection。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        :raises HostDurableError: memory projection 未覆盖当前 durable cursor 时抛出。
+        """
+
+        def _required_cursor(transaction: HostTransaction) -> int:
+            row = transaction.fetchone(
+                f"""
+                SELECT COALESCE(MAX(event_sequence), 0) AS event_sequence
+                FROM {TABLE_EVENT_LOG}
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+            if row is None:
+                return 0
+            value = row.get("event_sequence")
+            if not isinstance(value, int) or value < 0:
+                raise HostDurableError(
+                    "candidate memory projection cursor is invalid"
+                )
+            return value
+
+        required_event_sequence = self._transaction_runner.run_read(
+            _required_cursor
+        )
+        result = catch_up_conversation_memory_projection(
+            self._transaction_runner,
+            policy=self._local_execution.memory_projection_policy,
+            batch_size=(
+                self._local_execution.memory_projection_catchup_batch_size
+            ),
+            max_event_sequence=required_event_sequence,
+        )
+        if result.failures == 0 and result.target_reached:
+            return
+        raise HostDurableError(
+            "candidate memory projection did not reach required cursor: "
+            f"session_id={session_id}, required_event_sequence="
+            f"{required_event_sequence}, finished_cursor={result.finished_cursor}, "
+            f"stop_reason={result.stop_reason.value}"
+        )
+
+    def _commit_dispatch_candidate_in_transaction(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+        candidate: PreparedRunnerCallCandidate,
+        plan: DispatchStartPlan,
+    ) -> PendingDispatchRecord:
+        """按 manifest-before-start 顺序提交一个 allow candidate。
+
+        :param transaction: 调用方 write transaction。
+        :param run: 当前 startable Run。
+        :param candidate: identity-free frozen candidate。
+        :param plan: budgeted/no-budget closed start plan。
+        :returns: exact pending dispatch。
+        :raises _StartCandidateCasMissRollback: start precondition miss或完整 rows
+            缺失时触发整笔 rollback。
+        :raises HostDurableError: identity/digest/CAS integrity failure时传播。
+        """
+
+        if isinstance(plan, BudgetedDispatchStart):
+            start_input = plan.start_input
+            sizing = plan.sizing
+            if (
+                sizing.candidate_input_digest
+                != candidate.input_snapshot_digest
+                or sizing.candidate_input_cursor
+                != candidate.candidate_input_cursor
+            ):
+                raise HostDurableError(
+                    "dispatch sizing does not match frozen candidate"
+                )
+            sizing_snapshot = complete_runner_call_sizing_snapshot(
+                sizing_stage=sizing.stage,
+                estimator_id=sizing.estimator_contract.estimator_id,
+                estimator_version=(
+                    sizing.estimator_contract.estimator_version
+                ),
+                estimator_digest=sizing.estimator_digest,
+                conservative_input_tokens=(
+                    sizing.conservative_input_tokens
+                ),
+                context_window_size=sizing.context_window_size,
+                provider=candidate.policy_snapshot.runner_spec.provider,
+                model=candidate.policy_snapshot.runner_spec.model,
+                request_semantics_digest=(
+                    candidate.request_semantics_digest
+                ),
+                input_snapshot_digest=candidate.input_snapshot_digest,
+                policy_ref=sizing.policy_ref,
+                policy_snapshot_digest=sizing.policy_snapshot_digest,
+            )
+        else:
+            start_input = plan.start_input
+            sizing_snapshot = unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=plan.stage,
+            )
+        record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            self._event_log_store,
+            PayloadStore(),
+            run=run,
+            attempt_id=start_input.attempt_id,
+            execution_id=start_input.execution_id,
+            occurred_at=start_input.occurred_at,
+            candidate=candidate,
+            sizing_snapshot=sizing_snapshot,
+        )
+        if isinstance(plan, BudgetedDispatchStart):
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=start_input.attempt_id,
+                execution_id=start_input.execution_id,
+                occurred_at=start_input.occurred_at,
+                result=plan.sizing,
+            )
         result = start_governed_run_with_starting_attempt_in_transaction(
             transaction,
             self._event_log_store,
-            StartGovernedRunInput(
-                run_id=run.run_id,
-                expected_status=run.status,
-                run_started_event_id=_new_event_id("event-run-started"),
-                attempt_started_event_id=_new_event_id("event-attempt-started"),
-                attempt_id=_new_event_id("attempt"),
-                execution_id=_new_event_id("execution"),
-                dispatch_record_id=_new_event_id("dispatch"),
-                occurred_at=datetime.now(UTC),
-                actor=_EVENT_ACTOR,
-                source=_EVENT_SOURCE,
-                start_reason=(
-                    RunStartReason.INITIAL if run.status is RunStatus.ACCEPTED else RunStartReason.QUEUE_PROMOTION
-                ),
-                worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=(self._host_instance_identity.host_instance_id),
-            ),
+            start_input,
         )
-        if result.status != StateMutationStatus.UPDATED:
-            _LOGGER.debug(
-                "dispatch.start_governed.cas_miss session_id=%s run_id=%s " "expected_status=%s",
-                run.session_id,
-                run.run_id,
-                run.status.value,
+        if result.status is not StateMutationStatus.UPDATED:
+            raise _StartCandidateCasMissRollback()
+        if (
+            result.run is None
+            or result.attempt is None
+            or result.dispatch_record is None
+        ):
+            raise _StartCandidateCasMissRollback()
+        dispatch_record = result.dispatch_record
+        if (
+            result.run.current_attempt_id != start_input.attempt_id
+            or result.attempt.attempt_id != start_input.attempt_id
+            or result.attempt.execution_id != start_input.execution_id
+            or dispatch_record.attempt_id != start_input.attempt_id
+            or dispatch_record.execution_id != start_input.execution_id
+            or dispatch_record.dispatch_record_id
+            != start_input.dispatch_record_id
+        ):
+            raise HostDurableError(
+                "governed start rows do not match caller-owned identity"
             )
-            return None
-        if result.dispatch_record is None:
-            return None
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "dispatch.start_governed.committed session_id=%s run_id=%s "
             "attempt_id=%s execution_id=%s dispatch_record_id=%s",
             run.session_id,
-            result.dispatch_record.run_id,
-            result.dispatch_record.attempt_id,
-            result.dispatch_record.execution_id,
-            result.dispatch_record.dispatch_record_id,
+            dispatch_record.run_id,
+            dispatch_record.attempt_id,
+            dispatch_record.execution_id,
+            dispatch_record.dispatch_record_id,
         )
         return PendingDispatchRecord(
-            dispatch_record_id=result.dispatch_record.dispatch_record_id,
-            run_id=result.dispatch_record.run_id,
-            attempt_id=result.dispatch_record.attempt_id,
-            execution_id=result.dispatch_record.execution_id,
-            execution_target=result.dispatch_record.execution_target,
-            worker_kind=result.dispatch_record.worker_kind,
+            dispatch_record_id=dispatch_record.dispatch_record_id,
+            run_id=dispatch_record.run_id,
+            attempt_id=dispatch_record.attempt_id,
+            execution_id=dispatch_record.execution_id,
+            execution_target=dispatch_record.execution_target,
+            worker_kind=dispatch_record.worker_kind,
         )
 
     def _fail_unstarted_in_transaction(
@@ -2433,7 +3033,7 @@ class HostDispatchScheduler:
                         )
                     )
                 )
-                fallback_dispatch = (
+                fallback_outcome = (
                     self._append_compaction_failed_with_proactive_fallback(
                         transaction,
                         run=run,
@@ -2446,10 +3046,11 @@ class HostDispatchScheduler:
                         retry_repair_budget_exhausted=True,
                     )
                 )
-                if fallback_dispatch is not None:
+                if fallback_outcome is not None:
                     return _GovernanceStageResult(
-                        pending_dispatch=fallback_dispatch,
+                        pending_dispatch=fallback_outcome.pending_dispatch,
                         compact_accepted=None,
+                        terminal_notice=fallback_outcome.terminal_notice,
                     )
                 return _GovernanceStageResult(
                     pending_dispatch=None,
@@ -2476,7 +3077,7 @@ class HostDispatchScheduler:
                 compactor is not None,
                 artifact_root is not None,
             )
-            fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
+            fallback_outcome = self._append_compaction_failed_with_proactive_fallback(
                 transaction,
                 run=run,
                 material_view=material_view,
@@ -2487,10 +3088,11 @@ class HostDispatchScheduler:
                 attempt_count=0,
                 retry_repair_budget_exhausted=False,
             )
-            if fallback_dispatch is not None:
+            if fallback_outcome is not None:
                 return _GovernanceStageResult(
-                    pending_dispatch=fallback_dispatch,
+                    pending_dispatch=fallback_outcome.pending_dispatch,
                     compact_accepted=None,
+                    terminal_notice=fallback_outcome.terminal_notice,
                 )
             return _GovernanceStageResult(
                 pending_dispatch=None,
@@ -2714,7 +3316,7 @@ class HostDispatchScheduler:
         attempt_count: int,
         retry_repair_budget_exhausted: bool,
         budget_after_attempted_compact: int | None = None,
-    ) -> PendingDispatchRecord | None:
+    ) -> _DispatchCandidateOutcome | None:
         """写入 proactive failed event，并按 recent-window fallback 决定是否启动。
 
         :param transaction: 当前 Host transaction。
@@ -2727,7 +3329,8 @@ class HostDispatchScheduler:
         :param attempt_count: operation 内已拒绝 proposal attempt 数。
         :param retry_repair_budget_exhausted: retry / repair 预算是否耗尽。
         :param budget_after_attempted_compact: compact 尝试后预算；未知为 ``None``。
-        :returns: fallback 预算通过时返回 pending dispatch；否则返回 ``None``。
+        :returns: fallback action为dispatch时返回封闭candidate outcome；否则返回
+            ``None``。
         """
 
         policy = self._local_execution.context_budget_policy
@@ -2790,7 +3393,11 @@ class HostDispatchScheduler:
         )
         if fallback_decision.action_hint != FALLBACK_ACTION_DISPATCH:
             return None
-        return self._start_governed_in_transaction(transaction, run)
+        return self._prepare_and_commit_start_in_transaction(
+            transaction,
+            run,
+            stage=ContextSizingStage.DISPATCH_FALLBACK,
+        )
 
     def _append_compaction_failed_event(
         self,
@@ -3990,11 +4597,10 @@ class HostDispatchScheduler:
                 policy_snapshot_ref=effective_decision.policy_snapshot.policy_snapshot_ref,
             )
             self._catch_up_memory_projection_before_worker(record)
-            request = self._build_run_input_with_lag_repair(
-                record=record,
+            request = self._build_frozen_run_input(
                 snapshot=snapshot,
                 policy_snapshot=effective_decision.policy_snapshot,
-                selected_business_tool_names=(effective_decision.selected_business_tool_names),
+                effective_tool_facts=effective_decision.effective_tool_facts,
             )
             worker = self._local_execution.worker_factory.create_worker(snapshot)
             _LOGGER.log(
@@ -4032,43 +4638,6 @@ class HostDispatchScheduler:
                     exc.result.batches_used,
                     exc.result.stop_reason.value,
                     exc.result.failures,
-                )
-                self._safe_closeout_worker_startup_timeout(
-                    record,
-                    reason=_MEMORY_PROJECTION_REPAIR_REQUIRED_REASON,
-                    original_error=exc,
-                )
-            finally:
-                await _safe_release_lane_token(token)
-            return "timed_out"
-        except MemoryProjectionRepairRequired as exc:
-            if exc.repair_request.reason is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD:
-                try:
-                    _LOGGER.warning(
-                        "dispatch memory projection lag repair still required; "
-                        "closing run run_id=%s attempt_id=%s execution_id=%s "
-                        "reason=%s",
-                        record.run_id,
-                        record.attempt_id,
-                        record.execution_id,
-                        exc.repair_request.reason.value,
-                    )
-                    self._safe_closeout_worker_startup_timeout(
-                        record,
-                        reason=_MEMORY_PROJECTION_REPAIR_REQUIRED_REASON,
-                        original_error=exc,
-                    )
-                finally:
-                    await _safe_release_lane_token(token)
-                return "timed_out"
-            try:
-                _LOGGER.warning(
-                    "dispatch memory projection repair required; closing run "
-                    "run_id=%s attempt_id=%s execution_id=%s reason=%s",
-                    record.run_id,
-                    record.attempt_id,
-                    record.execution_id,
-                    exc.repair_request.reason.value,
                 )
                 self._safe_closeout_worker_startup_timeout(
                     record,
@@ -4171,114 +4740,102 @@ class HostDispatchScheduler:
         consumer_stream_continue.set()
         return "dispatched"
 
-    def _build_run_input_with_lag_repair(
+    def _build_frozen_run_input(
         self,
         *,
-        record: PendingDispatchRecord,
         snapshot: AttemptDispatchSnapshot,
         policy_snapshot: PolicySnapshot,
-        selected_business_tool_names: frozenset[str] | None,
+        effective_tool_facts: EffectiveToolFacts,
     ) -> AgentRunRequest:
-        """构造 Engine request，并对大滞后 memory snapshot 执行一次重建重试。
+        """从 pre-start frozen candidate 构造 Engine request。
 
-        :param record: pending dispatch 摘要。
         :param snapshot: 当前 Attempt dispatch snapshot。
         :param policy_snapshot: admission 冻结的 policy snapshot。
-        :param selected_business_tool_names: admission 冻结的业务工具名集合。
+        :param effective_tool_facts: admission 冻结的完整 exact tool facts。
         :returns: Engine run request。
-        :raises MemoryProjectionRepairRequired: 非 lag repair 或重建后仍需 repair 时抛出。
+        :raises HostDurableError: candidate、policy 或 tool runtime 不一致时抛出。
         """
 
-        builder = self._run_input_builder_for_dispatch(
+        candidate = load_prepared_runner_call_candidate(
+            self._transaction_runner,
+            attempt_snapshot=snapshot,
+            policy_snapshot=policy_snapshot,
+        )
+        tool_executor = self._tool_executor_for_frozen_candidate(
             snapshot=snapshot,
             policy_snapshot=policy_snapshot,
-            selected_business_tool_names=selected_business_tool_names,
+            effective_tool_facts=effective_tool_facts,
+            candidate=candidate,
         )
-        try:
-            return builder.build(snapshot)
-        except MemoryProjectionRepairRequired as exc:
-            if exc.repair_request.reason is not MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD:
-                raise
-            _LOGGER.warning(
-                "dispatch.memory_projection.lag_rebuild_retry run_id=%s "
-                "attempt_id=%s execution_id=%s required_event_sequence=%s",
-                record.run_id,
-                record.attempt_id,
-                record.execution_id,
-                exc.repair_request.required_event_sequence,
-            )
-            rebuild_result = rebuild_conversation_memory_projection(
-                self._transaction_runner,
-                policy=self._local_execution.memory_projection_policy,
-                batch_size=(self._local_execution.memory_projection_catchup_batch_size),
-                max_event_sequence=exc.repair_request.required_event_sequence,
-            )
-            _raise_if_memory_projection_target_not_reached(
-                operation="rebuild_before_dispatch",
-                record=record,
-                required_event_sequence=exc.repair_request.required_event_sequence,
-                result=rebuild_result,
-            )
-            retry_builder = self._run_input_builder_for_dispatch(
-                snapshot=snapshot,
-                policy_snapshot=policy_snapshot,
-                selected_business_tool_names=selected_business_tool_names,
-            )
-            return retry_builder.build(snapshot)
+        return agent_run_request_from_prepared_candidate(
+            candidate=candidate,
+            attempt_snapshot=snapshot,
+            tool_executor=tool_executor,
+        )
 
-    def _run_input_builder_for_dispatch(
+    def _tool_executor_for_frozen_candidate(
         self,
         *,
         snapshot: AttemptDispatchSnapshot,
         policy_snapshot: PolicySnapshot,
-        selected_business_tool_names: frozenset[str] | None,
-    ) -> RunInputBuilder:
-        """按本地执行配置构造当前 dispatch 使用的 RunInputBuilder。
+        effective_tool_facts: EffectiveToolFacts,
+        candidate: PreparedRunnerCallCandidate,
+    ) -> ToolExecutor:
+        """为 frozen selected schema 构造 runtime，并拒绝 schema drift。
 
         :param snapshot: 当前 Attempt dispatch snapshot。
-        :param policy_snapshot: 本地执行 policy snapshot。
-        :returns: no-tool 或 tool-enabled RunInputBuilder。
+        :param policy_snapshot: admission-frozen policy。
+        :param effective_tool_facts: admission-frozen exact tool facts。
+        :param candidate: pre-start frozen candidate。
+        :returns: no-tool executor 或同源 ToolRuntime executor。
+        :raises HostDurableError: 当前 runtime 无法精确实现 frozen schema 时抛出。
         """
 
-        tooling_options = self._local_execution.tooling_options
-        memory_provider = DurableMemorySnapshotProvider(
-            self._transaction_runner,
-            self._local_execution.memory_projection_policy,
+        tooling_options = (
+            None
+            if candidate.tool_execution_mode is ToolExecutionMode.NO_TOOL_REPLAY
+            else self._local_execution.tooling_options
         )
-        compact_provider = DurableCompactArtifactProvider(self._transaction_runner)
-        fallback_provider = EventLogContextFallbackProvider(self._transaction_runner)
-        if tooling_options is None or not policy_snapshot.agent_policy.allow_tool_calls:
-            return create_no_tool_run_input_builder(
-                transaction_runner=self._transaction_runner,
-                policy_snapshot=policy_snapshot,
-                memory_projection_policy=(
-                    self._local_execution.memory_projection_policy
-                ),
-                memory_snapshot_provider=memory_provider,
-                compact_artifact_provider=compact_provider,
-                context_fallback_provider=fallback_provider,
-                tool_execution_mode=(
-                    ToolExecutionMode.NO_TOOL_REPLAY
-                    if self._is_replay_run(snapshot.run_id)
-                    else ToolExecutionMode.NO_TOOL_DISABLED
-                ),
+        selected_business_tool_names = validate_effective_tool_facts_runtime(
+            effective_tool_facts,
+            tooling_options=tooling_options,
+        )
+        if candidate.disable_tools:
+            if candidate.tool_schemas:
+                raise HostDurableError(
+                    "disabled frozen candidate must not expose tool schemas"
+                )
+            return NoToolExecutor()
+        if tooling_options is None:
+            raise HostDurableError(
+                "tool-enabled frozen candidate has no tooling runtime"
             )
-        tool_runtime = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        handle = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
             ToolRuntimeBuildRequest(
                 effective_bundle_request=EffectiveToolBundleBuildRequest(
                     business_tool_bundle=tooling_options.business_tool_bundle,
                     source_refs=tooling_options.source_refs,
-                    framework_tool_policy=tooling_options.framework_tool_policy,
-                    policy_snapshot_digest=_policy_snapshot_digest(policy_snapshot),
+                    framework_tool_policy=(
+                        tooling_options.framework_tool_policy
+                    ),
+                    policy_snapshot_digest=_policy_snapshot_digest(
+                        policy_snapshot
+                    ),
                     selected_business_tool_names=selected_business_tool_names,
-                    enable_truncation_manager=(self._local_execution.enable_truncation_manager),
+                    enable_truncation_manager=(
+                        self._local_execution.enable_truncation_manager
+                    ),
                 ),
                 execution_scope=ToolRuntimeExecutionScope(
                     session_id=snapshot.session_id,
                     run_id=snapshot.run_id,
                     attempt_id=snapshot.attempt_id,
                     execution_id=snapshot.execution_id,
-                    allow_tool_calls=policy_snapshot.agent_policy.allow_tool_calls,
+                    allow_tool_calls=(
+                        policy_snapshot.agent_policy.allow_tool_calls
+                    ),
                 ),
                 accept_port=DefaultHostToolFactAcceptPort(
                     transaction_runner=self._transaction_runner,
@@ -4301,25 +4858,11 @@ class HostDispatchScheduler:
                 ),
             )
         )
-        return create_tool_enabled_run_input_builder(
-            transaction_runner=self._transaction_runner,
-            policy_snapshot=policy_snapshot,
-            tool_runtime_handle=tool_runtime,
-            memory_projection_policy=self._local_execution.memory_projection_policy,
-            memory_snapshot_provider=memory_provider,
-            compact_artifact_provider=compact_provider,
-            context_fallback_provider=fallback_provider,
-        )
-
-    def _is_replay_run(self, run_id: str) -> bool:
-        """判断当前 Run 是否是 replay 关联 Run。
-
-        :param run_id: 目标 Run id。
-        :returns: Run source relation 为 replay 时返回 ``True``。
-        :raises RuntimeError: durable Run 缺失时抛出。
-        """
-
-        return self._transaction_runner.run_read(_IsReplayRunOperation(run_id=run_id))
+        if handle.tool_schemas != candidate.tool_schemas:
+            raise HostDurableError(
+                "tool runtime schemas do not match frozen candidate"
+            )
+        return handle.tool_executor
 
     def _catch_up_memory_projection_before_worker(self, record: PendingDispatchRecord) -> None:
         """在构造 Engine request 前追平 conversation memory projection。
@@ -4377,25 +4920,9 @@ class HostDispatchScheduler:
             if event is None:
                 raise RuntimeError("dispatch input event is missing")
             payload = event_payload_object(transaction, event, payload_label="USER_INPUT_ACCEPTED")
-            return _effective_dispatch_decision_from_payload(
-                payload,
-                fallback_policy_snapshot=self._local_policy_snapshot(),
-            )
+            return _effective_dispatch_decision_from_payload(payload)
 
         return self._transaction_runner.run_read(_operation)
-
-    def _local_policy_snapshot(self) -> PolicySnapshot:
-        """构造本地 dispatch 使用的 fallback policy snapshot。
-
-        :returns: 本地执行 fallback policy snapshot。
-        """
-
-        return PolicySnapshot(
-            runner_spec=self._local_execution.runner_spec,
-            runner_options=self._local_execution.runner_options,
-            agent_policy=self._local_execution.agent_policy,
-            policy_snapshot_ref=_LOCAL_POLICY_SNAPSHOT_REF,
-        )
 
     def _snapshot_from_dispatch(
         self,
@@ -5552,34 +6079,28 @@ def _policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:
 
 def _effective_dispatch_decision_from_payload(
     payload: JsonValue,
-    *,
-    fallback_policy_snapshot: PolicySnapshot,
 ) -> _EffectiveDispatchDecision:
     """从 ``USER_INPUT_ACCEPTED`` payload 解析冻结 dispatch 决策。
 
     :param payload: EventLog payload JSON。
-    :param fallback_policy_snapshot: 旧 start_run / 低层路径使用的 fallback。
     :returns: effective dispatch 决策。
     :raises RuntimeError: 冻结 execution config 或 tool set JSON shape 非法时抛出。
     :raises ValueError: 冻结 provider/agent policy 枚举值或字段语义非法时抛出。
     """
 
     if not isinstance(payload, Mapping):
-        return _EffectiveDispatchDecision(
-            policy_snapshot=fallback_policy_snapshot,
-            selected_business_tool_names=None,
-        )
+        raise RuntimeError("USER_INPUT_ACCEPTED payload must be object")
     execution_value = payload.get(_PAYLOAD_FIELD_EFFECTIVE_EXECUTION_CONFIG)
     tool_value = payload.get(_PAYLOAD_FIELD_EFFECTIVE_TOOL_SET)
-    policy_snapshot = (
-        fallback_policy_snapshot
-        if execution_value is None
-        else _policy_snapshot_from_effective_execution(execution_value)
-    )
-    selected_tool_names = None if tool_value is None else _selected_tool_names_from_effective_tool_set(tool_value)
+    if execution_value is None:
+        raise RuntimeError("effective_execution_config is missing")
+    if tool_value is None:
+        raise RuntimeError("effective_tool_set is missing")
+    policy_snapshot = _policy_snapshot_from_effective_execution(execution_value)
+    effective_tool_facts = parse_effective_tool_facts(tool_value)
     return _EffectiveDispatchDecision(
         policy_snapshot=policy_snapshot,
-        selected_business_tool_names=selected_tool_names,
+        effective_tool_facts=effective_tool_facts,
     )
 
 
@@ -5599,31 +6120,6 @@ def _policy_snapshot_from_effective_execution(value: JsonValue) -> PolicySnapsho
         agent_policy=snapshot.agent_policy,
         policy_snapshot_ref=snapshot.policy_snapshot_ref,
     )
-
-
-def _selected_tool_names_from_effective_tool_set(
-    value: JsonValue,
-) -> frozenset[str] | None:
-    """从冻结 tool set JSON 读取本次 effective 业务工具名。
-
-    :param value: ``effective_tool_set`` JSON。
-    :returns: ``None`` 表示全量，否则为冻结后的业务工具名集合。
-    :raises RuntimeError: JSON shape 非法时抛出。
-    """
-
-    root = _required_json_mapping(value, field_name="effective_tool_set")
-    selector = _required_json_text(root, field_name="selector")
-    if selector == "all":
-        return None
-    names_value = root.get("effective_business_tool_names")
-    if not isinstance(names_value, list):
-        raise RuntimeError("effective_business_tool_names must be list")
-    names: set[str] = set()
-    for item in names_value:
-        if not isinstance(item, str) or item.strip() == "":
-            raise RuntimeError("effective_business_tool_names entries must be text")
-        names.add(item)
-    return frozenset(names)
 
 
 def _register_dispatch_host_instance(

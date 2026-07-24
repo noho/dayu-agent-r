@@ -56,6 +56,7 @@ from dayu.host.api import (
     RunStatus,
 )
 from dayu.host.accepted_tool_outcome import accepted_tool_outcome_json
+from dayu.host.admission import effective_tool_facts_json
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -165,15 +166,19 @@ from dayu.host.run_input import (
     ToolExecutionMode,
     MemorySnapshotView,
     ToolSchemaSnapshot,
+    _prepared_candidate_from_json,
+    _prepared_candidate_projection_body,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
     _fallback_context_messages,
     _memory_projection_event_from_row,
     _normalize_ordinary_run_messages,
-    _resume_wait_messages_from_current_start,
+    _resume_wait_continuity_from_current_start,
     _resume_wait_tool_message_content,
     _runner_call_kind_and_trigger,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
+    prepare_runner_call_candidate,
+    runner_request_semantics_digest,
 )
 from dayu.host.evidence import (
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
@@ -527,10 +532,10 @@ def test_resume_wait_messages_rebuild_tool_result_roundtrip(
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         messages = store.transaction_runner.run_read(operation)
 
@@ -587,10 +592,10 @@ def test_resume_wait_messages_fail_closed_for_invalid_start_reason(
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         with pytest.raises(HostDurableError, match="RunStartReason|start_reason"):
             store.transaction_runner.run_read(operation)
@@ -636,7 +641,10 @@ def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             ),
-            continuity=SessionContinuityView(messages=()),
+                continuity=SessionContinuityView(
+                    messages=(),
+                    source_refs=(),
+                ),
             tool_snapshot=ToolSchemaSnapshot(
                 tool_schemas=(),
                 disable_tools=True,
@@ -685,10 +693,10 @@ def test_resume_wait_missing_canonical_evidence_fails_closed(
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         with pytest.raises(HostDurableError, match="evidence envelope is missing"):
             store.transaction_runner.run_read(operation)
@@ -724,10 +732,10 @@ def test_resume_wait_missing_request_atom_fails_closed(tmp_path: Path) -> None:
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         with pytest.raises(HostDurableError, match="request atom is missing"):
             store.transaction_runner.run_read(operation)
@@ -765,10 +773,10 @@ def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         with pytest.raises(HostDurableError, match="payload digest must match"):
             store.transaction_runner.run_read(operation)
@@ -806,10 +814,10 @@ def test_resume_wait_completed_tool_content_wraps_non_object_value(
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         messages = store.transaction_runner.run_read(operation)
 
@@ -876,10 +884,10 @@ def test_resume_wait_replays_exact_canonical_arguments(tmp_path: Path) -> None:
             :returns: resume wait messages。
             """
 
-            return _resume_wait_messages_from_current_start(
+            return _resume_wait_continuity_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
-            )
+            ).messages
 
         messages = store.transaction_runner.run_read(operation)
 
@@ -1052,6 +1060,10 @@ def test_internal_execution_value_round_trips_without_llm_projection(
     )
     input_payload = _user_input_payload("分析本期经营情况")
     input_payload["effective_execution_config"] = effective_config
+    input_payload["effective_tool_set"] = effective_tool_facts_json(
+        frozenset(),
+        tooling_options=None,
+    )
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -1073,7 +1085,6 @@ def test_internal_execution_value_round_trips_without_llm_projection(
         )
         dispatch_decision = _effective_dispatch_decision_from_payload(
             durable_input_payload,
-            fallback_policy_snapshot=fallback_policy,
         )
 
         assert dispatch_decision.policy_snapshot.runner_spec.headers == {
@@ -1419,6 +1430,66 @@ def test_policy_snapshot_allows_tool_policy_for_tool_enabled() -> None:
     snapshot = _policy_snapshot(allow_tool_calls=True)
 
     assert snapshot.agent_policy.allow_tool_calls is True
+
+
+def test_prepared_candidate_tool_execution_mode_is_strict_and_digest_owned() -> None:
+    """tool execution mode 进入 strict candidate schema 与两类 digest。"""
+
+    policy = _policy_snapshot()
+    common = {
+        "session_id": "session-candidate-mode",
+        "run_id": "run-candidate-mode",
+        "candidate_input_cursor": 7,
+        "messages": (
+            SystemMessage(
+                role=AgentMessageRole.SYSTEM,
+                content="system",
+            ),
+            UserMessage(
+                role=AgentMessageRole.USER,
+                content="question",
+            ),
+        ),
+        "tool_schemas": (),
+        "disable_tools": True,
+        "policy_snapshot": policy,
+        "source_cursor_refs": ("event-input-mode",),
+        "memory_snapshot_cursor_ref": None,
+        "compact_artifact_refs": (),
+        "context_fallback_decision_ref": None,
+    }
+    disabled = prepare_runner_call_candidate(
+        **common,
+        tool_execution_mode=ToolExecutionMode.NO_TOOL_DISABLED,
+    )
+    replay = prepare_runner_call_candidate(
+        **common,
+        tool_execution_mode=ToolExecutionMode.NO_TOOL_REPLAY,
+    )
+
+    assert disabled.candidate_input_projection_digest != (
+        replay.candidate_input_projection_digest
+    )
+    assert disabled.input_snapshot_digest != replay.input_snapshot_digest
+    body = dict(
+        _prepared_candidate_projection_body(
+            **common,
+            tool_execution_mode=ToolExecutionMode.NO_TOOL_DISABLED,
+            request_semantics_digest=runner_request_semantics_digest(policy),
+        )
+    )
+    assert body["tool_execution_mode"] == "no_tool_disabled"
+    assert (
+        _prepared_candidate_from_json(body, policy_snapshot=policy)
+        .tool_execution_mode
+        is ToolExecutionMode.NO_TOOL_DISABLED
+    )
+    body["tool_execution_mode"] = "unknown_mode"
+    with pytest.raises(
+        HostDurableError,
+        match="tool_execution_mode is invalid",
+    ):
+        _prepared_candidate_from_json(body, policy_snapshot=policy)
 
 
 def test_system_envelope_boundedness_allows_multiple_items_in_same_section() -> None:

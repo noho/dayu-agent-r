@@ -552,7 +552,7 @@ def _full_runner_call_manifest(
         else role_sequence_digest
     )
     return {
-        "schema_version": "runner_call_input_manifest.v1",
+        "schema_version": "runner_call_input_manifest.v2",
         "manifest_id": manifest_id,
         "session_id": "session-1",
         "host_run_id": "run-1",
@@ -582,6 +582,22 @@ def _full_runner_call_manifest(
         "context_fallback_decision_ref": None,
         "projector_metadata": metadata,
         "compactor_identity": None,
+        "sizing_snapshot": {
+            "status": "unavailable",
+            "reason": "context_policy_unavailable",
+            "sizing_stage": "ordinary",
+            "estimator_id": None,
+            "estimator_version": None,
+            "estimator_digest": None,
+            "conservative_input_tokens": None,
+            "context_window_size": None,
+            "provider": None,
+            "model": None,
+            "request_semantics_digest": None,
+            "input_snapshot_digest": None,
+            "policy_ref": None,
+            "policy_snapshot_digest": None,
+        },
         "diagnostic": diagnostic,
     }
 
@@ -900,7 +916,10 @@ def _record_real_ordinary_runner_call_manifest(
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             ),
-            continuity=SessionContinuityView(messages=()),
+        continuity=SessionContinuityView(
+            messages=(),
+            source_refs=(),
+        ),
             tool_snapshot=ToolSchemaSnapshot(
                 tool_schemas=(),
                 disable_tools=True,

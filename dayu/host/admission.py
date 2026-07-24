@@ -1,8 +1,7 @@
-"""Host 内部 admission 与 queue promotion 服务。
+"""Host 内部 admission 服务。
 
 本模块实现 Phase 3 P3-S5 的内部 command 编排：``start_run``、
-``submit_followup(queue)``、``cancel_run``、terminal closeout 和单次 FIFO
-queue promotion。它只依赖 Host durable
+``submit_followup(queue)``、``cancel_run``与 terminal closeout。它只依赖 Host durable
 foundation、Session/Run/Attempt state helper 与调用方提供的 transaction
 runner；不实现 public facade、scheduler、lane、WorkerProxy、Engine dispatch、
 steer、retry、replay、wait 或 recovery。
@@ -19,8 +18,9 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_schema import ToolSchema
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
@@ -73,6 +73,22 @@ from dayu.host.durable.payload import (
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
+from dayu.host._runner_call_manifest import (
+    RunnerCallSizingUnavailableReason,
+    complete_runner_call_sizing_snapshot,
+    unavailable_runner_call_sizing_snapshot,
+)
+from dayu.host.context_budget import (
+    BudgetEstimate,
+    ContextBudgetPolicy,
+    ContextSizingResult,
+    ContextSizingStage,
+    build_conservative_context_sizing_result,
+    build_context_sizing_result,
+)
+from dayu.host.context_events import (
+    append_context_budget_evaluated_in_transaction,
+)
 from dayu.host.durable.run_transition import (
     CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
@@ -81,9 +97,6 @@ from dayu.host.durable.run_transition import (
     CancelWaitingRunInput,
     CreateAcceptedRunInput,
     CreateQueuedRunInput,
-    CreateRunningRunInput,
-    PromoteQueuedRunInput,
-    PromotionSkipReason,
     RunTransitionResult as DurableRunTransitionResult,
     TerminalCloseoutInput,
     cancel_predispatch_starting_in_transaction,
@@ -93,9 +106,7 @@ from dayu.host.durable.run_transition import (
     confirm_terminal_run_in_transaction,
     create_accepted_run_in_transaction,
     create_queued_run_in_transaction,
-    create_running_run_with_starting_attempt_in_transaction,
     project_terminal_notice_from_exact_run_event,
-    promote_queued_run_in_transaction,
     request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
 )
@@ -138,6 +149,26 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.memory import (
+    MemoryProjectionPolicy,
+)
+from dayu.host.memory_repair import (
+    catch_up_conversation_memory_projection,
+)
+from dayu.host.run_input import (
+    PolicySnapshot,
+    SessionContinuityView,
+    ToolExecutionMode,
+    estimate_prepared_runner_call_candidate,
+    load_prepared_runner_call_source_in_transaction,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
+)
+from dayu.host.tool_runtime import (
+    EffectiveToolBundleBuildRequest,
+    EffectiveToolBundleBuilder,
+)
 from dayu.host.queue_policy import (
     RunQueuePolicy,
     parse_run_queue_policy,
@@ -145,7 +176,6 @@ from dayu.host.queue_policy import (
 )
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_runtime_schema_projection import (
-    business_bundle_digest as _business_bundle_digest,
     tool_definitions_digest as _tool_definitions_digest,
     tool_schemas_digest as _tool_schemas_digest,
 )
@@ -187,6 +217,53 @@ _TOOL_SELECTION_ALL = "all"
 _TOOL_SELECTION_NONE = "none"
 _TOOL_SELECTION_SUBSET = "subset"
 _MAX_ORDINARY_RETRY_RUNS_PER_SOURCE = 1
+_EFFECTIVE_TOOL_FACT_FIELDS = frozenset(
+    {
+        "tool_snapshot_ref",
+        "selector",
+        "requested_business_tool_names",
+        "effective_business_tool_names",
+        "business_bundle_digest",
+        "effective_schema_digest",
+        "effective_tool_display_names",
+        "source_refs",
+    }
+)
+_TOOL_SOURCE_REF_FIELDS = frozenset(
+    {"source_kind", "source_id", "version_ref", "content_digest"}
+)
+
+
+class EffectiveBusinessToolSelector(StrEnum):
+    """admission 冻结的业务工具选择意图。"""
+
+    ALL = _TOOL_SELECTION_ALL
+    SUBSET = _TOOL_SELECTION_SUBSET
+    NONE = _TOOL_SELECTION_NONE
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveToolFacts:
+    """admission 与 dispatch 共用的严格 effective tool facts。
+
+    :param tool_snapshot_ref: exact effective schema snapshot 引用。
+    :param selector: 调用方选择意图。
+    :param requested_business_tool_names: 原始选择；``all`` 时为 ``None``。
+    :param effective_business_tool_names: admission 时冻结的 exact 工具名集合。
+    :param business_bundle_digest: admission 时完整业务 bundle 摘要。
+    :param effective_schema_digest: exact selected schema 摘要。
+    :param effective_tool_display_names: exact selected display name 快照。
+    :param source_refs: admission 时完整业务工具来源引用。
+    """
+
+    tool_snapshot_ref: str
+    selector: EffectiveBusinessToolSelector
+    requested_business_tool_names: frozenset[str] | None
+    effective_business_tool_names: frozenset[str]
+    business_bundle_digest: str
+    effective_schema_digest: str
+    effective_tool_display_names: tuple[tuple[str, str], ...]
+    source_refs: tuple[ToolBundleSourceRef, ...]
 
 
 class AdmissionClock(Protocol):
@@ -332,26 +409,6 @@ class SteerAdmissionResult:
     steered_cancel_target: ActiveCancelTarget | None
     input_event_id: str
     idempotent_replay: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PromotionResult:
-    """admission 层 queue promotion 结果。
-
-    :param promoted_run: 被 promotion 的 Run；未 promotion 时为 ``None``。
-    :param attempt: 新建 Attempt；未 promotion 时为 ``None``。
-    :param dispatch_record: 新建 dispatch record；未 promotion 时为 ``None``。
-    :param pending_dispatch: commit 后需要唤醒 dispatch 检查的摘要。
-    :param skipped: 本次是否跳过 promotion。
-    :param skip_reason: 跳过原因；成功 promotion 时为 ``None``。
-    """
-
-    promoted_run: RunRow | None
-    attempt: AttemptRow | None
-    dispatch_record: DispatchRecordRow | None
-    pending_dispatch: PendingDispatchRecord | None
-    skipped: bool
-    skip_reason: PromotionSkipReason | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,23 +585,38 @@ class HostAdmissionService:
     :param transaction_runner: Host durable write transaction runner。
     :param event_log_store: EventLog primitive。
     :param idempotency_store: idempotency primitive。
+    :param payload_store: durable payload primitive。
     :param clock: admission 事件时间来源。
     :param id_factory: admission id 生成端口。
     :param wakeup_port: commit 后 no-op/测试 wakeup 端口。
     :param terminal_post_commit_port: commit 后消费精确 terminal notice 的本地端口。
     :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+    :param ordinary_run_baseline: ordinary Run 的显式 execution baseline；管理句柄为
+        ``None``。
+    :param tooling_options: ordinary Run 的显式 tool truth；管理句柄为 ``None``。
+    :param context_budget_policy: continuation context budget policy；管理句柄为
+        ``None``。
+    :param memory_projection_policy: continuation memory projection policy；管理句柄为
+        ``None``。
+    :param enable_truncation_manager: 是否启用受 Host 治理的 truncation manager。
+    :param owner_host_instance_id: 当前 Host owner id；不声明 owner 时为 ``None``。
     """
 
     transaction_runner: HostTransactionRunner
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
+    payload_store: PayloadStore
     clock: AdmissionClock
     id_factory: AdmissionIdFactory
     wakeup_port: AdmissionWakeupPort
     terminal_post_commit_port: TerminalPostCommitPort
     projection_catchup_port: ProjectionCatchupPort
-    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None
-    tooling_options: HostToolingOptions | None = None
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None
+    tooling_options: HostToolingOptions | None
+    context_budget_policy: ContextBudgetPolicy | None
+    memory_projection_policy: MemoryProjectionPolicy | None
+    enable_truncation_manager: bool
+    owner_host_instance_id: str | None
 
     def start_run(
         self, request: StartRunRequest, *, caller_semantic_digest: str
@@ -568,6 +640,8 @@ class HostAdmissionService:
                 request=request,
                 policy=policy,
                 caller_semantic_digest=caller_semantic_digest,
+                ordinary_run_baseline=self.ordinary_run_baseline,
+                tooling_options=self.tooling_options,
                 event_log_store=self.event_log_store,
                 idempotency_store=self.idempotency_store,
                 clock=self.clock,
@@ -600,16 +674,12 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
-        effective_facts = _resolve_followup_effective_facts(
-            admission_input.request,
-            baseline=self.ordinary_run_baseline,
-            tooling_options=self.tooling_options,
-        )
         result = self.transaction_runner.run_write(
             _SubmitFollowupQueueOperation(
                 admission_input=admission_input,
                 caller_semantic_digest=caller_semantic_digest,
-                effective_facts=effective_facts,
+                ordinary_run_baseline=self.ordinary_run_baseline,
+                tooling_options=self.tooling_options,
                 event_log_store=self.event_log_store,
                 idempotency_store=self.idempotency_store,
                 clock=self.clock,
@@ -643,6 +713,21 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
+        if self.memory_projection_policy is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="submit_followup steer requires memory policy",
+                retryable=False,
+            )
+        catch_up = catch_up_conversation_memory_projection(
+            self.transaction_runner,
+            policy=self.memory_projection_policy,
+            batch_size=self.memory_projection_policy.max_delta_repair_events,
+        )
+        if catch_up.failures != 0:
+            raise HostDurableError(
+                "steer memory projection catch-up failed"
+            )
         result = self.transaction_runner.run_write(
             _SubmitFollowupSteerOperation(
                 request=request,
@@ -653,6 +738,11 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
                 ordinary_run_baseline=self.ordinary_run_baseline,
                 tooling_options=self.tooling_options,
+                payload_store=self.payload_store,
+                context_budget_policy=self.context_budget_policy,
+                memory_projection_policy=self.memory_projection_policy,
+                enable_truncation_manager=self.enable_truncation_manager,
+                owner_host_instance_id=self.owner_host_instance_id,
             )
         )
         catch_up_projection_best_effort(self.projection_catchup_port)
@@ -867,65 +957,43 @@ class HostAdmissionService:
             terminal_notice=result.terminal_notice,
         )
 
-    def promote_next_queued_run(self, session_id: str) -> PromotionResult:
-        """按 FIFO promotion 一个 queued Run。
-
-        :param session_id: 目标 Session id。
-        :returns: promotion 结果；active 存在或无 queued 时返回 skipped。
-        :raises HostApiError: Session 缺失时抛出。
-        :raises HostDurableError: durable 写入失败时由底层抛出。
-        """
-
-        _require_non_empty_text(session_id, field_name="session_id")
-        result = self.transaction_runner.run_write(
-            _PromoteNextQueuedRunOperation(
-                session_id=session_id,
-                event_log_store=self.event_log_store,
-                clock=self.clock,
-                id_factory=self.id_factory,
-            )
-        )
-        _LOGGER.log(
-            VERBOSE_LOG_LEVEL,
-            (
-                "host.admission.promotion_committed session_id=%s "
-                "promoted_run_id=%s pending_dispatch=%s skip_reason=%s"
-            ),
-            session_id,
-            None if result.promoted_run is None else result.promoted_run.run_id,
-            result.pending_dispatch is not None,
-            None if result.skip_reason is None else result.skip_reason.value,
-        )
-        _wake_dispatch_if_needed(
-            self.wakeup_port,
-            result.pending_dispatch,
-            suppress_runtime_error=True,
-        )
-        return result
-
-
 def create_host_admission_service(
     transaction_runner: HostTransactionRunner,
     *,
     terminal_post_commit_port: TerminalPostCommitPort,
+    payload_store: PayloadStore,
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None,
+    tooling_options: HostToolingOptions | None,
+    context_budget_policy: ContextBudgetPolicy | None,
+    memory_projection_policy: MemoryProjectionPolicy | None,
+    enable_truncation_manager: bool,
+    owner_host_instance_id: str | None,
     event_log_store: EventLogStore | None = None,
     idempotency_store: IdempotencyStore | None = None,
     clock: AdmissionClock | None = None,
     id_factory: AdmissionIdFactory | None = None,
     wakeup_port: AdmissionWakeupPort | None = None,
     projection_catchup_port: ProjectionCatchupPort | None = None,
-    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None,
-    tooling_options: HostToolingOptions | None = None,
 ) -> HostAdmissionService:
     """创建默认依赖装配的内部 admission service。
 
     :param transaction_runner: Host durable write transaction runner。
+    :param terminal_post_commit_port: terminal commit 后本地 notice 的显式最终端点。
+    :param payload_store: durable payload primitive。
+    :param ordinary_run_baseline: ordinary Run 的显式 execution baseline；管理句柄为
+        ``None``。
+    :param tooling_options: ordinary Run 的显式 tool truth；管理句柄为 ``None``。
+    :param context_budget_policy: continuation context budget policy；管理句柄为
+        ``None``。
+    :param memory_projection_policy: continuation memory projection policy；管理句柄为
+        ``None``。
+    :param enable_truncation_manager: 是否启用受 Host 治理的 truncation manager。
+    :param owner_host_instance_id: 当前 Host owner id；不声明 owner 时为 ``None``。
     :param event_log_store: 可选 EventLog primitive。
     :param idempotency_store: 可选 idempotency primitive。
     :param clock: 可选 clock 端口。
     :param id_factory: 可选 id factory 端口。
     :param wakeup_port: 可选 wakeup 端口。
-    :param terminal_post_commit_port: terminal commit 后本地 notice 的显式最终端点。
     :param projection_catchup_port: 可选 projection catch-up 端口。
     :returns: Host admission service。
     """
@@ -938,6 +1006,7 @@ def create_host_admission_service(
         idempotency_store=(
             idempotency_store if idempotency_store is not None else IdempotencyStore()
         ),
+        payload_store=payload_store,
         clock=clock if clock is not None else UtcAdmissionClock(),
         id_factory=id_factory if id_factory is not None else UuidAdmissionIdFactory(),
         wakeup_port=(
@@ -951,6 +1020,10 @@ def create_host_admission_service(
         ),
         ordinary_run_baseline=ordinary_run_baseline,
         tooling_options=tooling_options,
+        context_budget_policy=context_budget_policy,
+        memory_projection_policy=memory_projection_policy,
+        enable_truncation_manager=enable_truncation_manager,
+        owner_host_instance_id=owner_host_instance_id,
     )
 
 
@@ -993,6 +1066,8 @@ class _StartRunOperation:
     request: StartRunRequest
     policy: RunQueuePolicy
     caller_semantic_digest: str
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None
+    tooling_options: HostToolingOptions | None
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
     clock: AdmissionClock
@@ -1034,7 +1109,7 @@ class _StartRunOperation:
             idempotency_store=self.idempotency_store,
             clock=self.clock,
             id_factory=self.id_factory,
-            request=_CreateAdmissionRequest.from_start_request(self.request),
+            request=self._create_request(),
             semantic_digest=semantic_digest,
             scope=scope,
             queue_policy=self.policy,
@@ -1114,11 +1189,27 @@ class _StartRunOperation:
             idempotency_store=self.idempotency_store,
             clock=self.clock,
             id_factory=self.id_factory,
-            request=_CreateAdmissionRequest.from_start_request(self.request),
+            request=self._create_request(),
             semantic_digest=semantic_digest,
             scope=scope,
             queue_policy=self.policy,
             active_run_id=active.run_id,
+        )
+
+    def _create_request(self) -> "_CreateAdmissionRequest":
+        """构造带有 admission-time effective facts 的初始 Run 输入。
+
+        :returns: 已冻结 execution/tool facts 的创建输入。
+        :raises HostApiError: 当前 handle 不具备 execution baseline 时抛出。
+        :raises TypeError: execution baseline 含非法 provider extension 时抛出。
+        """
+
+        return _CreateAdmissionRequest.from_start_request(
+            self.request,
+            effective_facts=_resolve_start_effective_facts(
+                baseline=self.ordinary_run_baseline,
+                tooling_options=self.tooling_options,
+            ),
         )
 
 
@@ -1128,7 +1219,8 @@ class _SubmitFollowupQueueOperation:
 
     admission_input: SubmitFollowupQueueAdmissionInput
     caller_semantic_digest: str
-    effective_facts: _ResolvedFollowupEffectiveFacts
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None
+    tooling_options: HostToolingOptions | None
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
     clock: AdmissionClock
@@ -1157,10 +1249,15 @@ class _SubmitFollowupQueueOperation:
             return _idempotent_run_result(transaction, existing)
 
         _require_open_session(transaction, request.session_id)
+        effective_facts = _resolve_followup_effective_facts(
+            request,
+            baseline=self.ordinary_run_baseline,
+            tooling_options=self.tooling_options,
+        )
         active = read_active_run_for_session(transaction, request.session_id)
         create_request = _CreateAdmissionRequest.from_followup_queue_input(
             self.admission_input,
-            effective_facts=self.effective_facts,
+            effective_facts=effective_facts,
         )
         if active is not None:
             return _create_queued_admission_result(
@@ -1200,6 +1297,11 @@ class _SubmitFollowupSteerOperation:
     id_factory: AdmissionIdFactory
     ordinary_run_baseline: OrdinaryRunExecutionBaseline | None
     tooling_options: HostToolingOptions | None
+    payload_store: PayloadStore
+    context_budget_policy: ContextBudgetPolicy | None
+    memory_projection_policy: MemoryProjectionPolicy | None
+    enable_truncation_manager: bool
+    owner_host_instance_id: str | None
 
     def __call__(self, transaction: HostTransaction) -> SteerAdmissionResult:
         """执行 follow-up steer admission transaction。
@@ -1303,6 +1405,12 @@ class _SubmitFollowupSteerOperation:
             input_event=input_event,
             steer_event=steer_event,
             occurred_at=now,
+            tooling_options=self.tooling_options,
+            payload_store=self.payload_store,
+            context_budget_policy=self.context_budget_policy,
+            memory_projection_policy=self.memory_projection_policy,
+            enable_truncation_manager=self.enable_truncation_manager,
+            owner_host_instance_id=self.owner_host_instance_id,
         )
 
 
@@ -1468,72 +1576,6 @@ class _ReplayRunOperation:
             source_run=source_run,
             source_relation=SourceRunRelation.REPLAY,
             control_event=control_event,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class _PromoteNextQueuedRunOperation:
-    """promote_next_queued_run transaction body。"""
-
-    session_id: str
-    event_log_store: EventLogStore
-    clock: AdmissionClock
-    id_factory: AdmissionIdFactory
-
-    def __call__(self, transaction: HostTransaction) -> PromotionResult:
-        """执行一次 FIFO queue promotion。
-
-        :param transaction: 当前 Host transaction。
-        :returns: promotion 结果。
-        :raises HostApiError: Session 缺失时抛出。
-        """
-
-        _require_existing_session(transaction, self.session_id)
-        now = self.clock.now()
-        transition_result = promote_queued_run_in_transaction(
-            transaction,
-            self.event_log_store,
-            PromoteQueuedRunInput(
-                session_id=self.session_id,
-                run_started_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
-                attempt_started_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
-                attempt_id=self.id_factory.new_id(_ATTEMPT_ID_PREFIX),
-                execution_id=self.id_factory.new_id(_EXECUTION_ID_PREFIX),
-                dispatch_record_id=self.id_factory.new_id(_DISPATCH_RECORD_ID_PREFIX),
-                occurred_at=now,
-                actor=_INTERNAL_ACTOR,
-                source=_EVENT_SOURCE,
-                worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=None,
-            ),
-        )
-        if transition_result.status != StateMutationStatus.UPDATED:
-            return PromotionResult(
-                promoted_run=None,
-                attempt=None,
-                dispatch_record=None,
-                pending_dispatch=None,
-                skipped=True,
-                skip_reason=_promotion_skip_reason(transition_result.skip_reason),
-            )
-        if (
-            transition_result.promoted_run is None
-            or transition_result.attempt is None
-            or transition_result.dispatch_record is None
-        ):
-            raise HostApiError(
-                code=HostApiErrorCode.INTERNAL_ERROR,
-                message="Promotion result is incomplete",
-                retryable=False,
-            )
-        pending_dispatch = _pending_dispatch_from_row(transition_result.dispatch_record)
-        return PromotionResult(
-            promoted_run=transition_result.promoted_run,
-            attempt=transition_result.attempt,
-            dispatch_record=transition_result.dispatch_record,
-            pending_dispatch=pending_dispatch,
-            skipped=False,
-            skip_reason=None,
         )
 
 
@@ -2528,10 +2570,16 @@ class _CreateAdmissionRequest:
     effective_tool_set: JsonValue | None
 
     @classmethod
-    def from_start_request(cls, request: StartRunRequest) -> "_CreateAdmissionRequest":
+    def from_start_request(
+        cls,
+        request: StartRunRequest,
+        *,
+        effective_facts: _ResolvedFollowupEffectiveFacts,
+    ) -> "_CreateAdmissionRequest":
         """从 start_run request 构造归一化创建输入。
 
         :param request: start_run request。
+        :param effective_facts: admission-time 冻结的 execution/tool facts。
         :returns: 归一化创建输入。
         """
 
@@ -2545,8 +2593,8 @@ class _CreateAdmissionRequest:
             source=request.context.source,
             call_context_digest=_call_context_digest(request.context),
             operation_kind=_OPERATION_START_RUN,
-            effective_execution_config=None,
-            effective_tool_set=None,
+            effective_execution_config=effective_facts.effective_execution_config,
+            effective_tool_set=effective_facts.effective_tool_set,
         )
 
     @classmethod
@@ -2688,100 +2736,11 @@ class _CreateAdmissionRequest:
                 payload.get("effective_execution_config"),
                 baseline=baseline,
             ),
-            effective_tool_set=_no_tool_effective_tool_set_json(),
+            effective_tool_set=effective_tool_facts_json(
+                frozenset(),
+                tooling_options=None,
+            ),
         )
-
-
-def _create_running_admission_result(
-    *,
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    idempotency_store: IdempotencyStore,
-    clock: AdmissionClock,
-    id_factory: AdmissionIdFactory,
-    request: _CreateAdmissionRequest,
-    semantic_digest: str,
-    scope: IdempotencyScope,
-    queue_policy: RunQueuePolicy,
-    start_reason: RunStartReason,
-) -> RunAdmissionResult:
-    """创建 running Run、STARTING Attempt 和 pending dispatch。
-
-    :param transaction: 当前 Host transaction。
-    :param event_log_store: EventLog primitive。
-    :param idempotency_store: idempotency primitive。
-    :param clock: admission clock。
-    :param id_factory: admission id factory。
-    :param request: 归一化创建输入。
-    :param semantic_digest: semantic input digest。
-    :param scope: 幂等 scope。
-    :param queue_policy: 持久化 queue policy。
-    :param start_reason: Run start reason。
-    :returns: admission 结果。
-    """
-
-    now = clock.now()
-    run_id = id_factory.new_id(_RUN_ID_PREFIX)
-    input_event = _append_user_input_event(
-        transaction=transaction,
-        event_log_store=event_log_store,
-        request=request,
-        run_id=run_id,
-        event_id=id_factory.new_id(_EVENT_ID_PREFIX),
-        occurred_at=now,
-    )
-    transition_result = create_running_run_with_starting_attempt_in_transaction(
-        transaction,
-        event_log_store,
-        CreateRunningRunInput(
-            session_id=request.session_id,
-            run_id=run_id,
-            client_request_id=request.client_request_id,
-            input_event_id=input_event.event_id,
-            input_event_sequence=input_event.event_sequence,
-            run_accepted_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
-            run_started_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
-            attempt_started_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
-            attempt_id=id_factory.new_id(_ATTEMPT_ID_PREFIX),
-            execution_id=id_factory.new_id(_EXECUTION_ID_PREFIX),
-            dispatch_record_id=id_factory.new_id(_DISPATCH_RECORD_ID_PREFIX),
-            occurred_at=now,
-            actor=request.actor,
-            source=request.source,
-            idempotency_key=request.client_request_id,
-            execution_target=request.execution_target,
-            queue_policy=queue_policy,
-            start_reason=start_reason,
-            worker_kind=WorkerKind.LOCAL,
-            owner_host_instance_id=None,
-            call_context_digest=request.call_context_digest,
-        ),
-    )
-    run = _require_transition_run(transition_result.run)
-    dispatch_record = _require_transition_dispatch_record(
-        transition_result.dispatch_record
-    )
-    idempotency_store.record_idempotent_result(
-        transaction,
-        scope,
-        semantic_digest,
-        IdempotencyResultRef(
-            result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
-            result_ref=run.run_id,
-            created_event_id=input_event.event_id,
-            created_event_sequence=input_event.event_sequence,
-        ),
-    )
-    return RunAdmissionResult(
-        run=run,
-        attempt=transition_result.attempt,
-        dispatch_record=dispatch_record,
-        pending_dispatch=_pending_dispatch_from_row(dispatch_record),
-        created=True,
-        queued=False,
-        attached_active=False,
-        idempotent_replay=False,
-    )
 
 
 def _create_accepted_admission_result(
@@ -3046,6 +3005,12 @@ def _create_steer_attempt_result(
     input_event: EventLogRow,
     steer_event: EventLogRow,
     occurred_at: datetime,
+    tooling_options: HostToolingOptions | None,
+    payload_store: PayloadStore,
+    context_budget_policy: ContextBudgetPolicy | None,
+    memory_projection_policy: MemoryProjectionPolicy | None,
+    enable_truncation_manager: bool,
+    owner_host_instance_id: str | None,
 ) -> SteerAdmissionResult:
     """创建 steer 新 Attempt、切换 Run 并记录幂等结果。
 
@@ -3061,6 +3026,12 @@ def _create_steer_attempt_result(
     :param input_event: 新 steer 输入事件。
     :param steer_event: ``STEER_REQUESTED`` 事件。
     :param occurred_at: 事件发生时间。
+    :param tooling_options: construction-time tool truth。
+    :param payload_store: manifest payload primitive。
+    :param context_budget_policy: 当前 Host context policy；不可用时为 ``None``。
+    :param memory_projection_policy: candidate memory policy。
+    :param enable_truncation_manager: framework truncation tool 是否启用。
+    :param owner_host_instance_id: 新 dispatch owner Host instance id。
     :returns: steer admission 结果。
     :raises HostApiError: Run 切换 CAS 失败时抛出。
     """
@@ -3068,6 +3039,124 @@ def _create_steer_attempt_result(
     attempt_id = id_factory.new_id(_ATTEMPT_ID_PREFIX)
     execution_id = id_factory.new_id(_EXECUTION_ID_PREFIX)
     dispatch_record_id = id_factory.new_id(_DISPATCH_RECORD_ID_PREFIX)
+    if memory_projection_policy is None:
+        raise HostDurableError(
+            "steer memory projection policy is unavailable"
+        )
+    policy_snapshot, tool_schemas, disable_tools, execution_mode = (
+        _strict_steer_candidate_inputs(
+            transaction=transaction,
+            input_event=input_event,
+            tooling_options=tooling_options,
+            enable_truncation_manager=enable_truncation_manager,
+            replay=target_run.source_run_relation is SourceRunRelation.REPLAY,
+        )
+    )
+    load_prepared_runner_call_source_in_transaction(
+        transaction,
+        event_log_store,
+        run_id=target_run.run_id,
+        attempt_id=previous_attempt.attempt_id,
+        execution_id=previous_attempt.execution_id,
+    )
+    candidate = prepare_runner_call_candidate_in_transaction(
+        transaction,
+        event_log_store,
+        run=target_run,
+        current_input_event=input_event,
+        continuity=SessionContinuityView(
+            messages=(),
+            source_refs=(),
+        ),
+        policy_snapshot=policy_snapshot,
+        tool_schemas=tool_schemas,
+        disable_tools=disable_tools,
+        tool_execution_mode=execution_mode,
+        memory_projection_policy=memory_projection_policy,
+    )
+    sizing: ContextSizingResult | None = None
+    estimate: BudgetEstimate | None = None
+    if context_budget_policy is None:
+        sizing_snapshot = unavailable_runner_call_sizing_snapshot(
+            RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+            sizing_stage=ContextSizingStage.CONTINUATION,
+        )
+    else:
+        estimate = estimate_prepared_runner_call_candidate(
+            candidate,
+            context_budget_policy,
+        )
+        sizing = build_conservative_context_sizing_result(
+            stage=ContextSizingStage.CONTINUATION,
+            candidate_input_cursor=candidate.candidate_input_cursor,
+            candidate_input_projection_ref=(
+                candidate.candidate_input_projection_ref
+            ),
+            candidate_input_digest=candidate.input_snapshot_digest,
+            policy=context_budget_policy,
+            estimate=estimate,
+        )
+        sizing_snapshot = complete_runner_call_sizing_snapshot(
+            sizing_stage=sizing.stage,
+            estimator_id=sizing.estimator_contract.estimator_id,
+            estimator_version=sizing.estimator_contract.estimator_version,
+            estimator_digest=sizing.estimator_digest,
+            conservative_input_tokens=sizing.conservative_input_tokens,
+            context_window_size=sizing.context_window_size,
+            provider=candidate.policy_snapshot.runner_spec.provider,
+            model=candidate.policy_snapshot.runner_spec.model,
+            request_semantics_digest=candidate.request_semantics_digest,
+            input_snapshot_digest=candidate.input_snapshot_digest,
+            policy_ref=sizing.policy_ref,
+            policy_snapshot_digest=sizing.policy_snapshot_digest,
+        )
+    manifest_event = record_prepared_runner_call_candidate_in_transaction(
+        transaction,
+        event_log_store,
+        payload_store,
+        run=target_run,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        occurred_at=occurred_at,
+        candidate=candidate,
+        sizing_snapshot=sizing_snapshot,
+    )
+    if sizing is not None:
+        if context_budget_policy is None or estimate is None:
+            raise HostDurableError(
+                "steer sizing exists without context budget estimate"
+            )
+        anchor_resolution = (
+            resolve_prepared_runner_call_context_anchor_in_transaction(
+                transaction,
+                event_log_store,
+                candidate=candidate,
+                context_window_size=(
+                    context_budget_policy.context_window_size
+                ),
+            )
+        )
+        sizing = build_context_sizing_result(
+            stage=ContextSizingStage.CONTINUATION,
+            candidate_input_cursor=manifest_event.event_sequence,
+            candidate_input_projection_ref=(
+                sizing.candidate_input_projection_ref
+            ),
+            candidate_input_digest=sizing.candidate_input_digest,
+            policy=context_budget_policy,
+            estimate=estimate,
+            anchor_resolution=anchor_resolution,
+        )
+        append_context_budget_evaluated_in_transaction(
+            transaction,
+            event_log_store,
+            session_id=target_run.session_id,
+            run_id=target_run.run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            occurred_at=occurred_at,
+            result=sizing,
+        )
     run_started_event = _append_steer_run_started_event(
         transaction=transaction,
         event_log_store=event_log_store,
@@ -3112,7 +3201,7 @@ def _create_steer_attempt_result(
         status=DispatchRecordStatus.PENDING,
         worker_kind=WorkerKind.LOCAL,
         execution_target=target_run.execution_target,
-        owner_host_instance_id=None,
+        owner_host_instance_id=owner_host_instance_id,
         created_event_id=attempt_started_event.event_id,
         created_event_sequence=attempt_started_event.event_sequence,
         waiting_for_lane_at=None,
@@ -3186,6 +3275,120 @@ def _create_steer_attempt_result(
         ),
         input_event_id=input_event.event_id,
         idempotent_replay=False,
+    )
+
+
+def _strict_steer_candidate_inputs(
+    *,
+    transaction: HostTransaction,
+    input_event: EventLogRow,
+    tooling_options: HostToolingOptions | None,
+    enable_truncation_manager: bool,
+    replay: bool,
+) -> tuple[
+    PolicySnapshot,
+    tuple[ToolSchema, ...],
+    bool,
+    ToolExecutionMode,
+]:
+    """从刚追加的 steer input payload strict 重建candidate执行输入。
+
+    :param transaction: 当前 admission write transaction。
+    :param input_event: 本次刚追加的 ``USER_INPUT_ACCEPTED``。
+    :param tooling_options: construction-time tool truth。
+    :param enable_truncation_manager: framework truncation tool 是否启用。
+    :param replay: 当前 Run 是否为 replay lineage。
+    :returns: typed policy、selected schemas、disable flag与tool mode。
+    :raises HostDurableError: durable effective facts缺失或损坏时抛出。
+    """
+
+    if input_event.event_type != _EVENT_TYPE_USER_INPUT_ACCEPTED:
+        raise HostDurableError("steer input event type mismatch")
+    payload = event_payload_object(
+        transaction,
+        input_event,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    execution_value = payload.get("effective_execution_config")
+    tool_value = payload.get("effective_tool_set")
+    if execution_value is None or tool_value is None:
+        raise HostDurableError("steer durable effective facts are missing")
+    execution = _effective_execution_snapshot_from_json(execution_value)
+    policy_snapshot = PolicySnapshot(
+        runner_spec=execution.runner_spec,
+        runner_options=execution.runner_options,
+        agent_policy=execution.agent_policy,
+        policy_snapshot_ref=execution.policy_snapshot_ref,
+    )
+    effective_tool_facts = parse_effective_tool_facts(tool_value)
+    runtime_tooling_options = None if replay else tooling_options
+    selected_names = validate_effective_tool_facts_runtime(
+        effective_tool_facts,
+        tooling_options=runtime_tooling_options,
+    )
+    if (
+        runtime_tooling_options is None
+        or not policy_snapshot.agent_policy.allow_tool_calls
+    ):
+        if (
+            not replay
+            and effective_tool_facts.selector
+            is EffectiveBusinessToolSelector.SUBSET
+            and selected_names
+        ):
+            raise HostDurableError(
+                "steer explicit subset tools are unavailable under frozen policy"
+            )
+        return (
+            policy_snapshot,
+            (),
+            True,
+            ToolExecutionMode.NO_TOOL_REPLAY
+            if replay
+            else ToolExecutionMode.NO_TOOL_DISABLED,
+        )
+    tooling_options = runtime_tooling_options
+    effective_bundle = EffectiveToolBundleBuilder().build(
+        EffectiveToolBundleBuildRequest(
+            business_tool_bundle=tooling_options.business_tool_bundle,
+            source_refs=tooling_options.source_refs,
+            framework_tool_policy=tooling_options.framework_tool_policy,
+            policy_snapshot_digest=_steer_policy_snapshot_digest(
+                policy_snapshot
+            ),
+            selected_business_tool_names=selected_names,
+            enable_truncation_manager=enable_truncation_manager,
+        )
+    )
+    return (
+        policy_snapshot,
+        effective_bundle.tool_schemas,
+        False,
+        ToolExecutionMode.TOOL_ENABLED,
+    )
+
+
+def _steer_policy_snapshot_digest(
+    policy_snapshot: PolicySnapshot,
+) -> str:
+    """计算 shared tool builder 使用的 frozen policy诊断digest。
+
+    :param policy_snapshot: steer input strict typed policy。
+    :returns: canonical sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
+            "allow_tool_calls": policy_snapshot.agent_policy.allow_tool_calls,
+            "max_iterations": policy_snapshot.agent_policy.max_iterations,
+            "continuation_max_attempts": (
+                policy_snapshot.agent_policy.continuation_max_attempts
+            ),
+            "tool_execution_timeout_seconds": (
+                policy_snapshot.agent_policy.tool_execution_timeout_seconds
+            ),
+        }
     )
 
 
@@ -3660,13 +3863,53 @@ def _resolve_followup_effective_facts(
         runner_options_source=_field_source(request.runner_options is not None),
         agent_policy_source=_field_source(request.agent_policy is not None),
     )
-    tool_set = _effective_tool_set_json(
+    tool_set = effective_tool_facts_json(
         request.tool_names,
         tooling_options=tooling_options,
     )
     return _ResolvedFollowupEffectiveFacts(
         effective_execution_config=execution_config,
         effective_tool_set=tool_set,
+    )
+
+
+def _resolve_start_effective_facts(
+    *,
+    baseline: OrdinaryRunExecutionBaseline | None,
+    tooling_options: HostToolingOptions | None,
+) -> _ResolvedFollowupEffectiveFacts:
+    """解析并冻结初始 Run 的 effective execution config 与业务工具集合。
+
+    初始 ``StartRunRequest`` 没有 per-request execution/tool override，因此两个
+    canonical facts 必须完全来自当前 execution Host 的构造期输入。admin-only
+    handle 没有 baseline 时在 admission owner 边界 fail closed。
+
+    :param baseline: execution Host ordinary Run baseline。
+    :param tooling_options: execution Host 构造期工具选项。
+    :returns: 已解析的 effective facts。
+    :raises HostApiError: 当前 handle 没有 ordinary Run baseline 时抛出。
+    :raises TypeError: RunnerSpec 中包含未知 provider request extension 时抛出。
+    """
+
+    if baseline is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="start_run requires an opener ordinary Run baseline",
+            retryable=False,
+        )
+    return _ResolvedFollowupEffectiveFacts(
+        effective_execution_config=_effective_execution_config_json(
+            runner_spec=baseline.runner_spec,
+            runner_options=baseline.runner_options,
+            agent_policy=baseline.agent_policy,
+            runner_spec_source="opener_baseline",
+            runner_options_source="opener_baseline",
+            agent_policy_source="opener_baseline",
+        ),
+        effective_tool_set=effective_tool_facts_json(
+            None,
+            tooling_options=tooling_options,
+        ),
     )
 
 
@@ -3683,7 +3926,7 @@ def _field_source(override_present: bool) -> str:
     return "opener_baseline"
 
 
-def _effective_tool_set_json(
+def effective_tool_facts_json(
     requested_tool_names: frozenset[str] | None,
     *,
     tooling_options: HostToolingOptions | None,
@@ -3757,6 +4000,245 @@ def _effective_tool_set_json(
     return tool_set
 
 
+def parse_effective_tool_facts(value: JsonValue) -> EffectiveToolFacts:
+    """严格解析 admission 冻结的 effective tool facts。
+
+    :param value: ``USER_INPUT_ACCEPTED.effective_tool_set`` JSON。
+    :returns: 完整 typed effective tool facts。
+    :raises HostDurableError: 字段缺失、多余、类型、选择闭集或摘要非法时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise HostDurableError("effective_tool_set must be object")
+    if frozenset(value) != _EFFECTIVE_TOOL_FACT_FIELDS:
+        raise HostDurableError("effective_tool_set fields mismatch")
+    selector_value = value.get("selector")
+    if not isinstance(selector_value, str):
+        raise HostDurableError("effective tool selector must be text")
+    try:
+        selector = EffectiveBusinessToolSelector(selector_value)
+    except ValueError as exc:
+        raise HostDurableError("effective tool selector is invalid") from exc
+    effective_names = _strict_tool_name_set(
+        value.get("effective_business_tool_names"),
+        field_name="effective_business_tool_names",
+    )
+    requested_value = value.get("requested_business_tool_names")
+    requested_names = (
+        None
+        if requested_value is None
+        else _strict_tool_name_set(
+            requested_value,
+            field_name="requested_business_tool_names",
+        )
+    )
+    if selector is EffectiveBusinessToolSelector.ALL:
+        if requested_names is not None:
+            raise HostDurableError("all tool selector must have null requested names")
+    elif selector is EffectiveBusinessToolSelector.SUBSET:
+        if not requested_names or requested_names != effective_names:
+            raise HostDurableError(
+                "subset tool selector must preserve exact requested names"
+            )
+    elif requested_names != frozenset() or effective_names:
+        raise HostDurableError("none tool selector must preserve exact empty names")
+    business_bundle_digest = _strict_effective_tool_digest(
+        value.get("business_bundle_digest"),
+        field_name="business_bundle_digest",
+    )
+    effective_schema_digest = _strict_effective_tool_digest(
+        value.get("effective_schema_digest"),
+        field_name="effective_schema_digest",
+    )
+    tool_snapshot_ref = value.get("tool_snapshot_ref")
+    if (
+        not isinstance(tool_snapshot_ref, str)
+        or tool_snapshot_ref
+        != _TOOL_SNAPSHOT_REF_PREFIX + effective_schema_digest
+    ):
+        raise HostDurableError("effective tool snapshot ref does not match schema digest")
+    display_names = _strict_effective_tool_display_names(
+        value.get("effective_tool_display_names"),
+        effective_names=effective_names,
+    )
+    source_refs = _strict_tool_source_refs(value.get("source_refs"))
+    return EffectiveToolFacts(
+        tool_snapshot_ref=tool_snapshot_ref,
+        selector=selector,
+        requested_business_tool_names=requested_names,
+        effective_business_tool_names=effective_names,
+        business_bundle_digest=business_bundle_digest,
+        effective_schema_digest=effective_schema_digest,
+        effective_tool_display_names=display_names,
+        source_refs=source_refs,
+    )
+
+
+def validate_effective_tool_facts_runtime(
+    facts: EffectiveToolFacts,
+    *,
+    tooling_options: HostToolingOptions | None,
+) -> frozenset[str]:
+    """校验当前 runtime 能精确实现 admission 冻结的工具事实。
+
+    :param facts: strict typed admission tool facts。
+    :param tooling_options: 当前 Host construction-time 工具真源。
+    :returns: admission 冻结的 exact effective 业务工具名集合。
+    :raises HostDurableError: bundle、selected schema、source refs 或 display
+        snapshot 发生漂移时抛出。
+    """
+
+    definitions = (
+        ()
+        if tooling_options is None
+        else tooling_options.business_tool_bundle.definitions
+    )
+    source_refs = () if tooling_options is None else tooling_options.source_refs
+    if _tool_definitions_digest(definitions) != facts.business_bundle_digest:
+        raise HostDurableError("current business tool bundle does not match admission")
+    if source_refs != facts.source_refs:
+        raise HostDurableError("current business tool source refs do not match admission")
+    known_names = frozenset(definition.name for definition in definitions)
+    if not facts.effective_business_tool_names.issubset(known_names):
+        raise HostDurableError("admission effective tool names are unavailable")
+    selected_schemas = tuple(
+        definition.to_tool_schema()
+        for definition in definitions
+        if definition.name in facts.effective_business_tool_names
+    )
+    if _tool_schemas_digest(selected_schemas) != facts.effective_schema_digest:
+        raise HostDurableError("current selected tool schemas do not match admission")
+    if (
+        _TOOL_SNAPSHOT_REF_PREFIX + facts.effective_schema_digest
+        != facts.tool_snapshot_ref
+    ):
+        raise HostDurableError("admission tool snapshot ref is inconsistent")
+    expected_display_names = _effective_tool_display_names(
+        definitions,
+        facts.effective_business_tool_names,
+    )
+    if expected_display_names != facts.effective_tool_display_names:
+        raise HostDurableError("current selected tool display names do not match admission")
+    return facts.effective_business_tool_names
+
+
+def _strict_tool_name_set(
+    value: JsonValue | None,
+    *,
+    field_name: str,
+) -> frozenset[str]:
+    """严格解析无重复工具名数组。
+
+    :param value: 待解析 JSON 值。
+    :param field_name: 错误消息字段名。
+    :returns: exact 工具名集合。
+    :raises HostDurableError: 值不是数组、元素为空或重复时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise HostDurableError(f"{field_name} must be array")
+    names: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise HostDurableError(f"{field_name} entries must be non-empty text")
+        if item in names:
+            raise HostDurableError(f"{field_name} contains duplicate")
+        names.add(item)
+    return frozenset(names)
+
+
+def _strict_effective_tool_digest(
+    value: JsonValue | None,
+    *,
+    field_name: str,
+) -> str:
+    """严格读取 effective tool digest。
+
+    :param value: 待解析 JSON 值。
+    :param field_name: 错误消息字段名。
+    :returns: 合法 ``sha256:`` 摘要。
+    :raises HostDurableError: 值不是合法摘要时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise HostDurableError(f"{field_name} must be sha256 digest")
+    try:
+        _require_sha256_digest(value, field_name=field_name)
+    except ValueError as exc:
+        raise HostDurableError(f"{field_name} must be sha256 digest") from exc
+    return value
+
+
+def _strict_effective_tool_display_names(
+    value: JsonValue | None,
+    *,
+    effective_names: frozenset[str],
+) -> tuple[tuple[str, str], ...]:
+    """严格读取 selected tool display name 快照。
+
+    :param value: display name JSON mapping。
+    :param effective_names: admission exact selected names。
+    :returns: 按工具名排序的 immutable 键值对。
+    :raises HostDurableError: key/value 非法或包含未选中工具时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise HostDurableError("effective_tool_display_names must be object")
+    display_names: list[tuple[str, str]] = []
+    for name, display_name in value.items():
+        if (
+            name not in effective_names
+            or name.strip() == ""
+            or not isinstance(display_name, str)
+            or display_name.strip() == ""
+        ):
+            raise HostDurableError("effective tool display name is invalid")
+        display_names.append((name, display_name))
+    return tuple(sorted(display_names))
+
+
+def _strict_tool_source_refs(
+    value: JsonValue | None,
+) -> tuple[ToolBundleSourceRef, ...]:
+    """严格读取完整业务工具来源引用。
+
+    :param value: ``source_refs`` JSON 数组。
+    :returns: 保留冻结顺序的 typed source refs。
+    :raises HostDurableError: shape、枚举或字段语义非法时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise HostDurableError("effective tool source_refs must be array")
+    refs: list[ToolBundleSourceRef] = []
+    for item in value:
+        if not isinstance(item, Mapping) or frozenset(item) != _TOOL_SOURCE_REF_FIELDS:
+            raise HostDurableError("effective tool source ref fields mismatch")
+        source_kind_value = item.get("source_kind")
+        source_id = item.get("source_id")
+        version_ref = item.get("version_ref")
+        content_digest = item.get("content_digest")
+        if (
+            not isinstance(source_kind_value, str)
+            or not isinstance(source_id, str)
+            or (version_ref is not None and not isinstance(version_ref, str))
+            or (content_digest is not None and not isinstance(content_digest, str))
+        ):
+            raise HostDurableError("effective tool source ref values are invalid")
+        try:
+            source_ref = ToolBundleSourceRef(
+                source_kind=ToolBundleSourceKind(source_kind_value),
+                source_id=source_id,
+                version_ref=version_ref,
+                content_digest=content_digest,
+            )
+        except (TypeError, ValueError) as exc:
+            raise HostDurableError("effective tool source ref is invalid") from exc
+        if source_ref in refs:
+            raise HostDurableError("effective tool source refs contain duplicate")
+        refs.append(source_ref)
+    return tuple(refs)
+
+
 def _effective_tool_display_names_json(
     definitions: tuple[ToolDefinition, ...], effective_names: frozenset[str]
 ) -> JsonValue:
@@ -3768,32 +4250,27 @@ def _effective_tool_display_names_json(
     :raises: 无主动抛出。
     """
 
-    display_names: dict[str, JsonValue] = {}
+    return dict(_effective_tool_display_names(definitions, effective_names))
+
+
+def _effective_tool_display_names(
+    definitions: tuple[ToolDefinition, ...],
+    effective_names: frozenset[str],
+) -> tuple[tuple[str, str], ...]:
+    """构造 selected tools 的 immutable display name 快照。
+
+    :param definitions: construction-time business tool definitions。
+    :param effective_names: 本次 Run 选中的稳定工具名集合。
+    :returns: 按工具名排序的 display name 键值对。
+    :raises: 无主动抛出。
+    """
+
+    display_names: list[tuple[str, str]] = []
     for definition in definitions:
         if definition.name not in effective_names or definition.display is None:
             continue
-        display_names[definition.name] = definition.display.name
-    return display_names
-
-
-def _no_tool_effective_tool_set_json() -> JsonValue:
-    """构造 replay no-tool 的 effective tool set 冻结 JSON。
-
-    :returns: 表示禁用业务工具的 tool set JSON。
-    """
-
-    empty_schemas: tuple[ToolSchema, ...] = ()
-    empty_schema_digest = _tool_schemas_digest(empty_schemas)
-    return {
-        "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX + empty_schema_digest,
-        "selector": _TOOL_SELECTION_NONE,
-        "requested_business_tool_names": [],
-        "effective_business_tool_names": [],
-        "business_bundle_digest": _tool_definitions_digest(()),
-        "effective_schema_digest": empty_schema_digest,
-        "effective_tool_display_names": {},
-        "source_refs": [],
-    }
+        display_names.append((definition.name, definition.display.name))
+    return tuple(sorted(display_names))
 
 
 def _replay_effective_execution_config(
@@ -4858,26 +5335,6 @@ def _raise_for_terminal_transition_status(
         message="Run or Attempt state is not terminal-closeout eligible in Phase 3",
         retryable=False,
     )
-
-
-def _promotion_skip_reason(skip_reason: str | None) -> PromotionSkipReason | None:
-    """把低层 skip reason 文本转为 admission enum。
-
-    :param skip_reason: 低层 skip reason 文本。
-    :returns: 对应 enum；无 skip reason 时返回 ``None``。
-    :raises HostApiError: 低层返回未知 skip reason 时抛出。
-    """
-
-    if skip_reason is None:
-        return None
-    try:
-        return PromotionSkipReason(skip_reason)
-    except ValueError as exc:
-        raise HostApiError(
-            code=HostApiErrorCode.INTERNAL_ERROR,
-            message="Promotion returned unknown skip reason",
-            retryable=False,
-        ) from exc
 
 
 def _start_run_semantic_digest(

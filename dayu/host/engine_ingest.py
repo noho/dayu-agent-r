@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
@@ -57,12 +58,18 @@ from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
     RunnerCallHotDiagnostic,
     RunnerCallProjectorMetadata,
+    RunnerCallSizingSnapshot,
+    RunnerCallSizingStatus,
+    RunnerCallSizingUnavailableReason,
+    complete_runner_call_sizing_snapshot,
     complete_runner_call_hot_diagnostic,
     parse_runner_call_hot_payload,
     parse_runner_call_manifest,
     runner_call_hot_diagnostic_from_json,
     runner_call_hot_payload,
     runner_call_projector_metadata_descriptor,
+    runner_call_sizing_snapshot_json,
+    unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.admission import (
     AdmissionWakeupPort,
@@ -117,10 +124,19 @@ from dayu.host.compaction_operation import (
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
 from dayu.host.context_budget import (
+    CONTEXT_ESTIMATOR_CONTRACT,
     BudgetEstimate,
     BudgetEstimateInput,
+    BudgetJsonFragment,
     BudgetTextFragment,
     ContextBudgetDecision,
+    ContextEstimatorContract,
+    ContextSizingFallbackReason,
+    ContextSizingResult,
+    ContextSizingStage,
+    build_conservative_context_sizing_result,
+    build_context_sizing_result,
+    build_context_sizing_result_from_atoms,
     UsageObservation,
     UsageObservationDiagnostic,
     USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
@@ -128,6 +144,11 @@ from dayu.host.context_budget import (
     build_usage_observation_diagnostic,
     decide_context_budget,
     estimate_context_budget,
+    estimate_context_input,
+)
+from dayu.host.context_anchor import (
+    ContextAnchorQuery,
+    resolve_context_anchor,
 )
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
@@ -138,10 +159,14 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    ContextBudgetEvaluatedPayload,
+    ContextBudgetEvaluationIdentity,
+    append_context_budget_evaluated_in_transaction,
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
+    load_matching_context_budget_evaluation_in_transaction,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -229,7 +254,22 @@ from dayu.host.memory import (
     digest_memory_projection_policy,
 )
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
-from dayu.host.payload_resolution import event_payload_object
+from dayu.host.payload_resolution import (
+    event_payload_object,
+    sqlite_payload_object,
+)
+from dayu.host.run_input import (
+    PreparedRunnerCallCandidate,
+    PreparedRunnerCallSourceError,
+    PreparedRunnerCallSourceFailureCategory,
+    SessionContinuityView,
+    estimate_prepared_runner_call_candidate,
+    load_prepared_runner_call_source_in_transaction,
+    load_prepared_runner_call_candidate_in_transaction,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+    resolve_prepared_runner_call_context_anchor_in_transaction,
+)
 from dayu.host.tool_trace_signals import (
     CONTEXT_PRESSURE_SCHEMA_VERSION as _CONTEXT_PRESSURE_SCHEMA_VERSION,
     FAILURE_KIND_PROVIDER_PROTOCOL_ERROR as _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
@@ -300,6 +340,7 @@ _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
 _CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED = "USAGE_REPORTED"
 _CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN = "unknown"
+_PAYLOAD_FIELD_OPERATION_ID = "operation_id"
 _RUNNER_CALL_MANIFEST_STATUS_COMPLETE = "complete"
 _RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL = "limited_signal"
 _RUNNER_CALL_MANIFEST_STATUS_MISMATCH = "mismatch"
@@ -327,6 +368,9 @@ _ORDINARY_RUNNER_CALL_KINDS = frozenset(
         _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
     )
 )
+_USAGE_PAIRING_ELIGIBLE_RUNNER_CALL_KINDS = frozenset(
+    (*_ORDINARY_RUNNER_CALL_KINDS, _RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION)
+)
 
 
 class EngineIngestStatus(StrEnum):
@@ -342,6 +386,21 @@ class _HostLifecycleSource(StrEnum):
 
     WORKER_CLEAN_EOF = "worker_clean_eof"
     WORKER_LOST = "worker_lost"
+
+
+class _UsagePairingStatus(StrEnum):
+    """usage 与 runner-call manifest pairing 的封闭状态。"""
+
+    COMPLETE = "complete"
+    UNAVAILABLE = "unavailable"
+
+
+class _UsagePairingReason(StrEnum):
+    """usage pairing unavailable 的封闭原因。"""
+
+    ITERATION_LINK_MISSING = "iteration_link_missing"
+    ITERATION_LINK_INVALID = "iteration_link_invalid"
+    MANIFEST_INCOMPLETE = "manifest_incomplete"
 
 
 class _TerminalCloseoutRollback(Exception):
@@ -372,6 +431,10 @@ class LocalEngineEnvelope:
     execution_target: str
     local_worker_id: str
     cancellation_token: CancellationToken
+
+
+class _ReactiveRecoveryStartCasMissRollback(Exception):
+    """请求 reactive recovery start transaction 整体回滚的私有信号。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,6 +665,83 @@ class _ReactiveCompactPending:
 
 
 @dataclass(frozen=True, slots=True)
+class _UsageManifestPairing:
+    """USAGE_REPORTED 与 exact linked manifest 的内部 pairing 结果。
+
+    :param status: complete/unavailable。
+    :param reason: unavailable closed reason。
+    :param manifest_event_id: exact manifest event id。
+    :param manifest_payload_ref: manifest descriptor ref。
+    :param manifest_digest: manifest digest。
+    :param iteration_link_event_id: accepted link event id。
+    :param input_snapshot_digest: manifest frozen candidate digest。
+    :param estimator_digest: manifest conservative estimator digest。
+    :param conservative_input_tokens: manifest conservative token count。
+    :param policy_ref: manifest frozen policy ref。
+    """
+
+    status: _UsagePairingStatus
+    reason: _UsagePairingReason | None
+    manifest_event_id: str | None
+    manifest_payload_ref: str | None
+    manifest_digest: str | None
+    iteration_link_event_id: str | None
+    input_snapshot_digest: str | None
+    estimator_digest: str | None
+    conservative_input_tokens: int | None
+    policy_ref: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _UnavailableContinuationFrozenSources:
+    """continuation manifest 不完整 frozen source。
+
+    :param unavailable_reason: 首个缺失 source 的 closed reason。
+    :param tool_schema_snapshot_refs: pre-start manifest exact refs。
+    :param tool_schema_fragments: digest-verified selected schema JSON atoms。
+    """
+
+    unavailable_reason: RunnerCallSizingUnavailableReason
+    tool_schema_snapshot_refs: tuple[str, ...]
+    tool_schema_fragments: tuple[BudgetJsonFragment, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompleteContinuationFrozenSources:
+    """continuation manifest 完整 frozen source。
+
+    :param tool_schema_snapshot_refs: pre-start manifest exact refs。
+    :param tool_schema_fragments: digest-verified selected schema JSON atoms。
+    :param context_window_size: frozen context window。
+    :param provider: frozen provider。
+    :param model: frozen model。
+    :param request_semantics_digest: frozen request semantics。
+    :param estimator_id: frozen estimator id。
+    :param estimator_version: frozen estimator version。
+    :param policy_ref: frozen policy ref。
+    :param policy_snapshot_digest: frozen policy digest。
+    :param source_budget: matching source canonical fact。
+    """
+
+    tool_schema_snapshot_refs: tuple[str, ...]
+    tool_schema_fragments: tuple[BudgetJsonFragment, ...]
+    context_window_size: int
+    provider: str
+    model: str
+    request_semantics_digest: str
+    estimator_id: str
+    estimator_version: str
+    policy_ref: str
+    policy_snapshot_digest: str
+    source_budget: ContextBudgetEvaluatedPayload
+
+
+_ContinuationFrozenSources = (
+    _UnavailableContinuationFrozenSources | _CompleteContinuationFrozenSources
+)
+
+
+@dataclass(frozen=True, slots=True)
 class _ReactiveRecoveryStarted:
     """reactive recovery start 后的 dispatch 摘要。"""
 
@@ -610,79 +750,644 @@ class _ReactiveRecoveryStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReactiveRecoveryTerminal:
+    """真实 fallback hard pressure 的 terminal closeout 摘要。"""
+
+    result: EngineIngestResult
+
+
+@dataclass(frozen=True, slots=True)
+class _ReactiveRecoverySource:
+    """通过 recovery start 前置校验的 durable source。
+
+    :param run: 当前 ``RECOVERING`` Run。
+    :param attempt: 已终态 source Attempt。
+    :param candidate: source Attempt 的 strict frozen candidate。
+    """
+
+    run: RunRow
+    attempt: AttemptRow
+    candidate: PreparedRunnerCallCandidate
+
+
+@dataclass(frozen=True, slots=True)
+class _ReactiveRecoveryStartTruth:
+    """同一 transaction 写入的 reactive recovery start truths。
+
+    :param manifest: 新 Attempt 的 runner-call manifest。
+    :param budget_fact: 与 manifest 同源的 budget fact。
+    :param start_rows: ``RUN_STARTED`` 与 ``ATTEMPT_STARTED`` rows。
+    :param pending_dispatch: commit 后可唤醒的 pending dispatch。
+    """
+
+    manifest: EventLogRow
+    budget_fact: EventLogRow
+    start_rows: tuple[EventLogRow, EventLogRow]
+    pending_dispatch: PendingDispatchRecord
+
+
+@dataclass(frozen=True, slots=True)
 class _StartReactiveRecoveryOperation:
     """reactive recovery accepted 后的 start transaction。"""
 
     event_log_store: EventLogStore
+    payload_store: PayloadStore
+    context_budget_policy: ContextBudgetPolicy
+    memory_projection_policy: MemoryProjectionPolicy
     accepted: _ReactiveRecoveryAccepted
 
-    def __call__(self, transaction: HostTransaction) -> _ReactiveRecoveryStarted:
+    def __call__(
+        self,
+        transaction: HostTransaction,
+    ) -> _ReactiveRecoveryStarted | _ReactiveRecoveryTerminal:
         """执行 recovery start transaction。
 
         :param transaction: 当前 Host transaction。
-        :returns: recovery started 摘要。
-        :raises HostDurableError: transition precondition 失败时抛出。
+        :returns: recovery started 或真实 fallback hard terminal 摘要。
+        :raises _ReactiveRecoveryStartCasMissRollback: start 前置条件竞争时抛出。
+        :raises HostDurableError: durable source、candidate 或 digest 非法时抛出。
         """
 
-        attempt_id = _new_id("attempt-recovery")
-        execution_id = _new_id("execution-recovery")
-        dispatch_record_id = _new_id("dispatch-recovery")
-        run_started_event_id = _new_id("event-run-started-recovery")
-        attempt_started_event_id = _new_id("event-attempt-started-recovery")
-        result = start_recovery_run_with_starting_attempt_in_transaction(
+        source = _load_reactive_recovery_source(
             transaction,
             self.event_log_store,
-            StartRecoveryRunInput(
-                run_id=self.accepted.run_id,
-                source_attempt_id=self.accepted.source_attempt_id,
-                run_started_event_id=run_started_event_id,
-                attempt_started_event_id=attempt_started_event_id,
-                attempt_id=attempt_id,
-                execution_id=execution_id,
-                dispatch_record_id=dispatch_record_id,
-                occurred_at=datetime.now(UTC),
-                actor=_EVENT_ACTOR,
-                source=_EVENT_SOURCE,
-                worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=None,
-                context_compacted_event_id=self.accepted.compacted_event_id,
-                context_compacted_event_sequence=(
-                    self.accepted.compacted_event_sequence
-                ),
+            accepted=self.accepted,
+        )
+        candidate = _prepare_reactive_recovery_candidate(
+            transaction,
+            self.event_log_store,
+            memory_projection_policy=self.memory_projection_policy,
+            source=source,
+        )
+        sizing = _build_reactive_recovery_sizing(
+            transaction,
+            self.event_log_store,
+            accepted=self.accepted,
+            candidate=candidate,
+            context_budget_policy=self.context_budget_policy,
+        )
+        terminal = _close_reactive_fallback_hard_if_required(
+            transaction,
+            self.event_log_store,
+            accepted=self.accepted,
+            source=source,
+            sizing=sizing,
+        )
+        if terminal is not None:
+            return terminal
+        start_input = _reactive_recovery_start_input(self.accepted)
+        truth = _commit_reactive_recovery_start_truths(
+            transaction,
+            self.event_log_store,
+            self.payload_store,
+            source=source,
+            candidate=candidate,
+            sizing=sizing,
+            start_input=start_input,
+        )
+        return _reactive_recovery_started(
+            accepted=self.accepted,
+            truth=truth,
+        )
+
+
+def _load_reactive_recovery_source(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+) -> _ReactiveRecoverySource:
+    """校验 recovery start 前置状态并 strict-load source candidate。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :returns: Run、source Attempt 与 frozen candidate。
+    :raises _ReactiveRecoveryStartCasMissRollback: lifecycle 前置条件竞争时抛出。
+    :raises HostDurableError: outcome 或 source candidate 非法时抛出。
+    """
+
+    run = read_run_by_id(transaction, accepted.run_id)
+    source_attempt = read_attempt_by_id(
+        transaction,
+        accepted.source_attempt_id,
+    )
+    if (
+        run is None
+        or run.status is not RunStatus.RECOVERING
+        or run.current_attempt_id != accepted.source_attempt_id
+        or source_attempt is None
+        or source_attempt.run_id != accepted.run_id
+        or not is_terminal_attempt_status(source_attempt.status)
+    ):
+        raise _ReactiveRecoveryStartCasMissRollback()
+    _validate_reactive_recovery_outcome_event(
+        transaction,
+        event_log_store,
+        accepted=accepted,
+        source_attempt=source_attempt,
+    )
+    prepared_source = load_prepared_runner_call_source_in_transaction(
+        transaction,
+        event_log_store,
+        run_id=run.run_id,
+        attempt_id=source_attempt.attempt_id,
+        execution_id=source_attempt.execution_id,
+    )
+    return _ReactiveRecoverySource(
+        run=run,
+        attempt=source_attempt,
+        candidate=prepared_source.candidate,
+    )
+
+
+def _prepare_reactive_recovery_candidate(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    memory_projection_policy: MemoryProjectionPolicy,
+    source: _ReactiveRecoverySource,
+) -> PreparedRunnerCallCandidate:
+    """从 source frozen execution truth 组装 recovery complete candidate。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param memory_projection_policy: candidate memory policy。
+    :param source: 已校验的 recovery source。
+    :returns: identity-free complete candidate。
+    :raises HostDurableError: current input 缺失或 candidate source 非法时抛出。
+    """
+
+    current_input_event = event_log_store.read_event_by_id(
+        transaction,
+        source.run.input_event_id,
+    )
+    if current_input_event is None:
+        raise HostDurableError(
+            "reactive recovery current input event is missing"
+        )
+    source_candidate = source.candidate
+    return prepare_runner_call_candidate_in_transaction(
+        transaction,
+        event_log_store,
+        run=source.run,
+        current_input_event=current_input_event,
+        continuity=SessionContinuityView(
+            messages=(),
+            source_refs=(),
+        ),
+        policy_snapshot=source_candidate.policy_snapshot,
+        tool_schemas=source_candidate.tool_schemas,
+        disable_tools=source_candidate.disable_tools,
+        tool_execution_mode=source_candidate.tool_execution_mode,
+        memory_projection_policy=memory_projection_policy,
+    )
+
+
+def _build_reactive_recovery_sizing(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    candidate: PreparedRunnerCallCandidate,
+    context_budget_policy: ContextBudgetPolicy,
+) -> ContextSizingResult:
+    """为 reactive accepted/fallback candidate 构造同源 sizing result。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param candidate: complete recovery candidate。
+    :param context_budget_policy: frozen Host context policy。
+    :returns: stage-aware sizing result。
+    :raises HostDurableError: anchor durable truth 损坏时抛出。
+    :raises TypeError: candidate 或 policy atoms 非法时抛出。
+    :raises ValueError: sizing invariant 非法时抛出。
+    """
+
+    stage = (
+        ContextSizingStage.REACTIVE_POST_COMPACT
+        if accepted.compacted_event_id is not None
+        else ContextSizingStage.DISPATCH_FALLBACK
+    )
+    estimate = estimate_prepared_runner_call_candidate(
+        candidate,
+        context_budget_policy,
+    )
+    if stage is ContextSizingStage.REACTIVE_POST_COMPACT:
+        return build_conservative_context_sizing_result(
+            stage=stage,
+            candidate_input_cursor=candidate.candidate_input_cursor,
+            candidate_input_projection_ref=(
+                candidate.candidate_input_projection_ref
+            ),
+            candidate_input_digest=candidate.input_snapshot_digest,
+            policy=context_budget_policy,
+            estimate=estimate,
+            fallback_reason=(
+                ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
             ),
         )
-        if (
-            result.status != StateMutationStatus.UPDATED
-            or result.run is None
-            or result.attempt is None
-            or result.dispatch_record is None
-        ):
-            raise HostDurableError("reactive recovery start precondition failed")
-        rows = _existing_rows(
-            self.event_log_store,
+    anchor_resolution = (
+        resolve_prepared_runner_call_context_anchor_in_transaction(
             transaction,
-            (run_started_event_id, attempt_started_event_id),
+            event_log_store,
+            candidate=candidate,
+            context_window_size=context_budget_policy.context_window_size,
         )
-        pending_dispatch = PendingDispatchRecord(
+    )
+    return build_context_sizing_result(
+        stage=stage,
+        candidate_input_cursor=candidate.candidate_input_cursor,
+        candidate_input_projection_ref=(
+            candidate.candidate_input_projection_ref
+        ),
+        candidate_input_digest=candidate.input_snapshot_digest,
+        policy=context_budget_policy,
+        estimate=estimate,
+        anchor_resolution=anchor_resolution,
+    )
+
+
+def _close_reactive_fallback_hard_if_required(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    source: _ReactiveRecoverySource,
+    sizing: ContextSizingResult,
+) -> _ReactiveRecoveryTerminal | None:
+    """在真实 dispatch fallback 达到 hard 时提交 fact 并收口 Run。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param source: 已校验的 recovery source。
+    :param sizing: 当前 candidate sizing truth。
+    :returns: hard closeout 摘要；无需收口时返回 ``None``。
+    :raises _ReactiveRecoveryStartCasMissRollback: terminal transition 竞争时抛出。
+    :raises HostDurableError: failed fact 或 durable row 非法时抛出。
+    """
+
+    if (
+        sizing.stage is not ContextSizingStage.DISPATCH_FALLBACK
+        or sizing.budget_decision
+        is not ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+    ):
+        return None
+    append_context_budget_evaluated_in_transaction(
+        transaction,
+        event_log_store,
+        session_id=source.run.session_id,
+        run_id=source.run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        occurred_at=datetime.now(UTC),
+        result=sizing,
+    )
+    return _close_reactive_fallback_hard_in_transaction(
+        transaction,
+        event_log_store,
+        accepted=accepted,
+        run=source.run,
+        source_attempt=source.attempt,
+    )
+
+
+def _reactive_recovery_start_input(
+    accepted: _ReactiveRecoveryAccepted,
+) -> StartRecoveryRunInput:
+    """分配 reactive recovery 新 Attempt 的唯一 start identity。
+
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :returns: existing recovery transition 的 typed input。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    occurred_at = datetime.now(UTC)
+    return StartRecoveryRunInput(
+        run_id=accepted.run_id,
+        source_attempt_id=accepted.source_attempt_id,
+        run_started_event_id=_new_id("event-run-started-recovery"),
+        attempt_started_event_id=_new_id("event-attempt-started-recovery"),
+        attempt_id=_new_id("attempt-recovery"),
+        execution_id=_new_id("execution-recovery"),
+        dispatch_record_id=_new_id("dispatch-recovery"),
+        occurred_at=occurred_at,
+        actor=_EVENT_ACTOR,
+        source=_EVENT_SOURCE,
+        worker_kind=WorkerKind.LOCAL,
+        owner_host_instance_id=None,
+        context_compacted_event_id=accepted.compacted_event_id,
+        context_compacted_event_sequence=accepted.compacted_event_sequence,
+    )
+
+
+def _commit_reactive_recovery_start_truths(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    payload_store: PayloadStore,
+    *,
+    source: _ReactiveRecoverySource,
+    candidate: PreparedRunnerCallCandidate,
+    sizing: ContextSizingResult,
+    start_input: StartRecoveryRunInput,
+) -> _ReactiveRecoveryStartTruth:
+    """按 manifest、budget fact、start rows 顺序提交 recovery truths。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param payload_store: candidate/manifest payload primitive。
+    :param source: 已校验的 recovery source。
+    :param candidate: complete recovery candidate。
+    :param sizing: 与 candidate 同源的 sizing result。
+    :param start_input: 唯一 recovery start identity。
+    :returns: 同 transaction 写入的 start truths。
+    :raises _ReactiveRecoveryStartCasMissRollback: transition 或 identity 竞争时抛出。
+    :raises HostDurableError: payload、manifest 或 durable write 非法时抛出。
+    """
+
+    manifest = record_prepared_runner_call_candidate_in_transaction(
+        transaction,
+        event_log_store,
+        payload_store,
+        run=source.run,
+        attempt_id=start_input.attempt_id,
+        execution_id=start_input.execution_id,
+        occurred_at=start_input.occurred_at,
+        candidate=candidate,
+        sizing_snapshot=_reactive_recovery_sizing_snapshot(
+            candidate,
+            sizing,
+        ),
+    )
+    budget_fact = append_context_budget_evaluated_in_transaction(
+        transaction,
+        event_log_store,
+        session_id=source.run.session_id,
+        run_id=source.run.run_id,
+        attempt_id=start_input.attempt_id,
+        execution_id=start_input.execution_id,
+        occurred_at=start_input.occurred_at,
+        result=sizing,
+    )
+    result = start_recovery_run_with_starting_attempt_in_transaction(
+        transaction,
+        event_log_store,
+        start_input,
+    )
+    if (
+        result.status is not StateMutationStatus.UPDATED
+        or result.run is None
+        or result.attempt is None
+        or result.dispatch_record is None
+        or result.attempt.attempt_id != start_input.attempt_id
+        or result.attempt.execution_id != start_input.execution_id
+        or result.dispatch_record.dispatch_record_id
+        != start_input.dispatch_record_id
+    ):
+        raise _ReactiveRecoveryStartCasMissRollback()
+    rows = _existing_rows(
+        event_log_store,
+        transaction,
+        (
+            start_input.run_started_event_id,
+            start_input.attempt_started_event_id,
+        ),
+    )
+    if len(rows) != 2:
+        raise _ReactiveRecoveryStartCasMissRollback()
+    return _ReactiveRecoveryStartTruth(
+        manifest=manifest,
+        budget_fact=budget_fact,
+        start_rows=(rows[0], rows[1]),
+        pending_dispatch=PendingDispatchRecord(
             dispatch_record_id=result.dispatch_record.dispatch_record_id,
             run_id=result.run.run_id,
             attempt_id=result.attempt.attempt_id,
             execution_id=result.attempt.execution_id,
             execution_target=result.dispatch_record.execution_target,
             worker_kind=result.dispatch_record.worker_kind,
-        )
-        return _ReactiveRecoveryStarted(
-            result=EngineIngestResult(
-                status=EngineIngestStatus.ACCEPTED,
-                events=self.accepted.result.events + rows,
-                terminal_closeout=False,
-                terminal_notice=None,
-                reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
-                transient_delta=None,
-                stop_worker_stream=True,
+        ),
+    )
+
+
+def _reactive_recovery_sizing_snapshot(
+    candidate: PreparedRunnerCallCandidate,
+    sizing: ContextSizingResult,
+) -> RunnerCallSizingSnapshot:
+    """把 recovery sizing result 投影为 complete manifest snapshot。
+
+    :param candidate: complete recovery candidate。
+    :param sizing: 同源 sizing result。
+    :returns: complete runner-call sizing snapshot。
+    :raises TypeError: typed atoms 非法时由 manifest owner 抛出。
+    :raises ValueError: snapshot invariant 非法时由 manifest owner 抛出。
+    """
+
+    return complete_runner_call_sizing_snapshot(
+        sizing_stage=sizing.stage,
+        estimator_id=sizing.estimator_contract.estimator_id,
+        estimator_version=sizing.estimator_contract.estimator_version,
+        estimator_digest=sizing.estimator_digest,
+        conservative_input_tokens=sizing.conservative_input_tokens,
+        context_window_size=sizing.context_window_size,
+        provider=candidate.policy_snapshot.runner_spec.provider,
+        model=candidate.policy_snapshot.runner_spec.model,
+        request_semantics_digest=candidate.request_semantics_digest,
+        input_snapshot_digest=candidate.input_snapshot_digest,
+        policy_ref=sizing.policy_ref,
+        policy_snapshot_digest=sizing.policy_snapshot_digest,
+    )
+
+
+def _reactive_recovery_started(
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    truth: _ReactiveRecoveryStartTruth,
+) -> _ReactiveRecoveryStarted:
+    """构造 transaction-local reactive recovery started 摘要。
+
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param truth: 本 transaction 新增的 manifest/fact/start truths。
+    :returns: commit 后可 dispatch 的 typed 摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _ReactiveRecoveryStarted(
+        result=EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=(
+                accepted.result.events
+                + (truth.manifest, truth.budget_fact)
+                + truth.start_rows
             ),
-            pending_dispatch=pending_dispatch,
+            terminal_closeout=False,
+            terminal_notice=None,
+            reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+            transient_delta=None,
+            stop_worker_stream=True,
+        ),
+        pending_dispatch=truth.pending_dispatch,
+    )
+
+
+def _validate_reactive_recovery_outcome_event(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    source_attempt: AttemptRow,
+) -> None:
+    """校验 accepted compact 或真实 failed fallback 的 committed truth。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交的 reactive outcome 摘要。
+    :param source_attempt: 已终态 source Attempt。
+    :returns: ``None``。
+    :raises HostDurableError: outcome 缺失、类型或 identity 不匹配时抛出。
+    """
+
+    if accepted.compacted_event_id is None:
+        if accepted.compacted_event_sequence is not None:
+            raise HostDurableError(
+                "reactive fallback cannot carry compacted event sequence"
+            )
+        _reactive_failed_event_from_accepted(
+            transaction,
+            event_log_store,
+            accepted=accepted,
+            source_attempt=source_attempt,
         )
+        return
+    if accepted.compacted_event_sequence is None:
+        raise HostDurableError(
+            "reactive compacted event sequence is missing"
+        )
+    event = event_log_store.read_event_by_id(
+        transaction,
+        accepted.compacted_event_id,
+    )
+    if (
+        event is None
+        or event.event_type != CONTEXT_COMPACTED
+        or event.event_sequence != accepted.compacted_event_sequence
+        or event.run_id != accepted.run_id
+        or event.attempt_id != source_attempt.attempt_id
+        or event.execution_id != source_attempt.execution_id
+    ):
+        raise HostDurableError(
+            "reactive compacted outcome identity is invalid"
+        )
+
+
+def _reactive_failed_event_from_accepted(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    source_attempt: AttemptRow,
+) -> EventLogRow:
+    """读取 fallback recovery 唯一真实 ``CONTEXT_COMPACTION_FAILED``。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交 fallback recovery 摘要。
+    :param source_attempt: 已终态 source Attempt。
+    :returns: digest/identity 已验证的真实 failed event。
+    :raises HostDurableError: failed event 缺失、歧义或 identity 不匹配时抛出。
+    """
+
+    event_ids = tuple(
+        row.event_id
+        for row in accepted.result.events
+        if row.event_type == CONTEXT_COMPACTION_FAILED
+    )
+    if len(event_ids) != 1:
+        raise HostDurableError(
+            "reactive fallback requires one compaction failed event"
+        )
+    event = event_log_store.read_event_by_id(transaction, event_ids[0])
+    if (
+        event is None
+        or event.event_type != CONTEXT_COMPACTION_FAILED
+        or event.run_id != accepted.run_id
+        or event.attempt_id != source_attempt.attempt_id
+        or event.execution_id != source_attempt.execution_id
+    ):
+        raise HostDurableError(
+            "reactive compaction failed outcome identity is invalid"
+        )
+    return event
+
+
+def _close_reactive_fallback_hard_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    accepted: _ReactiveRecoveryAccepted,
+    run: RunRow,
+    source_attempt: AttemptRow,
+) -> _ReactiveRecoveryTerminal:
+    """以真实 failed fact 收口 dispatch-fallback hard pressure。
+
+    :param transaction: 当前 recovery-start transaction。
+    :param event_log_store: EventLog primitive。
+    :param accepted: 已提交 fallback recovery 摘要。
+    :param run: 当前 ``RECOVERING`` Run。
+    :param source_attempt: 已终态 source Attempt。
+    :returns: terminal closeout 摘要。
+    :raises _ReactiveRecoveryStartCasMissRollback: transition 前置条件竞争时抛出。
+    :raises HostDurableError: failed fact 或 durable row 非法时抛出。
+    """
+
+    failed_event = _reactive_failed_event_from_accepted(
+        transaction,
+        event_log_store,
+        accepted=accepted,
+        source_attempt=source_attempt,
+    )
+    run_failed_event_id = (
+        f"{failed_event.event_id}:dispatch-fallback-hard"
+    )
+    result = fail_recovering_run_in_transaction(
+        transaction,
+        event_log_store,
+        FailRecoveringRunInput(
+            run_id=run.run_id,
+            source_attempt_id=source_attempt.attempt_id,
+            run_failed_event_id=run_failed_event_id,
+            occurred_at=datetime.now(UTC),
+            actor=_EVENT_ACTOR,
+            source=_EVENT_SOURCE,
+            reason=_REASON_CONTEXT_COMPACTION_RECOVERY_FAILED,
+            error_code="context_hard_threshold_after_fallback",
+            message="Context estimate exceeds hard threshold after fallback",
+            context_compaction_failed_event_id=failed_event.event_id,
+        ),
+    )
+    if (
+        result.status is not StateMutationStatus.UPDATED
+        or result.run is None
+        or result.run_event is None
+    ):
+        raise _ReactiveRecoveryStartCasMissRollback()
+    return _ReactiveRecoveryTerminal(
+        result=EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=accepted.result.events + (result.run_event,),
+            terminal_closeout=True,
+            terminal_notice=project_terminal_notice_from_exact_run_event(
+                result.run,
+                result.run_event,
+                wake_queue_promotion=True,
+            ),
+            reason=_REASON_CONTEXT_COMPACTION_RECOVERY_FAILED,
+            transient_delta=None,
+            stop_worker_stream=True,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,6 +1416,14 @@ class _IngestValidatedOperation:
             self.candidate,
         )
         if context is None:
+            winner_duplicate = (
+                self.ingestor._reactive_recovery_winner_duplicate_result(
+                    transaction,
+                    self.candidate,
+                )
+            )
+            if winner_duplicate is not None:
+                return winner_duplicate
             return self.ingestor._append_rejected_diagnostic(
                 transaction,
                 candidate=self.candidate,
@@ -901,12 +1614,13 @@ class EngineEventIngestor:
 
     def _duplicate_engine_terminal_result(
         self, transaction: HostTransaction, context: _ValidatedCandidate
-    ) -> EngineIngestResult | None:
+    ) -> EngineIngestResult | _ReactiveRecoveryAccepted | None:
         """识别 Engine-origin terminal candidate 的完整重复写入。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
-        :returns: duplicate 结果；不是完整重复时返回 ``None``。
+        :returns: duplicate 结果、需继续启动的 reactive recovery 摘要；不是完整
+            重复时返回 ``None``。
         :raises HostDurableError: EventLog 读取失败时抛出。
         """
 
@@ -917,6 +1631,43 @@ class EngineEventIngestor:
         if len(existing) != len(event_ids):
             return None
         if context.candidate.engine_event.type == EngineEventType.CONTEXT_COMPACTION_REQUESTED:
+            if not _reactive_prefix_matches_candidate(
+                existing,
+                context.candidate,
+            ):
+                raise HostDurableError(
+                    "reactive compaction prefix identity is invalid"
+                )
+            outcome = self._matching_reactive_outcome_event(
+                transaction,
+                candidate=context.candidate,
+                request_event=existing[0],
+            )
+            if outcome is not None:
+                return _ReactiveRecoveryAccepted(
+                    result=EngineIngestResult(
+                        status=EngineIngestStatus.DUPLICATE,
+                        events=(*existing, outcome),
+                        terminal_closeout=False,
+                        terminal_notice=None,
+                        reason="duplicate_candidate",
+                        transient_delta=None,
+                        stop_worker_stream=True,
+                    ),
+                    run_id=context.run.run_id,
+                    session_id=context.run.session_id,
+                    source_attempt_id=context.attempt.attempt_id,
+                    compacted_event_id=(
+                        outcome.event_id
+                        if outcome.event_type == CONTEXT_COMPACTED
+                        else None
+                    ),
+                    compacted_event_sequence=(
+                        outcome.event_sequence
+                        if outcome.event_type == CONTEXT_COMPACTED
+                        else None
+                    ),
+                )
             return EngineIngestResult(
                 status=EngineIngestStatus.DUPLICATE,
                 events=existing,
@@ -943,6 +1694,174 @@ class EngineEventIngestor:
             reason="duplicate_candidate",
             transient_delta=None,
         )
+
+    def _reactive_recovery_winner_duplicate_result(
+        self,
+        transaction: HostTransaction,
+        candidate: EngineEventCandidate,
+    ) -> EngineIngestResult | None:
+        """识别同一 reactive candidate 已由 recovery winner 启动的重复输入。
+
+        该分支只接受 deterministic request/closeout/outcome、source Attempt 与
+        dispatch identity 全部匹配，且 Run 已切换到另一个真实 Attempt 的情形。
+        其它 stale candidate 仍由通用拒绝路径处理。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: durable current-attempt 校验未通过的 Engine candidate。
+        :returns: matching winner 的 duplicate 结果；不满足完整合取时返回
+            ``None``。
+        :raises HostDurableError: durable payload 无法严格读取或 outcome 歧义时抛出。
+        """
+
+        event_ids = _duplicate_terminal_event_ids(candidate)
+        if (
+            candidate.engine_event.type
+            is not EngineEventType.CONTEXT_COMPACTION_REQUESTED
+            or len(event_ids) != 3
+        ):
+            return None
+        existing = _existing_rows(
+            self._event_log_store,
+            transaction,
+            event_ids,
+        )
+        if len(existing) != len(event_ids):
+            return None
+        if not _reactive_prefix_matches_candidate(existing, candidate):
+            raise HostDurableError(
+                "reactive compaction prefix identity is invalid"
+            )
+        outcome = self._matching_reactive_outcome_event(
+            transaction,
+            candidate=candidate,
+            request_event=existing[0],
+        )
+        if outcome is None:
+            return None
+        envelope = candidate.envelope
+        run = read_run_by_id(transaction, envelope.run_id)
+        source_attempt = read_attempt_by_id(
+            transaction,
+            envelope.attempt_id,
+        )
+        source_dispatch = read_dispatch_record_by_attempt_id(
+            transaction,
+            envelope.attempt_id,
+        )
+        if (
+            run is None
+            or source_attempt is None
+            or source_dispatch is None
+            or run.session_id != envelope.session_id
+            or run.current_attempt_id == envelope.attempt_id
+            or source_attempt.run_id != envelope.run_id
+            or source_attempt.execution_id != envelope.execution_id
+            or not is_terminal_attempt_status(source_attempt.status)
+            or source_dispatch.dispatch_record_id
+            != envelope.dispatch_record_id
+            or source_dispatch.execution_id != envelope.execution_id
+            or run.current_attempt_id is None
+        ):
+            return None
+        winner_attempt = read_attempt_by_id(
+            transaction,
+            run.current_attempt_id,
+        )
+        if (
+            winner_attempt is None
+            or winner_attempt.run_id != run.run_id
+            or winner_attempt.attempt_id == source_attempt.attempt_id
+        ):
+            return None
+        return EngineIngestResult(
+            status=EngineIngestStatus.DUPLICATE,
+            events=(*existing, outcome),
+            terminal_closeout=False,
+            terminal_notice=None,
+            reason="duplicate_candidate",
+            transient_delta=None,
+            stop_worker_stream=True,
+        )
+
+    def _matching_reactive_outcome_event(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: EngineEventCandidate,
+        request_event: EventLogRow,
+    ) -> EventLogRow | None:
+        """读取与 deterministic reactive request 严格配对的唯一 outcome。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: 原始 context compaction candidate。
+        :param request_event: 已按 deterministic id 命中的 request fact。
+        :returns: 唯一 matching compacted/failed outcome；尚未产生时返回
+            ``None``。
+        :raises HostDurableError: request identity、outcome identity、operation
+            pairing 非法或两个 outcome 同时存在时抛出。
+        """
+
+        envelope = candidate.envelope
+        if (
+            candidate.engine_event.type
+            is not EngineEventType.CONTEXT_COMPACTION_REQUESTED
+            or request_event.event_type != CONTEXT_COMPACTION_REQUESTED
+            or request_event.session_id != envelope.session_id
+            or request_event.run_id != envelope.run_id
+            or request_event.attempt_id != envelope.attempt_id
+            or request_event.execution_id != envelope.execution_id
+        ):
+            raise HostDurableError(
+                "reactive compaction request identity is invalid"
+            )
+        outcome_ids = (
+            _event_id(
+                candidate,
+                EventClass.CANONICAL_FACT,
+                CONTEXT_COMPACTED,
+                3,
+            ),
+            _event_id(
+                candidate,
+                EventClass.CANONICAL_FACT,
+                CONTEXT_COMPACTION_FAILED,
+                3,
+            ),
+        )
+        outcomes = _existing_rows(
+            self._event_log_store,
+            transaction,
+            outcome_ids,
+        )
+        if len(outcomes) > 1:
+            raise HostDurableError(
+                "reactive compaction outcome is ambiguous"
+            )
+        if len(outcomes) == 0:
+            return None
+        outcome = next(iter(outcomes))
+        if (
+            outcome.session_id != envelope.session_id
+            or outcome.run_id != envelope.run_id
+            or outcome.attempt_id != envelope.attempt_id
+            or outcome.execution_id != envelope.execution_id
+        ):
+            raise HostDurableError(
+                "reactive compaction outcome identity is invalid"
+            )
+        payload = event_payload_object(
+            transaction,
+            outcome,
+            payload_label=outcome.event_type,
+        )
+        if (
+            payload.get(_PAYLOAD_FIELD_OPERATION_ID)
+            != request_event.event_id
+        ):
+            raise HostDurableError(
+                "reactive compaction outcome operation pairing is invalid"
+            )
+        return outcome
 
     def _duplicate_host_lifecycle_terminal_result(
         self,
@@ -2647,7 +3566,7 @@ class EngineEventIngestor:
 
         if accepted.compacted_event_sequence is not None:
             try:
-                catch_up_conversation_memory_projection(
+                catch_up = catch_up_conversation_memory_projection(
                     self._transaction_runner,
                     policy=self._memory_projection_policy,
                     batch_size=self._memory_projection_catchup_batch_size,
@@ -2665,12 +3584,40 @@ class EngineEventIngestor:
                     str(exc),
                     exc_info=True,
                 )
-        started = self._transaction_runner.run_write(
-            _StartReactiveRecoveryOperation(
-                event_log_store=self._event_log_store,
-                accepted=accepted,
+                return accepted.result
+            if catch_up.failures != 0 or not catch_up.target_reached:
+                _LOGGER.warning(
+                    "engine_ingest.reactive_recovery.memory_catch_up_incomplete "
+                    "session_id=%s run_id=%s compacted_event_sequence=%s "
+                    "finished_cursor=%s stop_reason=%s failures=%s",
+                    accepted.session_id,
+                    accepted.run_id,
+                    accepted.compacted_event_sequence,
+                    catch_up.finished_cursor,
+                    catch_up.stop_reason.value,
+                    catch_up.failures,
+                )
+                return accepted.result
+        context_budget_policy = self._context_budget_policy
+        if context_budget_policy is None:
+            raise HostDurableError(
+                "reactive recovery context budget policy is missing"
             )
-        )
+        try:
+            outcome = self._transaction_runner.run_write(
+                _StartReactiveRecoveryOperation(
+                    event_log_store=self._event_log_store,
+                    payload_store=self._payload_store,
+                    context_budget_policy=context_budget_policy,
+                    memory_projection_policy=self._memory_projection_policy,
+                    accepted=accepted,
+                )
+            )
+        except _ReactiveRecoveryStartCasMissRollback:
+            return accepted.result
+        if isinstance(outcome, _ReactiveRecoveryTerminal):
+            return outcome.result
+        started = outcome
         self._wakeup_port.wake_dispatch(started.pending_dispatch)
         return started.result
 
@@ -2948,14 +3895,20 @@ class EngineEventIngestor:
                     reason=_RUNNER_CALL_MANIFEST_REASON_MISSING,
                     stop_worker_stream=True,
                 )
-            manifest_event = self._append_limited_runner_call_manifest_event(
-                transaction,
-                context,
-                data,
-                runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
-                runner_call_trigger_reason=_RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE,
+            manifest_event, budget_fact = (
+                self._append_limited_runner_call_manifest_event(
+                    transaction,
+                    context,
+                    data,
+                    runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
+                    runner_call_trigger_reason=(
+                        _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE
+                    ),
+                )
             )
             rows.append(manifest_event)
+            if budget_fact is not None:
+                rows.append(budget_fact)
             resolution = _resolution_from_limited_manifest_event(
                 manifest_event,
                 data,
@@ -3010,7 +3963,7 @@ class EngineEventIngestor:
         *,
         runner_call_kind: str | None = None,
         runner_call_trigger_reason: str | None = None,
-    ) -> EventLogRow:
+    ) -> tuple[EventLogRow, EventLogRow | None]:
         """为 Engine-only runner continuation 写入 limited-signal manifest。
 
         :param transaction: 当前 Host transaction。
@@ -3020,7 +3973,7 @@ class EngineEventIngestor:
             按 Engine iteration signal 推导。
         :param runner_call_trigger_reason: Host 已判定的 trigger reason；为
             ``None`` 时按 Engine iteration signal 推导。
-        :returns: `RUNNER_CALL_INPUT_ASSEMBLED` canonical EventLog row。
+        :returns: manifest row与可用时紧随其后的canonical budget fact。
         :raises HostDurableError: payload descriptor 或 manifest 校验失败时抛出。
         """
 
@@ -3051,6 +4004,11 @@ class EngineEventIngestor:
                 projection=projection,
                 projection_digest=projection_digest,
             )
+        frozen_sources = _continuation_frozen_sources(
+            transaction,
+            self._event_log_store,
+            context=context,
+        )
         manifest = _limited_runner_call_manifest_body(
             context,
             data,
@@ -3059,6 +4017,7 @@ class EngineEventIngestor:
             runner_call_kind=runner_call_kind,
             runner_call_trigger_reason=runner_call_trigger_reason,
             projection_descriptor=projection_descriptor,
+            frozen_sources=frozen_sources,
         )
         manifest_digest = sha256_digest_json(manifest)
         descriptor = _write_runner_call_manifest_payload(
@@ -3068,7 +4027,7 @@ class EngineEventIngestor:
             manifest=manifest,
             manifest_digest=manifest_digest,
         )
-        return self._event_log_store.append_event(
+        manifest_event = self._event_log_store.append_event(
             transaction,
             _runner_call_manifest_event_request(
                 context=context,
@@ -3078,6 +4037,93 @@ class EngineEventIngestor:
                 manifest_digest=manifest_digest,
             ),
         ).row
+        typed_manifest = parse_runner_call_manifest(
+            manifest,
+            hot_payload=parse_runner_call_hot_payload(
+                _payload_object(manifest_event)
+            ),
+        )
+        sizing = typed_manifest.sizing_snapshot
+        if sizing.status is not RunnerCallSizingStatus.COMPLETE:
+            return (manifest_event, None)
+        if not isinstance(
+            frozen_sources,
+            _CompleteContinuationFrozenSources,
+        ):
+            raise AssertionError(
+                "complete continuation sizing requires complete frozen sources"
+            )
+        source_budget = frozen_sources.source_budget
+        projection = typed_manifest.projection_descriptor
+        if (
+            projection is None
+            or sizing.estimator_id is None
+            or sizing.estimator_version is None
+            or sizing.estimator_digest is None
+            or sizing.conservative_input_tokens is None
+            or sizing.context_window_size is None
+            or sizing.provider is None
+            or sizing.model is None
+            or sizing.request_semantics_digest is None
+            or sizing.input_snapshot_digest is None
+            or sizing.policy_ref is None
+            or sizing.policy_snapshot_digest is None
+        ):
+            raise HostDurableError(
+                "complete continuation manifest is missing budget atoms"
+            )
+        anchor_resolution = resolve_context_anchor(
+            transaction,
+            self._event_log_store,
+            ContextAnchorQuery(
+                session_id=context.run.session_id,
+                current_run_id=context.run.run_id,
+                candidate_input_cursor=manifest_event.event_sequence - 1,
+                candidate_input_digest=sizing.input_snapshot_digest,
+                provider=sizing.provider,
+                model=sizing.model,
+                context_window_size=sizing.context_window_size,
+                estimator_contract=ContextEstimatorContract(
+                    estimator_id=sizing.estimator_id,
+                    estimator_version=sizing.estimator_version,
+                ),
+                request_semantics_digest=(
+                    sizing.request_semantics_digest
+                ),
+            ),
+        )
+        result = build_context_sizing_result_from_atoms(
+            stage=ContextSizingStage.CONTINUATION,
+            candidate_input_cursor=manifest_event.event_sequence,
+            candidate_input_projection_ref=projection.payload_ref,
+            candidate_input_digest=sizing.input_snapshot_digest,
+            estimator_contract=ContextEstimatorContract(
+                estimator_id=sizing.estimator_id,
+                estimator_version=sizing.estimator_version,
+            ),
+            estimator_digest=sizing.estimator_digest,
+            conservative_input_tokens=sizing.conservative_input_tokens,
+            context_window_size=sizing.context_window_size,
+            soft_threshold_tokens=source_budget.soft_threshold_tokens,
+            hard_threshold_tokens=source_budget.hard_threshold_tokens,
+            policy_ref=sizing.policy_ref,
+            policy_snapshot_digest=sizing.policy_snapshot_digest,
+            anchor_resolution=anchor_resolution,
+            fallback_reason=None,
+        )
+        return (
+            manifest_event,
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                self._event_log_store,
+                session_id=context.run.session_id,
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                execution_id=context.attempt.execution_id,
+                occurred_at=context.candidate.engine_event.occurred_at,
+                result=result,
+            ),
+        )
 
     def _append_runner_call_iteration_link_event(
         self,
@@ -3134,11 +4180,16 @@ class EngineEventIngestor:
         """
 
         candidate = context.candidate
-        estimate = self._estimate_usage_observation_input(transaction, context)
+        pairing = _usage_manifest_pairing(
+            transaction,
+            self._event_log_store,
+            context=context,
+            iteration_id=data.iteration_id,
+        )
         diagnostic = self._usage_observation_diagnostic(
             context=context,
             data=data,
-            estimate=estimate,
+            pairing=pairing,
         )
         return self._event_log_store.append_event(
             transaction,
@@ -3171,7 +4222,12 @@ class EngineEventIngestor:
                     "context_pressure": _usage_context_pressure_signal(
                         data=data,
                         diagnostic=diagnostic,
-                        estimate=estimate,
+                    ),
+                    "runner_call_pairing": _usage_pairing_payload(
+                        pairing,
+                        observation_digest=(
+                            diagnostic.observation_digest
+                        ),
                     ),
                 },
                 reason=None,
@@ -3183,26 +4239,22 @@ class EngineEventIngestor:
         *,
         context: _ValidatedCandidate,
         data: UsageReportedData,
-        estimate: BudgetEstimate | None,
+        pairing: _UsageManifestPairing,
     ) -> UsageObservationDiagnostic:
         """构造 usage observation diagnostic，失败时降级为估算不可用。
 
         :param context: 已校验 candidate 上下文。
         :param data: usage_reported data。
-        :param estimate: 当前 Run 输入估算；不可用时为 ``None``。
+        :param pairing: exact linked manifest pairing。
         :returns: usage observation diagnostic。
         """
 
-        policy_ref = (
-            self._context_budget_policy.policy_ref
-            if self._context_budget_policy is not None
-            else _NO_CONTEXT_BUDGET_POLICY_REF
-        )
-        estimator_digest = estimate.estimator_digest if estimate is not None else None
-        estimated_input_tokens = estimate.estimated_input_tokens if estimate is not None else None
+        policy_ref = pairing.policy_ref or _NO_CONTEXT_BUDGET_POLICY_REF
+        estimator_digest = pairing.estimator_digest
+        estimated_input_tokens = pairing.conservative_input_tokens
         status = (
             USAGE_OBSERVATION_STATUS_OBSERVED
-            if estimate is not None
+            if pairing.status is _UsagePairingStatus.COMPLETE
             else USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE
         )
         try:
@@ -3248,55 +4300,6 @@ class EngineEventIngestor:
                 prompt_token_delta=None,
                 status=_USAGE_OBSERVATION_STATUS_USAGE_INVALID,
             )
-
-    def _estimate_usage_observation_input(
-        self, transaction: HostTransaction, context: _ValidatedCandidate
-    ) -> BudgetEstimate | None:
-        """为 usage observation 尝试重建当前 Run 输入估算。
-
-        :param transaction: 当前 Host transaction。
-        :param context: 已校验 candidate 上下文。
-        :returns: 估算结果；policy、input event 或 payload 不可用时返回
-            ``None``。
-        """
-
-        policy = self._context_budget_policy
-        if policy is None:
-            return None
-        input_event = self._event_log_store.read_event_by_id(
-            transaction, context.run.input_event_id
-        )
-        if input_event is None:
-            return None
-        try:
-            display_text = _display_text_from_input_event(transaction, input_event)
-            return estimate_context_budget(
-                policy,
-                BudgetEstimateInput(
-                    session_id=context.run.session_id,
-                    run_id=context.run.run_id,
-                    message_fragments=(
-                        BudgetTextFragment(
-                            fragment_ref=context.run.input_event_id,
-                            text=display_text,
-                        ),
-                    ),
-                    current_prompt_ref=context.run.input_event_id,
-                ),
-            )
-        except (HostDurableError, TypeError, ValueError):
-            _LOGGER.debug(
-                (
-                    "host.engine_ingest.usage_observation_estimate_unavailable "
-                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s"
-                ),
-                context.run.session_id,
-                context.run.run_id,
-                context.attempt.attempt_id,
-                context.attempt.execution_id,
-                exc_info=True,
-            )
-            return None
 
     def _append_provider_protocol_error(
         self,
@@ -4704,29 +5707,18 @@ def _usage_context_pressure_signal(
     *,
     data: UsageReportedData,
     diagnostic: UsageObservationDiagnostic,
-    estimate: BudgetEstimate | None,
 ) -> Mapping[str, JsonValue]:
     """构造 usage projection 的 context pressure signal。
 
-    本函数只序列化 Host budget owner 已产出的 ``BudgetEstimate`` 与
-    ``decide_context_budget`` 结果，不重新实现阈值计算。
+    本函数只序列化 exact linked manifest 已冻结的 conservative estimate。
+    manifest v2未冻结soft/hard threshold，因此usage diagnostic不得读取当前
+    local policy补算decision。
 
     :param data: Engine usage reported data。
     :param diagnostic: usage observation diagnostic。
-    :param estimate: Host context budget estimate；不可用时为 ``None``。
     :returns: 可写入 projection signal payload 的 JSON object。
     """
 
-    budget_decision = (
-        decide_context_budget(estimate).value
-        if estimate is not None
-        else _CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN
-    )
-    overage_reason = (
-        estimate.overage_reason.value
-        if estimate is not None and estimate.overage_reason is not None
-        else None
-    )
     return {
         "schema_version": _CONTEXT_PRESSURE_SCHEMA_VERSION,
         "signal_source": _CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED,
@@ -4734,27 +5726,13 @@ def _usage_context_pressure_signal(
         "policy_ref": diagnostic.policy_ref,
         "estimator_digest": diagnostic.estimator_digest,
         "estimated_input_tokens": diagnostic.estimated_input_tokens,
-        "input_budget_tokens": (
-            estimate.input_budget_tokens if estimate is not None else None
-        ),
-        "soft_threshold_tokens": (
-            estimate.soft_threshold_tokens if estimate is not None else None
-        ),
-        "hard_threshold_tokens": (
-            estimate.hard_threshold_tokens if estimate is not None else None
-        ),
-        "soft_threshold_exceeded": (
-            estimate.estimated_input_tokens >= estimate.soft_threshold_tokens
-            if estimate is not None
-            else None
-        ),
-        "hard_threshold_exceeded": (
-            estimate.estimated_input_tokens >= estimate.hard_threshold_tokens
-            if estimate is not None
-            else None
-        ),
-        "budget_decision": budget_decision,
-        "overage_reason": overage_reason,
+        "input_budget_tokens": None,
+        "soft_threshold_tokens": None,
+        "hard_threshold_tokens": None,
+        "soft_threshold_exceeded": None,
+        "hard_threshold_exceeded": None,
+        "budget_decision": _CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN,
+        "overage_reason": None,
         "prompt_tokens": data.prompt_tokens,
         "completion_tokens": data.completion_tokens,
         "total_tokens": data.total_tokens,
@@ -4939,6 +5917,35 @@ def _duplicate_terminal_event_ids(
             ),
         )
     return ()
+
+
+def _reactive_prefix_matches_candidate(
+    rows: tuple[EventLogRow, ...],
+    candidate: EngineEventCandidate,
+) -> bool:
+    """判断 request/Attempt closeout/Run recovering 是否与 source 完全同源。
+
+    :param rows: 按 deterministic ids 读取的 reactive 前缀 rows。
+    :param candidate: 原始 context compaction candidate。
+    :returns: 三条 row 的类型与全部 durable identity 都匹配时返回 ``True``。
+    """
+
+    if len(rows) != 3:
+        return False
+    expected_types = (
+        CONTEXT_COMPACTION_REQUESTED,
+        _closeout_attempt_event_type(AttemptStatus.FAILED),
+        _EVENT_TYPE_RUN_RECOVERING,
+    )
+    envelope = candidate.envelope
+    return all(
+        row.event_type == expected_type
+        and row.session_id == envelope.session_id
+        and row.run_id == envelope.run_id
+        and row.attempt_id == envelope.attempt_id
+        and row.execution_id == envelope.execution_id
+        for row, expected_type in zip(rows, expected_types, strict=True)
+    )
 
 
 def _engine_event_ref(candidate: EngineEventCandidate) -> str:
@@ -5571,6 +6578,359 @@ def _observed_message_content_text(
     return message.content
 
 
+def _continuation_frozen_sources(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    context: _ValidatedCandidate,
+) -> _ContinuationFrozenSources:
+    """读取同一Attempt首个pre-start manifest冻结的三项非projection source。
+
+    :param transaction: 当前 iteration ingest transaction。
+    :param event_log_store: EventLog primitive。
+    :param context: exact Attempt identity。
+    :returns: complete sources或按tool→policy→request首缺失原因。
+    :raises HostDurableError: SQLite查询失败时传播。
+    """
+
+    try:
+        source = load_prepared_runner_call_source_in_transaction(
+            transaction,
+            event_log_store,
+            run_id=context.run.run_id,
+            attempt_id=context.attempt.attempt_id,
+            execution_id=context.attempt.execution_id,
+        )
+    except PreparedRunnerCallSourceError as exc:
+        return _unavailable_continuation_sources(
+            _continuation_reason_from_source_failure(exc.category)
+        )
+    first_manifest = source.manifest
+    tool_refs = first_manifest.source_refs.tool_schema_snapshot_refs
+    try:
+        tool_fragments = _continuation_tool_schema_fragments(
+            transaction,
+            tool_refs,
+        )
+    except HostDurableError:
+        return _unavailable_continuation_sources(
+            RunnerCallSizingUnavailableReason.CONTINUATION_TOOL_SCHEMA_UNAVAILABLE,
+            tool_schema_snapshot_refs=tool_refs,
+        )
+    sizing = first_manifest.sizing_snapshot
+    if (
+        sizing.status is not RunnerCallSizingStatus.COMPLETE
+        or sizing.context_window_size is None
+        or sizing.policy_ref is None
+        or sizing.policy_snapshot_digest is None
+    ):
+        return _unavailable_continuation_sources(
+            RunnerCallSizingUnavailableReason.CONTINUATION_POLICY_UNAVAILABLE,
+            tool_schema_snapshot_refs=tool_refs,
+            tool_schema_fragments=tool_fragments,
+        )
+    if (
+        sizing.provider is None
+        or sizing.model is None
+        or sizing.request_semantics_digest is None
+        or sizing.estimator_id is None
+        or sizing.estimator_version is None
+        or sizing.estimator_digest is None
+        or sizing.conservative_input_tokens is None
+        or sizing.input_snapshot_digest is None
+        or sizing.sizing_stage is None
+        or sizing.estimator_id
+        != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+        or sizing.estimator_version
+        != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+    ):
+        return _unavailable_continuation_sources(
+            RunnerCallSizingUnavailableReason.CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE,
+            tool_schema_snapshot_refs=tool_refs,
+            tool_schema_fragments=tool_fragments,
+        )
+    try:
+        source_budget = load_matching_context_budget_evaluation_in_transaction(
+            transaction,
+            event_log_store,
+            session_id=context.run.session_id,
+            attempt_id=context.attempt.attempt_id,
+            execution_id=context.attempt.execution_id,
+            identity=ContextBudgetEvaluationIdentity(
+                run_id=context.run.run_id,
+                candidate_input_cursor=(
+                    source.manifest_event.event_sequence
+                    if sizing.sizing_stage is ContextSizingStage.CONTINUATION
+                    else source.candidate.candidate_input_cursor
+                ),
+                candidate_input_digest=source.candidate.input_snapshot_digest,
+                sizing_stage=sizing.sizing_stage,
+                policy_snapshot_digest=sizing.policy_snapshot_digest,
+                estimator_id=sizing.estimator_id,
+                estimator_version=sizing.estimator_version,
+            ),
+            candidate_input_projection_ref=(
+                source.candidate.candidate_input_projection_ref
+            ),
+            estimator_digest=sizing.estimator_digest,
+            conservative_input_tokens=sizing.conservative_input_tokens,
+            context_window_size=sizing.context_window_size,
+            policy_ref=sizing.policy_ref,
+        )
+    except HostDurableError:
+        return _unavailable_continuation_sources(
+            RunnerCallSizingUnavailableReason.CONTINUATION_POLICY_UNAVAILABLE,
+            tool_schema_snapshot_refs=tool_refs,
+            tool_schema_fragments=tool_fragments,
+        )
+    return _CompleteContinuationFrozenSources(
+        tool_schema_snapshot_refs=tool_refs,
+        tool_schema_fragments=tool_fragments,
+        context_window_size=sizing.context_window_size,
+        provider=sizing.provider,
+        model=sizing.model,
+        request_semantics_digest=sizing.request_semantics_digest,
+        estimator_id=sizing.estimator_id,
+        estimator_version=sizing.estimator_version,
+        policy_ref=sizing.policy_ref,
+        policy_snapshot_digest=sizing.policy_snapshot_digest,
+        source_budget=source_budget,
+    )
+
+
+def _continuation_reason_from_source_failure(
+    category: PreparedRunnerCallSourceFailureCategory,
+) -> RunnerCallSizingUnavailableReason:
+    """把 strict RunInput source category 投影为 continuation closed reason。
+
+    :param category: RunInput strict owner 产生的 typed failure category。
+    :returns: 对应 continuation sizing unavailable reason。
+    :raises AssertionError: category 超出闭集时 fail closed。
+    """
+
+    if category is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA:
+        return (
+            RunnerCallSizingUnavailableReason.CONTINUATION_TOOL_SCHEMA_UNAVAILABLE
+        )
+    if category is PreparedRunnerCallSourceFailureCategory.POLICY:
+        return RunnerCallSizingUnavailableReason.CONTINUATION_POLICY_UNAVAILABLE
+    if category is PreparedRunnerCallSourceFailureCategory.REQUEST_SEMANTICS:
+        return (
+            RunnerCallSizingUnavailableReason.CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE
+        )
+    raise AssertionError("unsupported prepared runner-call source failure category")
+
+
+def _unavailable_continuation_sources(
+    reason: RunnerCallSizingUnavailableReason,
+    *,
+    tool_schema_snapshot_refs: tuple[str, ...] = (),
+    tool_schema_fragments: tuple[BudgetJsonFragment, ...] = (),
+) -> _UnavailableContinuationFrozenSources:
+    """构造closed unavailable continuation sources。
+
+    :param reason: 首个不可用source原因。
+    :param tool_schema_snapshot_refs: 已验证前可保留的refs。
+    :param tool_schema_fragments: 已验证schema atoms。
+    :returns: unavailable source snapshot。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _UnavailableContinuationFrozenSources(
+        unavailable_reason=reason,
+        tool_schema_snapshot_refs=tool_schema_snapshot_refs,
+        tool_schema_fragments=tool_schema_fragments,
+    )
+
+
+def _continuation_tool_schema_fragments(
+    transaction: HostTransaction,
+    refs: tuple[str, ...],
+) -> tuple[BudgetJsonFragment, ...]:
+    """从pre-start selected-schema descriptor读取exact estimator atoms。
+
+    :param transaction: 当前 ingest transaction。
+    :param refs: strict manifest schema refs；空表示frozen no-tool集合。
+    :returns: ordered tool schema JSON fragments。
+    :raises HostDurableError: ref、digest或payload shape非法时抛出。
+    """
+
+    if not refs:
+        return ()
+    payload_ref = _manifest_prefixed_ref(
+        refs,
+        prefix="tool_schema_snapshot_ref:",
+    )
+    payload_digest = _manifest_prefixed_ref(
+        refs,
+        prefix="tool_schema_snapshot_digest:",
+    )
+    payload = sqlite_payload_object(
+        transaction,
+        payload_ref=payload_ref,
+        payload_digest=payload_digest,
+        payload_label="continuation selected tool schema",
+    )
+    schemas = payload.get("tool_schemas")
+    if not isinstance(schemas, list):
+        raise HostDurableError(
+            "continuation selected tool schemas must be array"
+        )
+    fragments: list[BudgetJsonFragment] = []
+    for index, item in enumerate(schemas):
+        if not isinstance(item, Mapping):
+            raise HostDurableError(
+                "continuation selected tool schema must be object"
+            )
+        fragments.append(
+            BudgetJsonFragment(
+                fragment_ref=f"continuation-tool-schema:{index}",
+                value=cast(Mapping[str, JsonValue], item),
+            )
+        )
+    return tuple(fragments)
+
+
+def _manifest_prefixed_ref(
+    refs: tuple[str, ...],
+    *,
+    prefix: str,
+) -> str:
+    """读取manifest ref闭集中唯一prefix value。
+
+    :param refs: ref strings。
+    :param prefix: required prefix。
+    :returns: 去前缀非空值。
+    :raises HostDurableError: 缺失、重复或空值时抛出。
+    """
+
+    values = tuple(ref.removeprefix(prefix) for ref in refs if ref.startswith(prefix))
+    if len(values) != 1 or values[0].strip() == "":
+        raise HostDurableError("continuation frozen source ref is invalid")
+    return values[0]
+
+
+def _continuation_sizing_snapshot(
+    context: _ValidatedCandidate,
+    data: IterationStartedData,
+    *,
+    projection_descriptor: PayloadDescriptor | None,
+    input_projection_digest: str,
+    frozen_sources: _ContinuationFrozenSources,
+) -> RunnerCallSizingSnapshot:
+    """构造continuation strict complete/unavailable sizing snapshot。
+
+    :param context: exact Attempt context。
+    :param data: accepted Engine input projection。
+    :param projection_descriptor: 同transaction写入的projection descriptor。
+    :param input_projection_digest: 当前manifest projection digest。
+    :param frozen_sources: pre-start frozen sources。
+    :returns: strict runner-call sizing snapshot。
+    :raises ValueError: estimator输入非法时抛出。
+    """
+
+    if projection_descriptor is None:
+        return unavailable_runner_call_sizing_snapshot(
+            RunnerCallSizingUnavailableReason.CONTINUATION_PROJECTION_UNAVAILABLE,
+            sizing_stage=ContextSizingStage.CONTINUATION,
+        )
+    if isinstance(frozen_sources, _UnavailableContinuationFrozenSources):
+        return unavailable_runner_call_sizing_snapshot(
+            frozen_sources.unavailable_reason,
+            sizing_stage=ContextSizingStage.CONTINUATION,
+        )
+    message_fragments = tuple(
+        BudgetTextFragment(
+            fragment_ref=f"continuation-message:{message.index}:{message.role}",
+            text=_observed_message_content_text(message),
+        )
+        for message in data.input_projection
+    )
+    structured_fragments = tuple(
+        BudgetJsonFragment(
+            fragment_ref=f"continuation-message-structured:{message.index}",
+            value=_continuation_message_structured_atom(message),
+        )
+        for message in data.input_projection
+        if _continuation_message_has_structured_atom(message)
+    )
+    input_snapshot_digest = sha256_digest_json(
+        {
+            "projection_digest": input_projection_digest,
+            "tool_schema_snapshot_refs": list(
+                frozen_sources.tool_schema_snapshot_refs
+            ),
+            "policy_snapshot_digest": (
+                frozen_sources.policy_snapshot_digest
+            ),
+            "request_semantics_digest": (
+                frozen_sources.request_semantics_digest
+            ),
+        }
+    )
+    tokens, estimator_digest = estimate_context_input(
+        BudgetEstimateInput(
+            session_id=context.run.session_id,
+            run_id=context.run.run_id,
+            message_fragments=message_fragments,
+            json_fragments=structured_fragments,
+            tool_schema_fragments=frozen_sources.tool_schema_fragments,
+            input_snapshot_digest=input_snapshot_digest,
+        )
+    )
+    return complete_runner_call_sizing_snapshot(
+        sizing_stage=ContextSizingStage.CONTINUATION,
+        estimator_id=frozen_sources.estimator_id,
+        estimator_version=frozen_sources.estimator_version,
+        estimator_digest=estimator_digest,
+        conservative_input_tokens=tokens,
+        context_window_size=frozen_sources.context_window_size,
+        provider=frozen_sources.provider,
+        model=frozen_sources.model,
+        request_semantics_digest=frozen_sources.request_semantics_digest,
+        input_snapshot_digest=input_snapshot_digest,
+        policy_ref=frozen_sources.policy_ref,
+        policy_snapshot_digest=frozen_sources.policy_snapshot_digest,
+    )
+
+
+def _continuation_message_has_structured_atom(
+    message: RunnerInputMessageProjection,
+) -> bool:
+    """判断observed message是否存在正文外structured atom。
+
+    :param message: Engine observed message。
+    :returns: tool identity/calls存在时返回``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return message.tool_call_id is not None or bool(message.tool_calls)
+
+
+def _continuation_message_structured_atom(
+    message: RunnerInputMessageProjection,
+) -> Mapping[str, JsonValue]:
+    """投影continuation message正文外的provider-neutral atom。
+
+    :param message: Engine observed message。
+    :returns: canonical structured atom。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "role": message.role,
+        "tool_call_id": message.tool_call_id,
+        "tool_calls": [
+            {
+                "id": call.tool_call_id,
+                "name": call.name,
+                "arguments": dict(call.arguments),
+            }
+            for call in message.tool_calls
+        ],
+    }
+
+
 def _limited_runner_call_manifest_body(
     context: _ValidatedCandidate,
     data: IterationStartedData,
@@ -5580,6 +6940,7 @@ def _limited_runner_call_manifest_body(
     runner_call_kind: str | None,
     runner_call_trigger_reason: str | None,
     projection_descriptor: PayloadDescriptor | None,
+    frozen_sources: _ContinuationFrozenSources,
 ) -> Mapping[str, JsonValue]:
     """构造 Engine continuation 的 limited-signal manifest body。
 
@@ -5591,6 +6952,7 @@ def _limited_runner_call_manifest_body(
         按 Engine iteration signal 推导。
     :param runner_call_trigger_reason: Host 已判定的 trigger reason；为
         ``None`` 时按 Engine iteration signal 推导。
+    :param frozen_sources: pre-start manifest冻结的schema/policy/request sources。
     :returns: limited-signal manifest body。
     """
 
@@ -5647,6 +7009,13 @@ def _limited_runner_call_manifest_body(
             }
         )
     )
+    sizing_snapshot = _continuation_sizing_snapshot(
+        context,
+        data,
+        projection_descriptor=projection_descriptor,
+        input_projection_digest=input_projection_digest,
+        frozen_sources=frozen_sources,
+    )
     return {
         "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
         "manifest_id": manifest_id,
@@ -5690,7 +7059,9 @@ def _limited_runner_call_manifest_body(
         ),
         "message_entries": list(message_entries),
         "source_cursor_refs": list(_limited_runner_call_source_refs(context)),
-        "tool_schema_snapshot_refs": [],
+        "tool_schema_snapshot_refs": list(
+            frozen_sources.tool_schema_snapshot_refs
+        ),
         "memory_snapshot_cursor_ref": None,
         "compact_artifact_refs": [],
         "context_fallback_decision_ref": None,
@@ -5698,6 +7069,9 @@ def _limited_runner_call_manifest_body(
             _limited_runner_call_projector_metadata(context, data)
         ],
         "compactor_identity": None,
+        "sizing_snapshot": runner_call_sizing_snapshot_json(
+            sizing_snapshot
+        ),
         "diagnostic": diagnostic,
     }
 
@@ -6218,6 +7592,207 @@ def _find_runner_call_iteration_link_event(
         if _optional_payload_text(payload, field_name="iteration_id") == iteration_id:
             return event
     return None
+
+
+def _usage_manifest_pairing(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    context: _ValidatedCandidate,
+    iteration_id: str,
+) -> _UsageManifestPairing:
+    """把 actual usage只配对到exact accepted iteration link与strict manifest。
+
+    :param transaction: 当前 usage ingest transaction。
+    :param event_log_store: EventLog primitive。
+    :param context: 已校验 Attempt identity。
+    :param iteration_id: exact Engine iteration id。
+    :returns: complete 或 closed unavailable pairing。
+    :raises HostDurableError: durable descriptor integrity损坏时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND attempt_id = ?
+          AND execution_id = ?
+          AND event_type = ?
+        ORDER BY event_sequence ASC
+        """,
+        (
+            context.run.run_id,
+            context.attempt.attempt_id,
+            context.attempt.execution_id,
+            _EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED,
+        ),
+    )
+    matching: list[EventLogRow] = []
+    for row in rows:
+        event_id = row.get("event_id")
+        if not isinstance(event_id, str):
+            raise HostDurableError(
+                "runner-call usage link event id is invalid"
+            )
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError(
+                "runner-call usage link event row is missing"
+            )
+        payload = _payload_object(event)
+        if (
+            _optional_payload_text(payload, field_name="iteration_id")
+            == iteration_id
+        ):
+            matching.append(event)
+    if not matching:
+        return _unavailable_usage_manifest_pairing(
+            _UsagePairingReason.ITERATION_LINK_MISSING
+        )
+    if len(matching) != 1:
+        return _unavailable_usage_manifest_pairing(
+            _UsagePairingReason.ITERATION_LINK_INVALID
+        )
+    link_event = matching[0]
+    link = _payload_object(link_event)
+    if (
+        _manifest_text(link, "validation_status")
+        != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+    ):
+        return _unavailable_usage_manifest_pairing(
+            _UsagePairingReason.ITERATION_LINK_INVALID,
+            iteration_link_event_id=link_event.event_id,
+        )
+    manifest_event_id = _manifest_text(link, "manifest_event_id")
+    manifest_ref = _manifest_text(link, "manifest_payload_ref")
+    manifest_digest = _manifest_text(link, "manifest_digest")
+    manifest_event = event_log_store.read_event_by_id(
+        transaction,
+        manifest_event_id,
+    )
+    if (
+        manifest_event is None
+        or manifest_event.payload_ref != manifest_ref
+        or manifest_event.payload_digest != manifest_digest
+    ):
+        return _unavailable_usage_manifest_pairing(
+            _UsagePairingReason.MANIFEST_INCOMPLETE,
+            manifest_event_id=manifest_event_id,
+            manifest_payload_ref=manifest_ref,
+            manifest_digest=manifest_digest,
+            iteration_link_event_id=link_event.event_id,
+        )
+    hot = parse_runner_call_hot_payload(_payload_object(manifest_event))
+    if (
+        hot.manifest_payload_ref != manifest_ref
+        or hot.manifest_digest != manifest_digest
+    ):
+        return _unavailable_usage_manifest_pairing(
+            _UsagePairingReason.MANIFEST_INCOMPLETE,
+            manifest_event_id=manifest_event_id,
+            manifest_payload_ref=manifest_ref,
+            manifest_digest=manifest_digest,
+            iteration_link_event_id=link_event.event_id,
+        )
+    manifest_json = sqlite_payload_object(
+        transaction,
+        payload_ref=manifest_ref,
+        payload_digest=manifest_digest,
+        payload_label="usage-linked runner-call manifest",
+    )
+    manifest = parse_runner_call_manifest(
+        manifest_json,
+        hot_payload=hot,
+    )
+    sizing = manifest.sizing_snapshot
+    if (
+        manifest.identity.runner_call_kind
+        not in _USAGE_PAIRING_ELIGIBLE_RUNNER_CALL_KINDS
+        or manifest.compactor_identity is not None
+        or sizing.status is not RunnerCallSizingStatus.COMPLETE
+        or sizing.input_snapshot_digest is None
+        or sizing.estimator_digest is None
+        or sizing.conservative_input_tokens is None
+        or sizing.policy_ref is None
+    ):
+        return _unavailable_usage_manifest_pairing(
+            _UsagePairingReason.MANIFEST_INCOMPLETE,
+            manifest_event_id=manifest_event_id,
+            manifest_payload_ref=manifest_ref,
+            manifest_digest=manifest_digest,
+            iteration_link_event_id=link_event.event_id,
+        )
+    return _UsageManifestPairing(
+        status=_UsagePairingStatus.COMPLETE,
+        reason=None,
+        manifest_event_id=manifest_event_id,
+        manifest_payload_ref=manifest_ref,
+        manifest_digest=manifest_digest,
+        iteration_link_event_id=link_event.event_id,
+        input_snapshot_digest=sizing.input_snapshot_digest,
+        estimator_digest=sizing.estimator_digest,
+        conservative_input_tokens=sizing.conservative_input_tokens,
+        policy_ref=sizing.policy_ref,
+    )
+
+
+def _unavailable_usage_manifest_pairing(
+    reason: _UsagePairingReason,
+    *,
+    manifest_event_id: str | None = None,
+    manifest_payload_ref: str | None = None,
+    manifest_digest: str | None = None,
+    iteration_link_event_id: str | None = None,
+) -> _UsageManifestPairing:
+    """构造closed unavailable usage pairing。
+
+    :param reason: closed unavailable reason。
+    :param manifest_event_id: 可证明的manifest event id。
+    :param manifest_payload_ref: 可证明的manifest ref。
+    :param manifest_digest: 可证明的manifest digest。
+    :param iteration_link_event_id: 可证明的link event id。
+    :returns: unavailable pairing。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _UsageManifestPairing(
+        status=_UsagePairingStatus.UNAVAILABLE,
+        reason=reason,
+        manifest_event_id=manifest_event_id,
+        manifest_payload_ref=manifest_payload_ref,
+        manifest_digest=manifest_digest,
+        iteration_link_event_id=iteration_link_event_id,
+        input_snapshot_digest=None,
+        estimator_digest=None,
+        conservative_input_tokens=None,
+        policy_ref=None,
+    )
+
+
+def _usage_pairing_payload(
+    pairing: _UsageManifestPairing,
+    *,
+    observation_digest: str,
+) -> Mapping[str, JsonValue]:
+    """把 typed pairing投影为USAGE_REPORTED nested durable object。
+
+    :param pairing: typed pairing。
+    :param observation_digest: 本条 normalized usage observation digest。
+    :returns: strict nested pairing JSON。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "status": pairing.status.value,
+        "reason": pairing.reason.value if pairing.reason is not None else None,
+        "manifest_event_id": pairing.manifest_event_id,
+        "manifest_payload_ref": pairing.manifest_payload_ref,
+        "manifest_digest": pairing.manifest_digest,
+        "iteration_link_event_id": pairing.iteration_link_event_id,
+        "input_snapshot_digest": pairing.input_snapshot_digest,
+        "observation_digest": observation_digest,
+    }
 
 
 def _find_unlinked_prepared_runner_call_manifest_events(

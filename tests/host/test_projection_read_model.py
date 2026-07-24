@@ -32,7 +32,7 @@ from dayu.host import (
 from dayu.host.api import HostInput
 from dayu.host.admission import create_host_admission_service
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
-from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.command import HostCommandHandle, start_run
 from dayu.host.dispatch import ActiveWorkerRegistry
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -46,6 +46,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
@@ -67,6 +68,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.projection import (
     ProjectionConsumerId,
     ProjectionEventView,
@@ -81,6 +83,7 @@ from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
 )
+from tests.host.execution_handle_support import create_execution_command_handle
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -166,8 +169,19 @@ def _host_with_ordinary_baseline(tmp_path: Path) -> HostCommandHandle:
             admission_service=create_host_admission_service(
                 durable_store.transaction_runner,
                 terminal_post_commit_port=terminal_post_commit_port,
+                payload_store=PayloadStore(),
+                event_log_store=None,
+                idempotency_store=None,
+                clock=None,
+                id_factory=None,
+                wakeup_port=None,
+                projection_catchup_port=None,
                 ordinary_run_baseline=_ordinary_run_baseline(),
                 tooling_options=None,
+                context_budget_policy=None,
+                memory_projection_policy=default_memory_projection_policy(),
+                enable_truncation_manager=False,
+                owner_host_instance_id="host-projection-read-model",
             ),
             active_registry=ActiveWorkerRegistry(),
             terminal_post_commit_port=terminal_post_commit_port,
@@ -211,6 +225,26 @@ def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
             fallback_prompt="test fallback prompt",
             continuation_prompt="test continuation prompt",
         ),
+    )
+
+
+def _create_execution_handle(
+    options: HostCommandHandleOptions,
+) -> HostCommandHandle:
+    """创建与本文件 projection baseline 同源的 execution handle。
+
+    :param options: durable command options。
+    :returns: 显式装配 execution truth 的 command handle。
+    :raises HostApiError: durable store 或 admission 装配失败时抛出。
+    """
+
+    return create_execution_command_handle(
+        options,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        memory_projection_policy=default_memory_projection_policy(),
+        tooling_options=None,
+        context_budget_policy=None,
+        enable_truncation_manager=False,
     )
 
 
@@ -590,7 +624,7 @@ def _assert_invalid_display_text_fails_without_timeline_item(
     :raises AssertionError: projection failure、checkpoint 或 timeline 断言失败时抛出。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         transaction_runner = host._transaction_runner()
@@ -639,7 +673,7 @@ def test_terminal_event_projects_run_result_and_duplicate_replay_is_noop(
 ) -> None:
     """terminal fact 生成 RunResult；重复 replay 不插入重复行。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start"))
@@ -691,7 +725,7 @@ def test_terminal_event_mapping_covers_current_run_terminal_statuses(
         ("RUN_CANCELLED", RunStatus.CANCELLED),
         ("RUN_LOST", RunStatus.LOST),
     )
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         transaction_runner = host._transaction_runner()
@@ -758,7 +792,7 @@ def test_read_model_python_validation_rejects_unknown_terminal_status(
 ) -> None:
     """RunResult Python validation 对未知 terminal_status fail closed。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         transaction_runner = host._transaction_runner()
         row = RunResultRow(
@@ -788,7 +822,7 @@ def test_read_model_python_validation_rejects_unknown_timeline_kind(
 ) -> None:
     """SessionTimeline Python validation 对未知 item_kind fail closed。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         transaction_runner = host._transaction_runner()
         row = SessionTimelineItemRow(
@@ -820,7 +854,7 @@ def test_conflicting_terminal_event_records_failure_without_overwrite(
 ) -> None:
     """同一 Run 的不同 terminal event 失败，既有 RunResult 不被覆盖。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start"))
@@ -1005,7 +1039,7 @@ def test_cancelled_input_and_later_input_remain_separate_items(
 def test_repair_rebuilds_rows_after_deletion_and_reset(tmp_path: Path) -> None:
     """repair reset 删除读模型与 checkpoint 后可从 EventLog 重建同等 rows。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start"))
@@ -1066,7 +1100,7 @@ def test_minimal_read_model_reset_replays_fixed_consumer_owned_tables(
 ) -> None:
     """fixed minimal consumer 可清空独占 read model tables 并从 EventLog 重建。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start-reset-replay"))
@@ -1120,7 +1154,7 @@ def test_rebuild_after_purge_replays_remaining_eventlog_only(tmp_path: Path) -> 
     :raises AssertionError: 被 purge Session 被重建或保留 Session 丢失时由断言抛出。
     """
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         purged_session_id = _session_id_for_slot(host, "slot-purged-rebuild")
         preserved_session_id = _session_id_for_slot(host, "slot-preserved-rebuild")
@@ -1227,7 +1261,7 @@ def test_repair_failure_resumes_from_last_committed_checkpoint(
 ) -> None:
     """repair 后续 batch 失败时保留 checkpoint，下一次从该 cursor 继续。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start"))
@@ -1280,7 +1314,7 @@ def test_repair_failure_resumes_from_last_committed_checkpoint(
 def test_repair_result_uses_minimal_consumer_id(tmp_path: Path) -> None:
     """repair result 返回强类型 minimal consumer id。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         result = repair_minimal_read_models(
             host._transaction_runner(), reset_checkpoint=True, batch_size=1

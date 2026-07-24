@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
+import sqlite3
 from contextlib import AsyncExitStack
+from dataclasses import replace
+from typing import cast
 
 import pytest
 
+import dayu.host.admission as admission_module
+from dayu.contracts.json_value import JsonValue
 from dayu.host import (
     FollowupBehavior,
     HostApiError,
@@ -15,6 +21,29 @@ from dayu.host import (
     SteerConflictDetail,
     SubmitFollowupRequest,
     open_host,
+)
+from dayu.host.context_budget import (
+    BudgetEstimate,
+    ContextBudgetDecision,
+    ContextEstimateMethod,
+    ContextPressureLevel,
+    ContextSizingStage,
+)
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
+)
+from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.transaction import HostTransaction
+from dayu.host.run_input import PreparedRunnerCallCandidate
+from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
+    parse_context_budget_evaluated_payload,
+)
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    context_budget_policy_from_threshold_tokens,
 )
 from tests.host.public_smoke_support import (
     AwaitingThenFinalWorkerFactory,
@@ -87,6 +116,175 @@ async def test_steer_running_run_creates_new_attempt_public_path(
         assert after.current_attempt_id != first_attempt_id
         await _wait_for_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
         assert factory.handles[0].cancel_reasons == ["steered"]
+
+
+@pytest.mark.asyncio
+async def test_steer_hard_continuation_orders_fact_before_new_attempt(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """running steer以hard continuation fact启动新Attempt且仍allow。
+
+    :param tmp_path: pytest临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: manifest/fact/start顺序或decision错误时抛出。
+    """
+
+    estimate_call_count = 0
+    original_estimator = admission_module.estimate_prepared_runner_call_candidate
+
+    def count_estimate(
+        candidate: PreparedRunnerCallCandidate,
+        policy: ContextBudgetPolicy,
+    ) -> BudgetEstimate:
+        """记录public steer一次candidate sizing所调用的estimate次数。
+
+        :param candidate: 已冻结的runner-call candidate。
+        :param policy: context budget policy。
+        :returns: production estimator结果。
+        :raises Exception: production estimator错误时透传。
+        """
+
+        nonlocal estimate_call_count
+        estimate_call_count += 1
+        return original_estimator(candidate, policy)
+
+    monkeypatch.setattr(
+        admission_module,
+        "estimate_prepared_runner_call_candidate",
+        count_estimate,
+    )
+
+    def resolve_anchor(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        *,
+        candidate: PreparedRunnerCallCandidate,
+        context_window_size: int,
+        candidate_input_cursor: int | None = None,
+    ) -> ContextAnchorResolution:
+        """为steer candidate注入compatible anchor。
+
+        :param transaction: admission transaction。
+        :param event_log_store: EventLog primitive。
+        :param candidate: steer complete candidate。
+        :param context_window_size: frozen context window。
+        :param candidate_input_cursor: 可选scan cursor。
+        :returns: compatible anchor。
+        """
+
+        del transaction, event_log_store, candidate, candidate_input_cursor
+        assert context_window_size == 4_096
+        return ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-anchor",
+                manifest_payload_ref="payload-anchor",
+                manifest_digest=sha256_digest_json({"anchor": "manifest"}),
+                iteration_link_event_id="event-anchor-link",
+                usage_event_id="event-anchor-usage",
+                usage_observation_digest=sha256_digest_json(
+                    {"anchor": "usage"}
+                ),
+                iteration_completed_event_id="event-anchor-completed",
+                usage_anchor_tokens=4_000,
+                conservative_anchor_tokens=0,
+            ),
+            fallback_reason=None,
+        )
+
+    monkeypatch.setattr(
+        admission_module,
+        "resolve_prepared_runner_call_context_anchor_in_transaction",
+        resolve_anchor,
+    )
+    factory = _SequencedWorkerFactory([_BLOCK, _FINAL])
+    options = replace(
+        _options(tmp_path, factory),
+        context_budget_policy=context_budget_policy_from_threshold_tokens(
+            context_window_size=4_096,
+            soft_threshold_tokens=400,
+            hard_threshold_tokens=500,
+        ),
+    )
+    run_id = ""
+    async with (
+        open_host(options) as host,
+        AsyncExitStack() as attachment_stack,
+    ):
+        session = await host.ensure_session(_ensure_request("steer-budgeted"))
+        attachment = await host.attach_session(session.session_id)
+        attachment_stack.push_async_callback(
+            close_attachment_shielded,
+            attachment,
+        )
+        first = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "steer-budgeted-source"),
+        )
+        run_id = first.accepted_run_id
+        await _wait_for_run_status(host, run_id, RunStatus.RUNNING)
+        await wait_for_diagnostic_event_type_count(
+            tmp_path / "host.sqlite3",
+            "ATTEMPT_RUNNING",
+            1,
+        )
+        calls_before_steer = estimate_call_count
+
+        await host.submit_followup(
+            session.session_id,
+            SubmitFollowupRequest(
+                context=_context("steer-budgeted-control"),
+                session_id=session.session_id,
+                client_request_id="steer-budgeted-control",
+                system_prompt=None,
+                    user_prompt="hard continuation " + ("x" * 1_500),
+                tool_names=None,
+                runner_spec=None,
+                runner_options=None,
+                agent_policy=None,
+                behavior=FollowupBehavior.STEER,
+                target_run_id=run_id,
+            ),
+        )
+        await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+
+    assert estimate_call_count - calls_before_steer == 1
+    with sqlite3.connect(tmp_path / "host.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT event_type, payload_json
+            FROM event_log
+            WHERE run_id = ?
+            ORDER BY event_sequence ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    event_types = tuple(str(row[0]) for row in rows)
+    fact_indexes = tuple(
+        index
+        for index, event_type in enumerate(event_types)
+        if event_type == CONTEXT_BUDGET_EVALUATED
+    )
+    assert len(fact_indexes) == 2
+    continuation_index = fact_indexes[-1]
+    assert event_types[continuation_index - 1 : continuation_index + 3] == (
+        "RUNNER_CALL_INPUT_ASSEMBLED",
+        CONTEXT_BUDGET_EVALUATED,
+        "RUN_STARTED",
+        "ATTEMPT_STARTED",
+    )
+    payload = parse_context_budget_evaluated_payload(
+        cast(dict[str, JsonValue], json.loads(str(rows[continuation_index][1])))
+    )
+    assert payload.sizing_stage is ContextSizingStage.CONTINUATION
+    assert payload.estimate_method is ContextEstimateMethod.USAGE_ANCHORED
+    assert payload.anchor_diagnostic is not None
+    assert (
+        payload.pressure_level
+        is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+    )
+    assert payload.budget_decision is ContextBudgetDecision.ALLOW_DISPATCH
 
 
 @pytest.mark.asyncio

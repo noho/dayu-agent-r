@@ -26,8 +26,10 @@ from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
     RunnerCallProjectorMetadata,
     complete_runner_call_hot_diagnostic,
+    not_applicable_runner_call_sizing_snapshot,
     runner_call_hot_payload,
     runner_call_projector_metadata_descriptor,
+    runner_call_sizing_snapshot_json,
 )
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compact_payload import accepted_compact_business_texts
@@ -1380,6 +1382,9 @@ def _compactor_runner_call_manifest_body(
             "compaction_request_digest": prepared_input.compaction_request_digest,
             "compactor_input_projection_ref": compactor_input_projection_ref,
         },
+        "sizing_snapshot": runner_call_sizing_snapshot_json(
+            not_applicable_runner_call_sizing_snapshot()
+        ),
         "diagnostic": None,
     }
 

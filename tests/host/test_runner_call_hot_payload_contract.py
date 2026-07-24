@@ -116,7 +116,7 @@ def _manifest(message_count: int) -> Mapping[str, JsonValue]:
         for index, role in enumerate(roles)
     ]
     return {
-        "schema_version": "runner_call_input_manifest.v1",
+        "schema_version": "runner_call_input_manifest.v2",
         "manifest_id": "runner-call-manifest:hot-contract",
         "session_id": "session-hot-contract",
         "host_run_id": "run-hot-contract",
@@ -146,6 +146,22 @@ def _manifest(message_count: int) -> Mapping[str, JsonValue]:
         "context_fallback_decision_ref": None,
         "projector_metadata": projector_metadata,
         "compactor_identity": None,
+        "sizing_snapshot": {
+            "status": "unavailable",
+            "reason": "context_policy_unavailable",
+            "sizing_stage": "ordinary",
+            "estimator_id": None,
+            "estimator_version": None,
+            "estimator_digest": None,
+            "conservative_input_tokens": None,
+            "context_window_size": None,
+            "provider": None,
+            "model": None,
+            "request_semantics_digest": None,
+            "input_snapshot_digest": None,
+            "policy_ref": None,
+            "policy_snapshot_digest": None,
+        },
         "diagnostic": None,
     }
 
@@ -260,6 +276,22 @@ def _compactor_manifest(
         ),
         "compactor_input_projection_ref": "payload-compactor-input-projection",
     }
+    value["sizing_snapshot"] = {
+        "status": "not_applicable",
+        "reason": None,
+        "sizing_stage": None,
+        "estimator_id": None,
+        "estimator_version": None,
+        "estimator_digest": None,
+        "conservative_input_tokens": None,
+        "context_window_size": None,
+        "provider": None,
+        "model": None,
+        "request_semantics_digest": None,
+        "input_snapshot_digest": None,
+        "policy_ref": None,
+        "policy_snapshot_digest": None,
+    }
     return value
 
 
@@ -348,6 +380,70 @@ def test_shared_hot_parser_accepts_explicit_complete_diagnostic() -> None:
     assert parsed.diagnostic.expected_count == 2
     assert parsed.diagnostic.observed_digest == parsed.role_sequence_digest
     assert parsed.diagnostic.expected_digest == parsed.role_sequence_digest
+
+
+def test_manifest_sizing_stage_rejects_unknown_value() -> None:
+    """strict manifest parser 拒绝未知 sizing stage。"""
+
+    manifest: dict[str, JsonValue] = dict(_manifest(2))
+    sizing = manifest["sizing_snapshot"]
+    assert isinstance(sizing, Mapping)
+    tampered_sizing: dict[str, JsonValue] = dict(sizing)
+    tampered_sizing["sizing_stage"] = "reactive_guess"
+    manifest["sizing_snapshot"] = tampered_sizing
+
+    with pytest.raises(
+        HostDurableError,
+        match="sizing stage is unsupported",
+    ):
+        _ordinary_hot_payload(manifest)
+
+
+def test_compactor_manifest_rejects_complete_sizing_snapshot() -> None:
+    """compactor proposal 只允许 not-applicable sizing。"""
+
+    manifest: dict[str, JsonValue] = dict(_compactor_manifest(_manifest(2)))
+    manifest["sizing_snapshot"] = {
+        "status": "complete",
+        "reason": None,
+        "sizing_stage": "ordinary",
+        "estimator_id": "host-conservative-estimator",
+        "estimator_version": "v1",
+        "estimator_digest": sha256_digest_json({"estimate": "compactor"}),
+        "conservative_input_tokens": 10,
+        "context_window_size": 1024,
+        "provider": "openai",
+        "model": "test-model",
+        "request_semantics_digest": sha256_digest_json({"request": "compactor"}),
+        "input_snapshot_digest": sha256_digest_json({"input": "compactor"}),
+        "policy_ref": "context-policy:test",
+        "policy_snapshot_digest": sha256_digest_json({"policy": "compactor"}),
+    }
+
+    with pytest.raises(
+        HostDurableError,
+        match="compactor proposal sizing must be not_applicable",
+    ):
+        compaction_operation._compactor_runner_call_hot_payload(
+            manifest=manifest,
+            manifest_payload_ref="payload-manifest-compactor",
+            manifest_digest=sha256_digest_json(manifest),
+        )
+
+
+def test_ordinary_manifest_rejects_not_applicable_sizing_snapshot() -> None:
+    """dispatch-relevant manifest 不得使用 compactor-only not-applicable。"""
+
+    manifest: dict[str, JsonValue] = dict(_manifest(2))
+    sizing = _compactor_manifest(manifest)["sizing_snapshot"]
+    assert isinstance(sizing, Mapping)
+    manifest["sizing_snapshot"] = dict(sizing)
+
+    with pytest.raises(
+        HostDurableError,
+        match="not-applicable runner-call sizing requires compactor proposal",
+    ):
+        _ordinary_hot_payload(manifest)
 
 
 @pytest.mark.parametrize("tamper_kind", tuple(_HotPayloadTamperKind))

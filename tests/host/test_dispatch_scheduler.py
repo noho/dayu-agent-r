@@ -13,6 +13,7 @@ from typing import TypeVar, cast
 
 import pytest
 
+import dayu.host.admission as host_admission
 import dayu.host.dispatch as host_dispatch
 import dayu.host.engine_ingest as host_engine_ingest
 from tests.host.transient_delta_support import NOOP_TRANSIENT_DELTA_PUBLISHER
@@ -48,8 +49,20 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
-from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
+from dayu.host.admission import (
+    AdmissionWakeupPort,
+    EffectiveBusinessToolSelector,
+    EffectiveToolFacts,
+    PendingDispatchRecord,
+    effective_tool_facts_json,
+    parse_effective_tool_facts,
+    validate_effective_tool_facts_runtime,
+)
 from dayu.host._execution_health import HostExecutionHealthState
+from dayu.host._execution_config_projection import (
+    effective_execution_config_json,
+    effective_execution_snapshot_from_json,
+)
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
@@ -57,6 +70,7 @@ from dayu.host.api import (
     EnsureSessionRequest,
     HostApiError,
     HostApiErrorCode,
+    HostActivityKind,
     HostUnavailableDetail,
     HostLocalExecutionOptions,
     LocalEngineWorker,
@@ -101,8 +115,17 @@ from dayu.host.compaction_operation import (
 )
 from dayu.host.context_budget import (
     ContextBudgetDecision,
+    ContextEstimateMethod,
+    ContextPressureLevel,
+    ContextSizingFallbackReason,
+    ContextSizingStage,
+)
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
 )
 from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
@@ -110,6 +133,7 @@ from dayu.host.context_events import (
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_requested_payload,
+    parse_context_budget_evaluated_payload,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -170,6 +194,17 @@ from dayu.host.run_input import (
     MemoryProjectionRepairRequired,
     NoToolExecutor,
     PolicySnapshot,
+    SessionContinuityView,
+    ToolExecutionMode,
+    load_prepared_runner_call_source_in_transaction,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+)
+from dayu.host._runner_call_manifest import (
+    RunnerCallSizingUnavailableReason,
+    parse_runner_call_hot_payload,
+    parse_runner_call_manifest,
+    unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.proactive_compaction import (
     ProactiveCompactionAttemptStage,
@@ -180,7 +215,10 @@ from dayu.host.proactive_compaction import (
 )
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
-from dayu.host.durable.errors import HostTransactionRetryExhaustedError
+from dayu.host.durable.errors import (
+    HostDurableError,
+    HostTransactionRetryExhaustedError,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -192,9 +230,13 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import PayloadStore
+from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_PAYLOAD_DESCRIPTORS,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
@@ -208,7 +250,10 @@ from dayu.host.durable.run_transition import (
     create_accepted_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     FailUnstartedRunInput,
+    RunTransitionResult,
     fail_unstarted_run_in_transaction,
+    StartGovernedRunInput,
+    start_governed_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -223,6 +268,7 @@ from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunRow,
     RunStartReason,
+    StateMutationStatus,
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
@@ -237,6 +283,8 @@ from dayu.host.durable.transaction import (
 )
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.read_api import _host_event_from_row
+from dayu.host.run_input import PreparedRunnerCallCandidate
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneAcquireOutcome,
@@ -352,9 +400,9 @@ class _FailingTerminalPortFactory(_RecordingTerminalPortFactory):
         return self.port
 _SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
 _HARD_THRESHOLD_PROMPT_CHAR_COUNT = 240
-_SOFT_CONTEXT_WINDOW_SIZE = 110
-_SOFT_RESERVED_OUTPUT_TOKENS = 10
-_SOFT_HARD_THRESHOLD_TOKENS = 80
+_SOFT_CONTEXT_WINDOW_SIZE = 200
+_SOFT_RESERVED_OUTPUT_TOKENS = 20
+_SOFT_HARD_THRESHOLD_TOKENS = 180
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
 _REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS = 2.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
@@ -2063,7 +2111,7 @@ class _CountingTool:
         return ToolCompletedOutcome(
             result=ToolResultSuccess(
                 ok=True,
-                value={"tool_call_id": call.tool_call_id, "arguments": call.arguments},
+                value={"arguments": call.arguments},
                 meta=None,
             )
         )
@@ -2802,18 +2850,18 @@ async def test_dispatch_lag_repair_rebuild_not_reached_fails_closed(
             *,
             snapshot: AttemptDispatchSnapshot,
             policy_snapshot: PolicySnapshot,
-            selected_business_tool_names: frozenset[str] | None,
-        ) -> _LagRepairRunInputBuilder:
+            effective_tool_facts: EffectiveToolFacts,
+        ) -> AgentRunRequest:
             """返回会先抛 lag repair 的测试 builder。
 
             :param snapshot: dispatch snapshot。
             :param policy_snapshot: 冻结 policy snapshot。
-            :param selected_business_tool_names: 冻结业务工具名。
+            :param effective_tool_facts: 冻结 effective tool facts。
             :returns: 测试 builder。
             """
 
-            del snapshot, policy_snapshot, selected_business_tool_names
-            return builder
+            del policy_snapshot, effective_tool_facts
+            return builder.build(snapshot)
 
         monkeypatch.setattr(
             scheduler,
@@ -2822,7 +2870,7 @@ async def test_dispatch_lag_repair_rebuild_not_reached_fails_closed(
         )
         monkeypatch.setattr(
             scheduler,
-            "_run_input_builder_for_dispatch",
+            "_build_frozen_run_input",
             _fake_builder_for_dispatch,
         )
         try:
@@ -2839,7 +2887,7 @@ async def test_dispatch_lag_repair_rebuild_not_reached_fails_closed(
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
             assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
             assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
-            assert "dispatch.memory_projection.repair_not_reached" in caplog.text
+            assert "dispatch.worker_accept.failed" in caplog.text
         finally:
             await scheduler.close()
 
@@ -2874,18 +2922,18 @@ async def test_inline_repair_view_missing_does_not_rebuild_retry(
             *,
             snapshot: AttemptDispatchSnapshot,
             policy_snapshot: PolicySnapshot,
-            selected_business_tool_names: frozenset[str] | None,
-        ) -> _InlineRepairViewMissingRunInputBuilder:
+            effective_tool_facts: EffectiveToolFacts,
+        ) -> AgentRunRequest:
             """返回会抛 view 缺失 repair 的测试 builder。
 
             :param snapshot: dispatch snapshot。
             :param policy_snapshot: 冻结 policy snapshot。
-            :param selected_business_tool_names: 冻结业务工具名。
+            :param effective_tool_facts: 冻结 effective tool facts。
             :returns: 测试 builder。
             """
 
-            del snapshot, policy_snapshot, selected_business_tool_names
-            return builder
+            del policy_snapshot, effective_tool_facts
+            return builder.build(snapshot)
 
         monkeypatch.setattr(
             scheduler,
@@ -2894,7 +2942,7 @@ async def test_inline_repair_view_missing_does_not_rebuild_retry(
         )
         monkeypatch.setattr(
             scheduler,
-            "_run_input_builder_for_dispatch",
+            "_build_frozen_run_input",
             _fake_builder_for_dispatch,
         )
         try:
@@ -2940,18 +2988,18 @@ async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
             *,
             snapshot: AttemptDispatchSnapshot,
             policy_snapshot: PolicySnapshot,
-            selected_business_tool_names: frozenset[str] | None,
-        ) -> _LagRepairRunInputBuilder:
+            effective_tool_facts: EffectiveToolFacts,
+        ) -> AgentRunRequest:
             """返回测试 builder。
 
             :param snapshot: dispatch snapshot。
             :param policy_snapshot: policy snapshot。
-            :param selected_business_tool_names: 业务工具名集合。
+            :param effective_tool_facts: 冻结 effective tool facts。
             :returns: 测试 builder。
             """
 
-            del snapshot, policy_snapshot, selected_business_tool_names
-            return builder
+            del policy_snapshot, effective_tool_facts
+            return builder.build(snapshot)
 
         monkeypatch.setattr(
             scheduler,
@@ -2960,7 +3008,7 @@ async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
         )
         monkeypatch.setattr(
             scheduler,
-            "_run_input_builder_for_dispatch",
+            "_build_frozen_run_input",
             _fake_builder_for_dispatch,
         )
         try:
@@ -3011,18 +3059,18 @@ async def test_persistent_memory_lag_repair_failure_closes_starting_run(
             *,
             snapshot: AttemptDispatchSnapshot,
             policy_snapshot: PolicySnapshot,
-            selected_business_tool_names: frozenset[str] | None,
-        ) -> _PersistentLagRepairRunInputBuilder:
+            effective_tool_facts: EffectiveToolFacts,
+        ) -> AgentRunRequest:
             """返回持续 lag repair 的测试 builder。
 
             :param snapshot: dispatch snapshot。
             :param policy_snapshot: policy snapshot。
-            :param selected_business_tool_names: 业务工具名集合。
+            :param effective_tool_facts: 冻结 effective tool facts。
             :returns: 测试 builder。
             """
 
-            del snapshot, policy_snapshot, selected_business_tool_names
-            return builder
+            del policy_snapshot, effective_tool_facts
+            return builder.build(snapshot)
 
         monkeypatch.setattr(
             scheduler,
@@ -3031,7 +3079,7 @@ async def test_persistent_memory_lag_repair_failure_closes_starting_run(
         )
         monkeypatch.setattr(
             scheduler,
-            "_run_input_builder_for_dispatch",
+            "_build_frozen_run_input",
             _fake_builder_for_dispatch,
         )
         try:
@@ -3536,6 +3584,8 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
 
     factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     tool = _CountingTool()
+    tooling = _tooling_options(tool)
+    tool_policy = _agent_policy(True)
     projection = _FailingProjectionCatchup()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -3548,13 +3598,22 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             client_request_id="client-tool-memory-previous",
             idempotency_key="idem-tool-memory-previous",
         )
-        seeded = _seed_current_run(store, session_id=session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            agent_policy=tool_policy,
+            tool_schemas=tuple(
+                definition.to_tool_schema()
+                for definition in tooling.business_tool_bundle.definitions
+            ),
+            tooling_options=tooling,
+        )
         scheduler = await _open_scheduler(
             tmp_path,
             store,
             factory,
-            agent_policy=_agent_policy(True),
-            tooling_options=_tooling_options(tool),
+            agent_policy=tool_policy,
+            tooling_options=tooling,
             projection_catchup=projection,
         )
         try:
@@ -4942,28 +5001,386 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             )
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            budget_indexes = tuple(
+                index
+                for index, event_type in enumerate(event_types)
+                if event_type == CONTEXT_BUDGET_EVALUATED
+            )
+            assert len(budget_indexes) == 2
+            assert budget_indexes[0] < event_types.index(
+                CONTEXT_COMPACTION_REQUESTED
+            )
             assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < event_types.index(CONTEXT_COMPACTED)
-            assert event_types.index(CONTEXT_COMPACTED) < event_types.index("RUN_STARTED")
+            assert event_types.index(CONTEXT_COMPACTED) < budget_indexes[1]
+            assert budget_indexes[1] < event_types.index("RUN_STARTED")
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
+            budget_payloads = tuple(
+                parse_context_budget_evaluated_payload(
+                    _event_payload(event)
+                )
+                for event in _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_BUDGET_EVALUATED,
+                )
+            )
+            assert tuple(payload.sizing_stage for payload in budget_payloads) == (
+                ContextSizingStage.ORDINARY,
+                ContextSizingStage.POST_COMPACT,
+            )
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
         finally:
             await scheduler.close()
 
 
+@pytest.mark.parametrize(
+    "stage",
+    (
+        ContextSizingStage.ORDINARY,
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.DISPATCH_FALLBACK,
+    ),
+)
 @pytest.mark.asyncio
-async def test_compact_accepted_hot_path_does_not_call_memory_catchup(
+async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
+    tmp_path: Path,
+    stage: ContextSizingStage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """budgeted allow 对三个dispatch stage提交manifest、fact、start。
+
+    :param tmp_path: pytest 临时目录。
+    :param stage: 本次dispatch candidate的真实stage。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: stage或EventLog顺序错误时抛出。
+    """
+
+    resolver_calls: list[ContextSizingStage] = []
+
+    def resolve_anchor(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        *,
+        candidate: PreparedRunnerCallCandidate,
+        context_window_size: int,
+        candidate_input_cursor: int | None = None,
+    ) -> ContextAnchorResolution:
+        """为eligible dispatch stage注入compatible anchor。
+
+        :param transaction: 当前Host transaction。
+        :param event_log_store: EventLog primitive。
+        :param candidate: complete candidate。
+        :param context_window_size: frozen context window。
+        :param candidate_input_cursor: 可选scan cursor。
+        :returns: compatible anchor。
+        """
+
+        del transaction, event_log_store, candidate_input_cursor
+        assert context_window_size == 32_768
+        resolver_calls.append(stage)
+        return ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-anchor",
+                manifest_payload_ref="payload-anchor",
+                manifest_digest=sha256_digest_json({"anchor": "manifest"}),
+                iteration_link_event_id="event-anchor-link",
+                usage_event_id="event-anchor-usage",
+                usage_observation_digest=sha256_digest_json(
+                    {"anchor": "usage"}
+                ),
+                iteration_completed_event_id="event-anchor-completed",
+                usage_anchor_tokens=100,
+                conservative_anchor_tokens=100,
+            ),
+            fallback_reason=None,
+        )
+
+    monkeypatch.setattr(
+        host_dispatch,
+        "resolve_prepared_runner_call_context_anchor_in_transaction",
+        resolve_anchor,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-budgeted-allow-{stage.value}",
+            display_text="short budgeted input",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=32_768,
+                soft_threshold_tokens=30_000,
+                hard_threshold_tokens=31_000,
+            ),
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            scheduler._catch_up_memory_projection_before_candidate(
+                run.session_id
+            )
+            outcome = store.transaction_runner.run_write(
+                lambda transaction: (
+                    scheduler._prepare_and_commit_start_in_transaction(
+                        transaction,
+                        run,
+                        stage=stage,
+                    )
+                )
+            )
+
+            assert outcome.pending_dispatch is not None
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert event_types[-4:] == (
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+                CONTEXT_BUDGET_EVALUATED,
+                "RUN_STARTED",
+                "ATTEMPT_STARTED",
+            )
+            fact = parse_context_budget_evaluated_payload(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_BUDGET_EVALUATED,
+                    )
+                )
+            )
+            assert fact.sizing_stage is stage
+            if stage is ContextSizingStage.POST_COMPACT:
+                assert resolver_calls == []
+                assert fact.estimate_method is (
+                    ContextEstimateMethod.CONSERVATIVE_FALLBACK
+                )
+                assert fact.fallback_reason is (
+                    ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
+                )
+            else:
+                assert resolver_calls == [stage]
+                assert fact.estimate_method is (
+                    ContextEstimateMethod.USAGE_ANCHORED
+                )
+                assert fact.anchor_diagnostic is not None
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        ContextSizingStage.ORDINARY,
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.DISPATCH_FALLBACK,
+    ),
+)
+@pytest.mark.asyncio
+async def test_budgeted_hard_stage_records_fact_before_terminal(
+    tmp_path: Path,
+    stage: ContextSizingStage,
+) -> None:
+    """ordinary/post-compact/fallback hard均先写fact再收口。
+
+    :param tmp_path: pytest 临时目录。
+    :param stage: 本次hard candidate的真实stage。
+    :returns: ``None``。
+    :raises AssertionError: fact stage、pressure或terminal顺序错误时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-budgeted-hard-{stage.value}",
+            display_text=_hard_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=200,
+                soft_threshold_tokens=70,
+                hard_threshold_tokens=120,
+            ),
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            scheduler._catch_up_memory_projection_before_candidate(
+                run.session_id
+            )
+            outcome = store.transaction_runner.run_write(
+                lambda transaction: (
+                    scheduler._prepare_and_commit_start_in_transaction(
+                        transaction,
+                        run,
+                        stage=stage,
+                    )
+                )
+            )
+
+            assert outcome.pending_dispatch is None
+            assert outcome.terminal_notice is not None
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            fact_index = event_types.index(CONTEXT_BUDGET_EVALUATED)
+            assert fact_index < event_types.index("RUN_FAILED")
+            fact = parse_context_budget_evaluated_payload(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_BUDGET_EVALUATED,
+                    )
+                )
+            )
+            assert fact.sizing_stage is stage
+            assert (
+                fact.pressure_level
+                is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+            )
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize("failure_kind", ("precondition", "cas_lost"))
+@pytest.mark.asyncio
+async def test_budgeted_start_failure_rolls_back_candidate_fact_and_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """start precondition miss与CAS lost均回滚candidate/fact/state。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param failure_kind: 注入owner precondition miss或low-level CAS lost。
+    :returns: ``None``。
+    :raises AssertionError: transaction留下孤立写入时抛出。
+    """
+
+    def reject_start(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        request: StartGovernedRunInput,
+    ) -> RunTransitionResult:
+        """在manifest/fact之后注入transition失败。
+
+        :param transaction: Host write transaction。
+        :param event_log_store: EventLog primitive。
+        :param request: governed start input。
+        :returns: precondition场景的``INVALID_STATE``结果。
+        :raises HostDurableError: CAS lost场景固定抛出。
+        """
+
+        del transaction, event_log_store, request
+        if failure_kind == "cas_lost":
+            raise HostDurableError("injected governed start CAS lost")
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+            run_event=None,
+        )
+
+    monkeypatch.setattr(
+        host_dispatch,
+        "start_governed_run_with_starting_attempt_in_transaction",
+        reject_start,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-budgeted-rollback-{failure_kind}",
+            display_text="short rollback input",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=32_768,
+                soft_threshold_tokens=30_000,
+                hard_threshold_tokens=31_000,
+            ),
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            scheduler._catch_up_memory_projection_before_candidate(
+                run.session_id
+            )
+            descriptor_count_before = _table_count(
+                store.transaction_runner,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+            expected_error = (
+                HostDurableError
+                if failure_kind == "cas_lost"
+                else host_dispatch._StartCandidateCasMissRollback
+            )
+            with pytest.raises(expected_error):
+                store.transaction_runner.run_write(
+                    lambda transaction: (
+                        scheduler._prepare_and_commit_start_in_transaction(
+                            transaction,
+                            run,
+                            stage=ContextSizingStage.ORDINARY,
+                        )
+                    )
+                )
+
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert "RUNNER_CALL_INPUT_ASSEMBLED" not in event_types
+            assert CONTEXT_BUDGET_EVALUATED not in event_types
+            assert "RUN_STARTED" not in event_types
+            assert "ATTEMPT_STARTED" not in event_types
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == 0
+            assert _table_count(
+                store.transaction_runner,
+                TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+            ) == 0
+            assert _table_count(
+                store.transaction_runner,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            ) == descriptor_count_before
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_compact_accepted_hot_path_runs_bounded_memory_catchup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """compact accepted 后的 queue promotion 不执行无界 memory correctness catch-up。
+    """compact accepted 后在 freeze candidate 前执行有界 memory catch-up。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
     """
 
-    def forbidden_catch_up(
+    original_catch_up = host_dispatch.catch_up_conversation_memory_projection
+    observed_max_event_sequences: list[int | None] = []
+
+    def observed_catch_up(
         transaction_runner: HostTransactionRunner,
         *,
         policy: MemoryProjectionPolicy,
@@ -4971,24 +5388,30 @@ async def test_compact_accepted_hot_path_does_not_call_memory_catchup(
         consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
         max_event_sequence: int | None = None,
     ) -> ConversationMemoryProjectionRepairResult:
-        """若 compact accepted 热路径调用 memory repair，则让测试失败。
+        """记录 compact accepted 热路径的有界 memory repair。
 
         :param transaction_runner: Host transaction runner。
         :param policy: memory projection policy。
         :param batch_size: projection page size。
         :param consumer_id: projection consumer id。
         :param max_event_sequence: 目标 EventLog sequence。
-        :returns: 不会返回。
-        :raises AssertionError: 始终抛出，标记禁止路径被调用。
+        :returns: memory projection repair result。
+        :raises Exception: owner catch-up 异常原样透传。
         """
 
-        del transaction_runner, policy, batch_size, consumer_id, max_event_sequence
-        raise AssertionError("compact accepted hot path must not run memory catch-up")
+        observed_max_event_sequences.append(max_event_sequence)
+        return original_catch_up(
+            transaction_runner,
+            policy=policy,
+            batch_size=batch_size,
+            consumer_id=consumer_id,
+            max_event_sequence=max_event_sequence,
+        )
 
     monkeypatch.setattr(
         host_dispatch,
         "catch_up_conversation_memory_projection",
-        forbidden_catch_up,
+        observed_catch_up,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
@@ -5009,6 +5432,11 @@ async def test_compact_accepted_hot_path_does_not_call_memory_catchup(
 
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert len(observed_max_event_sequences) == 2
+            assert all(
+                sequence is not None
+                for sequence in observed_max_event_sequences
+            )
         finally:
             await scheduler.close()
 
@@ -5301,9 +5729,9 @@ async def test_second_proactive_compact_uses_previous_view_without_old_raw_repla
             store,
             factory,
             context_budget_policy=_soft_compact_policy(
-                context_window_size=180,
+                context_window_size=400,
                 soft_threshold_tokens=50,
-                hard_threshold_tokens=140,
+                hard_threshold_tokens=300,
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -6876,7 +7304,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             context_budget_policy=_soft_compact_policy(
                 context_window_size=200,
                 soft_threshold_tokens=70,
-                hard_threshold_tokens=120,
+                hard_threshold_tokens=200,
             ),
             memory_projection_policy=memory_policy,
             compact_artifact_root=compact_artifact_root,
@@ -6948,7 +7376,11 @@ async def test_pre_start_governance_fallback_budget_fail_closes_run(
             tmp_path,
             store,
             _FakeWorkerFactory(),
-            context_budget_policy=_soft_compact_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=200,
+                soft_threshold_tokens=70,
+                hard_threshold_tokens=120,
+            ),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6977,7 +7409,7 @@ async def test_pre_start_governance_fallback_budget_fail_closes_run(
 async def test_pre_start_governance_material_source_failure_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """material source failure fail closed，不创建 Attempt 且不走 fallback。"""
+    """required memory catch-up 失败时零 start、零 fallback。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -7001,24 +7433,19 @@ async def test_pre_start_governance_material_source_failure_fails_closed(
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
         try:
-            await scheduler.run_queue_promotion(seeded.session_id)
+            with pytest.raises(
+                HostDurableError,
+                match="candidate memory projection did not reach required cursor",
+            ):
+                await scheduler.run_queue_promotion(seeded.session_id)
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
-            assert _run_status(store.transaction_runner, seeded.run_id) == RunStatus.FAILED
+            assert _run_status(store.transaction_runner, seeded.run_id) == RunStatus.ACCEPTED
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED) == 0
-            failed = _latest_event_for_run(
+            assert _event_count(
                 store.transaction_runner,
-                seeded.run_id,
                 CONTEXT_COMPACTION_FAILED,
-            )
-            payload = _event_payload(failed)
-            assert payload["failure_reason"] == "material_source_failed"
-            assert_failed_payload_no_fallback(
-                payload,
-                expected_operation_id=None,
-                expected_attempt_count=0,
-                expected_retry_repair_budget_exhausted=False,
-            )
+            ) == 0
         finally:
             await scheduler.close()
 
@@ -7198,11 +7625,34 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
                     CONTEXT_COMPACTED,
                 )
             )
+            runner_call_event = _latest_event_for_run(
+                store.transaction_runner,
+                compacted.run_id,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+            hot = parse_runner_call_hot_payload(
+                _event_payload(runner_call_event)
+            )
+            manifest_json = store.transaction_runner.run_read(
+                lambda transaction: sqlite_payload_object(
+                    transaction,
+                    payload_ref=hot.manifest_payload_ref,
+                    payload_digest=hot.manifest_digest,
+                    payload_label="proactive post-compact manifest",
+                )
+            )
+            manifest = parse_runner_call_manifest(
+                manifest_json,
+                hot_payload=hot,
+            )
 
             assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < (
                 event_types.index(CONTEXT_COMPACTED)
             )
             assert event_types.index(CONTEXT_COMPACTED) < event_types.index("RUN_STARTED")
+            assert manifest.sizing_snapshot.sizing_stage is (
+                ContextSizingStage.POST_COMPACT
+            )
             assert compacted_payload["operation_id"] != ""
             assert compacted_payload["accepted_attempt_number"] == 1
             assert compacted_payload["compact_artifact_ref"] != ""
@@ -7644,8 +8094,21 @@ async def test_reactive_recovery_uses_fresh_duplicate_governance_attempt(
     duplicate_policy = DuplicateGovernancePolicy(
         default_duplicate_decision=DuplicateDecisionKind.REUSE
     )
+    tool_policy = _agent_policy(True)
+    tooling = _tooling_options(
+        tool,
+        duplicate_governance_policy=duplicate_policy,
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        seeded = _seed_current_run(
+            store,
+            agent_policy=tool_policy,
+            tool_schemas=tuple(
+                definition.to_tool_schema()
+                for definition in tooling.business_tool_bundle.definitions
+            ),
+            tooling_options=tooling,
+        )
         factory = _ReactiveRecoveryWorkerFactory(
             final_blocks=True,
             first_event_gate=first_event_gate,
@@ -7654,11 +8117,8 @@ async def test_reactive_recovery_uses_fresh_duplicate_governance_attempt(
             tmp_path,
             store,
             factory,
-            agent_policy=_agent_policy(True),
-            tooling_options=_tooling_options(
-                tool,
-                duplicate_governance_policy=duplicate_policy,
-            ),
+            agent_policy=tool_policy,
+            tooling_options=tooling,
             context_budget_policy=_soft_compact_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -7720,6 +8180,318 @@ async def test_reactive_recovery_uses_fresh_duplicate_governance_attempt(
                 RunStatus.RECOVERING,
                 RunStatus.RUNNING,
                 RunStatus.FAILED,
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize(
+    ("requested_names", "expected_names"),
+    (
+        (None, ("tool_a", "tool_b")),
+        (frozenset({"tool_b"}), ("tool_b",)),
+        (frozenset(), ()),
+    ),
+)
+@pytest.mark.asyncio
+async def test_dispatch_consumes_exact_admission_tool_names(
+    tmp_path: Path,
+    requested_names: frozenset[str] | None,
+    expected_names: tuple[str, ...],
+) -> None:
+    """all/subset/none 均消费 admission 冻结的 exact names。
+
+    :param tmp_path: pytest 临时目录。
+    :param requested_names: admission selector 输入。
+    :param expected_names: frozen candidate 应暴露的业务工具名。
+    """
+
+    tooling = _tooling_options_for_names(("tool_a", "tool_b"))
+    frozen_facts = effective_tool_facts_json(
+        requested_names,
+        tooling_options=tooling,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-exact-tool-selection",
+            display_text="exact tool selection",
+            agent_policy=_agent_policy(True),
+            effective_tool_set=frozen_facts,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            agent_policy=_agent_policy(True),
+            tooling_options=tooling,
+        )
+        try:
+            run = store.transaction_runner.run_read(
+                lambda transaction: read_run_by_id(transaction, seeded.run_id)
+            )
+            assert run is not None
+            pending = _start_governed_for_test(
+                store.transaction_runner,
+                scheduler,
+                run,
+            )
+            source = store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=pending.attempt_id,
+                    execution_id=pending.execution_id,
+                )
+            )
+            assert tuple(
+                schema.function.name for schema in source.candidate.tool_schemas
+            ) == expected_names
+        finally:
+            await scheduler.close()
+
+
+def test_replay_no_tool_facts_are_independent_of_current_tooling() -> None:
+    """repair replay 的 empty tool truth 不读取当前业务 bundle/source。"""
+
+    current_tooling = _tooling_options_for_names(("tool_a",))
+    facts = parse_effective_tool_facts(
+        effective_tool_facts_json(
+            frozenset(),
+            tooling_options=None,
+        )
+    )
+
+    assert facts.selector is EffectiveBusinessToolSelector.NONE
+    assert facts.effective_business_tool_names == frozenset()
+    assert facts.source_refs == ()
+    assert validate_effective_tool_facts_runtime(
+        facts,
+        tooling_options=None,
+    ) == frozenset()
+    with pytest.raises(
+        HostDurableError,
+        match="current business tool bundle",
+    ):
+        validate_effective_tool_facts_runtime(
+            facts,
+            tooling_options=current_tooling,
+        )
+
+
+def test_steer_explicit_subset_fails_when_frozen_policy_disables_tools(
+    tmp_path: Path,
+) -> None:
+    """steer 显式非空 subset 在 policy 禁用工具时保留 caller-intent fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    """
+
+    tooling = _tooling_options_for_names(("tool_a", "tool_b"))
+    execution_config = effective_execution_config_json(
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=_agent_policy(False),
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-steer-subset-policy-disabled",
+            event_id="event-steer-subset-policy-disabled",
+            effective_execution_config=execution_config,
+            effective_tool_set=effective_tool_facts_json(
+                frozenset({"tool_a"}),
+                tooling_options=tooling,
+            ),
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match="explicit subset tools are unavailable",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: host_admission._strict_steer_candidate_inputs(
+                    transaction=transaction,
+                    input_event=cast(
+                        EventLogRow,
+                        EventLogStore().read_event_by_id(
+                            transaction,
+                            "event-steer-subset-policy-disabled",
+                        ),
+                    ),
+                    tooling_options=tooling,
+                    enable_truncation_manager=False,
+                    replay=False,
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "drift_kind",
+    ("added_tool", "same_name_schema", "bundle_digest", "schema_digest", "source_ref"),
+)
+@pytest.mark.asyncio
+async def test_dispatch_tool_drift_fails_before_start_without_artifacts(
+    tmp_path: Path,
+    drift_kind: str,
+) -> None:
+    """bundle/schema/source drift 与冻结摘要损坏均在 start 前 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param drift_kind: 单一工具事实漂移类别。
+    """
+
+    frozen_tooling = _tooling_options_for_names(("tool_a",))
+    runtime_tooling = frozen_tooling
+    frozen_facts = effective_tool_facts_json(
+        None,
+        tooling_options=frozen_tooling,
+    )
+    assert isinstance(frozen_facts, Mapping)
+    tampered_facts: dict[str, JsonValue] = dict(frozen_facts)
+    if drift_kind == "added_tool":
+        runtime_tooling = _tooling_options_for_names(("tool_a", "tool_b"))
+    elif drift_kind == "same_name_schema":
+        runtime_tooling = _tooling_options_for_names(
+            ("tool_a",),
+            description="schema drift",
+        )
+    elif drift_kind == "bundle_digest":
+        tampered_facts["business_bundle_digest"] = sha256_digest_json(
+            {"corrupt": "bundle"}
+        )
+    elif drift_kind == "schema_digest":
+        corrupt_digest = sha256_digest_json({"corrupt": "schema"})
+        tampered_facts["effective_schema_digest"] = corrupt_digest
+        tampered_facts["tool_snapshot_ref"] = f"tools:{corrupt_digest}"
+    else:
+        source_refs = tampered_facts["source_refs"]
+        assert isinstance(source_refs, list)
+        source_ref = source_refs[0]
+        assert isinstance(source_ref, Mapping)
+        corrupt_source_ref: dict[str, JsonValue] = dict(source_ref)
+        corrupt_source_ref["source_id"] = "corrupt-source"
+        tampered_facts["source_refs"] = [corrupt_source_ref]
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-tool-drift-{drift_kind}",
+            display_text="tool drift",
+            agent_policy=_agent_policy(True),
+            effective_tool_set=tampered_facts,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            agent_policy=_agent_policy(True),
+            tooling_options=runtime_tooling,
+        )
+        try:
+            run = store.transaction_runner.run_read(
+                lambda transaction: read_run_by_id(transaction, seeded.run_id)
+            )
+            assert run is not None
+            with pytest.raises(HostDurableError):
+                _start_governed_for_test(
+                    store.transaction_runner,
+                    scheduler,
+                    run,
+                )
+            unchanged = store.transaction_runner.run_read(
+                lambda transaction: read_run_by_id(transaction, seeded.run_id)
+            )
+            assert unchanged is not None
+            assert unchanged.current_attempt_id is None
+            assert "RUN_STARTED" not in _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert "RUNNER_CALL_INPUT_ASSEMBLED" not in _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        ContextSizingStage.ORDINARY,
+        ContextSizingStage.POST_COMPACT,
+        ContextSizingStage.DISPATCH_FALLBACK,
+    ),
+)
+@pytest.mark.asyncio
+async def test_no_budget_manifest_preserves_actual_dispatch_stage(
+    tmp_path: Path,
+    stage: ContextSizingStage,
+) -> None:
+    """无 context policy 时 ordinary/post-compact/fallback 均记录实际 stage。
+
+    :param tmp_path: pytest 临时目录。
+    :param stage: 本次 no-budget candidate 的真实阶段。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=f"run-no-budget-{stage.value}",
+            display_text="no budget stage",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+        )
+        try:
+            run = store.transaction_runner.run_read(
+                lambda transaction: read_run_by_id(transaction, seeded.run_id)
+            )
+            assert run is not None
+            scheduler._catch_up_memory_projection_before_candidate(run.session_id)
+            outcome = store.transaction_runner.run_write(
+                lambda transaction: scheduler._prepare_and_commit_start_in_transaction(
+                    transaction,
+                    run,
+                    stage=stage,
+                )
+            )
+            assert outcome.pending_dispatch is not None
+            pending = outcome.pending_dispatch
+            source = store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=pending.attempt_id,
+                    execution_id=pending.execution_id,
+                )
+            )
+            assert source.manifest.sizing_snapshot.sizing_stage is stage
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            assert CONTEXT_BUDGET_EVALUATED not in event_types
+            assert (
+                _has_context_usage_activity(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                is False
             )
         finally:
             await scheduler.close()
@@ -7969,11 +8741,46 @@ def _tooling_options(
     )
 
 
-def _tool_definition(name: str, tool: _CountingTool) -> ToolDefinition:
+def _tooling_options_for_names(
+    names: tuple[str, ...],
+    *,
+    description: str = "dispatch fake tool",
+) -> HostToolingOptions:
+    """构造 exact-name/tool-schema contract 测试用工具装配。
+
+    :param names: 按 bundle 顺序给出的业务工具名。
+    :param description: 所有测试工具共用的 schema description。
+    :returns: 带稳定 source ref 的 Host 工具选项。
+    """
+
+    tool = _CountingTool()
+    return HostToolingOptions(
+        business_tool_bundle=ToolBundle(
+            definitions=tuple(
+                _tool_definition(name, tool, description=description)
+                for name in names
+            )
+        ),
+        source_refs=(
+            ToolBundleSourceRef(
+                source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                source_id="dispatch-tool-contract-test",
+            ),
+        ),
+    )
+
+
+def _tool_definition(
+    name: str,
+    tool: _CountingTool,
+    *,
+    description: str = "dispatch fake tool",
+) -> ToolDefinition:
     """构造测试工具声明。
 
     :param name: 工具名。
     :param tool: 测试工具 callable。
+    :param description: LLM-facing schema description。
     :returns: ToolDefinition。
     """
 
@@ -7983,7 +8790,7 @@ def _tool_definition(name: str, tool: _CountingTool) -> ToolDefinition:
             type="function",
             function=ToolFunctionSchema(
                 name=name,
-                description="dispatch fake tool",
+                description=description,
                 parameters=_tool_parameters(),
             ),
         ),
@@ -8061,11 +8868,21 @@ def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
     )
 
 
-def _seed_current_run(store: HostDurableStore, *, session_id: str | None = None) -> _SeededRun:
+def _seed_current_run(
+    store: HostDurableStore,
+    *,
+    session_id: str | None = None,
+    agent_policy: AgentPolicy | None = None,
+    tool_schemas: tuple[ToolSchema, ...] = (),
+    tooling_options: HostToolingOptions | None = None,
+) -> _SeededRun:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
 
     :param store: durable store。
     :param session_id: 可选已有 Session id；不传则创建默认测试 Session。
+    :param agent_policy: frozen Agent policy；缺失时使用默认no-tool policy。
+    :param tool_schemas: frozen selected tool schemas。
+    :param tooling_options: admission 与 dispatch 共用的 construction-time 工具真源。
     :returns: seeded run 摘要。
     """
 
@@ -8077,43 +8894,145 @@ def _seed_current_run(store: HostDurableStore, *, session_id: str | None = None)
         execution_id="execution-dispatch",
         dispatch_record_id="dispatch-dispatch",
     )
+    policy = agent_policy if agent_policy is not None else _agent_policy(False)
+    runner_options = RunnerCallOptions(
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        stream=False,
+    )
+    effective_execution_config = effective_execution_config_json(
+        runner_spec=_runner_spec(),
+        runner_options=runner_options,
+        agent_policy=policy,
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
+    effective_snapshot = effective_execution_snapshot_from_json(
+        effective_execution_config
+    )
     input_event_sequence = _append_user_input(
         store.transaction_runner,
         session_id=actual_session_id,
         run_id=seeded.run_id,
         event_id="event-input-dispatch",
+        effective_execution_config=effective_execution_config,
+        effective_tool_set=effective_tool_facts_json(
+            None,
+            tooling_options=tooling_options,
+        ),
     )
 
-    def _operation(transaction: HostTransaction) -> None:
-        create_running_run_with_starting_attempt_in_transaction(
+    def _accept_operation(transaction: HostTransaction) -> None:
+        accepted = create_accepted_run_in_transaction(
             transaction,
             EventLogStore(),
-            CreateRunningRunInput(
+            CreateAcceptedRunInput(
                 session_id=actual_session_id,
                 run_id=seeded.run_id,
                 client_request_id="client-dispatch",
                 input_event_id="event-input-dispatch",
                 input_event_sequence=input_event_sequence,
                 run_accepted_event_id="event-run-accepted-dispatch",
-                run_started_event_id="event-run-started-dispatch",
-                attempt_started_event_id="event-attempt-started-dispatch",
-                attempt_id=seeded.attempt_id,
-                execution_id=seeded.execution_id,
-                dispatch_record_id=seeded.dispatch_record_id,
                 occurred_at=_NOW,
                 actor="tester",
                 source="pytest",
                 idempotency_key="idem-dispatch",
                 execution_target="target-dispatch",
                 queue_policy=RunQueuePolicy.QUEUE,
-                start_reason=RunStartReason.INITIAL,
-                worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=None,
                 call_context_digest=_CALL_CONTEXT_DIGEST,
             ),
         )
+        assert accepted.run is not None
 
-    store.transaction_runner.run_write(_operation)
+    store.transaction_runner.run_write(_accept_operation)
+    required_cursor = store.transaction_runner.run_read(
+        lambda transaction: EventLogStore()
+        .read_events_after(transaction, 0, limit=100)[-1]
+        .event_sequence
+    )
+    catch_up = catch_up_conversation_memory_projection(
+        store.transaction_runner,
+        policy=default_memory_projection_policy(),
+        batch_size=100,
+        max_event_sequence=required_cursor,
+    )
+    assert catch_up.target_reached is True
+
+    def _start_operation(transaction: HostTransaction) -> None:
+        run = read_run_by_id(transaction, seeded.run_id)
+        assert run is not None
+        policy_snapshot = PolicySnapshot(
+            runner_spec=effective_snapshot.runner_spec,
+            runner_options=effective_snapshot.runner_options,
+            agent_policy=effective_snapshot.agent_policy,
+            policy_snapshot_ref=effective_snapshot.policy_snapshot_ref,
+        )
+        candidate = prepare_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            run=run,
+            current_input_event=cast(
+                EventLogRow,
+                EventLogStore().read_event_by_id(
+                    transaction,
+                    run.input_event_id,
+                ),
+            ),
+            continuity=SessionContinuityView(
+                messages=(),
+                source_refs=(),
+            ),
+            policy_snapshot=policy_snapshot,
+            tool_schemas=tool_schemas,
+            disable_tools=not tool_schemas,
+            tool_execution_mode=(
+                ToolExecutionMode.TOOL_ENABLED
+                if tool_schemas
+                else ToolExecutionMode.NO_TOOL_DISABLED
+            ),
+            memory_projection_policy=default_memory_projection_policy(),
+        )
+        start_input = StartGovernedRunInput(
+            run_id=run.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            run_started_event_id="event-run-started-dispatch",
+            attempt_started_event_id="event-attempt-started-dispatch",
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            dispatch_record_id=seeded.dispatch_record_id,
+            occurred_at=_NOW,
+            actor="tester",
+            source="pytest",
+            start_reason=RunStartReason.INITIAL,
+            worker_kind=WorkerKind.LOCAL,
+            owner_host_instance_id=None,
+        )
+        record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            PayloadStore(),
+            run=run,
+            attempt_id=start_input.attempt_id,
+            execution_id=start_input.execution_id,
+            occurred_at=start_input.occurred_at,
+            candidate=candidate,
+            sizing_snapshot=unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
+            ),
+        )
+        started = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            start_input,
+        )
+        assert started.run is not None
+        assert started.attempt is not None
+        assert started.dispatch_record is not None
+
+    store.transaction_runner.run_write(_start_operation)
     return seeded
 
 
@@ -8123,6 +9042,8 @@ def _seed_accepted_run(
     run_id: str,
     display_text: str,
     session_id: str | None = None,
+    agent_policy: AgentPolicy | None = None,
+    effective_tool_set: JsonValue | None = None,
 ) -> _AcceptedSeededRun:
     """创建 pre-start accepted Run，不创建 Attempt 或 dispatch。
 
@@ -8130,10 +9051,27 @@ def _seed_accepted_run(
     :param run_id: Run id。
     :param display_text: 当前用户输入文本。
     :param session_id: 可选已有 Session id。
+    :param agent_policy: admission 冻结的 Agent policy。
+    :param effective_tool_set: admission 冻结的完整 effective tool facts。
     :returns: accepted Run 摘要。
     """
 
     actual_session_id = _ensure_session_id(store.transaction_runner) if session_id is None else session_id
+    effective_execution_config = effective_execution_config_json(
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=(
+            agent_policy if agent_policy is not None else _agent_policy(False)
+        ),
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
     input_event_id = f"event-input-{run_id}"
     input_event_sequence = _append_user_input(
         store.transaction_runner,
@@ -8143,6 +9081,8 @@ def _seed_accepted_run(
         display_text=display_text,
         client_request_id=f"client-{run_id}",
         idempotency_key=f"idem-input-{run_id}",
+        effective_execution_config=effective_execution_config,
+        effective_tool_set=effective_tool_set,
     )
 
     def _operation(transaction: HostTransaction) -> None:
@@ -8403,6 +9343,8 @@ def _append_user_input(
     display_text: str = "dispatch prompt",
     client_request_id: str = "client-dispatch",
     idempotency_key: str = "idem-input",
+    effective_execution_config: JsonValue | None = None,
+    effective_tool_set: JsonValue | None = None,
 ) -> int:
     """追加 USER_INPUT_ACCEPTED。
 
@@ -8413,10 +9355,43 @@ def _append_user_input(
     :param display_text: 用户输入展示文本。
     :param client_request_id: EventLog client request id。
     :param idempotency_key: EventLog idempotency key。
+    :param effective_execution_config: 可选的 durable frozen execution config。
+    :param effective_tool_set: 可选的完整 durable effective tool facts。
     :returns: 追加后的 EventLog sequence。
     """
 
     def _operation(transaction: HostTransaction) -> int:
+        frozen_execution = (
+            effective_execution_config
+            if effective_execution_config is not None
+            else effective_execution_config_json(
+                runner_spec=_runner_spec(),
+                runner_options=RunnerCallOptions(
+                    temperature=None,
+                    max_tokens=None,
+                    top_p=None,
+                    stream=False,
+                ),
+                agent_policy=_agent_policy(False),
+                runner_spec_source="test",
+                runner_options_source="test",
+                agent_policy_source="test",
+            )
+        )
+        payload: dict[str, JsonValue] = {
+            "display_text": display_text,
+            "operation_kind": "unit_test",
+            "execution_target": "target-dispatch",
+            "effective_tool_set": (
+                effective_tool_set
+                if effective_tool_set is not None
+                else effective_tool_facts_json(
+                    None,
+                    tooling_options=None,
+                )
+            ),
+            "effective_execution_config": frozen_execution,
+        }
         event = EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -8434,11 +9409,7 @@ def _append_user_input(
                 idempotency_key=idempotency_key,
                 policy_decision=None,
                 reason=None,
-                payload_json={
-                    "display_text": display_text,
-                    "operation_kind": "unit_test",
-                    "execution_target": "target-dispatch",
-                },
+                payload_json=payload,
                 payload_ref=None,
                 payload_digest=None,
             ),
@@ -8656,6 +9627,47 @@ def _append_previous_compacted_event(
     """
 
     def _operation(transaction: HostTransaction) -> None:
+        operation_id = f"operation-{event_id}"
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=operation_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=build_context_compaction_requested_payload(
+                    operation_id=operation_id,
+                    max_compaction_attempts_per_operation=1,
+                    trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+                    budget_reason=(
+                        ContextBudgetDecision.COMPACT_SOFT_THRESHOLD.value
+                    ),
+                    budget_snapshot_ref=_CALL_CONTEXT_DIGEST,
+                    input_snapshot_cursor=1,
+                    estimator_digest=_CALL_CONTEXT_DIGEST,
+                    policy_ref="test-soft-compact-policy",
+                    provider_request_id=None,
+                    provider_error_ref=None,
+                    attempt_id=None,
+                    execution_id=None,
+                    client_correlation_id=None,
+                    frozen_material_list_digest=_CALL_CONTEXT_DIGEST,
+                    frozen_material_refs=(),
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
         EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -8674,7 +9686,7 @@ def _append_previous_compacted_event(
                 policy_decision=None,
                 reason=None,
                 payload_json=build_context_compacted_payload(
-                    operation_id="operation-previous-compact",
+                    operation_id=operation_id,
                     accepted_attempt_number=1,
                     compact_artifact_ref="artifact:previous-compact",
                     compact_artifact_digest=_CALL_CONTEXT_DIGEST,
@@ -8969,11 +9981,19 @@ def _start_governed_for_test(
     :raises AssertionError: governed start CAS 未创建 dispatch 时抛出。
     """
 
-    def _operation(transaction: HostTransaction) -> PendingDispatchRecord | None:
-        return scheduler._start_governed_in_transaction(transaction, run)
+    scheduler._catch_up_memory_projection_before_candidate(run.session_id)
+
+    def _operation(transaction: HostTransaction) -> PendingDispatchRecord:
+        outcome = scheduler._prepare_and_commit_start_in_transaction(
+            transaction,
+            run,
+            stage=ContextSizingStage.ORDINARY,
+        )
+        assert outcome.pending_dispatch is not None
+        assert outcome.terminal_notice is None
+        return outcome.pending_dispatch
 
     pending = transaction_runner.run_write(_operation)
-    assert pending is not None
     return pending
 
 
@@ -9065,6 +10085,44 @@ def _attempt_count_for_run(transaction_runner: HostTransactionRunner, run_id: st
     return transaction_runner.run_read(_operation)
 
 
+def _table_count(
+    transaction_runner: HostTransactionRunner,
+    table_name: str,
+) -> int:
+    """读取测试白名单表的总行数。
+
+    :param transaction_runner: transaction runner。
+    :param table_name: 由调用测试传入的schema常量。
+    :returns: table row count。
+    :raises AssertionError: table不在白名单或count类型非法时抛出。
+    """
+
+    assert table_name in frozenset(
+        (
+            TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+            TABLE_PAYLOAD_DESCRIPTORS,
+        )
+    )
+
+    def _operation(transaction: HostTransaction) -> int:
+        """执行固定白名单table count。
+
+        :param transaction: Host read transaction。
+        :returns: row count。
+        :raises AssertionError: SQLite未返回int count时抛出。
+        """
+
+        row = transaction.fetchone(
+            f"SELECT COUNT(*) AS count FROM {table_name}"
+        )
+        assert row is not None
+        count = row.get("count")
+        assert isinstance(count, int)
+        return count
+
+    return transaction_runner.run_read(_operation)
+
+
 def _event_types_for_run(transaction_runner: HostTransactionRunner, run_id: str) -> tuple[str, ...]:
     """按 sequence 读取指定 Run 的 EventLog 类型。
 
@@ -9080,6 +10138,45 @@ def _event_types_for_run(transaction_runner: HostTransactionRunner, run_id: str)
             limit=_EVENT_LOG_TEST_READ_LIMIT,
         )
         return tuple(row.event_type for row in rows if row.run_id == run_id)
+
+    return transaction_runner.run_read(_operation)
+
+
+def _has_context_usage_activity(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> bool:
+    """检查指定Run是否投影出context usage activity。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: 任一durable row投影为context usage时返回``True``。
+    :raises Exception: durable读取或strict public投影失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> bool:
+        """在同一read transaction检查public activity。
+
+        :param transaction: Host read transaction。
+        :returns: 是否存在context usage activity。
+        :raises Exception: strict public投影失败时透传。
+        """
+
+        rows = EventLogStore().read_events_after(
+            transaction,
+            0,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
+        for row in rows:
+            if row.run_id != run_id:
+                continue
+            activity = _host_event_from_row(transaction, row).activity
+            if (
+                activity is not None
+                and activity.kind is HostActivityKind.CONTEXT_USAGE
+            ):
+                return True
+        return False
 
     return transaction_runner.run_read(_operation)
 

@@ -77,6 +77,7 @@ class HostToolWaitEventType(StrEnum):
 class HostContextGovernanceEventType(StrEnum):
     """Host context governance EventLog 事件类型。"""
 
+    CONTEXT_BUDGET_EVALUATED = "CONTEXT_BUDGET_EVALUATED"
     CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
     CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
     CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
@@ -206,6 +207,7 @@ HOST_TOOL_WAIT_EVENT_TYPES: tuple[HostToolWaitEventType, ...] = (
 """Host tool runtime 与 wait governance 事件集合。"""
 
 HOST_CONTEXT_GOVERNANCE_EVENT_TYPES: tuple[HostContextGovernanceEventType, ...] = (
+    HostContextGovernanceEventType.CONTEXT_BUDGET_EVALUATED,
     HostContextGovernanceEventType.CONTEXT_COMPACTION_REQUESTED,
     HostContextGovernanceEventType.CONTEXT_COMPACTED,
     HostContextGovernanceEventType.CONTEXT_COMPACTION_FAILED,

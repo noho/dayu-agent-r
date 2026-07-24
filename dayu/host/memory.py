@@ -1263,6 +1263,11 @@ def project_conversation_memory_event(
         if compacted_semantics is None:
             raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
         accepted_candidate = compacted_semantics.accepted_candidate
+        selected = _selected_recent_after_compaction(
+            selected,
+            current_input_ref=compacted_semantics.current_input_ref,
+            compacted_source_refs=compacted_semantics.compacted_source_refs,
+        )
         latest_compaction_event_ref = event.event_id
         session_summary, summary_diagnostics = _session_summary_from_accepted_event(
             event,
@@ -1979,6 +1984,34 @@ def _limit_selected_recent_window(
         used += item.size_units.units
     selected_ids = {item.item_id for item in selected_reversed}
     return tuple(item for item in items if item.item_id in selected_ids)
+
+
+def _selected_recent_after_compaction(
+    items: tuple[SelectedRecentWindowItem, ...],
+    *,
+    current_input_ref: str,
+    compacted_source_refs: tuple[str, ...],
+) -> tuple[SelectedRecentWindowItem, ...]:
+    """按 accepted compact typed coverage 更新 selected recent window。
+
+    current input 优先保留；其余 item 只在 canonical source set 命中本次
+    compacted refs 时删除。未命中的 protected raw 继续由后续 bounded policy
+    决定是否保留。
+
+    :param items: compact 前的 selected recent items。
+    :param current_input_ref: 本次 compact 的 current input boundary ref。
+    :param compacted_source_refs: 本次 accepted compact 覆盖的 canonical refs。
+    :returns: 删除 covered older raw 后的 selected recent items。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    covered = frozenset(compacted_source_refs)
+    retained: list[SelectedRecentWindowItem] = []
+    for item in items:
+        source_set = frozenset((item.event_id, *item.source_refs))
+        if current_input_ref in source_set or source_set.isdisjoint(covered):
+            retained.append(item)
+    return tuple(retained)
 
 
 def _protected_recent_run_ids(

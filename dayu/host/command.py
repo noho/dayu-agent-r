@@ -84,6 +84,7 @@ from dayu.host.durable.errors import (
 from dayu.host.durable.options import (
     project_host_durable_store_options,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.purge import (
     PurgeSessionAlreadyPurgedError,
     PurgeSessionDeleteRequest,
@@ -406,6 +407,13 @@ def create_host_command_handle(
         admission_service = create_host_admission_service(
             durable_store.transaction_runner,
             terminal_post_commit_port=terminal_post_commit_port,
+            payload_store=PayloadStore(),
+            ordinary_run_baseline=None,
+            tooling_options=None,
+            context_budget_policy=None,
+            memory_projection_policy=None,
+            enable_truncation_manager=False,
+            owner_host_instance_id=None,
         )
         return HostCommandHandle(
             host_handle_id=_host_handle_id_from_options(options),
@@ -793,6 +801,36 @@ def replay_run(host: HostCommandHandle, run_id: str, request: ReplayRunRequest) 
     return run_snapshot_from_row(result.run)
 
 
+def _resolve_wait_service(
+    host: HostCommandHandle,
+) -> DefaultHostResolveWaitService:
+    """从 command handle唯一admission construction truth装配wait owner。
+
+    :param host: 当前 Host command handle。
+    :returns: 逐项显式装配的 resolve wait service。
+    :raises HostApiError: admin-only handle缺少memory policy时抛出。
+    """
+
+    memory_policy = host._admission_service.memory_projection_policy
+    if memory_policy is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="resolve_wait requires an execution Host memory policy",
+            retryable=False,
+        )
+    return DefaultHostResolveWaitService(
+        transaction_runner=host._transaction_runner(),
+        terminal_post_commit_port=host._terminal_post_commit_port,
+        event_log_store=host._admission_service.event_log_store,
+        idempotency_store=host._admission_service.idempotency_store,
+        payload_store=host._admission_service.payload_store,
+        memory_projection_policy=memory_policy,
+        projection_catchup_port=(
+            host._admission_service.projection_catchup_port
+        ),
+    )
+
+
 def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
     """接收 wait result 并返回最新 Run snapshot。
 
@@ -810,14 +848,7 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
         wait_id,
     )
     try:
-        transaction_runner = host._transaction_runner()
-        service = DefaultHostResolveWaitService(
-            transaction_runner=transaction_runner,
-            terminal_post_commit_port=host._terminal_post_commit_port,
-            event_log_store=host._admission_service.event_log_store,
-            idempotency_store=host._admission_service.idempotency_store,
-            projection_catchup_port=(host._admission_service.projection_catchup_port),
-        )
+        service = _resolve_wait_service(host)
         result = service.resolve_wait(wait_id, request)
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
@@ -850,13 +881,7 @@ def expire_wait(host: HostCommandHandle, request: ExpireWaitInput) -> ExpireWait
 
     host._raise_if_closed()
     try:
-        service = DefaultHostResolveWaitService(
-            transaction_runner=host._transaction_runner(),
-            terminal_post_commit_port=host._terminal_post_commit_port,
-            event_log_store=host._admission_service.event_log_store,
-            idempotency_store=host._admission_service.idempotency_store,
-            projection_catchup_port=host._admission_service.projection_catchup_port,
-        )
+        service = _resolve_wait_service(host)
         return service.expire_wait(request)
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
@@ -917,16 +942,7 @@ class HostCommandWaitCallbackPort(CallbackWaitResolvePort, WaitCallbackStateRead
             wait_id,
         )
         try:
-            transaction_runner = self.host._transaction_runner()
-            service = DefaultHostResolveWaitService(
-                transaction_runner=transaction_runner,
-                terminal_post_commit_port=self.host._terminal_post_commit_port,
-                event_log_store=self.host._admission_service.event_log_store,
-                idempotency_store=self.host._admission_service.idempotency_store,
-                projection_catchup_port=(
-                    self.host._admission_service.projection_catchup_port
-                ),
-            )
+            service = _resolve_wait_service(self.host)
             result = service.resolve_wait(wait_id, request)
         except HostDurableError as exc:
             raise _host_api_error_from_durable_error(exc) from exc

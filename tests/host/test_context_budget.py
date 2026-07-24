@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import dayu.host.context_budget as context_budget_module
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorResolution,
+)
 from dayu.host.context_budget import (
     BudgetEstimate,
     BudgetEstimateInput,
@@ -15,6 +21,10 @@ from dayu.host.context_budget import (
     BudgetTextFragment,
     ContextBudgetDecision,
     ContextBudgetOverageReason,
+    ContextEstimateMethod,
+    ContextPressureLevel,
+    ContextSizingFallbackReason,
+    ContextSizingStage,
     DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
@@ -24,6 +34,8 @@ from dayu.host.context_budget import (
     UsageObservation,
     USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
     USAGE_OBSERVATION_STATUS_OBSERVED,
+    build_conservative_context_sizing_result,
+    build_context_sizing_result,
     build_usage_observation_diagnostic,
     decide_context_budget,
     estimate_budget_text_tokens,
@@ -38,6 +50,7 @@ from dayu.host.context_policy import (
     default_context_budget_policy,
 )
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
@@ -56,6 +69,338 @@ from dayu.host.durable.transaction import HostTransaction
 
 _NOW = datetime(2026, 5, 18, 1, 2, 3, tzinfo=UTC)
 _TRIGGER_SOURCE_VALUES = tuple(source.value for source in ContextCompactionTriggerSource)
+
+
+def test_context_sizing_fallback_reason_has_only_sizing_owner_members() -> None:
+    """fallback reason只保留sizing owner实际产生的封闭成员。
+
+    :returns: ``None``。
+    :raises AssertionError: 错误owner的continuation source原因重新进入时抛出。
+    """
+
+    assert frozenset(reason.value for reason in ContextSizingFallbackReason) == (
+        frozenset(
+            {
+                "usage_missing",
+                "usage_invalid",
+                "usage_ambiguous",
+                "iteration_incomplete",
+                "iteration_completion_ambiguous",
+                "iteration_finish_reason_ineligible",
+                "iteration_link_missing",
+                "iteration_link_invalid",
+                "manifest_incomplete",
+                "manifest_mismatch",
+                "runner_call_kind_ineligible",
+                "provider_mismatch",
+                "model_mismatch",
+                "context_window_mismatch",
+                "estimator_contract_mismatch",
+                "request_semantics_mismatch",
+                "accepted_compact_invalidated",
+                "lineage_gap",
+                "anchor_value_invalid",
+                "prediction_non_positive",
+                "arithmetic_range_invalid",
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "estimated_tokens", "expected_pressure", "expected_decision"),
+    (
+        (
+            ContextSizingStage.ORDINARY,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.ORDINARY,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.COMPACT_SOFT_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.ORDINARY,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.POST_COMPACT,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.POST_COMPACT,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.POST_COMPACT,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.REACTIVE_POST_COMPACT,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.REACTIVE_POST_COMPACT,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.REACTIVE_POST_COMPACT,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.DISPATCH_FALLBACK,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.DISPATCH_FALLBACK,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.DISPATCH_FALLBACK,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
+        ),
+        (
+            ContextSizingStage.CONTINUATION,
+            100,
+            ContextPressureLevel.NORMAL,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.CONTINUATION,
+            850,
+            ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+        (
+            ContextSizingStage.CONTINUATION,
+            950,
+            ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+            ContextBudgetDecision.ALLOW_DISPATCH,
+        ),
+    ),
+)
+def test_context_sizing_stage_matrix_separates_pressure_from_action(
+    stage: ContextSizingStage,
+    estimated_tokens: int,
+    expected_pressure: ContextPressureLevel,
+    expected_decision: ContextBudgetDecision,
+) -> None:
+    """producer与result invariant共同冻结5x3 stage-aware action矩阵。
+
+    :param stage: 当前治理阶段。
+    :param estimated_tokens: normal、soft或hard区间的预测值。
+    :param expected_pressure: 只由阈值决定的压力。
+    :param expected_decision: 由stage与压力共同决定的动作。
+    """
+
+    policy = default_context_budget_policy(context_window_size=1024)
+    estimate = BudgetEstimate(
+        estimated_input_tokens=estimated_tokens,
+        input_budget_tokens=1024,
+        soft_threshold_tokens=819,
+        hard_threshold_tokens=921,
+        safety_margin_tokens=205,
+        estimator_digest=f"estimate:{stage.value}:{estimated_tokens}",
+        overage_reason=None,
+    )
+
+    sizing = build_conservative_context_sizing_result(
+        stage=stage,
+        candidate_input_cursor=1,
+        candidate_input_projection_ref="candidate:projection",
+        candidate_input_digest="candidate:digest",
+        policy=policy,
+        estimate=estimate,
+    )
+
+    assert sizing.pressure_level is expected_pressure
+    assert sizing.budget_decision is expected_decision
+    with pytest.raises(ValueError, match="budget_decision mismatch"):
+        replace(
+            sizing,
+            budget_decision=(
+                ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+                if expected_decision is not ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+                else ContextBudgetDecision.ALLOW_DISPATCH
+            ),
+        )
+
+
+def test_context_sizing_matrix_rejects_unknown_stage() -> None:
+    """五阶段矩阵对未知 stage fail closed。"""
+
+    with pytest.raises(AssertionError, match="matrix is not exhaustive"):
+        context_budget_module._stage_pressure_action(
+            cast(ContextSizingStage, "unknown-stage"),
+            ContextPressureLevel.NORMAL,
+        )
+
+
+def test_context_sizing_matrix_rejects_unknown_pressure() -> None:
+    """三压力矩阵对未知 pressure fail closed。"""
+
+    with pytest.raises(AssertionError, match="matrix is not exhaustive"):
+        context_budget_module._stage_pressure_action(
+            ContextSizingStage.ORDINARY,
+            cast(ContextPressureLevel, "unknown-pressure"),
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "usage_anchor_tokens",
+        "conservative_anchor_tokens",
+        "conservative_current_tokens",
+        "expected_prediction",
+    ),
+    (
+        (6_200, 6_000, 6_500, 6_700),
+        (6_200, 7_000, 6_000, 5_200),
+    ),
+)
+def test_usage_anchored_sizing_uses_signed_delta_without_clamp(
+    usage_anchor_tokens: int,
+    conservative_anchor_tokens: int,
+    conservative_current_tokens: int,
+    expected_prediction: int,
+) -> None:
+    """sizing owner精确实现``U_anchor + (E_current - E_anchor)``。
+
+    :param usage_anchor_tokens: ``U_anchor``。
+    :param conservative_anchor_tokens: ``E_anchor``。
+    :param conservative_current_tokens: ``E_current``。
+    :param expected_prediction: 预期signed-delta prediction。
+    """
+
+    policy = default_context_budget_policy(context_window_size=10_000)
+    result = build_context_sizing_result(
+        stage=ContextSizingStage.ORDINARY,
+        candidate_input_cursor=10,
+        candidate_input_projection_ref="candidate:projection",
+        candidate_input_digest=sha256_digest_json({"candidate": "current"}),
+        policy=policy,
+        estimate=_budget_estimate(conservative_current_tokens),
+        anchor_resolution=_anchor_resolution(
+            usage_tokens=usage_anchor_tokens,
+            conservative_tokens=conservative_anchor_tokens,
+        ),
+    )
+
+    assert result.estimate_method is ContextEstimateMethod.USAGE_ANCHORED
+    assert result.predicted_input_tokens == expected_prediction
+    assert result.anchor_diagnostic is not None
+    assert result.anchor_diagnostic.signed_delta_tokens == (
+        conservative_current_tokens - conservative_anchor_tokens
+    )
+    assert result.fallback_reason is None
+
+
+def test_usage_anchor_prediction_drives_current_soft_threshold_action() -> None:
+    """anchored P而非conservative E决定ordinary soft compaction。"""
+
+    policy = default_context_budget_policy(
+        context_window_size=10_000,
+        soft_threshold_context_ratio=0.65,
+        hard_threshold_context_ratio=0.9,
+    )
+    result = build_context_sizing_result(
+        stage=ContextSizingStage.ORDINARY,
+        candidate_input_cursor=10,
+        candidate_input_projection_ref="candidate:projection",
+        candidate_input_digest=sha256_digest_json({"candidate": "soft"}),
+        policy=policy,
+        estimate=_budget_estimate(
+            6_300,
+            soft_threshold_tokens=6_500,
+            hard_threshold_tokens=9_000,
+        ),
+        anchor_resolution=_anchor_resolution(
+            usage_tokens=6_200,
+            conservative_tokens=6_000,
+        ),
+    )
+
+    assert result.predicted_input_tokens == 6_500
+    assert result.pressure_level is ContextPressureLevel.SOFT_THRESHOLD_EXCEEDED
+    assert result.budget_decision is (
+        ContextBudgetDecision.COMPACT_SOFT_THRESHOLD
+    )
+
+
+@pytest.mark.parametrize(
+    ("usage_tokens", "anchor_tokens", "current_tokens", "reason"),
+    (
+        (
+            0,
+            7_000,
+            6_000,
+            ContextSizingFallbackReason.PREDICTION_NON_POSITIVE,
+        ),
+        (
+            1,
+            0,
+            context_budget_module.MAX_CONTEXT_TOKEN_COUNT,
+            ContextSizingFallbackReason.ARITHMETIC_RANGE_INVALID,
+        ),
+    ),
+)
+def test_invalid_anchor_arithmetic_falls_back_to_exact_current_estimate(
+    usage_tokens: int,
+    anchor_tokens: int,
+    current_tokens: int,
+    reason: ContextSizingFallbackReason,
+) -> None:
+    """非正或越界prediction无失败回退完整``E_current``。
+
+    :param usage_tokens: anchor usage tokens。
+    :param anchor_tokens: anchor conservative tokens。
+    :param current_tokens: 当前complete candidate estimate。
+    :param reason: 预期closed fallback reason。
+    """
+
+    policy = default_context_budget_policy(context_window_size=10_000)
+    result = build_context_sizing_result(
+        stage=ContextSizingStage.CONTINUATION,
+        candidate_input_cursor=10,
+        candidate_input_projection_ref="candidate:projection",
+        candidate_input_digest=sha256_digest_json({"candidate": "invalid"}),
+        policy=policy,
+        estimate=_budget_estimate(current_tokens),
+        anchor_resolution=_anchor_resolution(
+            usage_tokens=usage_tokens,
+            conservative_tokens=anchor_tokens,
+        ),
+    )
+
+    assert result.estimate_method is (
+        ContextEstimateMethod.CONSERVATIVE_FALLBACK
+    )
+    assert result.predicted_input_tokens == current_tokens
+    assert result.fallback_reason is reason
+    assert result.anchor_diagnostic is None
 
 
 def test_default_policy_computes_budget_thresholds_and_digest() -> None:
@@ -617,6 +962,63 @@ def _replace_inline_payload_json(
         WHERE event_id = ?
         """,
         (payload_json, event_id),
+    )
+
+
+def _budget_estimate(
+    estimated_tokens: int,
+    *,
+    soft_threshold_tokens: int = 8_000,
+    hard_threshold_tokens: int = 9_000,
+) -> BudgetEstimate:
+    """构造anchor formula测试使用的complete estimate。
+
+    :param estimated_tokens: 当前``E_current``。
+    :param soft_threshold_tokens: soft threshold。
+    :param hard_threshold_tokens: hard threshold。
+    :returns: complete budget estimate。
+    """
+
+    return BudgetEstimate(
+        estimated_input_tokens=estimated_tokens,
+        input_budget_tokens=10_000,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+        safety_margin_tokens=2_000,
+        estimator_digest=sha256_digest_json(
+            {"estimated_tokens": estimated_tokens}
+        ),
+        overage_reason=None,
+    )
+
+
+def _anchor_resolution(
+    *,
+    usage_tokens: int,
+    conservative_tokens: int,
+) -> ContextAnchorResolution:
+    """构造已由resolver证明compatible的typed anchor。
+
+    :param usage_tokens: ``U_anchor``。
+    :param conservative_tokens: ``E_anchor``。
+    :returns: anchored resolution。
+    """
+
+    return ContextAnchorResolution(
+        anchor=CompatibleContextAnchor(
+            manifest_event_id="event-manifest-anchor",
+            manifest_payload_ref="payload-manifest-anchor",
+            manifest_digest=sha256_digest_json({"manifest": "anchor"}),
+            iteration_link_event_id="event-link-anchor",
+            usage_event_id="event-usage-anchor",
+            usage_observation_digest=sha256_digest_json(
+                {"usage": usage_tokens}
+            ),
+            iteration_completed_event_id="event-completion-anchor",
+            usage_anchor_tokens=usage_tokens,
+            conservative_anchor_tokens=conservative_tokens,
+        ),
+        fallback_reason=None,
     )
 
 

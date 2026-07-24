@@ -69,7 +69,6 @@ from dayu.host import (
 from dayu.host.api import AuthorizationClaim, HostLocalExecutionOptions
 from dayu.host.command import (
     HostCommandHandle,
-    create_host_command_handle,
     expire_wait,
     start_run,
 )
@@ -142,6 +141,7 @@ from tests.host.test_resolve_wait_command import (
     _seed_waiting_run,
     _set_wait_deadline_text,
 )
+from tests.host.execution_handle_support import create_execution_command_handle
 
 T = TypeVar("T")
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
@@ -574,9 +574,19 @@ def _seed_waiting_run_with_queued_successor(
         ),
         local_execution=None,
     )
-    seed_host = create_host_command_handle(command_options)
+    seed_host = create_execution_command_handle(
+        command_options,
+        ordinary_run_baseline=options.ordinary_run_baseline,
+        memory_projection_policy=options.memory_projection_policy,
+        tooling_options=options.tooling_options,
+        context_budget_policy=options.context_budget_policy,
+        enable_truncation_manager=options.enable_truncation_manager,
+    )
     try:
-        seeded = _seed_waiting_run(seed_host)
+        seeded = _seed_waiting_run(
+            seed_host,
+            tooling_options=options.tooling_options,
+        )
         if deadline_text is not None:
             _set_wait_deadline_text(
                 seed_host._transaction_runner(),
@@ -635,9 +645,15 @@ async def _assert_terminal_before_promoted_start(
     )
 
     promoted = await asyncio.wait_for(anext(watcher), timeout=1.0)
-    assert isinstance(promoted, HostEvent)
-    assert promoted.run_id == run_b_id
-    assert promoted.event_type == "RUN_STARTED"
+    while not (
+        isinstance(promoted, HostEvent)
+        and promoted.run_id == run_b_id
+        and promoted.event_type == "RUN_STARTED"
+    ):
+        assert isinstance(promoted, HostEvent)
+        assert promoted.run_id == run_b_id
+        assert promoted.event_type == "RUNNER_CALL_INPUT_ASSEMBLED"
+        promoted = await asyncio.wait_for(anext(watcher), timeout=1.0)
 
 
 async def _close_terminal_barrier_watcher(
@@ -2049,19 +2065,6 @@ async def test_open_host_wait_poller_resolves_waiting_run_in_background(
 
     factory = _FinalAnswerWorkerFactory()
     base_options = _options(tmp_path, factory)
-    seed_command_options = replace(
-        _command_options_from_open_host_options(
-            base_options,
-            host_handle_id="host-open-runtime-poller-seed",
-        ),
-        local_execution=None,
-    )
-    seed_host = create_host_command_handle(seed_command_options)
-    try:
-        seeded = _seed_waiting_run(seed_host)
-    finally:
-        seed_host.close()
-
     adapter = _ReadyPollAdapter()
     options = replace(
         base_options,
@@ -2070,6 +2073,28 @@ async def test_open_host_wait_poller_resolves_waiting_run_in_background(
         ),
         wait_poller_policy=_wait_poller_policy(),
     )
+    seed_command_options = replace(
+        _command_options_from_open_host_options(
+            options,
+            host_handle_id="host-open-runtime-poller-seed",
+        ),
+        local_execution=None,
+    )
+    seed_host = create_execution_command_handle(
+        seed_command_options,
+        ordinary_run_baseline=options.ordinary_run_baseline,
+        memory_projection_policy=options.memory_projection_policy,
+        tooling_options=options.tooling_options,
+        context_budget_policy=options.context_budget_policy,
+        enable_truncation_manager=options.enable_truncation_manager,
+    )
+    try:
+        seeded = _seed_waiting_run(
+            seed_host,
+            tooling_options=options.tooling_options,
+        )
+    finally:
+        seed_host.close()
 
     async with open_host(options) as host:
         final_run = await _wait_for_run_status(

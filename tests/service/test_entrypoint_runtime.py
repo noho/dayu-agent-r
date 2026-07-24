@@ -6,7 +6,7 @@ import ast
 import asyncio
 import json
 from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -29,6 +29,7 @@ from dayu.host.api import (
     HostActivitySeverity,
     HostActivityStatus,
     HostActivityView,
+    HostContextUsageView,
     HostCallContext,
     HostClosedError,
     HostContentDelta,
@@ -60,6 +61,8 @@ from dayu.host.api import (
     SessionStatus,
     SubmitFollowupRequest,
     TerminalResultSummary,
+    ContextEstimateMethod,
+    ContextPressureLevel,
     is_terminal_run_status,
 )
 from dayu.service.entrypoint_runtime import (
@@ -68,6 +71,9 @@ from dayu.service.entrypoint_runtime import (
     EntrypointActivityKind,
     EntrypointActivitySeverity,
     EntrypointActivityStatus,
+    EntrypointContextEstimateMethod,
+    EntrypointContextPressureLevel,
+    EntrypointContextUsage,
     EntrypointThinking,
     EntrypointThinkingCallback,
     EntrypointCallbackExecutionPort,
@@ -1292,6 +1298,89 @@ async def test_submit_entrypoint_turn_emits_host_public_activity(
     assert activity.counts.completed == 2
     assert activity.counts.failed == 0
     assert activity.counts.cancelled == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_maps_context_usage_without_recalculation(
+    tmp_path: Path,
+) -> None:
+    """submit helper 应逐字段交付 Host canonical context usage。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises Exception: runtime 准备或事件消费失败时透传。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _context_usage_activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="context-budget-fact",
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+        callback_execution_port=_InlineCallbackExecutionPort(),
+    )
+
+    assert len(activities) == 1
+    activity = activities[0]
+    assert activity.kind is EntrypointActivityKind.CONTEXT_USAGE
+    assert activity.status is EntrypointActivityStatus.INFO
+    assert activity.summary is None
+    assert activity.tool_name is None
+    assert activity.tool_display_name is None
+    assert activity.counts is None
+    assert activity.context_usage == EntrypointContextUsage(
+        predicted_input_tokens=777,
+        context_window_size=1_000,
+        utilization_basis_points=12_345,
+        soft_threshold_tokens=800,
+        hard_threshold_tokens=900,
+        estimate_method=EntrypointContextEstimateMethod.CONSERVATIVE_FALLBACK,
+        pressure_level=EntrypointContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
+    )
+
+
+def test_entrypoint_context_usage_requires_strict_threshold_ordering() -> None:
+    """Service public DTO接受严格顺序并直接拒绝相等阈值。
+
+    :returns: ``None``。
+    :raises AssertionError: entrypoint boundary未保持``soft < hard``时抛出。
+    """
+
+    usage = EntrypointContextUsage(
+        predicted_input_tokens=700,
+        context_window_size=1_000,
+        utilization_basis_points=7_000,
+        soft_threshold_tokens=800,
+        hard_threshold_tokens=900,
+        estimate_method=EntrypointContextEstimateMethod.CONSERVATIVE_FALLBACK,
+        pressure_level=EntrypointContextPressureLevel.NORMAL,
+    )
+
+    assert usage.soft_threshold_tokens < usage.hard_threshold_tokens
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"EntrypointContextUsage\.soft_threshold_tokens must be less than "
+            r"hard_threshold_tokens"
+        ),
+    ):
+        replace(
+            usage,
+            soft_threshold_tokens=usage.hard_threshold_tokens,
+        )
 
 
 @pytest.mark.asyncio
@@ -3320,6 +3409,56 @@ def _activity_event(
                 completed=2,
                 failed=0,
                 cancelled=0,
+            ),
+        ),
+        dedupe_key=dedupe_key,
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _context_usage_activity_event(
+    *,
+    event_sequence: int,
+    run_id: str,
+    dedupe_key: str,
+) -> HostEvent:
+    """构造带 canonical context usage 的 progress HostEvent。
+
+    :param event_sequence: event sequence。
+    :param run_id: Run id。
+    :param dedupe_key: Host public dedupe key。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"activity-{run_id}-{event_sequence}",
+        event_sequence=event_sequence,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.CANONICAL_FACT,
+        event_type="CONTEXT_BUDGET_EVALUATED",
+        kind=HostEventKind.PROGRESS,
+        activity=HostActivityView(
+            kind=HostActivityKind.CONTEXT_USAGE,
+            status=HostActivityStatus.INFO,
+            title="上下文预算已评估",
+            summary=None,
+            severity=HostActivitySeverity.INFO,
+            tool_name=None,
+            tool_display_name=None,
+            counts=None,
+            context_usage=HostContextUsageView(
+                predicted_input_tokens=777,
+                context_window_size=1_000,
+                utilization_basis_points=12_345,
+                soft_threshold_tokens=800,
+                hard_threshold_tokens=900,
+                estimate_method=ContextEstimateMethod.CONSERVATIVE_FALLBACK,
+                pressure_level=ContextPressureLevel.HARD_THRESHOLD_EXCEEDED,
             ),
         ),
         dedupe_key=dedupe_key,

@@ -6,7 +6,6 @@ import json
 import logging
 import os
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,6 +62,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CreateRunningRunInput,
@@ -391,9 +391,6 @@ def test_followup_queue_with_active_creates_queued_run_with_supplied_target(
         assert _count_rows(store.transaction_runner, "host_attempts") == 0
         assert spy.dispatches == []
         assert spy.promotions == [session_id]
-        skipped = service.promote_next_queued_run(session_id)
-        assert skipped.skipped is True
-        assert skipped.promoted_run is None
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
             RunStatus.QUEUED
         )
@@ -774,55 +771,6 @@ def test_unknown_queue_policy_raises_value_error_without_transaction(
         assert _event_count(store.transaction_runner) == before
 
 
-def test_promotion_skips_with_active_then_promotes_earliest_queued_run(
-    tmp_path: Path,
-) -> None:
-    """promotion active skip 不报错；释放 active 后按 accepted sequence FIFO。"""
-
-    with open_host_durable_store(_options(tmp_path)) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-        spy = _WakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
-        active = _seed_active_run(store.transaction_runner, session_id=session_id)
-        first_queued = service.submit_followup_queue(
-            SubmitFollowupQueueAdmissionInput(
-                request=_followup_request(
-                    session_id=session_id,
-                    client_request_id="follow-b",
-                    display_text="first queued",
-                ),
-                resolved_execution_target="first-target",
-            ),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
-        second_queued = service.submit_followup_queue(
-            SubmitFollowupQueueAdmissionInput(
-                request=_followup_request(
-                    session_id=session_id,
-                    client_request_id="follow-a",
-                    display_text="second queued",
-                ),
-                resolved_execution_target="second-target",
-            ),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
-        skipped = service.promote_next_queued_run(session_id)
-
-        _closeout_active(store.transaction_runner, active.run.run_id)
-        promoted = service.promote_next_queued_run(session_id)
-
-        assert skipped.skipped is True
-        assert skipped.skip_reason is not None
-        assert skipped.skip_reason.value == "active_run_exists"
-        assert promoted.promoted_run is not None
-        assert promoted.promoted_run.run_id == first_queued.run.run_id
-        assert promoted.promoted_run.execution_target == "first-target"
-        assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
-            RunStatus.QUEUED
-        )
-        assert len(spy.dispatches) == 1
-
-
 def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
     tmp_path: Path,
 ) -> None:
@@ -959,7 +907,7 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
         assert spy.dispatches == []
 
 
-def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
+def test_cancel_predispatch_starting_emits_notice_without_direct_queue_wakeup(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """active cancel 不触碰 ordinary promotion port，仍交付 exact notice。"""
@@ -1002,52 +950,6 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
         )
         assert spy.promotions == []
         assert "queue_promotion_wakeup_failed" not in caplog.text
-
-
-def test_promote_after_release_reports_delegated_to_governance(
-    tmp_path: Path,
-) -> None:
-    """active slot 释放后的 wakeup 结果不谎称 active Run 仍存在。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    """
-
-    assert tmp_path.exists()
-    assert not hasattr(admission_module, "_promote_after_release")
-
-
-def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
-    tmp_path: Path,
-) -> None:
-    """promotion 提交后 dispatch wakeup 失败不掩盖 promotion 结果。"""
-
-    with open_host_durable_store(_options(tmp_path)) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-        spy = _ToggleFailingWakeupSpy()
-        service = _service(store.transaction_runner, spy=spy)
-        active = _seed_active_run(store.transaction_runner, session_id=session_id)
-        queued = service.submit_followup_queue(
-            SubmitFollowupQueueAdmissionInput(
-                request=_followup_request(
-                    session_id=session_id,
-                    client_request_id="follow-dispatch-wakeup-fails",
-                ),
-                resolved_execution_target="queued-target",
-            ),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
-        _closeout_active(store.transaction_runner, active.run.run_id)
-        spy.fail_dispatch = True
-
-        result = service.promote_next_queued_run(session_id)
-
-        assert result.promoted_run is not None
-        assert result.promoted_run.run_id == queued.run.run_id
-        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
-            RunStatus.RUNNING
-        )
-        assert len(spy.dispatches) == 1
 
 
 def test_start_run_survives_after_commit_projection_catchup_failure(
@@ -1229,7 +1131,7 @@ def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
         assert projection.calls == 2
 
 
-def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
+def test_terminal_closeout_emits_notice_without_direct_queue_wakeup(
     tmp_path: Path,
 ) -> None:
     """terminal closeout 不调用 ordinary promotion port。"""
@@ -1458,57 +1360,6 @@ def test_rollback_before_cancel_commit_does_not_wake_or_promote(
         )
 
 
-def test_concurrent_promotion_attempts_promote_at_most_one_run(
-    tmp_path: Path,
-) -> None:
-    """两个进程式连接竞争 promotion 时最多一个 queued Run 进入 running。"""
-
-    db_path = tmp_path / "durable.sqlite3"
-    artifact_root = tmp_path / "artifacts"
-    options = _options_for_path(db_path, artifact_root)
-    session_id = ""
-    with open_host_durable_store(options) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-        service = _service(store.transaction_runner, label="seed")
-        active = _seed_active_run(store.transaction_runner, session_id=session_id)
-        service.submit_followup_queue(
-            SubmitFollowupQueueAdmissionInput(
-                request=_followup_request(
-                    session_id=session_id,
-                    client_request_id="follow-one",
-                ),
-                resolved_execution_target="target-one",
-            ),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
-        _closeout_active(store.transaction_runner, active.run.run_id)
-
-    def promote(label: str) -> tuple[bool, str | None]:
-        """在独立连接中执行一次 promotion。
-
-        :param label: 测试 id 标签。
-        :returns: 是否 promotion 成功与 Run id。
-        """
-
-        with open_host_durable_store(options) as thread_store:
-            result = _service(thread_store.transaction_runner, label=label).promote_next_queued_run(
-                session_id
-            )
-            return (
-                result.promoted_run is not None,
-                result.promoted_run.run_id if result.promoted_run is not None else None,
-            )
-        raise AssertionError("promotion worker did not return")
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        assert session_id != ""
-        results = tuple(executor.map(promote, ("worker-a", "worker-b")))
-
-    assert sum(1 for promoted, _run_id in results if promoted) == 1
-    with open_host_durable_store(options) as store:
-        assert _count_running_runs(store.transaction_runner, session_id) == 1
-
-
 def _service(
     transaction_runner: HostTransactionRunner,
     *,
@@ -1538,8 +1389,13 @@ def _service(
         wakeup_port=spy if spy is not None else _WakeupSpy(),
         projection_catchup_port=projection_catchup,
         event_log_store=event_log_store,
+        payload_store=PayloadStore(),
         ordinary_run_baseline=_ordinary_run_baseline(),
         tooling_options=None,
+        context_budget_policy=None,
+        memory_projection_policy=None,
+        enable_truncation_manager=False,
+        owner_host_instance_id=None,
     )
 
 

@@ -99,6 +99,7 @@ from dayu.host.durable.connection import (
 )
 from dayu.host.durable.options import project_host_durable_store_options
 from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.outbox import (
     DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
@@ -675,6 +676,7 @@ class _SessionAttachmentRecoveryActorOperation:
             session_id=self.session_id,
             transaction_runner=handle._transaction_runner(),
             event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
             dispatch_wakeup_port=self.wakeup_port,
             terminal_post_commit_port=self.terminal_post_commit_port,
             recovery_owner_host_instance_id=self.recovery_owner_host_instance_id,
@@ -803,6 +805,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
     terminal_post_commit_port: TerminalPostCommitPort
     policy: WaitPollerRuntimePolicy
     owner_id: str
+    open_options: OpenHostOptions
 
     def create_wait_poller(
         self,
@@ -825,6 +828,17 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
                 durable_store.transaction_runner,
                 wakeup_port=self.wakeup_port,
                 terminal_post_commit_port=self.terminal_post_commit_port,
+                payload_store=PayloadStore(),
+                ordinary_run_baseline=self.open_options.ordinary_run_baseline,
+                tooling_options=self.open_options.tooling_options,
+                context_budget_policy=self.open_options.context_budget_policy,
+                memory_projection_policy=(
+                    self.open_options.memory_projection_policy
+                ),
+                enable_truncation_manager=(
+                    self.open_options.enable_truncation_manager
+                ),
+                owner_host_instance_id=self.owner_id,
             )
             command_handle = HostCommandHandle(
                 host_handle_id=self.owner_id,
@@ -895,9 +909,18 @@ class _ExecutionCommandHandleFactory:
                 durable_store.transaction_runner,
                 wakeup_port=self.wakeup_port,
                 terminal_post_commit_port=self.terminal_post_commit_port,
+                payload_store=PayloadStore(),
                 projection_catchup_port=None,
                 ordinary_run_baseline=self.open_options.ordinary_run_baseline,
                 tooling_options=self.open_options.tooling_options,
+                context_budget_policy=self.open_options.context_budget_policy,
+                memory_projection_policy=(
+                    self.open_options.memory_projection_policy
+                ),
+                enable_truncation_manager=(
+                    self.open_options.enable_truncation_manager
+                ),
+                owner_host_instance_id=self.host_handle_id,
             )
             return HostCommandHandle(
                 host_handle_id=self.host_handle_id,
@@ -938,6 +961,13 @@ class _AdminCommandHandleFactory:
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
                 terminal_post_commit_port=terminal_post_commit_port,
+                payload_store=PayloadStore(),
+                ordinary_run_baseline=None,
+                tooling_options=None,
+                context_budget_policy=None,
+                memory_projection_policy=None,
+                enable_truncation_manager=False,
+                owner_host_instance_id=None,
             )
             return HostCommandHandle(
                 host_handle_id=self.host_handle_id,
@@ -2339,6 +2369,7 @@ def _wait_poller_supervisor_from_open_host_options(
             terminal_post_commit_port=terminal_post_commit_port,
             policy=configuration.policy,
             owner_id=owner_id,
+            open_options=options,
         ),
         policy=configuration.policy,
         owner_id=owner_id,

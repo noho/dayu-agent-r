@@ -53,7 +53,6 @@ from dayu.host.durable.state import (
     dispatch_record_row_from_host_row,
     is_terminal_attempt_status,
     is_terminal_run_status,
-    promote_queued_run_row,
     read_active_run_for_session,
     read_cancelling_runs_for_session,
     read_non_terminal_runs_for_session,
@@ -91,9 +90,8 @@ _STARTED_RUN_STATUSES = (
 
 
 class _StartTransitionKind(StrEnum):
-    """测试覆盖的四类 start transition。"""
+    """测试覆盖的三类 start transition。"""
 
-    PROMOTE_QUEUED = "promote_queued"
     START_UNSTARTED = "start_unstarted"
     RESUME_WAITING = "resume_waiting"
     START_RECOVERING = "start_recovering"
@@ -145,16 +143,6 @@ def _apply_start_transition(
     :raises AssertionError: ``transition_kind`` 不属于受测封闭集合时抛出。
     """
 
-    if transition_kind is _StartTransitionKind.PROMOTE_QUEUED:
-        return promote_queued_run_row(
-            transaction,
-            session_id=session_id,
-            run_id=run_id,
-            started_event_id=started_event_id,
-            started_event_sequence=started_event_sequence,
-            current_attempt_id=next_attempt_id,
-            updated_at=_TIMESTAMP,
-        )
     if transition_kind is _StartTransitionKind.START_UNSTARTED:
         return start_unstarted_run_row(
             transaction,
@@ -554,7 +542,6 @@ def test_session_snapshot_active_run_matches_owner_derived_public_read(
 @pytest.mark.parametrize(
     ("transition_kind", "target_status"),
     (
-        (_StartTransitionKind.PROMOTE_QUEUED, RunStatus.QUEUED),
         (_StartTransitionKind.START_UNSTARTED, RunStatus.ACCEPTED),
         (_StartTransitionKind.RESUME_WAITING, RunStatus.WAITING),
         (_StartTransitionKind.START_RECOVERING, RunStatus.RECOVERING),

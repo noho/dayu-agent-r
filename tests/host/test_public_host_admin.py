@@ -36,6 +36,7 @@ from dayu.host.command import HostCommandHandle
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import project_host_durable_store_options
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.transaction import HostTransactionRunner
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import SessionAttachmentRecoveryScanner
@@ -235,7 +236,13 @@ def _seed_nonterminal_runs(tmp_path: Path) -> str:
         admission_service=create_host_admission_service(
             durable_store.transaction_runner,
             terminal_post_commit_port=terminal_post_commit_port,
+            payload_store=PayloadStore(),
             ordinary_run_baseline=_ordinary_baseline(),
+            tooling_options=None,
+            context_budget_policy=None,
+            memory_projection_policy=None,
+            enable_truncation_manager=False,
+            owner_host_instance_id=None,
         ),
         active_registry=ActiveWorkerRegistry(),
         terminal_post_commit_port=terminal_post_commit_port,

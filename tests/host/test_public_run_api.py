@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -46,8 +47,21 @@ from dayu.host.durable.state import (
     run_snapshot_from_row,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.queue_policy import RunQueuePolicy
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline("public-run-api"),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
     """构造测试用 Host command handle options。
 
@@ -78,7 +92,7 @@ def _open_handle(tmp_path: Path) -> HostCommandHandle:
     :returns: Host command handle。
     """
 
-    return create_host_command_handle(_options(tmp_path))
+    return _create_execution_handle(_options(tmp_path))
 
 
 def _durable_run_row(status: RunStatus) -> RunRow:
@@ -462,7 +476,7 @@ def test_start_run_accepts_and_attach_active_returns_unstarted_run(
     """public attach_active 可附着 ACCEPTED active Run 且不写新事件。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         accepted = start_run(host, _start_request(session_id, "start-1"))
@@ -507,7 +521,7 @@ def test_get_run_returns_durable_status_and_cursor(
     """get_run 返回 accepted、queued、cancelled Run 的 durable truth。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         accepted = start_run(host, _start_request(session_id, "start-accepted"))
@@ -562,7 +576,7 @@ def test_start_run_idempotent_replay_returns_latest_snapshot_without_events(
     """start_run 幂等重放返回当前 Run snapshot，且不追加重复事实。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         request = _start_request(session_id, "start-1")
@@ -603,23 +617,20 @@ def test_start_run_same_key_different_digest_conflicts(tmp_path: Path) -> None:
         host.close()
 
 
-def test_submit_followup_queue_requires_opener_baseline(tmp_path: Path) -> None:
-    """低层 command handle 无 opener baseline 时 submit_followup fail closed。"""
+def test_start_run_requires_opener_baseline(tmp_path: Path) -> None:
+    """低层 admin command handle 无 opener baseline 时 start_run fail closed。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host)
-        start_run(host, _start_request(session_id, "start-1"))
-        before_followup = _event_count(options.db_path)
+        before_start = _event_count(options.db_path)
 
         with pytest.raises(HostApiError) as exc_info:
-            submit_followup(
-                host, session_id, _followup_request(session_id, "follow-queued")
-            )
+            start_run(host, _start_request(session_id, "start-1"))
 
         assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
-        assert _event_count(options.db_path) == before_followup
+        assert _event_count(options.db_path) == before_start
     finally:
         host.close()
 
@@ -630,7 +641,7 @@ def test_submit_followup_steer_rejects_unstarted_target_without_event_append(
     """submit_followup(steer) 对未启动 target 返回 invalid state 且不追加 EventLog。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         active = start_run(host, _start_request(session_id, "start-1"))
@@ -684,7 +695,7 @@ def test_get_run_uses_durable_status_when_minimal_read_model_is_missing(
     """minimal RunResult 缺失不改变 public RunSnapshot durable truth。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start-1"))
@@ -705,7 +716,7 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
     """public queued cancel 与 active cancel/promotion 竞争时保持 first-committer-wins。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         active = start_run(host, _start_request(session_id, "start-1"))
@@ -721,7 +732,7 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
         :returns: cancel 后状态。
         """
 
-        worker = create_host_command_handle(options)
+        worker = _create_execution_handle(options)
         try:
             return cancel_run(
                 worker, active.run_id, _cancel_request("cancel-active")
@@ -735,7 +746,7 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
         :returns: cancel 后状态。
         """
 
-        worker = create_host_command_handle(options)
+        worker = _create_execution_handle(options)
         try:
             return cancel_run(
                 worker, queued.run_id, _cancel_request("cancel-queued")
@@ -765,7 +776,7 @@ def test_retry_replay_reject_non_terminal_and_purge_rejects_open_session(
     """retry/replay 对非目标源状态 fail closed；purge 拒绝未关闭 Session。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start-1"))
@@ -818,7 +829,7 @@ def test_purge_session_deletes_run_truth_and_retry_replay_fail_not_found(
     """purge 后 Run read/retry/replay 都按缺失事实 fail closed。"""
 
     options = _options(tmp_path)
-    host = create_host_command_handle(options)
+    host = _create_execution_handle(options)
     try:
         session_id = _session_id(host)
         run = start_run(host, _start_request(session_id, "start-purge"))

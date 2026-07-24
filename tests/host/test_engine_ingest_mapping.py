@@ -28,6 +28,11 @@ from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.error_codes import (
@@ -87,9 +92,19 @@ from dayu.host.terminal_post_commit import TerminalPostCommitNotice
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
     RunnerCallProjectorMetadata,
+    RunnerCallSizingSnapshot,
+    RunnerCallSizingUnavailableReason,
+    complete_runner_call_sizing_snapshot,
     complete_runner_call_hot_diagnostic,
+    parse_runner_call_hot_payload,
+    parse_runner_call_manifest,
     runner_call_hot_payload,
     runner_call_projector_metadata_descriptor,
+    unavailable_runner_call_sizing_snapshot,
+)
+from dayu.host._execution_config_projection import (
+    effective_execution_config_json,
+    effective_execution_snapshot_from_json,
 )
 from dayu.host.api import (
     AttemptStatus,
@@ -108,10 +123,13 @@ from dayu.host.api import (
     WaitResolutionSource,
 )
 from dayu.host.context_events import (
+    CONTEXT_BUDGET_EVALUATED,
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    append_context_budget_evaluated_in_transaction,
+    parse_context_budget_evaluated_payload,
 )
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
@@ -136,6 +154,22 @@ from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
 )
+from dayu.host.context_budget import (
+    CONTEXT_ESTIMATOR_CONTRACT,
+    BudgetEstimate,
+    ContextBudgetDecision,
+    ContextEstimateMethod,
+    ContextEstimatorContract,
+    ContextPressureLevel,
+    ContextSizingFallbackReason,
+    ContextSizingStage,
+    build_conservative_context_sizing_result_from_atoms,
+)
+from dayu.host.context_anchor import (
+    CompatibleContextAnchor,
+    ContextAnchorQuery,
+    ContextAnchorResolution,
+)
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
@@ -145,6 +179,7 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.idempotency import IdempotencyStore
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     register_current_instance,
@@ -167,6 +202,8 @@ from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     FailRecoveringRunInput,
     RunTransitionResult,
+    StartRecoveryRunInput,
+    StartGovernedRunInput,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     active_cancel_watchdog_closeout_in_transaction,
@@ -178,6 +215,7 @@ from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
@@ -207,8 +245,28 @@ from dayu.host.lifecycle_events import (
     closeout_attempt_terminal_event_type_for_status,
     run_terminal_event_type_for_status,
 )
-from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.memory import (
+    MemoryProjectionPolicy,
+    default_memory_projection_policy,
+)
+from dayu.host.memory_repair import (
+    ConversationMemoryProjectionRepairResult,
+    catch_up_conversation_memory_projection,
+)
 from dayu.host.payload_resolution import event_payload_object
+from dayu.host.run_input import (
+    PolicySnapshot,
+    PreparedRunnerCallCandidate,
+    PreparedRunnerCallSourceError,
+    PreparedRunnerCallSourceFailureCategory,
+    SessionContinuityView,
+    ToolExecutionMode,
+    _prepared_candidate_payload_ref,
+    load_prepared_runner_call_candidate_in_transaction,
+    load_prepared_runner_call_source_in_transaction,
+    prepare_runner_call_candidate_in_transaction,
+    record_prepared_runner_call_candidate_in_transaction,
+)
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
 from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
@@ -264,6 +322,15 @@ class _EngineHotTamperKind(StrEnum):
     STATUS_MISMATCH = "status_mismatch"
     COUNT_MISMATCH = "count_mismatch"
     DIGEST_MISMATCH = "digest_mismatch"
+
+
+class _ReactiveSourceTamperKind(StrEnum):
+    """reactive source strict-load 的 durable 篡改分类。"""
+
+    EFFECTIVE_CONFIG_MISSING = "effective_config_missing"
+    MANIFEST_MISSING = "manifest_missing"
+    CANDIDATE_DIGEST_MISMATCH = "candidate_digest_mismatch"
+    TOOL_SNAPSHOT_MISSING = "tool_snapshot_missing"
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,7 +781,10 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
     """final_answer 映射为 ATTEMPT_SUCCEEDED 与 RUN_SUCCEEDED。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         candidate = _candidate(
             seeded,
             worker_event_index=1,
@@ -733,7 +803,7 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.status == EngineIngestStatus.ACCEPTED, result.reason
         assert result.terminal_closeout is True
         assert result.terminal_notice is not None
         assert result.terminal_notice.wake_queue_promotion is True
@@ -1031,7 +1101,10 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
     )
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         wakeup = _WakeupSpy()
         policy = replace(
             _reactive_policy(),
@@ -1069,6 +1142,12 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             "ATTEMPT_FAILED",
             "RUN_RECOVERING",
             CONTEXT_COMPACTED,
+        )
+        assert event_types[-4:] == (
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            "CONTEXT_BUDGET_EVALUATED",
+            "RUN_STARTED",
+            "ATTEMPT_STARTED",
         )
         requested_payload = _payload(result.events[0])
         assert requested_payload["operation_id"] == result.events[0].event_id
@@ -1129,14 +1208,117 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert len(wakeup.dispatches) == 1
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
+        recovery_manifest_event = result.events[-4]
+        hot = parse_runner_call_hot_payload(
+            _payload(recovery_manifest_event)
+        )
+        manifest_json = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=hot.manifest_payload_ref,
+                payload_digest=hot.manifest_digest,
+                payload_label="recovery manifest",
+            )
+        )
+        manifest = parse_runner_call_manifest(
+            manifest_json,
+            hot_payload=hot,
+        )
+        recovery_attempt_id = hot.attempt_id
+        recovery_execution_id = hot.execution_id
+        assert recovery_attempt_id is not None
+        assert recovery_execution_id is not None
+        policy_snapshot, _config = _source_policy_snapshot_and_config()
+        loaded = store.transaction_runner.run_read(
+            lambda transaction: (
+                    load_prepared_runner_call_candidate_in_transaction(
+                        transaction,
+                        EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=recovery_attempt_id,
+                    execution_id=recovery_execution_id,
+                    policy_snapshot=policy_snapshot,
+                )
+            )
+        )
+        assert manifest.sizing_snapshot.sizing_stage is (
+            ContextSizingStage.REACTIVE_POST_COMPACT
+        )
+        assert manifest.sizing_snapshot.input_snapshot_digest == (
+            loaded.input_snapshot_digest
+        )
+        assert loaded.tool_execution_mode is (
+            ToolExecutionMode.NO_TOOL_DISABLED
+        )
+        assert wakeup.dispatches[0].attempt_id == hot.attempt_id
+        assert wakeup.dispatches[0].execution_id == hot.execution_id
 
 
 @pytest.mark.asyncio
-async def test_reactive_memory_catch_up_failure_still_starts_recovery(
+async def test_reactive_reuses_source_frozen_tool_snapshot_and_mode(
+    tmp_path: Path,
+) -> None:
+    """recovery candidate 精确复用 source tool schema 与 execution mode。
+
+    :param tmp_path: pytest 临时目录。
+    """
+
+    source_schema = _reactive_source_tool_schema()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_tool_schema=source_schema,
+        )
+        wakeup = _WakeupSpy()
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(
+                seeded,
+                worker_event_index=151,
+            )
+        )
+
+        hot = parse_runner_call_hot_payload(_payload(result.events[-4]))
+        recovery_attempt_id = hot.attempt_id
+        recovery_execution_id = hot.execution_id
+        assert recovery_attempt_id is not None
+        assert recovery_execution_id is not None
+        policy_snapshot, _config = _source_policy_snapshot_and_config(
+            allow_tool_calls=True,
+        )
+        loaded = store.transaction_runner.run_read(
+            lambda transaction: (
+                    load_prepared_runner_call_candidate_in_transaction(
+                        transaction,
+                        EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=recovery_attempt_id,
+                    execution_id=recovery_execution_id,
+                    policy_snapshot=policy_snapshot,
+                )
+            )
+        )
+
+        assert loaded.tool_schemas == (source_schema,)
+        assert loaded.disable_tools is False
+        assert loaded.tool_execution_mode is ToolExecutionMode.TOOL_ENABLED
+        assert len(wakeup.dispatches) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_memory_catch_up_failure_blocks_recovery_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """accepted compact 后 memory catch-up 失败不阻断 recovery attempt。"""
+    """accepted compact 后 memory catch-up 失败必须零 start、零 wake。"""
 
     def fail_memory_catch_up(
         transaction_runner: HostTransactionRunner,
@@ -1164,7 +1346,10 @@ async def test_reactive_memory_catch_up_failure_still_starts_recovery(
         fail_memory_catch_up,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         wakeup = _WakeupSpy()
 
         result = await EngineEventIngestor(
@@ -1178,12 +1363,528 @@ async def test_reactive_memory_catch_up_failure_still_starts_recovery(
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=52))
 
         assert result.status is EngineIngestStatus.ACCEPTED
-        assert tuple(event.event_type for event in result.events)[-2:] == (
+        assert result.events[-1].event_type == CONTEXT_COMPACTED
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status is RunStatus.RECOVERING
+        assert attempt_status is AttemptStatus.FAILED
+        assert wakeup.dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_reactive_memory_catch_up_not_reached_blocks_recovery_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """memory 未达到 compact exact cursor 时零 start、零 wake。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    original_catch_up = catch_up_conversation_memory_projection
+
+    def report_target_not_reached(
+        transaction_runner: HostTransactionRunner,
+        *,
+        policy: MemoryProjectionPolicy,
+        batch_size: int,
+        max_event_sequence: int,
+    ) -> ConversationMemoryProjectionRepairResult:
+        """完成真实 projection 后注入 target-not-reached 汇总。
+
+        :param transaction_runner: Host transaction runner。
+        :param policy: memory projection policy。
+        :param batch_size: projection batch size。
+        :param max_event_sequence: required compact cursor。
+        :returns: target 未达的 typed repair result。
+        """
+
+        result = original_catch_up(
+            transaction_runner,
+            policy=policy,
+            batch_size=batch_size,
+            max_event_sequence=max_event_sequence,
+        )
+        return replace(result, target_reached=False)
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "catch_up_conversation_memory_projection",
+        report_target_not_reached,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(
+                seeded,
+                worker_event_index=53,
+            )
+        )
+
+        assert result.events[-1].event_type == CONTEXT_COMPACTED
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.RECOVERING,
+            AttemptStatus.FAILED,
+        )
+        assert wakeup.dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_reactive_recovery_requires_terminal_source_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """source Attempt 非终态时不得选择 reactive post-compact stage。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    original_catch_up = catch_up_conversation_memory_projection
+
+    def make_source_nonterminal(
+        transaction_runner: HostTransactionRunner,
+        *,
+        policy: MemoryProjectionPolicy,
+        batch_size: int,
+        max_event_sequence: int,
+    ) -> ConversationMemoryProjectionRepairResult:
+        """追平后把 source fixture 改成非终态以验证 conjunction gate。
+
+        :param transaction_runner: Host transaction runner。
+        :param policy: memory projection policy。
+        :param batch_size: projection batch size。
+        :param max_event_sequence: required compact cursor。
+        :returns: 真实 catch-up 汇总。
+        """
+
+        result = original_catch_up(
+            transaction_runner,
+            policy=policy,
+            batch_size=batch_size,
+            max_event_sequence=max_event_sequence,
+        )
+
+        def _make_nonterminal(transaction: HostTransaction) -> None:
+            """把 source Attempt 还原为非终态 fixture。
+
+            :param transaction: Host write transaction。
+            :returns: ``None``。
+            """
+
+            updated = transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_ATTEMPTS}
+                SET status = ?,
+                    terminal_event_id = NULL,
+                    terminal_event_sequence = NULL,
+                    terminal_at = NULL
+                WHERE attempt_id = ?
+                """,
+                (AttemptStatus.RUNNING.value, "attempt-ingest"),
+            )
+            assert updated.rowcount == 1
+
+        transaction_runner.run_write(_make_nonterminal)
+        return result
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "catch_up_conversation_memory_projection",
+        make_source_nonterminal,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(
+                seeded,
+                worker_event_index=54,
+            )
+        )
+
+        assert result.events[-1].event_type == CONTEXT_COMPACTED
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert wakeup.dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_reactive_recovery_requires_matching_committed_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """matching compact outcome 不可读时 fail closed 且零 start/wake。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    original_read = EventLogStore.read_event_by_id
+
+    def hide_compacted_outcome(
+        event_log_store: EventLogStore,
+        transaction: HostTransaction,
+        event_id: str,
+    ) -> EventLogRow | None:
+        """只隐藏已提交 compact outcome，模拟 startup orphan。
+
+        :param event_log_store: EventLog primitive。
+        :param transaction: Host transaction。
+        :param event_id: 待读取 event id。
+        :returns: compacted outcome 返回 ``None``，其它 row 原样返回。
+        """
+
+        row = original_read(event_log_store, transaction, event_id)
+        if row is not None and row.event_type == CONTEXT_COMPACTED:
+            return None
+        return row
+
+    monkeypatch.setattr(
+        EventLogStore,
+        "read_event_by_id",
+        hide_compacted_outcome,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match="reactive compacted outcome identity is invalid",
+        ):
+            await ingestor.ingest_async(
+                _context_compaction_candidate(
+                    seeded,
+                    worker_event_index=55,
+                )
+            )
+
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert wakeup.dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reactive post-compact hard 保留真实压力但不伪造 lifecycle failure。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    policy = _reactive_policy()
+    hard_pressure_tokens = int(
+        policy.context_window_size * policy.hard_threshold_context_ratio
+    )
+    original_estimator = (
+        engine_ingest_module.estimate_prepared_runner_call_candidate
+    )
+
+    def estimate_post_compact_hard(
+        candidate: PreparedRunnerCallCandidate,
+        sizing_policy: ContextBudgetPolicy,
+    ) -> BudgetEstimate:
+        """仅把 complete post-compact candidate 的真实估算推到 hard。
+
+        :param candidate: recovery complete candidate。
+        :param sizing_policy: recovery sizing policy。
+        :returns: 保留 estimator contract、仅调整 token 压力的估算。
+        """
+
+        estimate = original_estimator(candidate, sizing_policy)
+        return replace(
+            estimate,
+            estimated_input_tokens=estimate.hard_threshold_tokens,
+        )
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "estimate_prepared_runner_call_candidate",
+        estimate_post_compact_hard,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=policy,
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(seeded, worker_event_index=152)
+        )
+
+        assert tuple(event.event_type for event in result.events)[-4:] == (
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            "CONTEXT_BUDGET_EVALUATED",
             "RUN_STARTED",
             "ATTEMPT_STARTED",
         )
-        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+        hot = parse_runner_call_hot_payload(_payload(result.events[-4]))
+        manifest_json = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=hot.manifest_payload_ref,
+                payload_digest=hot.manifest_digest,
+                payload_label="reactive hard manifest",
+            )
+        )
+        manifest = parse_runner_call_manifest(
+            manifest_json,
+            hot_payload=hot,
+        )
+        assert manifest.sizing_snapshot.sizing_stage is (
+            ContextSizingStage.REACTIVE_POST_COMPACT
+        )
+        assert manifest.sizing_snapshot.conservative_input_tokens is not None
+        assert (
+            manifest.sizing_snapshot.conservative_input_tokens
+            >= hard_pressure_tokens
+        )
+        budget_payload = parse_context_budget_evaluated_payload(
+            _payload(result.events[-3])
+        )
+        assert budget_payload.estimate_method is (
+            ContextEstimateMethod.CONSERVATIVE_FALLBACK
+        )
+        assert budget_payload.fallback_reason is (
+            ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
+        )
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_COMPACTION_FAILED,
+        ) == 0
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
         assert len(wakeup.dispatches) == 1
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    tuple(_ReactiveSourceTamperKind),
+)
+@pytest.mark.asyncio
+async def test_reactive_source_strict_load_failure_has_zero_start_and_wake(
+    tmp_path: Path,
+    tamper_kind: _ReactiveSourceTamperKind,
+) -> None:
+    """source durable contract 缺失或 mismatch 时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_kind: effective config、manifest 或 candidate digest 篡改。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_tool_schema=(
+                _reactive_source_tool_schema()
+                if tamper_kind
+                is _ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING
+                else None
+            ),
+        )
+        _tamper_reactive_source(
+            store.transaction_runner,
+            seeded=seeded,
+            tamper_kind=tamper_kind,
+        )
+        wakeup = _WakeupSpy()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+
+        with pytest.raises(HostDurableError):
+            await ingestor.ingest_async(
+                _context_compaction_candidate(
+                    seeded,
+                    worker_event_index=160,
+                )
+            )
+
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.RECOVERING,
+            AttemptStatus.FAILED,
+        )
+        assert wakeup.dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_reactive_duplicate_after_recovery_winner_does_not_repeat_wake(
+    tmp_path: Path,
+) -> None:
+    """matching committed winner 已 start 时 duplicate 不再创建或 wake。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        candidate = _context_compaction_candidate(
+            seeded,
+            worker_event_index=161,
+        )
+
+        first = await ingestor.ingest_async(candidate)
+        duplicate = await ingestor.ingest_async(candidate)
+
+        assert first.status is EngineIngestStatus.ACCEPTED
+        assert duplicate.status is EngineIngestStatus.DUPLICATE
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 2
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
+        assert len(wakeup.dispatches) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_start_precondition_miss_rolls_back_candidate_and_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recovery start precondition miss 回滚同事务 candidate/manifest。"""
+
+    def reject_start(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        request: StartRecoveryRunInput,
+    ) -> RunTransitionResult:
+        """模拟 recovery transition 的 owner precondition miss。
+
+        :param transaction: Host write transaction。
+        :param event_log_store: EventLog primitive。
+        :param request: recovery start input。
+        :returns: ``INVALID_STATE`` transition result。
+        """
+
+        del transaction, event_log_store, request
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+            run_event=None,
+        )
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "start_recovery_run_with_starting_attempt_in_transaction",
+        reject_start,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        descriptor_count_before = store.transaction_runner.run_read(
+            lambda transaction: _table_row_count(
+                transaction,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+        )
+        wakeup = _WakeupSpy()
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(seeded, worker_event_index=162)
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.events[-1].event_type == CONTEXT_COMPACTED
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        assert _event_count(
+            store.transaction_runner,
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+        ) == 1
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_BUDGET_EVALUATED,
+        ) == 0
+        descriptor_count_after = store.transaction_runner.run_read(
+            lambda transaction: _table_row_count(
+                transaction,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+        )
+        assert descriptor_count_after == descriptor_count_before + 1
+        assert wakeup.dispatches == []
 
 
 @pytest.mark.asyncio
@@ -1193,7 +1894,10 @@ async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
     """reactive accepted compact payload 携带 prepared proposal manifest 引用。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
@@ -1217,7 +1921,13 @@ async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
         assert isinstance(
             compacted_payload["accepted_proposal_manifest_digest"], str
         )
-        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+            == 3
+        )
 
 
 @pytest.mark.asyncio
@@ -1227,7 +1937,10 @@ async def test_reactive_freezes_overflow_material_list_before_compaction(
     """reactive pending record 保存冻结 ordinary material digest 与 refs。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
@@ -1251,7 +1964,10 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
     """reactive compactor 外部调用不持有 Host write transaction。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         compactor = _TransactionReadableCompactor(store.transaction_runner)
         candidate = _context_compaction_candidate(seeded, worker_event_index=41)
 
@@ -1304,7 +2020,10 @@ async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
         status_gate,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         compactor = _TransactionReadableCompactor(store.transaction_runner)
 
         result = await EngineEventIngestor(
@@ -1336,7 +2055,10 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
     """reactive compact 返回后 input sequence 变化时拒绝旧 snapshot 结果。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         compactor = _InputSequenceAdvancingCompactor(store.transaction_runner)
         candidate = _context_compaction_candidate(seeded, worker_event_index=43)
 
@@ -1378,7 +2100,10 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
     """reactive attempt rejected 使用 request fact event id 作为 operation anchor。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         candidate = _context_compaction_candidate(seeded, worker_event_index=42)
 
         result = await EngineEventIngestor(
@@ -1416,7 +2141,10 @@ async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
     """reactive rejected attempt payload 携带 prepared proposal manifest 引用。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
@@ -1444,7 +2172,13 @@ async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
             "runner-call-manifest:"
         )
         assert isinstance(rejected_payload["proposal_manifest_digest"], str)
-        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+            == 3
+        )
 
 
 def test_context_compaction_requested_stale_identity_is_rejected(
@@ -1453,7 +2187,10 @@ def test_context_compaction_requested_stale_identity_is_rejected(
     """attempt_id + execution_id 不匹配时拒绝 reactive compact。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         wrong_seeded = _SeededRun(
             session_id=seeded.session_id,
             run_id=seeded.run_id,
@@ -1498,7 +2235,10 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
     """reactive compact final failure 预算通过时 fallback 创建 recovery Attempt。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
@@ -1511,11 +2251,13 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
         assert tuple(event.event_type for event in result.events) == (
             CONTEXT_COMPACTION_REQUESTED,
             "ATTEMPT_FAILED",
-            "RUN_RECOVERING",
-            CONTEXT_COMPACTION_FAILED,
-            "RUN_STARTED",
-            "ATTEMPT_STARTED",
-        )
+                "RUN_RECOVERING",
+                CONTEXT_COMPACTION_FAILED,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+                "CONTEXT_BUDGET_EVALUATED",
+                "RUN_STARTED",
+                "ATTEMPT_STARTED",
+            )
         assert result.terminal_closeout is False
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -1554,6 +2296,7 @@ async def test_reactive_fallback_over_budget_fails_closed_without_lost(
         seeded = _seed_active_run(
             store.transaction_runner,
             display_text="overflow " * 80,
+            record_source_candidate=True,
         )
         terminal_port = _CommittedTerminalPostCommitPort(
             db_path=options.db_path,
@@ -1650,6 +2393,7 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
         seeded = _seed_active_run(
             store.transaction_runner,
             display_text="overflow " * 80,
+            record_source_candidate=True,
         )
         terminal_port = _RecordingTerminalPostCommitPort()
 
@@ -1683,7 +2427,10 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
     """recovery start 后旧 Attempt 的 recoverable run_failed 不创建第二个 Attempt。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
@@ -1805,7 +2552,10 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
     """配置为一次 reactive 时，已有 request 会触发失败收口。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         _append_reactive_requested_fact(
             store.transaction_runner,
             seeded=seeded,
@@ -1847,7 +2597,10 @@ async def test_reactive_repeated_overflow_respects_max_reactive_compactions_per_
     """重复 overflow 达到 reactive 上限后 fail closed 且不无限 retry。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         _append_reactive_requested_fact(
             store.transaction_runner,
             seeded=seeded,
@@ -1889,7 +2642,10 @@ async def test_reactive_compact_count_allows_second_operation(
     """
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         _append_reactive_requested_fact(
             store.transaction_runner,
             seeded=seeded,
@@ -1922,7 +2678,10 @@ async def test_reactive_compact_corrupt_count_fact_fails_closed(
     """reactive compact count fact 损坏时 fail closed 且不创建第二个 Attempt。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         _append_reactive_requested_fact(
             store.transaction_runner,
             seeded=seeded,
@@ -2249,7 +3008,10 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
     """旧 Attempt 在 wait resolved 后的 late waiting confirmation 只能被拒绝。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_active_run(store.transaction_runner)
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
         accept_result = DefaultHostToolAwaitingAcceptPort(
             transaction_runner=store.transaction_runner
         ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
@@ -2257,6 +3019,10 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         resolved = DefaultHostResolveWaitService(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            event_log_store=EventLogStore(),
+            idempotency_store=IdempotencyStore(),
+            payload_store=PayloadStore(),
+            memory_projection_policy=default_memory_projection_policy(),
         ).resolve_wait(
             accept_result.wait_id,
             _resolve_wait_completed_request("resolve-old-attempt"),
@@ -2291,9 +3057,43 @@ def test_usage_reported_is_projection_signal_without_state_change(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        role_digest = runner_role_sequence_digest(("system", "user"))
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-usage",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            context_budget_policy=_reactive_policy(),
+        )
+        link_result = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=7,
+                data=IterationStartedData(
+                    iteration_id="iter-usage",
+                    iteration_index=0,
+                    message_count=2,
+                    role_sequence_digest=role_digest,
+                    runner_input_serializer_schema_version=(
+                        RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                    ),
+                ),
+                event_type=EngineEventType.ITERATION_STARTED,
+            )
+        )
+        assert link_result.status == EngineIngestStatus.ACCEPTED
         candidate = _candidate(
             seeded,
-            worker_event_index=7,
+            worker_event_index=8,
             data=UsageReportedData(
                 iteration_id="iter-usage",
                 prompt_tokens=10,
@@ -2304,12 +3104,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
             event_type=EngineEventType.USAGE_REPORTED,
         )
 
-        result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner,
-            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
-            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
-            context_budget_policy=_reactive_policy(),
-        ).ingest(candidate)
+        result = ingestor.ingest(candidate)
 
         assert result.events[0].event_class == EventClass.PROJECTION_SIGNAL
         assert result.events[0].event_type == "USAGE_REPORTED"
@@ -2323,32 +3118,40 @@ def test_usage_reported_is_projection_signal_without_state_change(
         assert payload["completion_tokens"] == 20
         assert payload["total_tokens"] == 30
         assert payload["provider_request_id"] == "req-usage"
-        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert payload["policy_ref"] == "policy-test"
         assert isinstance(payload["estimator_digest"], str)
-        assert payload["estimated_input_tokens"] == 14
+        assert payload["estimated_input_tokens"] == 128
         assert payload["usage_observation_status"] == "observed"
         assert isinstance(payload["usage_observation_digest"], str)
-        assert payload["prompt_token_delta"] == -4
+        assert payload["prompt_token_delta"] == -118
+        pairing = payload["runner_call_pairing"]
+        assert isinstance(pairing, Mapping)
+        assert pairing["status"] == "complete"
+        assert pairing["reason"] is None
+        assert pairing["manifest_event_id"] == (
+            "event-prepared-runner-call-usage"
+        )
+        assert isinstance(pairing["observation_digest"], str)
         context_pressure = payload["context_pressure"]
         assert isinstance(context_pressure, Mapping)
         pressure = cast(Mapping[str, JsonValue], context_pressure)
         assert pressure["schema_version"] == 1
         assert pressure["signal_source"] == "USAGE_REPORTED"
         assert pressure["status"] == "observed"
-        assert pressure["policy_ref"] == _REACTIVE_POLICY_REF
+        assert pressure["policy_ref"] == "policy-test"
         assert pressure["estimator_digest"] == payload["estimator_digest"]
-        assert pressure["estimated_input_tokens"] == 14
-        assert pressure["input_budget_tokens"] == 100
-        assert pressure["soft_threshold_tokens"] == 45
-        assert pressure["hard_threshold_tokens"] == 80
-        assert pressure["soft_threshold_exceeded"] is False
-        assert pressure["hard_threshold_exceeded"] is False
-        assert pressure["budget_decision"] == "allow_dispatch"
+        assert pressure["estimated_input_tokens"] == 128
+        assert pressure["input_budget_tokens"] is None
+        assert pressure["soft_threshold_tokens"] is None
+        assert pressure["hard_threshold_tokens"] is None
+        assert pressure["soft_threshold_exceeded"] is None
+        assert pressure["hard_threshold_exceeded"] is None
+        assert pressure["budget_decision"] == "unknown"
         assert pressure["overage_reason"] is None
         assert pressure["prompt_tokens"] == 10
         assert pressure["completion_tokens"] == 20
         assert pressure["total_tokens"] == 30
-        assert pressure["prompt_token_delta"] == -4
+        assert pressure["prompt_token_delta"] == -118
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -2440,7 +3243,7 @@ def test_usage_reported_missing_input_event_keeps_projection_non_failing(
 
         assert result.status == EngineIngestStatus.ACCEPTED
         payload = _payload(result.events[0])
-        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert payload["policy_ref"] == "none"
         assert payload["estimator_digest"] is None
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
@@ -2487,7 +3290,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
 
         assert result.status == EngineIngestStatus.ACCEPTED
         payload = _payload(result.events[0])
-        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert payload["policy_ref"] == "none"
         assert payload["estimator_digest"] is None
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
@@ -2532,9 +3335,9 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
         payload = _payload(result.events[0])
         assert payload["prompt_tokens"] == -1
         assert payload["provider_request_id"] == "req-invalid-usage"
-        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
-        assert isinstance(payload["estimator_digest"], str)
-        assert payload["estimated_input_tokens"] == 14
+        assert payload["policy_ref"] == "none"
+        assert payload["estimator_digest"] is None
+        assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "usage_invalid"
         assert isinstance(payload["usage_observation_digest"], str)
         assert payload["prompt_token_delta"] is None
@@ -2542,8 +3345,8 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
         assert isinstance(context_pressure, Mapping)
         pressure = cast(Mapping[str, JsonValue], context_pressure)
         assert pressure["status"] == "usage_invalid"
-        assert pressure["estimated_input_tokens"] == 14
-        assert pressure["budget_decision"] == "allow_dispatch"
+        assert pressure["estimated_input_tokens"] is None
+        assert pressure["budget_decision"] == "unknown"
         assert pressure["prompt_tokens"] == -1
         assert pressure["prompt_token_delta"] is None
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
@@ -4929,6 +5732,10 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "RUNNER_CALL_INPUT_ASSEMBLED",
             "ITERATION_STARTED",
         ]
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_BUDGET_EVALUATED,
+        ) == 0
         manifest_event = result.events[0]
         preview_event = result.events[1]
         manifest_hot = _payload(manifest_event)
@@ -4955,7 +5762,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "status": "limited_signal",
             "reason": "missing_projection_artifact",
             "missing_atom_kind": None,
-                "missing_ref_kind": "artifact_ref",
+            "missing_ref_kind": "artifact_ref",
             "missing_ref": None,
             "observed_count": 4,
             "expected_count": None,
@@ -4978,8 +5785,53 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
 
 def test_iteration_started_continuation_with_projection_writes_complete_manifest(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """tool-loop continuation 携带 observed projection 时写 complete manifest。"""
+    """complete tool-loop continuation在同事务消费typed anchor。
+
+    :param tmp_path: pytest临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    observed_queries: list[ContextAnchorQuery] = []
+
+    def resolve_anchor(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        query: ContextAnchorQuery,
+    ) -> ContextAnchorResolution:
+        """注入compatible continuation anchor。
+
+        :param transaction: 当前ingest transaction。
+        :param event_log_store: EventLog primitive。
+        :param query: complete continuation query。
+        :returns: compatible anchor。
+        """
+
+        del transaction, event_log_store
+        observed_queries.append(query)
+        return ContextAnchorResolution(
+            anchor=CompatibleContextAnchor(
+                manifest_event_id="event-anchor",
+                manifest_payload_ref="payload-anchor",
+                manifest_digest=sha256_digest_json({"anchor": "manifest"}),
+                iteration_link_event_id="event-anchor-link",
+                usage_event_id="event-anchor-usage",
+                usage_observation_digest=sha256_digest_json(
+                    {"anchor": "usage"}
+                ),
+                iteration_completed_event_id="event-anchor-completed",
+                usage_anchor_tokens=100,
+                conservative_anchor_tokens=100,
+            ),
+            fallback_reason=None,
+        )
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "resolve_context_anchor",
+        resolve_anchor,
+    )
 
     role_digest = runner_role_sequence_digest(
         ("system", "user", "assistant", "tool")
@@ -5025,13 +5877,16 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
     with open_host_durable_store(
         _options(tmp_path, payload_inline_threshold_bytes=4096)
     ) as store:
-        seeded = _seed_active_run(store.transaction_runner)
-        _append_prior_iteration_started_preview(
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_complete_sizing=True,
+        )
+        _link_pre_start_runner_call_manifest(
             store.transaction_runner,
             seeded,
-            event_id="event-prior-iteration-preview-complete",
             iteration_id="iter-prior-complete",
-            iteration_index=0,
+            worker_event_index=1,
         )
         candidate = _candidate(
             seeded,
@@ -5055,12 +5910,36 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.status == EngineIngestStatus.ACCEPTED, result.reason
+        assert tuple(event.event_type for event in result.events) == (
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            CONTEXT_BUDGET_EVALUATED,
+            "ITERATION_STARTED",
+        )
         manifest_hot = _payload(result.events[0])
-        preview_payload = _payload(result.events[1])
+        budget_payload = parse_context_budget_evaluated_payload(
+            _payload(result.events[1])
+        )
+        preview_payload = _payload(result.events[2])
         validation = preview_payload["runner_call_manifest_validation"]
         assert isinstance(validation, Mapping)
         assert manifest_hot["validation_status"] == "complete"
+        assert (
+            budget_payload.sizing_stage
+            is ContextSizingStage.CONTINUATION
+        )
+        assert (
+            budget_payload.budget_decision
+            is ContextBudgetDecision.ALLOW_DISPATCH
+        )
+        assert budget_payload.estimate_method is (
+            ContextEstimateMethod.USAGE_ANCHORED
+        )
+        assert budget_payload.anchor_diagnostic is not None
+        assert len(observed_queries) == 1
+        assert observed_queries[0].candidate_input_cursor == (
+            result.events[0].event_sequence - 1
+        )
         hot_diagnostic = _json_object(manifest_hot["diagnostic"])
         assert hot_diagnostic["status"] == "complete"
         assert hot_diagnostic["reason"] is None
@@ -5129,6 +6008,370 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             assert message["content_digest"] == entry["content_digest"]
             assert entry["projection_artifact_ref"] == projection_ref
             assert entry["projection_artifact_digest"] == projection_digest
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_reason"),
+    (
+        (
+            "projection",
+            "continuation_projection_unavailable",
+        ),
+        (
+            "tool",
+            "continuation_tool_schema_unavailable",
+        ),
+        (
+            "policy",
+            "continuation_policy_unavailable",
+        ),
+        (
+            "request",
+            "continuation_request_semantics_unavailable",
+        ),
+    ),
+)
+def test_continuation_source_failure_projects_typed_closed_reason(
+    tmp_path: Path,
+    failure_kind: str,
+    expected_reason: str,
+) -> None:
+    """continuation 按 projection→tool→policy→request 投影 typed closed reason。
+
+    :param tmp_path: pytest 临时目录。
+    :param failure_kind: 单一 source failure 类别。
+    :param expected_reason: manifest sizing 应记录的 closed reason。
+    """
+
+    input_projection = (
+        RunnerInputMessageProjection(
+            index=0,
+            role="system",
+            content="system",
+            tool_call_id=None,
+            tool_calls=(),
+        ),
+        RunnerInputMessageProjection(
+            index=1,
+            role="user",
+            content="user",
+            tool_call_id=None,
+            tool_calls=(),
+        ),
+    )
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_tool_schema=(
+                _reactive_source_tool_schema()
+                if failure_kind == "tool"
+                else None
+            ),
+            source_complete_sizing=True,
+            source_request_semantics_digest_override=(
+                sha256_digest_json({"request": "corrupt"})
+                if failure_kind == "request"
+                else None
+            ),
+        )
+        _link_pre_start_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            worker_event_index=69,
+            iteration_id=f"iter-prior-{failure_kind}",
+        )
+        if failure_kind in {"projection", "policy"}:
+            _tamper_reactive_source(
+                store.transaction_runner,
+                seeded=seeded,
+                tamper_kind=_ReactiveSourceTamperKind.EFFECTIVE_CONFIG_MISSING,
+            )
+        elif failure_kind == "tool":
+            _tamper_reactive_source(
+                store.transaction_runner,
+                seeded=seeded,
+                tamper_kind=_ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING,
+            )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=70,
+            data=IterationStartedData(
+                iteration_id=f"iter-continuation-{failure_kind}",
+                iteration_index=1,
+                message_count=2,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+                input_projection=(
+                    () if failure_kind == "projection" else input_projection
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        ).ingest(candidate)
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.events[0].event_type == "RUNNER_CALL_INPUT_ASSEMBLED"
+        hot = parse_runner_call_hot_payload(_payload(result.events[0]))
+        manifest_body = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=hot.manifest_payload_ref,
+                payload_digest=hot.manifest_digest,
+                payload_label="continuation source failure manifest",
+            )
+        )
+        sizing = manifest_body["sizing_snapshot"]
+        assert isinstance(sizing, Mapping)
+        assert sizing["status"] == "unavailable"
+        assert sizing["reason"] == expected_reason
+
+
+def test_source_loader_ignores_valid_continuation_manifest(
+    tmp_path: Path,
+) -> None:
+    """同 Attempt 的 continuation manifest 不参与 pre-start duplicate 判定。"""
+
+    projection = (
+        RunnerInputMessageProjection(
+            index=0,
+            role="system",
+            content="system",
+            tool_call_id=None,
+            tool_calls=(),
+        ),
+        RunnerInputMessageProjection(
+            index=1,
+            role="user",
+            content="user",
+            tool_call_id=None,
+            tool_calls=(),
+        ),
+    )
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_complete_sizing=True,
+        )
+        _link_pre_start_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            iteration_id="iter-prior-source-loader",
+            worker_event_index=70,
+        )
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+        ).ingest(
+            _candidate(
+                seeded,
+                worker_event_index=71,
+                data=IterationStartedData(
+                    iteration_id="iter-source-loader-continuation",
+                    iteration_index=1,
+                    message_count=2,
+                    role_sequence_digest=role_digest,
+                    runner_input_serializer_schema_version=(
+                        RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                    ),
+                    input_projection=projection,
+                ),
+                event_type=EngineEventType.ITERATION_STARTED,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        source = store.transaction_runner.run_read(
+            lambda transaction: load_prepared_runner_call_source_in_transaction(
+                transaction,
+                EventLogStore(),
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+            )
+        )
+        assert source.manifest.identity.iteration_id is None
+        assert source.manifest.identity.iteration_index is None
+
+
+def test_source_loader_rejects_two_pre_start_manifests(
+    tmp_path: Path,
+) -> None:
+    """同 Attempt/execution 两个 pre-start manifest 必须 fail duplicate。"""
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_complete_sizing=True,
+        )
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-second-pre-start-manifest",
+            runner_call_index=1,
+            runner_call_kind="followup_user_dispatch",
+            runner_call_trigger_reason="followup_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+
+        with pytest.raises(PreparedRunnerCallSourceError) as exc_info:
+            store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                )
+            )
+
+        assert (
+            exc_info.value.category
+            is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
+        )
+
+
+def test_source_loader_rejects_eventlog_hot_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    """manifest EventLog row 与 hot attempt identity 错配时 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_complete_sizing=True,
+        )
+
+        def _corrupt_row(transaction: HostTransaction) -> None:
+            """只篡改 canonical EventLog row identity。
+
+            :param transaction: Host write transaction。
+            :returns: ``None``。
+            """
+
+            result = transaction.execute(
+                f"""
+                UPDATE {TABLE_EVENT_LOG}
+                SET attempt_id = ?
+                WHERE event_type = ?
+                  AND attempt_id = ?
+                  AND execution_id = ?
+                """,
+                (
+                    "attempt-corrupt",
+                    "RUNNER_CALL_INPUT_ASSEMBLED",
+                    seeded.attempt_id,
+                    seeded.execution_id,
+                ),
+            )
+            assert result.rowcount == 1
+
+        store.transaction_runner.run_write(_corrupt_row)
+        with pytest.raises(PreparedRunnerCallSourceError) as exc_info:
+            store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                )
+            )
+
+        assert (
+            exc_info.value.category
+            is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
+        )
+
+
+def test_source_loader_prioritizes_tool_failure_over_policy_failure(
+    tmp_path: Path,
+) -> None:
+    """同一 source 的 tool 与 policy 同时损坏时稳定归属 TOOL_SCHEMA。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_tool_schema=_reactive_source_tool_schema(),
+            source_complete_sizing=True,
+        )
+        _tamper_reactive_source(
+            store.transaction_runner,
+            seeded=seeded,
+            tamper_kind=_ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING,
+        )
+        _tamper_reactive_source(
+            store.transaction_runner,
+            seeded=seeded,
+            tamper_kind=_ReactiveSourceTamperKind.EFFECTIVE_CONFIG_MISSING,
+        )
+
+        with pytest.raises(PreparedRunnerCallSourceError) as exc_info:
+            store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                )
+            )
+
+        assert (
+            exc_info.value.category
+            is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
+        )
+
+
+def test_source_loader_reports_policy_after_valid_tool_source(
+    tmp_path: Path,
+) -> None:
+    """tool-owned source 完整而 exact policy 损坏时返回 POLICY。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+            source_tool_schema=_reactive_source_tool_schema(),
+            source_complete_sizing=True,
+        )
+        _tamper_reactive_source(
+            store.transaction_runner,
+            seeded=seeded,
+            tamper_kind=_ReactiveSourceTamperKind.EFFECTIVE_CONFIG_MISSING,
+        )
+
+        with pytest.raises(PreparedRunnerCallSourceError) as exc_info:
+            store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                )
+            )
+
+        assert (
+            exc_info.value.category
+            is PreparedRunnerCallSourceFailureCategory.POLICY
+        )
 
 
 @pytest.mark.parametrize("tamper_kind", tuple(_EngineHotTamperKind))
@@ -5246,12 +6489,24 @@ def _options(
 
 
 def _seed_active_run(
-    transaction_runner: HostTransactionRunner, *, display_text: str = "hello"
+    transaction_runner: HostTransactionRunner,
+    *,
+    display_text: str = "hello",
+    record_source_candidate: bool = False,
+    source_tool_schema: ToolSchema | None = None,
+    source_complete_sizing: bool = False,
+    source_request_semantics_digest_override: str | None = None,
 ) -> _SeededRun:
     """创建已 worker accepted 的 active Run。
 
     :param transaction_runner: Host transaction runner。
     :param display_text: 当前用户输入展示文本。
+    :param record_source_candidate: 是否记录 reactive recovery 所需的
+        strict source candidate/manifest。
+    :param source_tool_schema: 可选 source frozen tool schema。
+    :param source_complete_sizing: 是否记录 continuation 可消费的完整 sizing。
+    :param source_request_semantics_digest_override: 可选 source sizing request
+        semantics 摘要覆盖值，用于反例。
     :returns: seeded run。
     """
 
@@ -5265,6 +6520,11 @@ def _seed_active_run(
         attempt_id="attempt-ingest",
         execution_id="execution-ingest",
         dispatch_record_id="dispatch-ingest",
+    )
+    policy_snapshot, effective_execution_config = (
+        _source_policy_snapshot_and_config(
+            allow_tool_calls=source_tool_schema is not None,
+        )
     )
 
     def _operation(transaction: HostTransaction) -> None:
@@ -5296,7 +6556,13 @@ def _seed_active_run(
                     idempotency_key="idem-ingest-input",
                     policy_decision=None,
                     reason=None,
-                    payload_json={"display_text": display_text},
+                    payload_json={
+                        "display_text": display_text,
+                        "operation_kind": "analysis",
+                        "effective_execution_config": (
+                            effective_execution_config
+                        ),
+                    },
                     payload_ref=None,
                     payload_digest=None,
                 ),
@@ -5362,7 +6628,227 @@ def _seed_active_run(
         )
 
     transaction_runner.run_write(_operation)
+    if not record_source_candidate:
+        return seeded
+    required_cursor = transaction_runner.run_read(
+        lambda transaction: EventLogStore()
+        .read_events_after(transaction, 0, limit=100)[-1]
+        .event_sequence
+    )
+    catch_up = catch_up_conversation_memory_projection(
+        transaction_runner,
+        policy=default_memory_projection_policy(),
+        batch_size=100,
+        max_event_sequence=required_cursor,
+    )
+    assert catch_up.target_reached is True
+
+    def _record_source_candidate(transaction: HostTransaction) -> None:
+        """记录与 source Attempt 严格配对的 frozen candidate。
+
+        :param transaction: Host write transaction。
+        :returns: ``None``。
+        :raises AssertionError: source Run 缺失时抛出。
+        :raises HostDurableError: candidate 或 manifest contract 非法时抛出。
+        """
+
+        run = read_run_by_id(transaction, seeded.run_id)
+        assert run is not None
+        candidate = prepare_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            run=run,
+            current_input_event=cast(
+                EventLogRow,
+                EventLogStore().read_event_by_id(
+                    transaction,
+                    run.input_event_id,
+                ),
+            ),
+            continuity=SessionContinuityView(
+                messages=(),
+                source_refs=(),
+            ),
+            policy_snapshot=policy_snapshot,
+            tool_schemas=(
+                ()
+                if source_tool_schema is None
+                else (source_tool_schema,)
+            ),
+            disable_tools=source_tool_schema is None,
+            tool_execution_mode=(
+                ToolExecutionMode.NO_TOOL_DISABLED
+                if source_tool_schema is None
+                else ToolExecutionMode.TOOL_ENABLED
+            ),
+            memory_projection_policy=default_memory_projection_policy(),
+        )
+        start_input = StartGovernedRunInput(
+            run_id=seeded.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            run_started_event_id="event-run-started-ingest",
+            attempt_started_event_id="event-attempt-started-ingest",
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            dispatch_record_id=seeded.dispatch_record_id,
+            occurred_at=_NOW,
+            actor="tester",
+            source="pytest",
+            start_reason=RunStartReason.INITIAL,
+            worker_kind=WorkerKind.LOCAL,
+            owner_host_instance_id=None,
+        )
+        sizing_snapshot: RunnerCallSizingSnapshot
+        source_estimator_digest = sha256_digest_json(
+            {"estimate": "source"}
+        )
+        source_policy_digest = sha256_digest_json(
+            {"context_policy": "source"}
+        )
+        if source_complete_sizing:
+            sizing_snapshot = complete_runner_call_sizing_snapshot(
+                sizing_stage=ContextSizingStage.ORDINARY,
+                estimator_id=CONTEXT_ESTIMATOR_CONTRACT.estimator_id,
+                estimator_version=CONTEXT_ESTIMATOR_CONTRACT.estimator_version,
+                estimator_digest=source_estimator_digest,
+                conservative_input_tokens=128,
+                context_window_size=32768,
+                provider=candidate.policy_snapshot.runner_spec.provider,
+                model=candidate.policy_snapshot.runner_spec.model,
+                request_semantics_digest=(
+                    source_request_semantics_digest_override
+                    if source_request_semantics_digest_override is not None
+                    else candidate.request_semantics_digest
+                ),
+                input_snapshot_digest=candidate.input_snapshot_digest,
+                policy_ref="context-policy:source",
+                policy_snapshot_digest=source_policy_digest,
+            )
+        else:
+            sizing_snapshot = unavailable_runner_call_sizing_snapshot(
+                RunnerCallSizingUnavailableReason.CONTEXT_POLICY_UNAVAILABLE,
+                sizing_stage=ContextSizingStage.ORDINARY,
+            )
+        manifest_event = record_prepared_runner_call_candidate_in_transaction(
+            transaction,
+            EventLogStore(),
+            PayloadStore(),
+            run=run,
+            attempt_id=start_input.attempt_id,
+            execution_id=start_input.execution_id,
+            occurred_at=start_input.occurred_at,
+            candidate=candidate,
+            sizing_snapshot=sizing_snapshot,
+        )
+        if source_complete_sizing:
+            append_context_budget_evaluated_in_transaction(
+                transaction,
+                EventLogStore(),
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                occurred_at=_NOW,
+                result=build_conservative_context_sizing_result_from_atoms(
+                    stage=ContextSizingStage.ORDINARY,
+                    candidate_input_cursor=candidate.candidate_input_cursor,
+                    candidate_input_projection_ref=(
+                        candidate.candidate_input_projection_ref
+                    ),
+                    candidate_input_digest=candidate.input_snapshot_digest,
+                    estimator_contract=ContextEstimatorContract(
+                        estimator_id=(
+                            CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+                        ),
+                        estimator_version=(
+                            CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+                        ),
+                    ),
+                    estimator_digest=source_estimator_digest,
+                    conservative_input_tokens=128,
+                    context_window_size=32_768,
+                    soft_threshold_tokens=20_000,
+                    hard_threshold_tokens=30_000,
+                    policy_ref="context-policy:source",
+                    policy_snapshot_digest=source_policy_digest,
+                ),
+            )
+            assert manifest_event.event_sequence > (
+                candidate.candidate_input_cursor
+            )
+
+    transaction_runner.run_write(_record_source_candidate)
     return seeded
+
+
+def _source_policy_snapshot_and_config(
+    *,
+    allow_tool_calls: bool = False,
+) -> tuple[PolicySnapshot, JsonValue]:
+    """构造 reactive source 共用的冻结 policy 与 durable JSON。
+
+    :param allow_tool_calls: frozen Agent policy 是否允许工具。
+    :returns: typed policy snapshot 与 ``effective_execution_config`` JSON。
+    :raises HostDurableError: 生产投影 helper 无法还原刚构造的 JSON 时抛出。
+    """
+
+    runner_spec = _runner_spec()
+    runner_options = RunnerCallOptions(
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        stream=False,
+    )
+    agent_policy = AgentPolicy(
+        max_iterations=3,
+        continuation_max_attempts=1,
+        allow_tool_calls=allow_tool_calls,
+        tool_execution_timeout_seconds=1.0,
+        fallback_prompt="test fallback prompt",
+        continuation_prompt="test continuation prompt",
+    )
+    config = effective_execution_config_json(
+        runner_spec=runner_spec,
+        runner_options=runner_options,
+        agent_policy=agent_policy,
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
+    snapshot = effective_execution_snapshot_from_json(config)
+    return (
+        PolicySnapshot(
+            runner_spec=snapshot.runner_spec,
+            runner_options=snapshot.runner_options,
+            agent_policy=snapshot.agent_policy,
+            policy_snapshot_ref=snapshot.policy_snapshot_ref,
+        ),
+        config,
+    )
+
+
+def _reactive_source_tool_schema() -> ToolSchema:
+    """构造用于验证 source frozen tool snapshot 的业务 schema。
+
+    :returns: 单参数测试工具 schema。
+    """
+
+    properties: dict[str, JsonValue] = {
+        "ticker": {"type": "string"},
+    }
+    return ToolSchema(
+        type="function",
+        function=ToolFunctionSchema(
+            name="lookup_filing",
+            description="按股票代码查询财报。",
+            parameters=ToolParametersSchema(
+                type="object",
+                properties=properties,
+                required=("ticker",),
+                additional_properties=False,
+            ),
+        ),
+    )
 
 
 def _steer_to_new_running_attempt(
@@ -6150,6 +7636,49 @@ def _append_prepared_runner_call_manifest(
         "projector_metadata": metadata_items,
         "diagnostic": None,
         "compactor_identity": valid_compactor_identity,
+        "sizing_snapshot": (
+            {
+                "status": "not_applicable",
+                "reason": None,
+                "sizing_stage": None,
+                "estimator_id": None,
+                "estimator_version": None,
+                "estimator_digest": None,
+                "conservative_input_tokens": None,
+                "context_window_size": None,
+                "provider": None,
+                "model": None,
+                "request_semantics_digest": None,
+                "input_snapshot_digest": None,
+                "policy_ref": None,
+                "policy_snapshot_digest": None,
+            }
+            if is_compactor
+            else {
+                "status": "complete",
+                "reason": None,
+                "sizing_stage": "ordinary",
+                "estimator_id": "dayu.host.conservative_context_budget",
+                "estimator_version": "1",
+                "estimator_digest": sha256_digest_json(
+                    {"estimate": event_id}
+                ),
+                "conservative_input_tokens": 128,
+                "context_window_size": 32768,
+                "provider": "openai",
+                "model": "test-model",
+                "request_semantics_digest": sha256_digest_json(
+                    {"request": event_id}
+                ),
+                "input_snapshot_digest": sha256_digest_json(
+                    {"input": event_id}
+                ),
+                "policy_ref": "policy-test",
+                "policy_snapshot_digest": sha256_digest_json(
+                    {"policy": event_id}
+                ),
+            }
+        ),
     }
     if not is_compactor:
         manifest.update(
@@ -6241,6 +7770,67 @@ def _append_prepared_runner_call_manifest(
         )
 
     return transaction_runner.run_write(_operation)
+
+
+def _link_pre_start_runner_call_manifest(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    worker_event_index: int,
+    iteration_id: str,
+) -> None:
+    """把 strict source pre-start manifest 链接到首个 Engine iteration。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: active Run identity。
+    :param worker_event_index: Engine worker event 顺序。
+    :param iteration_id: 首个 iteration id。
+    :returns: ``None``。
+    :raises AssertionError: pre-start manifest 不唯一或 link 未被接受时抛出。
+    """
+
+    events = transaction_runner.run_read(
+        lambda transaction: tuple(
+            event
+            for event in EventLogStore().read_events_after(
+                transaction,
+                0,
+                limit=200,
+            )
+            if event.event_type == "RUNNER_CALL_INPUT_ASSEMBLED"
+            and event.attempt_id == seeded.attempt_id
+            and event.execution_id == seeded.execution_id
+        )
+    )
+    pre_start_events = tuple(
+        event
+        for event in events
+        if parse_runner_call_hot_payload(_payload(event)).iteration_id is None
+    )
+    assert len(pre_start_events) == 1
+    hot = parse_runner_call_hot_payload(_payload(pre_start_events[0]))
+    result = EngineEventIngestor(
+        transaction_runner=transaction_runner,
+        terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+        transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+    ).ingest(
+        _candidate(
+            seeded,
+            worker_event_index=worker_event_index,
+            data=IterationStartedData(
+                iteration_id=iteration_id,
+                iteration_index=0,
+                message_count=hot.message_count,
+                role_sequence_digest=hot.role_sequence_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+    )
+    assert result.status is EngineIngestStatus.ACCEPTED
+    assert result.events[0].event_type == "RUNNER_CALL_INPUT_ITERATION_LINKED"
 
 
 def _append_prior_iteration_started_preview(
@@ -6489,6 +8079,112 @@ def _replace_inline_payload_json(
             """,
             (payload_json, event_id),
         )
+
+    transaction_runner.run_write(_operation)
+
+
+def _tamper_reactive_source(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _SeededRun,
+    tamper_kind: _ReactiveSourceTamperKind,
+) -> None:
+    """篡改 reactive source durable truth 以验证 strict fail-closed。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: source active Run identity。
+    :param tamper_kind: 待模拟的 durable contract 缺口。
+    :returns: ``None``。
+    :raises AssertionError: source manifest 或 descriptor fixture 缺失时抛出。
+    :raises HostDurableError: strict payload helper无法读取原始fixture时抛出。
+    """
+
+    if tamper_kind is _ReactiveSourceTamperKind.EFFECTIVE_CONFIG_MISSING:
+        _replace_inline_payload_json(
+            transaction_runner,
+            event_id="event-input-ingest",
+            payload_json=json.dumps(
+                {
+                    "display_text": "hello",
+                    "operation_kind": "analysis",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        return
+
+    def _operation(transaction: HostTransaction) -> None:
+        """删除 source manifest 或破坏 candidate descriptor digest。
+
+        :param transaction: Host write transaction。
+        :returns: ``None``。
+        :raises AssertionError: source manifest 或 descriptor 缺失时抛出。
+        :raises HostDurableError: manifest payload 不可读时抛出。
+        """
+
+        rows = tuple(
+            row
+            for row in EventLogStore().read_events_after(
+                transaction,
+                0,
+                limit=200,
+            )
+            if row.event_type == "RUNNER_CALL_INPUT_ASSEMBLED"
+            and row.attempt_id == seeded.attempt_id
+            and row.execution_id == seeded.execution_id
+        )
+        assert len(rows) == 1
+        manifest_event = rows[0]
+        if tamper_kind is _ReactiveSourceTamperKind.MANIFEST_MISSING:
+            result = transaction.execute(
+                f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+                (manifest_event.event_id,),
+            )
+            assert result.rowcount == 1
+            return
+        hot = parse_runner_call_hot_payload(_payload(manifest_event))
+        manifest_json = sqlite_payload_object(
+            transaction,
+            payload_ref=hot.manifest_payload_ref,
+            payload_digest=hot.manifest_digest,
+            payload_label="source manifest",
+        )
+        manifest = parse_runner_call_manifest(
+            manifest_json,
+            hot_payload=hot,
+        )
+        if (
+            tamper_kind
+            is _ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING
+        ):
+            tool_refs = tuple(
+                ref.removeprefix("tool_schema_snapshot_ref:")
+                for ref in manifest.source_refs.tool_schema_snapshot_refs
+                if ref.startswith("tool_schema_snapshot_ref:")
+            )
+            assert len(tool_refs) == 1
+            result = transaction.execute(
+                f"""
+                DELETE FROM {TABLE_PAYLOAD_DESCRIPTORS}
+                WHERE payload_ref = ?
+                """,
+                (tool_refs[0],),
+            )
+            assert result.rowcount == 1
+            return
+        candidate_ref = _prepared_candidate_payload_ref(
+            manifest.input_projection_digest
+        )
+        result = transaction.execute(
+            f"""
+            UPDATE {TABLE_PAYLOAD_DESCRIPTORS}
+            SET payload_digest = ?
+            WHERE payload_ref = ?
+            """,
+            (_CALL_CONTEXT_DIGEST, candidate_ref),
+        )
+        assert result.rowcount == 1
 
     transaction_runner.run_write(_operation)
 

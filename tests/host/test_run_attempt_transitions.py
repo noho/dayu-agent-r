@@ -53,7 +53,6 @@ from dayu.host.durable.run_transition import (
     CreateQueuedRunInput,
     CreateRunningRunInput,
     ContextRecoveryCloseInput,
-    PromoteQueuedRunInput,
     OwnedAttemptCancelTarget,
     RunTransitionResult,
     StartupOrphanCloseInput,
@@ -68,7 +67,6 @@ from dayu.host.durable.run_transition import (
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     project_terminal_notice_from_exact_run_event,
-    promote_queued_run_in_transaction,
     read_exact_owned_attempt_cancel_targets,
     request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
@@ -322,77 +320,6 @@ def test_create_queued_run_creates_no_attempt_or_dispatch(tmp_path: Path) -> Non
         assert _EVENT_TYPE_RUN_ACCEPTED in types
         assert _EVENT_TYPE_RUN_QUEUED in types
         assert _EVENT_TYPE_ATTEMPT_STARTED not in types
-
-
-def test_promote_queued_run_uses_earliest_accepted_sequence(
-    tmp_path: Path,
-) -> None:
-    """promotion 选择 accepted_event_sequence 最早的 queued Run。"""
-
-    with open_host_durable_store(_options(tmp_path)) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-
-        def seed(transaction: HostTransaction) -> None:
-            """按非字典序 run id 写入两个 queued Run。
-
-            :param transaction: Host transaction。
-            :returns: ``None``。
-            """
-
-            first_input = _append_user_input(
-                transaction,
-                session_id=session_id,
-                run_id="run-b",
-                event_id="event-input-b",
-            )
-            create_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _create_queued_input(
-                    session_id=session_id,
-                    run_id="run-b",
-                    input_event_sequence=first_input.event_sequence,
-                    request_index="b",
-                ),
-            )
-            second_input = _append_user_input(
-                transaction,
-                session_id=session_id,
-                run_id="run-a",
-                event_id="event-input-a",
-            )
-            create_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _create_queued_input(
-                    session_id=session_id,
-                    run_id="run-a",
-                    input_event_sequence=second_input.event_sequence,
-                    request_index="a",
-                ),
-            )
-
-        store.transaction_runner.run_write(seed)
-
-        def promote(transaction: HostTransaction) -> str:
-            """执行一次 promotion。
-
-            :param transaction: Host transaction。
-            :returns: 被 promotion 的 Run id。
-            """
-
-            result = promote_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _promote_input(session_id=session_id),
-            )
-            assert result.status == StateMutationStatus.UPDATED
-            assert result.promoted_run is not None
-            assert result.attempt is not None
-            assert result.dispatch_record is not None
-            return result.promoted_run.run_id
-
-        assert store.transaction_runner.run_write(promote) == "run-b"
 
 
 def test_terminal_closeout_appends_concrete_terminal_events(
@@ -968,198 +895,6 @@ def test_terminal_closeout_wraps_terminal_event_type_errors(
 
         with pytest.raises(HostDurableError, match=message):
             store.transaction_runner.run_write(closeout)
-
-
-def test_promote_cas_loser_keeps_queued_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """promotion CAS 失败时回滚已 append 的 RUN_STARTED event。"""
-
-    with open_host_durable_store(_options(tmp_path)) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-
-        def seed(transaction: HostTransaction) -> None:
-            """写入 queued Run。
-
-            :param transaction: Host transaction。
-            :returns: ``None``。
-            """
-
-            queued_input = _append_user_input(
-                transaction,
-                session_id=session_id,
-                run_id="run-queued",
-                event_id="event-input-queued",
-            )
-            create_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _create_queued_input(
-                    session_id=session_id,
-                    run_id="run-queued",
-                    input_event_sequence=queued_input.event_sequence,
-                ),
-            )
-
-        store.transaction_runner.run_write(seed)
-
-        def cas_lost_promote_queued_run_row(
-            transaction: HostTransaction,
-            *,
-            session_id: str,
-            run_id: str,
-            started_event_id: str,
-            started_event_sequence: int,
-            current_attempt_id: str,
-            updated_at: str,
-        ) -> RunMutationResult:
-            """模拟 append RUN_STARTED 后低层 CAS 竞争失败。
-
-            :param transaction: Host transaction。
-            :param session_id: Session id。
-            :param run_id: Run id。
-            :param started_event_id: 已 append 的 RUN_STARTED event id。
-            :param started_event_sequence: 已 append 的 RUN_STARTED event sequence。
-            :param current_attempt_id: 待写入的 Attempt id。
-            :param updated_at: 更新时间。
-            :returns: ``CAS_LOST`` mutation 结果。
-            """
-
-            del session_id, started_event_id, started_event_sequence
-            del current_attempt_id, updated_at
-            latest = read_run_by_id(transaction, run_id)
-            assert latest is not None
-            return RunMutationResult(
-                status=StateMutationStatus.CAS_LOST,
-                row=latest,
-            )
-
-        monkeypatch.setattr(
-            run_transition_module,
-            "promote_queued_run_row",
-            cas_lost_promote_queued_run_row,
-        )
-
-        def promote(transaction: HostTransaction) -> None:
-            """执行必然 CAS_LOST 的 promotion。
-
-            :param transaction: Host transaction。
-            :returns: ``None``。
-            :raises HostDurableError: append 后 CAS 失败必须中止事务。
-            """
-
-            promote_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _promote_input(session_id=session_id),
-            )
-
-        with pytest.raises(HostDurableError):
-            store.transaction_runner.run_write(promote)
-
-        def verify(transaction: HostTransaction) -> tuple[str, int]:
-            """确认 queued state 保留且无 orphan RUN_STARTED event。
-
-            :param transaction: Host transaction。
-            :returns: queued Run 状态与 queued Run 的 RUN_STARTED event 数。
-            """
-
-            latest = read_run_by_id(transaction, "run-queued")
-            assert latest is not None
-            return (
-                latest.status.value,
-                _count_run_events(
-                    transaction,
-                    run_id="run-queued",
-                    event_type=_EVENT_TYPE_RUN_STARTED,
-                ),
-            )
-
-        assert store.transaction_runner.run_write(verify) == (
-            RunStatus.QUEUED.value,
-            0,
-        )
-
-
-def test_promote_active_run_skip_does_not_append_queued_started_event(
-    tmp_path: Path,
-) -> None:
-    """active Run 存在时 promotion skip 不追加 queued Run 的 RUN_STARTED。"""
-
-    with open_host_durable_store(_options(tmp_path)) as store:
-        session_id = _ensure_session_id(store.transaction_runner)
-
-        def seed(transaction: HostTransaction) -> None:
-            """写入 active Run 与 queued Run。
-
-            :param transaction: Host transaction。
-            :returns: ``None``。
-            """
-
-            active_input = _append_user_input(
-                transaction,
-                session_id=session_id,
-                run_id="run-active",
-                event_id="event-input-active",
-            )
-            create_running_run_with_starting_attempt_in_transaction(
-                transaction,
-                EventLogStore(),
-                _create_running_input(
-                    session_id=session_id,
-                    run_id="run-active",
-                    input_event_sequence=active_input.event_sequence,
-                ),
-            )
-            queued_input = _append_user_input(
-                transaction,
-                session_id=session_id,
-                run_id="run-queued",
-                event_id="event-input-queued",
-            )
-            create_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _create_queued_input(
-                    session_id=session_id,
-                    run_id="run-queued",
-                    input_event_sequence=queued_input.event_sequence,
-                ),
-            )
-
-        store.transaction_runner.run_write(seed)
-
-        def promote(transaction: HostTransaction) -> tuple[str, str | None, str, int]:
-            """在 active Run 存在时尝试 promotion。
-
-            :param transaction: Host transaction。
-            :returns: 结果状态、skip 原因、queued Run 状态与 queued RUN_STARTED 数。
-            """
-
-            result = promote_queued_run_in_transaction(
-                transaction,
-                EventLogStore(),
-                _promote_input(session_id=session_id),
-            )
-            latest = read_run_by_id(transaction, "run-queued")
-            assert latest is not None
-            return (
-                result.status.value,
-                result.skip_reason,
-                latest.status.value,
-                _count_run_events(
-                    transaction,
-                    run_id="run-queued",
-                    event_type=_EVENT_TYPE_RUN_STARTED,
-                ),
-            )
-
-        assert store.transaction_runner.run_write(promote) == (
-            StateMutationStatus.INVALID_STATE.value,
-            "active_run_exists",
-            RunStatus.QUEUED.value,
-            0,
-        )
 
 
 def test_cancel_predispatch_starting_updates_dispatch_attempt_and_run(
@@ -3605,28 +3340,6 @@ def _create_queued_input(
         queue_reason="active_run_exists",
         active_run_id="run-active",
         call_context_digest=_CALL_CONTEXT_DIGEST,
-    )
-
-
-def _promote_input(*, session_id: str) -> PromoteQueuedRunInput:
-    """构造 promotion 输入。
-
-    :param session_id: Session id。
-    :returns: PromoteQueuedRunInput。
-    """
-
-    return PromoteQueuedRunInput(
-        session_id=session_id,
-        run_started_event_id="event-promotion-run-started",
-        attempt_started_event_id="event-promotion-attempt-started",
-        attempt_id="attempt-promotion",
-        execution_id="execution-promotion",
-        dispatch_record_id="dispatch-promotion",
-        occurred_at=_NOW,
-        actor="analyst",
-        source="pytest",
-        worker_kind=WorkerKind.LOCAL,
-        owner_host_instance_id=None,
     )
 
 

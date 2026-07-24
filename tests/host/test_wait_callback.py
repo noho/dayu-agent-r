@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +32,6 @@ from dayu.host.api import HostCallContext
 from dayu.host.command import (
     HostCommandHandle,
     HostCommandWaitCallbackPort,
-    create_host_command_handle,
 )
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
@@ -48,6 +48,11 @@ from dayu.host.wait_callback import (
     WaitCallbackStateReadPort,
 )
 from dayu.host.waiting import _wait_resolution_digest
+from dayu.host.memory import default_memory_projection_policy
+from tests.host.execution_handle_support import (
+    create_execution_command_handle,
+    deterministic_ordinary_run_baseline,
+)
 from tests.host.test_resolve_wait_command import (
     _OBSERVED,
     _OBSERVED_REPLAY,
@@ -60,6 +65,14 @@ from tests.host.test_resolve_wait_command import (
     _seed_waiting_run,
 )
 
+_create_execution_handle = partial(
+    create_execution_command_handle,
+    ordinary_run_baseline=deterministic_ordinary_run_baseline("wait-callback"),
+    memory_projection_policy=default_memory_projection_policy(),
+    tooling_options=None,
+    context_budget_policy=None,
+    enable_truncation_manager=False,
+)
 _COMPLETED_AT = datetime(2026, 5, 16, 1, 5, 6, tzinfo=UTC)
 _COMPLETED_AT_REPLAY = datetime(2026, 5, 16, 1, 7, 9, tzinfo=UTC)
 _ZERO_DIGEST = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -189,8 +202,8 @@ def test_callback_completed_resumes_with_same_event_sequence_as_direct_resolve(
 ) -> None:
     """completed callback 复用 direct resolve 的 resume 事件序列。"""
 
-    direct_host = create_host_command_handle(_options(tmp_path / "direct"))
-    callback_host = create_host_command_handle(_options(tmp_path / "callback"))
+    direct_host = _create_execution_handle(_options(tmp_path / "direct"))
+    callback_host = _create_execution_handle(_options(tmp_path / "callback"))
     try:
         direct_seeded = _seed_waiting_run(direct_host)
         callback_seeded = _seed_waiting_run(callback_host)
@@ -251,7 +264,7 @@ def test_callback_accept_wakes_dispatch_once_and_replay_does_not_wake_again(
 ) -> None:
     """accepted callback 唤醒一次 dispatch，replay 不重复唤醒。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     wakeup = _install_counting_wakeup(host)
     try:
         seeded = _seed_waiting_run(host)
@@ -283,7 +296,7 @@ def test_callback_same_key_changed_outcome_returns_idempotency_conflict(
 ) -> None:
     """同幂等键不同 outcome 返回 idempotency conflict。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _real_adapter(host)
@@ -331,7 +344,7 @@ def test_unknown_wait_returns_unknown_wait_without_resolver_call() -> None:
 def test_pre_existing_cancelled_wait_maps_to_late_cancelled(tmp_path: Path) -> None:
     """稳定预读到 cancelled wait 时 late callback 返回 LATE_WAIT_CANCELLED。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -357,7 +370,7 @@ def test_pre_existing_cancelled_wait_maps_to_late_cancelled(tmp_path: Path) -> N
 def test_pre_existing_lost_wait_maps_to_late_lost(tmp_path: Path) -> None:
     """稳定预读到 lost wait 时 late callback 返回 LATE_WAIT_LOST。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         resolve_wait(host, seeded.wait_id, _lost_request("lost-original"))
@@ -376,7 +389,7 @@ def test_expired_callback_is_rejected_by_resolve_owner(
 ) -> None:
     """deadline 已过的 callback 由 resolve owner 拒绝并记录 late diagnostic。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline(
@@ -405,7 +418,7 @@ def test_expired_callback_is_rejected_by_resolve_owner(
 def test_wait_without_deadline_or_expires_is_not_stale(tmp_path: Path) -> None:
     """无 deadline/expires 的 wait 不因 completed_at 被判 stale。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
 
@@ -423,7 +436,7 @@ def test_invalid_stored_deadline_is_failed_closed_by_resolve_owner(
 ) -> None:
     """非法持久化 deadline 由 resolve owner fail closed，不由 callback 预解析。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         _set_wait_deadline_text(host, seeded.wait_id, "not-a-timestamp")
@@ -495,7 +508,7 @@ def test_auth_rejection_returns_auth_failed_without_resolver_call() -> None:
 def test_callback_replay_does_not_append_new_event_log(tmp_path: Path) -> None:
     """同 callback replay 不追加新的 EventLog。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _create_execution_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         adapter = _real_adapter(host)
@@ -536,10 +549,23 @@ def _install_counting_wakeup(host: HostCommandHandle) -> _CountingWakeupPort:
     """
 
     wakeup = _CountingWakeupPort()
+    previous = host._admission_service
     host._admission_service = create_host_admission_service(
         host._transaction_runner(),
         terminal_post_commit_port=host._terminal_post_commit_port,
+        payload_store=previous.payload_store,
+        event_log_store=previous.event_log_store,
+        idempotency_store=previous.idempotency_store,
+        clock=previous.clock,
+        id_factory=previous.id_factory,
         wakeup_port=wakeup,
+        projection_catchup_port=previous.projection_catchup_port,
+        ordinary_run_baseline=previous.ordinary_run_baseline,
+        tooling_options=previous.tooling_options,
+        context_budget_policy=previous.context_budget_policy,
+        memory_projection_policy=previous.memory_projection_policy,
+        enable_truncation_manager=previous.enable_truncation_manager,
+        owner_host_instance_id=previous.owner_host_instance_id,
     )
     return wakeup
 
