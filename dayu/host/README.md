@@ -97,6 +97,14 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
+包根同时导出只读 Tool Trace Analyzer public surface：
+`ToolTraceAnalysisSource`、`ToolTraceAnalysisPolicy`、
+`ToolTraceAnalysisReport`、`analyze_tool_trace(...)`、
+`tool_trace_analysis_report_to_json(...)` 与
+`render_tool_trace_analysis_markdown(...)`。source 明确表达 cold file、workspace、
+`.dayu` 或 tool-trace directory 四种布局；Host boundary 会再次校验 mode/path
+不变量。两个 renderer 只消费同一个 structured report，不重新读取输入或执行规则。
+
 `OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size、Session Event Delivery policy 与 truncation manager 开关。process-backed 工具子进程 terminate / kill cleanup grace 属于 `HostToolingOptions.process_capsule_interrupt_policy`，不作为 `OpenHostOptions` 直接字段，也不改变 `AgentPolicy.tool_execution_timeout_seconds` 的业务执行 deadline 语义。
 
 创建或确保 Session 本身不授予后续修改权限。`submit_followup`、steer、retry、replay、cancel、resolve wait、close、outbox drain 等 public mutation 都要求目标 Session 存在 active read-write attachment；read-only、recovering、closing 或 unattached 状态在创建 actor mutation Future 前 typed reject。attachment close 会先阻止新工作并 drain 已接受的 mutation / pre-start work，再释放跨进程机械互斥；同一 live attachment 不会在后台升级模式。
@@ -429,6 +437,14 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；resolver 逐层验证调用方、descriptor、SQLite row 或 artifact 实际 bytes 的 ref / digest / size，并只接受 canonical JSON object。runner-call projector metadata summary 在查询时只从 full-manifest owner 返回的 typed validated manifest 重建，不从 hot arrays、raw strings 或只通过 bytes digest 的未校验 JSON 推断。hot row 与 cold JSONL 会保存 bounded 业务可读的工具请求 / 结果摘要；`TOOL_CALL_REQUESTED` 必须通过真实 EventLog row 和严格 request atom 解析 inline 或 descriptor-backed canonical arguments / query，再做 canonical JSON 序列化和长度限制，不按字段名屏蔽合法业务参数。request row 缺失、事件类型错误、storage 或 digest 损坏均 fail closed，不发布 hot/cold trace。`TOOL_RESULT_ACCEPTED` 只消费 accepted-result projection 的 typed LLM material：结果摘要来自 exact canonical result，业务来源只来自 producer 显式 `result.value.citation` object；无 citation 使用统一中性 unavailable 文案。opaque envelope refs、arguments descriptor ref / digest 与其它 internal provenance 只保留在 durable / audit / diagnostic row，不进入 readable summary。Tool Trace、Conversation Memory、RunInputBuilder 与 compact material 都把 canonical request material 和 typed accepted-result material 视为严格前置条件：envelope、request link、row、identity、request atom shape / digest 或 typed material 缺失、损坏或漂移时统一抛出 `HostDurableError`，不得 skip、fallback 或发布 limited evidence。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
 
 `PROVIDER_DIAGNOSTIC` 是非致命诊断，只能作为 Read API `provider_diagnostic` / `info` activity 与 Tool Trace diagnostic 展示，不写 failure metadata，不进入 Outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。fatal `PROVIDER_PROTOCOL_ERROR` 在 Read API 中使用独立 `provider_protocol_error` activity kind，避免 UI / Service 从 provider diagnostic kind 反推致命错误。
+
+Tool Trace Analyzer 是上述 projection/resolver 的 read-only consumer，不是新的 Host
+truth、repair path 或状态机入口。它先验证 source layout、hot schema、cold snapshot、
+hot/cold identity 与 descriptor ref/digest/size，再从 owner 已提供的 typed signal 生成
+Host / Engine / Tool findings、vendor debugging blocks 与 limitations；无法取得 payload、
+iteration、tool timing 或 provider-native identity 时只报告 limited signal，不从时间戳、
+client id、路径或 raw string 猜语义。JSON 与 Markdown 都从同一个 immutable report
+投影，Analyzer 不写 EventLog、Tool Trace、payload descriptor 或 Run / Attempt state。
 
 ## 关键执行路径
 

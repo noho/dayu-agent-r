@@ -14,6 +14,7 @@
 - `dayu.service.scene_context`：为 product entrypoint 生成 LLM-facing context slot 文本，覆盖财报分析对象、当前时间、显式 FMP key 下的公司名增强和 FMP 失败时的 ticker-only fallback；该模块不读取 CLI 参数，不向 LLM 投影 FMP 错误文本。
 - `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、同一个 `ValidatedFinsEventStream` identity 透传和 operation-scoped cancellation；terminal 协议由 Fins validator 唯一拥有，该模块不解析 CLI 参数、不处理 stdout/stderr，也不读取 Fins storage。
 - `dayu.service.fins_wait_adapter`：为 Host production wait poller 提供 Fins awaiting observation integration，负责把 Host `WaitAdapterSnapshot` 映射到 Fins `FinsObservationRuntime` 的 activate / poll / cancel / abandon 入口；该模块不读取 Host durable row / store / state mutator，也不读取 Fins storage。
+- `dayu.service.tool_trace_analysis`：为 operator 入口发现 cold file、workspace、`.dayu`、tool-trace directory 四种显式输入布局，调用 Host public `analyze_tool_trace(...)`，并从同一个 structured report 原子发布固定 JSON/Markdown 文件；该模块不解释 analyzer findings，也不导入 Host durable internals。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。
 Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible client correlation policy，使 ordinary baseline 与 compactor baseline 的 Runner 调用都携带可由 Engine 映射的客户端调试关联 id；静态 `X-Client-Request-Id` header 冲突由 RunnerSpec 边界 fail fast。
@@ -35,6 +36,14 @@ activity / thinking callback 通过 Service 定义的 typed async execution port
 `wait_callback_endpoint` 只做 Service/Web transport 映射：method、content-type 与 path/body wait id 错误在 Service 层拒绝；JSON body 与 outcome shape 错误在 Service 层返回 malformed payload；认证结果、wait 状态、replay、digest 与 late callback 语义来自注入的 Host callback adapter。响应体只包含 typed status、diagnostic、retryable 与可选 Run 摘要，不回显 outcome payload。
 
 `fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest`，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。Service 的 protocol、public 与 private direct methods 都以 plain `def` 直接返回 runtime 提供的同一个 `ValidatedFinsEventStream`，不 `await`、迭代、包装或重建 stream；missing、duplicate、event-after-result 与 terminal availability 均由 Fins validator 判定一次。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`，并在 clean exhaustion 后读取 validator 的 terminal result。用户中断仍通过关闭当前 stream / 取消当前 task和 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
+
+`tool_trace_analysis` 的 path discovery 只消费 operator 显式 `INPUT`，不会从全局
+workspace/config 或 cold file 父目录猜其它输入。Service 把完整路径集合交给 Host
+public source contract 再校验；capability、integrity、finding 与 limitation 均由 Host
+Analyzer 从本次实际读取派生。发布 owner 先在 output directory 写入并 flush 同目录
+临时文件，再按 JSON、Markdown 顺序 `replace`。第二次 replace 失败时已发布 JSON 不回滚，
+既有 Markdown 不删除；typed error 分离 primary replace 与 optional cleanup secondary
+detail，且失败目标和已发布路径不因 cleanup 结果漂移。
 
 边界约束：
 

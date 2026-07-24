@@ -33,9 +33,11 @@ COMMAND_PROCESS: str = "process"
 COMMAND_PROCESS_FILING: str = "process_filing"
 COMMAND_PROCESS_MATERIAL: str = "process_material"
 COMMAND_SESSION: str = "session"
+COMMAND_TOOL_TRACE: str = "tool_trace"
 SESSION_ACTION_LIST: str = "list"
 SESSION_ACTION_RESUME: str = "resume"
 SESSION_ACTION_PURGE: str = "purge"
+TOOL_TRACE_ACTION_ANALYZE: str = "analyze"
 SESSION_LABEL_KIND_CHOICES: tuple[str, ...] = ("prompt", "interactive")
 SESSION_RESUME_MODE_CHOICES: tuple[str, ...] = ("prompt", "interactive")
 
@@ -51,6 +53,7 @@ CLI_COMMAND_NAMES: tuple[str, ...] = (
     COMMAND_PROCESS_FILING,
     COMMAND_PROCESS_MATERIAL,
     COMMAND_SESSION,
+    COMMAND_TOOL_TRACE,
 )
 EXCLUDED_COMMAND_NAMES: tuple[str, ...] = (
     "write",
@@ -174,6 +177,9 @@ class ParsedCliArgs(argparse.Namespace):
     session_prompt: str | None
     yes: bool
     reason: str | None
+    tool_trace_action: str | None
+    tool_trace_input: str
+    output_dir: str
 
 
 def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
@@ -209,6 +215,7 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     _register_process_filing_command(subparsers, global_parent)
     _register_process_material_command(subparsers, global_parent)
     _register_session_command(subparsers, global_parent)
+    _register_tool_trace_command(subparsers, global_parent)
     return parser
 
 
@@ -278,6 +285,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.session_prompt = None
     namespace.yes = False
     namespace.reason = None
+    namespace.tool_trace_action = None
     return namespace
 
 
@@ -494,6 +502,54 @@ def _register_session_command(
     _register_session_list_action(action_subparsers, global_parent)
     _register_session_resume_action(action_subparsers, global_parent)
     _register_session_purge_action(action_subparsers, global_parent)
+
+
+def _register_tool_trace_command(
+    subparsers: CommandSubparserRegistry,
+    global_parent: argparse.ArgumentParser,
+) -> None:
+    """注册 ``tool_trace analyze`` operator 命令。
+
+    :param subparsers: 顶层 subparsers 注册器。
+    :param global_parent: 包含全局参数的父解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser = _add_command_parser(
+        subparsers,
+        global_parent,
+        command_name=COMMAND_TOOL_TRACE,
+        help_text="分析 Tool Trace 并发布 JSON/Markdown 报告。",
+    )
+    action_subparsers = cast(
+        SessionActionSubparserRegistry,
+        parser.add_subparsers(
+            dest="tool_trace_action",
+            metavar="TOOL_TRACE_COMMAND",
+            required=True,
+        ),
+    )
+    analyze_parser = action_subparsers.add_parser(
+        TOOL_TRACE_ACTION_ANALYZE,
+        help="分析显式 Tool Trace 文件或目录。",
+        description="分析显式 Tool Trace 文件或目录。",
+        parents=[global_parent],
+    )
+    analyze_parser.set_defaults(
+        command_name=COMMAND_TOOL_TRACE,
+        tool_trace_action=TOOL_TRACE_ACTION_ANALYZE,
+    )
+    analyze_parser.add_argument(
+        "tool_trace_input",
+        metavar="INPUT",
+        help="现存 cold JSONL 文件、workspace、.dayu 或 tool-trace 目录。",
+    )
+    analyze_parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="JSON/Markdown 报告输出目录。",
+    )
 
 
 def _add_session_action_parser(
@@ -951,7 +1007,9 @@ __all__: tuple[str, ...] = (
     "CLI_COMMAND_NAMES",
     "EXCLUDED_COMMAND_NAMES",
     "CLI_PROGRAM_NAME",
+    "COMMAND_TOOL_TRACE",
     "ParsedCliArgs",
+    "TOOL_TRACE_ACTION_ANALYZE",
     "build_parser",
     "parse_cli_args",
 )

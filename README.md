@@ -146,6 +146,7 @@ dayu-cli <command> --help
 | `process_filing` | 预处理单份 filing |
 | `process_material` | 预处理单份 material |
 | `session` | 列出、恢复或清理 CLI Session |
+| `tool_trace` | 分析 Tool Trace 并发布诊断报告 |
 
 ### 3.1 全局路径与日志参数
 
@@ -351,7 +352,43 @@ dayu-cli session purge --session-id <session-id> --yes
 先在原进程正常退出当前 prompt 或 interactive 会话并等待其关闭完成，再退出并重新执行
 `session resume`；已经打开的只读会话不会在原进程退出后自动变为可写。
 
-## 7. 常见问题
+## 7. Tool Trace 诊断
+
+`tool_trace analyze` 只读分析现有 Tool Trace，并在指定目录发布同一次分析得到的
+JSON 与 Markdown 报告：
+
+```bash
+dayu-cli tool_trace analyze ./workspace --output-dir ./reports/tool-trace
+```
+
+`INPUT` 必须显式选择以下一种输入：
+
+- workspace 目录，例如 `./workspace`；
+- `.dayu` 目录，例如 `./workspace/.dayu`；
+- tool-trace 目录，例如
+  `./workspace/.dayu/artifacts/tool-trace`；
+- 单个 cold JSONL 文件，例如
+  `./workspace/.dayu/artifacts/tool-trace/tool-trace-cold.jsonl`。
+
+成功后输出目录包含：
+
+```text
+tool-trace-analysis.json
+tool-trace-analysis.md
+```
+
+目录输入会按当前固定布局同时发现可用的 hot SQLite、cold JSONL 和 payload
+artifacts；单文件或 tool-trace 目录输入是 cold-only，不会从父目录猜测 hot
+数据库或 payload root，因此报告会明确标记相应 `limited_signal`，而不是把
+“无法证明”写成“未发生”。同一输入若同时匹配多个布局会拒绝执行；此时传入更具体的
+`.dayu` 目录或 cold JSONL 文件。全局 `--base` / `--config` 不参与 Analyzer
+输入发现。
+
+报告中的 findings 和 limitations 不改变成功退出码。输入路径或布局错误返回 `2`；
+可信读取、分析或发布失败返回 `1`。发布第二个文件失败时，命令会分别列出本次已发布
+路径和失败路径；既有报告不会被主动删除。
+
+## 8. 常见问题
 
 ### 配置文件已存在
 

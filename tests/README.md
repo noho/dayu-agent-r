@@ -60,6 +60,18 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
   tests/cli/test_public_package_entrypoints.py -q
 ```
 
+运行 Tool Trace Analyzer、Service publication 与 CLI focused 回归：
+
+```bash
+pytest -q tests/host/test_tool_trace_analysis_input.py \
+  tests/host/test_tool_trace_analysis_rules.py \
+  tests/host/test_tool_trace_analysis.py \
+  tests/service/test_tool_trace_analysis.py \
+  tests/cli/test_tool_trace_command.py \
+  tests/cli/test_arg_parsing.py \
+  tests/cli/test_import_boundary.py
+```
+
 仓库当前不配置 GitHub Actions workflow；跨平台 CI 重建由
 [GitHub Issue #184](https://github.com/noho/dayu-agent-r/issues/184) 跟踪。以下真实 Windows nodes 保留为
 后续 CI 的验收资产：
@@ -165,7 +177,8 @@ ticker CSV、single FMP infer、human summary、调用者追加参数、atomic p
 SIGINT 130、确认生成阶段不启动 live event stream、terminal exit mapping、Fins-owned missing / duplicate protocol error 保持既有 CLI prefix/message/exit 1、typed error object 与 runtime `PREPROCESS` provenance 经 Service/CLI identity 传播、SIGINT 到 operation-scoped async cancellation、
 cancel race 收口、第二次 SIGINT 本地 130，以及 CLI 不直接 import `dayu.fins.storage`。
 CLI runtime display controller 独立测试覆盖每个 prompt / interactive display lifecycle 私有的单线程 executor 与 async serial gate、activity / thinking typed callback、toggle / finish / cancel / local-exit / terminal renderer 的同线程串行执行、thinking guard、blocking callback 与 close barrier、callback / renderer / executor failure identity、closing 后拒绝新 job，以及 `callback_started -> close_requested -> callback_released -> callback_finished -> renderer close -> executor shutdown -> caller-local release` 顺序；renderer 与 executor 在重复关闭和异常路径都恰好关闭一次，不使用 event-loop default executor 或 UI event queue。除本节明确列出的真实 POSIX / Windows CLI 到 Fins 临时仓储 smoke 外，CLI 单元测试不启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
-CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `interactive` command 导入下划线私有符号。
+CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `interactive` command 导入下划线私有符号，并阻止 `tool_trace` command 越过 Service public boundary 导入 Host、Engine、Fins 或 Runtime。
+`tool_trace analyze` 测试覆盖 parser help/required/unknown action、真实 module entry、成功报告与退出码、usage/analysis/publication failure 映射，以及 partial publication 同时展示已发布路径与失败路径。
 
 ### `tests/runtime/`
 
@@ -208,6 +221,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 - entrypoint runtime：覆盖 reusable Agent entrypoint Service boundary 的 runtime 准备、Session ensure/create、session helper 参数校验、submit 前 async watcher subscription open 与 accepted target binding 时序、sole consumer、capacity-one generation slot、fast terminal race、无关 terminal 过滤、activity / thinking typed callback execution port、callback shield 与 consumer 串行读取、exact-five disposition、old-generation / stop late commit 拒绝、terminal identity 去重、`DELIVERY_INTERRUPTED/TRANSIENT_MAILBOX_OVERFLOW` 专属 durable recovery、其它 EOF / public / non-public iterator failure 不 recovery，以及 callback、EOF、iterator、terminal、delivery recovery、slot-empty、caller cancellation分别与 watcher close failure 的异常优先级；durable read 继续覆盖 `get_run`、`OutboxTerminalCursor` / `seen_terminal_event_ids` / `limit=50`、`CAUGHT_UP` 分页、`LAGGED` 重试、`FAILED` 与 caught-up-without-match 错误；interactive startup 覆盖 watcher-first session-scoped backfill、无 target 不预读、target generation ack/rebind、idle snapshot 后 tail outbox closure、active Run observation与 queued-only bounded promotion wait / failure；cancel 覆盖已终态跳过 `cancel_run(...)`、非终态 subscription-before-cancel、terminal race recovery以及完整 `CancelRunRequest` 构造。scene context slot builder 覆盖 `fins_default_subject`、`current_time` 中文格式、FMP 成功增强、缺 key 时跳过 timeout 校验和失败 fallback；interactive path 覆盖真实 `interactive.json` 的 subject/current-time slots、Fins awaiting poller assembly 和连续两轮 terminal wait state。
 - Fins direct：覆盖 reusable Fins direct Service boundary 的 download / preprocess typed request 构造、upload wrapper 到 `FinsIngestionRuntime.upload(...)` union API、同一个 `ValidatedFinsEventStream` identity pass-through、progress / result contract、failure result pass-through、runtime stream exception 透传、Fins-owned typed protocol error object 与 runtime `PREPROCESS` provenance 不被 Service alias 重建、task cancellation 关闭 runtime stream、Service 不暴露 job handle / job event / `request_cancel` direct API，以及 direct event leakage guard。
 - Fins awaiting assembly：覆盖 Service 在 active filtering 前按显式 provider id、import path、source id 识别 Fins download / preprocess / upload awaiting providers，把 raw config 只交给 Fins 唯一 parser，并以 required parallel typed state 复用 mode/workspace/source/version；覆盖派生 discovery 直接替换 tool bundle 后仍保留相同 Host binding、activation registry、poll registry 与 policy composition，以及 disabled illegal fail-fast、disabled legal 不 active、recognized non-awaiting 字段存在性 misuse、未知第三方 opaque config、available tool 缺失过滤、poll/callback/manual 精确 binding、activation 全量、poll registry 只含 poll、callback pre-open failure、manual/no-provider/provider-disabled/runtime-disabled 与 enabled missing-registry matrix。`test_fins_wait_adapter.py` 还覆盖 Service-owned adapter 的 operation-kind 稳定映射、activation runtime 复用、corrupt token fail-fast、Host `WaitAdapterSnapshot` 到 Fins observation status / transient unavailable / lost / failed / cancelled / abandon lifecycle 的映射，以及 adapter 不读取 Host durable row deadline / expiry 字段。
+- Tool Trace analysis：覆盖四种显式 path discovery、ambiguous/unsupported layout、hot-only/cold-only/artifact-root-missing、Host public analyzer 调用与同一 report JSON/Markdown rendering、UTF-8 output，以及 JSON 第一次 replace 和 Markdown 第二次 replace 的 old-file 有/无矩阵；两个 replace 位置都覆盖 cleanup secondary failure，断言 primary `failed_path`、`published_paths` 与 cleanup detail 不漂移。
 - import boundary / weak typing guard：阻止 Service 导入 Config、UI 或 Fins 非 assembly 边界；当前只允许 Service composition helper 与 `dayu.service.fins_wait_adapter` 导入 `dayu.fins.ingestion` lightweight observation boundary、`dayu.service.fins_direct` 导入 Fins runtime / request / enum / direct event public boundary，以及 `dayu.service.scene_context` 导入 `dayu.fins.resolver` / `dayu.fins.ticker_normalization` 生成 entrypoint slot 文本；并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
 
 ### `tests/contracts/`
