@@ -1,8 +1,12 @@
-"""Tool Trace Analyzer Service 发现与原子发布测试。"""
+"""Tool Trace Analyzer Service 发现与逐文件原子替换测试。"""
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
+from types import TracebackType
+from typing import Self, TextIO
 
 import pytest
 
@@ -53,6 +57,47 @@ class _ReplaceFailure:
         temporary_path.replace(target_path)
 
 
+class _ReplaceInterruption:
+    """在指定调用序号原样抛出 replace phase 中断。"""
+
+    call_count: int
+    fail_call: int
+    failure: BaseException
+
+    def __init__(
+        self,
+        *,
+        fail_call: int,
+        failure: BaseException,
+    ) -> None:
+        """初始化 replace phase 中断注入器。
+
+        :param fail_call: 从 1 开始的中断调用序号。
+        :param failure: 需要原样传播的中断异常。
+        :returns: ``None``。
+        :raises: 无。
+        """
+
+        self.call_count = 0
+        self.fail_call = fail_call
+        self.failure = failure
+
+    def __call__(self, temporary_path: Path, target_path: Path) -> None:
+        """执行真实 replace 或在目标调用原样抛出中断。
+
+        :param temporary_path: 本次临时文件路径。
+        :param target_path: 最终报告路径。
+        :returns: ``None``。
+        :raises BaseException: 当前调用命中 ``fail_call`` 时原样抛出。
+        :raises OSError: 真实 replace 失败时抛出。
+        """
+
+        self.call_count += 1
+        if self.call_count == self.fail_call:
+            raise self.failure
+        temporary_path.replace(target_path)
+
+
 class _CleanupFailure:
     """记录并拒绝临时文件 cleanup。"""
 
@@ -77,6 +122,160 @@ class _CleanupFailure:
 
         self.paths.append(path)
         raise OSError("cleanup-failed")
+
+
+class _ControlledTemporaryTextFile:
+    """可在 write 阶段注入原始异常的真实同目录临时文件。"""
+
+    name: str
+    _stream: TextIO
+    _write_failure: BaseException | None
+
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        prefix: str,
+        suffix: str,
+        write_failure: BaseException | None,
+    ) -> None:
+        """创建由测试控制 write 结果的严格 UTF-8 临时文件。
+
+        :param output_dir: 临时文件所在目录。
+        :param prefix: 临时文件名前缀。
+        :param suffix: 临时文件名后缀。
+        :param write_failure: write 时原样抛出的异常；``None`` 表示正常写入。
+        :returns: ``None``。
+        :raises OSError: 临时文件创建或打开失败时抛出。
+        """
+
+        file_descriptor, self.name = tempfile.mkstemp(
+            dir=output_dir,
+            prefix=prefix,
+            suffix=suffix,
+            text=True,
+        )
+        os.close(file_descriptor)
+        self._stream = Path(self.name).open(
+            mode="w",
+            encoding="utf-8",
+            errors="strict",
+        )
+        self._write_failure = write_failure
+
+    def __enter__(self) -> Self:
+        """返回当前临时文件上下文。
+
+        :returns: 当前临时文件。
+        :raises: 无。
+        """
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """关闭底层文本流。
+
+        :param exc_type: 上下文异常类型。
+        :param exc_value: 上下文异常实例。
+        :param traceback: 上下文异常 traceback。
+        :returns: ``None``。
+        :raises OSError: 文本流关闭失败时抛出。
+        """
+
+        del exc_type, exc_value, traceback
+        self._stream.close()
+
+    def write(self, content: str) -> int:
+        """写入文本或原样抛出注入异常。
+
+        :param content: 待写入文本。
+        :returns: 正常写入的字符数。
+        :raises BaseException: 注入 write failure 时原样抛出。
+        """
+
+        if self._write_failure is not None:
+            raise self._write_failure
+        return self._stream.write(content)
+
+    def flush(self) -> None:
+        """flush 底层文本流。
+
+        :returns: ``None``。
+        :raises OSError: flush 失败时抛出。
+        """
+
+        self._stream.flush()
+
+
+class _NamedTemporaryFileFailure:
+    """在指定临时文件的 write 阶段注入原始异常。"""
+
+    call_count: int
+    fail_call: int
+    failure: BaseException
+
+    def __init__(
+        self,
+        *,
+        fail_call: int,
+        failure: BaseException,
+    ) -> None:
+        """初始化临时文件 failure factory。
+
+        :param fail_call: 从 1 开始的失败临时文件序号。
+        :param failure: 需要原样传播的 write 异常。
+        :returns: ``None``。
+        :raises: 无。
+        """
+
+        self.call_count = 0
+        self.fail_call = fail_call
+        self.failure = failure
+
+    def __call__(
+        self,
+        *,
+        mode: str,
+        encoding: str,
+        errors: str,
+        dir: Path,
+        prefix: str,
+        suffix: str,
+        delete: bool,
+    ) -> _ControlledTemporaryTextFile:
+        """返回真实临时文件，并按调用序号决定是否让 write 失败。
+
+        :param mode: production 请求的文本模式。
+        :param encoding: production 请求的编码。
+        :param errors: production 请求的编码错误策略。
+        :param dir: 临时文件所在目录。
+        :param prefix: 临时文件名前缀。
+        :param suffix: 临时文件名后缀。
+        :param delete: 关闭时是否自动删除。
+        :returns: 可控 write 行为的临时文件。
+        :raises AssertionError: production 不再请求严格 UTF-8、显式保留的文本文件时抛出。
+        :raises OSError: 临时文件创建或打开失败时抛出。
+        """
+
+        assert mode == "w"
+        assert encoding == "utf-8"
+        assert errors == "strict"
+        assert delete is False
+        self.call_count += 1
+        write_failure = (
+            self.failure if self.call_count == self.fail_call else None
+        )
+        return _ControlledTemporaryTextFile(
+            output_dir=dir,
+            prefix=prefix,
+            suffix=suffix,
+            write_failure=write_failure,
+        )
 
 
 def _write_empty_cold_file(path: Path) -> Path:
@@ -303,6 +502,96 @@ def test_analysis_calls_host_public_api_and_renders_same_report(
     assert "无法证明" in markdown
 
 
+@pytest.mark.parametrize(
+    ("json_text", "markdown_text"),
+    (
+        pytest.param("\ud800", "new-markdown", id="first-json"),
+        pytest.param("new-json", "\ud800", id="second-markdown"),
+    ),
+)
+def test_strict_utf8_temp_failure_keeps_old_reports_and_leaks_no_temp(
+    tmp_path: Path,
+    json_text: str,
+    markdown_text: str,
+) -> None:
+    """任一 strict UTF-8 temp 写入失败都必须保留旧报告并清理全部 temp。
+
+    :param tmp_path: pytest 临时目录。
+    :param json_text: 本次 JSON temp 文本。
+    :param markdown_text: 本次 Markdown temp 文本。
+    :returns: ``None``。
+    :raises AssertionError: 当前或此前 temp 泄漏、旧报告被改写时抛出。
+    """
+
+    output_dir = tmp_path / "reports"
+    output_dir.mkdir()
+    json_path = output_dir / "tool-trace-analysis.json"
+    markdown_path = output_dir / "tool-trace-analysis.md"
+    json_path.write_text("old-json", encoding="utf-8")
+    markdown_path.write_text("old-markdown", encoding="utf-8")
+
+    with pytest.raises(UnicodeEncodeError):
+        service_analysis._publish_report_pair(
+            json_text=json_text,
+            markdown_text=markdown_text,
+            json_path=json_path,
+            markdown_path=markdown_path,
+        )
+
+    assert json_path.read_text(encoding="utf-8") == "old-json"
+    assert markdown_path.read_text(encoding="utf-8") == "old-markdown"
+    assert _temporary_reports(output_dir) == ()
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    (OSError, KeyboardInterrupt, SystemExit),
+)
+def test_second_temp_write_failure_propagates_and_cleans_all_temps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    """第二个 temp 写失败须原样传播并清理当前及此前成功写入的 temp。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch。
+    :param failure_type: 本次在 Markdown temp write 注入的异常类型。
+    :returns: ``None``。
+    :raises AssertionError: 异常被转换、旧报告变化或 temp 泄漏时抛出。
+    """
+
+    output_dir = tmp_path / "reports"
+    output_dir.mkdir()
+    json_path = output_dir / "tool-trace-analysis.json"
+    markdown_path = output_dir / "tool-trace-analysis.md"
+    json_path.write_text("old-json", encoding="utf-8")
+    markdown_path.write_text("old-markdown", encoding="utf-8")
+    failure = failure_type("temp-write-failed")
+    failure_factory = _NamedTemporaryFileFailure(
+        fail_call=2,
+        failure=failure,
+    )
+    monkeypatch.setattr(
+        service_analysis.tempfile,
+        "NamedTemporaryFile",
+        failure_factory,
+    )
+
+    with pytest.raises(failure_type) as raised:
+        service_analysis._publish_report_pair(
+            json_text="new-json",
+            markdown_text="new-markdown",
+            json_path=json_path,
+            markdown_path=markdown_path,
+        )
+
+    assert raised.value is failure
+    assert json_path.read_text(encoding="utf-8") == "old-json"
+    assert markdown_path.read_text(encoding="utf-8") == "old-markdown"
+    assert _temporary_reports(output_dir) == ()
+
+
 def test_first_replace_failure_keeps_old_reports_and_publishes_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -339,6 +628,90 @@ def test_first_replace_failure_keeps_old_reports_and_publishes_nothing(
     assert error.cleanup_error is None
     assert error.temporary_paths_cleaned is True
     assert json_path.read_text(encoding="utf-8") == "old-json"
+    assert markdown_path.read_text(encoding="utf-8") == "old-markdown"
+    assert _temporary_reports(output_dir) == ()
+
+
+@pytest.mark.parametrize("failure_type", (KeyboardInterrupt, SystemExit))
+def test_first_replace_interruption_keeps_old_reports_and_cleans_all_temps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    """第一次 replace 中断须保留旧双报告并清理全部 pending temp。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch。
+    :param failure_type: 本次注入的中断异常类型。
+    :returns: ``None``。
+    :raises AssertionError: 异常 identity、最终文件或 temp lifecycle 漂移时抛出。
+    """
+
+    output_dir = tmp_path / "reports"
+    output_dir.mkdir()
+    json_path = output_dir / "tool-trace-analysis.json"
+    markdown_path = output_dir / "tool-trace-analysis.md"
+    json_path.write_text("old-json", encoding="utf-8")
+    markdown_path.write_text("old-markdown", encoding="utf-8")
+    failure = failure_type("first-replace-interrupted")
+    monkeypatch.setattr(
+        service_analysis,
+        "_replace_temporary_file",
+        _ReplaceInterruption(fail_call=1, failure=failure),
+    )
+
+    with pytest.raises(failure_type) as raised:
+        service_analysis._publish_report_pair(
+            json_text="new-json",
+            markdown_text="new-markdown",
+            json_path=json_path,
+            markdown_path=markdown_path,
+        )
+
+    assert raised.value is failure
+    assert json_path.read_text(encoding="utf-8") == "old-json"
+    assert markdown_path.read_text(encoding="utf-8") == "old-markdown"
+    assert _temporary_reports(output_dir) == ()
+
+
+@pytest.mark.parametrize("failure_type", (KeyboardInterrupt, SystemExit))
+def test_second_replace_interruption_keeps_new_json_and_old_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    """第二次 replace 中断须保留新 JSON、旧 Markdown 并仅清理 pending temp。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch。
+    :param failure_type: 本次注入的中断异常类型。
+    :returns: ``None``。
+    :raises AssertionError: 异常 identity、partial publication 或 temp lifecycle 漂移时抛出。
+    """
+
+    output_dir = tmp_path / "reports"
+    output_dir.mkdir()
+    json_path = output_dir / "tool-trace-analysis.json"
+    markdown_path = output_dir / "tool-trace-analysis.md"
+    json_path.write_text("old-json", encoding="utf-8")
+    markdown_path.write_text("old-markdown", encoding="utf-8")
+    failure = failure_type("second-replace-interrupted")
+    monkeypatch.setattr(
+        service_analysis,
+        "_replace_temporary_file",
+        _ReplaceInterruption(fail_call=2, failure=failure),
+    )
+
+    with pytest.raises(failure_type) as raised:
+        service_analysis._publish_report_pair(
+            json_text="new-json",
+            markdown_text="new-markdown",
+            json_path=json_path,
+            markdown_path=markdown_path,
+        )
+
+    assert raised.value is failure
+    assert json_path.read_text(encoding="utf-8") == "new-json"
     assert markdown_path.read_text(encoding="utf-8") == "old-markdown"
     assert _temporary_reports(output_dir) == ()
 

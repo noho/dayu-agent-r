@@ -1,8 +1,9 @@
 """Tool Trace Analyzer 的 Service 输入发现与报告发布边界。
 
 本模块把 operator 显式路径解析为 Host public source，调用 Host public analyzer，
-并把同一个 structured report 渲染为 JSON/Markdown 后原子发布。Service 不解释
-Tool Trace 业务语义，也不读取 Host durable internals。
+并把同一个 structured report 渲染为 JSON/Markdown 后，按固定顺序逐文件原子替换；
+两个报告文件不构成事务。Service 不解释 Tool Trace 业务语义，也不读取 Host durable
+internals。
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ class ServiceToolTraceCleanupFailure:
 
 
 class ServiceToolTraceAnalysisPublishError(Exception):
-    """Tool Trace 报告原子发布失败。
+    """Tool Trace 报告逐文件发布失败。
 
     :param published_paths: 本次已经成功 replace 的最终报告路径。
     :param failed_path: primary replace 失败对应的最终目标路径。
@@ -182,15 +183,18 @@ def analyze_and_publish_tool_trace(
     input_path: Path,
     output_dir: Path,
 ) -> ServiceToolTraceAnalysisResult:
-    """分析 Tool Trace 并把同源 JSON/Markdown 原子发布到输出目录。
+    """分析 Tool Trace 并按固定顺序逐文件原子替换同源 JSON/Markdown。
 
     :param input_path: operator 显式输入文件或目录。
     :param output_dir: 报告输出目录；不存在时由 Service 创建。
     :returns: structured report、source 与两个已发布路径。
     :raises TypeError: 参数不是 ``Path`` 时抛出。
     :raises ServiceToolTraceAnalysisUsageError: 输入路径或布局不合法时抛出。
-    :raises ServiceToolTraceAnalysisPublishError: 任一原子 replace 失败时抛出。
-    :raises OSError: 输出目录创建、临时文件写入或 flush 失败时抛出。
+    :raises ServiceToolTraceAnalysisPublishError: 任一逐文件原子 replace 失败时抛出。
+    :raises UnicodeEncodeError: JSON 或 Markdown 无法按严格 UTF-8 写入时抛出。
+    :raises OSError: 输出目录创建、临时文件创建、写入或 flush 失败时抛出。
+    :raises KeyboardInterrupt: 写入或替换中断，清理 pending 临时文件后原样传播。
+    :raises SystemExit: 写入或替换收到退出请求，清理 pending 临时文件后原样传播。
     :raises ToolTraceAnalysisInputError: Host 无法建立可信输入边界时透传。
     """
 
@@ -355,14 +359,17 @@ def _publish_report_pair(
     json_path: Path,
     markdown_path: Path,
 ) -> None:
-    """按 JSON 后 Markdown 的固定顺序原子发布报告对。
+    """按 JSON 后 Markdown 顺序逐文件原子替换，双文件不构成事务。
 
     :param json_text: 从 structured report 渲染的 JSON。
     :param markdown_text: 从同一 report 渲染的 Markdown。
     :param json_path: JSON 最终路径。
     :param markdown_path: Markdown 最终路径。
     :returns: ``None``。
+    :raises UnicodeEncodeError: 任一文本无法按严格 UTF-8 写入时抛出。
     :raises OSError: 临时文件创建、写入或 flush 失败时抛出。
+    :raises KeyboardInterrupt: 写入或替换中断，清理 pending 临时文件后原样传播。
+    :raises SystemExit: 写入或替换收到退出请求，清理 pending 临时文件后原样传播。
     :raises ServiceToolTraceAnalysisPublishError: 任一 replace 失败时抛出。
     """
 
@@ -375,35 +382,39 @@ def _publish_report_pair(
             markdown_text,
         )
         temporary_paths.append(markdown_temporary_path)
-    except OSError:
+    except BaseException:
         _cleanup_temporary_paths(tuple(temporary_paths))
         raise
 
     published_paths: list[Path] = []
     pending_temporary_paths = list(temporary_paths)
-    for temporary_path, target_path in (
-        (json_temporary_path, json_path),
-        (markdown_temporary_path, markdown_path),
-    ):
-        try:
+    target_path = json_path
+    try:
+        for temporary_path, target_path in (
+            (json_temporary_path, json_path),
+            (markdown_temporary_path, markdown_path),
+        ):
             _replace_temporary_file(temporary_path, target_path)
-        except OSError as exc:
-            cleanup_error = _cleanup_temporary_paths(
-                tuple(pending_temporary_paths)
-            )
-            primary_error = ServiceToolTracePublishFailure(
-                target_path=target_path,
-                error_summary=_bounded_error_summary(exc),
-            )
-            raise ServiceToolTraceAnalysisPublishError(
-                published_paths=tuple(published_paths),
-                failed_path=target_path,
-                primary_publish_error=primary_error,
-                cleanup_error=cleanup_error,
-                temporary_paths_cleaned=cleanup_error is None,
-            ) from exc
-        pending_temporary_paths.remove(temporary_path)
-        published_paths.append(target_path)
+            pending_temporary_paths.remove(temporary_path)
+            published_paths.append(target_path)
+    except OSError as exc:
+        cleanup_error = _cleanup_temporary_paths(
+            tuple(pending_temporary_paths)
+        )
+        primary_error = ServiceToolTracePublishFailure(
+            target_path=target_path,
+            error_summary=_bounded_error_summary(exc),
+        )
+        raise ServiceToolTraceAnalysisPublishError(
+            published_paths=tuple(published_paths),
+            failed_path=target_path,
+            primary_publish_error=primary_error,
+            cleanup_error=cleanup_error,
+            temporary_paths_cleaned=cleanup_error is None,
+        ) from exc
+    except BaseException:
+        _cleanup_temporary_paths(tuple(pending_temporary_paths))
+        raise
 
 
 def _write_temporary_text(output_dir: Path, content: str) -> Path:
@@ -412,10 +423,13 @@ def _write_temporary_text(output_dir: Path, content: str) -> Path:
     :param output_dir: 最终 report 所在目录。
     :param content: 待写入文本。
     :returns: 已关闭的同目录临时文件路径。
+    :raises UnicodeEncodeError: 文本无法按严格 UTF-8 写入时清理临时文件并抛出。
     :raises OSError: 临时文件创建、写入、flush 或关闭失败时抛出。
+    :raises KeyboardInterrupt: 写入中断且清理临时文件后原样传播。
+    :raises SystemExit: 写入收到退出请求且清理临时文件后原样传播。
     """
 
-    with tempfile.NamedTemporaryFile(
+    temporary_file = tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
         errors="strict",
@@ -423,10 +437,16 @@ def _write_temporary_text(output_dir: Path, content: str) -> Path:
         prefix=_TEMPORARY_FILE_PREFIX,
         suffix=_TEMPORARY_FILE_SUFFIX,
         delete=False,
-    ) as temporary_file:
-        temporary_file.write(content)
-        temporary_file.flush()
-        return Path(temporary_file.name)
+    )
+    temporary_path = Path(temporary_file.name)
+    try:
+        with temporary_file:
+            temporary_file.write(content)
+            temporary_file.flush()
+    except BaseException:
+        _cleanup_temporary_paths((temporary_path,))
+        raise
+    return temporary_path
 
 
 def _cleanup_temporary_paths(
