@@ -22,6 +22,7 @@ from dayu.cli.arg_parsing import (
     COMMAND_PROCESS_MATERIAL,
     COMMAND_PROMPT,
     COMMAND_SESSION,
+    COMMAND_TOOL_TRACE,
     COMMAND_UPLOAD_FILING,
     COMMAND_UPLOAD_FILINGS_FROM,
     COMMAND_UPLOAD_MATERIAL,
@@ -34,6 +35,7 @@ from dayu.cli.commands.init import run_init_command
 from dayu.cli.commands.interactive import run_interactive_command
 from dayu.cli.commands.prompt import run_prompt_command
 from dayu.cli.commands.session import run_session_command
+from dayu.cli.commands.tool_trace import run_tool_trace_command
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -70,6 +72,7 @@ COMMAND_RUNNERS[COMMAND_PROCESS] = run_fins_direct_command
 COMMAND_RUNNERS[COMMAND_PROCESS_FILING] = run_fins_direct_command
 COMMAND_RUNNERS[COMMAND_PROCESS_MATERIAL] = run_fins_direct_command
 COMMAND_RUNNERS[COMMAND_SESSION] = run_session_command
+COMMAND_RUNNERS[COMMAND_TOOL_TRACE] = run_tool_trace_command
 
 
 def main(argv: Sequence[str] | None = None) -> int:

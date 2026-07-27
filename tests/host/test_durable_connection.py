@@ -6,13 +6,18 @@ import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.connection import _close_connection_best_effort
-from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.connection import (
+    HostDurableReadStore,
+    _close_connection_best_effort,
+    open_host_durable_read_store,
+    open_host_durable_store,
+)
+from dayu.host.durable.errors import HostDurableConfigError, HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -28,7 +33,11 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import TABLE_EVENT_LOG
-from dayu.host.durable.transaction import HostTransaction, configure_connection_pragmas
+from dayu.host.durable.transaction import (
+    HostTransaction,
+    configure_connection_pragmas,
+    configure_read_only_connection_pragmas,
+)
 
 _USER_INPUT_ACCEPTED_TYPE = "USER_INPUT_ACCEPTED"
 _TEST_ACTOR = "durable-test"
@@ -144,6 +153,267 @@ def test_configure_connection_pragmas_sets_wal_autocheckpoint() -> None:
         configure_connection_pragmas(connection, HostSQLiteStoragePolicy())
         rows = connection.execute("PRAGMA wal_autocheckpoint").fetchall()
         assert rows == [(256,)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        HostSQLiteStoragePolicy(),
+        HostSQLiteStoragePolicy(busy_timeout_seconds=0.123),
+    ),
+)
+def test_configure_read_only_pragmas_sets_only_read_contract(
+    policy: HostSQLiteStoragePolicy,
+) -> None:
+    """只读 PRAGMA helper 必须设置 busy/foreign-key/query-only 且不切 WAL。"""
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        configure_read_only_connection_pragmas(connection, policy)
+        expected_timeout_ms = int(policy.busy_timeout_seconds * 1000)
+        assert connection.execute("PRAGMA busy_timeout").fetchall() == [(expected_timeout_ms,)]
+        assert connection.execute("PRAGMA foreign_keys").fetchall() == [(1,)]
+        assert connection.execute("PRAGMA query_only").fetchall() == [(1,)]
+        assert connection.execute("PRAGMA journal_mode").fetchall() == [("memory",)]
+        assert connection.execute("PRAGMA wal_autocheckpoint").fetchall() == [(1000,)]
+    finally:
+        connection.close()
+
+
+def test_read_only_store_is_physical_ro_and_does_not_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只读 opener 不得调用写侧 PRAGMA/bootstrap，关闭 query_only 后仍不可写。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        store.transaction_runner.run_write(lambda transaction: _append_event(transaction, "event-read-only"))
+    before_stat = options.db_path.stat()
+
+    def reject_write_helper(
+        connection: sqlite3.Connection,
+        sqlite_policy: HostSQLiteStoragePolicy,
+    ) -> None:
+        """若只读 opener 错调写侧 helper 则立即失败。
+
+        :param connection: SQLite connection。
+        :param sqlite_policy: SQLite policy。
+        :returns: 永不返回。
+        :raises AssertionError: 始终抛出。
+        """
+
+        raise AssertionError("write helper must not be called")
+
+    monkeypatch.setattr(
+        "dayu.host.durable.connection.configure_connection_pragmas",
+        reject_write_helper,
+    )
+    with open_host_durable_read_store(
+        db_path=options.db_path,
+        artifact_root=options.payload_policy.artifact_root,
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=0.321,
+            write_busy_retry_count=9,
+            write_retry_initial_delay_seconds=9.0,
+            write_retry_backoff_multiplier=9.0,
+            write_retry_max_delay_seconds=9.0,
+        ),
+    ) as read_store:
+        assert read_store.run_read(_count_event_log_rows) == 1
+
+        def attempt_write(transaction: HostTransaction) -> None:
+            """关闭 query_only 后尝试写入，证明底层 URI 仍是物理只读。
+
+            :param transaction: 只读 transaction。
+            :returns: ``None``。
+            :raises sqlite3.Error: 物理只读 connection 拒绝写入时抛出。
+            """
+
+            transaction.execute("PRAGMA query_only=OFF")
+            transaction.execute(
+                f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+                ("event-read-only",),
+            )
+
+        with pytest.raises(
+            HostDurableError,
+            match="read-only transaction failed",
+        ):
+            read_store.run_read(attempt_write)
+
+    after_stat = options.db_path.stat()
+    assert after_stat.st_size == before_stat.st_size
+    assert _read_event_count_from_path(options.db_path) == 1
+
+
+def test_read_only_store_missing_path_does_not_create_database(
+    tmp_path: Path,
+) -> None:
+    """只读 opener 对缺失路径必须 fail closed 且不创建 DB 或 parent。"""
+
+    db_path = (tmp_path / "missing" / "host.sqlite3").absolute()
+    with pytest.raises(HostDurableError, match="must exist"):
+        open_host_durable_read_store(
+            db_path=db_path,
+            artifact_root=(tmp_path / "artifacts").absolute(),
+            sqlite_policy=HostSQLiteStoragePolicy(),
+        )
+    assert not db_path.exists()
+    assert not db_path.parent.exists()
+
+
+def test_read_only_store_rejects_invalid_paths_and_corrupt_database(
+    tmp_path: Path,
+) -> None:
+    """只读 opener 必须拒绝相对路径、目录及既存损坏数据库。"""
+
+    with pytest.raises(HostDurableConfigError, match="must be absolute"):
+        open_host_durable_read_store(
+            db_path=Path("relative.sqlite3"),
+            artifact_root=tmp_path.absolute(),
+            sqlite_policy=HostSQLiteStoragePolicy(),
+        )
+
+    with pytest.raises(HostDurableConfigError, match="regular file"):
+        open_host_durable_read_store(
+            db_path=tmp_path.absolute(),
+            artifact_root=tmp_path.absolute(),
+            sqlite_policy=HostSQLiteStoragePolicy(),
+        )
+
+    corrupt_path = (tmp_path / "corrupt.sqlite3").absolute()
+    corrupt_path.write_bytes(b"not-a-sqlite-database")
+    with pytest.raises(HostDurableError, match="read-only SQLite setup failed"):
+        open_host_durable_read_store(
+            db_path=corrupt_path,
+            artifact_root=tmp_path.absolute(),
+            sqlite_policy=HostSQLiteStoragePolicy(),
+        )
+
+
+def test_read_only_store_validates_lifecycle_and_non_sqlite_failures(
+    tmp_path: Path,
+) -> None:
+    """只读 store 必须拒绝嵌套读取、透传业务异常并拒绝关闭后复用。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    read_store = open_host_durable_read_store(
+        db_path=options.db_path,
+        artifact_root=options.payload_policy.artifact_root,
+        sqlite_policy=HostSQLiteStoragePolicy(),
+    )
+
+    def nested_read(transaction: HostTransaction) -> int:
+        """在活跃 read transaction 内发起第二次读取。
+
+        :param transaction: 外层只读 transaction。
+        :returns: 永不返回。
+        :raises HostDurableError: 嵌套读取被只读 store 拒绝时抛出。
+        """
+
+        del transaction
+        return read_store.run_read(_count_event_log_rows)
+
+    with pytest.raises(HostDurableError, match="does not allow nesting"):
+        read_store.run_read(nested_read)
+
+    def raise_business_error(transaction: HostTransaction) -> int:
+        """在只读 transaction 内模拟非 SQLite 业务异常。
+
+        :param transaction: 当前只读 transaction。
+        :returns: 永不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        del transaction
+        raise RuntimeError("read operation failed")
+
+    with pytest.raises(RuntimeError, match="read operation failed"):
+        read_store.run_read(raise_business_error)
+
+    def close_during_read(transaction: HostTransaction) -> int:
+        """在活跃 read transaction 内尝试关闭 store。
+
+        :param transaction: 当前只读 transaction。
+        :returns: 永不返回。
+        :raises HostDurableError: 活跃读取期间关闭被拒绝时抛出。
+        """
+
+        del transaction
+        read_store.close()
+        return 0
+
+    with pytest.raises(HostDurableError, match="active transaction"):
+        read_store.run_read(close_during_read)
+
+    read_store.close()
+    read_store.close()
+    with pytest.raises(HostDurableError, match="read store is closed"):
+        read_store.run_read(_count_event_log_rows)
+
+
+def test_read_only_store_constructor_rejects_invalid_types(tmp_path: Path) -> None:
+    """只读 store 内部句柄必须在 owner boundary 拒绝错误参数类型。"""
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(TypeError, match="db_path must be Path"):
+            HostDurableReadStore(
+                db_path=cast(Path, "invalid-db-path"),
+                artifact_root=tmp_path.absolute(),
+                connection=connection,
+            )
+        with pytest.raises(TypeError, match="artifact_root must be Path"):
+            HostDurableReadStore(
+                db_path=tmp_path.absolute(),
+                artifact_root=cast(Path, "invalid-artifact-root"),
+                connection=connection,
+            )
+        with pytest.raises(TypeError, match="connection must be sqlite3.Connection"):
+            HostDurableReadStore(
+                db_path=tmp_path.absolute(),
+                artifact_root=tmp_path.absolute(),
+                connection=cast(sqlite3.Connection, "invalid-connection"),
+            )
+    finally:
+        connection.close()
+
+
+def test_read_only_store_rejects_relative_artifact_root(tmp_path: Path) -> None:
+    """只读 opener 必须拒绝相对 artifact root。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    with pytest.raises(HostDurableConfigError, match="artifact_root must be absolute"):
+        open_host_durable_read_store(
+            db_path=options.db_path,
+            artifact_root=Path("relative-artifacts"),
+            sqlite_policy=HostSQLiteStoragePolicy(),
+        )
+
+
+def _read_event_count_from_path(db_path: Path) -> int:
+    """使用独立 SQLite connection 读取 EventLog 行数。
+
+    :param db_path: Host DB 路径。
+    :returns: EventLog 行数。
+    :raises sqlite3.Error: DB 无法打开或查询时抛出。
+    :raises AssertionError: count row 类型错误时抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(f"SELECT COUNT(*) FROM {TABLE_EVENT_LOG}").fetchone()
+        assert row is not None
+        value = row[0]
+        assert isinstance(value, int)
+        return value
     finally:
         connection.close()
 

@@ -86,6 +86,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "process_filing": ("--ticker", "--document-id", "--overwrite"),
     "process_material": ("--ticker", "--document-id", "--overwrite"),
     "session": ("list", "resume", "purge"),
+    "tool_trace": ("analyze",),
 }
 _TEST_LOGGER_NAME: str = "dayu.cli.test_arg_parsing"
 _FIRST_LOG_FILE_DIAGNOSTIC: str = "first run diagnostic"
@@ -273,6 +274,66 @@ def test_interactive_help_contains_optional_ticker(
     help_text = _capture_help(capsys, ("interactive",))
 
     assert "--ticker" in help_text
+
+
+def test_tool_trace_analyze_help_and_required_arguments(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证 Analyzer action help 及 INPUT/output-dir 必填 contract。
+
+    :param capsys: pytest 标准输出捕获。
+    :returns: ``None``。
+    :raises AssertionError: help 或 required 参数 contract 漂移时抛出。
+    """
+
+    help_text = _capture_help(capsys, ("tool_trace", "analyze"))
+
+    assert "INPUT" in help_text
+    assert "--output-dir" in help_text
+    with pytest.raises(SystemExit) as missing_input:
+        parse_cli_args(("tool_trace", "analyze", "--output-dir", "reports"))
+    assert missing_input.value.code == EXIT_USAGE_ERROR
+    with pytest.raises(SystemExit) as missing_output:
+        parse_cli_args(("tool_trace", "analyze", "workspace"))
+    assert missing_output.value.code == EXIT_USAGE_ERROR
+
+
+def test_tool_trace_parser_rejects_unknown_action() -> None:
+    """验证未知 Tool Trace action 由 argparse 返回用法错误。
+
+    :returns: ``None``。
+    :raises AssertionError: unknown action 没有被拒绝时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(("tool_trace", "inspect"))
+
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_tool_trace_parser_returns_explicit_analyze_fields() -> None:
+    """验证 Analyzer parser 不从全局 workspace 参数猜输入。
+
+    :returns: ``None``。
+    :raises AssertionError: 解析字段或显式路径 contract 漂移时抛出。
+    """
+
+    args = parse_cli_args(
+        (
+            "tool_trace",
+            "analyze",
+            "trace.jsonl",
+            "--output-dir",
+            "reports",
+            "--base",
+            "ignored-workspace",
+        )
+    )
+
+    assert args.tool_trace_action == "analyze"
+    assert args.tool_trace_input == "trace.jsonl"
+    assert args.output_dir == "reports"
+    assert args.workspace_root == "ignored-workspace"
 
 
 def test_upload_actions_default_to_auto_and_batch_rejects_delete() -> None:

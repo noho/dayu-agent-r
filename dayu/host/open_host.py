@@ -137,6 +137,7 @@ from dayu.host.storage_maintenance import (
 from dayu.host.tool_trace import (
     DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
     ToolTraceSinkOptions,
+    _tool_trace_cold_lock_path,
     catch_up_tool_trace_projection,
 )
 from dayu.host.transient_delta import (
@@ -180,9 +181,6 @@ _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME = "tool-trace"
 
 _TOOL_TRACE_COLD_JSONL_FILE_NAME = "tool-trace-cold.jsonl"
 """默认 Tool Trace cold JSONL 文件名。"""
-
-_TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
-"""默认 Tool Trace cold JSONL lock 文件名后缀。"""
 
 _WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX = "wait-poller"
 """open_host wait poller 每轮 command handle id 后缀。"""
@@ -2603,7 +2601,7 @@ def _tool_trace_sink_options_from_open_host_options(
     return ToolTraceSinkOptions(
         cold_jsonl_path=cold_jsonl_path,
         create_parent_dirs=options.create_parent_dirs,
-        lock_path=_default_tool_trace_lock_path(cold_jsonl_path),
+        lock_path=_tool_trace_cold_lock_path(cold_jsonl_path),
     )
 
 
@@ -2616,17 +2614,6 @@ def _default_tool_trace_cold_jsonl_path(artifact_root: Path) -> Path:
     """
 
     return artifact_root / _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME / _TOOL_TRACE_COLD_JSONL_FILE_NAME
-
-
-def _default_tool_trace_lock_path(cold_jsonl_path: Path) -> Path:
-    """从 Tool Trace cold JSONL 路径派生相邻 lock 文件路径。
-
-    :param cold_jsonl_path: Tool Trace cold JSONL 路径。
-    :returns: 相邻 lock 文件路径。
-    :raises: 无。
-    """
-
-    return cold_jsonl_path.with_name(cold_jsonl_path.name + _TOOL_TRACE_LOCK_FILE_SUFFIX)
 
 
 def _new_open_host_handle_id() -> str:

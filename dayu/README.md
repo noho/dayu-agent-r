@@ -70,7 +70,7 @@ flowchart TD
 ## 稳定边界
 
 - `UI` 当前主要是外部调用者角色；本手册只把已经实现并发布的 package 作为稳定边界。当前 CLI 在选定 Session 后显式取得并持有 Host public attachment，随后才通过 Service / Host public view 发起动作和订阅结果；attachment 与 UI 会话同生命周期，UI 不写 Host truth。
-- `dayu.service` 是 Host 外部 composition boundary。execution assembly 把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`；admin assembly 只从 Host runtime storage config 映射 `OpenHostAdminOptions`，不加载 scene、tool、model 或 secret。Service 还提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up sole-consumer terminal observation、typed delivery interruption durable recovery 与 cancel request 构造；事件 watcher 只表达订阅，不授予、缓存或推断 Session 修改权限。Fins direct 命令入口通过 `dayu.service.fins_direct` 暴露 `AsyncIterator[FinsEvent]`，不伪装成 Host Run，也不把 CLI 操作建模为 durable job。
+- `dayu.service` 是 Host 外部 composition boundary。execution assembly 把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`；admin assembly 只从 Host runtime storage config 映射 `OpenHostAdminOptions`，不加载 scene、tool、model 或 secret。Service 还提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up sole-consumer terminal observation、typed delivery interruption durable recovery 与 cancel request 构造；事件 watcher 只表达订阅，不授予、缓存或推断 Session 修改权限。Fins direct 命令入口通过 `dayu.service.fins_direct` 暴露 `AsyncIterator[FinsEvent]`，不伪装成 Host Run，也不把 CLI 操作建模为 durable job。Tool Trace operator 入口由 Service 发现显式文件/目录布局，调用 Host public Analyzer，再按 JSON→Markdown 固定顺序逐文件原子替换同一 structured report 的两个输出；双文件不构成事务。
 - `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、Session Event Delivery、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
 - `dayu.engine` 是单次 run 执行边界。它不导入 Host，不读取 Host durable store，不管理 Session / Run / Attempt，不发现工具，不持有工具权限或财报业务语义。
 - `dayu.contracts` 是 Dayu Agent 公共契约包。它承载层中立数据与协议，不承载 Host / Engine 状态机、Service 流程、UI 展示语义或 Fins 业务事实。
@@ -87,6 +87,7 @@ flowchart TD
 - `dayu.config`：包内默认 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes`、`tool_discovery` 和 prompt / scene 资产。
 - `dayu.service.host_assembly`：从 runtime config、prepared scene、工具发现和 secret mapping 组合 execution Host construction-time inputs 与 per-run request；`dayu.service.host_admin` 只装配 Host durable 管理入口。
 - `dayu.service.fins_direct`：从 product entrypoint 显式参数构造 Fins download / preprocess / upload typed request，并把 Fins direct runtime events 以 `AsyncIterator[FinsEvent]` 形式交给调用方消费。
+- `dayu.service.tool_trace_analysis`：发现四种显式 Tool Trace 输入布局，通过 Host public Analyzer 获取 structured report，并负责同目录临时写入及 JSON→Markdown 逐文件原子替换；双文件不构成事务。
 - `dayu.host`：capability-separated execution `Host` / durable `HostAdmin` handle、public durable actor、durable store、admission、dispatch、EngineEvent ingest、ToolRuntime、waiting、production wait poller、context compaction、Conversation Memory、projection、outbox、purge、startup recovery。
 - `dayu.engine`：`run_agent_messages`、`run_agent_and_wait`、Agent loop、Runner 协议归一、provider adapter、tool loop、length continuation、fallback、provider error classification 和 EngineEvent contract。
 - `dayu.tools`：业务工具 provider 与工具实现，输出 current `ToolDefinition` / `ToolBundle`。
@@ -132,6 +133,11 @@ proactive compact 由 Host context budget 在 Attempt 创建前触发；reactive
 ### 投递与派生视图
 
 HostEvent、outbox、Conversation Memory、tool trace、audit、diagnostic 和 projection 都来自 committed Host facts。它们可以服务 UI 展示、离线 terminal notification、后续 RunInputBuilder、诊断和审计，但不能反向驱动 EventLog truth 或 Run / Attempt 状态迁移。content、reasoning 与 tool-call delta 经 Host identity / late-state 校验后只进入当前 runtime 的 `HostTransientDelta` live stream，三者不写 EventLog、不 replay，也不进入 memory、outbox 或 audit；Service 只把 reasoning delta 投影为 entrypoint thinking，content 与 tool-call delta 不越层成为 CLI 展示事实。
+
+Tool Trace operator 路径固定为
+`CLI -> Service path discovery/publication -> Host Analyzer -> Tool Trace projection/resolver`。
+Host Analyzer 只读消费派生 trace 与 owner 校验后的 descriptor，不成为 durable truth；
+Service 不解释 finding 规则，CLI 不导入 Host durable internals。
 
 ## 核心术语
 
