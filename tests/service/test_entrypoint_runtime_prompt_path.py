@@ -57,6 +57,19 @@ _PROMPT_CURRENT_TIME_TEXT = (
 )
 
 
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造真实 prompt runtime assembly 所需的测试 credential 环境。
+
+    :returns: 同时包含显式 DeepSeek 主 Run 与 package MiMo compactor credential 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
+
+
 class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
@@ -362,7 +375,7 @@ async def _prepare_prompt_runtime(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_runtime_assembly_env(),
         )
     )
 

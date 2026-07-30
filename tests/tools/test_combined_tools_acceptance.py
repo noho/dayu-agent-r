@@ -117,6 +117,20 @@ _FORBIDDEN_PROJECTION_TOKENS: Final[tuple[str, ...]] = (
     "fetch_more_args",
     "continuation_hint",
 )
+_API_KEY: Final[str] = "test-provider-key"
+
+
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造真实 combined tools Host assembly 所需的测试 credential 环境。
+
+    :returns: 同时包含显式 DeepSeek 主 Run 与 package MiMo compactor credential 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
 
 
 class _OpenCancellationToken:
@@ -387,7 +401,7 @@ def test_compose_open_host_options_passes_effective_bundle_to_host(
                 model_id="deepseek-v4-flash",
                 runner_option_hint_id="interactive",
             ),
-            env={"DEEPSEEK_API_KEY": "test-provider-key"},
+            env=_runtime_assembly_env(),
         )
     )
 
