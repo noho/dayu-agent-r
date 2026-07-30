@@ -373,8 +373,8 @@ attempt/execution 与 required evidence。
 |---|---|---|---|---|
 | `calibration_stage` | 当前 calibration run 的 handbook workflow | run 全程 | 下一步 observation/review/adjudication 动作 | completeness、validation verdict、Gateflow gate |
 | `observation_completeness` | 当前 immutable observed report 的覆盖/证据 contract | report generated 时计算、frozen 后只读 | 是否可声称 observation coverage complete | 命令成败、行为正确性、run validation verdict |
-| `execution_outcome` | per-leaf/path raw process observation | 每次真实执行后；`not-run/blocked` 时无值 | 记录 `success/error/timeout/cancel` 实际结果 | coverage、evidence status、gap、pass/fail |
-| `evidence_status` / `gap_kind` | per-leaf/path evidence integrity record | 取证检查后 | 说明证据充分性、gap owner 和后续取证动作 | execution outcome、平行 verdict |
+| `execution_outcome` | per-scenario raw process observation | 每次真实执行后；`not-run/blocked` 时无值 | 记录 `success/error/timeout/cancel` 实际结果 | coverage、evidence status、gap、pass/fail |
+| `evidence_status` / `gap_kind` | per-scenario evidence integrity record | 取证检查后 | 说明证据充分性、gap owner 和后续取证动作 | execution outcome、平行 verdict |
 | registry readiness proof | scenario/oracle registries 的 coverage/adjudication closure contract | campaign 更新 registry 后重算 | 决定 registry 是否为 `ready`、是否可结束第一轮 | observation completeness、产品 pass/fail |
 | primary validation verdict | 第 2.7 节既有 run 裁决 contract | 既有规则要求时 | 裁决整个 run | calibration stage、后续 WU 状态 |
 | goal-discovery status | 第 2.7 节 Phaseflow-aligned 后续 WU 路由 | observation/adjudication 产生候选目标后 | 选择、等待或声明后续 work unit | 当前 observation 或 oracle 状态 |
@@ -409,9 +409,10 @@ raw evidence 供深入复核；digest、raw ref、exit code 或 CLI 自报 summa
 明确 authority 的 objective / hard-contract fact，禁止写期望行为、Codex 模仿建议、产品取舍、修复方案或未裁决结论。
 
 AgentMiMo / AgentDS 的正式 suggestions、总控 synthesis 和 user adjudication 统一写入既有
-`oracle-adjudication.md`，且每条 suggestion 必须引用 frozen report digest、leaf/path 和 evidence refs。用户裁决的
-对象必须是具体可执行 predicate 及其 scope、precondition、trigger、expected observable、allowed variants、
-forbidden behavior 和 measurement，不能笼统裁决“与 Codex 一致”或“当前行为正确”。
+`oracle-adjudication.md`，且每条 suggestion 必须引用 frozen report digest、scenario/correctness surface 和 evidence
+refs；leaf/path 只能作为导航或分组，不能替代 scenario identity。用户裁决的对象必须是具体可执行 predicate 及其
+scope、precondition、trigger、expected observable、allowed variants、forbidden behavior 和 measurement，不能笼统
+裁决“与 Codex 一致”或“当前行为正确”。
 
 任一路 reviewer、总控或用户发现证据不足时，当前 predicate 的合法状态是第 4.3 节既有
 `needs-more-evidence`。新证据只能通过新 run 获取，并生成新的 immutable `observed-behavior.md`；旧 frozen report
