@@ -36,6 +36,8 @@ from dayu.cli.init_catalog import (
     find_init_model_choice,
     ollama_template_defaults,
     validate_init_catalog,
+    validate_dynamic_endpoint,
+    validate_dynamic_model_name,
 )
 from dayu.cli.init_environment import (
     OPTIONAL_ENVIRONMENT_NAMES,
@@ -62,18 +64,18 @@ from dayu.cli.init_workspace import (
     publish_workspace_transaction,
     snapshot_managed_roots,
 )
+from dayu.runtime.config_loader import ConfigLoadError, ConfigLoader
 from dayu.runtime.filelock import RuntimeFileLockError, file_lock
 
 _BASE_OPTION: Final[str] = "--base"
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "config"
 _PACKAGE_MANIFEST_ROOT: Final[Path] = _PACKAGE_CONFIG_ROOT / "prompts" / "manifests"
 _INIT_LOCK_NAME: Final[str] = ".dayu-init.lock"
-_DEFAULT_CONFIRM: Final[str] = "n"
+_EXECUTION_PROFILES_FILE_NAME: Final[str] = "execution_profiles.json"
 _AFFIRMATIVE_ANSWERS: Final[frozenset[str]] = frozenset({"y", "yes"})
 _NEGATIVE_ANSWERS: Final[frozenset[str]] = frozenset({"", "n", "no"})
 _DEFAULT_OLLAMA_MODEL_NAME: Final[str] = "qwen3:8b"
 _DEFAULT_CUSTOM_ENDPOINT: Final[str] = "https://api.example.com/v1/chat/completions"
-_DEFAULT_CONTEXT_WINDOW: Final[int] = 131072
 _PREWARM_IMPORT_ROOTS: Final[tuple[str, ...]] = (
     "dayu.cli.commands.interactive",
     "dayu.cli.commands.prompt",
@@ -159,7 +161,13 @@ def run_init_command(args: ParsedCliArgs) -> int:
                 requested_mode=requested_mode,
                 locked_mode=locked_mode,
             )
-            selection = _select_model()
+            min_context_window_tokens = _load_target_min_context_window(
+                locked_mode=locked_mode,
+                workspace_root=workspace_identity.canonical_path,
+            )
+            selection = _select_model(
+                min_context_window_tokens=min_context_window_tokens
+            )
             persistence_plan = _collect_environment_persistence_plan(selection)
             prepared = prepare_workspace_transaction(
                 WorkspaceTransactionRequest(
@@ -343,8 +351,9 @@ def _confirm_reset(snapshot: WorkspaceSnapshot) -> bool:
 
     :param snapshot: unlocked managed-root snapshot。
     :returns: 只有用户显式回答 Yes 时返回 True。
-    :raises CliInitUsageError: 输入不是明确 yes/no 时抛出。
+    :raises CliInitOperationError: 确认输入 EOF 时抛出。
     :raises KeyboardInterrupt: 用户中断时透传。
+    :raises OSError: 输入或诊断 I/O 失败时透传。
     """
 
     existing_targets = tuple(root.path for root in snapshot.roots if root.exists)
@@ -384,12 +393,88 @@ def _require_confirmed_snapshot(
         raise CliInitOperationError("RESET target snapshot changed after confirmation; rerun")
 
 
-def _select_model() -> InitModelSelection:
+def _load_target_min_context_window(
+    *,
+    locked_mode: InitMode,
+    workspace_root: Path,
+) -> int:
+    """按锁内 target mode 单次加载实际生效的默认 profile minimum。
+
+    :param locked_mode: 已在 init lock 内确认的目标模式。
+    :param workspace_root: 已复核 identity 的 canonical workspace root。
+    :returns: target typed default execution profile 的最小上下文窗口。
+    :raises CliInitOperationError: package 或 PRESERVE workspace profile 配置非法时
+        抛出脱敏、可操作错误。
+    :raises OSError: 配置文件状态或读取失败时原样透传。
+    """
+
+    workspace_config_dir = (
+        workspace_root / "config"
+        if locked_mode is InitMode.PRESERVE
+        else None
+    )
+    workspace_profile_exists = False
+    if workspace_config_dir is not None:
+        workspace_profile_exists = (
+            _workspace_execution_profile_is_regular_file(
+                workspace_config_dir
+            )
+        )
+    try:
+        profiles = ConfigLoader(
+            package_config_dir=_PACKAGE_CONFIG_ROOT
+        ).load_execution_profiles(workspace_config_dir=workspace_config_dir)
+    except ConfigLoadError as exc:
+        if workspace_profile_exists:
+            raise CliInitOperationError(
+                "workspace execution profile config is invalid; "
+                f"error_type={exc.__class__.__name__}; "
+                "rerun with --overwrite"
+            ) from exc
+        raise CliInitOperationError(
+            "package execution profile config is invalid; "
+            f"error_type={exc.__class__.__name__}; "
+            "repair or reinstall package config"
+        ) from exc
+    profile = profiles.execution_profiles[
+        profiles.default_execution_profile_id
+    ]
+    return profile.min_context_window_tokens
+
+
+def _workspace_execution_profile_is_regular_file(
+    workspace_config_dir: Path,
+) -> bool:
+    """用 no-follow stat 分类 PRESERVE workspace execution profile 路径。
+
+    :param workspace_config_dir: 已确认 PRESERVE 模式的 workspace config 根。
+    :returns: 路径真实缺失时返回 ``False``；普通文件时返回 ``True``。
+    :raises CliInitOperationError: 路径由 symlink、目录或 special file 占据时抛出。
+    :raises OSError: no-follow stat 的其它文件系统错误原样透传。
+    """
+
+    profile_path = workspace_config_dir / _EXECUTION_PROFILES_FILE_NAME
+    try:
+        profile_stat = os.stat(profile_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(profile_stat.st_mode):
+        raise CliInitOperationError(
+            "workspace execution profile path must be an ordinary file; "
+            "rerun with --overwrite"
+        )
+    return True
+
+
+def _select_model(*, min_context_window_tokens: int) -> InitModelSelection:
     """校验 package catalog 并收集一个明确 model pair。
 
+    :param min_context_window_tokens: target typed default profile 的显式最小窗口。
     :returns: 类型化模型选择。
-    :raises CliInitOperationError: 用户取消或选择输入非法时抛出。
-    :raises InitCatalogError: package catalog/dynamic 输入漂移时抛出。
+    :raises CliInitOperationError: 交互 EOF 时抛出。
+    :raises InitCatalogError: package catalog 漂移时抛出。
+    :raises KeyboardInterrupt: 用户中断时原样透传。
+    :raises OSError: 输入或 package config I/O 失败时原样透传。
     """
 
     models = validate_init_catalog(
@@ -399,21 +484,21 @@ def _select_model() -> InitModelSelection:
     print("dayu-cli init: 请选择普通/思考模型组合：")
     for index, choice in enumerate(INIT_MODEL_CHOICES, start=1):
         print(f"  {index}. {choice.display_name}")
-    raw_choice = _read_input("模型组合编号或 choice id: ").strip()
-    choice = _parse_model_choice(raw_choice)
+    choice = _read_model_choice("模型组合编号或 choice id: ")
     if choice.kind is InitModelChoiceKind.OLLAMA:
         defaults = ollama_template_defaults(models)
-        model_name = _read_non_empty_input(
+        model_name = _read_dynamic_model_name(
             f"Ollama model [{_DEFAULT_OLLAMA_MODEL_NAME}]: ",
             default=_DEFAULT_OLLAMA_MODEL_NAME,
         )
-        endpoint = _read_non_empty_input(
+        endpoint = _read_dynamic_endpoint(
             f"Ollama endpoint [{defaults.endpoint}]: ",
             default=defaults.endpoint,
         )
-        context_window = _read_positive_integer(
+        context_window = _read_context_window(
             f"Ollama context window [{defaults.context_window_tokens}]: ",
             default=defaults.context_window_tokens,
+            minimum=min_context_window_tokens,
         )
         return InitModelSelection(
             choice=choice,
@@ -424,14 +509,18 @@ def _select_model() -> InitModelSelection:
             ),
         )
     if choice.kind is InitModelChoiceKind.CUSTOM_OPENAI:
-        model_name = _read_non_empty_input("Custom model name: ", default=None)
-        endpoint = _read_non_empty_input(
+        model_name = _read_dynamic_model_name(
+            "Custom model name: ",
+            default=None,
+        )
+        endpoint = _read_dynamic_endpoint(
             f"Custom endpoint [{_DEFAULT_CUSTOM_ENDPOINT}]: ",
             default=_DEFAULT_CUSTOM_ENDPOINT,
         )
-        context_window = _read_positive_integer(
-            f"Custom context window [{_DEFAULT_CONTEXT_WINDOW}]: ",
-            default=_DEFAULT_CONTEXT_WINDOW,
+        context_window = _read_context_window(
+            f"Custom context window [{min_context_window_tokens}]: ",
+            default=min_context_window_tokens,
+            minimum=min_context_window_tokens,
         )
         return InitModelSelection(
             choice=choice,
@@ -442,6 +531,24 @@ def _select_model() -> InitModelSelection:
             ),
         )
     return InitModelSelection(choice=choice)
+
+
+def _read_model_choice(prompt: str) -> InitModelChoice:
+    """循环读取模型 choice，直到 owner validator 接受。
+
+    :param prompt: 用户可见模型选择提示。
+    :returns: 15 项 catalog 中的唯一选择。
+    :raises CliInitOperationError: 输入 EOF 时抛出。
+    :raises KeyboardInterrupt: 用户中断时原样透传。
+    :raises OSError: 输入 I/O 失败时原样透传。
+    """
+
+    while True:
+        raw_choice = _read_input(prompt).strip()
+        try:
+            return _parse_model_choice(raw_choice)
+        except CliInitOperationError as exc:
+            _report_recoverable_input_error(exc)
 
 
 def _parse_model_choice(raw_choice: str) -> InitModelChoice:
@@ -461,8 +568,92 @@ def _parse_model_choice(raw_choice: str) -> InitModelChoice:
         raise CliInitOperationError("model choice number is out of range")
     try:
         return find_init_model_choice(raw_choice)
-    except InitCatalogError as exc:
-        raise CliInitOperationError(str(exc)) from exc
+    except InitCatalogError:
+        raise CliInitOperationError("model choice id is unknown") from None
+
+
+def _read_dynamic_model_name(prompt: str, *, default: str | None) -> str:
+    """循环读取并由 catalog owner 校验动态 provider 模型名。
+
+    :param prompt: 用户可见提示。
+    :param default: 空输入采用的默认值；``None`` 表示空输入非法。
+    :returns: owner validator 接受的模型名。
+    :raises CliInitOperationError: 输入 EOF 时抛出。
+    :raises KeyboardInterrupt: 用户中断时原样透传。
+    :raises OSError: 输入 I/O 失败时原样透传。
+    """
+
+    while True:
+        raw_value = _read_input(prompt)
+        value = default if not raw_value and default is not None else raw_value
+        try:
+            validate_dynamic_model_name(value)
+        except InitCatalogError as exc:
+            _report_recoverable_input_error(exc)
+            continue
+        return value
+
+
+def _read_dynamic_endpoint(prompt: str, *, default: str) -> str:
+    """循环读取并由 catalog owner 校验动态 endpoint。
+
+    :param prompt: 用户可见提示。
+    :param default: 空输入采用的 endpoint 默认值。
+    :returns: owner validator 接受的完整 HTTP(S) endpoint。
+    :raises CliInitOperationError: 输入 EOF 时抛出。
+    :raises KeyboardInterrupt: 用户中断时原样透传。
+    :raises OSError: 输入 I/O 失败时原样透传。
+    """
+
+    while True:
+        raw_value = _read_input(prompt)
+        value = default if not raw_value else raw_value
+        try:
+            validate_dynamic_endpoint(value)
+        except InitCatalogError as exc:
+            _report_recoverable_input_error(exc)
+            continue
+        return value
+
+
+def _read_context_window(
+    prompt: str,
+    *,
+    default: int,
+    minimum: int,
+) -> int:
+    """循环读取满足 target execution profile minimum 的 context window。
+
+    :param prompt: 用户可见提示。
+    :param default: 空输入采用的正整数。
+    :param minimum: target typed default execution profile 的最小值。
+    :returns: 不小于 minimum 的正整数。
+    :raises CliInitOperationError: 输入 EOF 时抛出。
+    :raises KeyboardInterrupt: 用户中断时原样透传。
+    :raises OSError: 输入 I/O 失败时原样透传。
+    """
+
+    while True:
+        raw_value = _read_input(prompt).strip()
+        if not raw_value:
+            value = default
+        elif raw_value.isdecimal() and int(raw_value) > 0:
+            value = int(raw_value)
+        else:
+            _report_recoverable_input_error(
+                CliInitOperationError(
+                    "context window must be a positive integer"
+                )
+            )
+            continue
+        if value < minimum:
+            _report_recoverable_input_error(
+                CliInitOperationError(
+                    f"context window must be at least {minimum}"
+                )
+            )
+            continue
+        return value
 
 
 def _read_secret_input(prompt: str) -> str:
@@ -507,26 +698,24 @@ def _collect_environment_persistence_plan(
     entries: list[EnvironmentPersistenceEntry] = []
     required_name = selection.choice.required_secret_env_name
     if required_name is not None and not has_non_empty_environment_value(required_name, os.environ):
-        required_value = _read_secret_input(f"{required_name}（输入隐藏，不写日志）: ")
-        if not required_value:
-            raise CliInitOperationError(f"required environment value was not provided: {required_name}")
-        entries.append(
-            EnvironmentPersistenceEntry(
-                name=required_name,
-                value=required_value,
-            )
+        required_entry = _read_environment_persistence_entry(
+            name=required_name,
+            prompt=f"{required_name}（输入隐藏，不写日志）: ",
+            required=True,
         )
+        if required_entry is None:
+            raise AssertionError("required secret entry must not be absent")
+        entries.append(required_entry)
     for optional_name in OPTIONAL_ENVIRONMENT_NAMES:
         if has_non_empty_environment_value(optional_name, os.environ):
             continue
-        optional_value = _read_secret_input(f"可选 {optional_name}（留空跳过，输入隐藏）: ")
-        if optional_value:
-            entries.append(
-                EnvironmentPersistenceEntry(
-                    name=optional_name,
-                    value=optional_value,
-                )
-            )
+        optional_entry = _read_environment_persistence_entry(
+            name=optional_name,
+            prompt=f"可选 {optional_name}（留空跳过，输入隐藏）: ",
+            required=False,
+        )
+        if optional_entry is not None:
+            entries.append(optional_entry)
     if not entries:
         return None
     unconfirmed_plan = _build_environment_plan(
@@ -541,6 +730,33 @@ def _collect_environment_persistence_plan(
     if not _confirm("确认持久化这一批环境变量? [y/N]: "):
         raise CliInitOperationError("environment persistence was not confirmed; workspace unchanged")
     return _build_environment_plan(entries=tuple(entries), confirmed=True)
+
+
+def _read_environment_persistence_entry(
+    *,
+    name: str,
+    prompt: str,
+    required: bool,
+) -> EnvironmentPersistenceEntry | None:
+    """循环读取一个由 environment owner 校验的 secret entry。
+
+    :param name: catalog 或 optional 集合拥有的环境变量名。
+    :param prompt: 只包含变量名和输入规则的安全提示。
+    :param required: 空值是否必须作为可恢复错误重试。
+    :returns: 合法 entry；optional 空输入返回 ``None``。
+    :raises CliInitOperationError: secret 输入 EOF 时抛出。
+    :raises KeyboardInterrupt: 用户中断时原样透传。
+    :raises OSError: secret 输入 I/O 失败时原样透传。
+    """
+
+    while True:
+        value = _read_secret_input(prompt)
+        if not value and not required:
+            return None
+        try:
+            return EnvironmentPersistenceEntry(name=name, value=value)
+        except EnvironmentPersistenceError as exc:
+            _report_recoverable_input_error(exc)
 
 
 def _build_environment_plan(
@@ -707,23 +923,29 @@ def _run_init_prewarm() -> None:
 
 
 def _confirm(prompt: str) -> bool:
-    """读取默认 No 的明确 yes/no。
+    """循环读取默认 No 的明确 yes/no，并把 EOF 保持为失败。
 
     :param prompt: 用户可见提示。
-    :returns: 显式 yes 为 True；No/空/EOF 为 False。
-    :raises CliInitUsageError: 其它输入无法解释时抛出。
+    :returns: 显式 yes 为 ``True``；No/Enter 为 ``False``。
+    :raises CliInitOperationError: 输入 EOF 时抛出。
     :raises KeyboardInterrupt: 用户中断时透传。
+    :raises OSError: 输入或诊断 I/O 失败时透传。
     """
 
-    try:
-        answer = input(prompt).strip().lower()
-    except EOFError:
-        answer = _DEFAULT_CONFIRM
-    if answer in _AFFIRMATIVE_ANSWERS:
-        return True
-    if answer in _NEGATIVE_ANSWERS:
-        return False
-    raise CliInitUsageError("confirmation must be yes or no")
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError as exc:
+            raise CliInitOperationError(
+                "confirmation input ended before completion"
+            ) from exc
+        if answer in _AFFIRMATIVE_ANSWERS:
+            return True
+        if answer in _NEGATIVE_ANSWERS:
+            return False
+        _report_recoverable_input_error(
+            CliInitOperationError("confirmation must be yes or no")
+        )
 
 
 def _read_input(prompt: str) -> str:
@@ -741,38 +963,17 @@ def _read_input(prompt: str) -> str:
         raise CliInitOperationError("interactive input ended before selection") from exc
 
 
-def _read_non_empty_input(prompt: str, *, default: str | None) -> str:
-    """读取非空文本，可显式采用给定 default。
+def _report_recoverable_input_error(
+    exc: CliInitOperationError | InitCatalogError | EnvironmentPersistenceError,
+) -> None:
+    """输出 owner 已脱敏的可恢复字段规则并留在当前交互步骤。
 
-    :param prompt: 用户可见提示。
-    :param default: 空输入采用的默认值；None 表示空输入非法。
-    :returns: 非空文本。
-    :raises CliInitOperationError: 输入为空且无默认值时抛出。
+    :param exc: 当前字段 owner 的 value-free validation exception。
+    :returns: ``None``。
+    :raises OSError: stderr 写入失败时透传。
     """
 
-    value = _read_input(prompt).strip()
-    if value:
-        return value
-    if default is not None:
-        return default
-    raise CliInitOperationError("a non-empty value is required")
-
-
-def _read_positive_integer(prompt: str, *, default: int) -> int:
-    """读取严格正整数，可采用显式 default。
-
-    :param prompt: 用户可见提示。
-    :param default: 空输入采用的正整数。
-    :returns: 正整数。
-    :raises CliInitOperationError: 输入不是正整数时抛出。
-    """
-
-    raw_value = _read_input(prompt).strip()
-    if not raw_value:
-        return default
-    if not raw_value.isdecimal() or int(raw_value) <= 0:
-        raise CliInitOperationError("context window must be a positive integer")
-    return int(raw_value)
+    print(f"dayu-cli init: {exc}", file=sys.stderr)
 
 
 def _format_operation_error(exc: Exception) -> str:

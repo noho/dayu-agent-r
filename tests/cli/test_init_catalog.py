@@ -27,8 +27,11 @@ from dayu.cli.init_catalog import (
     ollama_template_defaults,
     project_known_manifest_models,
     validate_init_catalog,
+    validate_dynamic_endpoint,
+    validate_dynamic_model_name,
 )
 from dayu.contracts import JsonValue
+from dayu.runtime.assembly import model_family_identity
 from dayu.runtime.scene_prepare import (
     ScenePrepareRequest,
     SceneToolCatalog,
@@ -276,22 +279,39 @@ def test_choice_catalog_order_and_exact_mapping() -> None:
     assert len({choice.choice_id for choice in INIT_MODEL_CHOICES}) == 15
 
 
-def test_current_package_catalog_uses_resolved_models_and_ollama_template() -> None:
-    """当前 package 的 13 pair 与 Ollama template 应通过真实 loader。
+def test_current_fifteen_choices_have_single_resolved_family_identity(
+    tmp_path: Path,
+) -> None:
+    """15 个 choice 的 ordinary/thinking 必须通过同一个四字段 identity owner。
 
-    :returns: None。
-    :raises AssertionError: resolved model 数量或 Ollama 默认值不符合 contract 时抛出。
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 任一 choice 的 resolved family 或默认值漂移时抛出。
     :raises InitCatalogError: 当前 package catalog 或 manifest 集合校验失败时传播。
-    :raises OSError: package 配置文件无法读取时传播。
+    :raises OSError: package 配置复制或文件读写失败时传播。
     """
 
     config_dir = _package_config_dir()
     models = validate_init_catalog(config_dir, config_dir / _MANIFEST_RELATIVE_PATH)
     defaults = ollama_template_defaults(models)
+    mutable_config_dir = _copy_package_config(tmp_path)
+    custom_models = apply_model_selection(
+        mutable_config_dir,
+        _custom_selection(),
+    )
 
     assert len(models.models) == 27
     assert defaults.endpoint == "http://localhost:11434/v1/chat/completions"
     assert defaults.context_window_tokens == 262_144
+    for choice in INIT_MODEL_CHOICES:
+        resolved = (
+            custom_models
+            if choice.kind is InitModelChoiceKind.CUSTOM_OPENAI
+            else models
+        )
+        ordinary = resolved.models[choice.ordinary_model_id]
+        thinking = resolved.models[choice.thinking_model_id]
+        assert model_family_identity(ordinary) == model_family_identity(thinking)
 
 
 def test_raw_thinking_child_with_only_extends_uses_current_resolver(tmp_path: Path) -> None:
@@ -372,8 +392,59 @@ def test_ollama_template_provider_and_secret_ref_fail_closed(
     models["ollama"] = changed_ollama
     _replace_models_map(config_dir, models)
 
-    with pytest.raises(InitCatalogError, match="Ollama template"):
+    with pytest.raises(InitCatalogError, match="ollama"):
         validate_init_catalog(config_dir, config_dir / _MANIFEST_RELATIVE_PATH)
+
+
+@pytest.mark.parametrize(
+    ("raw_field", "mismatched_field", "sentinel"),
+    (
+        ("model", "provider_model", "sentinel-provider-model"),
+        (
+            "endpoint",
+            "endpoint",
+            "https://sentinel-family-mismatch.example.test/v1",
+        ),
+    ),
+)
+def test_static_pair_family_mismatch_reports_only_ids_and_field_names(
+    tmp_path: Path,
+    raw_field: str,
+    mismatched_field: str,
+    sentinel: str,
+) -> None:
+    """Family mismatch 诊断只报告 model ids 与字段名，不回显字段值。
+
+    :param tmp_path: pytest 临时目录。
+    :param raw_field: thinking raw record 中要覆盖的字段。
+    :param mismatched_field: identity owner 对外使用的字段名。
+    :param sentinel: 不得进入错误文本的敏感字段值。
+    :returns: ``None``。
+    :raises AssertionError: fixture shape、拒绝边界或诊断脱敏漂移时抛出。
+    :raises OSError: package 配置复制或 JSON 写入失败时传播。
+    """
+
+    config_dir = _copy_package_config(tmp_path)
+    models = _models_map(config_dir)
+    child_id = "mimo-v2.5-pro-thinking-plan"
+    raw_child = models[child_id]
+    assert isinstance(raw_child, Mapping)
+    changed_child: dict[str, JsonValue] = dict(raw_child)
+    changed_child[raw_field] = sentinel
+    models[child_id] = changed_child
+    _replace_models_map(config_dir, models)
+
+    with pytest.raises(InitCatalogError) as raised:
+        validate_init_catalog(
+            config_dir,
+            config_dir / _MANIFEST_RELATIVE_PATH,
+        )
+
+    rendered = str(raised.value)
+    assert "mimo-v2.5-pro-plan" in rendered
+    assert child_id in rendered
+    assert mismatched_field in rendered
+    assert sentinel not in rendered
 
 
 def test_static_validation_does_not_require_package_custom_record() -> None:
@@ -544,6 +615,22 @@ def test_dynamic_model_name_boundary_rejects_blank_or_control_text(model_name: s
             endpoint="http://localhost:11434/v1/chat/completions",
             context_window_tokens=1,
         )
+
+
+def test_dynamic_settings_and_ui_validators_share_field_owner() -> None:
+    """公开 field validators 与 settings dataclass 必须接受同一合法值。"""
+
+    validate_dynamic_model_name(_CUSTOM_MODEL_NAME)
+    validate_dynamic_endpoint(_CUSTOM_ENDPOINT)
+
+    settings = CustomOpenAIModelSettings(
+        model_name=_CUSTOM_MODEL_NAME,
+        endpoint=_CUSTOM_ENDPOINT,
+        context_window_tokens=_CUSTOM_CONTEXT_WINDOW,
+    )
+
+    assert settings.model_name == _CUSTOM_MODEL_NAME
+    assert settings.endpoint == _CUSTOM_ENDPOINT
 
 
 @pytest.mark.parametrize("context_window", [0, -1, cast(int, True)])

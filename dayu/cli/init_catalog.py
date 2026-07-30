@@ -16,6 +16,7 @@ from typing import Final, TypeAlias, cast
 from urllib.parse import urlsplit
 
 from dayu.contracts import JsonValue
+from dayu.runtime.assembly import model_family_identity
 from dayu.runtime.config_loader import ConfigLoader, ModelConfig, ModelsConfig
 
 _EXPECTED_CHOICE_COUNT: Final[int] = 15
@@ -27,6 +28,10 @@ _JSON_SUFFIX: Final[str] = ".json"
 _CUSTOM_MODEL_ID: Final[str] = "custom-openai"
 _OLLAMA_MODEL_ID: Final[str] = "ollama"
 _CUSTOM_API_KEY_REF: Final[str] = "CUSTOM_OPENAI_API_KEY"
+_FAMILY_FIELD_PROVIDER: Final[str] = "provider"
+_FAMILY_FIELD_PROVIDER_MODEL: Final[str] = "provider_model"
+_FAMILY_FIELD_ENDPOINT: Final[str] = "endpoint"
+_FAMILY_FIELD_CREDENTIAL_REF: Final[str] = "credential_ref"
 
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 """JSON object 的只读映射类型。"""
@@ -299,11 +304,9 @@ class OllamaModelSettings:
         :raises InitCatalogError: 模型名、URL 或上下文窗口非法时抛出。
         """
 
-        _validate_dynamic_model_inputs(
-            model_name=self.model_name,
-            endpoint=self.endpoint,
-            context_window_tokens=self.context_window_tokens,
-        )
+        validate_dynamic_model_name(self.model_name)
+        validate_dynamic_endpoint(self.endpoint)
+        _validate_dynamic_context_window(self.context_window_tokens)
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,11 +329,9 @@ class CustomOpenAIModelSettings:
         :raises InitCatalogError: 模型名、URL 或上下文窗口非法时抛出。
         """
 
-        _validate_dynamic_model_inputs(
-            model_name=self.model_name,
-            endpoint=self.endpoint,
-            context_window_tokens=self.context_window_tokens,
-        )
+        validate_dynamic_model_name(self.model_name)
+        validate_dynamic_endpoint(self.endpoint)
+        _validate_dynamic_context_window(self.context_window_tokens)
 
 
 DynamicModelSettings: TypeAlias = OllamaModelSettings | CustomOpenAIModelSettings
@@ -395,6 +396,62 @@ def find_init_model_choice(choice_id: str) -> InitModelChoice:
     raise InitCatalogError(f"unknown init model choice: {choice_id}")
 
 
+def validate_dynamic_model_name(model_name: str) -> None:
+    """校验动态 provider 模型名字段。
+
+    :param model_name: 用户输入的 provider 模型名。
+    :returns: ``None``。
+    :raises InitCatalogError: 模型名为空、含外围空白或控制字符时抛出。
+    """
+
+    if (
+        not model_name.strip()
+        or model_name != model_name.strip()
+        or _contains_control_character(model_name)
+    ):
+        raise InitCatalogError(
+            "dynamic model name must be non-empty and contain no "
+            "surrounding/control whitespace"
+        )
+
+
+def validate_dynamic_endpoint(endpoint: str) -> None:
+    """校验动态 provider endpoint 字段。
+
+    :param endpoint: 用户输入的完整 endpoint。
+    :returns: ``None``。
+    :raises InitCatalogError: endpoint 不是无空白的完整 HTTP(S) URL 时抛出。
+    """
+
+    if (
+        not endpoint
+        or endpoint != endpoint.strip()
+        or any(character.isspace() for character in endpoint)
+    ):
+        raise InitCatalogError(
+            "dynamic model endpoint must not be empty or contain whitespace"
+        )
+    if _contains_control_character(endpoint):
+        raise InitCatalogError(
+            "dynamic model endpoint must not contain control characters"
+        )
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError:
+        raise InitCatalogError("dynamic model endpoint is not a valid URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+    ):
+        raise InitCatalogError(
+            "dynamic model endpoint must be a complete HTTP(S) URL"
+        )
+    if port is not None and port <= 0:
+        raise InitCatalogError("dynamic model endpoint port must be positive")
+
+
 def validate_init_catalog(package_config_dir: Path, package_manifest_dir: Path) -> ModelsConfig:
     """用当前 ConfigLoader 与 package manifest 集合校验初始化目录。
 
@@ -409,7 +466,7 @@ def validate_init_catalog(package_config_dir: Path, package_manifest_dir: Path) 
     _validate_choice_tuple_shape()
     models = ConfigLoader(package_config_dir=package_config_dir).load_models()
     for choice in INIT_MODEL_CHOICES:
-        if choice.kind in (InitModelChoiceKind.OLLAMA, InitModelChoiceKind.CUSTOM_OPENAI):
+        if choice.kind is InitModelChoiceKind.CUSTOM_OPENAI:
             continue
         _validate_resolved_choice(models=models, choice=choice)
     _validate_ollama_template(models)
@@ -477,6 +534,7 @@ def apply_model_selection(config_dir: Path, selection: InitModelSelection) -> Mo
 
     models_after = ConfigLoader(package_config_dir=config_dir).load_models()
     _validate_dynamic_selection(models=models_after, selection=selection)
+    _validate_resolved_choice(models=models_after, choice=selection.choice)
     return models_after
 
 
@@ -547,9 +605,11 @@ def _validate_resolved_choice(*, models: ModelsConfig, choice: InitModelChoice) 
     :param models: 当前 ConfigLoader 的 resolved 模型目录。
     :param choice: 需要校验的静态选择。
     :returns: ``None``。
-    :raises InitCatalogError: 任一 id 缺失或 resolved provider/API key ref 不匹配时抛出。
+    :raises InitCatalogError: 任一 id 缺失、provider/API key ref 不匹配或四字段
+        family identity 不同源时抛出。
     """
 
+    resolved_models: list[ModelConfig] = []
     for role, model_id in (
         ("ordinary", choice.ordinary_model_id),
         ("thinking", choice.thinking_model_id),
@@ -561,6 +621,25 @@ def _validate_resolved_choice(*, models: ModelsConfig, choice: InitModelChoice) 
             raise InitCatalogError(f"{choice.choice_id} {role} model provider mismatch: {model_id}")
         if model.api_key_ref != choice.required_secret_env_name:
             raise InitCatalogError(f"{choice.choice_id} {role} model API key ref mismatch: {model_id}")
+        resolved_models.append(model)
+    ordinary_identity = model_family_identity(resolved_models[0])
+    thinking_identity = model_family_identity(resolved_models[1])
+    mismatched_fields: list[str] = []
+    if ordinary_identity.provider != thinking_identity.provider:
+        mismatched_fields.append(_FAMILY_FIELD_PROVIDER)
+    if ordinary_identity.provider_model != thinking_identity.provider_model:
+        mismatched_fields.append(_FAMILY_FIELD_PROVIDER_MODEL)
+    if ordinary_identity.endpoint != thinking_identity.endpoint:
+        mismatched_fields.append(_FAMILY_FIELD_ENDPOINT)
+    if ordinary_identity.credential_ref != thinking_identity.credential_ref:
+        mismatched_fields.append(_FAMILY_FIELD_CREDENTIAL_REF)
+    if mismatched_fields:
+        raise InitCatalogError(
+            "init model choice family mismatch: "
+            f"ordinary_model_id={choice.ordinary_model_id}, "
+            f"thinking_model_id={choice.thinking_model_id}, "
+            f"mismatched_fields={','.join(mismatched_fields)}"
+        )
 
 
 def _validate_ollama_template(models: ModelsConfig) -> ModelConfig:
@@ -628,44 +707,22 @@ def _known_manifest_basenames() -> frozenset[str]:
     return ORDINARY_MANIFEST_BASENAMES | THINKING_MANIFEST_BASENAMES
 
 
-def _validate_dynamic_model_inputs(*, model_name: str, endpoint: str, context_window_tokens: int) -> None:
-    """校验两类动态模型共享的显式输入。
+def _validate_dynamic_context_window(context_window_tokens: int) -> None:
+    """校验动态模型记录自身的正整数 context window。
 
-    :param model_name: provider 模型名。
-    :param endpoint: 完整 HTTP(S) endpoint URL。
     :param context_window_tokens: 上下文窗口 token 数。
     :returns: ``None``。
-    :raises InitCatalogError: 文本、URL 或正整数约束不满足时抛出。
+    :raises InitCatalogError: 值不是非 bool 正整数时抛出。
     """
 
-    if not model_name.strip() or model_name != model_name.strip() or _contains_control_character(model_name):
-        raise InitCatalogError("dynamic model name must be non-empty and contain no surrounding/control whitespace")
-    _validate_endpoint(endpoint)
-    if isinstance(context_window_tokens, bool) or not isinstance(context_window_tokens, int) or context_window_tokens <= 0:
-        raise InitCatalogError("dynamic model context_window_tokens must be a positive integer")
-
-
-def _validate_endpoint(endpoint: str) -> None:
-    """执行不联网的完整 HTTP(S) endpoint 语法校验。
-
-    :param endpoint: 用户输入的 endpoint 原文。
-    :returns: ``None``。
-    :raises InitCatalogError: endpoint 为空、含空白/控制字符或缺少 HTTP(S) scheme/netloc 时抛出。
-    """
-
-    if not endpoint or endpoint != endpoint.strip() or any(character.isspace() for character in endpoint):
-        raise InitCatalogError("dynamic model endpoint must not be empty or contain whitespace")
-    if _contains_control_character(endpoint):
-        raise InitCatalogError("dynamic model endpoint must not contain control characters")
-    try:
-        parsed = urlsplit(endpoint)
-        port = parsed.port
-    except ValueError:
-        raise InitCatalogError("dynamic model endpoint is not a valid URL") from None
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.hostname is None:
-        raise InitCatalogError("dynamic model endpoint must be a complete HTTP(S) URL")
-    if port is not None and port <= 0:
-        raise InitCatalogError("dynamic model endpoint port must be positive")
+    if (
+        isinstance(context_window_tokens, bool)
+        or not isinstance(context_window_tokens, int)
+        or context_window_tokens <= 0
+    ):
+        raise InitCatalogError(
+            "dynamic model context_window_tokens must be a positive integer"
+        )
 
 
 def _contains_control_character(value: str) -> bool:

@@ -88,6 +88,22 @@ class RuntimeAssemblySelectionError(RuntimeAssemblyError):
 
 
 @dataclass(frozen=True, slots=True)
+class ModelFamilyIdentity:
+    """resolved 模型家族的层中立 identity。
+
+    :param provider: provider 标识。
+    :param provider_model: provider 实际接收的模型名。
+    :param endpoint: provider endpoint。
+    :param credential_ref: credential 环境变量引用；未配置时为 ``None``。
+    """
+
+    provider: str
+    provider_model: str
+    endpoint: str
+    credential_ref: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRunnerHintOverride:
     """模型与 runner option hint 的显式 override。
 
@@ -254,6 +270,22 @@ class _SelectedValue(Generic[_ValueT]):
 
     value: _ValueT
     source: str
+
+
+def model_family_identity(model: ModelConfig) -> ModelFamilyIdentity:
+    """从 resolved typed 模型配置构造唯一家族 identity。
+
+    :param model: ``ConfigLoader`` 已解析的模型配置。
+    :returns: provider、provider model、endpoint 与 credential ref 四字段 identity。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ModelFamilyIdentity(
+        provider=model.provider,
+        provider_model=model.model,
+        endpoint=model.endpoint,
+        credential_ref=model.api_key_ref,
+    )
 
 
 def parse_model_runner_hint_override(
@@ -955,6 +987,7 @@ __all__ = [
     "AgentPolicyOverrideConfig",
     "ExecutionProfileCompatibilityDiagnostic",
     "MergedAgentPolicyConfig",
+    "ModelFamilyIdentity",
     "ModelRunnerHintOverride",
     "RunnerOptionHintSelection",
     "RuntimeAssemblyError",
@@ -964,6 +997,7 @@ __all__ = [
     "ToolTruncationPolicyDefaults",
     "effective_tool_truncate_spec_from_policy",
     "merge_agent_policy_config",
+    "model_family_identity",
     "parse_agent_policy_override_config",
     "parse_model_runner_hint_override",
     "select_runner_option_hint",
