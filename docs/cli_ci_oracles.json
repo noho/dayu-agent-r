@@ -58,12 +58,15 @@
           "expected": [
             "init 选择的普通模型成为所有 ordinary scene 的默认模型。",
             "init 选择的思考模型成为所有 thinking scene 的默认模型。",
-            "conversation_compaction 使用 init 选择的对应默认模型。",
+            "所有 ordinary/thinking scene 与 conversation_compaction 的 resolved provider、底层 provider model、endpoint 与 credential ref 都来自同一个 init 选择；thinking extension、temperature、stream 等 scene runner options 可以不同。",
+            "conversation_compaction 不拥有独立 provider/model family，只使用自己的 conversation_compaction runner option hint。",
+            "未执行 init 时，dayu/config 中所有 scene（包括 conversation_compaction）的 resolved provider/model family 必须一致；不得要求用户为默认 workspace 同时提供两家 provider credential。",
             "单次 CLI --model/-m 只覆盖本次主 Run，不改变 workspace 默认配置，也不隐式覆盖辅助 compactor Run。",
             "最终模型选择优先级为本次主 Run 的 --model/-m，高于 workspace scene 默认模型；无 workspace 默认时才使用包内默认或 execution profile fallback。"
           ],
           "forbidden": [
             "继续把 --model-name 作为公开参数或兼容别名。",
+            "compactor 使用与其它 scene 不同的 provider/model family 或额外 credential。",
             "只改写无人读取的配置字段，却让任一对应 scene 继续使用与 init 选择无关的默认模型。",
             "用 execution_profiles.json 的静态内容单独推断实际 scene 模型。"
           ]
@@ -155,12 +158,16 @@
           "expected": [
             "无 workspace config 的路径通过真实 prompt 证明使用 dayu/config 的默认模型/provider。",
             "workspace config 路径通过真实 prompt 证明使用 init 投影的默认模型/provider。",
-            "15 个 init 选择都执行真实 provider smoke；每个普通/思考模型角色都由真实模型请求覆盖，相同模型 id 的两个角色可以共享一次调用。",
-            "证据同时记录脱敏后的 effective model id、provider、endpoint identity、runner input/trace identity 和真实 provider response。",
+            "15 个 init 选择都进入真实 provider smoke matrix；相同 provider model id 的普通/思考角色可以共享一次调用，但必须分别证明 scene 投影正确。",
+            "credential、endpoint 与服务可用时必须获得真实 provider response；required API key 缺失时，init 的 secret 输入 EOF/拒绝安全失败是正确结果。",
+            "已初始化但 provider 拒绝、限流、endpoint 不可达、Ollama 未运行或 Custom endpoint 未配置时，真实 prompt 的明确、脱敏、bounded、非零失败可以是正确结果。",
+            "每个 matrix row 记录 precondition classification、脱敏 effective model/provider/endpoint、是否真正发出请求、runner input/trace identity、terminal outcome 与无 fallback 证据。",
+            "init 自己生成的 schema、model、profile 或 context-window 不兼容属于产品错误，不得归类成 provider 不可用。",
             "至少一个真实 prompt 证明 --model/-m 只覆盖该次主 Run，后续无 override prompt 恢复 workspace 默认模型。"
           ],
           "forbidden": [
             "用 session list、配置加载成功、mock runner 或 CLI 自报模型代替真实 provider 调用。",
+            "把产品内部配置不兼容、错误模型投影或静默 fallback 归类成可接受的外部 provider 失败。",
             "在证据中记录 authorization value 或其它 secret。"
           ]
         }
