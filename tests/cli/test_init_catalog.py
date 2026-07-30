@@ -45,6 +45,17 @@ _PROMPT_RELATIVE_PATH: Final[Path] = Path("prompts")
 _CUSTOM_ENDPOINT: Final[str] = "https://models.example.test/openai/v1"
 _CUSTOM_MODEL_NAME: Final[str] = "research-model"
 _CUSTOM_CONTEXT_WINDOW: Final[int] = 131_072
+_PACKAGE_ORDINARY_MODEL_ID: Final[str] = "mimo-v2.5-pro-plan"
+_PACKAGE_THINKING_MODEL_ID: Final[str] = "mimo-v2.5-pro-thinking-plan"
+_STATIC_INIT_MODEL_CHOICES: Final[tuple[InitModelChoice, ...]] = tuple(
+    choice
+    for choice in INIT_MODEL_CHOICES
+    if choice.kind
+    not in {
+        InitModelChoiceKind.OLLAMA,
+        InitModelChoiceKind.CUSTOM_OPENAI,
+    }
+)
 
 
 def _repo_root() -> Path:
@@ -312,6 +323,93 @@ def test_current_fifteen_choices_have_single_resolved_family_identity(
         ordinary = resolved.models[choice.ordinary_model_id]
         thinking = resolved.models[choice.thinking_model_id]
         assert model_family_identity(ordinary) == model_family_identity(thinking)
+
+
+def test_package_sixteen_manifests_share_mimo_token_plan_family() -> None:
+    """16 个 package manifest 必须投影到同一个 Mimo Token Plan 家族。
+
+    :returns: ``None``。
+    :raises AssertionError: manifest role、model id 或 resolved family 漂移时抛出。
+    :raises InitCatalogError: package catalog 或 manifest 集合非法时传播。
+    :raises OSError: package manifest 或 prompt asset 读取失败时传播。
+    """
+
+    config_dir = _package_config_dir()
+    manifest_dir = config_dir / _MANIFEST_RELATIVE_PATH
+    models = validate_init_catalog(config_dir, manifest_dir)
+    expected_identity = model_family_identity(
+        models.models[_PACKAGE_ORDINARY_MODEL_ID]
+    )
+
+    for basename in sorted(ORDINARY_MANIFEST_BASENAMES | THINKING_MANIFEST_BASENAMES):
+        manifest = _read_json_object(manifest_dir / f"{basename}.json")
+        available_tools = (
+            _manual_smoke_test_catalog()
+            if basename in TEST_OWNED_MANUAL_SMOKE_MANIFEST_BASENAMES
+            else _production_test_catalog()
+        )
+        prepared = prepare_scene(
+            ScenePrepareRequest(
+                scene_id=basename,
+                scene_manifest_root=manifest_dir,
+                prompt_asset_root=config_dir / _PROMPT_RELATIVE_PATH,
+                context_slot_values=_required_context_values(manifest),
+                available_tools=available_tools,
+            )
+        )
+        assert prepared.model_hints is not None
+        expected_model_id = (
+            _PACKAGE_ORDINARY_MODEL_ID
+            if basename in ORDINARY_MANIFEST_BASENAMES
+            else _PACKAGE_THINKING_MODEL_ID
+        )
+        assert prepared.model_hints.default_model_id == expected_model_id
+        assert (
+            model_family_identity(models.models[expected_model_id])
+            == expected_identity
+        )
+
+
+@pytest.mark.parametrize(
+    "choice",
+    _STATIC_INIT_MODEL_CHOICES,
+    ids=tuple(choice.choice_id for choice in _STATIC_INIT_MODEL_CHOICES),
+)
+def test_static_choice_compactor_projection_shares_ordinary_family(
+    tmp_path: Path,
+    choice: InitModelChoice,
+) -> None:
+    """每个静态 init choice 投影后的 compactor 必须与 ordinary family 同源。
+
+    :param tmp_path: pytest 临时 staging 根目录。
+    :param choice: 当前静态 init choice。
+    :returns: ``None``。
+    :raises AssertionError: compactor 投影或 family identity 漂移时抛出。
+    :raises InitCatalogError: selection、catalog 或 manifest 投影非法时传播。
+    :raises OSError: package 配置复制或 prompt asset 读取失败时传播。
+    """
+
+    config_dir = _copy_package_config(tmp_path)
+    selection = InitModelSelection(choice=choice)
+    models = apply_model_selection(config_dir, selection)
+    manifest_dir = config_dir / _MANIFEST_RELATIVE_PATH
+    project_known_manifest_models(manifest_dir, selection)
+    prepared = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="conversation_compaction",
+            scene_manifest_root=manifest_dir,
+            prompt_asset_root=config_dir / _PROMPT_RELATIVE_PATH,
+            context_slot_values={},
+            available_tools=_production_test_catalog(),
+        )
+    )
+
+    assert prepared.model_hints is not None
+    compactor_model_id = prepared.model_hints.default_model_id
+    assert compactor_model_id == choice.ordinary_model_id
+    assert model_family_identity(
+        models.models[compactor_model_id]
+    ) == model_family_identity(models.models[choice.ordinary_model_id])
 
 
 def test_raw_thinking_child_with_only_extends_uses_current_resolver(tmp_path: Path) -> None:
