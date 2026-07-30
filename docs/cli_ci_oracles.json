@@ -1,5 +1,220 @@
 {
   "schema_version": 1,
   "registry_status": "calibration",
-  "oracles": []
+  "oracles": [
+    {
+      "oracle_id": "cli.init.workspace-initialization",
+      "version": 1,
+      "status": "accepted",
+      "category": "cli-workspace-initialization",
+      "scope": {
+        "command": "init",
+        "scenes": [
+          "all-ordinary-scenes",
+          "all-thinking-scenes",
+          "conversation_compaction"
+        ],
+        "surfaces": [
+          "parser",
+          "interactive-input",
+          "workspace-resolution",
+          "config-publication",
+          "model-selection",
+          "secret-reference",
+          "preserve",
+          "overwrite",
+          "reset",
+          "repair",
+          "downstream-runtime-consumption"
+        ]
+      },
+      "predicates": [
+        {
+          "predicate_id": "init.workspace-resolution",
+          "expected": [
+            "不带 --base/-b/--workspace 时，workspace root 为当前工作目录下的 ./workspace。",
+            "workspace config 不存在时，后续 runtime 使用 dayu/config 包内默认配置。",
+            "workspace config 存在时，后续 runtime 使用 workspace 配置及 init 投影的默认模型。"
+          ],
+          "forbidden": [
+            "init 命令存在、展示、接受或解释 --config。",
+            "Agent、文档或 CI 把 init --config 当成合法产品能力。"
+          ]
+        },
+        {
+          "predicate_id": "init.first-publication",
+          "expected": [
+            "空 workspace 中，init 从当前包内默认配置发布完整 managed config/prompt tree，再应用本次模型选择。",
+            "当前目标版本的 clean publication 产生 5 个目录和 43 个文件；机器判定同时核对版本化 managed-file manifest、内容摘要和模型投影，不能只核对数量。",
+            "成功后后续 prompt 与 interactive 能真实启动和执行。"
+          ],
+          "forbidden": [
+            "只创建根配置 JSON 而遗漏 prompt assets。",
+            "只依据 CLI 自报 initialized 或 exit code 判定初始化成功。"
+          ]
+        },
+        {
+          "predicate_id": "init.model-defaults-and-overrides",
+          "expected": [
+            "init 选择的普通模型成为所有 ordinary scene 的默认模型。",
+            "init 选择的思考模型成为所有 thinking scene 的默认模型。",
+            "conversation_compaction 使用 init 选择的对应默认模型。",
+            "单次 CLI --model/-m 只覆盖本次主 Run，不改变 workspace 默认配置，也不隐式覆盖辅助 compactor Run。",
+            "最终模型选择优先级为本次主 Run 的 --model/-m，高于 workspace scene 默认模型；无 workspace 默认时才使用包内默认或 execution profile fallback。"
+          ],
+          "forbidden": [
+            "继续把 --model-name 作为公开参数或兼容别名。",
+            "只改写无人读取的配置字段，却让任一对应 scene 继续使用与 init 选择无关的默认模型。",
+            "用 execution_profiles.json 的静态内容单独推断实际 scene 模型。"
+          ]
+        },
+        {
+          "predicate_id": "init.secret-handling",
+          "expected": [
+            "配置只保存 secret ref 或环境变量模板，不保存 secret value。",
+            "secret 输入不回显，不进入日志、异常、trace、EventLog、SQLite 或报告。",
+            "需要持久化 secret 时必须得到明确确认；拒绝或 EOF 时 workspace 不发生部分发布。"
+          ],
+          "forbidden": [
+            "在 workspace 配置或其它 durable state 中保存 secret 明文。",
+            "未确认便修改 shell profile、用户环境或其它持久化 secret owner。"
+          ]
+        },
+        {
+          "predicate_id": "init.interactive-validation-and-exit",
+          "expected": [
+            "模型编号、choice id、endpoint、context window、必填文本等可恢复输入错误在当前步骤显示错误并重新提示，不立即退出。",
+            "argv/parser 使用错误退出 2。",
+            "尚未完成 init 时收到 EOF/Ctrl+D，终止且不发布部分 workspace，退出 1。",
+            "reset 确认时直接 Enter 选择默认 No，workspace 不变并退出 0；Ctrl+D 是 EOF 而不是默认 No，退出 1。",
+            "Ctrl+C/SIGINT 退出 130，并且不发布部分 workspace。"
+          ],
+          "forbidden": [
+            "用户一次可恢复输入错误就结束整个交互向导。",
+            "把 Ctrl+D 和 Enter 混为同一确认输入。",
+            "把 SIGINT 报告成普通成功或通用 exit 1。"
+          ]
+        },
+        {
+          "predicate_id": "init.preserve",
+          "expected": [
+            "无覆盖参数且 config 已存在时，保留用户已有文件、自建文件、自建 manifest 及所有非模型选择字段。",
+            "补齐当前 package managed manifest 中缺失的普通配置和 prompt 文件。",
+            "本次模型选择只更新 package-known scene manifest 的 default model 字段以及动态模型选择明确拥有的模型记录。",
+            "若已有内容非法且无法无损保留，停止并明确提示使用 --overwrite；不得猜测、宽松解析或静默丢弃用户内容。"
+          ],
+          "forbidden": [
+            "用 package 默认值覆盖与本次模型选择无关的用户修改。",
+            "保留模式自报 preserve，但实际重写无关业务字段。"
+          ]
+        },
+        {
+          "predicate_id": "init.overwrite",
+          "expected": [
+            "--overwrite 从当前 package defaults 整体重建 init-owned config/prompt tree，再应用本次模型选择。",
+            "旧 managed tree 中被修改的文件、陈旧文件、自建文件和额外目录全部从重建后的 managed tree 消失。",
+            "--overwrite 保留 .dayu runtime state 和 init-owned roots 之外的用户数据。",
+            "发布采用 staging、校验和原子替换；失败时恢复 publication 前公共状态。"
+          ],
+          "forbidden": [
+            "把 merge、补缺或仅重写部分文件称为 overwrite。",
+            "因 overwrite 删除 .dayu、portfolio 或其它非 config managed data。"
+          ]
+        },
+        {
+          "predicate_id": "init.reset",
+          "expected": [
+            "--reset 必须经过默认 No 的明确二次确认。",
+            "确认后删除 .dayu runtime state 与当前版本全部 init-owned publication roots，再按首次 init 流程重建。",
+            "旧版 workspace/assets 语义映射为当前 init-owned prompt/assets；不机械删除当前版本不归 init 所有的用户 assets。",
+            "--reset 与 --overwrite 同时出现时，reset 语义优先。",
+            "reset 重建失败时不得留下被伪报为成功的半初始化 workspace。"
+          ],
+          "forbidden": [
+            "未确认即删除 durable state。",
+            "只重建 config 而保留旧 .dayu runtime state。",
+            "删除 portfolio 或其它非 init-owned 用户数据。"
+          ]
+        },
+        {
+          "predicate_id": "init.repair-and-path-safety",
+          "expected": [
+            "缺失文件组成的普通 partial workspace 可由 preserve init 补齐并通过完整 staging validation。",
+            "非法或损坏 config 可由显式 --overwrite 重建；损坏 runtime state 可由显式 --reset 重建。",
+            "普通文件占据 init-owned managed root 时，只能在显式 destructive mode 和 no-follow 边界内替换。",
+            "workspace root 非目录、workspace/managed tree symlink、dangling symlink、特殊文件或非法 lock identity 必须安全拒绝并给出可操作错误，不得沿链接修复。",
+            "任何成功修复都必须由真实 prompt 和 interactive 证明 workspace 可运行。"
+          ],
+          "forbidden": [
+            "为追求自动修复而跟随 symlink 或越过 workspace ownership boundary。",
+            "仅凭 ConfigLoader 能解析就宣称 workspace 已可运行。"
+          ]
+        },
+        {
+          "predicate_id": "init.real-provider-validation",
+          "expected": [
+            "无 workspace config 的路径通过真实 prompt 证明使用 dayu/config 的默认模型/provider。",
+            "workspace config 路径通过真实 prompt 证明使用 init 投影的默认模型/provider。",
+            "15 个 init 选择都执行真实 provider smoke；每个普通/思考模型角色都由真实模型请求覆盖，相同模型 id 的两个角色可以共享一次调用。",
+            "证据同时记录脱敏后的 effective model id、provider、endpoint identity、runner input/trace identity 和真实 provider response。",
+            "至少一个真实 prompt 证明 --model/-m 只覆盖该次主 Run，后续无 override prompt 恢复 workspace 默认模型。"
+          ],
+          "forbidden": [
+            "用 session list、配置加载成功、mock runner 或 CLI 自报模型代替真实 provider 调用。",
+            "在证据中记录 authorization value 或其它 secret。"
+          ]
+        }
+      ],
+      "allowed_variants": [
+        "不影响语义、输入顺序和退出状态的终端文案微调。",
+        "package managed-file 数量随正式 schema/scene 版本演进，但必须通过新 oracle/scenario version 更新 manifest，而不是放宽为只检查目录存在。",
+        "Ollama 或 Custom 的普通/思考角色使用同一 model id 时，可用一次真实请求覆盖两个相同角色。"
+      ],
+      "authority_basis": [
+        {
+          "kind": "user-decision",
+          "date": "2026-07-30",
+          "summary": "用户逐项确认 init 的 workspace、模型、secret、模式、修复、退出码和真实 provider 验证语义。"
+        },
+        {
+          "kind": "reference-observation",
+          "source": "/Users/leo/workspace/dayu-agent/README.md#13-初始化工作区与配置",
+          "summary": "旧版 overwrite/reset 的业务行为作为目录迁移后的语义参考。"
+        },
+        {
+          "kind": "best-practice-proposal",
+          "summary": "可恢复交互输入原地重试；EOF=1、parser misuse=2、SIGINT=130；危险路径不自动修复。"
+        }
+      ],
+      "observed_behavior": {
+        "run_id": "20260730-first-oracle-01",
+        "report_id": "observed-behavior-20260730-first-oracle-01-draft-1",
+        "report_digest_sha256": "15cc3697a30498b6a5055776e955549fc4a00e89430dd42bfe43befa65907444",
+        "report_frozen": false,
+        "scenario_refs": [
+          "I01-I66",
+          "L01-L15",
+          "M01-M08"
+        ],
+        "summary": [
+          "空 workspace 的 15 个选择均完成 publication，当前版本创建 5 个目录和 43 个文件。",
+          "init 已投影 16 个 scene manifest；主 scene assembly 读取 scene model hint，compactor 仍读取 execution profile baseline。",
+          "当前非法交互输入多数立即退出，reset confirm EOF 被当作取消成功。",
+          "当前 init 接受 --config，公开模型覆盖参数为 --model-name/-m。",
+          "当前第一轮只对主要 Mimo Pro 路径形成真实 provider 调用证据。"
+        ]
+      },
+      "user_adjudication": {
+        "decision": "accepted",
+        "date": "2026-07-30",
+        "notes": "按用户逐项回复冻结 init 正确性；当前实现偏差作为后续 implementation findings，不改变 oracle。"
+      },
+      "applicable_from": {
+        "date": "2026-07-30",
+        "target": "next-init-conformance-run"
+      },
+      "supersedes": null,
+      "superseded_by": null
+    }
+  ]
 }
