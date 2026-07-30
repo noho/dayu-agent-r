@@ -119,6 +119,23 @@ _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
 _TEST_ASYNC_TIMEOUT_SECONDS = 2.0
 
 
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造 prompt 测试完整 runtime assembly 所需的环境输入。
+
+    本 helper 仅供经过完整 ``prepare_entrypoint_runtime -> Service assembly ->
+    compactor`` 装配路径的测试使用；mock-assembly 测试继续只声明自身消费的输入。
+
+    :returns: 同时满足单次 DeepSeek ordinary override 与 package Mimo compactor
+        baseline 的环境变量映射。
+    :raises Exception: 本函数不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
+
+
 class _TtySecretInput(io.StringIO):
     """只允许 capability 检查、禁止 init secret owner 逐行读取的 TTY fake。"""
 
@@ -1823,7 +1840,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
             assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_runtime_assembly_env(),
         )
     )
     invocation = session_execution.new_cli_invocation(
@@ -2440,7 +2457,7 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
             assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_runtime_assembly_env(),
         )
     )
     fake_host = _BlockingSubmitHost(submit_terminal=None)
@@ -2597,7 +2614,7 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
             assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_runtime_assembly_env(),
         )
     )
 
