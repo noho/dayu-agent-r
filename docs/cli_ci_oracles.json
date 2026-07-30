@@ -74,12 +74,12 @@
         {
           "predicate_id": "init.secret-handling",
           "expected": [
-            "配置只保存 secret ref 或环境变量模板，不保存 secret value。",
-            "secret 输入不回显，不进入日志、异常、trace、EventLog、SQLite 或报告。",
+            "init-owned workspace 配置只保存 secret ref 或环境变量模板，不保存 secret value。",
+            "secret 输入不回显，不进入屏幕输出、日志、异常、Tool Trace 或人类可读报告；Host SQLite 为 durable execution snapshot 持久化 resolved credential value 是允许行为，但不得把该值投影回这些用户可见或 LLM-facing 表面。",
             "需要持久化 secret 时必须得到明确确认；拒绝或 EOF 时 workspace 不发生部分发布。"
           ],
           "forbidden": [
-            "在 workspace 配置或其它 durable state 中保存 secret 明文。",
+            "在 init-owned workspace 配置、CI 报告或 Host SQLite 之外的 init evidence durable state 中保存 secret 明文。",
             "未确认便修改 shell profile、用户环境或其它持久化 secret owner。"
           ]
         },
@@ -168,7 +168,7 @@
           "forbidden": [
             "用 session list、配置加载成功、mock runner 或 CLI 自报模型代替真实 provider 调用。",
             "把产品内部配置不兼容、错误模型投影或静默 fallback 归类成可接受的外部 provider 失败。",
-            "在证据中记录 authorization value 或其它 secret。"
+            "把 authorization value 或其它 secret 投影到人类可读 evidence、报告、日志或 Tool Trace；原始 Host SQLite durable execution snapshot 除外。"
           ]
         }
       ],
@@ -182,6 +182,11 @@
           "kind": "user-decision",
           "date": "2026-07-30",
           "summary": "用户逐项确认 init 的 workspace、模型、secret、模式、修复、退出码和真实 provider 验证语义。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-30",
+          "summary": "用户明确确认 Host SQLite 持久化 resolved credential 明文是允许行为；该 raw durable state 只作为受限观察证据，不得把 value 投影到报告、日志、Tool Trace 或 LLM-facing 内容。"
         },
         {
           "kind": "reference-observation",

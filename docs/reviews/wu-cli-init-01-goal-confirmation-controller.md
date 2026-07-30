@@ -188,6 +188,22 @@ oracle 暴露的缺口；真实 provider 检查使用 `utils/` 下一个窄 smok
 None。用户已接受 init oracle 的模型、parser、交互、mode、repair、真实 prompt 和
 provider-unavailable 语义，并于 2026-07-30 确认本 goal confirmation。
 
+## 2026-07-30 用户补充裁决：Host SQLite credential
+
+用户明确确认：Host SQLite 中持久化 resolved credential 明文没有问题。此前
+“secret 不得持久化”的表述仅约束 init-owned workspace 配置及人类可读
+evidence surface，不约束 Host 的 durable execution snapshot。
+
+- init-owned workspace 配置仍只能保存 credential ref 或环境变量模板；
+- 屏幕输出、日志、异常、Tool Trace、人类可读报告和 LLM-facing 内容仍不得投影
+  credential value；
+- raw Host SQLite（包括 EventLog payload）中的 resolved credential value 是允许且
+  必须如实记录的观察事实，不构成 finding，不要求修改 Host，也不删除 raw evidence；
+- CI 可以扫描并计数这类 Host SQLite 命中，但必须把它归类为 accepted observation，
+  不能归类为 persistence violation。
+
+该补充裁决消除了 S5-B 的 oracle 歧义，不扩大本 work unit 的产品代码 scope。
+
 ## Completion
 
 本 gate 已由用户于 2026-07-30 确认并通过。下一未完成 gate 为 `plan`，由

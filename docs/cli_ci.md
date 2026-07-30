@@ -559,6 +559,37 @@ error/timeout/cancel 后仍继续其余已获授权场景；只有越过授权�
 - debug log、Host public reads、EventLog/Tool Trace 和相关 SQLite schema/关键 rows 的 before/after；
 - init 后由真实后续 CLI 命令加载配置并执行 primary read/operation flow，而不是只检查文件存在或 init 自报成功。
 
+`WU-CLI-INIT-01` 的 15-choice live provider slice 使用：
+
+```bash
+python utils/smoke_cli_init_provider_matrix.py --oracle-version 1
+```
+
+该命令为每个 choice 创建 fresh workspace 与 fresh HOME；只使用调用进程中已有
+credential，缺失 credential 或 custom endpoint 时以真实 EOF 拒绝且不得 publication。
+成功 init 后执行一次最小真实 prompt，并由 production Service assembly、Host canonical
+terminal 与 Tool Trace runner-call resolver 共同证明 effective ordinary/compactor identity、
+request/response truth 及 no-fallback。报告在
+`workspace/tmp/wu-cli-init-01/<run-id>/matrix-report.json`，只含脱敏 endpoint、bounded
+文本摘要、digest/marker 和 credential ref；terminal preview 只对显式
+project/run/workspace roots 做精确前缀替换，不使用泛化路径正则。每个 row 完成后，
+harness 必须在该 CI-owned row root 内执行 typed、bounded、no-follow 的全普通文件
+持久化扫描，至少覆盖 init-owned config、Host SQLite/WAL、report、trace、log 和
+其它 durable artifact；symlink、特殊文件、I/O/竞态或扫描边界超限均 fail closed。
+扫描只用当前进程已知 credential 值和 canary 作精确探针，输出只包含稳定 code、
+相对 artifact class 和 count，不得回显值或具体路径。init-owned config 只能保存
+secret ref，不能保存 resolved credential；report、config、log、trace 及其它非 Host
+SQLite durable artifact 出现 exact credential value 均为 persistence violation。
+secret canary 在任何位置出现都属于 violation。Host SQLite 及其 WAL 中出现 exact
+credential value 是已裁决允许的 durable fact，只记录为 accepted observation，不计
+violation，也不影响 row internal contract、availability 或 overall verdict。row
+report 全文与最终 report 仍必须分别通过 credential/canary/authorization/request-id/
+已知绝对 root scan 后才写入。持久化 violation 同时进入 row secret contract、
+internal contract 和 overall verdict；accepted observation 不进入失败判定。外部不可用会继续其余 rows；credential missing、endpoint
+unconfigured、transport unavailable、provider rejection 与 rate limit 只要真实
+证据、脱敏和 no-fallback contract 完整即可通过总体 verdict。internal product bug、
+未分类、secret leak、fallback 或证据矛盾仍使命令总体退出非零。
+
 其它命令必须按同一原则从其状态、选项、输入、组合、跨命令消费和 evidence obligations 派生矩阵。第一轮和以后每次
 完整 `full-real` 都运行全部 mandatory scenarios；`focused-real` 只用于局部复现/修复验证，不更新全量 coverage、
 registry readiness 或完整 CI 结论。

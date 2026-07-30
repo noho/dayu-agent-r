@@ -893,8 +893,9 @@ identity，dynamic record 由 init catalog owner 生成。
      它是用户已确认行为的 immutable expected snapshot，不是从本次 actual tree
      派生的 cache；
   2. smoke 每 row 使用 fresh workspace/home，不写用户真实 profile；
-  3. required key 已在 process env 时不收集/持久化；缺 key 时以 secret EOF/拒绝路径
-     验证无 publication；
+  3. required key 已在 process env 时，init 不重新收集、不写入 init-owned
+     workspace 配置；Host SQLite 的 durable execution snapshot 可以持久化 runtime
+     已解析的 credential value；缺 key 时以 secret EOF/拒绝路径验证无 publication；
   4.成功 init 后运行真实 `dayu-cli prompt`，并以同一配置调用 production
      entrypoint assembly 取得 effective ordinary/compactor typed identity；
   5.从真实 Host tool-trace / runner-input projection 读取 run/request/manifest
@@ -904,7 +905,10 @@ identity，dynamic record 由 init catalog owner 生成。
      path digest；
   8. evidence 写入
      `workspace/tmp/wu-cli-init-01/<run-id>/matrix-report.json`；
-  9. 全 report 做 secret canary / authorization / credential value scan。
+  9. 全 report 做 secret canary / authorization / credential value scan；raw Host
+     SQLite 中的 exact credential 命中只计为 accepted observation，report、config、
+     log、Tool Trace 或其它 durable evidence 中的命中仍是 violation；secret canary
+     在任何位置命中均失败。
 - manifest validation boundary：
   - 正常 deterministic test、正常 smoke 与 live matrix 只读
     `docs/cli_init_workspace_manifest_v1.json`；独立遍历实际 publication tree、独立计算
@@ -936,7 +940,8 @@ identity，dynamic record 由 init catalog owner 生成。
 - stop condition：
   - 任一 row 未分类；
   - internal incompatibility；
-  - secret scan failure；
+  - disallowed secret scan failure（不包括已接受的 Host SQLite credential
+    observation）；
   - fallback observed；
   - credential/provider 可用却没有真实 response；
   均阻止 slice pass。
@@ -1063,7 +1068,7 @@ provider model 不同，则两个角色分别发真实请求。Ollama / Custom �
 - bounded response or diagnostic `{length, sha256, preview}`；
 - before/after workspace managed-tree digest；
 - `fallback_observed` 与用于判定的 observed provider/model set；
-- secret scan result。
+- secret scan result，以及不含 value/path 的 Host SQLite accepted observation count。
 
 No-fallback 判定不能只看最终回答。至少同时要求：
 
@@ -1132,7 +1137,8 @@ python utils/smoke_cli_init_provider_matrix.py --oracle-version 1
 
 真实外部 unavailable row 不使 harness 伪装成功；harness 只有在该 row 满足预期
 nonzero/redaction/no-fallback 时才把 row 标为正确分类。`internal_product_bug`、
-unclassified、secret leak、fallback 或 requestable+无真实 response 使 harness 非零。
+unclassified、disallowed secret leak、fallback 或 requestable+无真实 response 使
+harness 非零；Host SQLite 中已接受的 resolved credential observation 不计为 leak。
 
 最终检查：
 
