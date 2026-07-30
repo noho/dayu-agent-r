@@ -34,7 +34,11 @@ from dayu.cli.init_workspace import (
     snapshot_managed_roots,
 )
 from dayu.contracts.json_value import JsonValue
-from dayu.runtime.config_loader import ToolDiscoveryProviderConfig
+from dayu.runtime.config_loader import (
+    ConfigLoader,
+    ToolDiscoveryProviderConfig,
+    config_file_names,
+)
 from dayu.service.host_assembly import ServiceDiscoveredTools
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
@@ -76,6 +80,11 @@ def _request(
     snapshot = snapshot_managed_roots(
         workspace_root,
         platform_system=_PLATFORM,
+        repair_mode=(
+            mode
+            if mode in (InitMode.OVERWRITE, InitMode.RESET)
+            else None
+        ),
     )
     return WorkspaceTransactionRequest(
         workspace_root=workspace_root.resolve(strict=True),
@@ -372,6 +381,269 @@ def test_preserve_overwrite_and_reset_have_distinct_tree_contracts(
     assert (workspace_root / "config" / "models.json").is_file()
     assert (workspace_root / "portfolio" / "sentinel.txt").read_text(encoding="utf-8") == "portfolio"
     assert (workspace_root / "assets" / "sentinel.txt").read_text(encoding="utf-8") == "assets"
+
+
+@pytest.mark.parametrize("missing_file_name", config_file_names())
+def test_preserve_staging_copies_each_missing_root_config_only(
+    tmp_path: Path,
+    missing_file_name: str,
+) -> None:
+    """PRESERVE staging 必须逐项补齐五类根配置且不改其它根配置 bytes。
+
+    :param tmp_path: pytest 临时目录。
+    :param missing_file_name: 本次从 staging 删除的根配置文件名。
+    :returns: None。
+    :raises AssertionError: 缺失项未补齐或其它根配置 bytes 漂移时抛出。
+    :raises OSError: 测试树复制、读取或删除失败时抛出。
+    """
+
+    staged_config_root = tmp_path / "staged-config"
+    shutil.copytree(_PACKAGE_CONFIG_ROOT, staged_config_root)
+    preserved_bytes = {
+        file_name: (staged_config_root / file_name).read_bytes()
+        for file_name in config_file_names()
+        if file_name != missing_file_name
+    }
+    (staged_config_root / missing_file_name).unlink()
+
+    init_workspace._copy_missing_root_config_files(
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+        staged_config_root=staged_config_root,
+        platform_system=_PLATFORM,
+    )
+
+    assert (staged_config_root / missing_file_name).read_bytes() == (
+        _PACKAGE_CONFIG_ROOT / missing_file_name
+    ).read_bytes()
+    assert {
+        file_name: (staged_config_root / file_name).read_bytes()
+        for file_name in preserved_bytes
+    } == preserved_bytes
+
+
+def test_ordinary_file_roots_follow_explicit_mode_ownership(
+    tmp_path: Path,
+) -> None:
+    """Ordinary-file roots 只能由 OVERWRITE/RESET 的精确 owner 恢复。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: mode matrix、最终 tree 或非 init-owned identity 漂移。
+    :raises InitWorkspaceError: 合法 destructive recovery 未能完成时抛出。
+    """
+
+    no_flag_root = tmp_path / "no-flag"
+    no_flag_root.mkdir()
+    _write_text(no_flag_root / "config", "ordinary-config-file")
+    with pytest.raises(InitWorkspaceError, match="ordinary directory"):
+        snapshot_managed_roots(no_flag_root, platform_system=_PLATFORM)
+
+    overwrite_root = tmp_path / "overwrite"
+    overwrite_root.mkdir()
+    _write_text(overwrite_root / "config", "ordinary-config-file")
+    dayu_state = overwrite_root / ".dayu" / "state.bin"
+    _write_text(dayu_state, "stable-state")
+    dayu_identity = init_workspace._path_identity(
+        overwrite_root / ".dayu",
+        platform_system=_PLATFORM,
+    )
+
+    overwrite = prepare_workspace_transaction(
+        _request(overwrite_root, mode=InitMode.OVERWRITE)
+    )
+    publish_workspace_transaction(overwrite)
+
+    assert (overwrite_root / "config").is_dir()
+    ConfigLoader().load(workspace_config_dir=overwrite_root / "config")
+    assert dayu_state.read_text(encoding="utf-8") == "stable-state"
+    assert (
+        init_workspace._path_identity(
+            overwrite_root / ".dayu",
+            platform_system=_PLATFORM,
+        )
+        == dayu_identity
+    )
+
+    overwrite_reject_root = tmp_path / "overwrite-reject"
+    overwrite_reject_root.mkdir()
+    _write_text(overwrite_reject_root / ".dayu", "ordinary-dayu-file")
+    with pytest.raises(InitWorkspaceError, match="ordinary directory"):
+        snapshot_managed_roots(
+            overwrite_reject_root,
+            platform_system=_PLATFORM,
+            repair_mode=InitMode.OVERWRITE,
+        )
+
+    reset_root = tmp_path / "reset"
+    reset_root.mkdir()
+    _write_text(reset_root / "config", "ordinary-config-file")
+    _write_text(reset_root / ".dayu", "ordinary-dayu-file")
+    portfolio_sentinel = reset_root / "portfolio" / "sentinel.txt"
+    assets_sentinel = reset_root / "assets" / "sentinel.txt"
+    _write_text(portfolio_sentinel, "portfolio")
+    _write_text(assets_sentinel, "assets")
+    portfolio_identity = init_workspace._path_identity(
+        portfolio_sentinel,
+        platform_system=_PLATFORM,
+    )
+    assets_identity = init_workspace._path_identity(
+        assets_sentinel,
+        platform_system=_PLATFORM,
+    )
+
+    reset = prepare_workspace_transaction(
+        _request(reset_root, mode=InitMode.RESET)
+    )
+    publish_workspace_transaction(reset)
+
+    assert (reset_root / "config").is_dir()
+    assert not (reset_root / ".dayu").exists()
+    ConfigLoader().load(workspace_config_dir=reset_root / "config")
+    assert portfolio_sentinel.read_text(encoding="utf-8") == "portfolio"
+    assert assets_sentinel.read_text(encoding="utf-8") == "assets"
+    assert (
+        init_workspace._path_identity(
+            portfolio_sentinel,
+            platform_system=_PLATFORM,
+        )
+        == portfolio_identity
+    )
+    assert (
+        init_workspace._path_identity(
+            assets_sentinel,
+            platform_system=_PLATFORM,
+        )
+        == assets_identity
+    )
+
+
+def test_corrupt_ordinary_config_requires_explicit_destructive_mode(
+    tmp_path: Path,
+) -> None:
+    """Malformed ordinary config 在 PRESERVE 保真失败并可由显式模式恢复。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: PRESERVE 发布、destructive recovery 或 sentinel 漂移。
+    :raises InitWorkspaceError: 合法 OVERWRITE/RESET recovery 未完成时抛出。
+    """
+
+    workspace_root = (tmp_path / "workspace").resolve(strict=False)
+    workspace_root.mkdir()
+    first = prepare_workspace_transaction(
+        _request(workspace_root, mode=InitMode.FIRST)
+    )
+    publish_workspace_transaction(first)
+    dayu_state = workspace_root / ".dayu" / "state.txt"
+    portfolio_sentinel = workspace_root / "portfolio" / "sentinel.txt"
+    assets_sentinel = workspace_root / "assets" / "sentinel.txt"
+    _write_text(dayu_state, "state")
+    _write_text(portfolio_sentinel, "portfolio")
+    _write_text(assets_sentinel, "assets")
+    corrupt_path = workspace_root / "config" / "execution_profiles.json"
+    corrupt_path.write_bytes(b"{")
+    before_preserve = snapshot_managed_roots(
+        workspace_root,
+        platform_system=_PLATFORM,
+    )
+
+    with pytest.raises(InitWorkspaceError):
+        prepare_workspace_transaction(
+            _request(workspace_root, mode=InitMode.PRESERVE)
+        )
+
+    assert snapshot_managed_roots(
+        workspace_root,
+        platform_system=_PLATFORM,
+    ) == before_preserve
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+
+    dayu_identity = init_workspace._path_identity(
+        workspace_root / ".dayu",
+        platform_system=_PLATFORM,
+    )
+    overwrite = prepare_workspace_transaction(
+        _request(workspace_root, mode=InitMode.OVERWRITE)
+    )
+    publish_workspace_transaction(overwrite)
+    ConfigLoader().load(workspace_config_dir=workspace_root / "config")
+    assert dayu_state.read_text(encoding="utf-8") == "state"
+    assert (
+        init_workspace._path_identity(
+            workspace_root / ".dayu",
+            platform_system=_PLATFORM,
+        )
+        == dayu_identity
+    )
+
+    corrupt_path.write_bytes(b"{")
+    reset = prepare_workspace_transaction(
+        _request(workspace_root, mode=InitMode.RESET)
+    )
+    publish_workspace_transaction(reset)
+
+    ConfigLoader().load(workspace_config_dir=workspace_root / "config")
+    assert not (workspace_root / ".dayu").exists()
+    assert portfolio_sentinel.read_text(encoding="utf-8") == "portfolio"
+    assert assets_sentinel.read_text(encoding="utf-8") == "assets"
+
+
+def test_cleanup_dispatches_regular_file_to_unlink_and_directory_to_rmtree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 cleanup owner 必须按 PathIdentity.mode 选择 unlink 或 rmtree。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: regular file 或 directory 删除分派错误时抛出。
+    :raises InitWorkspaceError: ordinary private target cleanup 失败时抛出。
+    """
+
+    parent = tmp_path / "owner"
+    parent.mkdir()
+    private_file = parent / "private-file"
+    _write_text(private_file, "file")
+    file_identity = init_workspace._path_identity(
+        private_file,
+        platform_system=_PLATFORM,
+    )
+    unlink = Mock(wraps=init_workspace.os.unlink)
+    real_rmtree = init_workspace.shutil.rmtree
+    rmtree = Mock(wraps=real_rmtree)
+    rmtree.avoids_symlink_attacks = real_rmtree.avoids_symlink_attacks
+    monkeypatch.setattr(init_workspace.os, "unlink", unlink)
+    monkeypatch.setattr(init_workspace.shutil, "rmtree", rmtree)
+
+    init_workspace._cleanup_private_path(
+        private_file,
+        expected_identity=file_identity,
+        private_parent=parent,
+        platform_system=_PLATFORM,
+        stage="file_cleanup",
+    )
+
+    assert unlink.call_count == 1
+    rmtree.assert_not_called()
+    private_directory = parent / "private-directory"
+    _write_text(private_directory / "child.txt", "directory")
+    directory_identity = init_workspace._path_identity(
+        private_directory,
+        platform_system=_PLATFORM,
+    )
+
+    init_workspace._cleanup_private_path(
+        private_directory,
+        expected_identity=directory_identity,
+        private_parent=parent,
+        platform_system=_PLATFORM,
+        stage="directory_cleanup",
+    )
+
+    assert rmtree.call_count == 1
+    assert not private_file.exists()
+    assert not private_directory.exists()
 
 
 def test_abort_prepared_transaction_removes_only_private_container(

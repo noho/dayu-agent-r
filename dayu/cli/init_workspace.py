@@ -286,16 +286,23 @@ def snapshot_managed_roots(
     workspace_root: Path,
     *,
     platform_system: str,
+    repair_mode: InitMode | None = None,
 ) -> WorkspaceSnapshot:
-    """读取唯一 manifest 的 no-follow identity 与逐字节快照。
+    """读取唯一 manifest 的 no-follow identity 与内容快照。
 
     :param workspace_root: canonical workspace root；可尚未存在。
     :param platform_system: 明确的标准平台值。
+    :param repair_mode: 显式 destructive mode 拥有的 ordinary-file root 修复意图。
     :returns: 按 manifest 顺序排列的 workspace snapshot。
-    :raises InitWorkspaceError: workspace/tree 不安全或无法读取时抛出。
+    :raises InitWorkspaceError: repair mode 非法或 workspace/tree 不安全时抛出。
     """
 
     _validate_platform(platform_system)
+    if repair_mode not in (None, InitMode.OVERWRITE, InitMode.RESET):
+        raise InitWorkspaceError(
+            stage="managed_root_identity",
+            message="repair mode must be OVERWRITE, RESET, or absent",
+        )
     canonical_workspace = workspace_root.expanduser().resolve(strict=False)
     if not workspace_root.exists():
         if workspace_root.is_symlink():
@@ -336,6 +343,36 @@ def snapshot_managed_roots(
             )
             continue
         identity = _path_identity(path, platform_system=platform_system)
+        if stat.S_ISREG(identity.mode):
+            regular_file_owned_by_mode = (
+                repair_mode is InitMode.RESET
+                or (
+                    repair_mode is InitMode.OVERWRITE
+                    and root_name == _CONFIG_ROOT_NAME
+                )
+            )
+            if not regular_file_owned_by_mode:
+                raise InitWorkspaceError(
+                    stage="managed_root_identity",
+                    message=f"path must be an ordinary directory: {path}",
+                )
+            if (
+                platform_system == _WINDOWS_PLATFORM
+                and identity.file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise InitWorkspaceError(
+                    stage="managed_root_identity",
+                    message=f"Windows reparse file is not allowed: {path}",
+                )
+            roots.append(
+                ManagedRootSnapshot(
+                    name=root_name,
+                    path=path,
+                    identity=identity,
+                    content_digest=_regular_file_digest(path),
+                )
+            )
+            continue
         _require_ordinary_directory(
             path,
             identity,
@@ -790,6 +827,11 @@ def _require_snapshot_unchanged(request: WorkspaceTransactionRequest) -> None:
     current = snapshot_managed_roots(
         request.workspace_root,
         platform_system=request.platform_system,
+        repair_mode=(
+            request.mode
+            if request.mode in (InitMode.OVERWRITE, InitMode.RESET)
+            else None
+        ),
     )
     if current != request.expected_snapshot:
         raise InitWorkspaceError(
@@ -823,6 +865,11 @@ def _build_staged_config(
             public_config,
             staged_config_root,
             symlinks=True,
+        )
+        _copy_missing_root_config_files(
+            package_config_root=request.package_config_root,
+            staged_config_root=staged_config_root,
+            platform_system=request.platform_system,
         )
         _copy_missing_prompt_files(
             package_config_root=request.package_config_root,
@@ -870,6 +917,44 @@ def _copy_package_config_defaults(
         staged_config_root / _PROMPTS_ROOT_NAME,
         symlinks=True,
     )
+
+
+def _copy_missing_root_config_files(
+    *,
+    package_config_root: Path,
+    staged_config_root: Path,
+    platform_system: str,
+) -> None:
+    """PRESERVE 只从 package 真源补齐缺失的五类根配置。
+
+    :param package_config_root: 当前 package config 真源。
+    :param staged_config_root: 已复制的用户 config staging tree。
+    :param platform_system: 明确平台值。
+    :returns: None。
+    :raises InitWorkspaceError: package 根配置不是 ordinary regular file 时抛出。
+    :raises OSError: identity 读取或文件复制失败时抛出。
+    """
+
+    for file_name in config_file_names():
+        destination = staged_config_root / file_name
+        if destination.exists() or destination.is_symlink():
+            continue
+        source = package_config_root / file_name
+        identity = _path_identity(source, platform_system=platform_system)
+        if stat.S_ISLNK(identity.mode) or not stat.S_ISREG(identity.mode):
+            raise InitWorkspaceError(
+                stage="staging_copy",
+                message=f"package config must be a regular file: {source}",
+            )
+        if (
+            platform_system == _WINDOWS_PLATFORM
+            and identity.file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise InitWorkspaceError(
+                stage="staging_copy",
+                message=f"Windows reparse config file is not allowed: {source}",
+            )
+        shutil.copy2(source, destination)
 
 
 def _copy_missing_prompt_files(
@@ -1272,16 +1357,16 @@ def _cleanup_private_path(
     platform_system: str,
     stage: str,
 ) -> None:
-    """Identity-lock 后同父 quarantine 并 no-follow 删除 private tree。
+    """Identity-lock 后同父 quarantine 并删除 private ordinary file/tree。
 
-    :param path: transaction 自己创建或移动的 private ordinary tree。
+    :param path: transaction 自己创建或移动的 private ordinary file/tree。
     :param expected_identity: owner 记录的精确 identity。
     :param private_parent: path 与 quarantine 的共同 parent。
     :param platform_system: 明确平台值。
     :param stage: diagnostic 阶段。
     :returns: None。
-    :raises InitWorkspaceError: containment/identity/reparse/capability 或
-        partial deletion 失败时抛出。
+    :raises InitWorkspaceError: containment、identity、reparse、删除 capability
+        或实际删除失败时抛出。
     """
 
     try:
@@ -1301,12 +1386,23 @@ def _cleanup_private_path(
             message=f"private path identity changed: {path}",
             retained_paths=(path,),
         )
-    _require_ordinary_directory(
-        path,
-        actual_identity,
-        platform_system=platform_system,
-        stage=f"{stage}_identity",
-    )
+    if stat.S_ISREG(expected_identity.mode):
+        if (
+            platform_system == _WINDOWS_PLATFORM
+            and expected_identity.file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise InitWorkspaceError(
+                stage=f"{stage}_identity",
+                message=f"Windows reparse file is not allowed: {path}",
+                retained_paths=(path,),
+            )
+    else:
+        _require_ordinary_directory(
+            path,
+            actual_identity,
+            platform_system=platform_system,
+            stage=f"{stage}_identity",
+        )
     quarantine = private_parent / f"{_QUARANTINE_PREFIX}{uuid.uuid4().hex}"
     try:
         os.replace(path, quarantine)
@@ -1353,6 +1449,16 @@ def _cleanup_private_path(
             message="quarantine identity or original-name absence check failed",
             retained_paths=(quarantine,),
         )
+    if stat.S_ISREG(expected_identity.mode):
+        try:
+            os.unlink(quarantine)
+        except (OSError, KeyboardInterrupt) as exc:
+            raise InitWorkspaceError(
+                stage=f"{stage}_file_delete",
+                message=f"private file delete failed: {exc.__class__.__name__}",
+                retained_paths=(quarantine,) if _path_exists_no_follow(quarantine) else (),
+            ) from exc
+        return
     try:
         if platform_system in _POSIX_PLATFORMS:
             if shutil.rmtree.avoids_symlink_attacks is not True:
@@ -1557,6 +1663,21 @@ def _tree_digest(root: Path, *, platform_system: str) -> str:
                 stage="managed_root_digest",
                 message=f"managed tree type changed during digest: {path}",
             )
+    return digest.hexdigest()
+
+
+def _regular_file_digest(path: Path) -> str:
+    """计算已按 mode 接受的 ordinary regular file 内容摘要。
+
+    :param path: 已由 no-follow identity 分类的 regular managed root。
+    :returns: lowercase SHA-256。
+    :raises OSError: 普通文件读取失败时抛出。
+    """
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(_FILE_READ_CHUNK_BYTES):
+            digest.update(chunk)
     return digest.hexdigest()
 
 

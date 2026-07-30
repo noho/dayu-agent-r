@@ -121,9 +121,14 @@ def run_init_command(args: ParsedCliArgs) -> int:
         requested_workspace = _resolve_workspace_root(args.workspace_root)
         _validate_requested_workspace_path(requested_workspace)
         platform_system = platform.system()
+        repair_mode = _requested_repair_mode(
+            reset=args.reset,
+            overwrite=args.overwrite,
+        )
         unlocked_snapshot = snapshot_managed_roots(
             requested_workspace,
             platform_system=platform_system,
+            repair_mode=repair_mode,
         )
         requested_mode = determine_init_mode(
             unlocked_snapshot,
@@ -149,6 +154,7 @@ def run_init_command(args: ParsedCliArgs) -> int:
             locked_snapshot = snapshot_managed_roots(
                 workspace_identity.canonical_path,
                 platform_system=platform_system,
+                repair_mode=repair_mode,
             )
             locked_mode = determine_init_mode(
                 locked_snapshot,
@@ -391,6 +397,22 @@ def _require_confirmed_snapshot(
         raise CliInitOperationError("init mode changed while acquiring lock; rerun")
     if requested_mode is InitMode.RESET and unlocked_snapshot.roots != locked_snapshot.roots:
         raise CliInitOperationError("RESET target snapshot changed after confirmation; rerun")
+
+
+def _requested_repair_mode(*, reset: bool, overwrite: bool) -> InitMode | None:
+    """把 destructive flags 投影为 managed-root repair intent。
+
+    :param reset: 用户是否显式传入 ``--reset``。
+    :param overwrite: 用户是否显式传入 ``--overwrite``。
+    :returns: RESET、OVERWRITE 或无 destructive repair intent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if reset:
+        return InitMode.RESET
+    if overwrite:
+        return InitMode.OVERWRITE
+    return None
 
 
 def _load_target_min_context_window(

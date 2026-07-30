@@ -829,6 +829,8 @@ def test_locked_target_mode_loads_typed_profile_once_and_passes_minimum(
     )
     monkeypatch.setattr(init_command, "ConfigLoader", loader_factory)
     monkeypatch.setattr(init_command, "_select_model", selection)
+    snapshot = Mock(wraps=init_command.snapshot_managed_roots)
+    monkeypatch.setattr(init_command, "snapshot_managed_roots", snapshot)
     if expected_mode is init_command.InitMode.RESET:
         monkeypatch.setattr(builtins, "input", _InputSequence(("y",)))
 
@@ -851,6 +853,25 @@ def test_locked_target_mode_loads_typed_profile_once_and_passes_minimum(
     selection.assert_called_once_with(
         min_context_window_tokens=expected_minimum
     )
+    expected_repair_mode = (
+        expected_mode
+        if expected_mode
+        in (init_command.InitMode.OVERWRITE, init_command.InitMode.RESET)
+        else None
+    )
+    expected_workspace_root = workspace_root.resolve(strict=True)
+    assert snapshot.call_args_list == [
+        call(
+            expected_workspace_root,
+            platform_system=platform.system(),
+            repair_mode=expected_repair_mode,
+        ),
+        call(
+            expected_workspace_root,
+            platform_system=platform.system(),
+            repair_mode=expected_repair_mode,
+        ),
+    ]
 
 
 def test_preserve_overwrite_and_reset_cli_matrix(

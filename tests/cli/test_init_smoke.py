@@ -1414,20 +1414,26 @@ def test_posix_real_four_state_config_scene_and_reset_sentinels(tmp_path: Path) 
 
     user_file = workspace_root / "config" / "user-owned.txt"
     user_manifest = workspace_root / "config" / "prompts" / "manifests" / "user-owned.json"
+    missing_root_config = workspace_root / "config" / "tool_discovery.json"
     missing_prompt = workspace_root / "config" / "prompts" / "base" / "fact_rules.md"
     _write_text(user_file, "user-file")
     _write_text(user_manifest, '{"owner":"user"}')
+    missing_root_config.unlink()
     missing_prompt.unlink()
 
     preserve = _run_init(workspace_root, environment)
     _assert_init_result(preserve, expected_returncode=0, expected_mode="preserve")
     assert user_file.read_text(encoding="utf-8") == "user-file"
     assert user_manifest.read_text(encoding="utf-8") == '{"owner":"user"}'
+    assert missing_root_config.read_bytes() == (
+        _REPOSITORY_ROOT / "dayu" / "config" / "tool_discovery.json"
+    ).read_bytes()
     assert (
         missing_prompt.read_bytes()
         == (_REPOSITORY_ROOT / "dayu" / "config" / "prompts" / "base" / "fact_rules.md").read_bytes()
     )
 
+    (workspace_root / "config" / "execution_profiles.json").write_bytes(b"{")
     overwrite = _run_init(workspace_root, environment, flags=("--overwrite",))
     _assert_init_result(overwrite, expected_returncode=0, expected_mode="overwrite")
     assert not user_file.exists()
@@ -1467,6 +1473,73 @@ def test_posix_real_four_state_config_scene_and_reset_sentinels(tmp_path: Path) 
     assert _path_identity(portfolio_sentinel) == portfolio_identity
     assert _path_identity(assets_sentinel) == assets_identity
     _validate_published_config(workspace_root, tmp_path / "reset-validation")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="真实 POSIX init smoke")
+def test_posix_real_ordinary_root_overwrite_reset_matrix(
+    tmp_path: Path,
+) -> None:
+    """真实 CLI 以精确 destructive mode 修复 ordinary-file managed roots。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises Exception: mode、最终 tree、ConfigLoader 或非 init-owned 保留失败时抛出。
+    """
+
+    environment = _subprocess_environment(tmp_path / "home")
+    overwrite_root = tmp_path / "overwrite-workspace"
+    overwrite_root.mkdir()
+    _write_text(overwrite_root / "config", "ordinary-config-file")
+    dayu_state = overwrite_root / ".dayu" / "state.bin"
+    _write_text(dayu_state, "stable-state")
+    dayu_identity = _path_identity(overwrite_root / ".dayu")
+
+    overwrite = _run_init(
+        overwrite_root,
+        environment,
+        flags=("--overwrite",),
+    )
+    _assert_init_result(
+        overwrite,
+        expected_returncode=0,
+        expected_mode="overwrite",
+    )
+    assert (overwrite_root / "config").is_dir()
+    assert dayu_state.read_text(encoding="utf-8") == "stable-state"
+    assert _path_identity(overwrite_root / ".dayu") == dayu_identity
+    _validate_published_config(
+        overwrite_root,
+        tmp_path / "overwrite-ordinary-validation",
+    )
+
+    reset_root = tmp_path / "reset-workspace"
+    reset_root.mkdir()
+    _write_text(reset_root / "config", "ordinary-config-file")
+    _write_text(reset_root / ".dayu", "ordinary-dayu-file")
+    portfolio_sentinel = reset_root / "portfolio" / "sentinel.bin"
+    assets_sentinel = reset_root / "assets" / "sentinel.bin"
+    _write_text(portfolio_sentinel, "portfolio")
+    _write_text(assets_sentinel, "assets")
+    portfolio_identity = _path_identity(portfolio_sentinel)
+    assets_identity = _path_identity(assets_sentinel)
+
+    reset = _run_init(
+        reset_root,
+        environment,
+        flags=("--reset",),
+        input_text=f"y\n{_OLLAMA_INPUT}",
+    )
+    _assert_init_result(reset, expected_returncode=0, expected_mode="reset")
+    assert (reset_root / "config").is_dir()
+    assert not (reset_root / ".dayu").exists()
+    assert portfolio_sentinel.read_text(encoding="utf-8") == "portfolio"
+    assert assets_sentinel.read_text(encoding="utf-8") == "assets"
+    assert _path_identity(portfolio_sentinel) == portfolio_identity
+    assert _path_identity(assets_sentinel) == assets_identity
+    _validate_published_config(
+        reset_root,
+        tmp_path / "reset-ordinary-validation",
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="真实 POSIX profile smoke")
