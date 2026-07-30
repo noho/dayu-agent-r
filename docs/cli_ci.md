@@ -6,13 +6,20 @@
 
 该体系需要同时回答三个问题：
 
-1. CLI 的用户可见行为是否符合 Dayu 设计，并在通用 Agent 交互层面与 Codex / Claude Code 的成熟行为保持一致。
+1. CLI 的用户可见行为是否符合 Dayu 设计，并在通用 Agent 交互层面与冻结的真实 Codex reference 保持语义一致；
+   Claude Code 只在明确使用时提供可选对照。
 2. Host 的 canonical truth、状态迁移、Tool Trace、Conversation Memory 和实际模型输入是否符合设计真源与最佳实践。
 3. 实际进入 LLM 上下文的 prompt、tool schema、memory 和 evidence material 是否符合 `AGENTS.md` 的“LLM-facing 文本约束”。
 
 本文是验证体系设计，不表示当前仓库已经实现完整覆盖。现有 CLI smoke、PTY 测试和真实环境验证可以作为后续实现的输入，但不能替代本文定义的完整场景矩阵。
 
 本文定义的 CI 是真实环境验收 CI。任何 mock runner、fake provider、fake tool、内存替身 Host、伪造 EventLog 或手工拼接 memory snapshot 都不能作为场景通过证据。普通单元测试仍可按其测试边界使用 test double，但它们属于开发回归，不计入本文 CI 的 pass verdict。
+
+首次执行不是依据现有实现替用户判断产品正确性，而是一次完整的 oracle calibration campaign：总控代替人工验收者在
+不同前置状态下逐项操作所有 CLI 命令、参数和交互分支，冻结实际行为证据，由 Agent 提供裁决建议，最终由用户定义
+正确行为。第一轮允许为了补齐新发现的交互分支或证据缺口执行多个 run，但只有 mandatory 场景矩阵全部执行、证据
+充分、用户裁决闭环且 scenario/oracle registries 均通过 readiness 校验后才结束。当前产品可以仍然违反新接受的
+oracle；产品 failure 不等于 calibration 未完成，coverage/evidence/adjudication gap 才会阻止 readiness。
 
 ## 2. 新会话执行契约
 
@@ -24,7 +31,9 @@
 
 - repository：包含本文档的当前仓库。
 - target ref：当前 `HEAD` 对应的 commit SHA。
-- profile：场景与 oracle registries 都为 `ready` 时使用 `full-real`；否则自动使用 `calibration-real`，不得伪装成 full pass。
+- profile：场景与 oracle registries 都通过 readiness proof 校验并为 `ready` 时使用 `full-real`；否则自动使用
+  `calibration-real`。`calibration-real` 必须以完成全量 mandatory 矩阵和建立 registry 为目标，不得降级为抽样 smoke，
+  也不得伪装成 full pass。
 - agent session：tmux session `ai`。
 - execution mode：新建独立 detached tmux session，不占用用户现有 `console` pane。
 - evidence policy：通过和失败场景均保留 evidence bundle；失败场景额外保留完整终端和运行目录定位。
@@ -43,7 +52,11 @@
 - SEC、CNInfo、HKEX、模型 provider 和其它场景依赖的网络可访问。
 - 机器具备足够的磁盘、内存和执行时间。
 - 默认授权允许真实模型调用、公开财报源读取/下载，以及 CI-owned run root 内的写入、预处理和上传；禁止读取用户未授权文件、写入用户共享 workspace、外部破坏性操作和非 CI-owned 上传。扩大权限时，用户必须给出对应授权边界。
-- 可选成本/时间/磁盘上限通过 invocation 或 `DAYU_CLI_CI_AUTH_PROFILE` 指向的 operator 配置提供。配置至少可表达 `max_wall_time_seconds`、`max_model_calls`、`max_disk_bytes`、`allow_public_financial_download`、`allow_ci_owned_upload` 和 `allow_external_write`。未提供时，每个 accepted 或 calibration provisional scenario 只执行一次主路径，不做自动模型重试或额外高成本采样，并在 run manifest 中记录预计和实际消耗。
+- 可选成本/时间/磁盘上限通过 invocation 或 `DAYU_CLI_CI_AUTH_PROFILE` 指向的 operator 配置提供。配置至少可表达
+  `max_wall_time_seconds`、`max_model_calls`、`max_disk_bytes`、`allow_public_financial_download`、
+  `allow_ci_owned_upload` 和 `allow_external_write`。未提供时不做自动模型重试或无 coverage obligation 支撑的额外高成本
+  采样，但仍必须尝试全部 mandatory 场景；预算不足使未执行场景成为显式 gap，并阻止 calibration completion /
+  registry readiness 或 full-real verdict，不能据此缩小矩阵。
 
 用户不需要提前创建 validation worktree、venv、CLI tmux session、workspace、日志、cast 或 evidence 目录。总控不得要求用户手工执行本可自动完成的命令。
 
@@ -55,7 +68,8 @@
 2. 阅读 `docs/host/design.md`、`docs/engine/design.md` 和当前项目总控文档；涉及 #80 时读取其当前 issue 内容。
 3. 使用 `$init-agents` 约定发现并确认 `ai` session 中的 Agent 类型、pane 和空闲状态。
 4. 解析 target ref 为不可变 commit SHA，记录 branch/ref、commit、dirty state、被排除的未提交改动和仓库 remote identity。
-5. 读取稳定 scenario/oracle registries，按其 readiness 决定 `full-real` 或 `calibration-real`。
+5. 读取稳定 scenario/oracle registries，重新计算并校验 readiness proof 后决定 `full-real` 或
+   `calibration-real`；不得只信任文件中的 `registry_status` 字面值。
 6. 创建唯一 run id 和 run manifest；CLI CI assessment 不创建 Phaseflow control_doc，也不把自身伪装成可进入 `plan` 的 work unit。
 7. 在仓库外部的独立 run root 创建 detached git worktree，避免 CI 产物污染主工作树，也避免 Agent 正在进行的修改改变被测代码。
 8. 在 run root 创建或复用可证明与 target commit/lock digest 一致的 Python 3.11 venv；安装 target worktree 对应项目。venv 不得继续引用控制仓库中的可变源码。
@@ -78,7 +92,8 @@ run root 默认位于仓库父目录下的专用 `.dayu-cli-ci/<run-id>/`，或�
 - 外部网络和真实财报源满足当前 profile 的最低条件。
 - evidence 目录可写，剩余磁盘与预计运行预算足够。
 - 当前系统时间、时区、locale、终端尺寸和关键依赖版本已记录。
-- parser inventory 能生成，且每个命令/参数都有场景 owner 或明确缺失报告。
+- parser inventory 与 interactive branch inventory 能生成并冻结，且每个 mandatory coverage obligation 都有场景
+  owner 或明确 gap。
 
 任何真实依赖缺失都必须产生 `blocked` preflight 结论。不得自动切换到 mock/fake、缓存模型答案或更低语义的替代路径。
 
@@ -93,21 +108,30 @@ run root 默认位于仓库父目录下的专用 `.dayu-cli-ci/<run-id>/`，或�
 
 AgentMiMo / AgentDS 的独立审查是候选 WU goal confirmation 的输入证据，不是 Gateflow 的 `plan review`、`code review`、`aggregate deepreview` 或 `PR review` gate，不得因此跳过后续开发 WU 中的任何正式 review gate。
 
-一次 CLI CI 是只读 assessment，不是 Phaseflow work unit。它复用 Phaseflow 的 preflight、Agent liveness、finding taxonomy 和 goal confirmation 输出要求，但不进入 Gate Order：
+一次 CLI CI 是只读 assessment，不是 Phaseflow work unit。它复用 Phaseflow 的 preflight、Agent liveness、finding taxonomy 和 goal confirmation 输出要求，但不进入 Gate Order。Goal-discovery evidence acquisition 中不可跳过的主流程是：
 
 ```text
-ASSESSMENT PREFLIGHT
-  -> GOAL-DISCOVERY EVIDENCE ACQUISITION
-       -> INVENTORY
-       -> EXECUTE
-       -> CORRELATE
-       -> DETERMINISTIC ASSERTIONS
-       -> MIMO INDEPENDENT REVIEW + DS INDEPENDENT REVIEW
-       -> ORACLE CLASSIFICATION / CALIBRATION
-       -> CONTROLLER ADJUDICATION
-  -> ONE GOAL-CONFIRMATION-READY ARTIFACT PER CANDIDATE WU
-  -> AWAITING USER CANDIDATE SELECTION / GOAL CONFIRMATION
+FREEZE PARSER + INTERACTIVE-BRANCH INVENTORIES
+-> BUILD ALL MANDATORY STATE / OPTION / INPUT / COMBINATION / CROSS-COMMAND OBLIGATIONS
+-> EXECUTE EVERY MANDATORY SCENARIO WITH BEFORE / INPUT / SCREEN / ARTIFACT / CROSS-LAYER / AFTER EVIDENCE
+-> CORRELATE / CLASSIFY OBJECTIVE OR HARD-CONTRACT FACTS WITHOUT SHORT-CIRCUITING
+-> FREEZE HUMAN-READABLE OBSERVED-BEHAVIOR REPORT
+-> AGENTMIMO + AGENTDS INDEPENDENT REVIEW / FORMAL SUGGESTIONS
+-> CONTROLLER SYNTHESIS
+-> USER ADJUDICATION
+-> EXPAND AND RERUN IF USER OR EXECUTION DISCOVERS A COVERAGE / EVIDENCE GAP
+-> PERSIST ACCEPTED SCENARIOS + EXECUTABLE ORACLES
+-> VALIDATE READINESS PROOF
+-> ORACLE LIFECYCLE / GOAL-DISCOVERY OUTPUT
 ```
+
+在 correlate/classify 阶段发现 objective fact 或 hard contract failure 时可以立即标注并突出显示；除非继续执行会越过
+授权、造成安全风险或受到真实依赖阻塞，不得以此短路其余 mandatory observation，也不得自动进入修复。Finding 或
+修复候选可以在运行中暂存事实定位，但只有相应 observed report 冻结后才允许正式 review、裁决或生成候选 WU。
+`observed-behavior.md` 只承载已观察事实，Agent suggestions 与 user adjudication 只写入
+`oracle-adjudication.md`，三者不得混写。
+
+`AGENTMIMO + AGENTDS INDEPENDENT REVIEW / FORMAL SUGGESTIONS` 是两路 reviewer 对同一 frozen report 的正式独立输出。两路 review 只能在 report freeze 后开始，freeze 前不得读取或写入针对本次行为的产品期望，以免污染 observation；它们不是第三套 review，也不替代后续开发 WU 的 Gateflow `plan review`、`code review`、`aggregate deepreview` 或 `PR review`。
 
 每个 goal-confirmation-ready artifact 只描述一个稳定候选 WU identity，并包含动机、直接证据、语义 owner、传播路径、严重性、成功信号、非目标、scope boundary、blocking questions 和建议优先级。`unadjudicated` oracle difference 只进入 oracle candidate 清单，用户裁决前不得伪装成实现 finding。若多个 findings 不属于同一语义闭环，必须生成多个独立 artifacts，不能为了减少 gate 数量硬塞进一个实现范围。
 
@@ -115,7 +139,8 @@ Agent 执行期间，总控应耐心等待其完成；只有确认任务失去�
 
 ### 2.6 CI 与修复边界
 
-CI runner 是只读验证者，不修改被冻结测 worktree。发现 failure 后：
+CI runner 是只读验证者，不修改被冻结测 worktree。发现 failure 后仍先完成其余获授权的 mandatory observation；
+相应 observed report 冻结后才按以下流程处理：
 
 1. 总控先用直接证据定位语义 owner 和传播路径。
 2. 两路独立审查对 finding、严重性和修复边界提供 goal confirmation evidence。
@@ -123,9 +148,14 @@ CI runner 是只读验证者，不修改被冻结测 worktree。发现 failure �
 4. 用户选择某个候选 WU 后，总控以正确 design_doc 和既有项目 control_doc 启动新的 Phaseflow，重新执行 branch/status preflight；若已有未完成 active WU，先等待或请用户裁决，不能覆盖。Preflight 通过后，由 Phaseflow 把该稳定 WU identity 写入项目 control_doc，current gate / next entry point 均指向 `goal confirmation`。Phaseflow 直接引用 assessment evidence并向用户复述目标；用户确认后才进入 `plan`。此后必须完整遵循既有 Gate Order，一直推进到 `final closeout pass`，不得因为 CI 已经做过双路审查而省略 plan review、code review、aggregate deepreview 或 PR review。
 5. 开发 Git 流程完全复用 Phaseflow：branch/status preflight、accepted local commits、push、draft PR、PR review 和 final closeout。CLI CI 不定义第二套 branch、commit 或 PR 规则。
 6. 修复不得直接修改 validation worktree。修复提交后，为新 commit 创建新的 CI run id 和 validation worktree。
-7. 先执行 focused-real regression，再执行受影响矩阵；需要形成 full pass 时必须重新完成 `full-real`。
+7. 先执行 focused-real regression，再执行受影响矩阵；focused-real 只产生局部结论，不更新全量 coverage、
+   calibration readiness 或 full-real verdict。需要形成完整结论时必须重新执行整个 mandatory `full-real` 矩阵。
 
-若 CI 未发现成立的问题且不存在待裁决 oracle，总控输出 `no-implementation-goal`，不创建开发 branch、commit 或 PR。若存在 `unadjudicated` oracle candidate，则停在 `awaiting-user-candidate-selection` / `oracle-review-required`，不能用 `no-implementation-goal` 跳过用户裁决。若用户不选择候选 WU 或不裁决 oracle，本次 assessment 保留 evidence 后结束，不启动任何 Phaseflow WU。
+若 CI 未发现成立的问题且不存在待裁决 oracle，总控输出 `no-implementation-goal`，不创建开发 branch、commit 或 PR。
+若存在 `unadjudicated` oracle candidate，则停在 `awaiting-user-candidate-selection` / `oracle-review-required`，不能用
+`no-implementation-goal` 跳过用户裁决。若用户暂不选择候选 WU 或不裁决 oracle，当前 execution run 可以在保留
+evidence 后安全结束且不启动任何 Phaseflow WU；第一轮 calibration campaign 必须保持
+`incomplete/awaiting-user-adjudication`，next entry point 仍指向补证、裁决或 readiness closure，不得报告为第一轮结束。
 
 旧 run 的 evidence 不得被新 commit 覆盖。跨 run 复用结论时，必须证明 target commit、场景定义、真实财报 corpus digest、provider/model policy 和 oracle 均未变化。
 
@@ -134,7 +164,20 @@ CI runner 是只读验证者，不修改被冻结测 worktree。发现 failure �
 每次执行必须生成唯一 run manifest 和最终报告。报告至少包含：
 
 - target commit、profile、run id、起止时间和 runtime identity。
-- command/parameter inventory 覆盖率及缺失项。
+- parser/interactive inventories 的 identity/digest、mandatory obligation 总数、逐维度 coverage 和缺失项。
+- `observed-behavior.md` 的路径、report identity、exact UTF-8 bytes SHA-256 digest 和冻结状态。
+- 当前 `calibration_stage`；parser leaf 总数和 in-scope / out-of-scope 数量。
+- mandatory scenarios 的 planned / attempted / executed / not-run / blocked 数量，以及
+  `success` / `error` / `timeout` / `cancel` 各 `execution_outcome` 数量。
+- 按 precondition、option/interactive branch、input class、combination、cross-command 和 path kind 分离的 coverage /
+  outcome 统计；任一维度都不能用其它维度抵扣。
+- required evidence 完整率、各 `evidence_status` 和 `gap_kind` 的独立统计，以及 frozen report 上的
+  `observation_completeness`。
+- AgentMiMo / AgentDS formal suggestions 状态、总控 synthesis 状态和 user adjudication 状态。
+- scenario/oracle registry readiness proof：inventory identity、mandatory/covered/gap counts、用户裁决 identity、
+  frozen report digests、dangling refs、uncovered correctness surfaces 和最终校验结果。
+- 适用时使用的 Codex reference identity/version/digest；不适用或未使用时记录原因。
+- SQLite observation 的 `queried` / `not-queried` 汇总、查询边界、只读证明、脱敏结果和 public observability gaps。
 - CLI/UI、Host、LLM-facing、Conversation Memory、财报分析五类 verdict。
 - 每个失败或 limited-signal 场景的直接证据、语义 owner、严重性和建议 owner。
 - 本次使用的 accepted oracle id/version，以及新增 `unadjudicated` / `needs-more-evidence` candidates。
@@ -144,6 +187,11 @@ CI runner 是只读验证者，不修改被冻结测 worktree。发现 failure �
 - 是否满足 `full-real-pass`，以及哪些场景 blocked/not-run。
 - 候选 WU 列表，或没有成立 implementation goal 的直接理由。
 - assessment 状态；若用户已选择候选 WU，则记录对应项目 control_doc、WU id 和 Phaseflow next entry point。
+
+上述 observation、suggestions、reference、SQLite 和 registry readiness 字段是相互正交的事实或流程投影。一个 run
+必须仍只有一个 primary validation verdict；不得从 `calibration_stage`、`observation_completeness`、registry
+readiness、单条 `execution_outcome` 或 evidence gap 派生第二套产品 verdict。相反，已证实产品 failure 不得阻止
+其余 mandatory observation，也不自动阻止用户定义 accepted oracle 或 registry ready。
 
 CI validation verdict 只允许：
 
@@ -173,11 +221,19 @@ Goal-discovery 状态只允许：
 
 默认策略如下：
 
-- 永久保留 bounded run manifest、verdict、oracle/scenario candidates、review/adjudication，以及必要 EventLog/Tool Trace/memory/runner-input 的 bounded 摘要与 digest。完整 logs、casts、screen snapshots 和受控 evidence artifacts 只在它们被未关闭 finding 引用，或该 run 是同一 target/profile 的最新基线时保留。
+- 永久保留 bounded run manifest、verdict、oracle/scenario candidates、review/adjudication，以及必要 EventLog/Tool
+  Trace/memory/runner-input 的 bounded 摘要与 digest。第一轮 campaign 未完成时，任何被 unresolved adjudication、
+  accepted scenario/oracle candidate、readiness proof 或未关闭 finding 引用的完整 logs、casts、screen snapshots 和
+  受控 evidence artifacts 都必须保留；最新 baseline 不能自动取代这些 owner。
 - 所有 Agent 完成且 evidence integrity 校验通过后，停止并删除本 run 的 detached tmux session，移除 detached validation worktree 和 run-local venv；重现必须创建新 run，不依赖旧可执行环境。
 - `full-real-pass` / `focused-real-pass` 场景的 CI workspace、下载和处理中间产物在 evidence 固化后删除。
-- `fail` / `oracle-review-required` / `limited-signal` 场景只保留最新一份尚未裁决的 CI workspace。用户完成裁决、候选 WU 进入 Phaseflow、明确拒绝候选，或更新 run 已提供同等/更强证据后，删除旧大型 workspace。
-- 新基线取代旧 run，或相关 finding/WU 关闭后，旧 run 只保留上述 bounded summary/digest；删除不再被 active finding 引用的完整 logs/casts/screens 和大 evidence payload。
+- `fail` / `oracle-review-required` / `limited-signal` 场景至少保留最新一份 CI workspace；旧 workspace 只有在用户完成
+  相关裁决、更新 run 明确 supersede 旧 evidence、所有 registry/readiness refs 已迁移且不存在 active finding 后才可
+  删除。
+- Campaign readiness 完成后，可把 accepted oracle/scenario 实际依赖的关键 screen、literal diff、DB delta 和
+  cross-layer evidence 固化为 immutable bounded retained projection；只有该 projection 足以独立支持全部 claim、
+  digest 校验通过且 registry refs 已通过正式 supersession/update 指向 retained material 后，才可删除对应大
+  logs/casts/screens/payload。新 baseline 或 finding 关闭本身不是删除 oracle authority evidence 的充分条件。
 - 清理失败必须写入 run report；下一次 preflight 统计所有 CI-owned run roots。若预计执行会超过 operator auth profile 的磁盘上限，则在创建新 workspace 前 `blocked`，不得删除无法证明归属的目录来腾空间。
 
 ## 3. 第一性原理
@@ -211,9 +267,12 @@ Debug log 用于诊断，不是 durable truth。Tool Trace 表达一次业务工
 
 ### 4.1 Oracle 不是默认真源
 
-“对齐 Codex / Claude Code”“对齐最佳实践”“对齐设计真源”都不能直接作为可执行 oracle：
+“对齐 Codex / Claude Code”“对齐最佳实践”“对齐设计真源”这样的抽象口号都不能直接作为可执行 oracle：
 
-- Codex / Claude Code 只提供参考行为；其产品版本、终端状态和任务上下文可能不同，不天然适合 Dayu。
+- 用户已经指定：适用的通用 CLI/UI 交互语义必须以真实 Codex 行为为 mandatory reference policy。该 policy 决定必须
+  采集和比较哪些 surface，但仍需冻结精确 Codex 版本/环境的实际行为并转写为可测 predicate；不得把“像 Codex”
+  本身当作可执行断言。
+- Claude Code 仍只提供可选参考；其产品版本、终端状态和任务上下文不同，不天然适合 Dayu。
 - 最佳实践是 Agent 基于经验、直接证据、替代方案和失败模式提出的候选判断，不因由总控或 reviewer 提出就自动正确。
 - 设计真源是当前规范，但允许真实 CI 发现设计本身不符合更高层目标、事实边界或最佳实践。实现与设计不一致和设计需要修正是两个不同 finding。
 - Dayu 当前实现只说明“现在发生了什么”，不能反过来定义“本来就应该这样”。
@@ -229,7 +288,7 @@ Debug log 用于诊断，不是 durable truth。Tool Trace 表达一次业务工
 | objective fact | 财报原始数值、单位、期间、digest、实际 EventLog row | 原始财报或 durable canonical fact | 来源与完整性校验通过后可直接使用 |
 | hard contract | secret 不得泄漏、非法状态迁移不得发生、分层反向依赖禁止 | `AGENTS.md` 与已接受架构硬约束 | 直接形成 finding；若硬约束本身被质疑，必须升级为设计裁决 |
 | current design behavior | memory、wait、trace、projection 当前设计要求 | 当前有效设计真源 | 实现偏离构成 conformance failure；CI 同时允许提出 design-review candidate，修复方向待用户裁决 |
-| reference behavior | Codex / Claude Code 的终端或交互行为 | 带版本/环境的观察证据 | 用户决定是否采纳为 Dayu oracle |
+| reference behavior | Codex / Claude Code 的终端或交互行为 | 用户指定的 Codex UI policy + 带版本/环境的真实观察证据 | 适用 Codex surface 必须形成候选 predicate；具体 expected observable 与 allowed variants 由用户裁决 |
 | best-practice proposal | reviewer 建议的 memory、UI、tool 或分析行为 | 有理由但未裁决的建议 | 双路 review 后由用户裁决 |
 | product-quality rubric | 买方分析深度、表达方式、交互体验 | 候选 rubric | 用户裁决范围、阈值和允许变体 |
 
@@ -268,20 +327,104 @@ Oracle predicate 应验证语义不变量，避免锁定真实模型的完整回
 
 ### 4.5 校准与用户裁决
 
-第一次或前几次 CI 允许处于 oracle calibration：
+第一轮 CI 是完整的 oracle calibration campaign，不是允许局部覆盖的预热 smoke。总控必须从 parser inventory、
+dynamic interactive branch inventory 和第 5.1 节 coverage dimensions 建立全部 mandatory obligations，在各相关前置
+状态下真实执行对应场景，完整关联实际进程、终端、文件系统和跨层证据；然后为每个 run 生成并冻结单一
+`observed-behavior.md`。只有 report frozen 后，AgentMiMo / AgentDS 才能独立 review 并提出正式 suggestions，最后由
+用户逐个 predicate 裁决。新发现 branch、用户要求补证或 rejected behavior 留下 correctness gap 时，campaign 必须扩展
+矩阵并产生新 run/new report，直到第 4.6 节 readiness proof 通过。Accepted oracle 冻结版本，从后续指定 run 开始参与
+正式 pass/fail。
 
-1. AgentCodex 执行真实场景并记录 Dayu 实际行为。
-2. 需要参考对齐时，收集可复核的 Codex / Claude Code 行为证据。
-3. AgentMiMo / AgentDS 分别提出候选 oracle、反例、替代方案和风险。
-4. 总控合并同义候选、保留分歧，不自行把建议升级为 oracle。
-5. 用户可以在一次或多次运行后批量裁决。
-6. Accepted oracle 冻结版本，从后续指定 run 开始参与正式 pass/fail。
+校准运行仍必须完整保存 evidence。不得因为用户尚未裁决，就只给结论而丢弃后续建立 oracle 所需的输入、screen、
+stdout/stderr、生成物 before/after、debug log、Host public reads、EventLog、Tool Trace、memory、runner input 或财报证据。
 
-校准运行仍必须完整保存 evidence。不得因为用户尚未裁决，就只给结论而丢弃后续建立 oracle 所需的 runner input、terminal、EventLog、Tool Trace、memory 或财报证据。
+#### 4.5.1 Observation gate 与 ordering invariants
+
+`calibration_stage` 是 run report 中的 handbook workflow 位置，不是 Host runtime state、durable schema、Phaseflow /
+Gateflow gate 或新的 validation verdict。合法 stage 和转移前置条件如下：
+
+| `calibration_stage` | Entry criterion | 允许动作 | 禁止动作 |
+|---|---|---|---|
+| `observation-not-started` | 当前 run 的 frozen inventories、mandatory obligations、scope 和授权已知，尚未执行场景 | 准备场景和 bounded before snapshot | suggestions、adjudication、oracle acceptance |
+| `observation-in-progress` | 至少一个 mandatory 场景已开始真实执行 | 继续逐场景取证；立即标注 objective / hard-contract failure | 修复；根据不完整样本冻结全量结论 |
+| `observed-report-generated` | 当前 run 的单一事实报告已生成，并首次计算 `observation_completeness` | 检查完整性、脱敏、raw refs 和 exact-byte digest 准备 | Agent review/suggestions、用户裁决、accepted oracle |
+| `observed-report-frozen` | report、evidence refs、脱敏结果和 digest 已冻结，completeness 已确定 | 启动 AgentMiMo / AgentDS 对 frozen report 的独立 review | 回写或原地替换 frozen facts；用 reviewer 期望污染 observation |
+| `agent-suggestions-ready` | 两路独立 review 都引用 frozen report digest，并形成带 authority basis 的正式 suggestions | 总控合并同义建议并保留分歧 | 将 reviewer 共识自动升级为 accepted oracle |
+| `awaiting-user-adjudication` | frozen report、两路 suggestions 和总控 synthesis 均可供用户阅读 | 用户逐 predicate accept / reject / request more evidence | 自动修改 registry、finding 或产品 |
+| `adjudicated` | 用户已对具体 predicate、scope 和 allowed variants 作出决定 | 进入第 4.3 节既有 oracle lifecycle；必要时另建后续 WU | 把未裁决项写成 accepted |
+
+`observation_completeness` 只在 `observed-report-generated` 时依据当前报告计算，在
+`observed-report-frozen` 时随 report 冻结；后续 stage 只引用该 immutable 值，不随 suggestions 或 adjudication
+改写：
+
+- `complete`：当前 run 声明的每个 mandatory scenario obligation 都已真实 attempted/executed，且 required
+  evidence 足以复核实际行为；该值只证明当前 report 的 observation scope，不单独证明整个 campaign matrix 已闭合。
+- `incomplete`：任一当前 run mandatory scenario 为 `not-run` / `blocked`，或 required evidence
+  缺失、损坏或歧义到不足以复核实际行为。
+
+合法场景实际得到 `error`、`timeout` 或 `cancel` 不会自动导致 observation incomplete；这些值只属于
+`execution_outcome`，行为正确与否由适用的 validation/oracle contract 判断。help、单个 negative、parser acceptance、
+exit 0、outcome `success` 或 CLI 自报 summary 都不能替代其它 mandatory state/option/input obligations 的真实
+attempt/execution 与 required evidence。
+
+以下 owner / 交互表是各章节解释状态维度的集中 anchor。不得建立平行 verdict、生命周期或全组合状态矩阵：
+
+| 维度 | 唯一 owner / scope | 何时有值 | 允许影响 | 不允许替代 |
+|---|---|---|---|---|
+| `calibration_stage` | 当前 calibration run 的 handbook workflow | run 全程 | 下一步 observation/review/adjudication 动作 | completeness、validation verdict、Gateflow gate |
+| `observation_completeness` | 当前 immutable observed report 的覆盖/证据 contract | report generated 时计算、frozen 后只读 | 是否可声称 observation coverage complete | 命令成败、行为正确性、run validation verdict |
+| `execution_outcome` | per-leaf/path raw process observation | 每次真实执行后；`not-run/blocked` 时无值 | 记录 `success/error/timeout/cancel` 实际结果 | coverage、evidence status、gap、pass/fail |
+| `evidence_status` / `gap_kind` | per-leaf/path evidence integrity record | 取证检查后 | 说明证据充分性、gap owner 和后续取证动作 | execution outcome、平行 verdict |
+| registry readiness proof | scenario/oracle registries 的 coverage/adjudication closure contract | campaign 更新 registry 后重算 | 决定 registry 是否为 `ready`、是否可结束第一轮 | observation completeness、产品 pass/fail |
+| primary validation verdict | 第 2.7 节既有 run 裁决 contract | 既有规则要求时 | 裁决整个 run | calibration stage、后续 WU 状态 |
+| goal-discovery status | 第 2.7 节 Phaseflow-aligned 后续 WU 路由 | observation/adjudication 产生候选目标后 | 选择、等待或声明后续 work unit | 当前 observation 或 oracle 状态 |
+| oracle lifecycle | 第 4.3 节每个 oracle predicate | 候选形成后 | `unadjudicated` / `needs-more-evidence` / `accepted` / `rejected` / `superseded` | run verdict、report completeness |
+
+同一 run 可以 observation-complete 且实际包含 error/timeout/cancel，也可以同时存在 hard-contract `fail`；它们分别回答
+“是否观察完整”“实际发生什么”和“行为是否正确”。必须遵守：
+
+1. 先事实、后两路独立 review / 正式 suggestions；没有 frozen `observed-behavior.md`，两路 reviewer 不得开始。
+2. 先建议、后用户裁决；用户必须能同时看到事实、authority basis、反例、替代方案和风险。
+3. 先用户裁决、后 accepted oracle；reviewer 或总控共识不能替代用户。
+4. 先 accepted oracle 或 confirmed hard-contract WU、后修复；validation run 不直接修改产品。用户裁决完成后，稳定
+   scenario/oracle registry 必须在第一轮 campaign 结束前通过正式 work unit 更新并完成 readiness 校验。
+5. 每个 mandatory state/option/interactive/input/combination/cross-command obligation 的真实 attempt/execution
+   先于 coverage 完成；help、单个 positive/negative 和任一 outcome 值都不能抵扣其它 obligation。
+6. hard failure 可立即分类，但除授权、安全或真实依赖 stop condition 外，不得短路其余 mandatory observation。
+7. frozen facts 永不回写；补充证据必须进入新 run 和新的 immutable report。
+8. SQLite private schema 只用于本次诊断，不升级为公共 contract、业务真源或唯一 oracle。
+9. Codex reference 只约束明确适用的通用 CLI/UI predicate；reference 不可用时不得伪造 fallback。
+10. incomplete run 中证据充分的局部 predicate 可以由用户裁决，但不得因此声称第一轮 calibration campaign 完成或
+    registry ready；它只能减少后续未决集合。
+11. outcome、evidence 和 verdict 必须分离；不得把 exit 0 / success 当作 completeness 或 correctness，也不得把
+    error/timeout/cancel 自动改写成 gap 或 fail。
+
+#### 4.5.2 Observed-behavior report 与建议/裁决边界
+
+`observed-behavior.md` 是当前 run 的人类可读事实投影，不是 Host、EventLog、Tool Trace、memory、runner input、
+oracle 或 verdict 的新真源。它必须在主体中直接展示足以让用户裁决的 bounded 关键 screen/transcript、输入选择、
+生成物内容/diff、durable state delta、日志/trace/memory/runner-input 摘要和跨命令加载结果，同时引用各 owner 的
+raw evidence 供深入复核；digest、raw ref、exit code 或 CLI 自报 summary 不能替代关键事实展示。Report 先支持全局
+扫读，再支持跳转到逐场景细节，schema 见第 11.1 节。主体只能陈述实际输入、实际输出、实际状态变化、证据完整性和有
+明确 authority 的 objective / hard-contract fact，禁止写期望行为、Codex 模仿建议、产品取舍、修复方案或未裁决结论。
+
+AgentMiMo / AgentDS 的正式 suggestions、总控 synthesis 和 user adjudication 统一写入既有
+`oracle-adjudication.md`，且每条 suggestion 必须引用 frozen report digest、leaf/path 和 evidence refs。用户裁决的
+对象必须是具体可执行 predicate 及其 scope、precondition、trigger、expected observable、allowed variants、
+forbidden behavior 和 measurement，不能笼统裁决“与 Codex 一致”或“当前行为正确”。
+
+任一路 reviewer、总控或用户发现证据不足时，当前 predicate 的合法状态是第 4.3 节既有
+`needs-more-evidence`。新证据只能通过新 run 获取，并生成新的 immutable `observed-behavior.md`；旧 frozen report
+及其 digest 永久保留，新 report 显式引用旧 report identity/digest。禁止修订、覆盖或回写旧 frozen facts，也禁止把
+新证据追加到旧 digest 所代表的报告中。
 
 ### 4.6 Oracle Registry 与 Phaseflow 衔接
 
-稳定 scenario registry 为 `docs/cli_ci_scenarios.json`，稳定 accepted oracle registry 为 `docs/cli_ci_oracles.json`。两个 registry 都包含 `schema_version`、`registry_status` 和记录列表；`registry_status` 只允许 `calibration` 或 `ready`。新总控必须先读取并校验两个 registry，再决定执行 profile。
+稳定 scenario registry 为 `docs/cli_ci_scenarios.json`，稳定 accepted oracle registry 为
+`docs/cli_ci_oracles.json`。两个 registry 都包含 `schema_version`、`registry_status` 和记录列表；
+`registry_status` 只允许 `calibration` 或 `ready`，且只是 readiness validation 的投影。`calibration` 空占位文件可以
+暂时没有 readiness proof；任何 `ready` registry 必须包含完整 proof。新总控必须重新计算并校验两个 registry 的 proof
+后决定 profile，不得只信任 status 字面值。
 
 每次 run 在 evidence bundle 中生成 `oracle-candidates.json` 和 `oracle-adjudication.md`。不存在 accepted oracle 的场景默认进入 calibration，不得根据当前实现猜测期望值。
 
@@ -294,41 +437,130 @@ Oracle predicate 应验证语义不变量，避免锁定真实模型的完整回
 
 `docs/cli_ci_oracles.json` 中每条 oracle 至少包含第 4.4 节要求的 identity、scope、predicate、authority、状态和版本字段；只有 `accepted` 记录参与正式 verdict。`rejected` / `superseded` 可以保留在 registry 用于历史解释，但不得参与当前判定。per-run candidate/adjudication artifact 不能伪装成跨 run 已冻结 registry。
 
+第一轮 campaign 只有同时满足以下 readiness conditions 才能结束：
+
+1. parser 与 interactive branch inventories 已冻结，identity/version/digest 可复核，且没有未分类 leaf、parameter、
+   branch 或 option；
+2. scenario registry 对每个 mandatory obligation 都有 accepted coverage claim；claim 使用稳定 ID 表达
+   command/parameter、precondition state、interactive branch/option、input class、combination policy/high-risk
+   combination、cross-command assertion 和 required evidence；
+3. 每个 mandatory scenario 都引用 sufficient frozen observation evidence；`not-run`、`blocked`、缺失/损坏/歧义
+   evidence 均是 readiness gap；
+4. 每个 mandatory scenario 的每个 correctness surface 都映射到适用的 accepted oracle，或明确适用的
+   objective/hard contract；
+5. rejected candidate 留下的 correctness gap 已由 replacement predicate 或用户明确的 out-of-scope 裁决关闭；
+   不能因为没有 `unadjudicated` 字面状态就视为 correctness 已定义；
+6. scenario/oracle refs 双向可解析，没有 dangling refs、uncovered correctness surface、未裁决 candidate 或
+   unresolved evidence gap；
+7. registry-level proof 记录 inventories/version/digest、mandatory/covered/gap counts、用户裁决 identity、引用的
+   frozen report digests 和 validation result，且两个 registry 均由该 result 派生为 `ready`。
+
+产品当前违反新 accepted oracle 时，第 2-7 项仍可成立；readiness proof 记录对应 implementation finding，但不得把
+产品 failure 伪装为 coverage gap。反之，产品当前看似运行成功也不能填补 coverage、evidence 或 correctness gap。
+
 ### 4.7 总控 Oracle 裁决算法
 
-总控对每个 observed difference 固定按以下顺序处理：
+总控只对 frozen `observed-behavior.md` 中有可复核 evidence refs 的 observed difference 执行以下算法：
 
-1. 固定实际观察：引用 terminal、runner input、EventLog、Tool Trace、memory 或财报原文，不先写期望结论。
-2. 判断是否违反 objective fact 或既有 hard contract。若是，形成 failure；若 hard contract 本身受到有材料的质疑，另建 design-review candidate，但不能让当前实现静默改写硬约束。
-3. 查找 scope 和 version 均适用的 accepted oracle。存在时按其 predicate 判定 pass/fail，并记录 oracle usage。
-4. 没有 accepted oracle 时，检查当前有效设计真源。实现与设计不一致时记录 conformance failure；若 reviewer 认为设计本身不合理，同时生成独立 design-review candidate，并在用户裁决前禁止直接修实现。
-5. 收集 Codex / Claude Code 参考行为和最佳实践建议，但只作为 candidate evidence，不升级为 oracle。
-6. AgentMiMo / AgentDS 独立给出 accept/reject/needs-more-evidence 建议、反例和 trade-off。
-7. 总控合并材料，状态保持 `unadjudicated` 或 `needs-more-evidence`，并提交用户裁决。
-8. 用户裁决 `accepted` 后冻结 oracle version；随后重新解释本次 observation 是否构成候选 implementation WU。用户裁决 `rejected` 后保留理由，防止下次运行重复提出同一无效候选。
+1. 读取 frozen report identity/digest，核对 `calibration_stage=observed-report-frozen` 和 evidence integrity；不回写
+   observed facts。
+2. 判断实际行为是否违反 objective fact 或既有 hard contract。若是，可形成有 authority basis 的 fail 建议；若
+   hard contract 本身受到有材料的质疑，另建 design-review candidate，但不能让当前实现静默改写硬约束。
+3. 查找 scope 和 version 均适用的 accepted oracle。存在时按其 predicate 形成 pass/fail 建议并记录 oracle usage。
+4. 没有 accepted oracle 时，检查当前有效设计真源。实现偏离可形成 current-design conformance 建议；设计本身被
+   质疑时，另提 design-review candidate，并在用户裁决修复方向前禁止直接修实现。
+5. 收集冻结的 Codex reference、best-practice proposal 和 product-quality rubric。它们只能形成候选建议，当前实现
+   永远不能自证为 oracle。
+6. AgentMiMo / AgentDS 分别基于同一 frozen report 给出带 authority basis 的 accept / reject /
+   `needs-more-evidence` 建议、反例、替代方案和 trade-off。
+7. 总控合并同义材料、保留分歧，把候选保持为第 4.3 节的 `unadjudicated` 或
+   `needs-more-evidence`，提交用户逐 predicate 裁决。
+8. 用户裁决 `accepted` 后冻结 oracle version，再判断本次 observation 是否构成候选 implementation WU。裁决
+   `rejected` 后保留理由；若 mandatory correctness surface 因此没有 accepted replacement predicate，则保持
+   correctness gap、补充候选并继续裁决，不得进入 ready。用户裁决前不得写 accepted oracle、修改 registry、生成实现
+   计划、启动修复或更改 finding。
 
-总控不得因为两路 reviewer 意见一致而代替用户完成产品 oracle 裁决；两路一致只表示候选证据更充分。
+Codex reference 不可用时，依赖该 reference 的 candidate predicate 必须为 `needs-more-evidence`，但不得阻塞 Dayu
+observation、不依赖该 reference 的其它候选或其它 predicate 的裁决。同一行为若另有明确、充分且适用的 authority，
+用户可以只基于该 authority 独立裁决，但记录不得声称完成 Codex 对齐；不得用历史印象、替代产品、未冻结 snapshot
+或“等价版本”伪造 fallback reference。
+
+总控不得因为两路 reviewer 意见一致而代替用户完成产品 oracle 裁决；用户裁决的是具体 predicate、scope 和 allowed
+variants，不是笼统的产品相似性。
 
 ## 5. 覆盖模型
 
-### 5.1 命令与参数清单
+### 5.1 Inventory、Mandatory Obligations 与场景 Registry
 
 命令和参数 inventory 必须从 `dayu.cli.arg_parsing.build_parser()` 派生，不能手工维护另一份可能漂移的完整清单。
+Parser 只拥有 command/parameter 的静态 identity；动态 prompt、条件选项和按前序选择出现的交互分支由独立
+interactive branch inventory 拥有。Interactive inventory 必须综合命令拥有的交互声明、当前 help/提示和真实运行
+发现，并冻结 identity/version/digest。任一新发现 branch 或 option 都必须获得 stable ID、扩展 mandatory
+obligations，并使 registry 保持或回到 `calibration`，直到补跑和裁决闭环。
 
-场景 registry 必须和 parser inventory 做覆盖比对。registry 为 `ready` 时，新增命令、参数、正反开关或子命令后没有对应验证场景，CI 必须判定 registry drift failure。registry 为 `calibration` 时，缺失项进入 scenario candidates，当前 run 不得形成 `full-real-pass`。
+场景 registry 必须同时和 parser/interactive inventories 做覆盖比对。registry 为 `ready` 时，新增命令、参数、
+正反开关、子命令、动态分支、交互选项或 mandatory precondition/input class 后没有对应 accepted scenario，CI 必须
+判定 registry drift failure。registry 为 `calibration` 时，所有缺失 obligation 都进入 scenario candidates，当前
+campaign 不得结束，当前 run 也不得形成 `full-real-pass`。
 
-`docs/cli_ci_scenarios.json` 中每条 scenario 至少包含 scenario id/version/status、覆盖的 command/parameter ids、profile、真实 invocation 与交互步骤、前置财报 corpus/live source、accepted oracle refs、authorization requirements、timeout/resource budget、expected evidence 和 supersession identity。只有用户已裁决并标记为 `accepted` 的 scenario 参与正式覆盖率；calibration run 生成的新场景写入 per-run candidates，不能直接修改 registry。
+`docs/cli_ci_scenarios.json` 中每条 scenario 至少包含：
 
-registry 为 `calibration` 时，AgentCodex 必须从 parser inventory 生成本次 run-local provisional scenario plan，覆盖每个 command 的 help/minimal path并优先选择高风险参数、真实 provider、多轮 memory 和财报分析代表场景。总控在执行前检查授权、预计资源和 scope；provisional scenarios 可以真实执行并用于收集 oracle/场景证据，但其覆盖率只能报告为 calibration coverage，不能计入 `full-real-pass`。
+- scenario id/version/status、supersession identity 和引用的 frozen report digests；
+- stable coverage claims：command/parameter IDs、precondition-state IDs、interactive branch/option IDs、
+  input-class IDs、combination policy/high-risk combination IDs 和 cross-command assertion IDs；
+- 真实 invocation、交互步骤、前置 workspace/Host/Fins/DB 状态、财报 corpus/live source；
+- accepted oracle refs、correctness surfaces、authorization requirements、timeout/resource budget；
+- required evidence、实际 evidence refs、evidence status 和用户裁决 identity。
 
-“覆盖所有命令及参数”定义为：
+只有用户已裁决并标记为 `accepted`、且 coverage/evidence/oracle refs 校验通过的 scenario 参与正式覆盖率。
+Calibration run 生成的新场景先写入 per-run candidates；用户裁决后通过正式 work unit 写入稳定 registry，不能由
+validation worktree 原地修改。
 
-- 每个命令至少具有 help、最小合法调用和典型失败场景。
-- 每个参数至少在一个场景中证明已被解析且真正影响其语义 owner，而不只是 parser 接受了该参数。
-- 每个布尔参数验证默认值、正向开关和反向开关。
-- 必填、互斥、依赖、重复、空值、非法值和边界值分别验证。
-- 参数组合使用 pairwise 覆盖，并额外维护人工裁决的高风险组合。
-- 不执行所有参数组合的笛卡尔积；该做法成本指数增长，且不能提供相称的行为保证。
+Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
+数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终
+validation result。`registry_status=ready` 只能由该 result 派生，禁止手工翻转 status 绕过校验。
+
+本节的 parser leaf 指 parser inventory 中没有下级 subparser、可以执行 primary operation 或 read flow 的完整 command
+path。每个 leaf 都必须先建立 coverage obligations，而不是只规划一条 happy path。Mandatory dimensions 至少包括：
+
+- **Precondition state**：空 workspace、已有 workspace、部分完成、重复执行、目标已存在，以及与命令相关的
+  冲突/损坏状态；
+- **Option / interactive branch**：默认行为、每个合法枚举/交互选项、显式参数、布尔正反开关、互斥和依赖关系；
+- **Input class**：合法最小输入、其它合法值、空值、非法值、边界值、重复值、EOF、取消和中断；
+- **Combination**：所有单维 obligation 至少独立生效一次，参数组合使用 pairwise，另行覆盖人工识别或历史 failure
+  证明的高风险组合；不执行无收益的全笛卡尔积；
+- **Cross-command**：一个命令生成的配置、文件、Host/Fins/DB 状态必须由真实后续 CLI 命令加载、查询或消费，不能只
+  相信创建命令的自报 summary；
+- **Evidence**：对每个场景声明应观察的 screen、filesystem、log、Host/EventLog、Tool Trace、memory、runner input、
+  Fins 和相关 SQLite before/after。
+
+Help、positive、negative、timeout 和 cancellation 可以作为 `path_kind` 分类，但不能替代上述 coverage dimensions。
+执行前只能声明输入有效性、触达目标和 required evidence，不预写 `success`、exit 0、输出内容、状态变化或其它
+“正确结果”，也不得依据期望 outcome 倒推场景。每个 mandatory scenario 必须有真实 attempted/executed 证据；
+合法调用实际为 `error`、`timeout` 或 `cancel` 仍可 observation-complete，正确性留给 oracle。
+
+Scenario 为 `not-run` / `blocked` 时没有 `execution_outcome`，必须记录对应 `gap_kind`；required evidence
+缺失、损坏或歧义到不足以复核实际行为时，也使 observation incomplete 并阻止 readiness。某场景得到
+error/timeout/cancel 后仍继续其余已获授权场景；只有越过授权、造成安全风险或受到真实依赖阻塞时，才可停止相关范围并
+逐项记录 gap。
+
+#### 5.1.1 `dayu-cli init` 最低 Mandatory Matrix 示例
+
+`init` 的场景 registry 至少必须覆盖：
+
+- 空 workspace、已有完整 workspace、部分初始化 workspace 和与 init 目标冲突/损坏的 workspace；
+- 默认路径及每个合法交互选项逐个输入，选项组合按 pairwise + 高风险组合覆盖；
+- 空输入、错误选项、非法值、EOF、Ctrl+C/取消和中断后的实际终端/文件状态；
+- 重复 init，以及 overwrite/reset/preserve 等真实可用策略的逐项行为；不存在的策略不得编造，必须从当前
+  parser/interactive inventory 记录为不适用；
+- 运行前后的文件 manifest、创建/修改/删除列表、每个关键配置文件的脱敏内容和 diff；
+- secret 是明文、secret ref 还是未持久化的直接事实；
+- debug log、Host public reads、EventLog/Tool Trace 和相关 SQLite schema/关键 rows 的 before/after；
+- init 后由真实后续 CLI 命令加载配置并执行 primary read/operation flow，而不是只检查文件存在或 init 自报成功。
+
+其它命令必须按同一原则从其状态、选项、输入、组合、跨命令消费和 evidence obligations 派生矩阵。第一轮和以后每次
+完整 `full-real` 都运行全部 mandatory scenarios；`focused-real` 只用于局部复现/修复验证，不更新全量 coverage、
+registry readiness 或完整 CI 结论。
 
 ### 5.2 验证层级
 
@@ -339,49 +571,121 @@ registry 为 `calibration` 时，AgentCodex 必须从 parser inventory 生成本
 3. Live provider：使用真实模型 provider 和当前运行配置，验证 prompt assembly、tool selection、模型交互及多轮行为。
 4. Live external tool：使用真实网络、Fins 下载、预处理、上传或其它外部服务，验证最新数据、长事务、取消和恢复。
 
-固定真实财报 corpus 用于提供稳定 oracle，但不能被改写为伪造工具结果或伪造模型调用。低成本场景负责完整命令/参数覆盖，高成本场景负责代表性端到端和真实财报业务验证。真实 provider 的非确定性通过结构化 oracle、重复运行和通过率处理，不允许为了稳定结果切换到 mock runner。
+固定真实财报 corpus 用于提供稳定 oracle，但不能被改写为伪造工具结果或伪造模型调用。低成本场景负责完整
+command/parameter/interaction/input coverage；高成本场景的 mandatory set 由 pairwise、高风险组合和代表性端到端
+obligations 决定，而不是任意抽样。真实 provider 的非确定性通过结构化 oracle、重复运行和通过率处理，不允许为了
+稳定结果切换到 mock runner。
 
-只有 scenario registry 为 `ready`，且所有 mandatory oracle-governed scenarios 都有适用的 accepted oracle 时，profile 才能是 `full-real`。否则总控必须使用 `calibration-real`，输出缺失 scenario/oracle candidates，并停在用户裁决入口。
+只有两个 registries 的 readiness proof 都重新校验通过，且所有 mandatory correctness surfaces 都有适用的 accepted
+oracle/objective/hard contract 时，profile 才能是 `full-real`。否则总控必须使用 `calibration-real`，继续执行并补齐
+完整 mandatory matrix、evidence 和用户裁决，不能用局部候选清单结束第一轮。
 
 ## 6. 执行与取证流程
 
 每个场景在独立 workspace、独立 session label 和独立日志目录中运行，避免前序状态污染。
 
-标准流程如下：
+标准流程必须采用 before / execute / after 顺序：
 
-1. 生成场景 invocation，包括命令、参数、环境、真实财报 corpus / live source、预期不变量和超时策略。
-2. 非交互命令直接执行；交互命令在 PTY 或 tmux pane 中执行。
-3. 自动发送用户输入、Esc、Ctrl+C、Ctrl+D 和必要的等待动作。
-4. 使用 `--log-level debug` 和独立 `--log-file` 保存诊断日志。
-5. 需要验证动态终端行为时，以 asciinema 记录输出。
-6. 记录并关联 `session_id`、`run_id`、`attempt_id`、`execution_id` 和 `tool_call_id`。
-7. 查询 Host DB、EventLog、Tool Trace、memory snapshot 和 runner-call input reconstruction。
-8. 执行确定性断言和双路语义 review。
-9. 生成场景 verdict 和 evidence bundle。
+1. 固定 run id、target/workspace canonical identity、runtime、terminal、非秘密 config、authorization、resource
+   budget、parser/interactive inventories、mandatory obligations 和 registry identity；记录 `session_id`、`run_id`、
+   `attempt_id`、`execution_id` 和 `tool_call_id` 的生成与关联规则。
+2. 在任何场景执行前，对 CI-owned workspace/run root 做 bounded before snapshot，记录文件 manifest、生成物、Host
+   public reads、Fins public state、与该场景相关的 SQLite schema/关键 rows 和其它必要 durable facts 的 evidence
+   refs；不得扫描或读取授权范围外路径。
+3. 对每个场景记录 stable coverage claims、精确 invocation、cwd、非秘密环境、脱敏 config/profile、stdin/按键/交互
+   输入和相对时间线；先核对公开 contract/help/interactive inventory 依据、输入类别、primary operation/read flow 和
+   required evidence，不预设执行结果。
+4. 真实执行每个 mandatory scenario。非交互命令直接执行；交互命令使用可编程 PTY 或 detached tmux pane。每个合法
+   选项、错误选项、Esc、Ctrl+C、Ctrl+D、EOF 或等待动作都必须按相应 obligation 记录精确输入和时间线。
+5. 分别保留 stdout、stderr、exit code/signal、timeout/cancel 原始状态、开始/结束时间和关键 screen/cast；
+   `execution_outcome` 只记录 `success/error/timeout/cancel`。`not-run/blocked` 记录为 coverage gap，不伪造 outcome。
+6. 执行 bounded after snapshot，并生成 created/modified/deleted artifact 清单、关键内容的脱敏 inline
+   before/after diff、content/metadata digest 和 raw refs；执行该场景声明的真实 cross-command load/query/consume
+   assertions；明确区分“没有变化”“未观察到变化”和“证据无法覆盖变化”。
+7. 收集独立 debug log、Host public reads、按第 11.2 节执行相关 SQLite before/after 观察、EventLog canonical facts、
+   Tool Trace、memory snapshot/source refs/diagnostics、runner-call input reconstruction、UI/final answer 和跨层
+   identities。debug/private SQLite 只用于诊断，不能替代其语义 owner。
+8. 完成脱敏、mock/fake absence、artifact presence/digest、identity correlation 和 evidence integrity 检查；
+   分别记录 `evidence_status`、`gap_kind`、owner 和 next evidence action。
+9. 先按第 11.1 节生成单一、人类无需重跑即可裁决的 `observed-behavior.md`，计算
+   `observation_completeness`，完成 exact UTF-8 bytes SHA-256 准备并冻结；只有 freeze 后才允许 AgentMiMo /
+   AgentDS 基于同一 report 独立 review、形成正式 suggestions、由总控 synthesis 并交用户裁决。确定性断言、
+   suggestions 和用户裁决不得回写 observed facts。
 
 tmux 主要用于需要多轮输入、异步观察和长事务控制的真实交互。无需人工观察的真实 CLI 场景优先使用可编程 PTY，以降低时间和环境不确定性。PTY 和终端模拟器只是输入与取证设施，不替换 Dayu 的任何生产组件。
 
 ## 7. CLI 与终端行为验证
 
-### 7.1 Codex / Claude Code 对齐边界
+### 7.1 Codex Mandatory UI Reference 与语义对齐边界
 
-Codex / Claude Code 是通用 Agent 终端体验的参考实现，不是 Dayu 的架构真源。对齐范围只包括通用交互行为，例如：
+用户已经把实际 Codex CLI 指定为 Dayu 通用 Agent CLI/UI 行为的 mandatory reference。Codex 不是 Dayu 的架构真源，
+但每个适用 surface 都必须建立 Codex reference obligation、真实运行当前冻结版本并保存证据；不得标为
+`not-used`，也不得只凭历史印象写“与 Codex 一致”。Claude Code 仍是可选参考；若使用，也必须遵守同等 evidence 和
+predicate 规则。
 
-- idle 和 running 状态下 Ctrl+C / Esc 的取消与退出语义。
-- 取消当前 Run 后 REPL 是否仍可继续使用。
-- thinking 和 activity 的增量显示与清除。
-- final answer 到达后的终端状态。
-- 多轮会话、重试、EOF 和恢复的用户反馈。
+对齐目标是人能感知和操作的交互语义，不是逐字或逐像素复制。以下通用 CLI/UI surface 必须标记为 Codex reference
+`applicable` 并纳入 mandatory matrix：
 
-Dayu 特有的 Host 治理、Fins 长事务、Conversation Memory 和证据语义以设计真源为准，不以 Codex / Claude Code 的实现替代。
+- prompt、输入编辑、提交、空输入和多行输入的交互结果；
+- idle、running 和 final 状态下 Ctrl+C / Esc / Ctrl+D / EOF 的取消与退出语义；
+- 取消当前 Run 后 REPL 是否仍可继续使用，以及 session/context 是否按可见契约保留；
+- thinking、streaming 和 activity 的出现、增量更新、完成、清除和残留行为；
+- final answer 到达后的 prompt 恢复、光标位置、终端清理和后续输入状态；
+- 多轮会话、重试、超时、错误、恢复和重新进入的用户反馈；
+- 通用参数错误、运行错误、provider 错误和中断时的反馈层级与可继续操作性。
 
-参考实现行为必须先转写为可判定的行为 oracle。例如：“运行中第一次 Ctrl+C 取消当前 Run，不退出 interactive REPL”，而不是只写“行为与 Codex 一致”。参考实现升级导致行为变化时，应先重新裁决 oracle，再更新 CI。
+允许不影响交互语义的差异包括产品名称、Dayu 财报领域文案、模型动态文本、时间、随机 identity、耗时、颜色、
+spinner glyph 和其它纯样式细节。若某个文案或视觉差异会改变用户下一步动作、错误理解、状态判断、输入可见性或
+终端可操作性，它就不是允许变体，必须形成单独 predicate 交给用户裁决。
+
+以下 Dayu 特有语义必须标记为 `dayu-specific/not-applicable` 并写明理由，不得强套 Codex：
+
+- Fins 下载、上传、预处理、文档发现、财报读取和外部 financial source 长事务。
+- 财务事实、计算、证据充分性、买方分析质量和财报业务 oracle。
+- Host lifecycle/governance、EventLog、Tool Trace。
+- Conversation Memory、runner input 和 Dayu evidence semantics。
+
+每次 Codex reference observation 必须冻结以下 identity 和 evidence：
+
+- product/name、精确 version/build、binary/source identity；
+- 观察日期、时间和时区；
+- OS、shell、terminal emulator、`TERM`、宽高和 locale；
+- 脱敏配置、feature flags、model/profile；
+- 初始 session/task 状态；
+- 精确 argv、输入、按键和 timing；
+- stdout/stderr、cast、关键 screen、final screen 或等价 transcript reference evidence；
+- reference artifact digest。
+
+产品版本、配置或 reference 环境变化时必须创建新 reference observation version 和新 candidate，不得原地覆盖旧
+reference，也不得自动改变 Dayu accepted oracle。reference 不可用时，记录
+`gap_kind=reference-evidence-blocked`；依赖该 reference 的 predicate 为第 4.3 节既有
+`needs-more-evidence`，不得使用历史印象、其它产品、未冻结版本、伪造 snapshot 或“近似相同”环境作为 fallback。
+该阻塞不影响继续完成 Dayu 自身 observation、不依赖该 reference 的其它候选或其它 predicate 的 adjudication，但会
+阻止所有 applicable Codex surfaces 的 correctness closure 和 registry readiness。同一行为存在其它明确、充分且适用的
+authority 时，用户可以只依据该 authority 单独裁决，但若用户没有明确取消该 surface 的 Codex alignment requirement，
+仍不得声称完成 Codex 对齐或第一轮 readiness。
+
+每条 reference claim 必须转写为可执行 predicate，至少包含：
+
+```text
+given <明确前置状态>
+when <精确输入/按键/事件>
+then <可观察屏幕/进程/会话结果>
+allow <不影响语义的变体>
+forbid <明确错误行为>
+measure-by <screen/cast/process/session evidence>
+```
+
+禁止只写“Dayu 与 Codex 一致”。Codex 版本冻结只保证证据可复核，不赋予产品裁决 authority；predicate 在用户
+accepted 前仍属于第 4.2 节的 `reference behavior` candidate。
 
 ### 7.2 终端状态检查
 
 asciinema cast 的原始输出仍保留已被 ANSI 控制序列清除的文本，因此不能通过 grep cast 判断清屏是否成功。
 
-CI 必须用 VT100/xterm 兼容终端模拟器回放 cast，并保存关键时刻及最终虚拟屏幕快照。至少断言：
+CI 必须用 VT100/xterm 兼容终端模拟器回放 cast，并保存关键时刻及最终虚拟屏幕快照。下列内容都是 mandatory
+observation surfaces：calibration 时记录 Dayu/Codex 的实际表现和差异、交给用户裁决；registry ready 后才按 accepted
+predicate 断言，不能把当前实现写法预设成 oracle：
 
 - 第一个 thinking delta 新起 `Thinking:` 行，后续 delta 在同一显示区域追加。
 - activity / thinking 在运行中按配置可见。
@@ -539,18 +843,30 @@ LLM judge 可以作为补充，用于评价分析完整性、表述清晰度和�
 
 ## 11. Evidence Bundle
 
-每个场景输出独立目录，至少包含：
+每个 run-level evidence root 必须且只能生成一份 `observed-behavior.md`。它是事实优先、逐场景汇总的唯一人类可读
+observation report；不得拆成多个 per-leaf Markdown。`oracle-adjudication.md` 继续承载 report freeze 后的两路正式
+suggestions、总控 synthesis 和 user adjudication，不与事实报告混写。
+
+每个场景输出独立 raw evidence 目录，run-level artifacts 引用这些目录。evidence bundle 至少包含：
 
 - `run-manifest.json`：run id、target commit、profile、registry digests、authorization、resource budget 和 artifact roots。
 - `ci-owned-marker.json`：canonical run-root identity、manifest digest 和可清理资源边界。
-- `scenario.json`：场景 id、命令、参数、环境、oracle 和超时。
+- `observed-behavior.md`：单一 frozen observation report，schema 见第 11.1 节。
+- `scenario.json`：场景 id/version、stable coverage claims、前置状态、命令/参数/交互输入、cross-command
+  assertions、required evidence、oracle refs、环境和超时。
 - `runtime-identity.json`：真实 CLI、Host、provider、model、tool bundle 和财报 corpus / live source 身份。
-- `command.json`：实际 invocation、退出码和时间线。
-- `debug.log`：CLI debug 日志。
+- `command.json`：实际 invocation、exit/signal/timeout/cancel 原始状态和输入时间线。
+- `stdout.txt` / `stderr.txt`：分离保存的原始进程输出；不支持分离时记录限制，不得伪造。
+- `filesystem-before.json` / `filesystem-after.json` / `filesystem-diff.json`：CI-owned 范围内的 bounded
+  before/after manifest、digest 和生成物差异。
+- `debug.log`：CLI debug 日志，仅为 diagnostic。
 - `terminal.cast`：需要 UI 验证时的 asciinema 记录。
 - `screen/`：关键时刻和最终虚拟终端快照。
 - `identities.json`：session/run/attempt/execution/tool-call 关联标识。
 - `eventlog.jsonl`：与场景相关的 canonical facts。
+- `host-public-reads.json`：Host public read contract 的 bounded 输出和查询 identity。
+- `sqlite-query-manifest.json`：相关 stateful 场景的只读 before/after 边界、query identity、limits、digest、脱敏记录
+  和 private-schema-dependent 声明；无相关 SQLite 时记录 `not-applicable` 理由。
 - `tool-trace.jsonl`：业务工具追踪。
 - `memory.json`：memory snapshot、source refs 和 diagnostics。
 - `runner-input.json`：实际模型输入重建结果。
@@ -558,16 +874,236 @@ LLM judge 可以作为补充，用于评价分析完整性、表述清晰度和�
 - `financial-evidence.json`：实际检索文档、section/table/fact、来源与 digest。
 - `financial-score.json`：事实、计算、证据、可比性、拒答和多轮延续指标。
 - `oracle-candidates.json`：本次发现的候选 oracle、状态、依据、允许变体和 evidence refs。
-- `oracle-adjudication.md`：两路意见、总控整理、用户裁决状态和后续 WU 建议。
+- `oracle-adjudication.md`：两路正式 suggestions、总控 synthesis、用户裁决状态和后续 WU 建议。
 - `oracle-usage.json`：本次实际使用的 accepted oracle id/version 及适用场景。
 - `assertions.json`：确定性断言及证据定位。
-- `reviews/`：两路 LLM-facing / memory 语义 review。
+- `reviews/`：report freeze 后的两路 LLM-facing / memory 语义 review。
 - `verdict.md`：总控裁决、残余风险和 owner。
 - `cleanup.json`：保留/删除资源、归属证明、失败原因和剩余磁盘占用。
 
 Evidence bundle 必须执行敏感信息检查。API key、credential、authorization header、cookie 和 provider secret 不得进入 cast、日志、EventLog 导出、Tool Trace、runner input artifact 或 review 文档。
 
 Evidence bundle 必须能证明场景未使用 mock/fake 组件。若无法从 runtime identity、runner trace、tool schema/call trace 和 durable records 证明真实执行链，场景不得判定 pass。
+
+### 11.1 Observed-behavior Markdown schema
+
+`observed-behavior.md` 必须同时支持用户全局扫读和从摘要跳转到逐场景证据。它只做 bounded narrative 和 evidence
+projection；raw artifacts、Host public contract、EventLog canonical facts、Tool Trace、memory、runner input 和
+filesystem artifacts 仍各自由原 owner 承诺。但“projection”不等于只列 ref：支持用户下一步裁决的关键实际内容必须
+脱敏后直接展示，raw artifacts 和 digest 只承担完整性证明与深入复核。
+
+#### A. Run-level header
+
+必须包含：
+
+- report schema version、report identity、status、冻结时间、digest algorithm 和 run-level final report digest
+  record ref；
+- run id、target commit、branch/ref、dirty exclusion 和 profile；
+- 起止时间、时区、OS、Python、Dayu CLI executable/version 和安装来源；
+- workspace/run-root canonical path 的脱敏表示和 CI-owned marker evidence；
+- provider/model/tool bundle/financial corpus identity，仅记录非秘密标识；
+- terminal emulator、`TERM`、宽高、locale 和 shell；
+- authorization/resource budget；
+- scenario/oracle registry version、digest、readiness proof validation 和当前 mandatory gap counts；
+- `calibration_stage_at_freeze=observed-report-frozen` 和 `observation_completeness`；
+- 敏感信息扫描结果和已应用的脱敏规则；
+- Codex reference identity/version；Dayu-specific surface 可记录 `not-applicable` 及原因，applicable 通用 UI surface
+  不允许 `not-used`。
+
+动态 `calibration_stage`、primary validation verdict 和 goal-discovery status 只记录在各自 owner 的 run-level final
+report 字段，不回写本 immutable report。
+
+frozen report digest 固定为对 `observed-behavior.md` exact UTF-8 bytes 计算 SHA-256。计算值记录在既有 run-level
+final report 的 report digest 字段，并由 `oracle-adjudication.md` 引用；`observed-behavior.md` 不内嵌自身计算值，
+避免 self-referential hash。任何字节变化都必须产生新 digest；frozen report 不做原地格式修订。补充证据进入新 run /
+新 report，新报告引用旧 report identity/digest，旧报告原样保留。
+
+#### B. Executive summary、导航与 coverage 表
+
+单份报告顶部必须按以下顺序提供：
+
+1. bounded executive summary：run 身份、`observation_completeness`、最重要 actual behaviors、objective /
+   hard-contract facts 和 gaps；只陈述事实。
+2. TOC：链接到 coverage 表、cross-command summary 和每个 scenario 的稳定锚点。
+3. 逐 mandatory scenario 一行 coverage 表：scenario/leaf、precondition state、option/interactive branch、input class、
+   combination/cross-command claims、`execution_outcome`、`evidence_status`、`gap_kind`、actual behavior 一句话摘要、
+   detail anchor 和 raw refs。
+4. 分离的统计区：
+   - parser/interactive inventory identity、leaf/branch/option 总数、in-scope / out-of-scope 数量和理由；
+   - mandatory obligations 的 planned、attempted、executed、not-run、blocked，以及
+     `success/error/timeout/cancel` 各 outcome 数；
+   - 按 precondition、option/branch、input class、combination、cross-command 和 path kind 分离的 coverage 统计；
+   - required evidence 完整率和各 `evidence_status` 数；
+   - incomplete gaps 按 `gap_kind`、owner 和 next evidence action 汇总。
+
+每个稳定锚点由 scenario id 派生；同一 scenario version 中不得因显示文案变化而改变。单场景细节必须 bounded；
+stdout/stderr、cast、log 或 trace 超出摘要预算时，不内嵌整份材料，但必须内嵌足以解释实际行为和支持裁决的 literal
+excerpt、关键 screen、关键生成物内容/diff、DB delta 和跨命令结果，并附 raw artifact ref。禁止只留一句总结、
+digest 或 ref，也不得另建 per-scenario Markdown 逃避全局可读性。
+
+#### C. Per-scenario observation record
+
+每个 mandatory scenario 独立成节；相同 leaf 的场景可以相邻展示，但不得合并后丢失 precondition、option/input 或
+cross-command identity。每个场景至少包含：
+
+1. **Identity**
+   - parser leaf id、完整 command path、scenario id/version 和 path kind；
+   - stable coverage claims：precondition state、parameter/interactive option、input class、combination/high-risk 和
+     cross-command assertion IDs；
+   - public CLI contract/help/interactive inventory 选择依据、syntactic/semantic validity、required evidence 和应
+     触达的 primary operation/read flow；
+   - Codex reference applicability：`generic-cli-ui` 或 `dayu-specific/not-applicable` 及理由。
+2. **Preconditions**
+   - 初始 workspace/session/DB 状态摘要；
+   - 所需 corpus、provider、model 和 credential ref availability；
+   - authorization/resource budget 和 before snapshot evidence refs。
+3. **Exact input**
+   - cwd、argv 的 shell-safe 展示、非秘密环境变量名称和值；
+   - config/profile 的脱敏快照和 digest；
+   - stdin、按键、交互输入、等待动作及相对时间线；不得记录 secret value。
+4. **Observed process result**
+   - started/finished timestamps 和 duration；
+   - 真实执行时记录 `execution_outcome=success/error/timeout/cancel`；`not-run/blocked` 时该字段无值，并在
+     evidence gaps 中记录；
+   - exit code、signal、timeout/cancel 原始状态；
+   - stdout/stderr 分离后的 raw artifact refs 和 bounded literal summary。
+
+   本段只拥有 process-level raw facts，不解释“正确/错误”、不做跨层叙述、不产生 pass/fail。exit 0 或
+   `success` 不能证明 observation completeness 或 correctness。
+5. **Terminal evidence**
+   - 按输入/选择顺序内嵌关键 screen 或等价 literal transcript，说明对应时间和按键；不得只列 screen 文件名；
+   - 内嵌 final screen 的关键可见状态，并给出完整 cast/transcript ref，以及 ANSI 清除、prompt 恢复和增量区域的
+     实际观察。
+6. **Filesystem / generated artifacts**
+   - before/after bounded manifest 和 created/modified/deleted artifact 列表；
+   - 每个用户相关关键生成文件的脱敏内容或 bounded literal excerpt、before/after diff、content/metadata digest、
+     路径归属、CI-owned validation 和超预算内容的摘要方式；
+   - secret 明文、secret ref、redacted 或未持久化的实际状态。
+7. **Diagnostics**
+   - debug log ref、关键事件时间线和 warning/error 原始事实摘要；
+   - 明确标记 debug log 为 diagnostic、非 durable truth。
+8. **Host DB / SQLite observation**
+   - `queried` / `not-queried` 及第 11.2 节 checklist 理由；
+   - public read contract evidence、resolved DB path 脱敏表示和 CI-owned validation；
+   - 相关 stateful 场景内嵌 SQLite schema/关键 rows 或 bounded aggregation 的 before/after 和 delta；同时给出只读
+     query manifest/id、row count/digest、private-schema-dependent 标记；
+   - query/redaction/row/byte/time limits，以及该证据仅为 diagnostic 的声明。
+9. **Cross-layer correlation**
+   - session、run、attempt、execution、tool-call identities 和映射关系；
+   - CLI/Service request、Host canonical EventLog、Tool Trace、memory snapshot/source refs/diagnostics、
+     runner input 和 UI/final answer refs；
+   - identity 缺失或关联歧义。
+10. **Cross-command consumption**
+    - 对生成配置、文件、Fins/Host/DB 状态，内嵌后续真实 CLI load/query/consume 的 invocation 和实际结果；
+    - 明确哪些产物没有被后续命令消费，以及对应 coverage gap；创建命令的自报 summary 不能替代本节。
+11. **Observed behavior only**
+    - 引用第 4-10 项 evidence refs，按时间顺序做 bounded cross-layer narrative，只描述实际发生了什么；
+    - 记录层间一致/不一致事实，不重复粘贴 raw process fields；
+    - objective fact / hard-contract violation 可以标注精确 authority basis；
+    - 禁止用 exit code、CLI 自报数量/summary、digest 或 raw ref 替代行为描述，禁止写期望、Codex 模仿建议、修复
+      方案或未裁决产品结论。
+12. **Evidence integrity and gaps**
+    - required artifact presence、mock/fake absence proof 和 secret scan；
+    - missing/corrupt/ambiguous evidence；
+    - `evidence_status`，至少区分 `sufficient/missing/corrupt/ambiguous`；
+    - `gap_kind`，至少区分 `none/not-run/blocked/evidence-missing/evidence-corrupt/evidence-ambiguous/
+      public-observability-gap/reference-evidence-blocked`，并记录 owner / next evidence action；
+    - 引用第 4 项 `execution_outcome`，但不得把 outcome 重写成 evidence gap 或另建 scenario verdict。
+
+Scenario observation completeness 只由该 mandatory scenario 是否真实 attempted/executed 与 required evidence 是否
+sufficient 决定，不由 success/error/timeout/cancel 决定。一个 help/positive/negative 或 workspace state 的成功不能
+填补其它 scenario obligation gap。
+
+#### D. Cross-command summary
+
+报告末尾必须包含：
+
+- 全命令实际行为索引；
+- mandatory obligations 的逐维度 coverage summary、未覆盖项和新发现 interactive branches；
+- 可复查的 cross-layer identity matrix；
+- 观察到的共同行为和差异，只陈述事实；
+- immediate objective / hard-contract failures 及精确 authority/evidence；
+- incomplete / blocked / limited evidence；
+- 未执行项及原因；
+- 所有 cross-command load/query/consume assertions 的实际结果；
+- report freeze statement、exact UTF-8 bytes SHA-256 的 run-level final report digest record ref，以及下一阶段只允许
+  AgentMiMo / AgentDS independent review / formal suggestions。
+
+#### E. Agent suggestions 与 user adjudication
+
+suggestions 和 adjudication 不得写入 `observed-behavior.md` 事实主体。它们只能在 report frozen 后写入既有
+`oracle-adjudication.md`；两路 formal review 不替代开发 WU 的任何 Gateflow review。每条 suggestion 必须包含：
+
+- suggestion id、对应 observed report digest、scenario/correctness surface 和 evidence refs；
+- authority basis；
+- proposed predicate 的 precondition、trigger、expected observable、allowed variants、forbidden behavior 和
+  measurement；
+- suggested disposition：建议既有 validation contract 判为 pass/fail、建议第 4.3 节 candidate accept/reject，
+  或 `needs-more-evidence`；该字段只是 review 输出，不持久化为平行 verdict；
+- Agent authority：可直接建议或必须由用户决定；
+- 反例、替代方案、trade-off 和 confidence；
+- AgentMiMo / AgentDS 分歧与总控 synthesis；
+- user decision、scope、effective version、reason 和 date；
+- accepted 后才产生的 oracle id/version 或后续 WU identity。
+
+任一路 reviewer、总控或用户发现证据不足时，对应 oracle candidate 必须为第 4.3 节既有
+`needs-more-evidence`。后续只允许创建新 run 和新 immutable report；`oracle-adjudication.md` 保留旧 report digest，
+并把新 report 作为新证据版本引用，不得回写 frozen facts。
+
+用户拒绝 observed behavior 时，`oracle-adjudication.md` 必须记录用户给出的 replacement behavior，或把该 correctness
+surface 保持为 unresolved gap；不能把 `rejected` 当作“无需 oracle”。用户指出新状态、选项或路径时，必须扩展
+scenario obligations、真实补跑并生成新 report，直至 readiness proof 不再有 gap。
+
+### 11.2 Host DB / SQLite observation safety boundary
+
+SQLite 是 internal observation source，不是 Host/Fins/EventLog public contract 或业务真源。对 runtime manifest
+证明会读取或写入 CI-owned SQLite 的 mandatory stateful scenario，bounded read-only schema/关键 rows before/after
+是 required observation，即使 public evidence 已经完整也不能省略；其目的是让用户看到实际持久化结果和发现跨层
+不一致，不是把 private schema 升级为 public contract。与 SQLite 无关或 runtime 没有 SQLite 的场景才可记录
+`not-applicable`。
+
+财报文档内容的存取边界不因 CI observation 改变：禁止从 SQLite 直接读取、重建或展示 Fins document body、
+section、table、fact、转换 payload 或 provider payload，也禁止依赖 Fins private file/schema layout 形成业务结论。
+Fins 相关 SQLite observation 只能包含必要的 schema metadata、document opaque identity、status、count、digest 和
+其它 bounded diagnostic；财报内容与业务可读状态必须通过 `dayu.fins.storage` 仓储协议及其 public read tools 取证。
+
+只允许观察本 run manifest 和 CI-owned marker 明确归属的 workspace/run root。数据库目标必须经过 canonical path
+解析与边界校验；路径越出 CI-owned root、ownership 不清或 marker 不匹配时 fail closed。查询必须绑定当前 scenario
+identities/time window，并限制 query 数、行数、字段、字节和时间范围。
+
+每个 mandatory scenario 必须执行并记录以下 checklist：
+
+1. 从 runtime identity、workspace manifest 和 command call path 判断场景是否可能触达 CI-owned SQLite，并记录
+   database owner/path identity；不得凭文件名猜测。
+2. 若无相关 SQLite，记录 `not-applicable` 及直接证据。若有关联，执行 bounded schema metadata 与场景相关关键
+   rows/aggregation 的 before query，场景结束后用同一 query identity 执行 after query 并生成 delta。
+3. 同时检查 Host public reads、EventLog export 和既有 trace reconstruction 是否覆盖 required public facts。若存在
+   public observability gap，记录 `gap_kind=public-observability-gap` 及缺失 owner；SQLite 不能把
+   contract gap 补写成 public fact。
+4. 查询前写明 observation 目的、目标 DB ownership、query/row/byte/time bounds 和脱敏方案。相关 SQLite 存在但
+   ownership/safety/redaction 任一项不满足时，记录 `blocked` / evidence gap 并阻止该 scenario readiness；不得用
+   `not-queried` 静默跳过。
+5. 报告内嵌脱敏的 schema/关键 rows 或 aggregation before/after/delta 和限制，并附 query manifest/raw ref；
+   不得只写“数据库已更新”、row count、digest 或 CLI 自报数量。
+6. 查询后仍分别报告 public facts、internal diagnostic observation、cross-layer contradiction 和 public gap 是否
+   存在；不得用 private row 消除、覆盖或隐藏 public observability gap。
+
+SQLite 连接必须同时使用 read-only URI 和 connection-local query-only 防线。SQL 只允许 `SELECT` 和明确列举的只读
+metadata inspection；禁止 DDL、DML、transactional mutation、`VACUUM`、`REINDEX`、`ATTACH`、extension loading、
+user-defined function、整库 dump、创建索引/临时业务表或修改持久 pragma。运行中 WAL 无法安全一致读取时记录
+evidence limitation；不得复制猜测、暂停或修改 Host 来迎合查询。
+
+query manifest 必须记录 query id、目的、参数范围、行/字节/时间上限和结果 digest。只导出与当前 scenario identities /
+time window 相关的 bounded rows 或聚合；secret、credential、authorization header、cookie、provider payload 和未授权
+用户内容必须遮蔽或只保留 digest。数据库路径使用可复核但不暴露无关用户目录的表示。before/after delta 必须区分：
+
+- “没有变化”：所定义且完整覆盖的查询结果确认无 delta；
+- “未观察到变化”：bounded observation 内未见 delta，但不能外推未覆盖范围；
+- “查询无法覆盖变化”：query/evidence limitation 使变化不可判定。
+
+Host public contract、EventLog canonical facts、accepted design 和 hard contract 决定业务/治理语义。SQLite 与 public
+projection 冲突时，报告冲突、identity、limitations 和正确 owner；不得在 calibration harness 中重算、择一或用 private
+row 伪装成真相。
 
 ## 12. Agent 路由
 
@@ -582,6 +1118,31 @@ Evidence bundle 必须能证明场景未使用 mock/fake 组件。若无法从 r
 
 ## 13. Pass / Fail 规则
 
+Observation completeness、registry readiness 与产品行为正确性是三个正交维度：
+
+- `observed-behavior.md` 缺失、未生成或未冻结时，禁止进入 Agent suggestions / user adjudication，更不能接受 oracle。
+- 任一当前 run mandatory scenario 为 `not-run` / `blocked`，或 required evidence
+  missing/corrupt/ambiguous 到无法复核实际行为时，`observation_completeness=incomplete`。
+- mandatory scenario 的 `error` / `timeout` / `cancel` 是 actual `execution_outcome`，不自动导致 observation
+  incomplete，也不自动代表 pass/fail；exit 0 / `success` 同样不自动证明 completeness 或 correctness。
+- 单个 help/positive/negative、parser acceptance、CLI 自报 summary、mock/fake 或其它场景的成功不能掩盖任一
+  precondition/option/interactive/input/combination/cross-command obligation 的 attempt/execution/evidence 缺口。
+- objective / hard-contract failure 可以立即标注，但不得掩盖 completeness 缺口、跳过其余 observation 或在用户
+  裁决前自动启动修复。
+- incomplete run 中证据充分的局部 predicate 可以交用户裁决；这只减少未决集合，禁止据此声明第一轮 campaign 完成、
+  registry ready 或 `full-real-pass`。
+- 相关 stateful scenario 缺少安全、bounded 的 SQLite before/after 是 evidence gap；private SQLite
+  schema/query result 仍不能单独支持产品 pass/fail，也不能覆盖 Host public read /
+  `public-observability-gap` 或升级为跨版本 public contract。
+- Applicable 通用 UI surface 缺少冻结 Codex reference、可执行 candidate predicate 或用户裁决时，Dayu observation
+  可以继续，但 correctness closure 和 registry readiness 不成立。
+- 用户裁决前不得依据 Codex reference、best-practice proposal、current implementation 或 reviewer 共识形成 accepted
+  oracle、修改 registry、生成实现计划或进入修复。
+- 用户裁决后，只有第 4.6 节 readiness conditions 全部通过才可结束第一轮。新 accepted oracle 若从后续
+  run/version 生效，则当前 calibration observation 只形成 implementation finding，不追溯改写当前 run verdict；
+  只有 target 已被既有 hard/current-design contract 或 effective accepted oracle 覆盖时才可形成正式 `fail`。无论
+  是否形成 fail，都不得把 implementation mismatch 改写成 coverage gap。
+
 场景只有在以下条件全部成立时才可判定 pass：
 
 - 命令和参数确实生效，而非仅解析成功。
@@ -595,6 +1156,8 @@ Evidence bundle 必须能证明场景未使用 mock/fake 组件。若无法从 r
 - 分析结论不包含无证据财务断言，并正确处理冲突、不可比和证据不足场景。
 - 没有敏感信息泄漏。
 - evidence bundle 足以让另一 Agent 在不重新运行命令的情况下复核结论。
+- 报告主体足以让用户看到关键 screen、生成物内容/diff、SQLite/durable delta 和跨命令消费结果；不能要求用户先
+  重跑命令或只根据 raw ref/digest 猜测。
 
 以下情况不得静默判定 pass：
 
@@ -609,16 +1172,26 @@ Evidence bundle 必须能证明场景未使用 mock/fake 组件。若无法从 r
 - 仅凭 Codex / Claude Code 行为、Agent 最佳实践建议、当前实现或未裁决设计争议直接创建 oracle。
 - 使用 `unadjudicated` / `needs-more-evidence` oracle 对产品判定 pass/fail。
 - 因 projection lag、日志缺失或 trace 缺字段而无法定位事实。
+- 只因某一 positive 返回 exit 0 / `success` 或 CLI 自报数量正确，就宣称 obligation matrix complete 或行为正确。
+- 只因某一场景返回 error/timeout/cancel，就自动宣称 observation incomplete 或行为错误。
+- `observed-behavior.md` 未冻结即生成 formal suggestions，或把 suggestions/adjudication 回写进 frozen facts。
+- 使用 SQLite 私有表、列、row order 或 query result 作为唯一 oracle，或用它填平 public observability gap。
+- 只把 `registry_status` 手工改为 `ready`，没有校验 inventory digest、coverage claims、correctness surfaces、
+  accepted oracle refs、user adjudication 和 frozen evidence。
+- 用户 rejected 当前行为后没有 accepted replacement predicate 或明确 out-of-scope 裁决，却把 correctness gap 当作
+  已关闭。
 
-这类场景应标记为 `blocked`、`limited-signal` 或 `not-run`，并给出原因和后续 owner。
+这类情况必须按其真实 owner 标记为 coverage/evidence gap、`blocked`、`limited-signal`、`oracle-review-required` 或
+product failure，并给出原因和后续 owner；不得统一降级或静默 pass。
 
 ## 14. 与人工验证的边界
 
 该体系的目标是把重复执行、录屏、日志关联、EventLog / Tool Trace / memory 查询和报告生成交给 Agents，从而减少人工遗漏与时间成本。
 
-人工验证主要保留在以下场景：
+人工裁决主要保留在以下场景：
 
-- 首次观察并裁决新的 Codex / Claude Code 行为 oracle。
+- 第一轮完整 observed-behavior campaign 中逐项确认正确行为、允许变体和禁止事项；
+- 首次观察或版本变化后裁决新的 Codex / Claude Code reference predicate；
 - 自动终端模拟无法可靠判断的视觉体验争议。
 - 真实外部账户、凭据、成本或副作用需要用户授权。
 - 设计真源没有给出唯一答案的产品语义。
@@ -627,7 +1200,8 @@ Evidence bundle 必须能证明场景未使用 mock/fake 组件。若无法从 r
 
 ## 15. 实施原则
 
-- 先建立 parser inventory 与场景覆盖检查，再逐步迁移现有 smoke。
+- 验证 harness 可以分步实现，但第一轮 calibration completion / registry ready 必须等到 parser + interactive
+  inventories、完整 mandatory matrix、evidence 和用户裁决全部闭环；局部 smoke 不得冒充第一轮完成。
 - 先支持 real-contract 和固定真实财报 corpus，再增加 live-provider / live-external lanes；所有产生 Agent verdict 的场景始终使用真实 provider。
 - 先建立固定真实 filing / XBRL / table 财报基准，再增加动态最新财报场景和主观分析评分。
 - 不将普通 mock-based unit test 的结果汇总为本文 CI 的通过率；两类验证分别报告。
