@@ -74,6 +74,8 @@ from dayu.service.entrypoint_runtime import (
 from dayu.service.host_assembly import ServiceRunOverrides
 from dayu.service.host_admin import ServiceHostAdminRequest, prepare_host_admin
 
+_MODEL_ID = "deepseek-v4-flash"
+
 
 def test_host_api_error_policy_maps_explicit_selector_not_found_to_usage() -> None:
     """显式 session id selector 的 NOT_FOUND 必须映射为 usage error。"""
@@ -1038,6 +1040,97 @@ def test_session_resume_prompt_by_session_id_resolves_and_submits_without_create
     assert resume_capture.prompt_prepare_calls == ["hello"]
     assert resume_capture.prompt_execute_sessions == ["session-1"]
     assert resume_capture.prompt_display_flags == [(True, True)]
+
+
+def test_session_resume_model_maps_to_service_assembly_override(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """session resume 的 ``--model`` 必须进入共享 Service assembly override。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: CLI model 没有精确映射到 ``model_id`` 时抛出。
+    """
+
+    host = _FakeSessionHost(list_result=ListSessionsResult(sessions=()))
+    _install_fake_open_host(monkeypatch, host)
+    captured_requests: list[EntrypointRuntimeRequest] = []
+
+    async def capture_prepare(
+        request: EntrypointRuntimeRequest,
+    ) -> EntrypointRuntimeResult:
+        """捕获 session resume 传给 Service helper 的 runtime request。
+
+        :param request: CLI 构造的 runtime request。
+        :returns: 不启动真实 runtime 的 typed fake。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        captured_requests.append(request)
+        return cast(
+            EntrypointRuntimeResult,
+            _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
+        )
+
+    async def execute_prompt(
+        *,
+        host: Host,
+        prepared: session_execution.PreparedPromptSessionExecution,
+        session_id: str,
+        sigint_monitor: CliSigintMonitor,
+        detail: bool = True,
+        thinking: bool = True,
+    ) -> int:
+        """短路 Host submit，只验证 resume runtime conversion。
+
+        :param host: 当前 fake Host。
+        :param prepared: 已准备的 prompt execution。
+        :param session_id: 已解析的目标 Session id。
+        :param sigint_monitor: 本轮 SIGINT monitor。
+        :param detail: 是否显示 activity。
+        :param thinking: 是否显示 thinking。
+        :returns: CLI 成功退出码。
+        :raises Exception: monitor 关闭失败时透传。
+        """
+
+        del host, prepared, session_id, detail, thinking
+        sigint_monitor.close()
+        return EXIT_SUCCESS
+
+    monkeypatch.setattr(
+        session_execution,
+        "prepare_entrypoint_runtime",
+        capture_prepare,
+    )
+    monkeypatch.setattr(
+        session_command,
+        "execute_prompt_on_session",
+        execute_prompt,
+    )
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "prompt",
+            "--model",
+            _MODEL_ID,
+            "--base",
+            str(tmp_path),
+            "hello",
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert capsys.readouterr().err == ""
+    assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
 
 
 def test_session_resume_interactive_by_label_resolves_and_reuses_session(

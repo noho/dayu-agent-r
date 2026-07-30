@@ -33,14 +33,14 @@ from dayu.cli.exit_codes import (
 )
 
 COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
-    "init": ("--base", "--workspace", "--config", "--reset", "--overwrite"),
+    "init": ("--base", "--workspace", "--reset", "--overwrite"),
     "prompt": (
         "prompt",
         "--ticker",
         "--label",
         "--detail",
         "--no-detail",
-        "--model-name",
+        "--model",
         "--temperature",
         "--tool-timeout-seconds",
         "--max-iterations",
@@ -50,7 +50,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--label",
         "--detail",
         "--no-detail",
-        "--model-name",
+        "--model",
         "--temperature",
     ),
     "download": ("--ticker", "--forms", "--start", "--end", "--overwrite"),
@@ -247,6 +247,33 @@ def test_command_help_contains_core_arguments(
 
     for expected_fragment in COMMAND_HELP_EXPECTATIONS[command_name]:
         assert expected_fragment in help_text
+
+
+@pytest.mark.parametrize(
+    "command_path",
+    (
+        ("prompt",),
+        ("interactive",),
+        ("session", "resume"),
+    ),
+)
+def test_agent_command_help_uses_model_long_and_short_forms(
+    capsys: pytest.CaptureFixture[str],
+    command_path: tuple[str, ...],
+) -> None:
+    """三个 Agent surface 的 help 只展示正式 ``--model/-m``。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param command_path: 待检查的命令及二级 action。
+    :returns: ``None``。
+    :raises AssertionError: help 仍展示旧参数或缺少正式参数时抛出。
+    """
+
+    help_text = _capture_help(capsys, command_path)
+
+    assert "--model MODEL" in help_text
+    assert "-m MODEL" in help_text
+    assert "--model-name" not in help_text
 
 
 def test_command_help_contains_debug_stream(
@@ -1222,6 +1249,166 @@ def test_parse_args_accepts_global_options_before_and_after_command() -> None:
     assert after_command.log_file == "after.log"
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected_config_dir"),
+    (
+        (("--config", "config-prompt-before", "prompt", "hello"), "config-prompt-before"),
+        (("prompt", "hello", "--config", "config-prompt-after"), "config-prompt-after"),
+        (("--config", "config-interactive-before", "interactive"), "config-interactive-before"),
+        (("interactive", "--config", "config-interactive-after"), "config-interactive-after"),
+        (
+            (
+                "--config",
+                "config-session-before",
+                "session",
+                "resume",
+                "--session-id",
+                "session-1",
+                "--mode",
+                "interactive",
+            ),
+            "config-session-before",
+        ),
+        (
+            (
+                "session",
+                "resume",
+                "--session-id",
+                "session-1",
+                "--mode",
+                "interactive",
+                "--config",
+                "config-session-after",
+            ),
+            "config-session-after",
+        ),
+    ),
+)
+def test_runtime_commands_accept_config_before_and_after_command(
+    argv: tuple[str, ...],
+    expected_config_dir: str,
+) -> None:
+    """非 init runtime 命令必须在 command 前后都接受 ``--config``。
+
+    :param argv: 待解析的完整 CLI 参数。
+    :param expected_config_dir: 预期的显式配置目录。
+    :returns: ``None``。
+    :raises AssertionError: 参数位置改变 ``config_dir`` 映射时抛出。
+    """
+
+    args = parse_cli_args(argv)
+
+    assert args.config_dir == expected_config_dir
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config", "forbidden-config", "init"),
+        ("init", "--config", "forbidden-config"),
+    ),
+)
+def test_init_rejects_config_before_and_after_command(
+    argv: tuple[str, ...],
+) -> None:
+    """init 必须在 command 前后都由 parser owner 拒绝 ``--config``。
+
+    :param argv: 待解析的 init 参数。
+    :returns: ``None``。
+    :raises AssertionError: argparse 未返回 usage error 2 时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(argv)
+
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_model"),
+    (
+        (("prompt", "hello", "--model", "model-prompt-long"), "model-prompt-long"),
+        (("prompt", "hello", "-m", "model-prompt-short"), "model-prompt-short"),
+        (("interactive", "--model", "model-interactive-long"), "model-interactive-long"),
+        (("interactive", "-m", "model-interactive-short"), "model-interactive-short"),
+        (
+            (
+                "session",
+                "resume",
+                "--session-id",
+                "session-1",
+                "--mode",
+                "interactive",
+                "--model",
+                "model-session-long",
+            ),
+            "model-session-long",
+        ),
+        (
+            (
+                "session",
+                "resume",
+                "--session-id",
+                "session-1",
+                "--mode",
+                "interactive",
+                "-m",
+                "model-session-short",
+            ),
+            "model-session-short",
+        ),
+    ),
+)
+def test_agent_commands_map_model_long_and_short_forms(
+    argv: tuple[str, ...],
+    expected_model: str,
+) -> None:
+    """三个 Agent surface 的 ``--model/-m`` 必须映射到同一 typed 字段。
+
+    :param argv: 待解析的完整 CLI 参数。
+    :param expected_model: 预期模型配置标识。
+    :returns: ``None``。
+    :raises AssertionError: long/short form 没有映射到 ``ParsedCliArgs.model`` 时抛出。
+    """
+
+    args = parse_cli_args(argv)
+
+    assert args.model == expected_model
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("prompt", "hello", "--model-name", "legacy-model"),
+        ("interactive", "--model-name", "legacy-model"),
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "interactive",
+            "--model-name",
+            "legacy-model",
+        ),
+    ),
+)
+def test_agent_commands_reject_removed_model_name_option(
+    argv: tuple[str, ...],
+) -> None:
+    """三个 Agent surface 都必须拒绝已删除的 ``--model-name``。
+
+    :param argv: 待解析的完整 CLI 参数。
+    :returns: ``None``。
+    :raises AssertionError: 旧参数未返回 usage error 2 时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(argv)
+
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
 def test_default_namespace_initializes_reset_false() -> None:
     """验证默认 CLI namespace 显式提供 ``reset=False``。
 
@@ -1253,6 +1440,7 @@ def test_init_help_describes_reset_precedence_and_overwrite_boundary(
 
     help_text = capsys.readouterr().out
     assert raised.value.code == 0
+    assert "--config" not in help_text
     assert "优先于 --overwrite" in help_text
     assert "重建 .dayu 与 config" in help_text
     assert "保留 .dayu" in help_text

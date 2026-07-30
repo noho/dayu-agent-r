@@ -986,7 +986,7 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
             " AAPL ",
             "--label",
             "earnings",
-            "--model-name",
+            "--model",
             _MODEL_ID,
             "--temperature",
             "0.2",

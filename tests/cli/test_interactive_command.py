@@ -791,7 +791,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
             " AAPL ",
             "--label",
             "earnings",
-            "--model-name",
+            "--model",
             _MODEL_ID,
         )
     )
@@ -800,6 +800,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
+    assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert tuple(captured_requests[0].context_slot_values) == (
         _FINS_DEFAULT_SUBJECT_SLOT,
         _CURRENT_TIME_SLOT,
