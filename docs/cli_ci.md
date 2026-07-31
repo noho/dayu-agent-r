@@ -6,8 +6,7 @@
 
 该体系需要同时回答三个问题：
 
-1. CLI 的用户可见行为是否符合 Dayu 设计，并在通用 Agent 交互层面与冻结的真实 Codex reference 保持语义一致；
-   Claude Code 只在明确使用时提供可选对照。
+1. CLI 的用户可见行为是否符合 Dayu 设计、用户已接受的 oracle 和适用的交互最佳实践。
 2. Host 的 canonical truth、状态迁移、Tool Trace、Conversation Memory 和实际模型输入是否符合设计真源与最佳实践。
 3. 实际进入 LLM 上下文的 prompt、tool schema、memory 和 evidence material 是否符合 `AGENTS.md` 的“LLM-facing 文本约束”。
 
@@ -102,7 +101,7 @@ run root 默认位于仓库父目录下的专用 `.dayu-cli-ci/<run-id>/`，或�
 总控保持唯一裁决权，具体工作按以下角色路由：
 
 - AgentCodex：Codex Agent，承担 goal-discovery evidence acquisition，生成 inventory/场景、操作 CLI tmux panes、收集 evidence、分析直接证据；候选 WU 完成正式 Phaseflow goal confirmation 后，再承担对应 `plan` / `implementation` / `fix` gate。
-- AgentMiMo：Claude Code Agent，在 assessment 内独立审查 UI/Codex 行为对齐、LLM-facing 文本、Conversation Memory 和财报分析证据充分性。
+- AgentMiMo：Claude Code Agent，在 assessment 内独立审查 UI 行为、LLM-facing 文本、Conversation Memory 和财报分析证据充分性。
 - AgentDS：Claude Code Agent，在 assessment 内独立审查 Host/EventLog/Tool Trace/RunInputBuilder 传播、财务 oracle 和架构/最佳实践。
 - 总控：维护 oracle、监督 Agent、不轻易中断长任务、关联证据、裁决 findings、决定 rerun 范围并输出最终 verdict。
 
@@ -176,7 +175,6 @@ evidence 后安全结束且不启动任何 Phaseflow WU；第一轮 calibration 
 - AgentMiMo / AgentDS formal suggestions 状态、总控 synthesis 状态和 user adjudication 状态。
 - scenario/oracle registry readiness proof：inventory identity、mandatory/covered/gap counts、用户裁决 identity、
   frozen report digests、dangling refs、uncovered correctness surfaces 和最终校验结果。
-- 适用时使用的 Codex reference identity/version/digest；不适用或未使用时记录原因。
 - SQLite observation 的 `queried` / `not-queried` 汇总、查询边界、只读证明、脱敏结果和 public observability gaps。
 - CLI/UI、Host、LLM-facing、Conversation Memory、财报分析五类 verdict。
 - 每个失败或 limited-signal 场景的直接证据、语义 owner、严重性和建议 owner。
@@ -269,10 +267,10 @@ Debug log 用于诊断，不是 durable truth。Tool Trace 表达一次业务工
 
 “对齐 Codex / Claude Code”“对齐最佳实践”“对齐设计真源”这样的抽象口号都不能直接作为可执行 oracle：
 
-- 用户已经指定：适用的通用 CLI/UI 交互语义必须以真实 Codex 行为为 mandatory reference policy。该 policy 决定必须
-  采集和比较哪些 surface，但仍需冻结精确 Codex 版本/环境的实际行为并转写为可测 predicate；不得把“像 Codex”
-  本身当作可执行断言。
-- Claude Code 仍只提供可选参考；其产品版本、终端状态和任务上下文不同，不天然适合 Dayu。
+- Codex / Claude Code 只在用户主动询问或 Agent 解释最佳实践时提供可选参考；CI 不负责运行、冻结、比较或记录其
+  行为，也不从参考产品派生 mandatory obligation、evidence gap、oracle 或 readiness gate。
+- 参考产品的版本、终端状态和任务上下文与 Dayu 不同，其行为不天然适合 Dayu，也不能替代用户对 Dayu predicate
+  的裁决。
 - 最佳实践是 Agent 基于经验、直接证据、替代方案和失败模式提出的候选判断，不因由总控或 reviewer 提出就自动正确。
 - 设计真源是当前规范，但允许真实 CI 发现设计本身不符合更高层目标、事实边界或最佳实践。实现与设计不一致和设计需要修正是两个不同 finding。
 - Dayu 当前实现只说明“现在发生了什么”，不能反过来定义“本来就应该这样”。
@@ -288,7 +286,7 @@ Debug log 用于诊断，不是 durable truth。Tool Trace 表达一次业务工
 | objective fact | 财报原始数值、单位、期间、digest、实际 EventLog row | 原始财报或 durable canonical fact | 来源与完整性校验通过后可直接使用 |
 | hard contract | secret 不得泄漏、非法状态迁移不得发生、分层反向依赖禁止 | `AGENTS.md` 与已接受架构硬约束 | 直接形成 finding；若硬约束本身被质疑，必须升级为设计裁决 |
 | current design behavior | memory、wait、trace、projection 当前设计要求 | 当前有效设计真源 | 实现偏离构成 conformance failure；CI 同时允许提出 design-review candidate，修复方向待用户裁决 |
-| reference behavior | Codex / Claude Code 的终端或交互行为 | 用户指定的 Codex UI policy + 带版本/环境的真实观察证据 | 适用 Codex surface 必须形成候选 predicate；具体 expected observable 与 allowed variants 由用户裁决 |
+| reference behavior | 用户主动询问的其它产品终端或交互行为 | 非约束性的参考信息 | 只用于解释建议与取舍；不进入 Dayu CI observation、coverage、oracle 或 readiness |
 | best-practice proposal | reviewer 建议的 memory、UI、tool 或分析行为 | 有理由但未裁决的建议 | 双路 review 后由用户裁决 |
 | product-quality rubric | 买方分析深度、表达方式、交互体验 | 候选 rubric | 用户裁决范围、阈值和允许变体 |
 
@@ -316,9 +314,10 @@ Accepted oracle 后续仍可被新证据挑战。修改时必须创建新版本�
 - category、适用 command/scene/surface 和前置状态。
 - 可判定的 expected behavior / predicate，以及允许的有效变体。
 - 明确禁止的行为。
-- authority basis：objective source、hard contract、current design、reference observation、best-practice proposal 或 user decision。
+- authority basis：objective source、hard contract、current design、best-practice proposal 或 user decision。
 - Dayu 实际行为和对应 evidence refs。
-- Codex / Claude Code 参考行为时的产品、版本、日期、环境和 evidence refs。
+- 用户明确把某项外部参考纳入裁决理由时，可以在 adjudication notes 中简述该理由；不得把它变成 Dayu observation 或
+  独立 oracle。
 - 设计依据及精确章节；若质疑设计，记录 design conflict。
 - AgentMiMo / AgentDS 的独立意见、替代方案和 trade-off。
 - 当前状态、用户裁决、裁决日期、适用起始版本和 `supersedes` / `superseded_by`。
@@ -393,7 +392,8 @@ attempt/execution 与 required evidence。
 6. hard failure 可立即分类，但除授权、安全或真实依赖 stop condition 外，不得短路其余 mandatory observation。
 7. frozen facts 永不回写；补充证据必须进入新 run 和新的 immutable report。
 8. SQLite private schema 只用于本次诊断，不升级为公共 contract、业务真源或唯一 oracle。
-9. Codex reference 只约束明确适用的通用 CLI/UI predicate；reference 不可用时不得伪造 fallback。
+9. 外部产品参考不属于 CI observation 或 correctness authority；未查询、不可用或版本不明都不构成 coverage /
+   evidence / correctness gap。
 10. incomplete run 中证据充分的局部 predicate 可以由用户裁决，但不得因此声称第一轮 calibration campaign 完成或
     registry ready；它只能减少后续未决集合。
 11. outcome、evidence 和 verdict 必须分离；不得把 exit 0 / success 当作 completeness 或 correctness，也不得把
@@ -426,6 +426,11 @@ scope、precondition、trigger、expected observable、allowed variants、forbid
 `registry_status` 只允许 `calibration` 或 `ready`，且只是 readiness validation 的投影。`calibration` 空占位文件可以
 暂时没有 readiness proof；任何 `ready` registry 必须包含完整 proof。新总控必须重新计算并校验两个 registry 的 proof
 后决定 profile，不得只信任 status 字面值。
+
+第一轮 calibration 的首个 observation run 启动时，`docs/cli_ci_scenarios.json` 仍是空的 `calibration` registry
+属于正常 bootstrap：该 run 用来发现、执行和冻结候选场景。该 run 可以独立收口并保留报告，但第一轮 campaign 不能
+在 registry 仍为空时结束；用户裁决和缺口补跑完成后，必须把 accepted scenarios 写入稳定 registry，并满足下述全部
+readiness conditions。不得把“首个 run 允许为空”误写成“第一轮结束时允许为空”。
 
 每次 run 在 evidence bundle 中生成 `oracle-candidates.json` 和 `oracle-adjudication.md`。不存在 accepted oracle 的场景默认进入 calibration，不得根据当前实现猜测期望值。
 
@@ -470,8 +475,8 @@ scope、precondition、trigger、expected observable、allowed variants、forbid
 3. 查找 scope 和 version 均适用的 accepted oracle。存在时按其 predicate 形成 pass/fail 建议并记录 oracle usage。
 4. 没有 accepted oracle 时，检查当前有效设计真源。实现偏离可形成 current-design conformance 建议；设计本身被
    质疑时，另提 design-review candidate，并在用户裁决修复方向前禁止直接修实现。
-5. 收集冻结的 Codex reference、best-practice proposal 和 product-quality rubric。它们只能形成候选建议，当前实现
-   永远不能自证为 oracle。
+5. 收集 best-practice proposal 和 product-quality rubric；用户主动询问时可以解释其它产品的做法，但该信息不进入
+   Dayu observation 或独立候选。当前实现和外部产品行为都不能自证为 oracle。
 6. AgentMiMo / AgentDS 分别基于同一 frozen report 给出带 authority basis 的 accept / reject /
    `needs-more-evidence` 建议、反例、替代方案和 trade-off。
 7. 总控合并同义材料、保留分歧，把候选保持为第 4.3 节的 `unadjudicated` 或
@@ -480,11 +485,6 @@ scope、precondition、trigger、expected observable、allowed variants、forbid
    `rejected` 后保留理由；若 mandatory correctness surface 因此没有 accepted replacement predicate，则保持
    correctness gap、补充候选并继续裁决，不得进入 ready。用户裁决前不得写 accepted oracle、修改 registry、生成实现
    计划、启动修复或更改 finding。
-
-Codex reference 不可用时，依赖该 reference 的 candidate predicate 必须为 `needs-more-evidence`，但不得阻塞 Dayu
-observation、不依赖该 reference 的其它候选或其它 predicate 的裁决。同一行为若另有明确、充分且适用的 authority，
-用户可以只基于该 authority 独立裁决，但记录不得声称完成 Codex 对齐；不得用历史印象、替代产品、未冻结 snapshot
-或“等价版本”伪造 fallback reference。
 
 总控不得因为两路 reviewer 意见一致而代替用户完成产品 oracle 裁决；用户裁决的是具体 predicate、scope 和 allowed
 variants，不是笼统的产品相似性。
@@ -590,6 +590,89 @@ unconfigured、transport unavailable、provider rejection 与 rate limit 只要�
 证据、脱敏和 no-fallback contract 完整即可通过总体 verdict。internal product bug、
 未分类、secret leak、fallback 或证据矛盾仍使命令总体退出非零。
 
+#### 5.1.2 `dayu-cli interactive` 的 Ctrl+D Mandatory Matrix
+
+`interactive` 拥有 composer 和跨轮 REPL 状态，因此 Ctrl+D coverage 必须按实际 UI 状态拆分，不能用一次 Run 中
+按键或 CLI 自报替代整个状态矩阵。第一轮 calibration 和以后每次适用的 `full-real` 至少真实运行：
+
+- 初次进入 REPL、空 composer 时按 Ctrl+D；
+- composer 非空且光标位于文本中间时按 Ctrl+D，并记录按键前后的完整 buffer、光标位置、屏幕和是否提交；
+- composer 非空且光标位于文本末尾时按 Ctrl+D，并记录输入是否保留、进程是否继续；
+- Run 等待真实 provider response 时按一次及连续多次 Ctrl+D；
+- Run 执行真实 tool request/response loop 时按一次及连续多次 Ctrl+D；
+- Run final、REPL 恢复 composer 后，在空 composer 中按 Ctrl+D。
+
+每个场景必须记录精确按键 bytes、发送时相对 UI/Run 状态、虚拟终端屏幕、composer buffer/光标、进程是否仍存活、
+exit code/signal、Host Run terminal 状态、后续是否自动退出，以及日志和相关 SQLite/EventLog before/after。harness
+必须把 raw-mode 下发送的 `0x04` 按键与关闭 stdin、canonical-mode EOF 分成不同 input class，不得用关闭 PTY 或
+harness cleanup 冒充 Ctrl+D。只对 Dayu 的各状态建立 mandatory observation；用户主动询问其它产品做法时可以另行
+回答，但该参考不进入场景 coverage，也不能替代任何 Dayu 状态的真实运行。
+
+`prompt` 是一次性命令，没有 composer 或 final 后 REPL。其 Ctrl+D obligation 只适用于命令仍在执行且终端按键监听
+有效的阶段；interactive 的空/非空 composer、光标编辑和 final 后恢复场景对 `prompt` 必须标记为不适用，禁止为追求
+矩阵对称而编造输入状态。
+
+#### 5.1.3 日志参数 Mandatory Matrix
+
+日志等级 selector 的语义等级为 `debug/verbose/info/warning/error/critical/quiet`；`warn` 是 `warning` 的等价拼写，
+两者必须并存。显式入口与快捷别名完整集合为：
+
+```text
+--log-level debug       --debug
+--log-level verbose     --verbose
+--log-level info        --info
+--log-level warn        --warn
+--log-level warning     --warning
+--log-level error       --error
+--log-level critical    --critical
+--log-level quiet       --quiet
+```
+
+上述 16 种 entry form 都是同一个日志等级 selector 的输入形式。一次 invocation 最多出现一次 selector；低成本
+real-contract matrix 必须生成并运行全部有序双 entry 组合，包括同一 entry 重复、`warn/warning` 混用、显式入口与其
+等价别名并用及 argv 顺序互换，验证都在 primary operation 前以 parser misuse 退出 2。不得只抽样几个冲突，也不得
+接受“最后一个值生效”。
+
+每个 entry form 都必须分别在有、无 `--log-file` 时执行真实 CLI primary operation，记录实际 effective ordinary
+log policy、stdout/stderr、日志文件、exit code 和 Run/SQLite before/after；`warn` 与 `warning`、每个
+`--log-level` 与其快捷别名必须证明语义等价，不能只证明 parser 接受。`quiet` 表示关闭普通诊断日志，不是 `error`
+别名；指定 `--log-file` 时不允许截断既有内容。
+
+`--debug-stream` 是 selector 之外的正交开关：单独使用时基于默认 `info`，可与 `debug/verbose/info/warn/warning/
+error/critical` 的每个显式入口和快捷别名组合，但不得改变所选 ordinary log policy；它只额外启用高频 stream
+delta、SSE 和逐 delta ingest 诊断。它与 `--log-level quiet`、`--quiet` 冲突，两个 argv 顺序都必须在 primary
+operation 前退出 2。每个合法组合必须通过真实 streaming Run 证明 ordinary 与 stream 两个维度同时生效；不得只
+检查解析结果或 runtime 自报等级。
+
+`--log-file` 独立于日志等级 selector 和合法的 `--debug-stream` 组合。append chain 必须用同一路径连续运行至少两次，
+以内嵌 bounded 内容和 before/after bytes/digest 证明第二次保留第一次完整内容并只在末尾追加；只比较文件大小、
+日志行数或 CLI 自报不能证明 append。
+
+#### 5.1.4 Exit Code Mandatory Matrix
+
+CLI exit code 必须由终止原因的语义 owner 确定，不能把所有非成功结果压成同一码，也不能让相同错误因触发代码路径
+不同而漂移：
+
+| exit code | 确定性语义 |
+|---|---|
+| `0` | primary operation 正常完成，或 help、正常 EOF 等适用的正常退出 |
+| `1` | 动态配置、资源解析、credential、provider、网络、Host 或 terminal Run 等应用/运行失败 |
+| `2` | invocation 违反公开 CLI 参数契约，包括结构、缺失值、类型/格式、枚举/范围和互斥关系 |
+| `130` | 当前一次性命令因用户 Ctrl+C、Escape 或其它已接受的取消输入而终止 |
+
+边界场景必须分别真实运行：`--model` 缺少值属于 exit 2；语法有效的 model id 在本次动态 catalog 中不存在属于
+exit 1；配置 JSON 存在但损坏属于 exit 1；credential 缺失、provider rejection 和 Host/Run failure 属于 exit 1；
+日志 selector 冲突属于 exit 2。`interactive` 取消当前 Run 后若按其 oracle 恢复 REPL 而不结束进程，则不能伪造
+process exit 130；只有进程确实因该取消终止时才适用。
+
+mandatory matrix 至少覆盖 unknown command/option、缺失 positional/option value、非法 choice、非法数值格式、越界
+数值、每类互斥冲突、unknown model、malformed config、缺失 credential、真实 provider rejection、真实
+network/timeout、Host/terminal Run failure 和用户取消。工具返回 error/not_found 但 Run 按其策略继续时，不能仅因
+tool result 非成功就强制进程退出 1；exit code 由最终 command/Run outcome 决定。每项必须关联 stderr/screen、
+exit code/signal、Run 是否创建、
+durable terminal、文件/日志和 SQLite/EventLog before/after；同一 exit code 仍必须保留明确且脱敏的错误原因，不能
+只显示“失败”。exit code 只是 contract 的一个维度，不能替代实际副作用和 durable state 验证。
+
 其它命令必须按同一原则从其状态、选项、输入、组合、跨命令消费和 evidence obligations 派生矩阵。第一轮和以后每次
 完整 `full-real` 都运行全部 mandatory scenarios；`focused-real` 只用于局部复现/修复验证，不更新全量 coverage、
 registry readiness 或完整 CI 结论。
@@ -654,75 +737,26 @@ tmux 主要用于需要多轮输入、异步观察和长事务控制的真实交
 
 ## 7. CLI 与终端行为验证
 
-### 7.1 Codex Mandatory UI Reference 与语义对齐边界
+### 7.1 外部 Agent CLI 只作为按需参考
 
-用户已经把实际 Codex CLI 指定为 Dayu 通用 Agent CLI/UI 行为的 mandatory reference。Codex 不是 Dayu 的架构真源，
-但每个适用 surface 都必须建立 Codex reference obligation、真实运行当前冻结版本并保存证据；不得标为
-`not-used`，也不得只凭历史印象写“与 Codex 一致”。Claude Code 仍是可选参考；若使用，也必须遵守同等 evidence 和
-predicate 规则。
+Dayu CLI/UI 的 mandatory matrix 只从 Dayu 的命令、参数、交互状态、用户输入类别、设计真源、hard contract 和用户
+已接受的 oracle 派生。Codex、Claude Code 或其它 Agent CLI 不是 CI target、架构真源或 correctness authority。
 
-对齐目标是人能感知和操作的交互语义，不是逐字或逐像素复制。以下通用 CLI/UI surface 必须标记为 Codex reference
-`applicable` 并纳入 mandatory matrix：
+只有用户主动询问“其它产品怎么做”或要求 Agent 比较最佳实践时，Agent 才按需查询或真实观察对应产品，并在当前对话
+中说明参考结论及不确定性。该参考不写入 `observed-behavior.md`，不建立 scenario/reference obligation，不要求冻结
+版本、录屏或 artifact digest，也不进入 oracle registry、coverage 统计、evidence gap、correctness closure 或
+registry readiness。
 
-- prompt、输入编辑、提交、空输入和多行输入的交互结果；
-- idle、running 和 final 状态下 Ctrl+C / Esc / Ctrl+D / EOF 的取消与退出语义；
-- 取消当前 Run 后 REPL 是否仍可继续使用，以及 session/context 是否按可见契约保留；
-- thinking、streaming 和 activity 的出现、增量更新、完成、清除和残留行为；
-- final answer 到达后的 prompt 恢复、光标位置、终端清理和后续输入状态；
-- 多轮会话、重试、超时、错误、恢复和重新进入的用户反馈；
-- 通用参数错误、运行错误、provider 错误和中断时的反馈层级与可继续操作性。
-
-允许不影响交互语义的差异包括产品名称、Dayu 财报领域文案、模型动态文本、时间、随机 identity、耗时、颜色、
-spinner glyph 和其它纯样式细节。若某个文案或视觉差异会改变用户下一步动作、错误理解、状态判断、输入可见性或
-终端可操作性，它就不是允许变体，必须形成单独 predicate 交给用户裁决。
-
-以下 Dayu 特有语义必须标记为 `dayu-specific/not-applicable` 并写明理由，不得强套 Codex：
-
-- Fins 下载、上传、预处理、文档发现、财报读取和外部 financial source 长事务。
-- 财务事实、计算、证据充分性、买方分析质量和财报业务 oracle。
-- Host lifecycle/governance、EventLog、Tool Trace。
-- Conversation Memory、runner input 和 Dayu evidence semantics。
-
-每次 Codex reference observation 必须冻结以下 identity 和 evidence：
-
-- product/name、精确 version/build、binary/source identity；
-- 观察日期、时间和时区；
-- OS、shell、terminal emulator、`TERM`、宽高和 locale；
-- 脱敏配置、feature flags、model/profile；
-- 初始 session/task 状态；
-- 精确 argv、输入、按键和 timing；
-- stdout/stderr、cast、关键 screen、final screen 或等价 transcript reference evidence；
-- reference artifact digest。
-
-产品版本、配置或 reference 环境变化时必须创建新 reference observation version 和新 candidate，不得原地覆盖旧
-reference，也不得自动改变 Dayu accepted oracle。reference 不可用时，记录
-`gap_kind=reference-evidence-blocked`；依赖该 reference 的 predicate 为第 4.3 节既有
-`needs-more-evidence`，不得使用历史印象、其它产品、未冻结版本、伪造 snapshot 或“近似相同”环境作为 fallback。
-该阻塞不影响继续完成 Dayu 自身 observation、不依赖该 reference 的其它候选或其它 predicate 的 adjudication，但会
-阻止所有 applicable Codex surfaces 的 correctness closure 和 registry readiness。同一行为存在其它明确、充分且适用的
-authority 时，用户可以只依据该 authority 单独裁决，但若用户没有明确取消该 surface 的 Codex alignment requirement，
-仍不得声称完成 Codex 对齐或第一轮 readiness。
-
-每条 reference claim 必须转写为可执行 predicate，至少包含：
-
-```text
-given <明确前置状态>
-when <精确输入/按键/事件>
-then <可观察屏幕/进程/会话结果>
-allow <不影响语义的变体>
-forbid <明确错误行为>
-measure-by <screen/cast/process/session evidence>
-```
-
-禁止只写“Dayu 与 Codex 一致”。Codex 版本冻结只保证证据可复核，不赋予产品裁决 authority；predicate 在用户
-accepted 前仍属于第 4.2 节的 `reference behavior` candidate。
+外部产品参考可以帮助用户理解替代方案，但 Dayu 的正确行为仍必须由用户针对 Dayu 的具体 predicate 裁决。即使
+Dayu 与某个外部产品行为相同，也不能写成“因为与 Codex 一致所以正确”；即使无法访问外部产品，也不影响 Dayu
+observation、oracle calibration 或 CI readiness。
 
 ### 7.2 终端状态检查
 
 asciinema cast 的原始输出仍保留已被 ANSI 控制序列清除的文本，因此不能通过 grep cast 判断清屏是否成功。
 
 CI 必须用 VT100/xterm 兼容终端模拟器回放 cast，并保存关键时刻及最终虚拟屏幕快照。下列内容都是 mandatory
-observation surfaces：calibration 时记录 Dayu/Codex 的实际表现和差异、交给用户裁决；registry ready 后才按 accepted
+observation surfaces：calibration 时记录 Dayu 的实际表现并交给用户裁决；registry ready 后才按 accepted
 predicate 断言，不能把当前实现写法预设成 oracle：
 
 - 第一个 thinking delta 新起 `Thinking:` 行，后续 delta 在同一显示区域追加。
@@ -776,6 +810,10 @@ GitHub Issue #80 是 Conversation Memory 的评测标准和行为 oracle。CLI C
 8. Context pressure / compact：长输入、长工具结果和多次 compact 后仍保持 bounded、可解释和可追溯。
 9. 财报场景：跨年度/季度指标、多公司对比、口径变化、脚注弱信号和前序风险点追问。
 
+`interactive` 是 context pressure 与实际 compaction 触发的 mandatory command owner，必须在同一 REPL/session 中累积
+真实多轮上下文并观察 compact 前后行为。一次性 `prompt` 不承担“必须触发 compaction”的 coverage obligation；prompt
+run 未触发 compaction 必须标记为 command-scoped `not-applicable`，不能计作 prompt coverage gap。
+
 多轮场景不得通过注入预制 assistant answer、伪造 tool result 或直接写 memory snapshot 来制造前序记忆。每一轮都必须由真实 CLI 提交，经真实 Host/EventLog、真实工具调用和真实 runner call 形成下一轮可用上下文。固定真实 corpus 只固定财报来源和 oracle，不固定或替代 Agent 的执行过程。
 
 每个场景不能只评价最终回答，至少同时验证以下两层，核心场景应覆盖全部层次：
@@ -820,6 +858,11 @@ CLI、Host、tool loop 和 memory 行为正确，只能证明 Agent 运行框架
 
 第一版至少覆盖：
 
+- Prompt 最小真实财报成功链：通过生产 `dayu-cli download` 至少下载一份真实财报，记录实际 source identity、
+  文件/生成物、Fins 状态、日志和相关 SQLite before/after；完成使该财报可被生产 read tools 查询所需的真实后续
+  CLI 步骤；再由 `dayu-cli prompt` 对同一 ticker/period 发起真实问题，至少观察一次成功的 document discovery 和
+  一次成功的财报内容/结构化事实读取。下载命令自报成功、仅有文件存在、`list_documents=not_found`、模型凭记忆回答
+  或搜索网页都不能满足该 obligation。
 - 文档发现：列出指定公司的可用 10-K / 10-Q / 20-F / 6-K / 年报 / 中报，并正确识别期间和修订版本。
 - 单点事实：从财务报表、XBRL 或正文提取收入、利润、现金流、债务、股本等明确指标。
 - 单位与口径：区分元/千/百万、币种、季度/累计、GAAP/non-GAAP、reported/constant currency。
@@ -951,8 +994,6 @@ filesystem artifacts 仍各自由原 owner 承诺。但“projection”不等于
 - scenario/oracle registry version、digest、readiness proof validation 和当前 mandatory gap counts；
 - `calibration_stage_at_freeze=observed-report-frozen` 和 `observation_completeness`；
 - 敏感信息扫描结果和已应用的脱敏规则；
-- Codex reference identity/version；Dayu-specific surface 可记录 `not-applicable` 及原因，applicable 通用 UI surface
-  不允许 `not-used`。
 
 动态 `calibration_stage`、primary validation verdict 和 goal-discovery status 只记录在各自 owner 的 run-level final
 report 字段，不回写本 immutable report。
@@ -996,7 +1037,6 @@ cross-command identity。每个场景至少包含：
      cross-command assertion IDs；
    - public CLI contract/help/interactive inventory 选择依据、syntactic/semantic validity、required evidence 和应
      触达的 primary operation/read flow；
-   - Codex reference applicability：`generic-cli-ui` 或 `dayu-specific/not-applicable` 及理由。
 2. **Preconditions**
    - 初始 workspace/session/DB 状态摘要；
    - 所需 corpus、provider、model 和 credential ref availability；
@@ -1044,14 +1084,14 @@ cross-command identity。每个场景至少包含：
     - 引用第 4-10 项 evidence refs，按时间顺序做 bounded cross-layer narrative，只描述实际发生了什么；
     - 记录层间一致/不一致事实，不重复粘贴 raw process fields；
     - objective fact / hard-contract violation 可以标注精确 authority basis；
-    - 禁止用 exit code、CLI 自报数量/summary、digest 或 raw ref 替代行为描述，禁止写期望、Codex 模仿建议、修复
+    - 禁止用 exit code、CLI 自报数量/summary、digest 或 raw ref 替代行为描述，禁止写期望、外部产品模仿建议、修复
       方案或未裁决产品结论。
 12. **Evidence integrity and gaps**
     - required artifact presence、mock/fake absence proof 和 secret scan；
     - missing/corrupt/ambiguous evidence；
     - `evidence_status`，至少区分 `sufficient/missing/corrupt/ambiguous`；
     - `gap_kind`，至少区分 `none/not-run/blocked/evidence-missing/evidence-corrupt/evidence-ambiguous/
-      public-observability-gap/reference-evidence-blocked`，并记录 owner / next evidence action；
+      public-observability-gap`，并记录 owner / next evidence action；
     - 引用第 4 项 `execution_outcome`，但不得把 outcome 重写成 evidence gap 或另建 scenario verdict。
 
 Scenario observation completeness 只由该 mandatory scenario 是否真实 attempted/executed 与 required evidence 是否
@@ -1178,9 +1218,9 @@ Observation completeness、registry readiness 与产品行为正确性是三个�
 - 相关 stateful scenario 缺少安全、bounded 的 SQLite before/after 是 evidence gap；private SQLite
   schema/query result 仍不能单独支持产品 pass/fail，也不能覆盖 Host public read /
   `public-observability-gap` 或升级为跨版本 public contract。
-- Applicable 通用 UI surface 缺少冻结 Codex reference、可执行 candidate predicate 或用户裁决时，Dayu observation
-  可以继续，但 correctness closure 和 registry readiness 不成立。
-- 用户裁决前不得依据 Codex reference、best-practice proposal、current implementation 或 reviewer 共识形成 accepted
+- 通用 UI surface 缺少可执行 candidate predicate 或用户裁决时，Dayu observation 可以继续，但 correctness closure
+  和 registry readiness 不成立；外部产品参考是否存在不影响该判断。
+- 用户裁决前不得依据外部产品参考、best-practice proposal、current implementation 或 reviewer 共识形成 accepted
   oracle、修改 registry、生成实现计划或进入修复。
 - 用户裁决后，只有第 4.6 节 readiness conditions 全部通过才可结束第一轮。新 accepted oracle 若从后续
   run/version 生效，则当前 calibration observation 只形成 implementation finding，不追溯改写当前 run verdict；
@@ -1235,7 +1275,6 @@ product failure，并给出原因和后续 owner；不得统一降级或静默 p
 人工裁决主要保留在以下场景：
 
 - 第一轮完整 observed-behavior campaign 中逐项确认正确行为、允许变体和禁止事项；
-- 首次观察或版本变化后裁决新的 Codex / Claude Code reference predicate；
 - 自动终端模拟无法可靠判断的视觉体验争议。
 - 真实外部账户、凭据、成本或副作用需要用户授权。
 - 设计真源没有给出唯一答案的产品语义。

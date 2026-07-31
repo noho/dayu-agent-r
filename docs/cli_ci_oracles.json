@@ -227,6 +227,381 @@
       },
       "supersedes": null,
       "superseded_by": null
+    },
+    {
+      "oracle_id": "cli.prompt.core-execution",
+      "version": 1,
+      "status": "accepted",
+      "category": "cli-prompt-core-execution",
+      "scope": {
+        "command": "prompt",
+        "scenes": [
+          "prompt"
+        ],
+        "surfaces": [
+          "package-config-fallback",
+          "workspace-model-consumption",
+          "single-run-model-override",
+          "partial-and-invalid-workspace-config",
+          "temperature-forwarding",
+          "label-session-continuity",
+          "tool-request-response-evidence",
+          "tool-result-consistency",
+          "fallback-mode",
+          "running-cancellation",
+          "repeated-running-cancellation",
+          "startup-cancellation",
+          "running-ctrl-d",
+          "log-level-entry-equivalence",
+          "log-selector-exclusion",
+          "debug-stream-orthogonality",
+          "log-file-append",
+          "exit-code-classification"
+        ]
+      },
+      "predicates": [
+        {
+          "predicate_id": "prompt.01-package-default-without-init",
+          "expected": [
+            "未运行 init、显式空 workspace，或 workspace 只有既有 .dayu 而没有可用 config 时，prompt 使用 dayu/config 包内默认 scene、model、provider 和 credential ref。",
+            "不带 --base/-b/--workspace 的裸 prompt 使用当前工作目录下的 ./workspace；不存在的 workspace 可以由运行时创建必要的 .dayu 状态。",
+            "已有 .dayu 中与本次 Run 无关的用户文件保持不变。"
+          ],
+          "forbidden": [
+            "把 init 作为 prompt 可运行的前置条件。",
+            "无可用 workspace config 时从残缺文件猜测或拼接 effective model。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.02-init-selected-default",
+          "expected": [
+            "workspace config 可用时，prompt 的真实主 Runner 使用 init 为 prompt scene 投影的默认 model/provider/endpoint/credential ref。",
+            "模型消费必须由真实 runner identity、请求和 terminal outcome 证明，不能只依据配置文件或 CLI 自报。"
+          ],
+          "forbidden": [
+            "workspace config 可用时仍静默回退到 package 默认模型。",
+            "只显示 init 选择值，但真实 Runner 使用其它 model/provider。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.03-single-run-model-override",
+          "expected": [
+            "显式 --model/-m 覆盖本次主 Run 的 model/provider/endpoint/credential ref，并通过真实 Runner 消费。",
+            "该覆盖不修改 workspace 默认配置；后续无 override 的 prompt 恢复 workspace 默认模型。",
+            "单次主 Run override 不隐式覆盖辅助 compactor Run。"
+          ],
+          "forbidden": [
+            "只替换展示 model id 而保留原 provider/endpoint/credential。",
+            "把单次 override 持久化成 workspace 默认值。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.04-missing-models-package-fallback",
+          "expected": [
+            "workspace config 目录存在但缺少 models.json 时，该 workspace config 不构成可用配置；prompt 整体使用 dayu/config 包内默认配置。",
+            "package fallback 可创建必要的运行态目录并正常执行真实 Run。"
+          ],
+          "forbidden": [
+            "把缺少 models.json 的 workspace config 与 package config 混合成一份来源不清的 effective config。",
+            "仅因 workspace/config 目录存在就宣称 workspace config 已生效。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.05-config-root-file-package-fallback",
+          "expected": [
+            "workspace/config 被普通文件占据、因而不存在可用 workspace config 目录时，prompt 使用 dayu/config 包内默认配置。",
+            "fallback 后的真实 Runner identity 必须与 package 默认配置一致。"
+          ],
+          "forbidden": [
+            "读取普通文件并猜测 workspace config。",
+            "展示 package fallback，但真实 Runner 消费其它隐式配置。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.06-invalid-models-fail-closed",
+          "expected": [
+            "workspace models.json 存在但 JSON 非法时，prompt 明确报配置错误并退出 1。",
+            "该路径不创建本次 Run、Session 或 Host 运行态文件，也不静默回退到 package config。"
+          ],
+          "forbidden": [
+            "把存在但损坏的 workspace config 当成 config absent。",
+            "配置解析失败后仍发出 provider 请求。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.07-finite-temperature-forwarding",
+          "expected": [
+            "CLI 与 Service 只执行公共有限数校验；有限负温度可以进入 Run，并按原值传递给所选 provider。",
+            "provider 不接受该温度时，Run 明确失败、CLI 退出 1，并保留 provider rejection 的脱敏诊断。"
+          ],
+          "forbidden": [
+            "CLI 或 Service 静默 clamp、改写或丢弃用户提供的有限温度。",
+            "把 provider rejection 报告为成功。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.08-label-continuity-and-tool-evidence",
+          "expected": [
+            "相同 --label 跨独立 CLI 进程解析到同一个 Host session，后续 Run 保留上一轮 user 与 assistant 对话连续性。",
+            "同一活跃 Run 的工具循环使用 provider 原生的 assistant tool-call request 与对应 tool response 配对，并保持原调用 identity 进入下一次 Runner iteration。",
+            "跨 Run、持久化或 compaction 上下文不原样重放 provider 工具协议；它投影业务可读 tool name、request/query/必要参数、response/result 和 source。",
+            "跨轮工具证据进入唯一 system envelope 的 Verified Evidence and Facts 或 Recent Evidence section；不伪装成 assistant 输出，也不提升为单独 developer 指令。"
+          ],
+          "forbidden": [
+            "跨轮只投影工具结果而丢失解释该结果所需的 request/query 语义。",
+            "把 tool_call_id、EventLog id、payload ref、digest、cursor 或其它内部治理字段作为 LLM 理解工具证据的主体。",
+            "把历史工具证据伪装成用户输入、assistant 既有结论或 developer 指令。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.09-tool-not-found-consistency",
+          "expected": [
+            "真实 list_documents 请求与 not_found response 在 EventLog、Tool Trace、memory、后续 runner input 和最终回答中保持同源一致。",
+            "最终回答只能基于工具实际返回的 not_found 事实，不得把失败伪装为已找到文档。"
+          ],
+          "forbidden": [
+            "只记录 CLI 自报的工具状态而没有 request/response 证据。",
+            "durable state、trace、memory、runner input 与最终回答表达互相矛盾的工具结果。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.10-live-tool-result-grounding",
+          "expected": [
+            "真实 search_web 请求、参数和 response 必须进入可关联的 Tool Trace/EventLog 证据；最终回答只复述或解释该次工具实际返回的结果。",
+            "外部搜索结果内容允许随真实服务变化，但回答中的标题、URL 和来源必须与同次 response 一致。"
+          ],
+          "forbidden": [
+            "用模型记忆或虚构结果代替真实工具 response。",
+            "把历史或其它 Run 的搜索结果误归因给本次调用。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.11-tool-limit-fallback",
+          "expected": [
+            "工具结果已接受但达到 max_iterations 时，fallback_mode=force_answer 生成 degraded final answer，Run 以 succeeded 收口且 CLI 退出 0。",
+            "相同条件下 fallback_mode=raise_error 以 max_iterations_exceeded 失败收口，CLI 退出 1。",
+            "两种模式都保留已接受工具 request/response，不得因 fallback 丢失或改写工具事实。"
+          ],
+          "forbidden": [
+            "force_answer 把 degraded 回答标记成非 degraded 普通成功。",
+            "raise_error 在达到 iteration 限制后继续无界调用模型或工具。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.12-running-cancellation",
+          "expected": [
+            "Run 进行中按 Escape 或一次 Ctrl+C 都请求取消当前 Run，Host durable terminal 状态为 cancelled，CLI 以 130 退出。",
+            "屏幕可以显示面向用户的取消请求与取消完成信息，但只能使用用户可理解的 UI 文案。"
+          ],
+          "forbidden": [
+            "取消后把 Run 报告为成功、保留为 active，或以普通错误码 1/2 退出。",
+            "在屏幕输出 active_cancel_watchdog_closeout 或其它 Host 内部 reason、watchdog、closeout、ledger 字符串。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.13-repeated-sigint-graceful-closeout",
+          "expected": [
+            "从用户观感看，一次 Ctrl+C 表达取消当前动作；连续两次 Ctrl+C 表达需要时先取消当前动作、然后退出 CLI。",
+            "Run 的取消已经开始后再次按 Ctrl+C，可以登记退出意图，但必须合并到同一个优雅取消与退出流程；不得把第二次按键升级为 OS 级强制终止。",
+            "CLI 必须等待 Host 将 Run 持久化为 cancelled，并完成 watcher、runtime、日志和终端等本地资源清理，然后以 130 退出。",
+            "重复 Ctrl+C 不改变第一次取消的 terminal 语义，也不产生第二个相互竞争的取消或退出 owner。"
+          ],
+          "forbidden": [
+            "第二次 Ctrl+C 直接以 SIGINT 终止本地进程、产生 harness returncode=-2，或绕过 CLI closeout。",
+            "取消过程中显示 Python Traceback/KeyboardInterrupt，或在 durable cancellation、本地清理完成前退出。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.14-startup-sigint-graceful-exit",
+          "expected": [
+            "从 dayu-cli 进程启动开始到 Run accepted 之前的任意阶段收到 Ctrl+C，都必须由 CLI 作为用户退出意图优雅收口并返回 130。",
+            "尚未 accepted Run 时不得伪造或发送 Host Run cancel；已经初始化的本地日志、终端、runtime 或其它资源仍必须按实际 ownership 完成清理。",
+            "启动期取消只显示 bounded、面向用户的退出信息；没有需要说明的状态时可以静默退出。"
+          ],
+          "forbidden": [
+            "启动导入、参数解析、配置装配或 Host 打开期间的 Ctrl+C 落入 Python 默认 SIGINT 处理并显示 Traceback/KeyboardInterrupt。",
+            "启动期 Ctrl+C 以 signal returncode=-2 强退、报告 parser/业务失败，或遗留已建立但未关闭的本地资源。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.15-running-ctrl-d-does-not-cancel",
+          "expected": [
+            "prompt 是一次性命令且没有 composer；其 Ctrl+D 语义只适用于命令仍在执行且终端按键监听有效的阶段。",
+            "Run 执行中收到 Ctrl+D 时忽略该按键；它不取消当前 Run、不登记延后退出意图，Run 继续执行并按自身结果正常收口。",
+            "prompt 的 Run 取消语义仅由 Escape 或 Ctrl+C 承担，Ctrl+D 不与取消语义混用。"
+          ],
+          "forbidden": [
+            "Run 执行中把 Ctrl+D 解释为取消、立即退出或 Run 完成后的排队退出。",
+            "为 prompt 编造空/非空 composer、光标编辑或 final 后 REPL 恢复语义。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.18-log-level-entry-equivalence",
+          "expected": [
+            "日志等级的业务语义集合为 debug、verbose、info、warning、error、critical、quiet；默认等级为 info，quiet 表示关闭普通诊断日志而不是 error 的别名。",
+            "--log-level 接受 debug、verbose、info、warn、warning、error、critical、quiet；warn 与 warning 并存并映射同一个 warning 语义。",
+            "每种显式入口都有对应快捷别名：--debug、--verbose、--info、--warn、--warning、--error、--critical、--quiet。",
+            "每个 --log-level 值与对应快捷别名产生相同的 effective ordinary log policy；warn、warning、--warn 与 --warning 四种入口语义等价。"
+          ],
+          "forbidden": [
+            "继续只暴露 warn 而不暴露 warning，或只为部分等级提供快捷别名。",
+            "把 warn 与 warning 解释成不同 severity，或把 quiet 映射成 error。",
+            "只根据 help/parser acceptance 宣称入口生效，没有运行真实 CLI 并观察实际日志策略和输出。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.19-log-selector-exclusion-and-debug-stream",
+          "expected": [
+            "--log-level 的任一值和 --debug/--verbose/--info/--warn/--warning/--error/--critical/--quiet 都属于同一个日志等级 selector；一次 invocation 最多出现一个 selector entry。",
+            "出现两个 selector entry 时，无论语义相同、不同、显式值与别名混用、warn/warning 混用或 argv 顺序如何，都在 primary operation 前按 parser misuse 退出 2，且不创建 Run 或业务状态。",
+            "--debug-stream 位于日志等级 selector 互斥组之外；它可单独使用，也可与除 quiet 外任一显式等级入口或快捷别名组合。",
+            "--debug-stream 不改变所选 ordinary log policy，只额外启用高频 stream delta、SSE 和逐 delta ingest 诊断；未选择等级时 ordinary policy 保持默认 info。",
+            "--debug-stream 与 --log-level quiet 或 --quiet 冲突，两个 argv 顺序都在 primary operation 前退出 2。",
+            "--log-file 是独立目的地参数，可与任一日志等级 selector 以及合法的 --debug-stream 组合。"
+          ],
+          "forbidden": [
+            "多个日志等级 selector 同时出现时按最后一个值静默覆盖。",
+            "--debug-stream 把 ordinary log policy 覆盖成 STREAM_DEBUG，令用户选择的 info、warning、error 或 critical 失效。",
+            "接受 quiet 与 --debug-stream 的自相矛盾组合，或把 --log-file 错误纳入等级互斥组。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.20-log-file-append",
+          "expected": [
+            "同一路径通过 --log-file 被连续多个独立 CLI 进程使用时，每次都以 append 语义写入。",
+            "第二次及后续运行保留此前完整日志 bytes，只在文件末尾追加本次记录；不同运行的日志事实均可在最终文件中复核。",
+            "append 必须由文件 before/after 内容、bytes 和 digest 证明，不能只依据行数、文件大小或 CLI 自报。"
+          ],
+          "forbidden": [
+            "后续运行 truncate、覆盖、重写或删除既有日志内容。",
+            "把两个独立文件的内容拼接后伪装成同一路径的 append 证据。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.21-deterministic-exit-code-classification",
+          "expected": [
+            "prompt 正常完成时退出 0；适用的 help 或其它正常退出路径也使用 0。",
+            "invocation 违反公开 CLI 参数契约时退出 2，包括未知参数、缺失参数值、非法类型/格式/枚举/范围和互斥参数并用；该分类不因校验发生在 argparse 内外而改变。",
+            "动态配置、资源解析和应用/运行失败时退出 1，包括语法有效但动态 catalog 中不存在的 model、损坏的配置 JSON、credential 缺失、provider/network failure 以及 Host failure 或 terminal Run failure；非成功 tool result 若被 Run 正常接受并继续，不单独决定进程退出码。",
+            "一次性 prompt 因用户 Ctrl+C 或 Escape 取消并终止时退出 130。",
+            "相同错误类别在不同触发路径保持相同 exit code；同一 exit code 下仍显示明确、脱敏且可行动的具体原因，并与 Run 是否创建及 durable terminal 状态一致。"
+          ],
+          "forbidden": [
+            "把所有非成功结果统一成 1，或让同类错误依赖偶然代码路径返回不同 exit code。",
+            "把语法有效但动态 model 不存在、配置 JSON 损坏或 provider rejection 伪装成 parser misuse 退出 2。",
+            "参数契约错误已经可在 primary operation 前判定，却创建 Run、调用 provider 或退出 1。",
+            "只断言 exit code 而不检查屏幕错误、Run/Host 状态和文件/SQLite/EventLog 副作用。"
+          ]
+        }
+      ],
+      "allowed_variants": [
+        "不改变参数语义、退出码、durable terminal 状态和 stdout/stderr 通道的终端文案微调。",
+        "真实 provider 的回答措辞、延迟、request id 和限流状态可以变化，但 effective model/provider/endpoint/credential ref 与本次配置选择必须一致。",
+        "真实联网工具的结果排序和内容可以变化，但最终回答必须与同一次实际 response 一致。",
+        "取消过程的用户可见措辞可以调整，但不得暴露内部治理字符串。"
+      ],
+      "authority_basis": [
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认 prompt 观察清单第 1 至 7 项为正确行为。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认工具证据必须覆盖 request 与 response；Run 内保持原生工具协议配对，跨轮使用 system evidence 语义投影。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认真实工具结果一致性与 force_answer/raise_error 行为，即观察清单第 9 至 11 项。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认 Run 中 Escape 和一次 Ctrl+C 都取消 Run 并以 130 退出；active_cancel_watchdog_closeout 属于待修改的内部 UI 字符串暴露。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户定义一次 Ctrl+C 为取消，连续两次 Ctrl+C 为需要时先取消再退出；用户拒绝第二次按键导致 SIGINT 强退，所有取消和退出都必须等待 CLI 优雅清理后以 130 退出。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户拒绝启动导入阶段 Ctrl+C 显示 Python Traceback 并由 SIGINT 强退；Run accepted 前也必须由 CLI 优雅清理并以 130 退出。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认 prompt 没有 composer；prompt 只冻结 Run 中 Ctrl+D 被忽略、不取消或排队退出的语义。空/非空 composer、编辑和 final 后 REPL 状态归 interactive，并要求 handbook 增加对应真实运行覆盖。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认 Codex 只用于按需参考，不需要在 Dayu CLI CI 中记录其行为；观察清单第 17 项因此不作为 Dayu 行为或待裁决 oracle。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户以 replacement behavior 裁决观察清单第 18、19 项：七个日志语义等级互斥，warn 与 warning 拼写并存，所有显式等级均有快捷别名；--debug-stream 正交且除 quiet 外可组合，--log-file 独立。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认观察清单第 20 项正确：同一 --log-file 跨独立 CLI 运行采用 append 而非 truncate。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认观察清单第 21 项正确，并将模糊的“通常”冻结为确定性分类：参数契约错误=2，动态配置/资源及应用运行错误=1，用户取消=130，正常完成=0。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认 prompt 未触发 context compaction 是 command-scoped 正常结果，实际 compaction mandatory coverage 归 interactive；prompt 仍缺至少下载并真实读取一份财报的成功路径。"
+        }
+      ],
+      "observed_behavior": {
+        "run_id": "prompt-20260731T011247Z",
+        "report_id": "prompt-20260731T011247Z/observed-behavior",
+        "report_digest_sha256": "5d71ee302abedf40443b060e566ce6cb52eb0af463244806ba0dec55c9d9c1aa",
+        "report_frozen": true,
+        "scenario_refs": [
+          "P27R-P47",
+          "P64",
+          "init-provider-matrix"
+        ],
+        "summary": [
+          "package fallback、init-selected default 和单次 --model override 均通过真实 Runner identity 验证。",
+          "缺少 models.json 或 config root 为普通文件时使用 package fallback；存在但损坏的 models.json fail closed。",
+          "相同 label 跨进程复用 Session；活跃 Run 内工具调用保持 request/response 配对，跨轮 runner input 使用 system evidence 语义投影。",
+          "list_documents not_found、search_web success 和 tool-limit fallback 均具备跨 EventLog、Tool Trace、memory、runner input 与 terminal outcome 的真实证据。",
+          "Escape 和一次 Ctrl+C 均使 Host cancelled、进程退出 130；当前屏幕仍错误显示 active_cancel_watchdog_closeout，属于后续实现修改项。",
+          "当前连续两次 Ctrl+C 虽已使 Host cancelled，但第二次 SIGINT 令本地进程 returncode=-2 并绕过完整 closeout；用户已拒绝该行为，要求等待优雅清理后退出 130。",
+          "当前启动约 0.05 秒的 Ctrl+C 命中 dayu.cli.main 及其 Service/Host/Engine 依赖导入链；此时顶层 KeyboardInterrupt 映射和运行阶段 SIGINT monitor 均未建立，Python 默认处理器显示 Traceback 并以 signal returncode=-2 终止。",
+          "当前 Dayu 实测 prompt Run 中 Ctrl+D 不取消 Run，Run 最终成功；prompt 没有 composer。",
+          "观察清单第 16 项的 P42 只在 Run 中发送一次 Ctrl+T（0x14），观察到 activity 切为 hidden；没有再次发送 Ctrl+T，因此 activity 恢复显示、隐藏期间历史是否补显、多次切换稳定性和 final 后残留均未观察，属于明确 coverage gap。",
+          "P49-P58 只运行当前六个 --log-level 值和四个快捷别名；当前只有 warn、没有 warning，缺少 quiet 显式值以及 --warn/--warning/--error/--critical，且 --quiet 仍映射 error，因此不满足用户裁决后的日志入口 oracle，必须扩充真实运行覆盖。",
+          "P59 的 --debug-stream --info 成功符合可组合方向，但当前 runtime 以 STREAM_DEBUG 覆盖 ordinary level，不满足正交语义；P60 的 --debug --quiet 静默成功并按后值覆盖，不满足 selector 互斥和退出 2 的 oracle。",
+          "P63a/P63b 使用同一 --log-file 连续运行，最终文件保留两次 host.open.start 及两次运行日志，观察到 append 而非 truncate；用户已确认该行为正确。",
+          "本轮参数结构错误退出 2；语法有效但 unknown model、配置 JSON 损坏、credential 缺失和 provider/Run failure 退出 1；Escape/Ctrl+C 取消 prompt 退出 130。用户已确认该分类正确，并要求后续以确定性 owner matrix 扩充运行覆盖。",
+          "本次 observation run 启动时稳定 scenario registry 仍为空，作为首个 calibration bootstrap 是正常状态；但第一轮 campaign 在 accepted scenarios 写入并通过 readiness proof 前仍不能结束。",
+          "prompt 没有真正触发 context compaction 不再属于 prompt coverage gap；实际 compaction 触发、跨轮状态和 compact 前后连续性由 interactive mandatory matrix 覆盖。",
+          "P36 的真实 list_documents(AAPL) 返回 not_found，没有覆盖带真实财报 corpus 的成功读取路径；prompt campaign 仍必须在新 run 中通过生产 CLI 至少下载并消费一份真实财报，关联 Fins、SQLite、Tool Trace、runner input 和最终回答证据。"
+        ]
+      },
+      "user_adjudication": {
+        "decision": "accepted",
+        "date": "2026-07-31",
+        "notes": "按用户逐项回复冻结观察清单第 1 至 12 项，并以用户给出的 replacement behavior 冻结第 13、14 项；第 15 项仅冻结 prompt Run 中 Ctrl+D 不取消或排队退出，composer 状态明确不适用于 prompt 并转入 interactive mandatory coverage。第 12 项的内部 closeout reason 暴露、第 13 项的第二次 SIGINT 强退和第 14 项的启动期 Traceback 都是明确 conformance gap。第 16 项只覆盖 Ctrl+T 隐藏，未覆盖再次 Ctrl+T 恢复显示，保持 coverage gap 和未裁决。第 17 项是 Codex 参考信息，按用户裁决排除出 Dayu observation/oracle。第 18、19 项按用户 replacement behavior 冻结，并要求扩充完整日志参数运行矩阵；第 20 项 append 行为按现有观察接受；第 21 项按确定性 exit-code 分类接受并要求扩充 owner matrix。第 22 项是 CI 取证充分性陈述，不是 Dayu 产品行为 predicate；它继续由 handbook evidence contract 和 frozen report 证明，不进入 oracle。Prompt 当前唯一新增 command-scoped observation gap 是至少一份真实财报的下载、可查询化和成功读取链；scenario registry 仍须在补跑及裁决闭环后写入并通过 readiness。"
+      },
+      "applicable_from": {
+        "date": "2026-07-31",
+        "target": "next-prompt-conformance-run"
+      },
+      "supersedes": null,
+      "superseded_by": null
     }
   ]
 }
