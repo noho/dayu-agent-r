@@ -42,6 +42,7 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.cli.errors import CliResourcePreparationError, CliUsageError
 import dayu.runtime.log as runtime_log
 
 CommandRunner = Callable[[ParsedCliArgs], int]
@@ -88,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_cli_standard_stream(sys.stderr)
 
     opened_log_stream: TextIO | None = None
-    log_level_for_cleanup: str | None = None
+    log_level_for_cleanup = runtime_log.DiagnosticLogLevel.INFO
     debug_stream_for_cleanup: bool = False
     try:
         try:
@@ -96,21 +97,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_level_for_cleanup = args.log_level
             debug_stream_for_cleanup = args.debug_stream
             if args.log_file is not None:
-                opened_log_stream = _open_log_file(args.log_file)
-                if opened_log_stream is None:
+                try:
+                    opened_log_stream = _open_log_file(args.log_file)
+                except CliUsageError as exc:
+                    print(str(exc), file=sys.stderr)
                     return EXIT_USAGE_ERROR
+                except CliResourcePreparationError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return EXIT_FAILURE
             else:
                 opened_log_stream = _open_default_log_file()
                 if opened_log_stream is None:
                     return EXIT_FAILURE
             log_stream = opened_log_stream
-            runtime_log.set_level_from_flags(
-                log_level=args.log_level,
-                debug=False,
+            runtime_log.configure_selected_diagnostics(
+                level=args.log_level,
                 debug_stream=args.debug_stream,
-                verbose=False,
-                info=False,
-                quiet=False,
                 stream=log_stream,
             )
             runner = COMMAND_RUNNERS.get(args.command_name)
@@ -126,13 +128,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             if opened_log_stream is not None:
                 try:
-                    runtime_log.set_level_from_flags(
-                        log_level=log_level_for_cleanup,
-                        debug=False,
+                    runtime_log.configure_selected_diagnostics(
+                        level=log_level_for_cleanup,
                         debug_stream=debug_stream_for_cleanup,
-                        verbose=False,
-                        info=False,
-                        quiet=False,
                         stream=sys.stderr,
                     )
                 finally:
@@ -159,27 +157,24 @@ def _configure_cli_standard_stream(stream: TextIO) -> None:
         )
 
 
-def _open_log_file(log_file: str) -> TextIO | None:
+def _open_log_file(log_file: str) -> TextIO:
     """打开 CLI 诊断日志文件。
 
     :param log_file: 用户传入的日志文件路径。
-    :returns: 已打开的文本写入流；输入非法或打开失败时返回 ``None``。
-    :raises Exception: 本函数不主动抛出文件打开异常；打开失败通过
-        usage diagnostic 与 ``None`` 返回值表达。
+    :returns: 已打开的文本写入流。
+    :raises CliUsageError: 路径为空白时抛出。
+    :raises CliResourcePreparationError: 输出目的地无法打开时抛出。
     """
 
     log_file_path = log_file.strip()
     if log_file_path == "":
-        print(LOG_FILE_EMPTY_DIAGNOSTIC, file=sys.stderr)
-        return None
+        raise CliUsageError(LOG_FILE_EMPTY_DIAGNOSTIC)
     try:
         return open(log_file_path, mode="a", encoding="utf-8")
     except OSError as exc:
-        print(
-            LOG_FILE_OPEN_FAILED_TEMPLATE.format(path=log_file_path, error=exc),
-            file=sys.stderr,
-        )
-        return None
+        raise CliResourcePreparationError(
+            LOG_FILE_OPEN_FAILED_TEMPLATE.format(path=log_file_path, error=exc)
+        ) from exc
 
 
 def _open_default_log_file() -> TextIO | None:

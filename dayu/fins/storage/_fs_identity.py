@@ -1,7 +1,8 @@
-"""文件系统仓储私有 identity 映射。
+"""文件系统仓储 identity 到物理 locator 的唯一映射。
 
-本模块唯一拥有 external identity 到 filesystem-safe private locator 的派生、
-descriptor 原子持久化与双向校验。private locator 的格式不属于公共契约。
+ticker 使用业务 owner 已产生的 canonical 值作为可读 locator；document identity
+使用 filesystem-safe private locator。两类 locator 共用 descriptor 原子持久化与
+双向校验，document private locator 的格式不属于公共契约。
 """
 
 from __future__ import annotations
@@ -9,6 +10,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
+
+from dayu.fins.ticker_normalization import normalize_ticker
 
 from ._fs_storage_utils import (
     _list_directory,
@@ -64,24 +67,54 @@ def _require_external_identity(value: str, *, field_name: str) -> str:
     return value
 
 
+def _require_canonical_ticker_identity(value: str, *, field_name: str) -> str:
+    """校验并返回 canonical ticker identity。
+
+    ticker 的业务归一化由 ``dayu.fins.ticker_normalization`` 唯一拥有；storage
+    只验证调用方已经传入 canonical 值，不在 mutation/read 边界静默改写 identity。
+
+    Args:
+        value: 调用方传入的 ticker identity。
+        field_name: 错误信息使用的字段名。
+
+    Returns:
+        与 ticker normalization 真源完全一致的 canonical ticker。
+
+    Raises:
+        ValueError: ticker 为空、无法识别或不是 canonical 形态时抛出。
+    """
+
+    identity = _require_external_identity(value, field_name=field_name)
+    try:
+        normalized = normalize_ticker(identity)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 必须是可识别的 canonical ticker") from exc
+    if normalized.canonical != identity:
+        raise ValueError(f"{field_name} 必须使用 canonical ticker")
+    return identity
+
+
 def _derive_storage_key(namespace: _IdentityNamespace, external_identity: str) -> str:
-    """为指定 namespace 派生 private storage key。
+    """为指定 namespace 派生 storage locator key。
 
     Args:
         namespace: storage 私有 identity namespace。
         external_identity: 已由 identity owner 校验的原始业务 identity。
 
     Returns:
-        只供 storage locator 使用的确定性 private key。
+        ticker namespace 返回 canonical ticker；document namespace 返回只供 storage
+        locator 使用的确定性 private key。
 
     Raises:
         ValueError: external identity 非法时抛出。
     """
 
-    identity = _require_external_identity(
-        external_identity,
-        field_name="external identity",
-    )
+    if namespace == _TICKER_IDENTITY_NAMESPACE:
+        return _require_canonical_ticker_identity(
+            external_identity,
+            field_name="ticker identity",
+        )
+    identity = _require_external_identity(external_identity, field_name="external identity")
     digest = hashlib.sha256()
     digest.update(namespace.encode("utf-8"))
     digest.update(b"\0")
@@ -94,7 +127,7 @@ def _identity_directory_path(
     namespace: _IdentityNamespace,
     external_identity: str,
 ) -> Path:
-    """返回 external identity 对应的 private directory locator。
+    """返回 external identity 对应的 directory locator。
 
     Args:
         root: 当前 namespace 的固定 storage root。
@@ -102,7 +135,7 @@ def _identity_directory_path(
         external_identity: 原始业务 identity。
 
     Returns:
-        root 下的 private directory path。
+        root 下的 directory path。
 
     Raises:
         ValueError: external identity 非法时抛出。
@@ -143,7 +176,7 @@ def _ensure_identity_directory(
         external_identity: 原始业务 identity。
 
     Returns:
-        已创建并校验的 private identity directory。
+        已创建并校验的 identity directory。
 
     Raises:
         ValueError: locator、descriptor 或双向映射不一致时抛出。
@@ -201,14 +234,14 @@ def _read_identity_descriptor(
     expected_external_identity: str | None = None,
     expected_storage_key: str | None = None,
 ) -> str:
-    """读取并双向校验 private directory 的 identity descriptor。
+    """读取并双向校验 identity directory 的 identity descriptor。
 
     Args:
-        directory: private identity directory。
+        directory: identity directory。
         namespace: 预期 storage namespace。
         expected_external_identity: lookup 已知的 external identity；枚举时为 ``None``。
         expected_storage_key: directory 名含 transaction 后缀时由 locator owner 传入的
-            原始 private key；普通 identity directory 为 ``None``。
+            原始 locator key；普通 identity directory 为 ``None``。
 
     Returns:
         descriptor 中经校验的 exact external identity。
@@ -263,7 +296,7 @@ def _identity_directory_for_read(
         external_identity: 原始业务 identity。
 
     Returns:
-        对应 private directory；目录不存在时仍返回确定性 locator。
+        对应 identity directory；目录不存在时仍返回确定性 locator。
 
     Raises:
         ValueError: external identity、目录或 descriptor 不合法时抛出。

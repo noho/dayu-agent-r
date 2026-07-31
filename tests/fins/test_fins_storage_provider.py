@@ -2009,10 +2009,10 @@ def test_download_rejection_registry_rejects_mismatched_storage_key(tmp_path: Pa
         batching.rollback_batch(batch)
 
 
-def test_opaque_ticker_and_document_identity_round_trip_all_storage_namespaces(
+def test_canonical_ticker_and_opaque_document_identity_round_trip_all_storage_namespaces(
     tmp_path: Path,
 ) -> None:
-    """opaque ticker/document identity 应跨 source/blob/processed/rejected 精确往返。
+    """canonical ticker 与 opaque document identity 应跨各仓储 namespace 往返。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2021,7 +2021,7 @@ def test_opaque_ticker_and_document_identity_round_trip_all_storage_namespaces(
         无。
 
     Raises:
-        AssertionError: external identity 被路径语义拒绝、归一化或泄漏时抛出。
+        AssertionError: ticker 布局或 document identity 往返语义不一致时抛出。
     """
 
     workspace_root = tmp_path / "fins-document-id-owner-workspace"
@@ -2031,7 +2031,7 @@ def test_opaque_ticker_and_document_identity_round_trip_all_storage_namespaces(
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     filing_repository = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
-    ticker = "../层级\\C:发行人."
+    ticker = "AAPL"
     document_id = "fil_../季度\\C:报告.."
     source_request = SourceDocumentUpsertRequest(
         ticker=ticker,
@@ -2128,14 +2128,16 @@ def test_opaque_ticker_and_document_identity_round_trip_all_storage_namespaces(
         "rejected.htm",
     ) == b"rejected payload"
     assert rejected_meta.uri.startswith("local://")
-    assert ticker not in rejected_meta.uri
+    assert repository_set.core._target_ticker_dir(ticker) == (
+        workspace_root / "portfolio" / ticker
+    )
     assert document_id not in rejected_meta.uri
 
 
-def test_opaque_identity_round_trips_unicode_hierarchy_separator_drive_dot_and_dotdot(
+def test_opaque_document_identity_round_trips_path_shaped_values(
     tmp_path: Path,
 ) -> None:
-    """Unicode、层级分隔、drive、dot 与 dotdot identity 应保持 exact 值。
+    """document identity 的 Unicode、分隔符、drive 与 dot 值应保持 exact。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2144,14 +2146,14 @@ def test_opaque_identity_round_trips_unicode_hierarchy_separator_drive_dot_and_d
         无。
 
     Raises:
-        AssertionError: opaque identity 被路径解释、归一化或丢失时抛出。
+        AssertionError: document identity 被路径解释、归一化或丢失时抛出。
     """
 
     workspace_root = tmp_path / "opaque-identity-variants"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     processed = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
-    ticker = "发行人/层级\\C:.."
+    ticker = "AAPL"
     document_ids = ("文档/层级", "文档\\层级", "C:文档", ".", "..")
     batch = batching.begin_batch(ticker)
     for document_id in document_ids:
@@ -2176,9 +2178,36 @@ def test_opaque_identity_round_trips_unicode_hierarchy_separator_drive_dot_and_d
         for entry in (repository_set.core._target_ticker_dir(ticker) / "processed").iterdir()
         if entry.is_dir()
     }
-    assert ticker not in published_ticker_names
+    assert published_ticker_names == {ticker}
     assert len(processed_names) == len(document_ids)
     assert all(document_id not in processed_names for document_id in document_ids)
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    ("aapl", "aapl.us", "../AAPL", "AAPL/../MSFT", "Apple Inc."),
+)
+def test_storage_rejects_noncanonical_ticker_identity(
+    tmp_path: Path,
+    ticker: str,
+) -> None:
+    """storage mutation boundary 应拒绝非 canonical 或路径形态 ticker。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        ticker: 非 canonical ticker 输入。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: storage 静默归一化或接受非法 ticker 时抛出。
+    """
+
+    batching = FsBatchingRepository(tmp_path)
+
+    with pytest.raises(ValueError, match="canonical ticker"):
+        batching.begin_batch(ticker)
 
 
 def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatch(
@@ -2246,8 +2275,10 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
         company.get_company_meta("AAPL")
 
 
-def test_company_inventory_never_projects_internal_storage_key(tmp_path: Path) -> None:
-    """company inventory 的业务 ticker/detail 不得投影 internal storage key。
+def test_company_inventory_projects_canonical_ticker_and_hides_invalid_candidate(
+    tmp_path: Path,
+) -> None:
+    """company inventory 应投影 canonical ticker 且不泄漏非法目录候选名。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2256,7 +2287,7 @@ def test_company_inventory_never_projects_internal_storage_key(tmp_path: Path) -
         无。
 
     Raises:
-        AssertionError: inventory 泄漏 private locator 时抛出。
+        AssertionError: inventory 未投影 ticker 或泄漏非法目录候选名时抛出。
     """
 
     workspace_root = tmp_path / "company-inventory"
@@ -2265,7 +2296,9 @@ def test_company_inventory_never_projects_internal_storage_key(tmp_path: Path) -
     company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     batch = batching.begin_batch("AAPL")
     batching.commit_batch(batch)
-    private_key = repository_set.core._target_ticker_dir("AAPL").name
+    assert repository_set.core._target_ticker_dir("AAPL") == (
+        workspace_root / "portfolio" / "AAPL"
+    )
     corrupt_key = "corrupt-private-candidate"
     (repository_set.core.portfolio_root / corrupt_key).mkdir()
 
@@ -2280,14 +2313,14 @@ def test_company_inventory_never_projects_internal_storage_key(tmp_path: Path) -
         ],
         ensure_ascii=False,
     )
-    assert private_key not in serialized
+    assert "AAPL" in serialized
     assert corrupt_key not in serialized
 
 
-def test_lock_only_company_inventory_has_no_business_ticker_or_internal_key(
+def test_lock_only_company_inventory_has_no_business_ticker_without_descriptor(
     tmp_path: Path,
 ) -> None:
-    """lock-only candidate 缺少 descriptor 时应保留 typed status 且不投影 key。
+    """lock-only candidate 缺少 descriptor 时应保留 typed status 且不投影 ticker。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2296,14 +2329,14 @@ def test_lock_only_company_inventory_has_no_business_ticker_or_internal_key(
         无。
 
     Raises:
-        AssertionError: lock stem 被误作 ticker 或 detail 泄漏 key 时抛出。
+        AssertionError: lock stem 被误作有效 ticker 或 detail 泄漏 locator 时抛出。
     """
 
     workspace_root = tmp_path / "lock-only-inventory"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
-    ticker = "../仅锁\\C:发行人"
+    ticker = "AAPL"
     batch = batching.begin_batch(ticker)
     private_key = repository_set.core._ticker_lock_path(ticker).name.removesuffix(".lock")
     try:
@@ -2340,7 +2373,7 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
     processed = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     maintenance = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
-    ticker = "发行人/错误\\C:"
+    ticker = "AAPL"
     document_id = "fil_缺失/错误\\.."
     batch = batching.begin_batch(ticker)
     company.upsert_company_meta(
@@ -2357,7 +2390,7 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
     batching.commit_batch(batch)
     target_dir = repository_set.core._target_ticker_dir(ticker)
     document_dir = repository_set.core._processed_dir_for_read(ticker, document_id)
-    private_locators = (target_dir.name, document_dir.name)
+    private_locators = (document_dir.name,)
 
     with pytest.raises(FileNotFoundError) as source_error:
         source.get_source_meta(ticker, document_id, SourceKind.FILING)
@@ -2428,7 +2461,7 @@ def test_public_storage_os_errors_are_path_free_across_read_and_inventory_bounda
         workspace_root,
         repository_set=repository_set,
     )
-    ticker = "发行人/权限\\C:"
+    ticker = "AAPL"
     document_id = "fil_权限/文档\\.."
     handle = SourceHandle(
         ticker=ticker,
@@ -2529,7 +2562,6 @@ def test_public_storage_os_errors_are_path_free_across_read_and_inventory_bounda
     processed_dir = core._processed_dir_for_read(ticker, document_id)
     rejected_dir = core._rejected_filing_meta_path_for_read(ticker, document_id).parent
     private_locators = (
-        target_dir.name,
         source_dir.name,
         processed_dir.name,
         rejected_dir.name,
@@ -2734,7 +2766,7 @@ def test_blob_read_projects_real_socket_io_error_without_private_locator(
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    ticker = "发行人/socket\\C:"
+    ticker = "AAPL"
     document_id = "fil_socket/文档\\.."
     handle = SourceHandle(
         ticker=ticker,
@@ -2790,7 +2822,6 @@ def test_blob_read_projects_real_socket_io_error_without_private_locator(
             expected_errno=expected_errno,
             workspace_root=workspace_root,
             private_locators=(
-                repository_set.core._target_ticker_dir(ticker).name,
                 physical_file.parent.name,
             ),
         )
@@ -2799,7 +2830,7 @@ def test_blob_read_projects_real_socket_io_error_without_private_locator(
         socket_fixture.close()
 
 
-def test_stale_filing_cleanup_uses_descriptor_external_id_in_opaque_layout(
+def test_stale_filing_cleanup_uses_descriptor_external_id_with_canonical_ticker_layout(
     tmp_path: Path,
 ) -> None:
     """stale cleanup 应先由 descriptor 恢复 external ID，再执行 fil_ 业务判断。
@@ -2820,7 +2851,7 @@ def test_stale_filing_cleanup_uses_descriptor_external_id_in_opaque_layout(
     source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     maintenance = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
-    ticker = "发行人/层级"
+    ticker = "AAPL"
     keep_id = "fil_保留/2025\\Q1"
     stale_id = "fil_过期/2024\\Q4"
     batch = batching.begin_batch(ticker)
@@ -3432,7 +3463,8 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
         "aapl-2024-10k",
         SourceKind.FILING,
     )
-    ticker_private_key = repository_set.core._target_ticker_dir("AAPL").name
+    ticker_directory = repository_set.core._target_ticker_dir("AAPL")
+    assert ticker_directory == workspace_root / "portfolio" / "AAPL"
     source_private_key = repository_set.core._source_meta_path_for_read(
         "AAPL",
         "aapl-2024-10k",
@@ -3564,7 +3596,6 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
 
         forbidden_values = (
             revision.token,
-            ticker_private_key,
             source_private_key,
             str(workspace_root),
             str(tmp_path),
@@ -4094,6 +4125,44 @@ def test_list_documents_executes_through_current_tool_runtime(tmp_path: Path) ->
     assert isinstance(value, Mapping)
     assert value.get("matched") == 1
     assert "ok" not in value
+
+
+@pytest.mark.parametrize("ticker", ("aapl.us", "apple"))
+def test_list_documents_resolves_ticker_variant_and_alias_to_canonical_directory(
+    tmp_path: Path,
+    ticker: str,
+) -> None:
+    """list_documents 应把 ticker 变体与 alias 解析到同一 canonical 目录。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        ticker: 归一化变体或公司 ticker alias。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: read runtime 绕过 resolver 或无法读取 canonical 目录时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    definition = _definitions_by_name(_discover_definitions(workspace_root))["list_documents"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("list_documents", {"ticker": ticker}),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = outcome.result.value
+    assert isinstance(value, Mapping)
+    company = value.get("company")
+    assert isinstance(company, Mapping)
+    assert company.get("ticker") == "AAPL"
+    assert value.get("matched") == 1
+    assert workspace_root.joinpath("portfolio", "AAPL").is_dir()
 
 
 def test_list_documents_pre_cancel_returns_cancelled_outcome(tmp_path: Path) -> None:

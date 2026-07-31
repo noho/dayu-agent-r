@@ -570,7 +570,7 @@ def test_begin_batch_projects_pathful_journal_oserror_graph_without_publishing_s
     monkeypatch.setattr(core, "_write_batch_journal", _fail_journal)
 
     with pytest.raises(PermissionError) as exc_info:
-        core.begin_batch("发行人/batch\\C:")
+        core.begin_batch("AAPL")
 
     assert states
     state = states[0]
@@ -589,7 +589,6 @@ def test_begin_batch_projects_pathful_journal_oserror_graph_without_publishing_s
         forbidden_locators=(
             str(core.workspace_root),
             state.staging_root_dir.name,
-            state.staging_ticker_dir.name,
             state.backup_dir.name,
             core._ticker_lock_path(state.token.ticker).name,
             "journal denied",
@@ -621,7 +620,7 @@ def test_runtime_lock_acquire_error_graph_is_path_free_at_public_batch_boundary(
 
     core = _build_core(tmp_path)
     core.ensure_batch_recovery()
-    ticker = "发行人/runtime-acquire\\C:"
+    ticker = "AAPL"
     lock_path = core._ticker_lock_path(ticker)
     lock_root_mode = core._batch_lock_root.stat().st_mode & 0o777
     acquired_batch: BatchToken | None = None
@@ -702,7 +701,7 @@ def test_runtime_lock_release_error_graph_is_path_free_at_public_batch_boundary(
     """
 
     core = _build_core(tmp_path)
-    ticker = "发行人/runtime-release\\C:"
+    ticker = "AAPL"
     batch = core.begin_batch(ticker)
     state = _only_active_batch_state(core)
     lock_path = state.writer_lock_token.lock_path
@@ -866,13 +865,13 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     batches = {
         ticker: batching.begin_batch(ticker)
-        for ticker in ("AAPL", "MSFT", "DUP1", "DUP2")
+        for ticker in ("AAPL", "MSFT", "DUP-A", "DUP-B")
     }
     for ticker, aliases in (
         ("AAPL", ["APPLE"]),
         ("MSFT", ["MICROSOFT"]),
-        ("DUP1", ["DUPLICATE"]),
-        ("DUP2", ["DUPLICATE"]),
+        ("DUP-A", ["DUPLICATE"]),
+        ("DUP-B", ["DUPLICATE"]),
     ):
         company.upsert_company_meta(
             CompanyMeta(
@@ -890,15 +889,16 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
         batching.commit_batch(batch)
 
     assert company.get_company_meta("AAPL").company_name == "AAPL Inc."
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="canonical ticker"):
         company.get_company_meta("aapl")
     assert company.resolve_existing_ticker(["aapl"]) == "AAPL"
+    assert company.resolve_existing_ticker(["aapl.us"]) == "AAPL"
     assert company.resolve_existing_ticker(["apple"]) == "AAPL"
     assert company.resolve_existing_ticker(["not-listed"]) is None
     with pytest.raises(ValueError, match="命中多个公司目录"):
         company.resolve_existing_ticker(["duplicate"])
     with pytest.raises(FileNotFoundError):
-        company.get_company_meta("NOT-LISTED")
+        company.get_company_meta("NONE")
 
     (repository_set.core.portfolio_root / ".hidden").mkdir()
     missing_batch = batching.begin_batch("MISSING")
@@ -1488,7 +1488,7 @@ def test_maintenance_public_file_read_delegates_to_unguarded_helper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """maintenance public read 应规范化 identity 后只委托 private unguarded helper。
+    """maintenance public read 应校验 canonical ticker 后委托 unguarded helper。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1514,8 +1514,8 @@ def test_maintenance_public_file_read_delegates_to_unguarded_helper(
         """记录 public entry 向 private helper 的 exact identity 委托参数。
 
         Args:
-                normalized_ticker: exact external ticker。
-                normalized_document_id: exact external document ID。
+            normalized_ticker: canonical ticker。
+            normalized_document_id: exact external document ID。
             filename: 原始文件名。
 
         Returns:
@@ -1535,11 +1535,11 @@ def test_maintenance_public_file_read_delegates_to_unguarded_helper(
     )
 
     assert maintenance.read_rejected_filing_file_bytes(
-        " aapl ",
+        "AAPL",
         " fil_rejected ",
         "rejected.htm",
     ) == b"delegated"
-    assert calls == [(" aapl ", " fil_rejected ", "rejected.htm")]
+    assert calls == [("AAPL", " fil_rejected ", "rejected.htm")]
 
 
 def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path: Path) -> None:
@@ -1957,9 +1957,9 @@ def test_store_file_allows_blob_first_source_but_requires_processed_meta(
         assert len(put_keys) == 1
         object_key_parts = put_keys[0].split("/")
         assert len(object_key_parts) == 4
+        assert object_key_parts[0] == "AAPL"
         assert object_key_parts[1] == "filings"
         assert object_key_parts[3] == "report.md"
-        assert "AAPL" not in put_keys[0]
         assert "blob-first" not in put_keys[0]
     else:
         assert put_keys == []
@@ -2706,10 +2706,10 @@ def test_unparseable_journal_preserves_evidence_and_later_orphan_recovers(
     assert not valid_paths.staging_root_dir.exists()
 
 
-def test_opaque_journal_ticker_cannot_escape_private_recovery_locator(
+def test_invalid_journal_ticker_cannot_escape_canonical_recovery_locator(
     tmp_path: Path,
 ) -> None:
-    """路径形态 opaque journal ticker 只能映射到 private recovery locator。
+    """路径形态 journal ticker 必须被拒绝且不能逃逸 canonical locator。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2718,7 +2718,7 @@ def test_opaque_journal_ticker_cannot_escape_private_recovery_locator(
         无。
 
     Raises:
-        AssertionError: opaque ticker 逃逸、改写他方 target 或阻断合法恢复时抛出。
+        AssertionError: 非法 ticker 逃逸、改写他方 target 或阻断合法恢复时抛出。
     """
 
     core = _build_core(tmp_path)
@@ -2743,7 +2743,12 @@ def test_opaque_journal_ticker_cannot_escape_private_recovery_locator(
 
     actions = core.recover_orphan_batches()
 
-    assert not invalid_transaction_dir.exists()
+    assert invalid_transaction_dir.exists()
+    assert (
+        f"skip batch transaction={invalid_transaction_dir.name} "
+        "reason=invalid_journal_ticker"
+        in actions
+    )
     assert any(
         action.startswith(
             f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}"
@@ -2755,10 +2760,10 @@ def test_opaque_journal_ticker_cannot_escape_private_recovery_locator(
     assert not valid_paths.staging_root_dir.exists()
 
 
-def test_orphan_backup_requires_descriptor_and_recovers_opaque_identity(
+def test_orphan_backup_requires_descriptor_and_recovers_canonical_ticker(
     tmp_path: Path,
 ) -> None:
-    """orphan backup 必须由 descriptor 恢复 external ticker，损坏项 fail closed。
+    """orphan backup 必须由 descriptor 恢复 canonical ticker，损坏项 fail closed。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2776,9 +2781,9 @@ def test_orphan_backup_requires_descriptor_and_recovers_opaque_identity(
     _write_state(protected_target, "published")
     invalid_backup = core.backup_root / "corrupt-private-key.bak.000-invalid-backup"
     _write_state(invalid_backup, "invalid")
-    opaque_ticker = "../MSFT\\C:恢复"
-    valid_target = core._target_ticker_dir(opaque_ticker)
-    core._ensure_ticker_structure(valid_target, opaque_ticker)
+    ticker = "MSFT"
+    valid_target = core._target_ticker_dir(ticker)
+    core._ensure_ticker_structure(valid_target, ticker)
     _write_state(valid_target, "valid")
     valid_backup = core.backup_root / f"{valid_target.name}.bak.999-valid-backup"
     core._replace_directory(valid_target, valid_backup)
@@ -2789,7 +2794,7 @@ def test_orphan_backup_requires_descriptor_and_recovers_opaque_identity(
         "preserve backup transaction=000-invalid-backup reason=invalid_identity_descriptor"
         in actions
     )
-    assert f"restore backup ticker={opaque_ticker} transaction=999-valid-backup" in actions
+    assert f"restore backup ticker={ticker} transaction=999-valid-backup" in actions
     assert invalid_backup.exists()
     assert (invalid_backup / "state.txt").read_text(encoding="utf-8") == "invalid"
     assert (protected_target / "state.txt").read_text(encoding="utf-8") == "published"
@@ -2801,11 +2806,11 @@ def test_orphan_backup_requires_descriptor_and_recovers_opaque_identity(
     "phase",
     (_PHASE_STARTED, _PHASE_BACKED_UP_TARGET, _PHASE_SWAPPED_TARGET, _PHASE_COMMITTED),
 )
-def test_recovery_round_trips_opaque_ticker_without_path_name_inference(
+def test_recovery_round_trips_canonical_ticker_from_journal_and_descriptor(
     tmp_path: Path,
     phase: str,
 ) -> None:
-    """每个 crash phase 均应由 journal/descriptor 恢复 opaque ticker old/new。
+    """每个 crash phase 均应由 journal/descriptor 恢复 canonical ticker old/new。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2819,7 +2824,7 @@ def test_recovery_round_trips_opaque_ticker_without_path_name_inference(
     """
 
     core = _build_core(tmp_path)
-    ticker = "../发行人\\C:恢复/.."
+    ticker = "AAPL"
     paths = _seed_orphan_batch(
         core,
         phase=phase,
@@ -2833,7 +2838,7 @@ def test_recovery_round_trips_opaque_ticker_without_path_name_inference(
     assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == expected
     assert not paths.backup_dir.exists()
     assert not paths.staging_root_dir.exists()
-    assert all(paths.target_ticker_dir.name not in action for action in actions)
+    assert any("ticker=AAPL" in action for action in actions)
 
 
 def test_recovery_rejects_symlinked_transaction_directory_without_escape(tmp_path: Path) -> None:
@@ -3767,7 +3772,7 @@ def test_complete_validator_rejects_identity_descriptor_symlink_and_mismatch(
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    ticker = "发行人/descriptor"
+    ticker = "AAPL"
     document_id = "fil_文档/descriptor"
     batch = batching.begin_batch(ticker)
     handle = SourceHandle(
@@ -3834,10 +3839,10 @@ def test_complete_validator_rejects_identity_descriptor_symlink_and_mismatch(
         ] == document_id
 
 
-def test_filename_absolute_and_local_uri_attacks_remain_rejected_for_opaque_id_documents(
+def test_filename_absolute_and_local_uri_attacks_remain_rejected_for_opaque_documents(
     tmp_path: Path,
 ) -> None:
-    """opaque identity 不得放宽 filename 与 local URI containment 边界。
+    """opaque document identity 不得放宽 filename 与 local URI containment 边界。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -3854,7 +3859,7 @@ def test_filename_absolute_and_local_uri_attacks_remain_rejected_for_opaque_id_d
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    ticker = "../发行人\\C:"
+    ticker = "AAPL"
     document_id = "fil_../文档\\层级"
     batch = batching.begin_batch(ticker)
     handle = SourceHandle(

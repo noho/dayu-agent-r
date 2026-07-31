@@ -3103,7 +3103,7 @@ Engine ingest 接受 `ITERATION_STARTED` 后，Host 必须通过追加式 `RUNNE
 | `runner_call_projection_artifact_size_bytes` | `int | null` | no | bounded projection payload/artifact size summary | non-negative when present |
 | `message_entries` | `list[RunnerCallMessageEntry]` | yes | per-message lightweight provenance and digest | length equals `message_count`; indexes contiguous |
 | `source_cursor_refs` | `list[HostInternalRef]` | yes | EventLog cursor, memory cursor, compact boundary or equivalent source boundary | every ref must resolve or produce limited-signal diagnostic |
-| `tool_schema_snapshot_refs` | `list[HostInternalRef]` | no | selected tool schema snapshot ref / digest / size visible to the call | required when tools are available |
+| `tool_schema_snapshot_refs` | `list[HostInternalRef]` | no | Host 冻结的 selected tool schema source snapshot ref / digest / size；pre-start ordinary call 中表达 Host 交给 Engine 的工具集，Engine-only continuation 中复用同 Attempt 首个 pre-start source 供 reconstruction / sizing | pre-start 有工具时 required；不得据此反推 Engine 内部单轮 Runner call 的工具收窄策略 |
 | `memory_snapshot_cursor_ref` | `HostInternalRef | null` | no | memory read model cursor used by RunInputBuilder | missing historical snapshot body leaves manifest valid and emits limited-signal for body reconstruction |
 | `compact_artifact_refs` | `list[HostInternalRef]` | no | accepted compact artifacts or fallback diagnostic artifacts used in input selection | refs must point to accepted compact or explicit fallback diagnostic |
 | `context_fallback_decision_ref` | `HostInternalRef | null` | no | tiered dispatch fallback decision when compaction recovery failed but dispatch continued | present only when tier 4/5 fallback affected this input |
@@ -3168,7 +3168,17 @@ Closed `RunnerCallTriggerReason` enum：
 | `context_compaction_repair_attempt` | compactor repair attempt after proposal rejection |
 | `context_compaction_retry_attempt` | compactor retry attempt after proposal execution failure |
 
-`runner_call_kind` 表达互不重叠的 logical call business kind；forced answer、length continuation、retry/replay/resume 只作为 trigger reason，不挤入 kind。该分类必须覆盖 ordinary initial / follow-up、tool result continuation、post compaction dispatch、compactor proposal、retry / replay / resume、forced answer 与 length continuation，且一个 runner call 只能有一个 kind。
+`runner_call_kind` 表达互不重叠的 logical call business kind；forced answer、length continuation、retry/replay/resume 只作为 trigger reason，不挤入 kind。该分类必须覆盖 ordinary initial / follow-up、tool result continuation、post compaction dispatch、compactor proposal、retry / replay / resume 与 length continuation，且一个 runner call 只能有一个 kind。`force_answer_after_tool_limit` 只有在 producer 提供 typed trigger fact 时才能使用；不得从消息文本或日志推断。
+
+Engine-only continuation 的 `IterationStartedData` 只投影本轮实际 Runner
+messages，不投影本轮 tool schemas、`disable_tools` 或 typed fallback kind。因此该路径
+写入的 `tool_schema_snapshot_refs` 是 Host 从同 Attempt 首个 pre-start manifest
+严格恢复的 frozen source，用于 continuation reconstruction 与 conservative sizing；
+它不承诺等于 Engine 内部该轮实际传给 Runner 的工具集。`force_answer` fallback
+以 `tools=()` 调用 Runner 是 Engine-owned 策略，Host 不得根据 fallback prompt
+字符串、iteration index、日志或 frozen source snapshot 反推并另建一份事实。若未来
+public Tool Trace 必须展示 Engine 内部每轮实际工具可见性，应先在 EngineEvent 中增加
+typed per-iteration tool-set projection，再由 Host manifest 和 Tool Trace 同源消费。
 
 Manifest size-boundary 不变量：
 

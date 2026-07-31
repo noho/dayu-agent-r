@@ -11,8 +11,9 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 import inspect
 from dataclasses import dataclass
+from pathlib import PureWindowsPath
 from collections.abc import Callable
-from typing import Awaitable, Optional, TypeVar
+from typing import Awaitable, Final, Optional, TypeVar
 
 from dayu.fins.downloaders.sec_downloader import RemoteFileDescriptor, SecDownloader
 from dayu.fins.pipelines.sec_6k_rules import (
@@ -46,6 +47,9 @@ class FilingRecord:
 
 
 _AwaitableResult = TypeVar("_AwaitableResult")
+_SEC_PRIMARY_DOCUMENT_SEPARATOR: Final[str] = "/"
+_SEC_PRIMARY_DOCUMENT_BACKSLASH: Final[str] = "\\"
+_INVALID_SEC_PRIMARY_DOCUMENT_SEGMENTS: Final[frozenset[str]] = frozenset({".", ".."})
 
 
 async def _maybe_await(value: Awaitable[_AwaitableResult] | _AwaitableResult) -> _AwaitableResult:
@@ -72,6 +76,45 @@ def _json_list(value: JsonValue | None) -> list[JsonValue]:
     if isinstance(value, list):
         return value
     return []
+
+
+def _normalize_sec_primary_document_name(value: JsonValue) -> str:
+    """把 SEC submissions 的主文档引用投影为归档文件名。
+
+    SEC 会在部分 XML filing 的 ``primaryDocument`` 前附加 XSL 展示转换目录，
+    但 filing archive 的业务文件仍是最后一个路径组件。本函数只接受严格的
+    POSIX 相对路径语法，不修复遍历、空 segment 或平台路径。
+
+    Args:
+        value: SEC submissions ``primaryDocument`` 原始值。
+
+    Returns:
+        可作为归档文件名和仓储单文件名使用的最后一个路径组件。
+
+    Raises:
+        ValueError: 值不是字符串、为空、包含非法路径语法或不是单文件名时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise ValueError("SEC primaryDocument 必须为字符串")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("SEC primaryDocument 不能为空")
+    if _SEC_PRIMARY_DOCUMENT_BACKSLASH in normalized:
+        raise ValueError("SEC primaryDocument 不能包含反斜杠")
+    if normalized.startswith(_SEC_PRIMARY_DOCUMENT_SEPARATOR):
+        raise ValueError("SEC primaryDocument 不能是绝对路径")
+    if normalized.endswith(_SEC_PRIMARY_DOCUMENT_SEPARATOR):
+        raise ValueError("SEC primaryDocument 不能以路径分隔符结尾")
+    segments = normalized.split(_SEC_PRIMARY_DOCUMENT_SEPARATOR)
+    if any(
+        not segment or segment in _INVALID_SEC_PRIMARY_DOCUMENT_SEGMENTS
+        for segment in segments
+    ):
+        raise ValueError("SEC primaryDocument 包含非法路径 segment")
+    if any(PureWindowsPath(segment).drive for segment in segments):
+        raise ValueError("SEC primaryDocument 不能包含盘符")
+    return segments[-1]
 
 
 # ---------- 函数 ----------
@@ -124,7 +167,9 @@ def collect_filings_from_table(
             filing_date=filing_date_value.isoformat(),
             report_date=report_date or None,
             accession_number=accession_number,
-            primary_document=str(primary_documents[index]).strip(),
+            primary_document=_normalize_sec_primary_document_name(
+                primary_documents[index]
+            ),
             filer_key=filer_key or None,
         )
 

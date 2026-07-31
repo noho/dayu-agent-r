@@ -17,7 +17,6 @@ from dayu.cli.exit_codes import (
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
 )
-from dayu.cli.host_context import CLI_SIGINT_REASON
 from dayu.cli.session_identity import display_identity_from_slot
 from dayu.fins.direct_events import (
     FinsEvent,
@@ -51,7 +50,6 @@ _SESSION_LIST_HEADER: Final[str] = "\t".join(
 _PURGE_TOMBSTONE_PREFIX_CHARS: Final[int] = 12
 _FAILED_FALLBACK_MESSAGE: str = "Host run failed without error message."
 _LOST_FALLBACK_MESSAGE: str = "Host run lost without error message."
-_CANCELLED_FALLBACK_MESSAGE: str = "Host run cancelled."
 _USER_CANCELLED_MESSAGE: str = "Cancelled."
 _MISSING_FINAL_ANSWER_MESSAGE: str = "Host run succeeded without final answer."
 _FINS_CANCEL_REQUESTED_MESSAGE: str = "Fins operation cancel requested."
@@ -94,7 +92,7 @@ def render_prompt_terminal_result(
         return EXIT_SUCCESS
     if result.terminal_status is HostTerminalStatus.CANCELLED:
         print(
-            _public_cancel_message(result.cancel_reason),
+            _public_cancel_message(),
             file=effective_stderr,
         )
         return EXIT_KEYBOARD_INTERRUPT
@@ -133,7 +131,7 @@ def render_interactive_terminal_result(
         return EXIT_SUCCESS
     if result.terminal_status is HostTerminalStatus.CANCELLED:
         print(
-            _public_cancel_message(result.cancel_reason),
+            _public_cancel_message(),
             file=effective_stderr,
         )
         return EXIT_SUCCESS
@@ -141,17 +139,14 @@ def render_interactive_terminal_result(
     return EXIT_FAILURE
 
 
-def _public_cancel_message(cancel_reason: str | None) -> str:
-    """把内部取消 reason 映射为 CLI 用户可读文案。
+def _public_cancel_message() -> str:
+    """返回 CLI 用户可读的取消终态文案。
 
-    :param cancel_reason: Host terminal result 中的取消 reason；无则为 ``None``。
     :returns: 面向终端用户的取消说明。
     :raises Exception: 不主动抛出异常。
     """
 
-    if cancel_reason == CLI_SIGINT_REASON:
-        return _USER_CANCELLED_MESSAGE
-    return cancel_reason or _CANCELLED_FALLBACK_MESSAGE
+    return _USER_CANCELLED_MESSAGE
 
 
 def render_cli_error(message: str, *, stderr: TextIO | None = None) -> None:

@@ -20,6 +20,7 @@ from dayu.host.api import (
     CreateSessionRequest,
     EnsureSessionRequest,
     FollowupBehavior,
+    FollowupSnapshot,
     Host,
     HostApiError,
     HostApiErrorCode,
@@ -49,6 +50,7 @@ from dayu.host.api import (
     OutboxTerminalItem,
     ReadOutboxTerminalItemsRequest,
     SessionSnapshot,
+    SubmitFollowupRequest,
     is_terminal_run_status,
 )
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
@@ -1054,10 +1056,13 @@ async def submit_entrypoint_turn_and_wait(
             host_assembly=host_assembly,
             run_overrides=request.run_overrides,
         )
-        followup = await host.submit_followup(request.session_id, submit_request)
-        runtime.state.bind(followup.accepted_run_id)
-        if on_run_accepted is not None:
-            on_run_accepted(followup.accepted_run_id)
+        followup = await _submit_followup_through_acceptance_barrier(
+            host,
+            session_id=request.session_id,
+            request=submit_request,
+            state=runtime.state,
+            on_run_accepted=on_run_accepted,
+        )
     except BaseException as error:
         cleanup_error = await _close_watch_and_wait_runtime(runtime)
         _raise_primary_with_cleanup(error, cleanup_error)
@@ -1072,6 +1077,57 @@ async def submit_entrypoint_turn_and_wait(
         poll_interval_seconds=poll_interval_seconds,
         sleep=sleep,
     )
+
+
+async def _submit_followup_through_acceptance_barrier(
+    host: Host,
+    *,
+    session_id: str,
+    request: SubmitFollowupRequest,
+    state: _ServiceObservationState,
+    on_run_accepted: RunAcceptedCallback | None,
+) -> FollowupSnapshot:
+    """等待 Host submit 的确定结果，并在传播 caller cancellation 前发布 accepted Run。
+
+    Host durable mutation 会隔离 caller cancellation：调用方停止等待时，事务仍可能完成。
+    因此 Service 必须把 public submit response、观察状态绑定和 accepted callback 视为同一
+    acceptance barrier。只有确认 Host 没有接受 Run，或已把 accepted Run id 交给调用方后，
+    才能传播取消；这样 UI adapter 才能对 durable Run 发起 canonical cancel。
+
+    :param host: Host public Protocol handle。
+    :param session_id: 目标 Session id。
+    :param request: 已组装的 public follow-up 请求。
+    :param state: 当前单目标终态观察状态。
+    :param on_run_accepted: 可选 accepted Run 通知回调。
+    :returns: Host follow-up 接受结果。
+    :raises asyncio.CancelledError: caller cancellation 在 Host 明确未接受 Run，或
+        accepted Run 已发布后传播；Host 自身取消 submit 时原样传播。
+    :raises Exception: caller 尚未取消时，Host submit、状态绑定或 callback 失败会
+        原样传播。
+    """
+
+    submit_task = asyncio.create_task(host.submit_followup(session_id, request))
+    caller_cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            followup = await asyncio.shield(submit_task)
+            break
+        except asyncio.CancelledError as error:
+            if submit_task.cancelled():
+                raise
+            if caller_cancellation is None:
+                caller_cancellation = error
+        except Exception:
+            if caller_cancellation is not None:
+                raise caller_cancellation
+            raise
+
+    state.bind(followup.accepted_run_id)
+    if on_run_accepted is not None:
+        on_run_accepted(followup.accepted_run_id)
+    if caller_cancellation is not None:
+        raise caller_cancellation
+    return followup
 
 
 async def cancel_entrypoint_run_and_wait(

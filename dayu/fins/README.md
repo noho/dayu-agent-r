@@ -112,7 +112,7 @@ download / upload overwrite 是单目标替换语义，不是 ticker 级清空�
 
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
-文件系统仓储把 external ticker / document ID 作为 exact opaque identity 保存，并由 storage-private mapping key 与 identity descriptor 唯一完成业务 identity 到物理目录的双向映射；lookup、枚举、staging、publication、backup 与 recovery 都必须验证 descriptor，不从目录名、lock stem 或路径文本反推业务 identity。filename、primary filename、manifest entry、object key 与 local URI 仍保持单路径组件、containment 与 symlink fail-closed 边界；调用方不得把 identity 规则与 filename/path 规则混用，也不得在下游补偿损坏映射。
+文件系统仓储只接受 `dayu.fins.ticker_normalization` 已产生的 canonical ticker，并把 ticker 物理目录固定为 `portfolio/<canonical ticker>`；storage 不在读写边界静默归一化 ticker。document ID 仍作为 exact opaque identity 保存，并由 storage-private mapping key 隔离路径语义。ticker 与 document 目录都持有 identity descriptor，lookup、枚举、staging、publication、backup 与 recovery 必须双向校验 descriptor；损坏或非 canonical ticker 失败关闭，不由下游工具补偿。filename、SEC `primaryDocument` 投影后的文件名、manifest entry、object key 与 local URI 保持单路径组件、containment 与 symlink fail-closed 边界。
 
 financial statement result contract 由 `dayu.fins.domain.financial_result_contract` 持有。processor 必须显式产生 `statement_type`、`periods`、`rows`、`currency`、`units`、`scale` 与 `data_quality`；`reason` 仅在 `partial` 时出现并给出稳定、可操作的降级原因，`xbrl/extracted` 完整结果省略该字段。`units` 只表达货币或计量单位，`scale` 独立表达 `units/thousands/millions/billions` 数值倍率；存在 rows 但缺少直接 scale 或 fiscal 证据时保持已有数据并降级为 `partial`，不得由 read runtime 补默认值。工具公共结果只在同一 typed projection 中组合 ticker、document ID、同版 citation 与这些业务字段。
 

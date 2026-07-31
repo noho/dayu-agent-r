@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from dayu.fins.ticker_normalization import try_normalize_ticker
+
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -251,13 +253,16 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
         """
 
         for candidate in candidates:
-            external_ticker = _require_external_identity(candidate, field_name="ticker")
-            guard_token = self._acquire_publication_guard(external_ticker)
+            normalized_candidate = try_normalize_ticker(candidate)
+            if normalized_candidate is None:
+                continue
+            canonical_ticker = normalized_candidate.canonical
+            guard_token = self._acquire_publication_guard(canonical_ticker)
             try:
-                ticker_dir = self._target_ticker_dir(external_ticker)
+                ticker_dir = self._target_ticker_dir(canonical_ticker)
                 if ticker_dir.exists():
-                    self._ticker_dir_for_read(external_ticker)
-                    return external_ticker
+                    self._ticker_dir_for_read(canonical_ticker)
+                    return canonical_ticker
             finally:
                 self._release_lock_token(guard_token)
         return self._resolve_existing_ticker_by_company_alias(candidates)
@@ -373,13 +378,13 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
         return alias_index
 
     def _published_ticker_candidate_keys(self) -> list[str]:
-        """收集 published、backup 与 lock locator 的 private ticker candidates。
+        """收集 published、backup 与 lock locator 的 ticker candidates。
 
         Args:
             无。
 
         Returns:
-            排序且去重的 private candidate keys；调用方不得把它们投影为业务 ticker。
+            排序且去重的 locator candidate keys；descriptor 校验前不得投影为业务 ticker。
 
         Raises:
             OSError: 文件系统访问失败时抛出。

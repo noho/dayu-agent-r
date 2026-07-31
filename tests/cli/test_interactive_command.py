@@ -465,6 +465,54 @@ class _FakeHost:
         return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
 
 
+class _DurablyAcceptedDelayedResponseHost(_FakeHost):
+    """模拟 interactive Run 已 durable accepted、但 submit response 延迟的 Host。"""
+
+    committed: asyncio.Event
+    release_response: asyncio.Event
+
+    def __init__(self) -> None:
+        """初始化 durable acceptance 与 response barrier。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(
+            cancel_status=HostTerminalStatus.CANCELLED,
+            run_statuses=(RunStatus.RUNNING,),
+        )
+        self.committed = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """记录 durable acceptance，并等待测试释放 public response。
+
+        :param session_id: 目标 Session id。
+        :param request: SubmitFollowupRequest。
+        :returns: accepted Run 的 FollowupSnapshot。
+        :raises asyncio.CancelledError: response barrier 被取消时透传。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append(request)
+        self.committed.set()
+        await self.release_response.wait()
+        return FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.QUEUE,
+            accepted_run_id="run-1",
+            accepted_run_status=RunStatus.RUNNING,
+            command_watermark=HostStreamCursor(event_sequence=1),
+            queued_run_id=None,
+            target_run_id=None,
+        )
+
+
 class _FakeOpenHostContext:
     """fake open_host async context manager。"""
 
@@ -760,6 +808,62 @@ class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
             await asyncio.sleep(0)
         self.notify()
         return self.count
+
+
+class _TwoSigintsBeforeSubmitResponseMonitor(CliSigintMonitor):
+    """在 durable acceptance 后、submit response 前连续触发两次 SIGINT。"""
+
+    host: _DurablyAcceptedDelayedResponseHost
+    closed_count: int
+
+    def __init__(self, host: _DurablyAcceptedDelayedResponseHost) -> None:
+        """保存 response barrier Host。
+
+        :param host: 提供 commit/response barrier 的 fake Host。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.host = host
+        self.closed_count = 0
+
+    def install(self) -> None:
+        """测试中不安装真实 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    def close(self) -> None:
+        """记录 interactive turn 已关闭 monitor。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.closed_count += 1
+
+    async def wait_next(self, observed_count: int) -> int:
+        """依次触发两次 SIGINT，第二次同时释放 submit response。
+
+        :param observed_count: 调用方已经观察的 SIGINT 计数。
+        :returns: 第一次或第二次 SIGINT 后的新计数；后续调用保持等待。
+        :raises asyncio.CancelledError: 第三次等待由 lifecycle cleanup 取消时透传。
+        """
+
+        if observed_count == 0:
+            await self.host.committed.wait()
+            self.notify()
+            return self.count
+        if observed_count == 1:
+            self.notify()
+            self.host.release_response.set()
+            return self.count
+        await asyncio.Event().wait()
+        return observed_count
 
 
 def test_interactive_label_reuses_host_slot_and_fills_context_slots(
@@ -1684,7 +1788,8 @@ def test_interactive_failed_and_cancelled_continue_until_eof(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-3"
     assert "failed for run-1" in captured.err
-    assert "cancelled for run-2" in captured.err
+    assert "Cancelled." in captured.err
+    assert "cancelled for run-2" not in captured.err
     assert len(fake_host.submit_requests) == 3
 
 
@@ -1872,6 +1977,45 @@ async def test_interactive_sigint_after_run_id_cancels_host_run(
     assert cancel_request.mode is CancelMode.GRACEFUL
     assert cancel_request.client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
     assert cancel_request.context.operation_context.operation_name == ("dayu_cli.interactive.cancel_run")
+
+
+@pytest.mark.asyncio
+async def test_interactive_double_sigint_during_acceptance_handoff_cancels_run(
+    tmp_path: Path,
+) -> None:
+    """acceptance handoff 内连续 SIGINT 仍必须对已接受 Run 做 canonical cancel。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: accepted handoff、cancel 或 terminal 断言失败时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    fake_host = _DurablyAcceptedDelayedResponseHost()
+    sigint_monitor = _TwoSigintsBeforeSubmitResponseMonitor(fake_host)
+
+    result = await session_execution._submit_interactive_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=session_execution.new_cli_invocation(
+            command_name="interactive",
+            scenario="interactive",
+            display_user="本地 CLI 用户",
+            ticker="AAPL",
+        ),
+        session_id="session-1",
+        turn_index=1,
+        user_prompt="请总结收入变化",
+        run_overrides=ServiceRunOverrides(),
+        sigint_monitor=sigint_monitor,
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert len(fake_host.cancel_requests) == 1
+    assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
+    assert sigint_monitor.count == 2
+    assert sigint_monitor.closed_count == 1
 
 
 @pytest.mark.asyncio
@@ -2197,6 +2341,28 @@ async def test_wait_for_run_id_returns_none_when_second_sigint_wins() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_run_id_keeps_acceptance_published_during_second_sigint() -> None:
+    """第二次 SIGINT 等待结束后不得丢弃 cancellation barrier 发布的 Run id。"""
+
+    accepted_run = session_execution._InteractiveAcceptedRunState()
+    submit_task = asyncio.create_task(
+        _accept_run_while_propagating_cancellation(accepted_run)
+    )
+    await asyncio.sleep(0)
+
+    result = await session_execution._wait_for_run_id_or_local_exit(
+        accepted_run=accepted_run,
+        submit_task=submit_task,
+        sigint_monitor=_ImmediateSecondSigintMonitor(),
+        observed_sigint_count=1,
+    )
+
+    assert isinstance(result, session_execution._RunIdAccepted)
+    assert result.run_id == "run-1"
+    assert submit_task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_first() -> None:
     """等待 run id 阶段 submit task 先返回成功终态时不得映射成本地 130。"""
 
@@ -2368,6 +2534,24 @@ async def _never_finishes_terminal() -> EntrypointRunTerminalResult:
 
     await asyncio.Event().wait()
     raise AssertionError("terminal task should be cancelled")
+
+
+async def _accept_run_while_propagating_cancellation(
+    accepted_run: session_execution._InteractiveAcceptedRunState,
+) -> EntrypointRunTerminalResult:
+    """在收到 caller cancellation 后发布 accepted Run id 并传播取消。
+
+    :param accepted_run: 待写入的 interactive accepted state。
+    :returns: 正常路径不会返回。
+    :raises asyncio.CancelledError: 发布 accepted Run id 后传播 caller cancellation。
+    """
+
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        accepted_run.record("run-1")
+        raise
+    raise AssertionError("submit task should be cancelled")
 
 
 async def _already_terminal(
