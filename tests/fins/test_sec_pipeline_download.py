@@ -185,6 +185,8 @@ def test_normalize_sec_primary_document_preserves_single_filename() -> None:
         "xsl/../primary_doc.xml",
         "xsl//primary_doc.xml",
         "C:primary_doc.xml",
+        "C:/primary_doc.xml",
+        "xsl/C:/primary_doc.xml",
         None,
     ),
 )

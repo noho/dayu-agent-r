@@ -112,10 +112,9 @@ def _normalize_sec_primary_document_name(value: JsonValue) -> str:
         for segment in segments
     ):
         raise ValueError("SEC primaryDocument 包含非法路径 segment")
-    filename = segments[-1]
-    if PureWindowsPath(filename).drive:
-        raise ValueError("SEC primaryDocument 文件名不能包含盘符")
-    return filename
+    if any(PureWindowsPath(segment).drive for segment in segments):
+        raise ValueError("SEC primaryDocument 不能包含盘符")
+    return segments[-1]
 
 
 # ---------- 函数 ----------
