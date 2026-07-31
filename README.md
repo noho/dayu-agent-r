@@ -236,7 +236,9 @@ dayu-cli download --ticker 0700 --rebuild
 
 可用参数以 `dayu-cli download --help` 为准：`--forms`、`--start`、`--end`、
 `--overwrite` 和 `--rebuild`。下载、上传和预处理命令会输出 direct progress 与
-终态摘要；`Ctrl-C` 请求取消当前 direct operation。
+终态摘要；`Ctrl-C` 请求取消当前 direct operation。财报保存在
+`<workspace>/portfolio/<规范 ticker>/`，例如 AAPL 对应
+`workspace/portfolio/AAPL/`。
 
 ### 5.2 上传单份 filing 或材料
 
