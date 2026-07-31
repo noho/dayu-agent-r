@@ -656,22 +656,53 @@ class _ControlledCancelHost(_FakeHost):
         return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
 
 
-class _BlockingSubmitHost(_FakeHost):
-    """submit_followup 永不接受 Run 的 fake Host。"""
+class _DurablyAcceptedDelayedResponseHost(_FakeHost):
+    """模拟 Run 已 durable accepted、但 submit response 延迟返回的 Host。"""
 
-    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
-        """阻塞 submit，用于测试 Run accepted 前 SIGINT。
+    committed: asyncio.Event
+    release_response: asyncio.Event
+
+    def __init__(self) -> None:
+        """初始化 durable acceptance 与 response barrier。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(
+            submit_terminal=None,
+            run_statuses=(RunStatus.RUNNING,),
+            cancel_terminal=_terminal_event(status=HostTerminalStatus.CANCELLED),
+        )
+        self.committed = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """记录 durable acceptance，并等待测试释放 public response。
 
         :param session_id: 目标 Session id。
         :param request: SubmitFollowupRequest。
-        :returns: 正常路径不会返回。
-        :raises asyncio.CancelledError: submit task 被取消时透传。
+        :returns: accepted Run 的 FollowupSnapshot。
+        :raises asyncio.CancelledError: response barrier 被取消时透传。
         """
 
         self.calls.append(f"submit:{session_id}")
         self.submit_requests.append(request)
-        await asyncio.Event().wait()
-        raise AssertionError("blocking submit should be cancelled")
+        self.committed.set()
+        await self.release_response.wait()
+        return FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.QUEUE,
+            accepted_run_id="run-1",
+            accepted_run_status=RunStatus.RUNNING,
+            command_watermark=HostStreamCursor(event_sequence=1),
+            queued_run_id=None,
+            target_run_id=None,
+        )
 
 
 class _DelayedTerminalHost(_FakeHost):
@@ -1087,40 +1118,6 @@ class _AutoSigintMonitor(CliSigintMonitor):
         await asyncio.sleep(0)
         if self.count <= observed_count:
             self.notify()
-            self.notify()
-        return self.count
-
-
-class _ImmediateSigintMonitor(CliSigintMonitor):
-    """测试用立即 SIGINT monitor。"""
-
-    def install(self) -> None:
-        """测试中不安装真实 OS signal handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return
-
-    def close(self) -> None:
-        """测试中无需恢复 OS signal handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return
-
-    async def wait_next(self, observed_count: int) -> int:
-        """立即触发一次 SIGINT。
-
-        :param observed_count: 已观察到的 SIGINT 计数。
-        :returns: 新的 SIGINT 计数。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        if self.count <= observed_count:
             self.notify()
         return self.count
 
@@ -2780,102 +2777,49 @@ def test_prompt_explicit_config_missing_exits_with_usage_error(
 
 
 @pytest.mark.asyncio
-async def test_prompt_sigint_before_run_id_returns_local_interrupt(
+async def test_prompt_sigint_after_durable_acceptance_waits_response_then_cancels(
     tmp_path: Path,
 ) -> None:
-    """Run accepted 前 SIGINT 应只本地退出，不发 Host cancel。"""
+    """durable accepted 与 callback 之间 SIGINT 必须等待 response 后 canonical cancel。
 
-    runtime = await session_execution.prepare_entrypoint_runtime(
-        EntrypointRuntimeRequest(
-            workspace_root=tmp_path,
-            package_config_root=package_config_root(),
-            explicit_config_dir=None,
-            scene_id="prompt",
-            context_slot_values={
-                "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
-                "current_time": _PROMPT_CURRENT_TIME_TEXT,
-            },
-            assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
-            env=_runtime_assembly_env(),
-        )
-    )
-    fake_host = _BlockingSubmitHost(submit_terminal=None)
-
-    result = await session_execution._submit_prompt_turn_handling_sigint(
-        host=cast(Host, fake_host),
-        runtime=runtime,
-        invocation=session_execution.new_cli_invocation(
-            command_name="prompt",
-            scenario="prompt",
-            display_user="本地 CLI 用户",
-            ticker="AAPL",
-        ),
-        session_id="session-1",
-        user_prompt="请总结收入变化",
-        run_overrides=ServiceRunOverrides(),
-        sigint_monitor=_ImmediateSigintMonitor(),
-    )
-
-    assert result is None
-    assert fake_host.cancel_requests == []
-
-
-@pytest.mark.asyncio
-async def test_prompt_sigint_before_run_id_does_not_advance_terminal_cursor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Run accepted 前本地退出没有 terminal 可渲染，不得推进 cursor。
-
-    :param tmp_path: pytest 临时目录夹具。
-    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: pytest 临时 workspace root。
     :returns: ``None``。
-    :raises AssertionError: 本地退出推进 cursor 或返回码错误时抛出。
+    :raises Exception: acceptance barrier、cancel 或 terminal 断言失败时抛出。
     """
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    args = parse_cli_args(
-        (
-            "session",
-            "resume",
-            "--session-id",
-            "session-existing",
-            "--mode",
-            "prompt",
-            "--base",
-            str(tmp_path),
-            "请总结收入变化",
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    fake_host = _DurablyAcceptedDelayedResponseHost()
+    sigint_monitor = _ControlledSigintMonitor()
+    execution_task = asyncio.create_task(
+        session_execution._submit_prompt_turn_handling_sigint(
+            host=cast(Host, fake_host),
+            runtime=runtime,
+            invocation=session_execution.new_cli_invocation(
+                command_name="prompt",
+                scenario="prompt",
+                display_user="本地 CLI 用户",
+                ticker="AAPL",
+            ),
+            session_id="session-1",
+            user_prompt="请总结收入变化",
+            run_overrides=ServiceRunOverrides(),
+            sigint_monitor=sigint_monitor,
         )
     )
-    prepared = await session_execution.prepare_prompt_session_execution(
-        args,
-        command_name="session",
-        scenario="prompt",
-        user_prompt="请总结收入变化",
-        ticker=None,
-        context_slot_values=prompt_command.build_prompt_context_slot_values(
-            ticker=None,
-            fmp_api_key=_API_KEY,
-        ),
-        usage_error_factory=prompt_command.CliCommandUsageError,
-    )
-    fake_host = _BlockingSubmitHost(submit_terminal=None)
+    await fake_host.committed.wait()
 
-    exit_code = await session_execution.execute_prompt_on_session(
-        host=cast(Host, fake_host),
-        prepared=prepared,
-        session_id="session-existing",
-        sigint_monitor=_ImmediateSigintMonitor(),
-    )
-
-    cursor_record = await read_cli_terminal_cursor(
-        workspace_root=tmp_path,
-        session_id="session-existing",
-    )
-    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    sigint_monitor.notify()
+    await asyncio.sleep(0)
+    assert execution_task.done() is False
     assert fake_host.cancel_requests == []
-    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=0)
-    assert cursor_record.seen_terminal_event_ids == ()
+
+    fake_host.release_response.set()
+    result = await execution_task
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert len(fake_host.cancel_requests) == 1
+    assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
 
 
 @pytest.mark.asyncio

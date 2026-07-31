@@ -1137,7 +1137,8 @@ async def _submit_interactive_turn_handling_sigint(
     :param thinking_renderer: invocation 级 thinking renderer；``None`` 表示不输出。
     :param runtime_display: interactive invocation 私有 display execution domain。
     :param key_monitor: 运行态 TTY 按键 monitor；``None`` 表示 no-op。
-    :returns: Host terminal result；第二次 SIGINT 本地退出时返回 ``None``。
+    :returns: Host terminal result；Host 明确未接受 Run，或已发起 Host cancel
+        后再次收到 SIGINT 时返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
@@ -1261,8 +1262,8 @@ async def _cancel_interactive_turn_after_first_sigint(
     :param sigint_monitor: 本轮 SIGINT monitor。
     :param observed_sigint_count: 第一次 SIGINT 后的计数。
     :param runtime_display: 运行态展示 controller。
-    :returns: cancel 后的 terminal result；第二次 SIGINT 本地退出时返回
-        ``None``。
+    :returns: cancel 后的 terminal result；Host 明确未接受 Run，或已发起
+        Host cancel 后再次收到 SIGINT 时返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
@@ -1281,11 +1282,12 @@ async def _cancel_interactive_turn_after_first_sigint(
         if isinstance(wait_outcome, _LocalExitRequested):
             return None
         run_id = wait_outcome.run_id
-    if submit_task.done():
+    if submit_task.done() and not submit_task.cancelled():
         return await submit_task
-    submit_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await submit_task
+    if not submit_task.done():
+        submit_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await submit_task
     if runtime_display is not None:
         await runtime_display.render_cancel_requested()
     return await _cancel_run_waiting_for_terminal_or_second_sigint(
@@ -1294,7 +1296,7 @@ async def _cancel_interactive_turn_after_first_sigint(
         turn_index=turn_index,
         run_id=run_id,
         sigint_monitor=sigint_monitor,
-        observed_sigint_count=observed_sigint_count,
+        observed_sigint_count=sigint_monitor.count,
         runtime_display=runtime_display,
     )
 
@@ -1312,7 +1314,8 @@ async def _wait_for_run_id_or_local_exit(
     :param submit_task: 正在运行的 submit / terminal wait task。
     :param sigint_monitor: 本轮 SIGINT monitor。
     :param observed_sigint_count: 第一次 SIGINT 后的计数。
-    :returns: typed outcome，区分 accepted Run id、submit 已完成和本地退出。
+    :returns: typed outcome，区分 accepted Run id、submit 已完成和 Host 明确
+        未接受 Run 时的本地退出。
     :raises Exception: submit task 已失败时通过 ``await submit_task`` 向上透传异常。
     """
 
@@ -1329,6 +1332,8 @@ async def _wait_for_run_id_or_local_exit(
             submit_task.cancel()
             with suppress(asyncio.CancelledError):
                 await submit_task
+            if accepted_run.run_id is not None:
+                return _RunIdAccepted(run_id=accepted_run.run_id)
             return _LocalExitRequested()
         return _RunIdAccepted(run_id=await run_id_task)
     finally:

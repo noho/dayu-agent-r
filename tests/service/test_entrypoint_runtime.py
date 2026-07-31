@@ -851,6 +851,51 @@ class _SubmitFailingHost(_FakeHost):
         raise self._submit_error
 
 
+class _CommitThenBlockSubmitHost(_FakeHost):
+    """模拟 durable commit 已完成但 public submit response 尚未返回的 Host。"""
+
+    committed: asyncio.Event
+    release_response: asyncio.Event
+
+    def __init__(self) -> None:
+        """初始化 commit/response barrier。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.committed = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """记录 durable commit，并等待测试释放 public response。
+
+        :param session_id: 目标 Session id。
+        :param request: public follow-up 请求。
+        :returns: committed Run 的 follow-up snapshot。
+        :raises asyncio.CancelledError: response barrier 被取消时透传。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append(request)
+        self.committed.set()
+        await self.release_response.wait()
+        return FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.QUEUE,
+            accepted_run_id="run-1",
+            accepted_run_status=RunStatus.RUNNING,
+            command_watermark=HostStreamCursor(event_sequence=1),
+            queued_run_id=None,
+            target_run_id=None,
+        )
+
+
 class _RecoveryFailingHost(_FakeHost):
     """typed delivery interruption 后 durable read 原样失败的 Host fake。"""
 
@@ -1104,6 +1149,47 @@ async def test_submit_entrypoint_turn_attaches_watcher_before_submit_and_returns
     assert fake_host.watchers[0].closed_count == 1
     assert fake_host.submit_requests[0].runner_options is not None
     assert fake_host.submit_requests[0].agent_policy is not None
+
+
+@pytest.mark.asyncio
+async def test_submit_cancellation_waits_for_acceptance_barrier_before_callback(
+    tmp_path: Path,
+) -> None:
+    """caller cancellation 不得越过 durable commit/public response acceptance barrier。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: acceptance ordering 或 watcher cleanup 断言失败时抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    fake_host = _CommitThenBlockSubmitHost()
+    accepted_run_ids: list[str] = []
+    submit_task = asyncio.create_task(
+        submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_run_accepted=accepted_run_ids.append,
+        )
+    )
+    await fake_host.committed.wait()
+
+    submit_task.cancel()
+    await asyncio.sleep(0)
+    assert submit_task.done() is False
+    assert accepted_run_ids == []
+    submit_task.cancel()
+    await asyncio.sleep(0)
+    assert submit_task.done() is False
+
+    fake_host.release_response.set()
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    assert accepted_run_ids == ["run-1"]
+    assert fake_host.watchers[0].closed_count == 1
 
 
 @pytest.mark.asyncio
