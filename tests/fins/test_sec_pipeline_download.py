@@ -41,6 +41,7 @@ from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_fi
 from dayu.fins.pipelines import sec_download_state as _sec_download_state
 from dayu.fins.pipelines import sec_6k_rules as _sec_6k_rules
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
+from dayu.fins.pipelines import sec_filing_collection as _sec_filing_collection
 from dayu.fins.pipelines import sec_fiscal_fields as _sec_fiscal_fields
 from dayu.fins.pipelines import sec_pipeline
 from dayu.fins.pipelines import sec_rebuild_workflow as _sec_rebuild_workflow
@@ -116,6 +117,94 @@ class _NeverCancelled:
         """始终返回未取消。"""
 
         return False
+
+
+def test_collect_filings_normalizes_sec_xsl_primary_document_path() -> None:
+    """SEC XSL 展示路径应在 filing 收集 owner 处投影为归档文件名。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 收集结果仍携带路径分隔符或 filing 字段漂移时抛出。
+    """
+
+    records: dict[str, _sec_filing_collection.FilingRecord] = {}
+    accession_number = "0002100119-26-000139"
+
+    _sec_filing_collection.collect_filings_from_table(
+        records=records,
+        table={
+            "form": ["SCHEDULE 13G"],
+            "filingDate": ["2026-04-29"],
+            "reportDate": [""],
+            "accessionNumber": [accession_number],
+            "primaryDocument": ["xslSCHEDULE_13G_X02/primary_doc.xml"],
+            "fileNumber": ["005-33632"],
+        },
+        form_windows={"SC 13G": dt.date(2026, 1, 1)},
+        end_date=dt.date(2026, 12, 31),
+    )
+
+    filing = records[accession_number]
+    assert filing.form_type == "SC 13G"
+    assert filing.primary_document == "primary_doc.xml"
+
+
+def test_normalize_sec_primary_document_preserves_single_filename() -> None:
+    """普通 SEC 单文件名应保持原值。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: helper 改写合法单文件名时抛出。
+    """
+
+    assert (
+        _sec_filing_collection._normalize_sec_primary_document_name("aapl-20240928.htm")
+        == "aapl-20240928.htm"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "",
+        " ",
+        "/primary_doc.xml",
+        "xsl/primary_doc.xml/",
+        "xsl\\primary_doc.xml",
+        "xsl/./primary_doc.xml",
+        "xsl/../primary_doc.xml",
+        "xsl//primary_doc.xml",
+        "C:primary_doc.xml",
+        None,
+    ),
+)
+def test_normalize_sec_primary_document_rejects_invalid_path_syntax(
+    value: JsonValue,
+) -> None:
+    """非法 SEC 主文档路径必须在 filing 收集 owner 处失败关闭。
+
+    Args:
+        value: 待验证的 SEC primaryDocument 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法路径被降成看似合法文件名时抛出。
+    """
+
+    with pytest.raises(ValueError, match="SEC primaryDocument"):
+        _sec_filing_collection._normalize_sec_primary_document_name(value)
 
 
 class _RollbackOutcomeBatchingRepository(FsBatchingRepository):
