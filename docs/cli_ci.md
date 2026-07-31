@@ -590,27 +590,211 @@ unconfigured、transport unavailable、provider rejection 与 rate limit 只要�
 证据、脱敏和 no-fallback contract 完整即可通过总体 verdict。internal product bug、
 未分类、secret leak、fallback 或证据矛盾仍使命令总体退出非零。
 
-#### 5.1.2 `dayu-cli interactive` 的 Ctrl+D Mandatory Matrix
+#### 5.1.2 `dayu-cli interactive` 第一轮 Mandatory Matrix
 
-`interactive` 拥有 composer 和跨轮 REPL 状态，因此 Ctrl+D coverage 必须按实际 UI 状态拆分，不能用一次 Run 中
-按键或 CLI 自报替代整个状态矩阵。第一轮 calibration 和以后每次适用的 `full-real` 至少真实运行：
+`interactive` 不是在 `prompt` 后增加一个输入循环。它同时拥有 invocation 级配置、TTY composer、单轮 Run 控制、
+跨轮 Session/Memory、跨进程 label reconnect、terminal cursor 和 context compaction。第一轮运行前必须先生成并冻结
+`interactive-inventory.json`、`interactive-mandatory-obligations.json` 和 `interactive-coverage-plan.json`；三者至少综合：
+
+- `dayu.cli.arg_parsing.build_parser()` 产生的当前 help/参数 leaf；
+- CLI 显式 composer bindings、运行态 key monitor actions、run view modes 和 terminal-result branches；
+- session 创建/绑定、startup reconnect、terminal cursor、单轮 submit/cancel 与 REPL continuation 的公开状态；
+- 当前 scene manifest、execution profile、tool selection、memory 与 compaction policy；
+- 已冻结的 `prompt` scenario/oracle registry 中可复用的 coverage 维度、历史高风险组合和失败反例。
+
+代码只能用于发现 branch、owner 和观测点，不能把当前分支的 outcome 写成 expected behavior。Inherited
+`prompt_toolkit` 默认 key map 不要求穷举每个组合，但必须冻结库版本/模式，并覆盖下述用户可达的代表性编辑动作和所有
+Dayu 显式 binding。运行前 coverage-plan validator 必须证明：parser leaf、显式参数、显式 key binding、运行态 key
+action、terminal branch、precondition、input class、pairwise assignment 和高风险组合均有 stable obligation；
+`unclassified_branch_count=0`、`missing_planned_scenario_count=0` 且无重复 claim。否则不得启动“全量”运行后再靠报告发现
+本可在静态盘点阶段发现的 gap。
+
+##### 5.1.2.1 从 `prompt` 复用的边界
+
+`prompt` 已冻结的矩阵用于减少遗漏，不用于替代 `interactive` 的真实运行。复用规则如下：
+
+| surface | 可以复用 | `interactive` 必须重新真实执行 |
+|---|---|---|
+| parser/help | 参数 identity、validator、互斥/依赖矩阵和已接受的通用 exit-code oracle | `interactive --help`、该 leaf 的合法/非法 invocation、无 positional prompt 与额外 positional 输入 |
+| workspace/config/model | config precedence、model id/credential 分类和 init-selected default 的 accepted predicate | package fallback、workspace config、显式 `--config`、init-selected default、`--model/-m` override 各自至少一次真实 interactive Run |
+| logging | 第 5.1.3 节的 16-entry、冲突、debug-stream、log-file 和 append 矩阵定义 | interactive 长进程中的实际 ordinary/stream admission、每个入口的 primary Run、跨 turn 写入和进程 close 后落盘 |
+| provider/tool/fallback | provider identity、原生 tool request/response 配对、failed-batch 与 fallback 的已接受语义 | interactive 单轮和跨轮的真实 provider、工具、失败/取消后 REPL 行为以及后续 turn 是否受污染 |
+| signal/display | startup bootstrap、单次 Run 的取消和 Ctrl+T 维度 | composer idle、Run 各阶段、取消后恢复 REPL、第二 turn、label reconnect 和终端恢复 |
+| 财报事实 | 已固定真实 corpus、source identity 和独立 financial oracle | 同一 interactive Session 内的真实读取、追问、证据复用/刷新、跨进程恢复和 compact 前后连续性 |
+
+只有同时满足以下条件，既有 `prompt` evidence 才可作为 shared static owner 的 cross-command supporting evidence：执行在
+进入 command runner 前结束；parser action/normalizer/validator identity 与 digest 相同；不存在 command-local
+side effect；interactive 至少有一个同类 sentinel 真实执行；registry 明确引用 source scenario 和 shared owner claim。
+第一轮 interactive calibration 中，所有 command-local primary operation、REPL、Session、screen、日志、Run、Tool
+Trace、memory、SQLite 和 filesystem obligation 都必须重新执行。禁止机械复制 `prompt` scenario 后只替换 command
+字符串，也禁止因 `prompt` 已通过而省略 interactive 的动态路径。
+
+从 `prompt` 迁移矩阵时至少逐项处理：help/unknown/removed option、base/config/model/ticker/label、detail/thinking、
+temperature/tool timeout/max iterations/fallback/failed-batch、日志入口与冲突、invalid UTF-8、credential/provider/network/
+Host failure、startup/running/closeout cancellation、真实工具 request/response、真实财报读取和 fixed pairwise
+assignments。`prompt` positional input、一次性进程终态和 prompt-only label scope 必须显式标记不适用，不能偷偷删除；
+对应的 interactive composer、REPL continuation 和 `cli.interactive` label scope 必须建立新的 obligations。
+
+##### 5.1.2.2 Invocation、配置与运行参数
+
+第一轮至少覆盖：
+
+- 默认 `./workspace`、`--base/-b/--workspace`、空 workspace、已有 workspace、已有 `.dayu` 但缺 config、init 后
+  workspace、显式 config、config 缺失/越界/普通文件/损坏/缺关键文件；
+- 无 init 时 package default、init-selected default、显式 `--model` 和 `-m` 覆盖，以及语法有效但 catalog 不存在、
+  credential 缺失和真实 provider rejection；
+- `--ticker` 缺省、合法、空白、Unicode/大小写/边界输入；`--label` 缺省、合法、空白、Unicode 和长文本；
+- `--detail/--no-detail`、`--thinking/--no-thinking`、temperature、tool timeout、max iterations、fallback mode/prompt、
+  max consecutive failed tool batches 的默认值、每个合法边界、非法格式/范围、互斥和 pairwise；
+- 无 positional prompt 是合法 REPL invocation；额外 positional、unknown option、removed option、缺少 option value、
+  invalid UTF-8 argv 和日志/参数错误必须在 primary operation 前观察；
+- 全局参数位于 command 前/后、短别名和等价 spelling 的 accepted placement；重复参数按其 parser contract 全量观察，
+  不假定“最后一个生效”。
+
+高成本 provider matrix 不机械重复 init 的全部 provider choice；但 interactive 必须真实证明 package/workspace/explicit
+三种 model resolution 路径、至少一个可用 provider 的多轮调用、至少一个真实不可用/rejection 路径，以及实际触发
+compaction 时 ordinary scene 与 compactor 的 effective provider/model identity。已有 provider evidence 只能说明 adapter
+可达，不能替代 interactive 的 scene assembly 和跨轮状态。
+
+##### 5.1.2.3 Composer、输入与编辑状态
+
+TTY 与 non-TTY 是不同 input class，必须分别执行。TTY composer 至少覆盖：
+
+- 初次空 buffer、空白 buffer、普通单行、Unicode、长行、宽字符、组合字符和含前后空白输入；
+- Enter 提交；Ctrl+J 插入换行后继续编辑并提交；粘贴单行/多行；光标位于开头、中间、末尾时的插入；
+- Left/Right、Home/End、Backspace/Delete 的代表性编辑链，并记录提交前 exact buffer 和 cursor；
+- 无历史时与至少两个已完成 turn 后的 Up/Down；Ctrl+R 无匹配、有唯一匹配和多匹配；选中历史后编辑再提交；
+- Ctrl+X Ctrl+E 使用 CI-owned editor 成功修改 draft，以及 editor 缺失/非零/启动失败；记录临时文件是否残留、draft
+  是否保留、stderr 和 REPL 是否继续，但不得读取或修改 CI-owned root 之外的用户 editor 配置；
+- 非空 draft Ctrl+C、空白 draft Ctrl+C、空 draft 第一次 Ctrl+C、连续第二次 Ctrl+C，以及中间经过空输入、正常提交、
+  已完成/失败/取消 turn 后 pending-exit 状态是否重置；
+- composer 中单独 Escape、方向键产生的 CSI、Alt 组合和 bracketed paste；这些输入必须与 Run 中同 bytes 分开记录；
+- Ctrl+Z suspend/SIGCONT 后的 buffer、screen、terminal mode 与 echo 恢复；
+- 合法 UTF-8 与 raw invalid byte 的 TTY/non-TTY 输入边界；若终端/locale/文本解码层先拒绝，必须记录实际 owner，不能
+  把 stdin decoding failure 与 argv parser failure 合并；
+- EOF/关闭 stdin 的 non-TTY 空输入、单行、多行、最后一行无换行和流中的 literal `0x04`；PTY raw key 不得归入本类。
+
+空白输入是否创建 Run、trim 后实际 user message、multi-line material、历史内容、屏幕重绘、stdout/stderr、terminal
+echo/mode 和下一次 `dayu>` 都是 observation surface。Harness 需保存 key-by-key 时间线与关键虚拟屏幕，不能只保存最终
+stdout；也不能从 EventLog 反推未被提交的 composer buffer。
+
+##### 5.1.2.4 Ctrl+D Mandatory Matrix
+
+Ctrl+D coverage 必须按实际 UI/Run 状态拆分，不能用一次 Run 中按键或 CLI 自报替代整个状态矩阵。第一轮
+calibration 和以后每次适用的 `full-real` 至少真实运行：
 
 - 初次进入 REPL、空 composer 时按 Ctrl+D；
 - composer 非空且光标位于文本中间时按 Ctrl+D，并记录按键前后的完整 buffer、光标位置、屏幕和是否提交；
 - composer 非空且光标位于文本末尾时按 Ctrl+D，并记录输入是否保留、进程是否继续；
-- Run 等待真实 provider response 时按一次及连续多次 Ctrl+D；
-- Run 执行真实 tool request/response loop 时按一次及连续多次 Ctrl+D；
-- Run final、REPL 恢复 composer 后，在空 composer 中按 Ctrl+D。
+- Run accepted 前、等待真实 provider response、真实 tool request/response loop 和 cancel/closeout 阶段分别按一次及
+  连续多次 Ctrl+D；
+- Run final、failed 或 cancelled 后 REPL 恢复 composer，在空 composer 和非空 composer 中分别按 Ctrl+D；
+- non-TTY stdin EOF、关闭 PTY master、canonical-mode EOF 与 raw-mode `0x04` 分别作为独立 input class。
 
 每个场景必须记录精确按键 bytes、发送时相对 UI/Run 状态、虚拟终端屏幕、composer buffer/光标、进程是否仍存活、
 exit code/signal、Host Run terminal 状态、后续是否自动退出，以及日志和相关 SQLite/EventLog before/after。harness
-必须把 raw-mode 下发送的 `0x04` 按键与关闭 stdin、canonical-mode EOF 分成不同 input class，不得用关闭 PTY 或
-harness cleanup 冒充 Ctrl+D。只对 Dayu 的各状态建立 mandatory observation；用户主动询问其它产品做法时可以另行
-回答，但该参考不进入场景 coverage，也不能替代任何 Dayu 状态的真实运行。
+不得用关闭 PTY、超时 kill 或 cleanup 冒充 Ctrl+D。只对 Dayu 的各状态建立 mandatory observation；用户主动询问其它
+产品做法时可以另行回答，但该参考不进入场景 coverage，也不能替代任何 Dayu 状态的真实运行。
 
 `prompt` 是一次性命令，没有 composer 或 final 后 REPL。其 Ctrl+D obligation 只适用于命令仍在执行且终端按键监听
 有效的阶段；interactive 的空/非空 composer、光标编辑和 final 后恢复场景对 `prompt` 必须标记为不适用，禁止为追求
 矩阵对称而编造输入状态。
+
+##### 5.1.2.5 Run 控制、type-ahead 与终端恢复
+
+运行态至少区分 startup/pre-accept、accepted/provider wait、thinking/streaming、tool request、tool execution、tool
+response continuation、fallback、terminal rendering 和 final-to-composer handoff。不是每种模型都会自然暴露全部阶段；
+场景必须用真实 provider/工具和状态证据确认按键确实落在目标阶段，不能仅靠固定 sleep 命名场景。
+
+每个可达阶段按风险组合覆盖：
+
+- 单次 Escape、单次 Ctrl+C、连续 Ctrl+C，以及第一次取消后 closeout 中的后续 Ctrl+C；
+- Ctrl+T 从初始 view 切换、再次切回、在无 activity/已有多条 activity/有 thinking 时切换、terminal 后第二 turn 再切换；
+- `--detail`、`--no-detail`、默认 detail 与 thinking on/off 下 Ctrl+T 的屏幕和 Run 副作用；
+- 一次/连续 Ctrl+D；普通 printable bytes、Enter 和完整 type-ahead 文本；
+- Up/Down/Home/Delete 等 CSI sequences、Alt key 和 bracketed paste。运行态 monitor 若按字节解释输入，必须证明完整
+  sequence 是被忽略、缓存、丢弃、进入下一 composer，还是因 ESC prefix 触发控制动作，不能只测试单字节 Escape；
+- Ctrl+Z/SIGCONT、SIGWINCH/终端宽度变化、窄终端长 activity/thinking 和 Unicode 宽字符。
+
+单次 Run succeeded/failed/cancelled 后都要观察是否回到 `dayu>`、下一 turn 能否真实提交、terminal mode/echo 是否恢复、
+先前 type-ahead 是否意外提交。若进程退出，记录 exit code/signal 和是否完成 Host/attachment/display/key-monitor 清理；
+若进程继续，不能把单轮 cancel 的 terminal status 冒充 process exit 130。重复 Ctrl+C 必须同时检查用户观感、process
+生命周期和 Host canonical terminal，不能只检查其中一个。
+
+##### 5.1.2.6 Session、label、reconnect 与 cursor
+
+至少建立以下相互独立的 state chains：
+
+1. 无 label 的 fresh invocation：同一进程至少两个成功 turn，随后正常 EOF；新进程不应因测试 harness 假定而被当作
+   同一 Session，实际 Session identity 由证据记录并交用户裁决。
+2. label 首次绑定：第一 turn 前的 Session/slot/cursor 状态、多个 turn、正常退出；同 label 新进程 reconnect 后继续
+   提交追问。
+3. reconnect 去重：已展示 succeeded/failed/cancelled terminal 后重启，观察是否重复展示；terminal cursor 文件的
+   before/after、EventLog terminal sequence 和新 turn cursor advance 必须一致。
+4. 未完成 Run recovery：通过真实 CLI 启动有 label 的 Run，再以明确记录的进程崩溃/终端断开/受支持退出路径构造
+   precondition；第二个真实 interactive 进程观察 running/cancelling/terminal promotion。Harness termination 只能作为
+   recovery precondition，不能被报告为 Dayu 的取消或退出行为。
+5. 相同 label 的两个并发 interactive 进程：空闲/一方 running/双方提交三种时序，记录 queue/rejection、每个客户端
+   屏幕、唯一 Run identities、terminal cursor 和最终 Session 状态。
+6. 同一文本 label 在 `prompt` 与 `interactive` scope 下的 cross-command identity，以及 `session` CLI 对 interactive
+   Session 的只读查询。该场景只证明 interactive 生成物可消费，不提前裁决 `session` 命令自身的 UI oracle。
+7. 同 label 新 invocation 更改 ticker、model 或其它 run override，区分 durable Session/Memory 与 invocation-local
+   scene inputs；不得从最终回答猜 effective 配置。
+
+还必须覆盖空白/Unicode/长 label、cursor 文件不存在/损坏/路径冲突/不可写、Host DB 或 runtime DB 路径冲突，以及
+startup reconnect 在任何 composer 输入前产生 terminal/error 的屏幕顺序。禁止写 SQLite 私有表伪造目标状态；若只能
+通过 harness 构造异常，必须使用公开 CLI/文件系统前置动作并清楚标记 setup 与被测 observation 的边界。
+
+##### 5.1.2.7 多轮工具、Memory、财报与 Compaction
+
+低成本 smoke 不能替代以下真实 Session 场景族；核心连续性场景必须在同一 Session chain 中完成：
+
+- 普通问答后使用“继续”“刚才那个”“第二点”等指代追问；
+- 对固定真实财报先 discovery/read，再追问数值、原因、来源和前一回答中的具体风险点；
+- 已有证据足够时的复用，以及 ticker/期间/口径改变时的必要刷新；记录实际 tool call count 和 request/response；
+- 用户纠正事实或切换主体后，后续回答、memory projection 和工具参数如何变化；
+- tool not_found/error、handshake timeout、failed-batch threshold 的 raise_error/force_answer、provider failure、单轮
+  cancelled 后，若屏幕仍提供 composer 则尝试再提交一个正常 turn；若进程已经退出则记录无法继续的直接事实，不能由
+  harness 重启后伪装成同一 REPL continuation；
+- 至少一个真实 web tool 和每类当前 interactive tool-selection 可达的 Fins read/download/preprocess 能力；其它命令的
+  UI/生成物正确性仍由各自 campaign 裁决；
+- 同 label 跨进程延续上述财报追问，区分 Host/Memory continuity 与仅存在于当前进程的 composer history。
+
+必须在 interactive 中真正触发至少一次 context compaction。场景在同一 REPL/Session 中用真实用户输入、真实
+provider 和真实工具结果累积上下文，直到 EventLog/runner-call evidence 出现实际 compaction operation；仅出现
+context budget evaluated、低剩余 token 估计或 compaction 配置不能算触发。报告至少对比 compact 前后：
+
+- ordinary scene 与 compactor 的实际 provider/model/endpoint/credential ref、runner inputs 和 outputs；
+- 被 compact 的 event/turn 范围、artifact identity/digest、memory snapshot/projection 与 RunInputBuilder material；
+- 财务事实、单位、期间、source refs、answer anchors、open question 和用户纠正是否保留；
+- tool request/response/evidence continuity、是否重复调用、是否把内部治理状态投影给 LLM；
+- compact 后至少两个真实 follow-up turn，其中一个引用 compact 前财报事实，另一个改变口径或请求新证据。
+
+可使用 CI-owned 合法 config 选择较小但真实受支持的 context profile以控制成本；必须保存完整 config diff、证明该
+profile 经 production config loader/Service assembly 生效，且不得注入 memory、伪造 assistant/tool result、直接写
+EventLog/SQLite 或调用内部 compactor API制造触发。
+
+##### 5.1.2.8 Terminal outcome、屏幕与 evidence closure
+
+真实可达的 succeeded、failed、cancelled、lost/startup-recovery terminal 分支必须逐项观察。无法在不破坏 private
+state、伪造 Host response 或越过授权的情况下到达的 defensive branch，必须在 inventory 中给出 unreachable/out-of-
+scope 证明和 owner-level test ref；不能静默漏掉，也不能为了“覆盖”写 SQLite 或 fake terminal result。
+
+每个 stateful scenario 除第 11 节通用材料外还必须保存：
+
+- asciinema/raw PTY transcript、按键时间线，以及 composer 前/后、每次 view 切换、terminal 渲染、恢复 `dayu>` 的
+  VT-compatible screen snapshots；
+- stdout、stderr、exit code/signal、process 存活时间线、termios/echo before/after 和子进程（editor）状态；
+- workspace manifest/diff、config、log/append bytes、terminal cursor 和 compaction artifacts；
+- Session/slot/attachment、每个 Run/Attempt terminal、EventLog、Tool Trace request+response、memory store/projection、
+  runner input、runtime lane 和相关 SQLite bounded before/after；
+- 每轮 user input、effective scene/model/provider/overrides/tool schema、final answer 与真实财报 source 的关联；
+- failed/cancelled/reconnect/compaction 后下一轮行为，以及进程关闭后的 Host stopped、attachment 释放、runtime lane
+  claim 清零和不应存在的后台进程/锁。
+
+运行完成后先以 inventory 和 coverage plan 重新计算 obligation closure，再生成单一 frozen
+`observed-behavior.md`。运行中发现真正的动态新 branch 时，必须加入 inventory 并补跑；但 parser、显式 key binding、
+已知状态机或 prompt 历史反例中本可预见的漏项属于 pre-run planning failure，不能把零散补跑报告伪装成一次完整运行。
 
 #### 5.1.3 日志参数 Mandatory Matrix
 
