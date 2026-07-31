@@ -11,22 +11,46 @@ import sys
 from collections.abc import Sequence
 from typing import Protocol, cast
 
+from dayu.runtime.log import DiagnosticLogLevel
+
 CLI_PROGRAM_NAME: str = "dayu-cli"
 DEFAULT_WORKSPACE: str = "./workspace"
-DEFAULT_LOG_LEVEL: str = "info"
+DEFAULT_LOG_LEVEL: DiagnosticLogLevel = DiagnosticLogLevel.INFO
 INVALID_UTF8_INVOCATION_DIAGNOSTIC: str = (
     "command-line arguments must be valid UTF-8 text; "
     "re-enter the command using UTF-8 input."
 )
-
-LOG_LEVEL_CHOICES: tuple[str, ...] = (
-    "debug",
-    "verbose",
-    "info",
-    "warn",
-    "error",
-    "critical",
+LOG_LEVEL_SELECTOR_CONFLICT_DIAGNOSTIC: str = (
+    "log level selectors are mutually exclusive"
 )
+QUIET_DEBUG_STREAM_CONFLICT_DIAGNOSTIC: str = (
+    "--debug-stream cannot be combined with --quiet"
+)
+
+_PUBLIC_LOG_LEVEL_SPELLINGS: dict[str, DiagnosticLogLevel] = {
+    "debug": DiagnosticLogLevel.DEBUG,
+    "verbose": DiagnosticLogLevel.VERBOSE,
+    "info": DiagnosticLogLevel.INFO,
+    "warn": DiagnosticLogLevel.WARNING,
+    "warning": DiagnosticLogLevel.WARNING,
+    "error": DiagnosticLogLevel.ERROR,
+    "critical": DiagnosticLogLevel.CRITICAL,
+    "quiet": DiagnosticLogLevel.QUIET,
+}
+LOG_LEVEL_CHOICES: tuple[str, ...] = tuple(_PUBLIC_LOG_LEVEL_SPELLINGS)
+_LOG_LEVEL_SHORTCUTS: tuple[tuple[str, DiagnosticLogLevel], ...] = (
+    ("--debug", DiagnosticLogLevel.DEBUG),
+    ("--verbose", DiagnosticLogLevel.VERBOSE),
+    ("--info", DiagnosticLogLevel.INFO),
+    ("--warn", DiagnosticLogLevel.WARNING),
+    ("--warning", DiagnosticLogLevel.WARNING),
+    ("--error", DiagnosticLogLevel.ERROR),
+    ("--critical", DiagnosticLogLevel.CRITICAL),
+    ("--quiet", DiagnosticLogLevel.QUIET),
+)
+_ROOT_LOG_LEVEL_SELECTORS_DEST: str = "_root_log_level_selectors"
+_COMMAND_LOG_LEVEL_SELECTORS_DEST: str = "_command_log_level_selectors"
+_ACTION_LOG_LEVEL_SELECTORS_DEST: str = "_action_log_level_selectors"
 COMMAND_INIT: str = "init"
 COMMAND_PROMPT: str = "prompt"
 COMMAND_INTERACTIVE: str = "interactive"
@@ -138,7 +162,10 @@ class ParsedCliArgs(argparse.Namespace):
     command_name: str
     workspace_root: str
     config_dir: str | None
-    log_level: str
+    log_level: DiagnosticLogLevel
+    _root_log_level_selectors: list[DiagnosticLogLevel]
+    _command_log_level_selectors: list[DiagnosticLogLevel]
+    _action_log_level_selectors: list[DiagnosticLogLevel]
     debug_stream: bool
     log_file: str | None
     detail: bool
@@ -195,12 +222,22 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     :raises ValueError: argparse 初始化或参数注册失败时透传底层异常。
     """
 
-    common_parent = _build_common_arguments_parent()
-    runtime_parent = _build_runtime_arguments_parent(common_parent)
+    root_common_parent = _build_common_arguments_parent(
+        log_level_selectors_dest=_ROOT_LOG_LEVEL_SELECTORS_DEST
+    )
+    root_runtime_parent = _build_runtime_arguments_parent(root_common_parent)
+    command_common_parent = _build_common_arguments_parent(
+        log_level_selectors_dest=_COMMAND_LOG_LEVEL_SELECTORS_DEST
+    )
+    command_runtime_parent = _build_runtime_arguments_parent(command_common_parent)
+    action_common_parent = _build_common_arguments_parent(
+        log_level_selectors_dest=_ACTION_LOG_LEVEL_SELECTORS_DEST
+    )
+    action_runtime_parent = _build_runtime_arguments_parent(action_common_parent)
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Dayu 财报分析命令行入口。",
-        parents=[runtime_parent],
+        parents=[root_runtime_parent],
     )
     subparsers = cast(
         CommandSubparserRegistry,
@@ -210,18 +247,26 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
             required=True,
         ),
     )
-    _register_init_command(subparsers, common_parent)
-    _register_prompt_command(subparsers, runtime_parent)
-    _register_interactive_command(subparsers, runtime_parent)
-    _register_download_command(subparsers, runtime_parent)
-    _register_upload_filing_command(subparsers, runtime_parent)
-    _register_upload_material_command(subparsers, runtime_parent)
-    _register_upload_filings_from_command(subparsers, runtime_parent)
-    _register_process_command(subparsers, runtime_parent)
-    _register_process_filing_command(subparsers, runtime_parent)
-    _register_process_material_command(subparsers, runtime_parent)
-    _register_session_command(subparsers, runtime_parent)
-    _register_tool_trace_command(subparsers, runtime_parent)
+    _register_init_command(subparsers, command_common_parent)
+    _register_prompt_command(subparsers, command_runtime_parent)
+    _register_interactive_command(subparsers, command_runtime_parent)
+    _register_download_command(subparsers, command_runtime_parent)
+    _register_upload_filing_command(subparsers, command_runtime_parent)
+    _register_upload_material_command(subparsers, command_runtime_parent)
+    _register_upload_filings_from_command(subparsers, command_runtime_parent)
+    _register_process_command(subparsers, command_runtime_parent)
+    _register_process_filing_command(subparsers, command_runtime_parent)
+    _register_process_material_command(subparsers, command_runtime_parent)
+    _register_session_command(
+        subparsers,
+        command_parent=command_runtime_parent,
+        action_parent=action_runtime_parent,
+    )
+    _register_tool_trace_command(
+        subparsers,
+        command_parent=command_runtime_parent,
+        action_parent=action_runtime_parent,
+    )
     return parser
 
 
@@ -238,6 +283,7 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> ParsedCliArgs:
     _require_valid_utf8_invocation(effective_argv, parser=parser)
     namespace = parser.parse_args(effective_argv, namespace=_new_default_namespace())
     parsed_args = cast(ParsedCliArgs, namespace)
+    _finalize_log_level_selection(parsed_args, parser=parser)
     if parsed_args.command_name == COMMAND_INIT and parsed_args.config_dir is not None:
         parser.error("init 命令不接受 --config")
     return parsed_args
@@ -264,6 +310,33 @@ def _require_valid_utf8_invocation(
             parser.error(INVALID_UTF8_INVOCATION_DIAGNOSTIC)
 
 
+def _finalize_log_level_selection(
+    parsed_args: ParsedCliArgs,
+    *,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """合并各 argparse scope 的日志 selector occurrence 并校验组合。
+
+    :param parsed_args: argparse 已填充的类型化 namespace。
+    :param parser: 负责输出公共 usage diagnostic 的顶层 parser。
+    :returns: ``None``；校验成功时写入唯一 canonical ``log_level``。
+    :raises SystemExit: selector 总次数大于一，或 quiet 与 debug-stream
+        同时出现时由 parser 以用法错误 2 退出。
+    """
+
+    selected_levels = (
+        *parsed_args._root_log_level_selectors,
+        *parsed_args._command_log_level_selectors,
+        *parsed_args._action_log_level_selectors,
+    )
+    if len(selected_levels) > 1:
+        parser.error(LOG_LEVEL_SELECTOR_CONFLICT_DIAGNOSTIC)
+    selected_level = DEFAULT_LOG_LEVEL if not selected_levels else selected_levels[0]
+    if selected_level is DiagnosticLogLevel.QUIET and parsed_args.debug_stream:
+        parser.error(QUIET_DEBUG_STREAM_CONFLICT_DIAGNOSTIC)
+    parsed_args.log_level = selected_level
+
+
 def _new_default_namespace() -> ParsedCliArgs:
     """创建带全局默认值的解析结果命名空间。
 
@@ -275,6 +348,9 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.workspace_root = DEFAULT_WORKSPACE
     namespace.config_dir = None
     namespace.log_level = DEFAULT_LOG_LEVEL
+    namespace._root_log_level_selectors = []
+    namespace._command_log_level_selectors = []
+    namespace._action_log_level_selectors = []
     namespace.debug_stream = False
     namespace.log_file = None
     namespace.detail = True
@@ -321,9 +397,14 @@ def _new_default_namespace() -> ParsedCliArgs:
     return namespace
 
 
-def _build_common_arguments_parent() -> argparse.ArgumentParser:
+def _build_common_arguments_parent(
+    *,
+    log_level_selectors_dest: str,
+) -> argparse.ArgumentParser:
     """创建所有命令共用且不含 runtime config 的参数父解析器。
 
+    :param log_level_selectors_dest: 当前 argparse scope 独占的 selector
+        occurrence 列表字段名。
     :returns: 不含 help 与 ``--config`` 的公共参数解析器。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
@@ -337,11 +418,9 @@ def _build_common_arguments_parent() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="工作区根目录，默认 ./workspace。",
     )
-    parser.add_argument(
-        "--log-level",
-        choices=LOG_LEVEL_CHOICES,
-        default=argparse.SUPPRESS,
-        help="日志等级。",
+    _add_log_level_selector_arguments(
+        parser,
+        selectors_dest=log_level_selectors_dest,
     )
     parser.add_argument(
         "--log-file",
@@ -350,47 +429,67 @@ def _build_common_arguments_parent() -> argparse.ArgumentParser:
         help="把诊断日志追加写入指定文件；未提供时日志仅保留到本次进程结束。",
     )
     parser.add_argument(
-        "--debug",
-        action="store_const",
-        const="debug",
-        dest="log_level",
-        default=argparse.SUPPRESS,
-        help="等价于 --log-level debug。",
-    )
-    parser.add_argument(
         "--debug-stream",
         action="store_true",
         dest="debug_stream",
         default=argparse.SUPPRESS,
         help=(
-            "启用普通 DEBUG 以及高频 stream delta、SSE、逐 delta ingest " "诊断；不要与互相矛盾的日志等级参数组合使用。"
+            "额外启用高频 stream delta、SSE、逐 delta ingest 诊断；"
+            "不改变普通日志等级，且不可与 quiet 组合。"
         ),
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_const",
-        const="verbose",
-        dest="log_level",
-        default=argparse.SUPPRESS,
-        help="等价于 --log-level verbose。",
-    )
-    parser.add_argument(
-        "--info",
-        action="store_const",
-        const="info",
-        dest="log_level",
-        default=argparse.SUPPRESS,
-        help="等价于 --log-level info。",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_const",
-        const="error",
-        dest="log_level",
-        default=argparse.SUPPRESS,
-        help="只输出错误级别日志。",
-    )
     return parser
+
+
+def _add_log_level_selector_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    selectors_dest: str,
+) -> None:
+    """从公共 selector spec 注册当前 argparse scope 的日志选项。
+
+    :param parser: 当前 scope 的公共参数父解析器。
+    :param selectors_dest: 当前 scope 独占的 canonical occurrence 列表字段名。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    selector_group = parser.add_mutually_exclusive_group()
+    selector_group.add_argument(
+        "--log-level",
+        action="append",
+        type=_parse_public_log_level,
+        dest=selectors_dest,
+        default=argparse.SUPPRESS,
+        metavar="{" + ",".join(LOG_LEVEL_CHOICES) + "}",
+        help="选择唯一普通日志等级。",
+    )
+    for option, canonical_level in _LOG_LEVEL_SHORTCUTS:
+        selector_group.add_argument(
+            option,
+            action="append_const",
+            const=canonical_level,
+            dest=selectors_dest,
+            default=argparse.SUPPRESS,
+            help=f"等价于 --log-level {canonical_level.value}。",
+        )
+
+
+def _parse_public_log_level(value: str) -> DiagnosticLogLevel:
+    """把公开日志 spelling 收敛为 canonical diagnostic level。
+
+    :param value: ``--log-level`` 收到的公开 spelling。
+    :returns: 唯一 canonical diagnostic level；``warn`` 与 ``warning``
+        均返回 ``WARNING``。
+    :raises argparse.ArgumentTypeError: spelling 不在公共 contract 时抛出。
+    """
+
+    canonical_level = _PUBLIC_LOG_LEVEL_SPELLINGS.get(value)
+    if canonical_level is None:
+        raise argparse.ArgumentTypeError(
+            "expected one of: " + ", ".join(LOG_LEVEL_CHOICES)
+        )
+    return canonical_level
 
 
 def _build_runtime_arguments_parent(
@@ -521,19 +620,22 @@ def _register_interactive_command(
 
 def _register_session_command(
     subparsers: CommandSubparserRegistry,
-    global_parent: argparse.ArgumentParser,
+    *,
+    command_parent: argparse.ArgumentParser,
+    action_parent: argparse.ArgumentParser,
 ) -> None:
     """注册 ``session`` 命令及其二级 action 参数。
 
     :param subparsers: 顶层 subparsers 注册器。
-    :param global_parent: 包含全局参数的父解析器。
+    :param command_parent: command scope 的 runtime 参数父解析器。
+    :param action_parent: action scope 的 runtime 参数父解析器。
     :returns: ``None``。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
 
     parser = _add_command_parser(
         subparsers,
-        global_parent,
+        command_parent,
         command_name=COMMAND_SESSION,
         help_text="查看或清理 CLI Session。",
     )
@@ -545,26 +647,29 @@ def _register_session_command(
             required=True,
         ),
     )
-    _register_session_list_action(action_subparsers, global_parent)
-    _register_session_resume_action(action_subparsers, global_parent)
-    _register_session_purge_action(action_subparsers, global_parent)
+    _register_session_list_action(action_subparsers, action_parent)
+    _register_session_resume_action(action_subparsers, action_parent)
+    _register_session_purge_action(action_subparsers, action_parent)
 
 
 def _register_tool_trace_command(
     subparsers: CommandSubparserRegistry,
-    global_parent: argparse.ArgumentParser,
+    *,
+    command_parent: argparse.ArgumentParser,
+    action_parent: argparse.ArgumentParser,
 ) -> None:
     """注册 ``tool_trace analyze`` operator 命令。
 
     :param subparsers: 顶层 subparsers 注册器。
-    :param global_parent: 包含全局参数的父解析器。
+    :param command_parent: command scope 的 runtime 参数父解析器。
+    :param action_parent: action scope 的 runtime 参数父解析器。
     :returns: ``None``。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
 
     parser = _add_command_parser(
         subparsers,
-        global_parent,
+        command_parent,
         command_name=COMMAND_TOOL_TRACE,
         help_text="分析 Tool Trace 并发布 JSON/Markdown 报告。",
     )
@@ -580,7 +685,7 @@ def _register_tool_trace_command(
         TOOL_TRACE_ACTION_ANALYZE,
         help="分析显式 Tool Trace 文件或目录。",
         description="分析显式 Tool Trace 文件或目录。",
-        parents=[global_parent],
+        parents=[action_parent],
     )
     analyze_parser.set_defaults(
         command_name=COMMAND_TOOL_TRACE,

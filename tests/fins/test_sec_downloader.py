@@ -1769,7 +1769,7 @@ def test_missing_sec_user_agent_warning_names_config_fact(
 
     monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
     log_stream = StringIO()
-    runtime_log.configure(level=runtime_log.LogLevel.WARN, stream=log_stream)
+    runtime_log.configure(level=runtime_log.LogLevel.WARNING, stream=log_stream)
 
     downloader = SecDownloader(workspace_root=tmp_path)
 
@@ -1915,7 +1915,7 @@ def test_throttle_retry_on_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     call_count = 0
     log_stream = StringIO()
-    runtime_log.configure(level=runtime_log.LogLevel.WARN, stream=log_stream)
+    runtime_log.configure(level=runtime_log.LogLevel.WARNING, stream=log_stream)
     _dummy_request = httpx.Request("GET", "https://example.com/api.json")
 
     async def _mock_get(**kwargs: JsonValue) -> httpx.Response:

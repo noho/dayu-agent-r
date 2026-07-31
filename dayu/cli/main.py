@@ -89,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_cli_standard_stream(sys.stderr)
 
     opened_log_stream: TextIO | None = None
-    log_level_for_cleanup: str | None = None
+    log_level_for_cleanup = runtime_log.DiagnosticLogLevel.INFO
     debug_stream_for_cleanup: bool = False
     try:
         try:
@@ -110,13 +110,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if opened_log_stream is None:
                     return EXIT_FAILURE
             log_stream = opened_log_stream
-            runtime_log.set_level_from_flags(
-                log_level=args.log_level,
-                debug=False,
+            runtime_log.configure_selected_diagnostics(
+                level=args.log_level,
                 debug_stream=args.debug_stream,
-                verbose=False,
-                info=False,
-                quiet=False,
                 stream=log_stream,
             )
             runner = COMMAND_RUNNERS.get(args.command_name)
@@ -132,13 +128,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             if opened_log_stream is not None:
                 try:
-                    runtime_log.set_level_from_flags(
-                        log_level=log_level_for_cleanup,
-                        debug=False,
+                    runtime_log.configure_selected_diagnostics(
+                        level=log_level_for_cleanup,
                         debug_stream=debug_stream_for_cleanup,
-                        verbose=False,
-                        info=False,
-                        quiet=False,
                         stream=sys.stderr,
                     )
                 finally:
