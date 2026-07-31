@@ -10,7 +10,8 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from types import ModuleType
+from typing import Never, TextIO
 
 import pytest
 
@@ -162,6 +163,65 @@ def _raise_keyboard_interrupt(_args: ParsedCliArgs) -> int:
     """
 
     raise KeyboardInterrupt
+
+
+class _InterruptedCliMainModule(ModuleType):
+    """在 bootstrap 解析 ``main`` symbol 时模拟启动中断的模块。"""
+
+    @property
+    def main(self) -> Never:
+        """模拟重型 CLI application import 尚未完成时的 Ctrl+C。
+
+        :returns: 本属性不会返回。
+        :raises KeyboardInterrupt: 始终抛出启动中断。
+        """
+
+        raise KeyboardInterrupt
+
+
+def _raise_standard_stream_startup_interrupt(_stream: TextIO) -> None:
+    """模拟标准流配置阶段发生 Ctrl+C。
+
+    :param _stream: CLI 标准文本流；测试不消费。
+    :returns: 本函数不会返回。
+    :raises KeyboardInterrupt: 始终抛出启动中断。
+    """
+
+    raise KeyboardInterrupt
+
+
+def _raise_parser_startup_interrupt(
+    _argv: Sequence[str] | None = None,
+) -> ParsedCliArgs:
+    """模拟 parser 启动阶段发生 Ctrl+C。
+
+    :param _argv: 待解析 argv；测试不消费。
+    :returns: 本函数不会返回。
+    :raises KeyboardInterrupt: 始终抛出启动中断。
+    """
+
+    raise KeyboardInterrupt
+
+
+def _raise_log_resource_startup_interrupt() -> TextIO | None:
+    """模拟默认日志资源准备阶段发生 Ctrl+C。
+
+    :returns: 本函数不会返回。
+    :raises KeyboardInterrupt: 始终抛出启动中断。
+    """
+
+    raise KeyboardInterrupt
+
+
+def _fail_primary_operation(_args: ParsedCliArgs) -> int:
+    """拒绝 startup interruption 测试误入 primary operation。
+
+    :param _args: 已解析参数；测试不消费。
+    :returns: 本函数不会返回。
+    :raises AssertionError: 任何调用都表示启动边界失效。
+    """
+
+    raise AssertionError("primary operation must not start during startup interrupt")
 
 
 def _return_success(_args: ParsedCliArgs) -> int:
@@ -651,6 +711,68 @@ def test_main_maps_keyboard_interrupt(
     monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _raise_keyboard_interrupt)
 
     assert cli_main.main(("prompt", "请分析收入变化")) == EXIT_KEYBOARD_INTERRUPT
+
+
+def test_run_module_maps_keyboard_interrupt_during_lazy_application_import(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """公共 bootstrap 必须覆盖 CLI application lazy import 中断。
+
+    :param monkeypatch: pytest 模块表替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 中断未归一为 130 或输出 traceback 时抛出。
+    """
+
+    interrupted_module = _InterruptedCliMainModule("dayu.cli.main")
+    monkeypatch.setitem(sys.modules, "dayu.cli.main", interrupted_module)
+
+    assert run_module() == EXIT_KEYBOARD_INTERRUPT
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "startup_phase",
+    ("standard_stream", "parser", "log_resource"),
+)
+def test_run_module_maps_keyboard_interrupt_before_primary_operation(
+    startup_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """公共 bootstrap 必须覆盖 main 内 primary operation 前的启动中断。
+
+    :param startup_phase: 注入中断的轻量启动阶段。
+    :param monkeypatch: pytest 属性与 argv 替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 中断未归一为 130、误入 runner 或输出 traceback 时抛出。
+    """
+
+    monkeypatch.setattr(sys, "argv", ["dayu-cli", "prompt", "请分析收入变化"])
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _fail_primary_operation)
+    if startup_phase == "standard_stream":
+        monkeypatch.setattr(
+            cli_main,
+            "_configure_cli_standard_stream",
+            _raise_standard_stream_startup_interrupt,
+        )
+    elif startup_phase == "parser":
+        monkeypatch.setattr(cli_main, "parse_cli_args", _raise_parser_startup_interrupt)
+    else:
+        monkeypatch.setattr(
+            cli_main,
+            "_open_default_log_file",
+            _raise_log_resource_startup_interrupt,
+        )
+
+    assert run_module() == EXIT_KEYBOARD_INTERRUPT
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize(

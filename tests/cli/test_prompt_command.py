@@ -6,13 +6,14 @@ import asyncio
 import builtins
 import getpass
 import io
+import sys
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
 from pathlib import Path
-from typing import cast
+from typing import Never, cast
 from unittest.mock import Mock
 
 import pytest
@@ -22,17 +23,19 @@ import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
 import dayu.service.scene_context as scene_context
+from dayu.cli.__main__ import run_module
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
 )
-from dayu.cli.arg_parsing import parse_cli_args
+from dayu.cli.arg_parsing import ParsedCliArgs, parse_cli_args
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.cli.host_context import CliInvocation
 from dayu.host.api import (
     CancelMode,
     CancelRunRequest,
@@ -68,6 +71,7 @@ from dayu.host.api import (
     OutboxTerminalItem,
     OutboxTerminalItemsBatch,
     OutboxTerminalItemState,
+    OpenHostOptions,
     ReadOutboxTerminalItemsRequest,
     RunSnapshot,
     RunStatus,
@@ -732,6 +736,7 @@ class _FakeOpenHostContext:
     """fake open_host async context manager。"""
 
     host: _FakeHost
+    exit_count: int
 
     def __init__(self, host: _FakeHost) -> None:
         """初始化 fake context manager。
@@ -742,6 +747,7 @@ class _FakeOpenHostContext:
         """
 
         self.host = host
+        self.exit_count = 0
 
     async def __aenter__(self) -> Host:
         """返回 fake Host public handle。
@@ -767,7 +773,251 @@ class _FakeOpenHostContext:
         :raises Exception: 不主动抛出异常。
         """
 
+        self.exit_count += 1
         return None
+
+
+class _FixedOpenHostFactory:
+    """始终返回同一 fake Host context 的 opener factory。"""
+
+    context: _FakeOpenHostContext
+
+    def __init__(self, context: _FakeOpenHostContext) -> None:
+        """保存待返回的 fake context。
+
+        :param context: 每次调用应返回的 fake Host context。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.context = context
+
+    def __call__(self, _options: OpenHostOptions) -> _FakeOpenHostContext:
+        """返回预先提供的 fake Host context。
+
+        :param _options: Host opener options；测试不消费。
+        :returns: 固定 fake Host context。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.context
+
+
+async def _raise_runtime_prepare_startup_interrupt(
+    _request: EntrypointRuntimeRequest,
+) -> EntrypointRuntimeResult:
+    """模拟 prompt runtime prepare 阶段发生 Ctrl+C。
+
+    :param _request: Service runtime prepare 请求；测试不消费。
+    :returns: 本函数不会返回。
+    :raises KeyboardInterrupt: 始终抛出启动中断。
+    """
+
+    raise KeyboardInterrupt
+
+
+def _raise_host_open_startup_interrupt(_options: OpenHostOptions) -> Never:
+    """模拟 Host public opener 建立前发生 Ctrl+C。
+
+    :param _options: Host opener options；测试不消费。
+    :returns: 本函数不会返回。
+    :raises KeyboardInterrupt: 始终抛出启动中断。
+    """
+
+    raise KeyboardInterrupt
+
+
+async def _raise_session_ensure_startup_interrupt(
+    *,
+    host: Host,
+    args: ParsedCliArgs,
+    invocation: CliInvocation,
+) -> str:
+    """模拟 Host 已打开但 Session ensure 尚未提交时的 Ctrl+C。
+
+    :param host: Host public handle；测试不消费。
+    :param args: 已解析 CLI 参数；测试不消费。
+    :param invocation: 当前 CLI invocation；测试不消费。
+    :returns: 本函数不会返回。
+    :raises KeyboardInterrupt: 始终抛出启动中断。
+    """
+
+    del host, args, invocation
+    raise KeyboardInterrupt
+
+
+class _InterruptedInstallSigintMonitor(CliSigintMonitor):
+    """在 prompt Run cancellation hook 安装阶段模拟 Ctrl+C。"""
+
+    def install(self) -> None:
+        """在 handler 完全安装前抛出启动中断。
+
+        :returns: 本方法不会返回。
+        :raises KeyboardInterrupt: 始终抛出启动中断。
+        """
+
+        raise KeyboardInterrupt
+
+
+def test_prompt_startup_interrupt_during_runtime_prepare_has_no_business_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """runtime prepare 中断必须由公共 bootstrap 收敛且不打开 Host。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest argv、环境与函数替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、输出或零业务状态 contract 失败时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dayu-cli", "prompt", "--base", str(tmp_path), "请总结收入变化"],
+    )
+    monkeypatch.setattr(
+        session_execution,
+        "prepare_entrypoint_runtime",
+        _raise_runtime_prepare_startup_interrupt,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _raise_host_open_startup_interrupt,
+    )
+
+    assert run_module() == EXIT_KEYBOARD_INTERRUPT
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert not (tmp_path / ".dayu" / "host" / "dayu_host.sqlite3").exists()
+
+
+def test_prompt_startup_interrupt_during_host_open_has_no_host_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Host opener 建立前中断必须退出 130 且不创建 Host durable state。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest argv、环境与函数替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、输出或 Host 文件副作用不符合 contract 时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dayu-cli", "prompt", "--base", str(tmp_path), "请总结收入变化"],
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _raise_host_open_startup_interrupt,
+    )
+
+    assert run_module() == EXIT_KEYBOARD_INTERRUPT
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert not (tmp_path / ".dayu" / "host" / "dayu_host.sqlite3").exists()
+
+
+def test_prompt_startup_interrupt_before_session_commit_closes_host_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Session ensure 提交前中断必须关闭 Host context 且无业务调用。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest argv、环境与函数替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: cleanup、零调用、退出码或输出 contract 失败时抛出。
+    """
+
+    fake_host = _FakeHost(submit_terminal=None)
+    host_context = _FakeOpenHostContext(fake_host)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dayu-cli", "prompt", "--base", str(tmp_path), "请总结收入变化"],
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _FixedOpenHostFactory(host_context),
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "_ensure_prompt_session",
+        _raise_session_ensure_startup_interrupt,
+    )
+
+    assert run_module() == EXIT_KEYBOARD_INTERRUPT
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert host_context.exit_count == 1
+    assert fake_host.calls == []
+    assert fake_host.create_requests == []
+    assert fake_host.ensure_requests == []
+    assert fake_host.submit_requests == []
+
+
+def test_prompt_startup_interrupt_during_monitor_install_closes_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Run monitor 安装中断必须关闭 attachment/context 且不得 submit Run。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest argv、环境与类替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: cleanup、Run 零创建、退出码或输出 contract 失败时抛出。
+    """
+
+    fake_host = _FakeHost(submit_terminal=None)
+    host_context = _FakeOpenHostContext(fake_host)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dayu-cli", "prompt", "--base", str(tmp_path), "请总结收入变化"],
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _FixedOpenHostFactory(host_context),
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "CliSigintMonitor",
+        _InterruptedInstallSigintMonitor,
+    )
+
+    assert run_module() == EXIT_KEYBOARD_INTERRUPT
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert host_context.exit_count == 1
+    assert len(fake_host.create_requests) == 1
+    assert fake_host.ensure_requests == []
+    assert fake_host.submit_requests == []
+    assert fake_host.cancel_requests == []
+    assert fake_host.attach_session_ids == ["session-1"]
+    assert [attachment.close_count for attachment in fake_host.attachments] == [1]
 
 
 class _AutoSigintMonitor(CliSigintMonitor):

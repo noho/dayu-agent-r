@@ -109,7 +109,7 @@ def test_pyproject_publishes_only_real_console_scripts() -> None:
     """
 
     scripts = _load_project_scripts()
-    assert scripts == {"dayu-cli": "dayu.cli.main:main"}
+    assert scripts == {"dayu-cli": "dayu.cli.__main__:run_module"}
     assert set(PLACEHOLDER_SCRIPT_NAMES).isdisjoint(scripts)
 
 
@@ -146,7 +146,7 @@ def test_wheel_excludes_placeholder_scripts_metadata_and_packages() -> None:
         metadata = archive.read(metadata_names[0]).decode("utf-8")
         entrypoints = archive.read(entrypoint_names[0]).decode("utf-8")
 
-    assert "dayu-cli = dayu.cli.main:main" in entrypoints
+    assert "dayu-cli = dayu.cli.__main__:run_module" in entrypoints
     assert not any(script_name in entrypoints for script_name in PLACEHOLDER_SCRIPT_NAMES)
     assert "Provides-Extra: web" not in metadata
     assert "Requires-Dist: streamlit" not in metadata
