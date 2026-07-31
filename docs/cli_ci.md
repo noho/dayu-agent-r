@@ -861,8 +861,11 @@ CLI、Host、tool loop 和 memory 行为正确，只能证明 Agent 运行框架
 - Prompt 最小真实财报成功链：通过生产 `dayu-cli download` 至少下载一份真实财报，记录实际 source identity、
   文件/生成物、Fins 状态、日志和相关 SQLite before/after；完成使该财报可被生产 read tools 查询所需的真实后续
   CLI 步骤；再由 `dayu-cli prompt` 对同一 ticker/period 发起真实问题，至少观察一次成功的 document discovery 和
-  一次成功的财报内容/结构化事实读取。下载命令自报成功、仅有文件存在、`list_documents=not_found`、模型凭记忆回答
-  或搜索网页都不能满足该 obligation。
+  一次成功的财报内容/结构化事实读取。这里的 download/process 结果只证明 prompt 场景的真实 corpus 前置条件，
+  不在 prompt campaign 中裁决这些命令自身的 UI、参数、状态或生成物语义；它们必须在各自 command campaign 中
+  单独覆盖和裁决。prompt verdict 只评价 prompt 是否真实调用 read tools、最终回答是否确实来自同次财报 response，
+  以及回答与 source、Tool Trace、EventLog、memory 和 SQLite 是否一致。下载命令自报成功、仅有文件存在、
+  `list_documents=not_found`、模型凭记忆回答或搜索网页都不能满足该 obligation。
 - 文档发现：列出指定公司的可用 10-K / 10-Q / 20-F / 6-K / 年报 / 中报，并正确识别期间和修订版本。
 - 单点事实：从财务报表、XBRL 或正文提取收入、利润、现金流、债务、股本等明确指标。
 - 单位与口径：区分元/千/百万、币种、季度/累计、GAAP/non-GAAP、reported/constant currency。

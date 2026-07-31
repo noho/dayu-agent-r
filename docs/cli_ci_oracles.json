@@ -247,11 +247,13 @@
           "label-session-continuity",
           "tool-request-response-evidence",
           "tool-result-consistency",
+          "real-filing-content-grounding",
           "fallback-mode",
           "running-cancellation",
           "repeated-running-cancellation",
           "startup-cancellation",
           "running-ctrl-d",
+          "activity-visibility-toggle",
           "log-level-entry-equivalence",
           "log-selector-exclusion",
           "debug-stream-orthogonality",
@@ -376,6 +378,20 @@
           ]
         },
         {
+          "predicate_id": "prompt.10a-real-filing-content-grounding",
+          "expected": [
+            "prompt 在已有真实、可查询财报 corpus 的 workspace 中，先通过 list_documents 获取真实 document identity，再调用适合的财报 read tool 读取回答所需的正文、表格或结构化事实。",
+            "最终回答中的数值、单位、期间、document identity 和来源必须确实来自同次工具 response，并与真实财报原文、Tool Trace、EventLog、memory 和 Host durable state 一致。",
+            "为 prompt 场景准备 corpus 时调用的 download/process 只证明前置条件，不在 prompt oracle 中定义或裁决这些命令自身的 UI、参数、状态或生成物语义。"
+          ],
+          "forbidden": [
+            "只因 workspace 中存在文件或 CLI 自报下载/处理成功，就宣称 prompt 已成功读取财报。",
+            "list_documents 返回 not_found、财报 read tool 未执行或失败时，仍用模型记忆、网页搜索或猜测生成财报答案。",
+            "最终回答与同次财报 response 的数值、单位、期间、document identity 或来源不一致。",
+            "把 download/process 的观察结果误冻结为 prompt 命令行为 oracle。"
+          ]
+        },
+        {
           "predicate_id": "prompt.11-tool-limit-fallback",
           "expected": [
             "工具结果已接受但达到 max_iterations 时，fallback_mode=force_answer 生成 degraded final answer，Run 以 succeeded 收口且 CLI 退出 0。",
@@ -433,6 +449,19 @@
           "forbidden": [
             "Run 执行中把 Ctrl+D 解释为取消、立即退出或 Run 完成后的排队退出。",
             "为 prompt 编造空/非空 composer、光标编辑或 final 后 REPL 恢复语义。"
+          ]
+        },
+        {
+          "predicate_id": "prompt.16-activity-visibility-toggle",
+          "expected": [
+            "active prompt Run 中按 Ctrl+T 把后续 activity stream 从显示切为隐藏；再次按 Ctrl+T 把后续 activity stream 恢复显示。",
+            "隐藏期间已经发生的 activity 不在恢复显示时补显；Ctrl+T 不取消 Run、不改变工具或 terminal 语义，Run 按自身结果正常收口。",
+            "第一次隐藏可以显示当前 Activity hidden 状态；恢复显示不需要额外输出 Activity shown 提示行，后续 activity 重新出现即可证明状态已切换。"
+          ],
+          "forbidden": [
+            "Ctrl+T 取消、暂停或终止 prompt Run。",
+            "第二次 Ctrl+T 后仍永久隐藏后续 activity，或通过重放隐藏期间历史制造重复 activity。",
+            "为恢复显示额外要求 final 后 REPL 或 composer；prompt 是一次性命令，不拥有这些状态。"
           ]
         },
         {
@@ -560,6 +589,16 @@
           "kind": "user-decision",
           "date": "2026-07-31",
           "summary": "用户确认 prompt 未触发 context compaction 是 command-scoped 正常结果，实际 compaction mandatory coverage 归 interactive；prompt 仍缺至少下载并真实读取一份财报的成功路径。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户确认 process 命令必须在其自身 command campaign 中单独覆盖；在 prompt campaign 中，download/process 只作为真实 corpus 前置证据。补跑中 prompt 实际读取 AAPL 2025 10-K 原文，最终回答与财报内容一致，因此该 prompt 成功路径被裁决为正确。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-07-31",
+          "summary": "用户宣布 prompt 第一轮运行全部裁决完毕；因此补充 PT01 观察到的 Ctrl+T 双向切换、隐藏期间历史不补显、Run 继续以及恢复时无单独 Activity shown 提示行均按正确行为冻结。"
         }
       ],
       "observed_behavior": {
@@ -567,6 +606,18 @@
         "report_id": "prompt-20260731T011247Z/observed-behavior",
         "report_digest_sha256": "5d71ee302abedf40443b060e566ce6cb52eb0af463244806ba0dec55c9d9c1aa",
         "report_frozen": true,
+        "supplemental_reports": [
+          {
+            "run_id": "prompt-financial-20260731TqJFtTp",
+            "report_id": "prompt-financial-20260731TqJFtTp/observed-behavior",
+            "report_digest_sha256": "fb3ddc4a193812cc88d49bc8887a5f911b32544124bfcbba4112d2926a9a5536",
+            "report_status": "all-observed-prompt-behavior-adjudicated",
+            "scenario_refs": [
+              "PF03",
+              "PT01"
+            ]
+          }
+        ],
         "scenario_refs": [
           "P27R-P47",
           "P64",
@@ -581,20 +632,20 @@
           "当前连续两次 Ctrl+C 虽已使 Host cancelled，但第二次 SIGINT 令本地进程 returncode=-2 并绕过完整 closeout；用户已拒绝该行为，要求等待优雅清理后退出 130。",
           "当前启动约 0.05 秒的 Ctrl+C 命中 dayu.cli.main 及其 Service/Host/Engine 依赖导入链；此时顶层 KeyboardInterrupt 映射和运行阶段 SIGINT monitor 均未建立，Python 默认处理器显示 Traceback 并以 signal returncode=-2 终止。",
           "当前 Dayu 实测 prompt Run 中 Ctrl+D 不取消 Run，Run 最终成功；prompt 没有 composer。",
-          "观察清单第 16 项的 P42 只在 Run 中发送一次 Ctrl+T（0x14），观察到 activity 切为 hidden；没有再次发送 Ctrl+T，因此 activity 恢复显示、隐藏期间历史是否补显、多次切换稳定性和 final 后残留均未观察，属于明确 coverage gap。",
+          "原观察清单第 16 项的 P42 只覆盖 Ctrl+T 隐藏；补充 PT01 已在同一 active Run 中观察到第二次 Ctrl+T 后后续 activity 恢复显示、隐藏期间历史不补显、Run 不取消且退出 0。用户宣布 prompt 第一轮运行全部裁决完毕，因此该行为已接受。",
           "P49-P58 只运行当前六个 --log-level 值和四个快捷别名；当前只有 warn、没有 warning，缺少 quiet 显式值以及 --warn/--warning/--error/--critical，且 --quiet 仍映射 error，因此不满足用户裁决后的日志入口 oracle，必须扩充真实运行覆盖。",
           "P59 的 --debug-stream --info 成功符合可组合方向，但当前 runtime 以 STREAM_DEBUG 覆盖 ordinary level，不满足正交语义；P60 的 --debug --quiet 静默成功并按后值覆盖，不满足 selector 互斥和退出 2 的 oracle。",
           "P63a/P63b 使用同一 --log-file 连续运行，最终文件保留两次 host.open.start 及两次运行日志，观察到 append 而非 truncate；用户已确认该行为正确。",
           "本轮参数结构错误退出 2；语法有效但 unknown model、配置 JSON 损坏、credential 缺失和 provider/Run failure 退出 1；Escape/Ctrl+C 取消 prompt 退出 130。用户已确认该分类正确，并要求后续以确定性 owner matrix 扩充运行覆盖。",
           "本次 observation run 启动时稳定 scenario registry 仍为空，作为首个 calibration bootstrap 是正常状态；但第一轮 campaign 在 accepted scenarios 写入并通过 readiness proof 前仍不能结束。",
           "prompt 没有真正触发 context compaction 不再属于 prompt coverage gap；实际 compaction 触发、跨轮状态和 compact 前后连续性由 interactive mandatory matrix 覆盖。",
-          "P36 的真实 list_documents(AAPL) 返回 not_found，没有覆盖带真实财报 corpus 的成功读取路径；prompt campaign 仍必须在新 run 中通过生产 CLI 至少下载并消费一份真实财报，关联 Fins、SQLite、Tool Trace、runner input 和最终回答证据。"
+          "补充 PF03 在真实 AAPL 2025 10-K corpus 上通过 list_documents、get_document_sections 和 read_section 读取 s_0013_c03；最终回答的 416,161 百万美元、单位、期间、document id 和 section ref 与财报原文、Tool Trace、EventLog、memory 和 Host 状态一致。用户已裁决该 prompt 成功路径正确；download/process 仅作为 corpus 准备证据，其命令行为归各自 campaign。"
         ]
       },
       "user_adjudication": {
         "decision": "accepted",
         "date": "2026-07-31",
-        "notes": "按用户逐项回复冻结观察清单第 1 至 12 项，并以用户给出的 replacement behavior 冻结第 13、14 项；第 15 项仅冻结 prompt Run 中 Ctrl+D 不取消或排队退出，composer 状态明确不适用于 prompt 并转入 interactive mandatory coverage。第 12 项的内部 closeout reason 暴露、第 13 项的第二次 SIGINT 强退和第 14 项的启动期 Traceback 都是明确 conformance gap。第 16 项只覆盖 Ctrl+T 隐藏，未覆盖再次 Ctrl+T 恢复显示，保持 coverage gap 和未裁决。第 17 项是 Codex 参考信息，按用户裁决排除出 Dayu observation/oracle。第 18、19 项按用户 replacement behavior 冻结，并要求扩充完整日志参数运行矩阵；第 20 项 append 行为按现有观察接受；第 21 项按确定性 exit-code 分类接受并要求扩充 owner matrix。第 22 项是 CI 取证充分性陈述，不是 Dayu 产品行为 predicate；它继续由 handbook evidence contract 和 frozen report 证明，不进入 oracle。Prompt 当前唯一新增 command-scoped observation gap 是至少一份真实财报的下载、可查询化和成功读取链；scenario registry 仍须在补跑及裁决闭环后写入并通过 readiness。"
+        "notes": "按用户逐项回复冻结观察清单第 1 至 12 项，并以用户给出的 replacement behavior 冻结第 13、14 项；第 15 项仅冻结 prompt Run 中 Ctrl+D 不取消或排队退出，composer 状态明确不适用于 prompt 并转入 interactive mandatory coverage。第 12 项的内部 closeout reason 暴露、第 13 项的第二次 SIGINT 强退和第 14 项的启动期 Traceback 都是明确 conformance gap。第 16 项的补充 PT01 已观察双向 Ctrl+T，用户最终宣布 prompt 第一轮运行全部裁决完毕，因此该现状已接受。第 17 项是 Codex 参考信息，按用户裁决排除出 Dayu observation/oracle。第 18、19 项按用户 replacement behavior 冻结，并要求扩充完整日志参数运行矩阵；第 20 项 append 行为按现有观察接受；第 21 项按确定性 exit-code 分类接受并要求扩充 owner matrix。第 22 项是 CI 取证充分性陈述，不是 Dayu 产品行为 predicate；它继续由 handbook evidence contract 和 frozen report 证明，不进入 oracle。补充 PF03 已证明真实 prompt 从 AAPL 2025 10-K 工具 response 读取并回答 416,161 百万美元，用户裁决为正确；download/process 只构成 corpus 前置证据，不在 prompt oracle 中裁决。全部 observed prompt behavior 的 oracle adjudication 已完成；mandatory scenario coverage 和 registry readiness 仍须补齐，不能据此宣称 full-real campaign 完成。"
       },
       "applicable_from": {
         "date": "2026-07-31",
