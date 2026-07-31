@@ -7,12 +7,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 from typing import Protocol, cast
 
 CLI_PROGRAM_NAME: str = "dayu-cli"
 DEFAULT_WORKSPACE: str = "./workspace"
 DEFAULT_LOG_LEVEL: str = "info"
+INVALID_UTF8_INVOCATION_DIAGNOSTIC: str = (
+    "command-line arguments must be valid UTF-8 text; "
+    "re-enter the command using UTF-8 input."
+)
 
 LOG_LEVEL_CHOICES: tuple[str, ...] = (
     "debug",
@@ -229,11 +234,34 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> ParsedCliArgs:
     """
 
     parser = build_parser()
-    namespace = parser.parse_args(argv, namespace=_new_default_namespace())
+    effective_argv = tuple(sys.argv[1:] if argv is None else argv)
+    _require_valid_utf8_invocation(effective_argv, parser=parser)
+    namespace = parser.parse_args(effective_argv, namespace=_new_default_namespace())
     parsed_args = cast(ParsedCliArgs, namespace)
     if parsed_args.command_name == COMMAND_INIT and parsed_args.config_dir is not None:
         parser.error("init 命令不接受 --config")
     return parsed_args
+
+
+def _require_valid_utf8_invocation(
+    argv: tuple[str, ...],
+    *,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """在 argparse 消费前拒绝不能编码为严格 UTF-8 的 argv 文本。
+
+    :param argv: 已物化且不含程序名的 CLI 参数。
+    :param parser: 负责输出公共 usage diagnostic 的参数解析器。
+    :returns: ``None``。
+    :raises SystemExit: 任一参数含 surrogate 等非法 UTF-8 文本时由 parser
+        以用法错误 2 退出。
+    """
+
+    for argument in argv:
+        try:
+            argument.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            parser.error(INVALID_UTF8_INVOCATION_DIAGNOSTIC)
 
 
 def _new_default_namespace() -> ParsedCliArgs:
@@ -1026,6 +1054,7 @@ __all__: tuple[str, ...] = (
     "EXCLUDED_COMMAND_NAMES",
     "CLI_PROGRAM_NAME",
     "COMMAND_TOOL_TRACE",
+    "INVALID_UTF8_INVOCATION_DIAGNOSTIC",
     "ParsedCliArgs",
     "TOOL_TRACE_ACTION_ANALYZE",
     "build_parser",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Never, TextIO
+from unittest.mock import Mock
 
 import pytest
 
@@ -21,6 +23,7 @@ import dayu.runtime.log as runtime_log
 from dayu.cli.arg_parsing import (
     CLI_COMMAND_NAMES,
     EXCLUDED_COMMAND_NAMES,
+    INVALID_UTF8_INVOCATION_DIAGNOSTIC,
     ParsedCliArgs,
     build_parser,
     parse_cli_args,
@@ -591,6 +594,107 @@ def test_missing_command_exits_with_usage_error() -> None:
     """
 
     assert cli_main.main(()) == EXIT_USAGE_ERROR
+
+
+def test_parse_cli_args_preserves_valid_unicode_invocation_text() -> None:
+    """CLI invocation owner 必须原样保留合法中文与 emoji。
+
+    :returns: ``None``。
+    :raises AssertionError: 合法 UTF-8 文本被拒绝或改写时抛出。
+    """
+
+    prompt = "分析收入变化 📈"
+
+    args = parse_cli_args(("prompt", prompt))
+
+    assert args.prompt == prompt
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("\udcff",),
+        ("prompt", "--base", "\udcff", "hello"),
+        ("prompt", "\udcff"),
+    ),
+)
+def test_main_rejects_invalid_utf8_before_primary_operation(
+    argv: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """surrogateescape argv 必须在 parser 边界 exit 2 且零 primary 副作用。
+
+    :param argv: 在 command、option value 或 positional 注入 surrogate 的参数。
+    :param monkeypatch: pytest runtime owner 替换夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 输入越过 parser 或 diagnostic 不可编码时抛出。
+    """
+
+    default_log_open = Mock(
+        side_effect=AssertionError("invalid argv must not prepare log resources")
+    )
+    log_configuration = Mock(
+        side_effect=AssertionError("invalid argv must not configure runtime logging")
+    )
+    monkeypatch.setattr(cli_main, "_open_default_log_file", default_log_open)
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        log_configuration,
+    )
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _fail_primary_operation)
+
+    assert cli_main.main(argv) == EXIT_USAGE_ERROR
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert INVALID_UTF8_INVOCATION_DIAGNOSTIC in captured.err
+    assert "Traceback" not in captured.err
+    assert "UnicodeEncodeError" not in captured.err
+    assert "\udcff" not in captured.err
+    captured.err.encode("utf-8", errors="strict")
+    default_log_open.assert_not_called()
+    log_configuration.assert_not_called()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不使用 POSIX bytes argv")
+def test_module_rejects_raw_non_utf8_argv_without_side_effects(tmp_path: Path) -> None:
+    """真实 POSIX bytes argv 必须稳定 exit 2 且不创建日志或业务状态。
+
+    :param tmp_path: pytest 临时父目录。
+    :returns: ``None``。
+    :raises AssertionError: raw argv、输出编码、退出码或副作用 contract 失败时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    log_file = tmp_path / "invalid-argv.log"
+    completed = subprocess.run(
+        (
+            os.fsencode(sys.executable),
+            b"-m",
+            b"dayu.cli",
+            b"prompt",
+            b"--base",
+            os.fsencode(workspace_root),
+            b"--log-file",
+            os.fsencode(log_file),
+            b"\xff",
+        ),
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        check=False,
+    )
+
+    stderr = completed.stderr.decode("utf-8", errors="strict")
+    assert completed.returncode == EXIT_USAGE_ERROR
+    assert completed.stdout == b""
+    assert INVALID_UTF8_INVOCATION_DIAGNOSTIC in stderr
+    assert "Traceback" not in stderr
+    assert "UnicodeEncodeError" not in stderr
+    assert b"\xff" not in completed.stderr
+    assert not log_file.exists()
+    assert not workspace_root.exists()
 
 
 @pytest.mark.parametrize("command_name", EXCLUDED_COMMAND_NAMES)
@@ -1264,41 +1368,59 @@ def test_main_restores_stderr_before_closing_log_file_on_keyboard_interrupt(
     assert log_stream.closed
 
 
-def test_main_returns_usage_error_when_log_file_cannot_open(
+def test_main_returns_resource_error_when_log_file_parent_is_missing(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--log-file`` 打开失败必须返回 usage error 且不执行命令 runner。
+    """缺失 ``--log-file`` 父目录必须 exit 1 且不执行 primary operation。
 
     :param tmp_path: pytest 临时目录夹具。
     :param capsys: pytest 标准输出捕获夹具。
     :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
-    :raises AssertionError: 打开失败没有被收敛为 usage error 时抛出。
+    :raises AssertionError: 错误分类、文件副作用或执行顺序不符合 contract 时抛出。
     """
 
-    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
+    runtime_configuration = Mock(
+        side_effect=AssertionError("resource failure must precede runtime logging")
+    )
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        runtime_configuration,
+    )
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _fail_primary_operation)
     missing_parent = tmp_path / "missing" / "dayu.log"
 
     assert (
         cli_main.main(("prompt", "请分析收入变化", "--log-file", str(missing_parent)))
-        == EXIT_USAGE_ERROR
+        == EXIT_FAILURE
     )
     captured = capsys.readouterr()
+    assert captured.out == ""
     assert "--log-file" in captured.err
     assert "cannot open" in captured.err
+    assert str(missing_parent) in captured.err
+    assert "Traceback" not in captured.err
+    assert not missing_parent.parent.exists()
+    assert not missing_parent.exists()
+    runtime_configuration.assert_not_called()
 
 
 def test_main_returns_usage_error_when_log_file_is_empty(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """空白 ``--log-file`` 路径必须返回 usage error。
 
     :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest primary runner 替换夹具。
     :returns: ``None``。
     :raises AssertionError: 空白路径没有被拒绝时抛出。
     """
+
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _fail_primary_operation)
 
     assert (
         cli_main.main(("prompt", "请分析收入变化", "--log-file", "   "))

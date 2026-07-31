@@ -12,4 +12,11 @@ class CliUsageError(ValueError):
     """CLI 用户用法错误基类。"""
 
 
-__all__: tuple[str, ...] = ("CliUsageError",)
+class CliResourcePreparationError(RuntimeError):
+    """CLI 运行资源或输出目的地准备失败。"""
+
+
+__all__: tuple[str, ...] = (
+    "CliResourcePreparationError",
+    "CliUsageError",
+)
