@@ -7,19 +7,23 @@ import errno
 import getpass
 import importlib
 import io
+import json
 import os
 import platform
 import secrets
+import shutil
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
-from typing import Final, TextIO
+from typing import Final, TextIO, cast
 from unittest.mock import Mock, call
 
 import pytest
 
 import dayu.cli.commands.init as init_command
 import dayu.cli.main as cli_main
+from dayu.contracts import JsonValue
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -379,6 +383,89 @@ def _write_text(path: Path, value: str) -> None:
     path.write_text(value, encoding="utf-8")
 
 
+def _read_json_object(path: Path) -> dict[str, JsonValue]:
+    """读取测试 JSON object 的可修改浅复制。
+
+    :param path: JSON 文件路径。
+    :returns: string-keyed JSON object。
+    :raises AssertionError: 顶层不是 mapping 时抛出。
+    :raises OSError: 文件读取失败时抛出。
+    """
+
+    value = cast(
+        JsonValue,
+        json.loads(path.read_text(encoding="utf-8")),
+    )
+    assert isinstance(value, Mapping)
+    return dict(value)
+
+
+def _write_json(path: Path, value: JsonValue) -> None:
+    """写入测试 JSON 值。
+
+    :param path: 目标 JSON 文件。
+    :param value: 严格 JSON 值。
+    :returns: ``None``。
+    :raises OSError: 写入失败时抛出。
+    :raises TypeError: fixture 不是 JSON 值时抛出。
+    """
+
+    path.write_text(
+        f"{json.dumps(value, ensure_ascii=False, indent=2)}\n",
+        encoding="utf-8",
+    )
+
+
+def _set_default_execution_profile(
+    config_root: Path,
+    execution_profile_id: str,
+) -> None:
+    """修改 workspace 默认 execution profile 引用。
+
+    :param config_root: workspace config 根目录。
+    :param execution_profile_id: 已存在的 target profile id。
+    :returns: ``None``。
+    :raises AssertionError: package fixture shape 非法时抛出。
+    :raises OSError: JSON 读写失败时抛出。
+    """
+
+    path = config_root / "execution_profiles.json"
+    root = _read_json_object(path)
+    raw_profiles = root["execution_profiles"]
+    assert isinstance(raw_profiles, Mapping)
+    assert execution_profile_id in raw_profiles
+    root["default_execution_profile_id"] = execution_profile_id
+    _write_json(path, root)
+
+
+def _set_all_environment_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让模型 required 与所有 optional 环境值都无需交互。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises Exception: monkeypatch 写环境失败时抛出。
+    """
+
+    for name in (
+        "CUSTOM_OPENAI_API_KEY",
+        *init_command.OPTIONAL_ENVIRONMENT_NAMES,
+    ):
+        monkeypatch.setenv(name, "configured")
+
+
+def _copy_package_config(tmp_path: Path) -> Path:
+    """复制 package config 供 fail-closed 测试隔离修改。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: 私有 package config 副本。
+    :raises OSError: copytree 失败时抛出。
+    """
+
+    destination = tmp_path / "package-config"
+    shutil.copytree(init_command._PACKAGE_CONFIG_ROOT, destination)
+    return destination
+
+
 def test_read_secret_input_uses_hidden_getpass_for_tty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -691,6 +778,102 @@ def test_first_cli_flow_uses_real_lock_discovery_and_current_config(
     assert config.models.models["ollama"].model == "qwen3:8b"
 
 
+@pytest.mark.parametrize(
+    ("expected_mode", "flags", "existing_config"),
+    (
+        (init_command.InitMode.FIRST, (), False),
+        (init_command.InitMode.PRESERVE, (), True),
+        (init_command.InitMode.OVERWRITE, ("--overwrite",), True),
+        (init_command.InitMode.RESET, ("--reset",), True),
+    ),
+)
+def test_locked_target_mode_loads_typed_profile_once_and_passes_minimum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_mode: init_command.InitMode,
+    flags: tuple[str, ...],
+    existing_config: bool,
+) -> None:
+    """四态在首个 model prompt 前按锁内 mode 单次加载并显式下传 minimum。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param expected_mode: 锁内 target mode。
+    :param flags: 构造该 mode 的 CLI flags。
+    :param existing_config: 是否预置 workspace config。
+    :returns: ``None``。
+    :raises AssertionError: loader source、次数、顺序或显式下传漂移时抛出。
+    :raises OSError: fixture 配置复制失败时抛出。
+    """
+
+    workspace_root = tmp_path / expected_mode.value
+    workspace_root.mkdir()
+    if existing_config:
+        shutil.copytree(
+            init_command._PACKAGE_CONFIG_ROOT,
+            workspace_root / "config",
+        )
+    typed_profiles = ConfigLoader(
+        package_config_dir=init_command._PACKAGE_CONFIG_ROOT
+    ).load_execution_profiles()
+    expected_minimum = typed_profiles.execution_profiles[
+        typed_profiles.default_execution_profile_id
+    ].min_context_window_tokens
+    loader = Mock()
+    loader.load_execution_profiles.return_value = typed_profiles
+    loader_factory = Mock(return_value=loader)
+    selection = Mock(
+        side_effect=init_command.CliInitOperationError(
+            "stop after target minimum"
+        )
+    )
+    monkeypatch.setattr(init_command, "ConfigLoader", loader_factory)
+    monkeypatch.setattr(init_command, "_select_model", selection)
+    snapshot = Mock(wraps=init_command.snapshot_managed_roots)
+    monkeypatch.setattr(init_command, "snapshot_managed_roots", snapshot)
+    if expected_mode is init_command.InitMode.RESET:
+        monkeypatch.setattr(builtins, "input", _InputSequence(("y",)))
+
+    exit_code = cli_main.main(
+        ("init", "--base", str(workspace_root), *flags)
+    )
+
+    assert exit_code == EXIT_FAILURE
+    loader_factory.assert_called_once_with(
+        package_config_dir=init_command._PACKAGE_CONFIG_ROOT
+    )
+    expected_workspace_config_dir = (
+        workspace_root.resolve(strict=True) / "config"
+        if expected_mode is init_command.InitMode.PRESERVE
+        else None
+    )
+    loader.load_execution_profiles.assert_called_once_with(
+        workspace_config_dir=expected_workspace_config_dir
+    )
+    selection.assert_called_once_with(
+        min_context_window_tokens=expected_minimum
+    )
+    expected_repair_mode = (
+        expected_mode
+        if expected_mode
+        in (init_command.InitMode.OVERWRITE, init_command.InitMode.RESET)
+        else None
+    )
+    expected_workspace_root = workspace_root.resolve(strict=True)
+    assert snapshot.call_args_list == [
+        call(
+            expected_workspace_root,
+            platform_system=platform.system(),
+            repair_mode=expected_repair_mode,
+        ),
+        call(
+            expected_workspace_root,
+            platform_system=platform.system(),
+            repair_mode=expected_repair_mode,
+        ),
+    ]
+
+
 def test_preserve_overwrite_and_reset_cli_matrix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -749,6 +932,436 @@ def test_preserve_overwrite_and_reset_cli_matrix(
     assert not (workspace_root / ".dayu").exists()
     assert (workspace_root / "portfolio" / "sentinel.txt").read_text(encoding="utf-8") == "keep"
     assert prewarm.call_count == 2
+
+
+def test_invalid_choice_and_dynamic_fields_retry_in_original_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Choice/model/endpoint/context 的 recoverable 错误必须逐步原地重试。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: prompt 顺序、成功 publication 或敏感 endpoint 脱敏漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    invalid_endpoint = "https://bad endpoint/sensitive-query?token=secret"
+    package_minimum = init_command._load_target_min_context_window(
+        locked_mode=init_command.InitMode.FIRST,
+        workspace_root=workspace_root,
+    )
+    input_sequence = _InputSequence(
+        (
+            "unknown-choice",
+            "15",
+            " invalid-model",
+            "valid-model",
+            invalid_endpoint,
+            "",
+            "1",
+            str(package_minimum),
+        )
+    )
+    monkeypatch.setattr(builtins, "input", input_sequence)
+    _install_tty_getpass(monkeypatch)
+    _set_all_environment_values(monkeypatch)
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert input_sequence.prompts[0:2] == [
+        "模型组合编号或 choice id: ",
+        "模型组合编号或 choice id: ",
+    ]
+    assert input_sequence.prompts[2:4] == [
+        "Custom model name: ",
+        "Custom model name: ",
+    ]
+    assert input_sequence.prompts[4:6] == [
+        f"Custom endpoint [{init_command._DEFAULT_CUSTOM_ENDPOINT}]: ",
+        f"Custom endpoint [{init_command._DEFAULT_CUSTOM_ENDPOINT}]: ",
+    ]
+    assert input_sequence.prompts[6:8] == [
+        f"Custom context window [{package_minimum}]: ",
+        f"Custom context window [{package_minimum}]: ",
+    ]
+    assert invalid_endpoint not in captured.out
+    assert invalid_endpoint not in captured.err
+    assert (
+        ConfigLoader()
+        .load_models(workspace_config_dir=workspace_root / "config")
+        .models["custom-openai"]
+        .context_window_tokens
+        == package_minimum
+    )
+
+
+@pytest.mark.parametrize("choice_id", ("14", "15"), ids=("ollama", "custom"))
+def test_preserve_workspace_minimum_retries_low_dynamic_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    choice_id: str,
+) -> None:
+    """PRESERVE 更高 workspace minimum 必须让低 context 在当前步骤重试。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param choice_id: Ollama 或 Custom 的 catalog 编号。
+    :returns: ``None``。
+    :raises AssertionError: layered minimum、prompt 次数或最终 model context 漂移时抛出。
+    :raises OSError: fixture 配置读写失败时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{choice_id}"
+    _install_ollama_inputs(monkeypatch)
+    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
+    workspace_minimum = 1_000_000
+    _set_default_execution_profile(
+        workspace_root / "config",
+        "standard-1m",
+    )
+    _set_all_environment_values(monkeypatch)
+    if choice_id == "14":
+        responses = (
+            choice_id,
+            "",
+            "",
+            "262144",
+            str(workspace_minimum),
+        )
+        model_id = "ollama"
+    else:
+        responses = (
+            choice_id,
+            "custom-model",
+            "",
+            "262144",
+            str(workspace_minimum),
+        )
+        model_id = "custom-openai"
+    input_sequence = _InputSequence(responses)
+    monkeypatch.setattr(builtins, "input", input_sequence)
+    _install_tty_getpass(monkeypatch)
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+
+    assert exit_code == EXIT_SUCCESS
+    context_prompts = [
+        prompt
+        for prompt in input_sequence.prompts
+        if "context window" in prompt
+    ]
+    assert len(context_prompts) == 2
+    model = ConfigLoader().load_models(
+        workspace_config_dir=workspace_root / "config"
+    ).models[model_id]
+    assert model.context_window_tokens == workspace_minimum
+
+
+def test_preserve_missing_workspace_profile_uses_package_layer(
+    tmp_path: Path,
+) -> None:
+    """PRESERVE 缺失 execution profile 文件时必须由 typed loader 取得 package layer。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: layered typed minimum 不等于 package owner 值时抛出。
+    """
+
+    package_profiles = ConfigLoader(
+        package_config_dir=init_command._PACKAGE_CONFIG_ROOT
+    ).load_execution_profiles()
+    expected_minimum = package_profiles.execution_profiles[
+        package_profiles.default_execution_profile_id
+    ].min_context_window_tokens
+    workspace_root = tmp_path / "workspace-without-profile"
+    (workspace_root / "config").mkdir(parents=True)
+
+    minimum = init_command._load_target_min_context_window(
+        locked_mode=init_command.InitMode.PRESERVE,
+        workspace_root=workspace_root,
+    )
+
+    assert minimum == expected_minimum
+
+
+@pytest.mark.parametrize(
+    "profile_shape",
+    (
+        "symlink",
+        "dangling-symlink",
+        "directory",
+        "fifo",
+    ),
+)
+def test_preserve_non_regular_workspace_profile_stops_before_all_consumers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    profile_shape: str,
+) -> None:
+    """PRESERVE 非普通 profile 必须在 loader 与全部下游消费者前失败。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :param profile_shape: symlink、dangling、目录或代表 special file 的 FIFO。
+    :returns: ``None``。
+    :raises AssertionError: no-follow 分类、脱敏、零副作用或外部 target 保持漂移时抛出。
+    :raises OSError: fixture 文件、symlink 或 FIFO 创建失败时抛出。
+    """
+
+    if profile_shape == "fifo" and os.name == "nt":
+        pytest.skip("Windows special path 由 reparse owner contract 覆盖")
+    workspace_root = tmp_path / f"workspace-{profile_shape}"
+    shutil.copytree(
+        init_command._PACKAGE_CONFIG_ROOT,
+        workspace_root / "config",
+    )
+    profile_path = workspace_root / "config" / "execution_profiles.json"
+    models_path = workspace_root / "config" / "models.json"
+    models_before = models_path.read_bytes()
+    dayu_sentinel = workspace_root / ".dayu" / "sentinel.txt"
+    _write_text(dayu_sentinel, "durable-state")
+    external_secret = "external-profile-secret"
+    external_target = tmp_path / f"external-{profile_shape}.json"
+    external_target.write_text(external_secret, encoding="utf-8")
+    external_before = external_target.read_bytes()
+    dangling_target = tmp_path / f"missing-{profile_shape}.json"
+    real_snapshot_check = init_command._require_confirmed_snapshot
+
+    def replace_profile_after_snapshot(
+        *,
+        unlocked_snapshot: init_command.WorkspaceSnapshot,
+        locked_snapshot: init_command.WorkspaceSnapshot,
+        requested_mode: init_command.InitMode,
+        locked_mode: init_command.InitMode,
+    ) -> None:
+        """先执行真实 snapshot 复核，再注入待分类的静态路径 shape。
+
+        :param unlocked_snapshot: lock 前 managed-root snapshot。
+        :param locked_snapshot: lock 内 managed-root snapshot。
+        :param requested_mode: lock 前目标模式。
+        :param locked_mode: lock 内目标模式。
+        :returns: ``None``。
+        :raises AssertionError: snapshot contract 或 profile shape 名非法时抛出。
+        :raises OSError: profile 替换或 special path 创建失败时抛出。
+        """
+
+        real_snapshot_check(
+            unlocked_snapshot=unlocked_snapshot,
+            locked_snapshot=locked_snapshot,
+            requested_mode=requested_mode,
+            locked_mode=locked_mode,
+        )
+        profile_path.unlink()
+        if profile_shape == "symlink":
+            profile_path.symlink_to(external_target)
+        elif profile_shape == "dangling-symlink":
+            profile_path.symlink_to(dangling_target)
+        elif profile_shape == "directory":
+            profile_path.mkdir()
+        elif profile_shape == "fifo":
+            os.mkfifo(profile_path)
+        else:
+            raise AssertionError("unknown profile shape fixture")
+
+    loader_factory = Mock(
+        side_effect=AssertionError("profile loader must not start")
+    )
+    select_model = Mock(
+        side_effect=AssertionError("model prompt must not start")
+    )
+    collect_secrets = Mock(
+        side_effect=AssertionError("secret collection must not start")
+    )
+    prepare_transaction = Mock(
+        side_effect=AssertionError("transaction prepare must not start")
+    )
+    publish_transaction = Mock(
+        side_effect=AssertionError("publication must not start")
+    )
+    secret_input = Mock(
+        side_effect=AssertionError("secret input must not start")
+    )
+    monkeypatch.setattr(
+        init_command,
+        "_require_confirmed_snapshot",
+        replace_profile_after_snapshot,
+    )
+    monkeypatch.setattr(init_command, "ConfigLoader", loader_factory)
+    monkeypatch.setattr(init_command, "_select_model", select_model)
+    monkeypatch.setattr(
+        init_command,
+        "_collect_environment_persistence_plan",
+        collect_secrets,
+    )
+    monkeypatch.setattr(
+        init_command,
+        "prepare_workspace_transaction",
+        prepare_transaction,
+    )
+    monkeypatch.setattr(
+        init_command,
+        "publish_workspace_transaction",
+        publish_transaction,
+    )
+    monkeypatch.setattr(getpass, "getpass", secret_input)
+    monkeypatch.setattr(builtins, "input", _InterruptInput())
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "workspace execution profile path must be an ordinary file" in captured.err
+    assert "rerun with --overwrite" in captured.err
+    assert external_secret not in captured.out
+    assert external_secret not in captured.err
+    loader_factory.assert_not_called()
+    select_model.assert_not_called()
+    collect_secrets.assert_not_called()
+    secret_input.assert_not_called()
+    prepare_transaction.assert_not_called()
+    publish_transaction.assert_not_called()
+    assert external_target.read_bytes() == external_before
+    assert models_path.read_bytes() == models_before
+    assert dayu_sentinel.read_text(encoding="utf-8") == "durable-state"
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ("malformed", "schema", "default-id"),
+)
+def test_preserve_invalid_workspace_profile_fails_closed_without_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    invalid_kind: str,
+) -> None:
+    """PRESERVE 已存在但非法的 profile 必须脱敏失败且保持 managed roots。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :param invalid_kind: malformed/schema/default-id-invalid 场景。
+    :returns: ``None``。
+    :raises AssertionError: fallback、prompt、退出码、脱敏或零 mutation 漂移时抛出。
+    :raises OSError: fixture 配置读写失败时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{invalid_kind}"
+    workspace_root.mkdir()
+    shutil.copytree(
+        init_command._PACKAGE_CONFIG_ROOT,
+        workspace_root / "config",
+    )
+    dayu_sentinel = workspace_root / ".dayu" / "sentinel.txt"
+    _write_text(dayu_sentinel, "durable-state")
+    profile_path = workspace_root / "config" / "execution_profiles.json"
+    secret_sentinel = "profile-secret-sentinel"
+    if invalid_kind == "malformed":
+        profile_path.write_text(
+            f'{{"secret":"{secret_sentinel}"',
+            encoding="utf-8",
+        )
+    elif invalid_kind == "schema":
+        _write_json(
+            profile_path,
+            {
+                "unexpected": secret_sentinel,
+            },
+        )
+    else:
+        root = _read_json_object(profile_path)
+        root["default_execution_profile_id"] = secret_sentinel
+        _write_json(profile_path, root)
+    before_profile = profile_path.read_bytes()
+    select_model = Mock(
+        side_effect=AssertionError("model prompt must not start")
+    )
+    monkeypatch.setattr(init_command, "_select_model", select_model)
+    monkeypatch.setattr(builtins, "input", _InterruptInput())
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "workspace execution profile config is invalid" in captured.err
+    assert "rerun with --overwrite" in captured.err
+    assert secret_sentinel not in captured.out
+    assert secret_sentinel not in captured.err
+    assert profile_path.read_bytes() == before_profile
+    assert dayu_sentinel.read_text(encoding="utf-8") == "durable-state"
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+    select_model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ("missing", "malformed", "default-id"),
+)
+def test_package_profile_failure_is_actionable_and_has_zero_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    invalid_kind: str,
+) -> None:
+    """Package profile 缺失/非法/default-id-invalid 必须在交互前失败。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :param invalid_kind: package typed load failure 场景。
+    :returns: ``None``。
+    :raises AssertionError: fallback、prompt、诊断或零 publication 漂移时抛出。
+    :raises OSError: package fixture 复制或修改失败时抛出。
+    """
+
+    package_config = _copy_package_config(tmp_path)
+    profile_path = package_config / "execution_profiles.json"
+    secret_sentinel = "package-profile-secret"
+    if invalid_kind == "missing":
+        profile_path.unlink()
+    elif invalid_kind == "malformed":
+        profile_path.write_text(
+            f'{{"secret":"{secret_sentinel}"',
+            encoding="utf-8",
+        )
+    else:
+        root = _read_json_object(profile_path)
+        root["default_execution_profile_id"] = secret_sentinel
+        _write_json(profile_path, root)
+    monkeypatch.setattr(init_command, "_PACKAGE_CONFIG_ROOT", package_config)
+    monkeypatch.setattr(
+        init_command,
+        "_PACKAGE_MANIFEST_ROOT",
+        package_config / "prompts" / "manifests",
+    )
+    select_model = Mock(
+        side_effect=AssertionError("model prompt must not start")
+    )
+    monkeypatch.setattr(init_command, "_select_model", select_model)
+    monkeypatch.setattr(builtins, "input", _InterruptInput())
+    workspace_root = tmp_path / "workspace"
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "package execution profile config is invalid" in captured.err
+    assert "repair or reinstall package config" in captured.err
+    assert secret_sentinel not in captured.out
+    assert secret_sentinel not in captured.err
+    assert not (workspace_root / "config").exists()
+    assert not (workspace_root / ".dayu").exists()
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+    select_model.assert_not_called()
 
 
 def test_prewarm_imports_exact_roots_without_inputs(
@@ -835,11 +1448,11 @@ def test_reset_default_no_has_zero_bootstrap_or_managed_mutation(
     assert not workspace_root.exists()
 
 
-def test_reset_eof_and_interrupt_have_zero_mutation(
+def test_reset_eof_and_interrupt_map_to_failure_and_interrupt_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RESET EOF 默认 No，SIGINT 返回 130，二者都不 bootstrap。
+    """RESET EOF 返回 1、SIGINT 返回 130，二者都不 bootstrap。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch 夹具。
@@ -849,13 +1462,41 @@ def test_reset_eof_and_interrupt_have_zero_mutation(
 
     eof_root = tmp_path / "eof"
     monkeypatch.setattr(builtins, "input", _EofInput())
-    assert cli_main.main(("init", "--base", str(eof_root), "--reset")) == EXIT_SUCCESS
+    assert cli_main.main(("init", "--base", str(eof_root), "--reset")) == EXIT_FAILURE
     assert not eof_root.exists()
 
     interrupt_root = tmp_path / "interrupt"
     monkeypatch.setattr(builtins, "input", _InterruptInput())
     assert cli_main.main(("init", "--base", str(interrupt_root), "--reset")) == EXIT_KEYBOARD_INTERRUPT
     assert not interrupt_root.exists()
+
+
+def test_reset_invalid_confirmation_retries_same_prompt_then_cancels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RESET 非法确认必须原步骤重试，Enter 仍按取消成功处理。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: prompt 次数、退出码或零 mutation contract 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    input_sequence = _InputSequence(("maybe", ""))
+    monkeypatch.setattr(builtins, "input", input_sequence)
+
+    exit_code = cli_main.main(
+        ("init", "--base", str(workspace_root), "--reset")
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert input_sequence.prompts == [
+        "确认 RESET? [y/N]: ",
+        "确认 RESET? [y/N]: ",
+    ]
+    assert not workspace_root.exists()
 
 
 def test_reset_confirmation_snapshot_drift_requires_rerun(
@@ -892,34 +1533,138 @@ def test_reset_confirmation_snapshot_drift_requires_rerun(
         )
 
 
-def test_required_secret_refusal_stops_before_transaction_publication(
+@pytest.mark.parametrize(
+    ("confirmation_kind", "expected_exit"),
+    (
+        ("no", EXIT_FAILURE),
+        ("enter", EXIT_FAILURE),
+        ("eof", EXIT_FAILURE),
+        ("interrupt", EXIT_KEYBOARD_INTERRUPT),
+    ),
+)
+def test_required_secret_persistence_incomplete_paths_have_zero_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    confirmation_kind: str,
+    expected_exit: int,
 ) -> None:
-    """Required secret 批次拒绝时不得 publish config 或泄漏 value。
+    """Required persistence No/Enter/EOF/SIGINT 必须按 contract 零写入。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch 夹具。
     :param capsys: pytest 输出捕获。
+    :param confirmation_kind: persistence confirmation terminal input。
+    :param expected_exit: 对应业务完成态退出码。
     :returns: None。
-    :raises AssertionError: 拒绝后仍 publication 或输出 secret 时抛出。
+    :raises AssertionError: 退出码、环境值或 managed publication 漂移时抛出。
     """
 
     secret = "sentinel-secret-value"
     workspace_root = tmp_path / "workspace"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(builtins, "input", _InputSequence(("6", "n")))
-    _install_tty_getpass(monkeypatch, (secret, "", "", "", "", ""))
+    if confirmation_kind == "no":
+        input_reader: _InputSequence | Mock = _InputSequence(("6", "n"))
+    elif confirmation_kind == "enter":
+        input_reader = _InputSequence(("6", ""))
+    elif confirmation_kind == "eof":
+        input_reader = _InputSequence(("6",))
+    else:
+        input_reader = Mock(side_effect=("6", KeyboardInterrupt()))
+    monkeypatch.setattr(builtins, "input", input_reader)
+    _install_tty_getpass(monkeypatch, (secret,))
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == expected_exit
+    assert not (workspace_root / "config").exists()
+    assert not (workspace_root / ".dayu").exists()
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert os.environ.get("OPENAI_API_KEY") != secret
+
+
+@pytest.mark.parametrize("invalid_value", ("", "bad\nvalue"))
+def test_required_secret_validation_retries_without_rendering_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    invalid_value: str,
+) -> None:
+    """Required secret 空值/control 必须在隐藏输入原步骤重试且不泄值。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :param invalid_value: owner 必须拒绝的 secret 值。
+    :returns: ``None``。
+    :raises AssertionError: 重试、退出码、脱敏或零 publication 漂移时抛出。
+    """
+
+    valid_secret = secrets.token_urlsafe(24)
+    workspace_root = tmp_path / "workspace"
+    input_sequence = _InputSequence(("6", "n"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", input_sequence)
+    getpass_sequence = _install_tty_getpass(
+        monkeypatch,
+        (invalid_value, valid_secret),
+    )
 
     exit_code = cli_main.main(("init", "--base", str(workspace_root)))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_FAILURE
+    required_prompts = [
+        prompt
+        for prompt in getpass_sequence.prompts
+        if prompt.startswith("OPENAI_API_KEY")
+    ]
+    assert len(required_prompts) == 2
+    if invalid_value:
+        assert invalid_value not in captured.out
+        assert invalid_value not in captured.err
+    assert valid_secret not in captured.out
+    assert valid_secret not in captured.err
     assert not (workspace_root / "config").exists()
-    assert secret not in captured.out
-    assert secret not in captured.err
-    assert os.environ.get("OPENAI_API_KEY") != secret
+    assert not (workspace_root / ".dayu").exists()
+
+
+def test_optional_secret_validation_retries_then_allows_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Optional secret control 值必须原步骤重试，随后空输入可跳过。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: owner retry 或 optional skip 语义漂移时抛出。
+    """
+
+    optional_name = init_command.OPTIONAL_ENVIRONMENT_NAMES[0]
+    invalid_value = "bad\rvalue"
+    getpass_sequence = _install_tty_getpass(
+        monkeypatch,
+        (invalid_value, ""),
+    )
+
+    entry = init_command._read_environment_persistence_entry(
+        name=optional_name,
+        prompt=f"可选 {optional_name}: ",
+        required=False,
+    )
+    captured = capsys.readouterr()
+
+    assert entry is None
+    assert getpass_sequence.prompts == [
+        f"可选 {optional_name}: ",
+        f"可选 {optional_name}: ",
+    ]
+    assert invalid_value not in captured.out
+    assert invalid_value not in captured.err
 
 
 @pytest.mark.parametrize("failure_kind", ("posix-error", "windows-partial"))
@@ -1301,10 +2046,10 @@ def test_real_lock_competition_waits_without_early_publish(
     assert (workspace_root / "config" / "models.json").is_file()
 
 
-def test_model_choice_and_input_helpers_reject_invalid_values(
+def test_model_choice_and_input_helpers_retry_recoverable_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Selection/input helpers 必须拒绝空、越界、未知和非正 context。
+    """Selection/input helpers 必须拒绝非法值并在当前步骤重试。
 
     :param monkeypatch: pytest monkeypatch 夹具。
     :returns: None。
@@ -1317,15 +2062,52 @@ def test_model_choice_and_input_helpers_reject_invalid_values(
         with pytest.raises(init_command.CliInitOperationError):
             init_command._parse_model_choice(invalid)
 
-    monkeypatch.setattr(builtins, "input", _InputSequence(("0",)))
-    with pytest.raises(init_command.CliInitOperationError):
-        init_command._read_positive_integer("context: ", default=1)
-    monkeypatch.setattr(builtins, "input", _InputSequence(("",)))
-    with pytest.raises(init_command.CliInitOperationError):
-        init_command._read_non_empty_input("value: ", default=None)
-    monkeypatch.setattr(builtins, "input", _InputSequence(("maybe",)))
-    with pytest.raises(init_command.CliInitUsageError):
-        init_command._confirm("confirm: ")
+    context_input = _InputSequence(("0", "100"))
+    monkeypatch.setattr(builtins, "input", context_input)
+    assert (
+        init_command._read_context_window(
+            "context: ",
+            default=100,
+            minimum=100,
+        )
+        == 100
+    )
+    assert context_input.prompts == ["context: ", "context: "]
+
+    model_input = _InputSequence(("", "valid-model"))
+    monkeypatch.setattr(builtins, "input", model_input)
+    assert (
+        init_command._read_dynamic_model_name("model: ", default=None)
+        == "valid-model"
+    )
+    assert model_input.prompts == ["model: ", "model: "]
+
+    confirmation_input = _InputSequence(("maybe", "yes"))
+    monkeypatch.setattr(builtins, "input", confirmation_input)
+    assert init_command._confirm("confirm: ") is True
+    assert confirmation_input.prompts == ["confirm: ", "confirm: "]
+
+
+def test_unexpected_input_os_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 owner validation 的 OSError 必须原样传播，不能进入 retry loop。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: OSError 被捕获或 input 被重复调用时抛出。
+    """
+
+    reader = Mock(side_effect=OSError(errno.EIO, "input fault"))
+    monkeypatch.setattr(builtins, "input", reader)
+
+    with pytest.raises(OSError, match="input fault"):
+        init_command._read_dynamic_endpoint(
+            "endpoint: ",
+            default="https://example.test/v1",
+        )
+
+    reader.assert_called_once_with("endpoint: ")
 
 
 def test_persistence_target_and_failure_message_use_names_only(

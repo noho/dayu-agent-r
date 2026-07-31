@@ -21,17 +21,37 @@ transaction-private staging，再用真实 `ConfigLoader`、工具发现与 13 �
 `init` 对 `<workspace>/config/` 的状态规则如下：
 
 - FIRST：目标不存在，从本目录默认值创建。
-- PRESERVE：目标已存在且无覆盖参数，完整保留用户配置、自建文件和自建 manifest，只补缺失的
-  package prompt 普通文件；随后只把本次选择写入相应模型记录和 16 个 package-known manifest
-  的 `model.default_model_id`，其它 manifest 字段保持不变。
+- PRESERVE：目标已存在且无覆盖参数，完整保留用户配置、自建文件和自建 manifest；先补齐
+  `models.json`、`execution_profiles.json`、`host_runtime.json`、
+  `runtime_lanes.json`、`tool_discovery.json` 中缺失的文件，再补缺失的 package prompt
+  普通文件；随后只把本次选择写入相应模型记录和 16 个 package-known manifest 的
+  `model.default_model_id`，其它 manifest 字段保持不变。已经存在的根配置和 prompt
+  文件不会被补缺步骤覆盖。
 - OVERWRITE：`--overwrite` 从本目录默认值重建整个 `config/`，不合并旧树。
 - RESET：`--reset` 经默认 No 的明确确认后，从本目录默认值重建 `config/`；同时由 workspace
   transaction 移除整个 `.dayu/`。RESET 优先于 `--overwrite`。
 
 四种状态都不把 `portfolio/` 或 `assets/` 纳入配置 manifest。`init` 会拒绝 workspace、
 受管树及其子树中的 symlink / Windows reparse entry，避免沿链接把配置或清理动作带出工作区。
+无 destructive flag 时，普通文件占据受管根也会失败；OVERWRITE 只允许修复普通文件形态的
+`config`，RESET 允许修复普通文件形态的 `config` 与 `.dayu`。symlink、reparse 与 special
+file 不因 destructive mode 放宽。
 所选模型需要的 secret 仍只通过 `api_key_ref` 表达；用户确认后由 POSIX shell profile 或 Windows
 用户环境 owner 持久化，配置文件、异常和 CLI 输出都不保存 value。
+
+当前 15 个 init choice 的 ordinary / thinking pair 必须解析到相同的 provider、
+provider model、endpoint 与 credential ref；provider request extension、runner hint、采样和
+stream 参数可以不同。选择结果投影到全部 16 个 package-known manifest，其中
+`conversation_compaction` 使用 ordinary model family 与自己的
+`conversation_compaction` runner hint。
+
+动态 Ollama / OpenAI-compatible 模型的 `context_window_tokens` 必须不低于本次目标
+default execution profile 的 `min_context_window_tokens`。FIRST、OVERWRITE 与 RESET
+读取 package default profile；PRESERVE 读取 workspace overlay 后的 effective default
+profile，workspace 文件缺失时自然使用 package layer。已存在但非法的 workspace
+`execution_profiles.json` 会直接失败并提示使用 `--overwrite`，不会改用 package 值掩盖
+错误。Custom 模型的默认 context window 直接取目标 minimum；Ollama 的默认值或显式输入
+低于 minimum 时会在 context 输入步骤重新询问。
 
 `dayu.runtime.location.resolve_runtime_locations` 负责把 workspace root 解析为 runtime assembly 位置：`<workspace>/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
@@ -157,6 +177,10 @@ semantic proposal attempt。
 `agent_policy` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
 
 包内默认 profile 按场景与上下文窗口显式分档为 `standard-256k`、`standard-1m`、`wechat-256k` 与 `wechat-1m`。Service / composition root 只能通过显式 override 或 `default_execution_profile_id` 选择 profile；runtime assembly helper 只校验 profile 的 `min_context_window_tokens` 与 effective model 的 `context_window_tokens`，不会按模型窗口自动切换到其它 profile。`256k` profile 搭配 `1m` 模型允许装配，但诊断会标记为保守策略；`1m` profile 搭配低于 `1000000` token 的模型会在调用 Host 前失败。
+
+四个 package execution profile 的 `run_baseline.model_id` 与
+`compactor_baseline.model_id` 当前都指向 `mimo-v2.5-pro-plan`。这保证 scene hint
+缺失时，普通 Run 与 compactor fallback 仍使用同一个 Mimo Token Plan family。
 
 配置只接受上述内嵌 `agent_policy` 与 baseline 结构；历史 catalog、间接引用或全局 runner/agent hint 结构出现在配置中都会加载失败。
 
@@ -330,6 +354,11 @@ Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最�
 只有 `interactive` 与 `wechat` manifest 通过 `"utils"` tag 选择 `get_current_time` 工具，使模型在用户明确要求获取此刻最新时间，或要求在等待、查询、下载、上传、处理等动作完成后再确认时间时可以主动调用工具。`prompt` 与其它 scene 即使需要当前时间，也只消费 `current_time` context slot，不通过 `"utils"` tag 暴露该工具。manifest 不写 `"time"` tag 或具体工具名也能通过 `"utils"` tag 获得默认实时时钟能力。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
 
 `conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
+
+package `conversation_compaction` manifest 的 `model.default_model_id` 当前是
+`mimo-v2.5-pro-plan`，与 package ordinary baseline 同 family；
+`model.runner_option_hint_id` 保持 `conversation_compaction`，因此压缩调用仍可使用独立
+temperature、top-p、stream 与 provider request extension。
 
 会话压缩 prompt asset 是直接投给模型阅读的文本，必须自足说明输入 JSON、输出 JSON 字段、字段含义、类型、必填性、允许值、最小示例与 label 引用规则。prompt 中的 label 只能解释为本次请求内的引用标签，不得写成业务事实、财报事实或用户可见结论；prompt 不要求模型理解 Host 内部治理、Python 类型名、迁移术语或底层账本标识。
 

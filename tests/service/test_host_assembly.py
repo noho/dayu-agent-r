@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,11 @@ from typing import Final
 
 import pytest
 
+from dayu.cli.init_catalog import (
+    InitModelSelection,
+    find_init_model_choice,
+    project_known_manifest_models,
+)
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts import (
     AgentFallbackMode,
@@ -69,7 +75,10 @@ from dayu.runtime.config_loader import (
     ToolDiscoveryProviderConfig,
 )
 from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
-from dayu.runtime.assembly import RuntimeAssemblySelectionError
+from dayu.runtime.assembly import (
+    RuntimeAssemblySelectionError,
+    model_family_identity,
+)
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
     SceneAgentPolicyOverride,
@@ -117,6 +126,9 @@ _CURRENT_TIME_TEXT = (
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+_PACKAGE_MODEL_ID: Final[str] = "mimo-v2.5-pro-plan"
+_PACKAGE_THINKING_MODEL_ID: Final[str] = "mimo-v2.5-pro-thinking-plan"
+_MIMO_PLAN_API_KEY: Final[str] = "test-mimo-plan-key"
 _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION: Final[int] = 5
 _DISCOVERY_REPLACEMENT_TOOL_NAME: Final[str] = "discovery_replacement_smoke"
 
@@ -171,6 +183,19 @@ def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
     )
 
 
+def _host_assembly_env() -> dict[str, str]:
+    """构造同时满足显式 DeepSeek ordinary 与 package Mimo compactor 的测试环境。
+
+    :returns: 只包含两个 fixture credential ref 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _MIMO_PLAN_API_KEY,
+    }
+
+
 def test_compose_open_host_options_uses_runtime_tuning_from_config(
     tmp_path: Path,
 ) -> None:
@@ -217,7 +242,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -262,7 +287,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         compactor_baseline.compactor_runner_spec.client_correlation_policy
         is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
     )
-    assert compactor_baseline.compactor_runner_options.temperature == 0.4
+    assert compactor_baseline.compactor_runner_options.temperature == 0.3
     assert compactor_baseline.compactor_runner_options.max_tokens is None
     assert compactor_baseline.compactor_runner_options.top_p == 1.0
     assert compactor_baseline.compactor_runner_options.stream is False
@@ -287,6 +312,252 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.diagnostics.ordinary_profile_compatibility.profile_id == "standard-256k"
     assert result.diagnostics.ordinary_profile_compatibility.selected_model_id == _MODEL_ID
     assert result.diagnostics.tool_selection == ("mode=select,tools=record_smoke_fact")
+
+
+def test_package_defaults_use_only_mimo_and_isolate_cross_family_run_override(
+    tmp_path: Path,
+) -> None:
+    """Package 默认只需 Mimo key，跨家族 Run override 不改变 compactor。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 默认选择、credential 依赖或 override isolation 漂移时抛出。
+    :raises Exception: package 配置、scene 或 Service assembly 非法时传播。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
+                "fins_default_subject": "测试财报主体",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    request = ServiceOpenHostAssemblyRequest(
+        workspace_root=tmp_path,
+        config=config,
+        locations=locations,
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+        overrides=ServiceAssemblyOverrides(),
+        env={"MIMO_PLAN_API_KEY": _MIMO_PLAN_API_KEY},
+    )
+
+    package_result = compose_open_host_options(request)
+
+    assert package_result.ordinary_selection.model_id == _PACKAGE_THINKING_MODEL_ID
+    assert package_result.ordinary_selection.diagnostic.selected_model_source == (
+        "scene_override"
+    )
+    assert package_result.compactor_selection.model_id == _PACKAGE_MODEL_ID
+    assert package_result.compactor_selection.runner_option_hint_id == (
+        "conversation_compaction"
+    )
+    assert package_result.compactor_selection.diagnostic.selected_model_source == (
+        "scene_override"
+    )
+    assert model_family_identity(
+        package_result.ordinary_selection.model
+    ) == model_family_identity(package_result.compactor_selection.model)
+    compactor_options = package_result.options.compactor_runner_baseline
+    assert compactor_options is not None
+    assert compactor_options.compactor_runner_options.temperature == 0.3
+    assert compactor_options.compactor_runner_options.stream is False
+    assert (
+        compactor_options.compactor_runner_spec.headers["Authorization"]
+        == f"Bearer {_MIMO_PLAN_API_KEY}"
+    )
+
+    override_result = compose_open_host_options(
+        replace(
+            request,
+            overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            env=_host_assembly_env(),
+        )
+    )
+
+    assert override_result.ordinary_selection.model_id == _MODEL_ID
+    assert override_result.ordinary_selection.diagnostic.selected_model_source == (
+        "run_override"
+    )
+    assert override_result.compactor_selection == package_result.compactor_selection
+    override_compactor_options = override_result.options.compactor_runner_baseline
+    assert override_compactor_options is not None
+    assert (
+        override_compactor_options.compactor_runner_options
+        == compactor_options.compactor_runner_options
+    )
+    assert (
+        override_compactor_options.compactor_runner_spec.model
+        == compactor_options.compactor_runner_spec.model
+    )
+
+
+def test_workspace_projected_family_assembles_without_package_mimo_key(
+    tmp_path: Path,
+) -> None:
+    """Workspace DeepSeek 投影必须让 ordinary/compactor 同源且不读取 Mimo key。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: workspace scene 投影或 family assembly 漂移时抛出。
+    :raises Exception: package copy、catalog projection 或 Service assembly 失败时传播。
+    """
+
+    workspace_config = tmp_path / "config"
+    shutil.copytree(_PACKAGE_CONFIG_ROOT, workspace_config)
+    selection = InitModelSelection(choice=find_init_model_choice("deepseek-flash"))
+    project_known_manifest_models(
+        workspace_config / "prompts" / "manifests",
+        selection,
+    )
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
+                "fins_default_subject": "测试财报主体",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    assert result.ordinary_selection.model_id == "deepseek-v4-flash-thinking"
+    assert result.compactor_selection.model_id == _MODEL_ID
+    assert model_family_identity(
+        result.ordinary_selection.model
+    ) == model_family_identity(result.compactor_selection.model)
+    compactor_options = result.options.compactor_runner_baseline
+    assert compactor_options is not None
+    assert compactor_options.compactor_runner_options.temperature == 0.4
+    assert compactor_options.compactor_runner_options.stream is False
+
+
+def test_compactor_family_mismatch_fails_before_host_options_without_secret_leak(
+    tmp_path: Path,
+) -> None:
+    """Durable primary/compactor family 漂移必须在 Host options 前脱敏失败。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: mismatch 未失败或错误泄露 endpoint/credential 时抛出。
+    :raises Exception: 测试配置或 scene 装配出现非预期错误时传播。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
+                "fins_default_subject": "测试财报主体",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    custom_locations = _custom_compactor_scene_locations(
+        tmp_path,
+        model_id=_MODEL_ID,
+    )
+    profile = config.execution_profiles.execution_profiles["standard-256k"]
+    mismatched_profile = replace(
+        profile,
+        compactor_baseline=replace(
+            profile.compactor_baseline,
+            scene_id=_CUSTOM_COMPACTOR_SCENE_ID,
+            user_prompt_template_path="scenes/custom_compactor_user.md",
+        ),
+    )
+    mismatched_config = replace(
+        config,
+        execution_profiles=replace(
+            config.execution_profiles,
+            execution_profiles={
+                **config.execution_profiles.execution_profiles,
+                "standard-256k": mismatched_profile,
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError) as raised:
+        compose_open_host_options(
+            ServiceOpenHostAssemblyRequest(
+                workspace_root=tmp_path,
+                config=mismatched_config,
+                locations=custom_locations,
+                scene_inputs=scene_inputs,
+                discovered_tools=discovered_tools,
+                overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
+                env={},
+            )
+        )
+
+    rendered = str(raised.value)
+    assert "primary_model_id=mimo-v2.5-pro-thinking-plan" in rendered
+    assert "compactor_model_id=deepseek-v4-flash" in rendered
+    assert "provider" in rendered
+    assert "provider_model" in rendered
+    assert "endpoint" in rendered
+    assert "credential_ref" in rendered
+    assert "api.deepseek.com" not in rendered
+    assert "token-plan-cn.xiaomimimo.com" not in rendered
+    assert "DEEPSEEK_API_KEY" not in rendered
+    assert "MIMO_PLAN_API_KEY" not in rendered
 
 
 def test_compose_open_host_options_projects_complete_config_owned_wait_policy(
@@ -322,7 +593,7 @@ def test_compose_open_host_options_projects_complete_config_owned_wait_policy(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -387,7 +658,7 @@ def test_replacing_discovered_bundle_preserves_host_wait_composition(
             model_id=_MODEL_ID,
             runner_option_hint_id=_RUNNER_HINT_ID,
         ),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_host_assembly_env(),
     )
 
     original_result = compose_open_host_options(request)
@@ -485,7 +756,7 @@ def test_scene_tool_selection_does_not_own_wait_poller_composition(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -901,7 +1172,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -999,7 +1270,7 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -2239,7 +2510,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -2356,7 +2627,7 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -2410,7 +2681,7 @@ def test_memory_projection_context_window_uses_effective_model_window(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -2472,7 +2743,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -2525,6 +2796,30 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
+    profile = config.execution_profiles.execution_profiles["standard-1m"]
+    config = replace(
+        config,
+        execution_profiles=replace(
+            config.execution_profiles,
+            execution_profiles={
+                **config.execution_profiles.execution_profiles,
+                "standard-1m": replace(
+                    profile,
+                    compactor_baseline=replace(
+                        profile.compactor_baseline,
+                        scene_id=_CUSTOM_COMPACTOR_SCENE_ID,
+                        user_prompt_template_path=(
+                            "scenes/custom_compactor_user.md"
+                        ),
+                    ),
+                ),
+            },
+        ),
+    )
+    compactor_locations = _custom_compactor_scene_locations(
+        tmp_path,
+        model_id="ollama",
+    )
     discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
@@ -2545,7 +2840,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
             ServiceOpenHostAssemblyRequest(
                 workspace_root=tmp_path,
                 config=config,
-                locations=locations,
+                locations=compactor_locations,
                 scene_inputs=scene_inputs,
                 discovered_tools=discovered_tools,
                 overrides=ServiceAssemblyOverrides(
@@ -2554,7 +2849,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
                     model_id=None,
                     runner_option_hint_id=None,
                 ),
-                env={"DEEPSEEK_API_KEY": _API_KEY},
+                env={},
             )
         )
 
@@ -2604,7 +2899,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 
@@ -2612,7 +2907,10 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
     assert result.execution_profile.execution_profile_id == "standard-256k"
     assert result.diagnostics.model_id == _MODEL_ID
     assert result.diagnostics.ordinary_profile_compatibility.status == "conservative"
-    assert result.diagnostics.compactor_profile_compatibility.selected_model_id == "deepseek-v4-flash"
+    assert (
+        result.diagnostics.compactor_profile_compatibility.selected_model_id
+        == _PACKAGE_MODEL_ID
+    )
 
 
 def test_resolve_workspace_path_rejects_relative_escape(tmp_path: Path) -> None:
@@ -2882,10 +3180,15 @@ def _write_execution_profile_overlay(
     )
 
 
-def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
+def _custom_compactor_scene_locations(
+    workspace_root: Path,
+    *,
+    model_id: str = _PACKAGE_MODEL_ID,
+) -> RuntimeLocations:
     """写入只包含自定义 compactor scene 的 prompt 根目录。
 
     :param workspace_root: pytest 临时 workspace root。
+    :param model_id: 自定义 compactor scene 的默认模型 id。
     :returns: 指向自定义 prompt 根目录的 RuntimeLocations。
     :raises OSError: 测试 prompt 文件写入失败时抛出。
     """
@@ -2903,7 +3206,7 @@ def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
             "capability_tags": ["conversation_compaction"],
             "extends": [],
             "model": {
-                "default_model_id": _MODEL_ID,
+                "default_model_id": model_id,
                 "runner_option_hint_id": "conversation_compaction",
             },
             "agent_policy": {
@@ -3218,7 +3521,7 @@ def _compose_with_fins_provider_configs(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_host_assembly_env(),
         )
     )
 

@@ -102,6 +102,23 @@ _API_KEY = "test-provider-key"
 _TRANSIENT_OBSERVED_AT = datetime(2026, 7, 20, 1, 2, 3, tzinfo=UTC)
 
 
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造 interactive 测试完整 runtime assembly 所需的环境输入。
+
+    本 helper 仅供经过完整 ``prepare_entrypoint_runtime -> Service assembly ->
+    compactor`` 装配路径的测试使用；mock-assembly 测试继续只声明自身消费的输入。
+
+    :returns: 同时满足单次 DeepSeek ordinary override 与 package Mimo compactor
+        baseline 的环境变量映射。
+    :raises Exception: 本函数不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
+
+
 async def _raise_cli_terminal_cursor_error(
     *,
     workspace_root: Path,
@@ -791,7 +808,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
             " AAPL ",
             "--label",
             "earnings",
-            "--model-name",
+            "--model",
             _MODEL_ID,
         )
     )
@@ -800,6 +817,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
+    assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert tuple(captured_requests[0].context_slot_values) == (
         _FINS_DEFAULT_SUBJECT_SLOT,
         _CURRENT_TIME_SLOT,
@@ -2278,7 +2296,7 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
                 _CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT,
             },
             assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_runtime_assembly_env(),
         )
     )
 

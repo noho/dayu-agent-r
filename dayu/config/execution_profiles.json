@@ -5,11 +5,11 @@
       "context_window_class": "256k",
       "min_context_window_tokens": 262144,
       "run_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "runner_option_hint_id": "interactive"
       },
       "compactor_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
         "user_prompt_template_path": "scenes/conversation_compaction_user.md",
@@ -91,11 +91,11 @@
       "context_window_class": "1m",
       "min_context_window_tokens": 1000000,
       "run_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "runner_option_hint_id": "interactive"
       },
       "compactor_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
         "user_prompt_template_path": "scenes/conversation_compaction_user.md",
@@ -177,11 +177,11 @@
       "context_window_class": "256k",
       "min_context_window_tokens": 262144,
       "run_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "runner_option_hint_id": "interactive"
       },
       "compactor_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
         "user_prompt_template_path": "scenes/conversation_compaction_user.md",
@@ -263,11 +263,11 @@
       "context_window_class": "1m",
       "min_context_window_tokens": 1000000,
       "run_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "runner_option_hint_id": "interactive"
       },
       "compactor_baseline": {
-        "model_id": "deepseek-v4-flash",
+        "model_id": "mimo-v2.5-pro-plan",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
         "user_prompt_template_path": "scenes/conversation_compaction_user.md",

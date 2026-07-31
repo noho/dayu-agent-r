@@ -8,7 +8,7 @@
   ],
   "extends": [],
   "model": {
-    "default_model_id": "deepseek-v4-flash",
+    "default_model_id": "mimo-v2.5-pro-plan",
     "runner_option_hint_id": "conversation_compaction"
   },
   "agent_policy": {

@@ -89,7 +89,7 @@ from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverr
 
 DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 PROMPT_TURN_INDEX: Final[int] = 1
-_MODEL_NAME_OPTION: Final[str] = "--model-name"
+_MODEL_OPTION: Final[str] = "--model"
 _PROMPT_OPERATION_SUBMIT_FOLLOWUP: Final[str] = "submit_followup"
 _PROMPT_OPERATION_CANCEL_RUN: Final[str] = "cancel_run"
 _INTERACTIVE_OPERATION_STARTUP_RECONNECT: Final[str] = "startup_reconnect"
@@ -519,8 +519,8 @@ async def _prepare_session_runtime(
             context_slot_values=context_slot_values,
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=optional_stripped_text(
-                    args.model_name,
-                    field_name=_MODEL_NAME_OPTION,
+                    args.model,
+                    field_name=_MODEL_OPTION,
                     error_factory=usage_error_factory,
                 )
             ),

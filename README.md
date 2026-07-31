@@ -80,17 +80,30 @@ dayu-cli init --base ./my-workspace --overwrite
 dayu-cli init --base ./my-workspace --reset
 ```
 
+`init` 不接受 `--config`；无论把它写在命令前还是命令后，都会作为用法错误退出
+`2`。不传 `--base` 时仍使用 `./workspace`。
+
 `init` 只有以下四种状态：
 
 - FIRST：`config/` 不存在且未传覆盖参数，从包内默认配置开始创建。
-- PRESERVE：`config/` 已存在且未传覆盖参数，保留用户配置、文件和自建 manifest；只补回
-  缺失的包内 prompt 文件，并把本次明确选择投影到已知模型/manifest 字段。
+- PRESERVE：`config/` 已存在且未传覆盖参数，保留用户配置、文件和自建 manifest；补回
+  缺失的五个根配置文件与包内 prompt 文件，并把本次明确选择投影到已知模型/manifest
+  字段。已经存在的文件不会被补缺步骤覆盖。
 - OVERWRITE：传 `--overwrite`，从包内默认配置完整重建 `config/`，不合并旧配置。
 - RESET：传 `--reset`，先列出实际存在的 `.dayu/`、`config/` 并默认选择 No；明确确认后
   移走整个 `.dayu/` 与旧 `config/`，再从包内默认配置重建。RESET 优先于 `--overwrite`。
 
 四种状态都不会创建、删除或重建 public `portfolio/`、`assets/`。为防止写出工作区，
 workspace、锁文件、受管树或其子树中的 symlink / Windows reparse entry 会被拒绝。
+无覆盖参数时，普通文件占据 `config` 或 `.dayu` 也会被拒绝；`--overwrite` 可以重建被
+普通文件占据的 `config`，`--reset` 可以重建被普通文件占据的 `config` 与 `.dayu`。
+symlink、dangling symlink、special file 和非法 lock identity 在所有模式下都拒绝。
+
+模型选择、动态模型名、endpoint、上下文窗口、secret 与 yes/no 输入不合法时会在当前
+提示重新输入。RESET 确认输入 No 或直接按 Enter 时退出 `0` 且不修改工作区；输入 EOF
+时退出 `1`，按 `Ctrl-C` 时退出 `130`。需要持久化必需 secret 时，最终确认输入 No、
+直接按 Enter 或 EOF 都表示初始化未完成并退出 `1`，按 `Ctrl-C` 退出 `130`；这些路径
+都不会发布部分配置。
 
 当所选模型需要 API Key 且当前进程没有对应变量时，`init` 在真实终端（TTY）隐藏输入值；
 stdin 被重定向时，每个 secret 提示写入 stderr，并从 stdin 逐项读取一行，CLI 不把值写回
@@ -120,9 +133,13 @@ workspace/
 `workspace/config/models.json` 为准。例如：
 
 ```bash
-export DEEPSEEK_API_KEY="..."
+export MIMO_PLAN_API_KEY="..."
 export FMP_API_KEY="..."       # 可选：为 ticker context 补充公司名
 ```
+
+包内默认普通问答与会话压缩都使用 Mimo Token Plan 模型家族。`init` 选择的普通/思考
+模型会投影到全部包内场景，会话压缩与该选择使用相同的 provider、provider 模型、
+endpoint 和 credential 引用，但可以使用不同的采样与流式参数。
 
 ## 3. CLI 公共命令
 
@@ -153,7 +170,7 @@ dayu-cli <command> --help
 | 参数 | 说明 |
 |---|---|
 | `--base` / `--workspace` | 工作区根目录，默认 `./workspace` |
-| `--config` | Agent / Session runtime 使用的显式配置目录；相对路径必须位于工作区内 |
+| `--config` | 除 `init` 外，Agent / Session runtime 使用的显式配置目录；相对路径必须位于工作区内 |
 | `--log-level` | `debug`、`verbose`、`info`、`warn`、`error` 或 `critical` |
 | `--debug` | 等价于 `--log-level debug` |
 | `--debug-stream` | 同时打开普通 DEBUG 与高频 stream/SSE 诊断 |
@@ -183,7 +200,10 @@ dayu-cli prompt "总结最新财报的主要风险" --ticker AAPL
 常用参数：
 
 - `--label LABEL`：绑定或复用 prompt Session。
-- `--model-name ID`：选择模型配置。
+- `--model ID` / `-m ID`：只覆盖本次主 Run 的模型配置；不写入 workspace，也不改变
+  会话压缩模型。即使本次主 Run 显式选择不同的 provider family，会话压缩仍使用
+  `init` 选择的 family；未执行 `init` 时使用包内默认 family，不跟随单次 override。
+  `interactive` 与 `session resume` 使用相同参数。
 - `--temperature FLOAT`、`--tool-timeout-seconds FLOAT`、`--max-iterations INT`：
   覆盖本轮执行参数。
 - `--thinking` / `--no-thinking`：控制运行态思考展示。
@@ -392,9 +412,10 @@ artifacts；单文件或 tool-trace 目录输入是 cold-only，不会从父目�
 
 ### 配置文件已存在
 
-默认再次运行 `init` 会进入 PRESERVE：保留用户文件和自建 manifest，只补缺失的包内
-prompt。需要完全用包内默认配置替换 `config/` 时使用 `--overwrite`；需要同时移除整个
-`.dayu/` 时使用 `--reset`，并先停止所有 active Dayu 进程。
+默认再次运行 `init` 会进入 PRESERVE：保留用户文件和自建 manifest，补齐缺失的五个
+根配置文件与包内 prompt 文件。需要完全用包内默认配置替换 `config/` 时使用
+`--overwrite`；需要同时移除整个 `.dayu/` 时使用 `--reset`，并先停止所有 active
+Dayu 进程。
 
 ### init 报 symlink 错误
 

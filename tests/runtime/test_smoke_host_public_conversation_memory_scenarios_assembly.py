@@ -101,6 +101,19 @@ _TOOL_NAME = "get_mock_finance_memory_fact"
 _TOOL_TAG = "manual-smoke"
 
 
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造真实 memory smoke runtime assembly 所需的测试 credential 环境。
+
+    :returns: 同时包含显式 DeepSeek 主 Run 与 package MiMo compactor credential 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
+
+
 class _OpenCancellationToken:
     """测试用未取消 token。"""
 
@@ -159,7 +172,7 @@ def test_runtime_assembly_adds_builtin_mock_tool_and_selects_manual_smoke(
 
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
 
     assert assembly.scene_inputs.tool_selection.tool_names == frozenset({_TOOL_NAME})
@@ -186,7 +199,7 @@ def test_reactive_runtime_assembly_bounds_selected_recent_window(
 
     assembly = _prepare_runtime_assembly(
         _args(tmp_path, suite=SuiteMode.MEMORY_REACTIVE_COMPACT),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
     policy = assembly.options.memory_projection_policy
 
@@ -418,7 +431,7 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
 
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
     policy = assembly.options.context_budget_policy
     assert policy is not None
@@ -492,7 +505,7 @@ def test_compact_acceptance_requires_event_log_audit_summary(tmp_path: pathlib.P
 
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
     assert assembly.options.compactor_runner_baseline is not None
     compact_root = assembly.options.compactor_runner_baseline.compact_artifact_root
@@ -929,7 +942,10 @@ def test_compact_audit_report_prints_operation_histograms_and_manifest_stage(
         _assert_compact_acceptance(
             suite=SuiteMode.MEMORY_COMPACT,
             audit=report.summary,
-            options=_prepare_runtime_assembly(_args(tmp_path), env={"DEEPSEEK_API_KEY": _API_KEY}).options,
+            options=_prepare_runtime_assembly(
+                _args(tmp_path),
+                env=_runtime_assembly_env(),
+            ).options,
         )
 
     _print_compact_audit_report(report, debug_smoke_output=True)

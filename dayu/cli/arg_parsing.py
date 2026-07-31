@@ -140,7 +140,7 @@ class ParsedCliArgs(argparse.Namespace):
     prompt: str
     ticker: str | None
     label: str | None
-    model_name: str | None
+    model: str | None
     thinking: bool
     temperature: float | None
     tool_timeout_seconds: float | None
@@ -190,11 +190,12 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     :raises ValueError: argparse 初始化或参数注册失败时透传底层异常。
     """
 
-    global_parent = _build_global_arguments_parent()
+    common_parent = _build_common_arguments_parent()
+    runtime_parent = _build_runtime_arguments_parent(common_parent)
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Dayu 财报分析命令行入口。",
-        parents=[global_parent],
+        parents=[runtime_parent],
     )
     subparsers = cast(
         CommandSubparserRegistry,
@@ -204,18 +205,18 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
             required=True,
         ),
     )
-    _register_init_command(subparsers, global_parent)
-    _register_prompt_command(subparsers, global_parent)
-    _register_interactive_command(subparsers, global_parent)
-    _register_download_command(subparsers, global_parent)
-    _register_upload_filing_command(subparsers, global_parent)
-    _register_upload_material_command(subparsers, global_parent)
-    _register_upload_filings_from_command(subparsers, global_parent)
-    _register_process_command(subparsers, global_parent)
-    _register_process_filing_command(subparsers, global_parent)
-    _register_process_material_command(subparsers, global_parent)
-    _register_session_command(subparsers, global_parent)
-    _register_tool_trace_command(subparsers, global_parent)
+    _register_init_command(subparsers, common_parent)
+    _register_prompt_command(subparsers, runtime_parent)
+    _register_interactive_command(subparsers, runtime_parent)
+    _register_download_command(subparsers, runtime_parent)
+    _register_upload_filing_command(subparsers, runtime_parent)
+    _register_upload_material_command(subparsers, runtime_parent)
+    _register_upload_filings_from_command(subparsers, runtime_parent)
+    _register_process_command(subparsers, runtime_parent)
+    _register_process_filing_command(subparsers, runtime_parent)
+    _register_process_material_command(subparsers, runtime_parent)
+    _register_session_command(subparsers, runtime_parent)
+    _register_tool_trace_command(subparsers, runtime_parent)
     return parser
 
 
@@ -229,7 +230,10 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> ParsedCliArgs:
 
     parser = build_parser()
     namespace = parser.parse_args(argv, namespace=_new_default_namespace())
-    return cast(ParsedCliArgs, namespace)
+    parsed_args = cast(ParsedCliArgs, namespace)
+    if parsed_args.command_name == COMMAND_INIT and parsed_args.config_dir is not None:
+        parser.error("init 命令不接受 --config")
+    return parsed_args
 
 
 def _new_default_namespace() -> ParsedCliArgs:
@@ -248,7 +252,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.detail = True
     namespace.ticker = None
     namespace.label = None
-    namespace.model_name = None
+    namespace.model = None
     namespace.thinking = True
     namespace.temperature = None
     namespace.tool_timeout_seconds = None
@@ -289,10 +293,10 @@ def _new_default_namespace() -> ParsedCliArgs:
     return namespace
 
 
-def _build_global_arguments_parent() -> argparse.ArgumentParser:
-    """创建可复用的全局参数父解析器。
+def _build_common_arguments_parent() -> argparse.ArgumentParser:
+    """创建所有命令共用且不含 runtime config 的参数父解析器。
 
-    :returns: 不含 help 的全局参数解析器。
+    :returns: 不含 help 与 ``--config`` 的公共参数解析器。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
 
@@ -304,12 +308,6 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         dest="workspace_root",
         default=argparse.SUPPRESS,
         help="工作区根目录，默认 ./workspace。",
-    )
-    parser.add_argument(
-        "--config",
-        dest="config_dir",
-        default=argparse.SUPPRESS,
-        help="显式配置目录；未提供时使用 <base>/config 或随包默认配置。",
     )
     parser.add_argument(
         "--log-level",
@@ -363,6 +361,26 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         dest="log_level",
         default=argparse.SUPPRESS,
         help="只输出错误级别日志。",
+    )
+    return parser
+
+
+def _build_runtime_arguments_parent(
+    common_parent: argparse.ArgumentParser,
+) -> argparse.ArgumentParser:
+    """创建 Agent runtime 命令使用的参数父解析器。
+
+    :param common_parent: 所有命令共用且不含 ``--config`` 的父解析器。
+    :returns: 在公共参数上增加 ``--config`` 的 runtime 参数解析器。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser = argparse.ArgumentParser(add_help=False, parents=[common_parent])
+    parser.add_argument(
+        "--config",
+        dest="config_dir",
+        default=argparse.SUPPRESS,
+        help="显式配置目录；未提供时使用 <base>/config 或随包默认配置。",
     )
     return parser
 
@@ -694,7 +712,7 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
 
-    parser.add_argument("--model-name", "-m", dest="model_name", help="模型配置标识。")
+    parser.add_argument("--model", "-m", dest="model", help="模型配置标识。")
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--thinking",

@@ -40,6 +40,19 @@ _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
 
 
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造真实 smoke runtime assembly 所需的测试 credential 环境。
+
+    :returns: 同时包含显式 DeepSeek 主 Run 与 package MiMo compactor credential 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
+
+
 async def _not_smoke_tool(
     call: ToolCallRequest,
     context: BatchToolExecutionContext,
@@ -69,7 +82,7 @@ def test_runtime_assembly_adds_builtin_smoke_tool_without_workspace_overlay(
 
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
 
     assert assembly.scene_inputs.tool_selection.tool_names == frozenset(
@@ -95,7 +108,7 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
     _write_smoke_tool_discovery_overlay(tmp_path)
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
 
     assert assembly.diagnostics.config_overlay_dir == tmp_path / "config"
@@ -146,7 +159,7 @@ def test_assembly_diagnostics_output_uses_current_agent_policy_sources(
     _write_smoke_tool_discovery_overlay(tmp_path)
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
 
     _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
@@ -184,7 +197,7 @@ def test_compact_pressure_prompt_targets_soft_before_hard(
 
     assembly = _prepare_runtime_assembly(
         _args(tmp_path),
-        env={"DEEPSEEK_API_KEY": _API_KEY},
+        env=_runtime_assembly_env(),
     )
     policy = assembly.options.context_budget_policy
     assert policy is not None

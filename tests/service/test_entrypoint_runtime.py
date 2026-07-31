@@ -110,6 +110,19 @@ _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
 
 
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造真实 entrypoint runtime assembly 所需的测试 credential 环境。
+
+    :returns: 同时包含显式 DeepSeek 主 Run 与 package MiMo compactor credential 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
+
+
 class _FakeSceneContextFmpResolver:
     """scene context 测试用 FMP resolver。"""
 
@@ -3121,7 +3134,7 @@ async def _prepare_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
             ),
-            env={"DEEPSEEK_API_KEY": _API_KEY},
+            env=_runtime_assembly_env(),
         )
     )
 

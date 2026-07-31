@@ -74,11 +74,13 @@ from dayu.runtime.assembly import (
     AgentPolicyBaseline,
     ExecutionProfileCompatibilityDiagnostic,
     MergedAgentPolicyConfig,
+    ModelFamilyIdentity,
     ModelRunnerHintOverride,
     RuntimeAssemblySelectionError,
     RunnerOptionHintSelection,
     effective_tool_truncate_spec_from_policy,
     merge_agent_policy_config,
+    model_family_identity,
     select_runner_option_hint,
     tool_truncation_policy_defaults,
     validate_execution_profile_context_window,
@@ -120,6 +122,10 @@ from dayu.runtime.workspace_paths import resolve_workspace_path
 _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
 _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT: Final[int] = 1
+_MODEL_FAMILY_PROVIDER_FIELD: Final[str] = "provider"
+_MODEL_FAMILY_PROVIDER_MODEL_FIELD: Final[str] = "provider_model"
+_MODEL_FAMILY_ENDPOINT_FIELD: Final[str] = "endpoint"
+_MODEL_FAMILY_CREDENTIAL_REF_FIELD: Final[str] = "credential_ref"
 _FINS_WORKSPACE_ROOT_CONFIG_FIELD: Final[str] = "workspace_root"
 _FINS_DOWNLOAD_PROVIDER_ID: Final[str] = "financial-download-tools"
 _FINS_PREPROCESS_PROVIDER_ID: Final[str] = "financial-preprocess-tools"
@@ -596,6 +602,13 @@ def compose_open_host_options(
             execution_profile=execution_profile,
         ),
     )
+    primary_default_selection = select_runner_option_hint(
+        models=config.models,
+        execution_baseline=execution_profile.run_baseline,
+        scene_model_hints=request.scene_inputs.model_hints,
+        run_override=None,
+        base_policy=None,
+    )
     ordinary_selection = select_runner_option_hint(
         models=config.models,
         execution_baseline=execution_profile.run_baseline,
@@ -609,7 +622,7 @@ def compose_open_host_options(
             model_id=execution_profile.compactor_baseline.model_id,
             runner_option_hint_id=(execution_profile.compactor_baseline.runner_option_hint_id),
         ),
-        scene_model_hints=None,
+        scene_model_hints=compactor_scene_inputs.model_hints,
         run_override=None,
         base_policy=None,
     )
@@ -620,6 +633,10 @@ def compose_open_host_options(
     compactor_profile_compatibility = validate_execution_profile_context_window(
         profile=execution_profile,
         model=compactor_selection.model,
+    )
+    _require_matching_model_families(
+        primary_default_selection=primary_default_selection,
+        compactor_selection=compactor_selection,
     )
     agent_policy_config = merge_agent_policy_config(
         base_policy=_agent_policy_baseline_from_config(execution_profile.agent_policy),
@@ -663,6 +680,61 @@ def compose_open_host_options(
         agent_policy_config=agent_policy_config,
         effective_tool_bundle=effective_tool_bundle,
     )
+
+
+def _require_matching_model_families(
+    *,
+    primary_default_selection: RunnerOptionHintSelection,
+    compactor_selection: RunnerOptionHintSelection,
+) -> None:
+    """校验 durable 主默认选择与 compactor 选择属于同一模型家族。
+
+    :param primary_default_selection: 不含单次 Run override 的主 scene 默认选择。
+    :param compactor_selection: 使用 compactor scene hints 且不含 Run override 的选择。
+    :returns: ``None``。
+    :raises ValueError: provider、provider model、endpoint 或 credential ref
+        任一字段不一致时抛出；错误只包含 model id 与不一致字段名。
+    """
+
+    primary_identity = model_family_identity(primary_default_selection.model)
+    compactor_identity = model_family_identity(compactor_selection.model)
+    mismatched_fields = _mismatched_model_family_fields(
+        primary_identity=primary_identity,
+        compactor_identity=compactor_identity,
+    )
+    if not mismatched_fields:
+        return
+    raise ValueError(
+        "primary default and compactor model families differ: "
+        f"primary_model_id={primary_default_selection.model_id}, "
+        f"compactor_model_id={compactor_selection.model_id}, "
+        f"mismatched_fields={','.join(mismatched_fields)}"
+    )
+
+
+def _mismatched_model_family_fields(
+    *,
+    primary_identity: ModelFamilyIdentity,
+    compactor_identity: ModelFamilyIdentity,
+) -> tuple[str, ...]:
+    """返回主默认与 compactor family identity 的不一致字段名。
+
+    :param primary_identity: durable 主默认模型家族 identity。
+    :param compactor_identity: compactor 模型家族 identity。
+    :returns: 按固定 contract 顺序排列的不一致字段名。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    mismatched_fields: list[str] = []
+    if primary_identity.provider != compactor_identity.provider:
+        mismatched_fields.append(_MODEL_FAMILY_PROVIDER_FIELD)
+    if primary_identity.provider_model != compactor_identity.provider_model:
+        mismatched_fields.append(_MODEL_FAMILY_PROVIDER_MODEL_FIELD)
+    if primary_identity.endpoint != compactor_identity.endpoint:
+        mismatched_fields.append(_MODEL_FAMILY_ENDPOINT_FIELD)
+    if primary_identity.credential_ref != compactor_identity.credential_ref:
+        mismatched_fields.append(_MODEL_FAMILY_CREDENTIAL_REF_FIELD)
+    return tuple(mismatched_fields)
 
 
 def compose_submit_followup_request(

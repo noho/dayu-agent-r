@@ -64,6 +64,20 @@ _DELTA_COUNT_PER_TYPE = 400
 _HOST_MAILBOX_MAX_ITEMS = 32
 _E2E_TIMEOUT_SECONDS = 30.0
 _FINAL_ANSWER = "delivery-interruption-final"
+_API_KEY = "test-provider-key"
+
+
+def _runtime_assembly_env() -> dict[str, str]:
+    """构造真实 Host→Service→CLI assembly 所需的测试 credential 环境。
+
+    :returns: 同时包含显式 DeepSeek 主 Run 与 package MiMo compactor credential 的新字典。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "DEEPSEEK_API_KEY": _API_KEY,
+        "MIMO_PLAN_API_KEY": _API_KEY,
+    }
 
 
 class _ObservedHostSessionEventIterator:
@@ -299,7 +313,7 @@ async def test_real_delivery_interruption_recovers_once_and_renders_terminal_onc
                 "current_time": "# 当前时间\n现在是 2026年7月21日。",
             },
             assembly_overrides=ServiceAssemblyOverrides(model_id="deepseek-v4-flash"),
-            env={"DEEPSEEK_API_KEY": "test-provider-key"},
+            env=_runtime_assembly_env(),
         )
     )
     worker_release = asyncio.Event()

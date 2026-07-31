@@ -29,6 +29,68 @@ pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/ho
 python -m pyright dayu/ tests/ utils/
 ```
 
+运行 workspace 初始化、模型家族、Service 装配与 provider matrix harness 的完整
+focused 回归：
+
+```bash
+pytest tests/cli/test_arg_parsing.py \
+  tests/cli/test_prompt_command.py \
+  tests/cli/test_interactive_command.py \
+  tests/cli/test_session_command.py \
+  tests/cli/test_init_command.py \
+  tests/cli/test_init_catalog.py \
+  tests/cli/test_init_workspace.py \
+  tests/cli/test_init_smoke.py \
+  tests/runtime/test_assembly_helpers.py \
+  tests/runtime/test_config_loader.py \
+  tests/service/test_host_assembly.py \
+  tests/cli/test_smoke_cli_init_provider_matrix.py -q
+```
+
+这些测试覆盖 `init` 参数面与退出码、resolved model family、单次模型 override 隔离、
+target profile context minimum、交互重试、FIRST/PRESERVE/OVERWRITE/RESET、普通文件
+repair、rollback、冻结 publication manifest、provider availability classifier、
+脱敏与 no-fallback report contract。
+
+对应单文件 coverage：
+
+```bash
+coverage erase
+coverage run -m pytest tests/cli/test_arg_parsing.py \
+  tests/cli/test_prompt_command.py \
+  tests/cli/test_interactive_command.py \
+  tests/cli/test_session_command.py \
+  tests/cli/test_init_command.py \
+  tests/cli/test_init_catalog.py \
+  tests/cli/test_init_workspace.py \
+  tests/cli/test_init_smoke.py \
+  tests/runtime/test_assembly_helpers.py \
+  tests/runtime/test_config_loader.py \
+  tests/service/test_host_assembly.py \
+  tests/cli/test_smoke_cli_init_provider_matrix.py
+coverage report --include='dayu/cli/arg_parsing.py,dayu/cli/session_execution.py,dayu/cli/commands/init.py,dayu/cli/init_catalog.py,dayu/cli/init_workspace.py,dayu/runtime/assembly.py,dayu/service/host_assembly.py,utils/smoke_cli_init_provider_matrix.py'
+```
+
+`docs/cli_init_workspace_manifest_v1.json` 是冻结的 workspace publication 真值，精确
+记录 5 个受管目录、43 个受管文件及 16 个 model pointer。普通 deterministic tests
+只读取该文件，并独立枚举实际 publication tree；不会从实际树动态生成 expected，也不会
+在 mismatch 时更新 manifest。
+
+真实 15-choice provider matrix 不属于默认 pytest。显式运行：
+
+```bash
+python utils/smoke_cli_init_provider_matrix.py --oracle-version 1
+```
+
+该命令执行真实 `init`、`prompt` 与 Host evidence 取证，报告写入
+`workspace/tmp/.../<run-id>/matrix-report.json`。外部 credential 缺失、
+endpoint 未配置、transport failure、provider rejection 与 rate limit 按封闭分类记录；
+内部 schema/profile/model/family/assembly/trace 错误、secret leak、fallback 或
+requestable row 无真实 response 会使命令非零。报告只保留有界、脱敏的 response/diagnostic
+摘要；Host SQLite/WAL 中 resolved credential 的 exact match 只记录为 accepted
+observation，非 Host SQLite artifact 中的 credential value 与任意位置的 canary 都是
+violation。
+
 运行 Host Session Event Delivery 的 Service / CLI focused 回归：
 
 ```bash
@@ -152,14 +214,19 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 ### `tests/cli/`
 
 CLI UI adapter 测试当前覆盖 pyproject 只发布真实 `dayu-cli`、wheel metadata / entrypoints / archive 不包含已删除的 placeholder scripts、packages、Web extra 或 Streamlit requirement；也覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
-用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及 `init`
+用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置、`init` 拒绝
+`--config`、Agent surfaces 使用 `--model/-m` 且拒绝旧 `--model-name`，以及 `init`
 的 typed model catalog、OS environment owner、`.dayu`/`config` 单一 managed-root transaction、
 FIRST/PRESERVE/OVERWRITE/RESET 四态、fresh-root/lock/identity/containment、真实 ConfigLoader/Service discovery/
-13-scene validation、private Fins side-effect isolation、publication/rollback/cleanup fault matrix、secret names-only
-diagnostic 与 SIGINT 130。`test_init_smoke.py` 进一步用隔离 subprocess 证明 FIRST/RESET-only exact-two-root
+13-scene validation、PRESERVE 根配置/prompt 补缺、ordinary-root repair、publication/rollback/cleanup fault
+matrix、target effective profile context minimum、可恢复输入原步骤 retry、EOF/confirmation exit、secret
+names-only diagnostic 与 SIGINT 130。`test_init_smoke.py` 进一步用隔离 subprocess 证明 FIRST/RESET-only exact-two-root
 import prewarm 的 transitive graph、连续稳定、零网络/零 workspace/env mutation，并在真实 POSIX 上覆盖完整四态、
 profile 0600/单 marker block/脱敏、user manifest 与缺失 prompt、portfolio/assets sentinel、RESET No 整树 hash、
 公开 waiting notification、真实 file_lock 单 waiter 与双 queued publisher 串行成功；
+`test_smoke_cli_init_provider_matrix.py` 覆盖冻结 manifest 的精确 publication tree、15-choice
+classifier、endpoint/response 脱敏、persisted secret classification、canonical no-fallback
+与 retained-report reconciliation；deterministic 路径不调用 provider。
 `python -m dayu.cli --help` 入口，并覆盖 CLI main 把默认 log level、`--debug` / `--debug-stream` / `--verbose` / `--quiet` / `--log-level`
 解析结果和进程结束自动删除的默认临时日志流或全局 `--log-file` 诊断流交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志，且覆盖临时流工厂、日志文件打开失败、连续调用恢复 stderr、恢复 stderr 失败仍关闭日志流，以及异常 / `KeyboardInterrupt` 路径恢复 stderr handler 后再关闭文件。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、`--ticker` 到 LLM-facing `fins_default_subject` Markdown slot 的生成、非法 `--ticker` usage error、FMP 公司名增强与缺 key fallback、stable
 Host slot key、已移除执行参数走 argparse unknown、已删除旧 debug 参数走 argparse unknown、`--thinking` / `--no-thinking` 展示参数解析、thinking event 存在时 `--thinking` 与 `--no-thinking` 输出不同、真实 `prompt.json` required context slots、入口身份不进入 LLM context slots、mock Host public
@@ -207,7 +274,7 @@ CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `in
 - tool call projection：覆盖 current `ToolCallable` 共享参数投影与 outcome 构造 helper，包括 schema default、类型收窄、unknown / missing / range / array item 参数失败、JSON typed enum equality（boolean/number 分离、有限 number 数学等价、array/object 递归）、default/显式参数同路径、构造后 mutable schema 负 count bound 防御、固定 `invalid_argument` failure、completed / failed outcome metadata，以及 Host cancellation token 对应的 `ToolCancelledOutcome(host_cancelled)`。
 - scene prepare：覆盖单 scene 装配、system prompt 输出、fragment refs / source refs / digest、required context slot、未知 / 非字符串 placeholder、双花括号字面量保留、单继承、可选或继承的 model hints、旧 `conversation` / 泛化 `runtime` / 旧 model 字段 fail fast、typed agent policy override、fragment id / order 冲突、fragment path containment、missing required fragment fail-closed，以及 `all` / `none` / `select` 工具选择的 names、tags、并集、未知工具、空匹配和 `<when_tag>` / `<when_tool>` 条件块过滤语义；真实 prompt assets 测试确认条件块 marker 不进入最终 system prompt。
 - tools discovery：覆盖显式 import path / package entry point provider 解析、禁用 provider 跳过、provider identity / source refs / 启用 provider 空工具输出 fail-fast、重复 provider / 工具名、reserved framework tool name 防线，以及 source refs 内容摘要规范化。
-- assembly helpers：覆盖 runtime-neutral 模型 / runner option hint 选择、typed allowlist override 解析、Agent policy 字段级优先级合并、工具截断 policy 默认值补齐、Fins packaged 缺省 workspace root 到 Service effective absolute `workspace_root` 的注入、Web storage state 目录按 workspace root 解析、raw provider config 不变性，以及 helper 返回值不构造 Host / Engine typed object；弱类型守卫显式确认这些 Phase 12 runtime helper 文件被扫描；`test_smoke_host_public_multiturn_assembly.py` 覆盖 Host public multiturn smoke 通过正式 Service assembly helper、内置 `manual-smoke` provider、workspace overlay provider、默认 fresh session slot、duplicate governance diagnostics 和 compact pressure 估算的成功路径；`test_smoke_host_public_conversation_memory_scenarios_assembly.py` 覆盖 Host public conversation memory 场景 smoke 的 `memory-core` / `memory-compact` / `memory-reactive-compact` / `memory-compact-fallback` suite 解析、pressure mode 参数、reactive deterministic recovery dispatch oracle、compact failure fallback selected window oracle、compact EventLog audit 摘要验收、compact operation timeline / rejected histogram / manifest missing stage 诊断、`CONTEXT_COMPACTION_FAILED` hard fail 语义、mock finance tool 装配、tool selection、pressure 文本和 slot key 语义；`test_smoke_host_public_r03_semantic_ownership_assembly.py` 覆盖窄 R03 smoke 的真实 Config / Scene / Service 装配、public `open_host -> ensure_session -> submit_followup` 命令链、固定真实工具轮次、durable projection 仅作显式 internal diagnostic read，以及异常输出的 secret 脱敏与长度上限 guard。
+- assembly helpers：覆盖 runtime-neutral 四字段 model family identity、模型 / runner option hint 选择、typed allowlist override 解析、Agent policy 字段级优先级合并、工具截断 policy 默认值补齐、Fins packaged 缺省 workspace root 到 Service effective absolute `workspace_root` 的注入、Web storage state 目录按 workspace root 解析、raw provider config 不变性，以及 helper 返回值不构造 Host / Engine typed object；弱类型守卫显式确认这些 Phase 12 runtime helper 文件被扫描；`test_smoke_host_public_multiturn_assembly.py` 覆盖 Host public multiturn smoke 通过正式 Service assembly helper、内置 `manual-smoke` provider、workspace overlay provider、默认 fresh session slot、duplicate governance diagnostics 和 compact pressure 估算的成功路径；`test_smoke_host_public_conversation_memory_scenarios_assembly.py` 覆盖 Host public conversation memory 场景 smoke 的 `memory-core` / `memory-compact` / `memory-reactive-compact` / `memory-compact-fallback` suite 解析、pressure mode 参数、reactive deterministic recovery dispatch oracle、compact failure fallback selected window oracle、compact EventLog audit 摘要验收、compact operation timeline / rejected histogram / manifest missing stage 诊断、`CONTEXT_COMPACTION_FAILED` hard fail 语义、mock finance tool 装配、tool selection、pressure 文本和 slot key 语义；`test_smoke_host_public_r03_semantic_ownership_assembly.py` 覆盖窄 R03 smoke 的真实 Config / Scene / Service 装配、public `open_host -> ensure_session -> submit_followup` 命令链、固定真实工具轮次、durable projection 仅作显式 internal diagnostic read，以及异常输出的 secret 脱敏与长度上限 guard。
 - scene asset migration：覆盖迁移后的真实 scene manifest 可被 `ScenePrepare` 装配，直接 fragment 引用可加载，`current_time` 与 `fins_default_subject` 的 source placement 和展开后 system prompt 顺序不打断 scene 执行契约，`current_time` 展开文本说明静态时间边界且不暴露内部实现术语，`get_current_time` 只在 interactive / wechat 场景暴露且工具描述说明实时刷新调用边界，旧
   `max_iterations` 落入新 `agent_policy` 且不迁移工具超时，base prompt 不混入未裁决占位段，并确认未迁移
   tasks、contract 文件、workflow 产物与未引用模板。
@@ -216,7 +283,7 @@ CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `in
 
 Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime typed config、locations、工具发现、prepared scene、显式 override 与 env/secret mapping 映射为 Host public typed inputs：
 
-- host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout、process capsule cleanup interrupt policy 与完整 wait poller policy 等 construction tuning 被映射进 `OpenHostOptions` / `HostToolingOptions`；wait policy 不再接受 Service override 或 scene authority，prompt / interactive 与 scene all/select/none 对相同 provider/runtime inputs 得到相同 opener 决策；execution profile 的工具重复治理 policy 被映射进 `HostToolingOptions`，ordinary / compactor baseline 默认启用 OpenAI-compatible client correlation policy，静态 `X-Client-Request-Id` header 冲突 fail fast，provider secret 占位符在 Service helper 中解析，prompt asset path / 工具发现 source refs / provider location 边界 fail-fast，compactor scene 必填 AgentPolicy 字段校验，per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`，以及 `ServiceRunOverrides` 到完整 `RunnerCallOptions` / `AgentPolicy` 的 typed override 合并。
+- host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout、process capsule cleanup interrupt policy 与完整 wait poller policy 等 construction tuning 被映射进 `OpenHostOptions` / `HostToolingOptions`；wait policy 不再接受 Service override 或 scene authority，prompt / interactive 与 scene all/select/none 对相同 provider/runtime inputs 得到相同 opener 决策；execution profile 的工具重复治理 policy 被映射进 `HostToolingOptions`，primary default、ordinary invocation override 与 compactor selection 各自独立求值，primary/compactor resolved family mismatch 在 Host 打开前 fail closed，单次跨 family ordinary override 不改变 compactor，ordinary / compactor baseline 默认启用 OpenAI-compatible client correlation policy，静态 `X-Client-Request-Id` header 冲突 fail fast，provider secret 占位符在 Service helper 中解析，prompt asset path / 工具发现 source refs / provider location 边界 fail-fast，compactor scene 必填 AgentPolicy 字段校验，per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`，以及 `ServiceRunOverrides` 到完整 `RunnerCallOptions` / `AgentPolicy` 的 typed override 合并。
 - wait callback endpoint：覆盖 framework-neutral callback completion mapper 的 method / content-type / path-body wait id transport rejection、malformed outcome shape、裸字符串 `provider_status_ref` 拒绝、headers/body 到 Host callback envelope 的 typed 映射、completed / failed / cancelled / lost outcome dataclass 转换、Host adapter status 到 HTTP-like code/body 的映射、AUTH_FAILED 401/403 reason code 分类、缺失认证字段交给 adapter 分类，以及 response body 不回显 outcome result payload。
 - entrypoint runtime：覆盖 reusable Agent entrypoint Service boundary 的 runtime 准备、Session ensure/create、session helper 参数校验、submit 前 async watcher subscription open 与 accepted target binding 时序、sole consumer、capacity-one generation slot、fast terminal race、无关 terminal 过滤、activity / thinking typed callback execution port、callback shield 与 consumer 串行读取、exact-five disposition、old-generation / stop late commit 拒绝、terminal identity 去重、`DELIVERY_INTERRUPTED/TRANSIENT_MAILBOX_OVERFLOW` 专属 durable recovery、其它 EOF / public / non-public iterator failure 不 recovery，以及 callback、EOF、iterator、terminal、delivery recovery、slot-empty、caller cancellation分别与 watcher close failure 的异常优先级；durable read 继续覆盖 `get_run`、`OutboxTerminalCursor` / `seen_terminal_event_ids` / `limit=50`、`CAUGHT_UP` 分页、`LAGGED` 重试、`FAILED` 与 caught-up-without-match 错误；interactive startup 覆盖 watcher-first session-scoped backfill、无 target 不预读、target generation ack/rebind、idle snapshot 后 tail outbox closure、active Run observation与 queued-only bounded promotion wait / failure；cancel 覆盖已终态跳过 `cancel_run(...)`、非终态 subscription-before-cancel、terminal race recovery以及完整 `CancelRunRequest` 构造。scene context slot builder 覆盖 `fins_default_subject`、`current_time` 中文格式、FMP 成功增强、缺 key 时跳过 timeout 校验和失败 fallback；interactive path 覆盖真实 `interactive.json` 的 subject/current-time slots、Fins awaiting poller assembly 和连续两轮 terminal wait state。
 - Fins direct：覆盖 reusable Fins direct Service boundary 的 download / preprocess typed request 构造、upload wrapper 到 `FinsIngestionRuntime.upload(...)` union API、同一个 `ValidatedFinsEventStream` identity pass-through、progress / result contract、failure result pass-through、runtime stream exception 透传、Fins-owned typed protocol error object 与 runtime `PREPROCESS` provenance 不被 Service alias 重建、task cancellation 关闭 runtime stream、Service 不暴露 job handle / job event / `request_cancel` direct API，以及 direct event leakage guard。

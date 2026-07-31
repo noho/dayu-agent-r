@@ -44,6 +44,8 @@ GitHub Issues
   -> 记录 issue scope、讨论、PR 关联和跨文档追踪状态
 ```
 
+> **当前 CLI 契约：**公开模型覆盖参数已冻结为 `--model/-m`，旧参数 `--model-name` 不存在；下文历史 gate 中的 `--model-name` 仅是当时记录，不代表当前公开参数。
+
 本文档不得引入新的架构边界、状态机、公共接口或事件语义。若实施编排过程中发现需要新的架构决策，应先和用户讨论并同步到设计真源，再更新本文档对应 work unit 的范围、非目标、验收信号和对应 GitHub Issue。
 
 术语必须遵循项目级术语真源和 Host 设计真源。planning、implementation、review、fix 与 re-review 不得自行重解释 `Session`、`Run`、`Attempt`、`EventLog`、`HostEvent`、`EngineEvent`、`Service assembly`、`Host public API`、`ToolsDiscovery`、`Fins storage` 等术语。若发现术语缺失或冲突，应先讨论并同步真源文档，再继续推进。

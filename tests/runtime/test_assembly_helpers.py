@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import cast
 
 import pytest
@@ -13,10 +13,12 @@ from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.runtime.assembly import (
     AgentPolicyBaseline,
     AgentPolicyOverrideConfig,
+    ModelFamilyIdentity,
     RuntimeAssemblyFieldError,
     RuntimeAssemblySelectionError,
     effective_tool_truncate_spec_from_policy,
     merge_agent_policy_config,
+    model_family_identity,
     parse_agent_policy_override_config,
     parse_model_runner_hint_override,
     select_runner_option_hint,
@@ -46,6 +48,66 @@ def _agent_policy_baseline() -> AgentPolicyBaseline:
         continuation_prompt="default continuation",
         max_consecutive_failed_tool_batches=1,
     )
+
+
+def test_model_family_identity_has_exact_four_resolved_fields() -> None:
+    """模型家族 identity 只投影四个 resolved typed 字段。"""
+
+    config = load_runtime_config()
+    model = config.models.models["mimo-v2.5-pro-plan"]
+
+    identity = model_family_identity(model)
+
+    assert identity == ModelFamilyIdentity(
+        provider=model.provider,
+        provider_model=model.model,
+        endpoint=model.endpoint,
+        credential_ref=model.api_key_ref,
+    )
+    assert tuple(field.name for field in fields(identity)) == (
+        "provider",
+        "provider_model",
+        "endpoint",
+        "credential_ref",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "expected_value"),
+    (
+        ("provider", "different-provider"),
+        ("model", "different-provider-model"),
+        ("endpoint", "https://different.example.test/v1"),
+        ("api_key_ref", "DIFFERENT_API_KEY"),
+    ),
+)
+def test_model_family_identity_detects_each_owned_field_mismatch(
+    field_name: str,
+    expected_value: str,
+) -> None:
+    """四个 owner 字段任一变化都必须产生不同 identity。"""
+
+    config = load_runtime_config()
+    model = config.models.models["mimo-v2.5-pro-plan"]
+    changed = replace(model, **{field_name: expected_value})
+
+    assert model_family_identity(changed) != model_family_identity(model)
+
+
+def test_model_family_identity_ignores_extensions_and_runner_hints() -> None:
+    """Provider extension 与 runner hints 差异不得改变家族 identity。"""
+
+    config = load_runtime_config()
+    model = config.models.models["mimo-v2.5-pro-plan"]
+    changed = replace(
+        model,
+        provider_request_extension={"reasoning": {"enabled": True}},
+        runtime_hints=config.models.models[
+            "mimo-v2.5-pro-thinking-plan"
+        ].runtime_hints,
+    )
+
+    assert model_family_identity(changed) == model_family_identity(model)
 
 
 def test_select_runner_option_hint_uses_field_level_precedence() -> None:

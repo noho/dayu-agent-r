@@ -10,6 +10,7 @@ from typing import Final
 import pytest
 
 from dayu.contracts import JsonValue, ToolBundleSourceKind
+from dayu.runtime.assembly import model_family_identity
 from dayu.runtime.config_loader import (
     ConfigExtendsError,
     ConfigFieldError,
@@ -23,6 +24,7 @@ from dayu.runtime.config_loader import (
 )
 
 _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION: Final[int] = 5
+_PACKAGE_DEFAULT_MODEL_ID: Final[str] = "mimo-v2.5-pro-plan"
 _REMOVED_CONFIG_FILE_NAMES: Final[frozenset[str]] = frozenset(
     {"llm_models.json", "run.json"}
 )
@@ -562,6 +564,36 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert utils_provider.import_path == "dayu.tools.utils:discover_tools"
     assert utils_provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
     assert utils_provider.config == {}
+
+
+def test_package_execution_profile_baselines_share_mimo_token_plan_family() -> None:
+    """四个 package profile 的八个模型 baseline 必须同属 Mimo Token Plan 家族。
+
+    :returns: ``None``。
+    :raises AssertionError: baseline model id 或 resolved family 漂移时抛出。
+    :raises ConfigLoadError: package 配置加载失败时由 loader 传播。
+    """
+
+    config = load_runtime_config()
+    expected_identity = model_family_identity(
+        config.models.models[_PACKAGE_DEFAULT_MODEL_ID]
+    )
+    baseline_model_ids: list[str] = []
+
+    for profile in config.execution_profiles.execution_profiles.values():
+        run_model_id = profile.run_baseline.model_id
+        compactor_model_id = profile.compactor_baseline.model_id
+        baseline_model_ids.extend((run_model_id, compactor_model_id))
+        assert (
+            model_family_identity(config.models.models[run_model_id])
+            == expected_identity
+        )
+        assert (
+            model_family_identity(config.models.models[compactor_model_id])
+            == expected_identity
+        )
+
+    assert baseline_model_ids == [_PACKAGE_DEFAULT_MODEL_ID] * 8
 
 
 def test_host_runtime_process_capsule_policy_missing_block_is_valid(
