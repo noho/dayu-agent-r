@@ -229,7 +229,9 @@ classifier、endpoint/response 脱敏、persisted secret classification、canoni
 与 retained-report reconciliation；deterministic 路径不调用 provider。
 `dayu-cli` 与 `python -m dayu.cli` 共用轻量 bootstrap；测试在 application import、parser、日志资源准备、
 Host 打开和 command-local monitor 接管前注入 `KeyboardInterrupt`，断言统一退出 `130`、无 traceback，
-且不会留下半初始化业务状态。parser/main 测试还覆盖 argv 在 argparse 前的 strict UTF-8 拒绝、静态脱敏
+且不会留下半初始化业务状态；进程入口测试还断言 canonical `130` 确定后，解释器收尾阶段的后续
+`SIGINT` 不会把退出码覆盖为原始 signal return code，command-local monitor 关闭时恢复既有进程 handler。
+parser/main 测试还覆盖 argv 在 argparse 前的 strict UTF-8 拒绝、静态脱敏
 错误与 primary-operation 零调用，区分空白 `--log-file` 的 usage exit `2` 和缺失父目录的资源 exit `1`，
 并断言两者都不创建目标或业务状态。
 

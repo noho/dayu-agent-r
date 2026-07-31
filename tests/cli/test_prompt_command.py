@@ -6,6 +6,7 @@ import asyncio
 import builtins
 import getpass
 import io
+import signal
 import sys
 import threading
 from contextlib import suppress
@@ -18,6 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import dayu.cli.__main__ as cli_module
 import dayu.cli.commands.init as init_command
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
@@ -895,6 +897,38 @@ def test_prompt_startup_interrupt_during_runtime_prepare_has_no_business_state(
     assert "Traceback" not in captured.out
     assert "Traceback" not in captured.err
     assert not (tmp_path / ".dayu" / "host" / "dayu_host.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_mask_count"),
+    ((EXIT_KEYBOARD_INTERRUPT, 1), (EXIT_SUCCESS, 0)),
+)
+def test_process_exit_masks_only_canonical_keyboard_interrupt_teardown(
+    exit_code: int,
+    expected_mask_count: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """进程收尾只能在 canonical 130 后屏蔽后续 SIGINT。
+
+    :param exit_code: 模拟 application 已确定的退出码。
+    :param expected_mask_count: 预期安装 ``SIG_IGN`` 的次数。
+    :param monkeypatch: pytest 函数与 signal 替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: SystemExit code 或 handler 安装契约漂移时抛出。
+    """
+
+    run_module_mock = Mock(return_value=exit_code)
+    signal_mock = Mock()
+    monkeypatch.setattr(cli_module, "run_module", run_module_mock)
+    monkeypatch.setattr(cli_module.signal, "signal", signal_mock)
+
+    with pytest.raises(SystemExit) as captured:
+        cli_module.exit_module()
+
+    assert captured.value.code == exit_code
+    assert signal_mock.call_count == expected_mask_count
+    if expected_mask_count == 1:
+        signal_mock.assert_called_once_with(signal.SIGINT, signal.SIG_IGN)
 
 
 def test_prompt_startup_interrupt_during_host_open_has_no_host_state(
@@ -2855,6 +2889,26 @@ async def test_prompt_sigint_monitor_waits_for_notification() -> None:
     monitor.notify()
 
     assert await wait_task == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_sigint_monitor_restores_previous_process_handler() -> None:
+    """关闭 monitor 必须恢复 asyncio runner 已有的进程级 SIGINT handler。
+
+    :returns: ``None``。
+    :raises AssertionError: monitor 关闭后 handler identity 漂移时抛出。
+    """
+
+    previous_handler = signal.getsignal(signal.SIGINT)
+    assert previous_handler is not None
+    monitor = CliSigintMonitor()
+
+    monitor.install()
+    installed_handler = signal.getsignal(signal.SIGINT)
+    assert installed_handler != previous_handler
+    monitor.close()
+
+    assert signal.getsignal(signal.SIGINT) == previous_handler
 
 
 def test_prompt_terminal_failed_outputs_error(

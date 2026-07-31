@@ -13,7 +13,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from types import FrameType
-from typing import TypeVar
+from typing import TypeAlias, TypeVar
 
 from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.service.host_assembly import ServiceRunOverrides
@@ -25,6 +25,9 @@ CONFIG_DIR_OPTION_NAME: str = "--config"
 FALLBACK_MODE_OPTION_NAME: str = "--fallback-mode"
 FALLBACK_PROMPT_OPTION_NAME: str = "--fallback-prompt"
 _TaskResult = TypeVar("_TaskResult")
+_SignalHandler: TypeAlias = (
+    signal.Handlers | int | Callable[[int, FrameType | None], None]
+)
 
 
 class CliSigintMonitor:
@@ -39,6 +42,7 @@ class CliSigintMonitor:
     _event: asyncio.Event
     _loop: asyncio.AbstractEventLoop | None
     _installed: bool
+    _previous_handler: _SignalHandler | None
 
     def __init__(self) -> None:
         """初始化 SIGINT monitor。
@@ -51,36 +55,49 @@ class CliSigintMonitor:
         self._event = asyncio.Event()
         self._loop = None
         self._installed = False
+        self._previous_handler = None
 
     def install(self) -> None:
         """在当前事件循环安装 SIGINT handler。
 
         :returns: ``None``。
-        :raises Exception: 不主动抛出异常；不支持 loop signal handler 时保留
-            默认 ``KeyboardInterrupt`` 行为。
+        :raises RuntimeError: 当前进程的既有 SIGINT handler 无法读取时抛出；
+            不支持 loop signal handler 时保留既有 ``KeyboardInterrupt`` 行为。
         """
 
         loop = asyncio.get_running_loop()
+        previous_handler = signal.getsignal(signal.SIGINT)
+        if previous_handler is None:
+            raise RuntimeError("SIGINT previous handler is unavailable")
         try:
             loop.add_signal_handler(signal.SIGINT, self.notify)
         except (NotImplementedError, RuntimeError):
             self._installed = False
             self._loop = None
+            self._previous_handler = None
             return
         self._installed = True
         self._loop = loop
+        self._previous_handler = previous_handler
 
     def close(self) -> None:
         """移除当前 monitor 安装的 SIGINT handler。
 
         :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
+        :raises OSError: 底层 SIGINT handler 恢复失败时抛出。
+        :raises ValueError: 当前线程不允许恢复 signal handler 时抛出。
         """
 
-        if self._installed and self._loop is not None:
+        if (
+            self._installed
+            and self._loop is not None
+            and self._previous_handler is not None
+        ):
             self._loop.remove_signal_handler(signal.SIGINT)
+            signal.signal(signal.SIGINT, self._previous_handler)
         self._installed = False
         self._loop = None
+        self._previous_handler = None
 
     def notify(
         self,

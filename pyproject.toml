@@ -93,7 +93,7 @@ Repository = "https://github.com/noho/dayu-agent"
 Issues = "https://github.com/noho/dayu-agent/issues"
 
 [project.scripts]
-dayu-cli = "dayu.cli.__main__:run_module"
+dayu-cli = "dayu.cli.__main__:exit_module"
 
 
 [tool.setuptools.packages.find]
