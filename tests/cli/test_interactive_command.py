@@ -1684,7 +1684,8 @@ def test_interactive_failed_and_cancelled_continue_until_eof(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-3"
     assert "failed for run-1" in captured.err
-    assert "cancelled for run-2" in captured.err
+    assert "Cancelled." in captured.err
+    assert "cancelled for run-2" not in captured.err
     assert len(fake_host.submit_requests) == 3
 
 
