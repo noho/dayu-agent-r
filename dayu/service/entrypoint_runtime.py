@@ -1100,9 +1100,10 @@ async def _submit_followup_through_acceptance_barrier(
     :param state: 当前单目标终态观察状态。
     :param on_run_accepted: 可选 accepted Run 通知回调。
     :returns: Host follow-up 接受结果。
-    :raises asyncio.CancelledError: caller cancellation 在 acceptance barrier 完成后传播；
-        Host 自身取消 submit 时原样传播。
-    :raises Exception: Host submit、状态绑定或 callback 失败时原样传播。
+    :raises asyncio.CancelledError: caller cancellation 在 Host 明确未接受 Run，或
+        accepted Run 已发布后传播；Host 自身取消 submit 时原样传播。
+    :raises Exception: caller 尚未取消时，Host submit、状态绑定或 callback 失败会
+        原样传播。
     """
 
     submit_task = asyncio.create_task(host.submit_followup(session_id, request))
@@ -1116,9 +1117,10 @@ async def _submit_followup_through_acceptance_barrier(
                 raise
             if caller_cancellation is None:
                 caller_cancellation = error
-            if submit_task.done():
-                followup = submit_task.result()
-                break
+        except Exception:
+            if caller_cancellation is not None:
+                raise caller_cancellation
+            raise
 
     state.bind(followup.accepted_run_id)
     if on_run_accepted is not None:

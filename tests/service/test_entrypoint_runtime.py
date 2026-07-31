@@ -896,6 +896,45 @@ class _CommitThenBlockSubmitHost(_FakeHost):
         )
 
 
+class _BlockThenRejectSubmitHost(_FakeHost):
+    """模拟 public submit 尚未确定，随后明确拒绝且未接受 Run 的 Host。"""
+
+    submit_started: asyncio.Event
+    release_rejection: asyncio.Event
+
+    def __init__(self, error: RuntimeError) -> None:
+        """初始化 submit rejection barrier。
+
+        :param error: Host 明确拒绝 submit 时抛出的错误。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不主动抛出异常。
+        """
+
+        super().__init__()
+        self._submit_error = error
+        self.submit_started = asyncio.Event()
+        self.release_rejection = asyncio.Event()
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """等待测试释放后明确拒绝 submit，且不产生 accepted Run。
+
+        :param session_id: 目标 Session id。
+        :param request: public follow-up 请求。
+        :returns: 本方法不返回。
+        :raises RuntimeError: 释放 rejection barrier 后抛出预设错误。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append(request)
+        self.submit_started.set()
+        await self.release_rejection.wait()
+        raise self._submit_error
+
+
 class _RecoveryFailingHost(_FakeHost):
     """typed delivery interruption 后 durable read 原样失败的 Host fake。"""
 
@@ -1189,6 +1228,44 @@ async def test_submit_cancellation_waits_for_acceptance_barrier_before_callback(
         await submit_task
 
     assert accepted_run_ids == ["run-1"]
+    assert fake_host.watchers[0].closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_cancellation_wins_after_host_confirms_no_run_was_accepted(
+    tmp_path: Path,
+) -> None:
+    """Host 明确未接受 Run 后必须传播已登记的 caller cancellation。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: cancellation ordering 或 watcher cleanup 断言失败时抛出。
+    """
+
+    runtime = await _prepare_runtime(tmp_path)
+    submit_error = RuntimeError("submit rejected before acceptance")
+    fake_host = _BlockThenRejectSubmitHost(submit_error)
+    accepted_run_ids: list[str] = []
+    submit_task = asyncio.create_task(
+        submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_run_accepted=accepted_run_ids.append,
+        )
+    )
+    await fake_host.submit_started.wait()
+
+    submit_task.cancel()
+    await asyncio.sleep(0)
+    assert submit_task.done() is False
+    fake_host.release_rejection.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    assert accepted_run_ids == []
     assert fake_host.watchers[0].closed_count == 1
 
 
