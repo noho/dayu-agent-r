@@ -914,19 +914,15 @@ async def _submit_prompt_turn_handling_sigint(
                     invocation=invocation,
                     accepted_run=accepted_run,
                     submit_task=submit_task,
-                    sigint_monitor=sigint_monitor,
-                    observed_sigint_count=observed_sigint_count,
                     runtime_display=runtime_display,
                 )
                 break
-            first_sigint_count = await sigint_task
+            await sigint_task
             terminal_result = await _cancel_prompt_turn_after_local_request(
                 host=host,
                 invocation=invocation,
                 accepted_run=accepted_run,
                 submit_task=submit_task,
-                sigint_monitor=sigint_monitor,
-                observed_sigint_count=first_sigint_count,
                 runtime_display=runtime_display,
             )
             break
@@ -953,22 +949,16 @@ async def _cancel_prompt_turn_after_local_request(
     invocation: CliInvocation,
     accepted_run: _PromptAcceptedRunState,
     submit_task: asyncio.Task[EntrypointRunTerminalResult],
-    sigint_monitor: CliSigintMonitor,
-    observed_sigint_count: int,
     runtime_display: RuntimeDisplayController | None,
 ) -> EntrypointRunTerminalResult | None:
-    """本地取消请求后取消 prompt turn 并等待 Host terminal 或二次 SIGINT。
+    """本地取消请求后取消 prompt turn 并等待 Host terminal。
 
     :param host: Host public handle。
     :param invocation: 当前 CLI invocation 身份。
     :param accepted_run: 本轮 accepted Run id 状态。
     :param submit_task: 正在运行的 submit / terminal wait task。
-    :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
-    :param observed_sigint_count: 第一次取消请求后的 SIGINT 计数；Esc 取消
-        时传入进入运行态前的计数，避免 Esc 被当作 Ctrl+C 次数。
     :param runtime_display: 运行态展示 controller。
-    :returns: cancel 后 terminal result；Run accepted 前或二次 SIGINT 时返回
-        ``None``。
+    :returns: cancel 后 terminal result；Run accepted 前返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
@@ -983,72 +973,45 @@ async def _cancel_prompt_turn_after_local_request(
         return None
     if runtime_display is not None:
         await runtime_display.render_cancel_requested()
-    return await _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
+    return await _cancel_prompt_run_and_wait_for_terminal(
         host=host,
         invocation=invocation,
         run_id=accepted_run.run_id,
-        sigint_monitor=sigint_monitor,
-        observed_sigint_count=observed_sigint_count,
-        runtime_display=runtime_display,
     )
 
 
-async def _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
+async def _cancel_prompt_run_and_wait_for_terminal(
     *,
     host: Host,
     invocation: CliInvocation,
     run_id: str,
-    sigint_monitor: CliSigintMonitor,
-    observed_sigint_count: int,
-    runtime_display: RuntimeDisplayController | None,
-) -> EntrypointRunTerminalResult | None:
-    """发起 prompt Host cancel，并在二次 SIGINT 时本地退出。
+) -> EntrypointRunTerminalResult:
+    """发起 prompt Host graceful cancel，并等待 canonical terminal。
 
     :param host: Host public handle。
     :param invocation: 当前 CLI invocation 身份。
     :param run_id: 待取消 Run id。
-    :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
-    :param observed_sigint_count: 第一次取消请求后的 SIGINT 计数。
-    :param runtime_display: 运行态展示 controller。
-    :returns: cancel terminal result；二次 SIGINT 先到时返回 ``None``。
+    :returns: Host canonical cancel terminal result。
     :raises Exception: cancel 或 terminal observation 失败时向上抛出。
     """
 
-    cancel_task = asyncio.create_task(
-        cancel_entrypoint_run_and_wait(
-            host,
-            request=EntrypointCancelRequest(
-                context=build_prompt_host_context(
-                    invocation,
-                    operation=_PROMPT_OPERATION_CANCEL_RUN,
-                ),
-                run_id=run_id,
-                client_request_id=prompt_cancel_client_request_id(
-                    invocation,
-                    turn_index=PROMPT_TURN_INDEX,
-                    run_id=run_id,
-                ),
-                reason=CLI_SIGINT_REASON,
-                mode=CancelMode.GRACEFUL,
+    return await cancel_entrypoint_run_and_wait(
+        host,
+        request=EntrypointCancelRequest(
+            context=build_prompt_host_context(
+                invocation,
+                operation=_PROMPT_OPERATION_CANCEL_RUN,
             ),
-        )
+            run_id=run_id,
+            client_request_id=prompt_cancel_client_request_id(
+                invocation,
+                turn_index=PROMPT_TURN_INDEX,
+                run_id=run_id,
+            ),
+            reason=CLI_SIGINT_REASON,
+            mode=CancelMode.GRACEFUL,
+        ),
     )
-    second_sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
-    try:
-        done, _pending = await asyncio.wait(
-            (cancel_task, second_sigint_task),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if cancel_task in done:
-            return await cancel_task
-        if runtime_display is not None:
-            await runtime_display.render_local_exit_after_cancel()
-        cancel_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await cancel_task
-        return None
-    finally:
-        await cancel_and_await_task(second_sigint_task)
 
 
 async def _run_interactive_repl(
