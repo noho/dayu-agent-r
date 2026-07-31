@@ -171,11 +171,14 @@ dayu-cli <command> --help
 |---|---|
 | `--base` / `--workspace` | 工作区根目录，默认 `./workspace` |
 | `--config` | 除 `init` 外，Agent / Session runtime 使用的显式配置目录；相对路径必须位于工作区内 |
-| `--log-level` | `debug`、`verbose`、`info`、`warn`、`error` 或 `critical` |
-| `--debug` | 等价于 `--log-level debug` |
-| `--debug-stream` | 同时打开普通 DEBUG 与高频 stream/SSE 诊断 |
-| `--verbose` / `--info` / `--quiet` | 日志等级快捷开关 |
-| `--log-file PATH` | 把诊断日志追加写入指定文件 |
+| `--log-level LEVEL` | 可选 `debug`、`verbose`、`info`、`warning`、`error`、`critical`、`quiet`；`warn` 与 `warning` 等价 |
+| `--debug` / `--verbose` / `--info` / `--warning` / `--error` / `--critical` / `--quiet` | 对应日志等级的快捷参数；同时保留与 `--warning` 等价的 `--warn` |
+| `--debug-stream` | 额外打开高频 stream/SSE 诊断，不改变普通日志等级；不可与 `quiet` 组合 |
+| `--log-file PATH` | 把诊断日志追加写入指定文件；可与任意合法日志等级选择组合 |
+
+`--log-level` 和所有日志等级快捷参数彼此互斥，一次调用只能选择其中一个。
+`--debug-stream` 可以单独使用，也可以与 `debug`、`verbose`、`info`、`warn` / `warning`、
+`error` 或 `critical` 组合。
 
 用户可见回答和进度仍写 stdout/stderr。未传 `--log-file` 时，诊断日志只保留到
 当前 CLI 进程结束；需要排障留档时必须显式指定路径：
@@ -184,6 +187,9 @@ dayu-cli <command> --help
 dayu-cli prompt "总结主要风险" --ticker AAPL \
   --debug --log-file workspace/prompt.log
 ```
+
+`--log-file` 不会创建缺失的父目录；请先创建父目录。父目录不存在或目标无法打开时，
+CLI 会显示可操作的错误并退出 `1`，不会开始本次分析。
 
 ## 4. 问答与交互
 
