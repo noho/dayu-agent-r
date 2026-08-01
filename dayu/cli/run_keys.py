@@ -1,8 +1,8 @@
-"""CLI Agent 运行态按键监听。
+"""CLI prompt one-shot 运行态按键监听。
 
-本模块只处理本地 TTY 控制键，把 ``Ctrl+T`` 和 ``Esc`` 映射为 CLI
-运行态控制动作。它不访问 Host / Service / Engine，也不改变 stdout
-结果通道。
+本模块只服务 prompt one-shot，把 ``Ctrl+T`` 和 ``Esc`` 映射为运行态控制
+动作。interactive 的整个 invocation 由 composer 独占 stdin，不使用本模块。
+本模块不访问 Host / Service / Engine，也不改变 stdout 结果通道。
 """
 
 from __future__ import annotations
@@ -30,14 +30,14 @@ _TerminalAttributes = list[_TerminalAttribute]
 
 
 class RunningKeyAction(StrEnum):
-    """CLI 运行态按键动作。"""
+    """prompt one-shot 运行态按键动作。"""
 
     TOGGLE_ACTIVITY = "toggle_activity"
     CANCEL_RUN = "cancel_run"
 
 
 class RunningKeyMonitor(Protocol):
-    """CLI 运行态按键 monitor 协议。"""
+    """prompt one-shot 运行态按键 monitor 协议。"""
 
     def start(self) -> None:
         """启动按键监听。
@@ -64,7 +64,7 @@ class RunningKeyMonitor(Protocol):
 
 
 class NoopRunningKeyMonitor:
-    """非 TTY 或测试路径使用的空运行态按键 monitor。"""
+    """prompt 非 TTY 或测试路径使用的空运行态按键 monitor。"""
 
     def start(self) -> None:
         """启动 no-op monitor。
@@ -96,7 +96,7 @@ class NoopRunningKeyMonitor:
 
 
 class TtyRunningKeyMonitor:
-    """TTY 运行态按键 monitor。
+    """prompt one-shot TTY 运行态按键 monitor。
 
     monitor 在当前事件循环外用后台线程读取 stdin 单字节输入，并通过
     ``asyncio.Queue`` 投递到运行态状态机。关闭时必须恢复原始终端模式。
@@ -245,7 +245,7 @@ class TtyRunningKeyMonitor:
 
 
 def new_running_key_monitor(*, stdin: TextIO | None = None) -> RunningKeyMonitor:
-    """按默认 TTY policy 创建运行态按键 monitor。
+    """按默认 TTY policy 创建 prompt one-shot 按键 monitor。
 
     :param stdin: 按键读取来源；``None`` 表示当前 ``sys.stdin``。
     :returns: POSIX TTY monitor 或 no-op monitor；非 POSIX 固定为 no-op。

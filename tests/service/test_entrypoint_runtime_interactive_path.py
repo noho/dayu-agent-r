@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
@@ -14,8 +17,22 @@ import pytest
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
+import dayu.cli.session_execution as session_execution
+from dayu.cli.agent_entrypoint import CliSigintMonitor
+from dayu.cli.composer import InteractiveComposerEvent, InteractiveComposerEventKind, InteractiveComposerPhase
+from dayu.cli.exit_codes import EXIT_KEYBOARD_INTERRUPT
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import (
+    EngineEvent,
+    EngineEventType,
+    FinalAnswerData,
+    RunCancelledData,
+)
+from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AssistantMessage, UserMessage
 from dayu.host.api import (
+    AttemptDispatchSnapshot,
+    AttemptStatus,
     FollowupBehavior,
     FollowupSnapshot,
     Host,
@@ -28,6 +45,9 @@ from dayu.host.api import (
     HostSessionEventIterator,
     HostStreamCursor,
     HostTerminalStatus,
+    LocalEngineWorker,
+    LocalEngineWorkerFactory,
+    LocalWorkerHandle,
     OperationContext,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -38,6 +58,20 @@ from dayu.host.api import (
     SubmitFollowupRequest,
     TerminalResultSummary,
 )
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.state import (
+    AttemptRow,
+    RunRow,
+    read_attempt_by_id,
+    read_non_terminal_runs_for_session,
+    read_run_by_id,
+)
+from dayu.host.durable.transaction import HostTransaction
 from dayu.host.open_host import OpenHostOptions, open_host
 from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeRequest,
@@ -64,41 +98,14 @@ _INTERACTIVE_CURRENT_TIME_TEXT = (
     "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
     "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
 )
+_REAL_HOST_BARRIER_TIMEOUT_SECONDS = 2.0
+_REAL_HOST_BARRIER_POLL_SECONDS = 0.01
+_WORKER_EVENT_TIME = datetime(2026, 8, 1, 9, 0, 0, tzinfo=UTC)
 _AgentSurface: TypeAlias = Literal["prompt", "interactive"]
-
-
-class _SingleTurnInteractiveInput:
-    """只返回一轮用户输入、随后报告 EOF 的真实 CLI 输入替身。"""
-
-    _user_prompt: str
-    _consumed: bool
-
-    def __init__(self, user_prompt: str) -> None:
-        """保存单轮输入。
-
-        :param user_prompt: 第一次读取时返回的用户文本。
-        :returns: ``None``。
-        :raises ValueError: 用户文本为空时抛出。
-        """
-
-        if user_prompt.strip() == "":
-            raise ValueError("user_prompt must not be empty")
-        self._user_prompt = user_prompt
-        self._consumed = False
-
-    def __call__(self, prompt: str) -> str:
-        """返回单轮输入，下一次读取抛出 EOF。
-
-        :param prompt: interactive 输入提示文本。
-        :returns: 首次调用返回保存的用户文本。
-        :raises EOFError: 第二次及后续读取时抛出。
-        """
-
-        del prompt
-        if self._consumed:
-            raise EOFError
-        self._consumed = True
-        return self._user_prompt
+_LifecycleDurableTruth: TypeAlias = tuple[
+    tuple[RunRow, ...],
+    tuple[tuple[RunRow, AttemptRow], ...],
+]
 
 
 class _RecordingHostOpener:
@@ -134,7 +141,7 @@ class _RecordingHostOpener:
 async def _open_recording_host(
     options: OpenHostOptions,
     *,
-    worker_factory: FinalAnswerWorkerFactory,
+    worker_factory: LocalEngineWorkerFactory,
 ) -> AsyncIterator[Host]:
     """使用原始 durable options 打开记录型真实 Host。
 
@@ -144,10 +151,430 @@ async def _open_recording_host(
     :raises Exception: Host 打开、执行或关闭失败时透传。
     """
 
-    async with open_host(
-        replace(options, worker_factory=worker_factory)
-    ) as host:
+    async with open_host(replace(options, worker_factory=worker_factory)) as host:
         yield host
+
+
+class _FreshQueuedLifecycleCurrentHandle:
+    """真实 Host current Run 使用的可取消 worker handle。"""
+
+    _factory: _FreshQueuedLifecycleWorkerFactory
+    _snapshot: AttemptDispatchSnapshot
+
+    def __init__(
+        self,
+        factory: _FreshQueuedLifecycleWorkerFactory,
+        snapshot: AttemptDispatchSnapshot,
+    ) -> None:
+        """保存 current dispatch identity 与 worker barriers。
+
+        :param factory: 生命周期 worker factory。
+        :param snapshot: current dispatch snapshot。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory = factory
+        self._snapshot = snapshot
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回 current worker id。
+
+        :returns: 稳定测试 worker id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return "interactive-fresh-current-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """在真实 cancel hook 与 exit-after barrier 后产出取消终态。
+
+        :returns: 单条 ``RUN_CANCELLED`` Engine event 流。
+        :raises asyncio.CancelledError: Host 错误取消 worker task 时透传。
+        """
+
+        self._factory.current_events_started.set()
+        await self._factory.release_current_terminal.wait()
+        yield EngineEvent(
+            occurred_at=_WORKER_EVENT_TIME,
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.RUN_CANCELLED,
+            data=RunCancelledData(
+                reason="cli_sigint",
+                requested_at=_WORKER_EVENT_TIME,
+                accepted_at=_WORKER_EVENT_TIME,
+                finished_at=_WORKER_EVENT_TIME,
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """记录 current handle 已由真实 Host 关闭。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory.closed_run_ids.append(self._snapshot.run_id)
+
+    def on_cancel(self, reason: str) -> None:
+        """记录真实 Host 传播的 canonical cancel 并打开观察 barrier。
+
+        :param reason: Host 传播的取消原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory.current_cancel_reasons.append(reason)
+        self._factory.current_cancel_observed.set()
+
+
+class _FreshQueuedLifecycleFinalHandle:
+    """queued promotion 后立即产出 final answer 的 worker handle。"""
+
+    _factory: _FreshQueuedLifecycleWorkerFactory
+    _snapshot: AttemptDispatchSnapshot
+
+    def __init__(
+        self,
+        factory: _FreshQueuedLifecycleWorkerFactory,
+        snapshot: AttemptDispatchSnapshot,
+    ) -> None:
+        """保存 promoted queued dispatch identity。
+
+        :param factory: 生命周期 worker factory。
+        :param snapshot: promoted queued dispatch snapshot。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory = factory
+        self._snapshot = snapshot
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回 promoted queued worker id。
+
+        :returns: 稳定测试 worker id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return "interactive-fresh-queued-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出 promoted queued Run 的成功 final answer。
+
+        :returns: 单条 ``FINAL_ANSWER`` Engine event 流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield EngineEvent(
+            occurred_at=_WORKER_EVENT_TIME,
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.FINAL_ANSWER,
+            data=FinalAnswerData(
+                content=f"queued final:{self._snapshot.run_id}",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """记录 promoted queued handle 已由真实 Host 关闭。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory.closed_run_ids.append(self._snapshot.run_id)
+
+    def on_cancel(self, reason: str) -> None:
+        """拒绝测试中意外取消 promoted queued Run。
+
+        :param reason: 意外取消原因。
+        :returns: ``None``。
+        :raises AssertionError: 始终抛出，queued Run 不应被 exit intent 取消。
+        """
+
+        raise AssertionError(f"promoted queued Run was unexpectedly cancelled: {reason}")
+
+
+class _FreshQueuedLifecycleWorker:
+    """按 dispatch 顺序返回 current-cancel 或 queued-final handle。"""
+
+    _factory: _FreshQueuedLifecycleWorkerFactory
+
+    def __init__(self, factory: _FreshQueuedLifecycleWorkerFactory) -> None:
+        """保存生命周期 worker factory。
+
+        :param factory: 生命周期 worker factory。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> LocalWorkerHandle:
+        """记录真实 Host dispatch，并按第一/第二轮选择 handle。
+
+        :param snapshot: 真实 Host dispatch snapshot。
+        :param request: 真实 Engine request。
+        :returns: current cancel handle 或 promoted queued final handle。
+        :raises RuntimeError: 出现第三次 dispatch 时抛出。
+        """
+
+        self._factory.snapshots.append(snapshot)
+        self._factory.requests.append(request)
+        if len(self._factory.snapshots) == 1:
+            return _FreshQueuedLifecycleCurrentHandle(self._factory, snapshot)
+        if len(self._factory.snapshots) == 2:
+            self._factory.queued_promoted.set()
+            return _FreshQueuedLifecycleFinalHandle(self._factory, snapshot)
+        raise RuntimeError("fresh queued lifecycle dispatched more than two Runs")
+
+
+class _FreshQueuedLifecycleWorkerFactory:
+    """记录 fresh Session current cancel 与 queued promotion 的真实 worker barrier。"""
+
+    def __init__(self) -> None:
+        """初始化 worker barrier 与 owner observations。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.requests: list[AgentRunRequest] = []
+        self.snapshots: list[AttemptDispatchSnapshot] = []
+        self.current_events_started = asyncio.Event()
+        self.current_cancel_observed = asyncio.Event()
+        self.release_current_terminal = asyncio.Event()
+        self.queued_promoted = asyncio.Event()
+        self.current_cancel_reasons: list[str] = []
+        self.closed_run_ids: list[str] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建共享生命周期记录器的真实 Host worker。
+
+        :param snapshot: Host 创建 worker 时的 dispatch snapshot。
+        :returns: 生命周期 worker。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del snapshot
+        return _FreshQueuedLifecycleWorker(self)
+
+
+class _FreshQueuedLifecycleHostOpener:
+    """为 fresh queued integration 注入 worker 并保留真实 Host options。"""
+
+    _worker_factory: _FreshQueuedLifecycleWorkerFactory
+    opened_options: OpenHostOptions | None
+
+    def __init__(self, worker_factory: _FreshQueuedLifecycleWorkerFactory) -> None:
+        """保存 worker factory。
+
+        :param worker_factory: fresh queued 生命周期 worker factory。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._worker_factory = worker_factory
+        self.opened_options = None
+
+    def __call__(
+        self,
+        options: OpenHostOptions,
+    ) -> AbstractAsyncContextManager[Host]:
+        """记录 Service 生成 options 并打开真实 Host。
+
+        :param options: Service runtime 生成的 Host options。
+        :returns: 注入 deterministic worker 的真实 Host context manager。
+        :raises Exception: Host 打开失败时透传。
+        """
+
+        self.opened_options = options
+        return _open_recording_host(options, worker_factory=self._worker_factory)
+
+    def require_opened_options(self) -> OpenHostOptions:
+        """返回已经由真实 CLI 路径产生的 Host options。
+
+        :returns: 已捕获的 Host options。
+        :raises AssertionError: CLI 尚未调用 opener 时抛出。
+        """
+
+        if self.opened_options is None:
+            raise AssertionError("interactive CLI did not open the real Host")
+        return self.opened_options
+
+
+class _FreshQueuedLifecycleSigintMonitor(CliSigintMonitor):
+    """在 exit-after 已被 driver 消费后释放真实 worker cancel terminal。"""
+
+    _release_current_terminal: asyncio.Event
+
+    def __init__(self, release_current_terminal: asyncio.Event) -> None:
+        """保存 current worker terminal release barrier。
+
+        :param release_current_terminal: current worker terminal release barrier。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self._release_current_terminal = release_current_terminal
+
+    def install(self) -> None:
+        """integration 不安装真实进程 signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    def close(self) -> None:
+        """integration 无进程 signal handler 需要恢复。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    async def wait_next(self, observed_count: int) -> int:
+        """等待下一次通知，并以第三个 waiter 证明 exit-after 已生效。
+
+        :param observed_count: driver 已消费的 SIGINT 计数。
+        :returns: 下一次 SIGINT 计数。
+        :raises asyncio.CancelledError: driver cleanup 取消 waiter 时透传。
+        """
+
+        if observed_count >= 2:
+            self._release_current_terminal.set()
+        return await super().wait_next(observed_count)
+
+
+class _FreshQueuedLifecycleComposer:
+    """按真实 Host durable/worker barrier 驱动 current、queued 与两次 Ctrl+C。"""
+
+    def __init__(
+        self,
+        *,
+        opener: _FreshQueuedLifecycleHostOpener,
+        worker_factory: _FreshQueuedLifecycleWorkerFactory,
+        sigint_monitor: _FreshQueuedLifecycleSigintMonitor,
+    ) -> None:
+        """保存真实 Host owner observations。
+
+        :param opener: 记录真实 Host options 的 opener。
+        :param worker_factory: 记录真实 worker barriers 的 factory。
+        :param sigint_monitor: 驱动两次 invocation SIGINT 的 monitor。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._opener = opener
+        self._worker_factory = worker_factory
+        self._sigint_monitor = sigint_monitor
+        self._call_index = 0
+        self._pending_submit = False
+        self.phase_calls: list[InteractiveComposerPhase] = []
+        self.observed_current_and_queue: tuple[RunRow, RunRow] | None = None
+
+    def set_phase(self, phase: InteractiveComposerPhase) -> None:
+        """记录真实 CLI state machine 投影的 composer phase。
+
+        :param phase: 新 composer phase。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.phase_calls.append(phase)
+
+    def accept_submit(self, *, record_history: bool) -> None:
+        """确认 current 或 queued submit 已被 CLI 接受。
+
+        :param record_history: 是否记录本次 submit history。
+        :returns: ``None``。
+        :raises AssertionError: 没有 pending submit 或未要求记录 history 时抛出。
+        """
+
+        if not self._pending_submit:
+            raise AssertionError("fresh lifecycle composer has no pending submit")
+        if not record_history:
+            raise AssertionError("fresh lifecycle non-empty submit must record history")
+        self._pending_submit = False
+
+    async def read_event(self, _prompt: str) -> InteractiveComposerEvent:
+        """按 owner barrier 依次提交 current、queued 与两次 Ctrl+C。
+
+        :param _prompt: CLI 输入提示文本。
+        :returns: 下一条 typed composer event。
+        :raises AssertionError: 真实 Host 未形成 current + sole QUEUE 时抛出。
+        """
+
+        self._call_index += 1
+        if self._call_index == 1:
+            return self._submit_event("current from fresh CLI")
+        if self._call_index == 2:
+            await asyncio.wait_for(
+                self._worker_factory.current_events_started.wait(),
+                timeout=_REAL_HOST_BARRIER_TIMEOUT_SECONDS,
+            )
+            return self._submit_event("sole queued from fresh CLI")
+        if self._call_index == 3:
+            snapshot = self._worker_factory.snapshots[0]
+            self.observed_current_and_queue = await _wait_for_current_and_sole_queue(
+                options=self._opener.require_opened_options(),
+                session_id=snapshot.session_id,
+            )
+            self._sigint_monitor.notify()
+            await asyncio.wait_for(
+                self._worker_factory.current_cancel_observed.wait(),
+                timeout=_REAL_HOST_BARRIER_TIMEOUT_SECONDS,
+            )
+            self._sigint_monitor.notify()
+        await asyncio.Event().wait()
+        raise AssertionError("fresh lifecycle composer wait unexpectedly returned")
+
+    def _submit_event(self, draft: str) -> InteractiveComposerEvent:
+        """构造并登记一份非空 submit event。
+
+        :param draft: 待提交的用户输入。
+        :returns: typed submit event。
+        :raises AssertionError: 前一份 submit 尚未确认时抛出。
+        """
+
+        if self._pending_submit:
+            raise AssertionError("fresh lifecycle submit acknowledgement is missing")
+        self._pending_submit = True
+        return InteractiveComposerEvent(
+            kind=InteractiveComposerEventKind.SUBMIT,
+            draft=draft,
+            input_revision=self._call_index,
+        )
+
+
+class _ReportedTty(io.StringIO):
+    """只用于让真实 interactive CLI 进入显式 TTY composer path。"""
+
+    def isatty(self) -> bool:
+        """报告 TTY capability。
+
+        :returns: 始终为 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
 
 
 def _runtime_assembly_env() -> dict[str, str]:
@@ -161,6 +588,117 @@ def _runtime_assembly_env() -> dict[str, str]:
         "DEEPSEEK_API_KEY": _API_KEY,
         "MIMO_PLAN_API_KEY": _API_KEY,
     }
+
+
+async def _wait_for_current_and_sole_queue(
+    *,
+    options: OpenHostOptions,
+    session_id: str,
+) -> tuple[RunRow, RunRow]:
+    """等待真实 Host durable truth 形成一个 current 与一个 sole QUEUE。
+
+    :param options: 当前真实 Host options。
+    :param session_id: fresh Session id。
+    :returns: 按 current、queued 顺序返回两个 durable Run rows。
+    :raises AssertionError: 有界时间内未形成精确状态组合时抛出。
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _REAL_HOST_BARRIER_TIMEOUT_SECONDS
+    with open_host_durable_store(_durable_options(options)) as store:
+        while loop.time() < deadline:
+            rows = store.transaction_runner.run_read(
+                partial(
+                    read_non_terminal_runs_for_session,
+                    session_id=session_id,
+                )
+            )
+            current = tuple(row for row in rows if row.status is RunStatus.RUNNING)
+            queued = tuple(row for row in rows if row.status is RunStatus.QUEUED)
+            if len(rows) == 2 and len(current) == 1 and len(queued) == 1:
+                return current[0], queued[0]
+            await asyncio.sleep(_REAL_HOST_BARRIER_POLL_SECONDS)
+    raise AssertionError("real Host did not expose current + sole QUEUE durable truth")
+
+
+def _durable_options(options: OpenHostOptions) -> HostDurableStoreOptions:
+    """从真实 Host options 构造只读 durable store options。
+
+    :param options: Service 生成并由真实 Host 消费的 options。
+    :returns: 指向同一 SQLite/artifact owner 的 durable options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=options.db_path,
+        payload_policy=PayloadStoragePolicy(artifact_root=options.artifact_root),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+            write_busy_retry_count=options.sqlite_write_busy_retry_count,
+            write_retry_initial_delay_seconds=options.sqlite_write_retry_initial_delay_seconds,
+            write_retry_backoff_multiplier=options.sqlite_write_retry_backoff_multiplier,
+            write_retry_max_delay_seconds=options.sqlite_write_retry_max_delay_seconds,
+        ),
+    )
+
+
+def _read_lifecycle_durable_truth(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    snapshots: tuple[AttemptDispatchSnapshot, ...],
+) -> _LifecycleDurableTruth:
+    """读取 fresh Session 的 Run/Attempt durable owner truth。
+
+    :param transaction: Host durable read transaction。
+    :param session_id: fresh Session id。
+    :param snapshots: 真实 worker 收到的两个 dispatch snapshots。
+    :returns: non-terminal Run rows 与逐 snapshot 的 Run/Attempt rows。
+    :raises AssertionError: durable row 缺失时抛出。
+    """
+
+    pairs: list[tuple[RunRow, AttemptRow]] = []
+    for snapshot in snapshots:
+        run = read_run_by_id(transaction, snapshot.run_id)
+        attempt = read_attempt_by_id(transaction, snapshot.attempt_id)
+        if run is None:
+            raise AssertionError(f"durable Run row is missing: {snapshot.run_id}")
+        if attempt is None:
+            raise AssertionError(f"durable Attempt row is missing: {snapshot.attempt_id}")
+        pairs.append((run, attempt))
+    return (
+        read_non_terminal_runs_for_session(transaction, session_id),
+        tuple(pairs),
+    )
+
+
+def _read_lifecycle_truth_from_store(
+    *,
+    options: OpenHostOptions,
+    session_id: str,
+    snapshots: tuple[AttemptDispatchSnapshot, ...],
+) -> _LifecycleDurableTruth:
+    """从真实 Host store 读取完整生命周期 durable truth。
+
+    :param options: 当前真实 Host options。
+    :param session_id: fresh Session id。
+    :param snapshots: 真实 worker dispatch snapshots。
+    :returns: non-terminal rows 与 Run/Attempt pairs。
+    :raises AssertionError: durable rows 缺失时抛出。
+    """
+
+    result: _LifecycleDurableTruth | None = None
+    with open_host_durable_store(_durable_options(options)) as store:
+        result = store.transaction_runner.run_read(
+            partial(
+                _read_lifecycle_durable_truth,
+                session_id=session_id,
+                snapshots=snapshots,
+            )
+        )
+    if result is None:
+        raise AssertionError("durable lifecycle truth was not read")
+    return result
 
 
 class _FakeHostEventIterator:
@@ -496,16 +1034,13 @@ def test_labeled_agent_surfaces_share_exact_session_and_prior_turn_runner_input(
     assert first_snapshot.session_id == second_snapshot.session_id
     assert first_request.session_id == first_snapshot.session_id
     assert second_request.session_id == first_snapshot.session_id
-    assert tuple(
-        message.content
-        for message in second_request.messages
-        if isinstance(message, UserMessage)
-    )[-2:] == (first_prompt, second_prompt)
-    assert tuple(
-        message.content
-        for message in second_request.messages
-        if isinstance(message, AssistantMessage)
-    )[-1:] == (f"final:1:{first_snapshot.run_id}",)
+    assert tuple(message.content for message in second_request.messages if isinstance(message, UserMessage))[-2:] == (
+        first_prompt,
+        second_prompt,
+    )
+    assert tuple(message.content for message in second_request.messages if isinstance(message, AssistantMessage))[
+        -1:
+    ] == (f"final:1:{first_snapshot.run_id}",)
 
 
 @pytest.mark.parametrize("surface", ("prompt", "interactive"))
@@ -551,14 +1086,82 @@ def test_unlabeled_agent_invocations_use_fresh_session_without_prior_memory(
     assert worker_factory.requests[0].session_id == worker_factory.snapshots[0].session_id
     assert worker_factory.requests[1].session_id == worker_factory.snapshots[1].session_id
     assert tuple(
-        message.content
-        for message in worker_factory.requests[1].messages
-        if isinstance(message, UserMessage)
+        message.content for message in worker_factory.requests[1].messages if isinstance(message, UserMessage)
     ) == (second_prompt,)
-    assert not any(
-        isinstance(message, AssistantMessage)
-        for message in worker_factory.requests[1].messages
+    assert not any(isinstance(message, AssistantMessage) for message in worker_factory.requests[1].messages)
+
+
+def test_unlabeled_interactive_exit_after_cancel_closes_real_current_and_sole_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fresh CLI 必须取消 current、提升 sole QUEUE 并在 exit 130 前收口 durable truth。
+
+    :param tmp_path: fresh interactive workspace root。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 真实 Host/worker/durable 生命周期任一环节不符合契约时抛出。
+    """
+
+    worker_factory = _FreshQueuedLifecycleWorkerFactory()
+    opener = _FreshQueuedLifecycleHostOpener(worker_factory)
+    sigint_monitor = _FreshQueuedLifecycleSigintMonitor(worker_factory.release_current_terminal)
+    composer = _FreshQueuedLifecycleComposer(
+        opener=opener,
+        worker_factory=worker_factory,
+        sigint_monitor=sigint_monitor,
     )
+    monkeypatch.setattr(interactive_command, "open_host", opener)
+    monkeypatch.setattr(
+        interactive_command,
+        "CliSigintMonitor",
+        lambda: sigint_monitor,
+    )
+    monkeypatch.setattr(session_execution, "new_interactive_composer", lambda: composer)
+    monkeypatch.setattr(session_execution.sys, "stdin", _ReportedTty())
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setenv("MIMO_PLAN_API_KEY", _API_KEY)
+
+    exit_code = cli_main.main(
+        (
+            "interactive",
+            "--base",
+            str(tmp_path),
+            "--no-detail",
+            "--no-thinking",
+        )
+    )
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert len(worker_factory.snapshots) == 2
+    assert len(worker_factory.requests) == 2
+    current_snapshot, queued_snapshot = worker_factory.snapshots
+    assert current_snapshot.session_id == queued_snapshot.session_id
+    assert worker_factory.current_cancel_reasons == ["cli_sigint"]
+    assert worker_factory.queued_promoted.is_set()
+    assert worker_factory.closed_run_ids == [
+        current_snapshot.run_id,
+        queued_snapshot.run_id,
+    ]
+    assert composer.observed_current_and_queue is not None
+    observed_current, observed_queue = composer.observed_current_and_queue
+    assert observed_current.run_id == current_snapshot.run_id
+    assert observed_current.status is RunStatus.RUNNING
+    assert observed_queue.run_id != current_snapshot.run_id
+    assert observed_queue.status is RunStatus.QUEUED
+    assert queued_snapshot.run_id == observed_queue.run_id
+
+    options = opener.require_opened_options()
+    non_terminal, pairs = _read_lifecycle_truth_from_store(
+        options=options,
+        session_id=current_snapshot.session_id,
+        snapshots=tuple(worker_factory.snapshots),
+    )
+    assert non_terminal == ()
+    assert [(run.status, attempt.status) for run, attempt in pairs] == [
+        (RunStatus.CANCELLED, AttemptStatus.CANCELLED),
+        (RunStatus.SUCCEEDED, AttemptStatus.SUCCEEDED),
+    ]
 
 
 def _install_recording_cli_host(
@@ -611,11 +1214,11 @@ def _run_agent_surface(
     if surface == "prompt":
         return cli_main.main(("prompt", *common_args, user_prompt))
     if surface == "interactive":
-        monkeypatch.setattr(
-            interactive_command,
-            "_read_user_input",
-            _SingleTurnInteractiveInput(user_prompt),
+        stdin = io.TextIOWrapper(
+            io.BytesIO(user_prompt.encode("utf-8")),
+            encoding="utf-8",
         )
+        monkeypatch.setattr(session_execution.sys, "stdin", stdin)
         return cli_main.main(("interactive", *common_args))
     raise ValueError(f"unsupported Agent surface: {surface}")
 

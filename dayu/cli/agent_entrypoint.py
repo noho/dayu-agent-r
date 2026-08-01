@@ -11,6 +11,7 @@ import asyncio
 import signal
 from collections.abc import Callable
 from contextlib import suppress
+from enum import Enum, auto
 from pathlib import Path
 from types import FrameType
 from typing import TypeAlias, TypeVar
@@ -25,23 +26,30 @@ CONFIG_DIR_OPTION_NAME: str = "--config"
 FALLBACK_MODE_OPTION_NAME: str = "--fallback-mode"
 FALLBACK_PROMPT_OPTION_NAME: str = "--fallback-prompt"
 _TaskResult = TypeVar("_TaskResult")
-_SignalHandler: TypeAlias = (
-    signal.Handlers | int | Callable[[int, FrameType | None], None]
-)
+_SignalHandler: TypeAlias = signal.Handlers | int | Callable[[int, FrameType | None], None]
+
+
+class _CliSigintInstallationMode(Enum):
+    """CLI SIGINT handler 的安装与恢复模式。"""
+
+    NONE = auto()
+    ASYNCIO = auto()
+    SYNCHRONOUS = auto()
 
 
 class CliSigintMonitor:
-    """CLI 异步 operation 运行阶段的 SIGINT 观察器。
+    """asyncio handler 优先、同步 handler fallback 的 SIGINT 观察器。
 
-    观察器只负责在当前 asyncio 事件循环安装和移除 ``SIGINT`` handler，
-    并把用户中断转换为可等待的本地计数。具体收到第一次或第二次中断后
-    如何取消 Host Run 或 direct operation，由调用方命令状态机决定。
+    观察器优先通过当前事件循环安装 ``SIGINT`` handler；平台不支持时，
+    同步 handler 只把通知线程安全地投递回同一事件循环。具体收到第一次
+    或第二次中断后如何取消 Host Run 或 direct operation，由调用方命令
+    状态机决定。
     """
 
     count: int
     _event: asyncio.Event
     _loop: asyncio.AbstractEventLoop | None
-    _installed: bool
+    _installation_mode: _CliSigintInstallationMode
     _previous_handler: _SignalHandler | None
 
     def __init__(self) -> None:
@@ -54,15 +62,16 @@ class CliSigintMonitor:
         self.count = 0
         self._event = asyncio.Event()
         self._loop = None
-        self._installed = False
+        self._installation_mode = _CliSigintInstallationMode.NONE
         self._previous_handler = None
 
     def install(self) -> None:
         """在当前事件循环安装 SIGINT handler。
 
         :returns: ``None``。
-        :raises RuntimeError: 当前进程的既有 SIGINT handler 无法读取时抛出；
-            不支持 loop signal handler 时保留既有 ``KeyboardInterrupt`` 行为。
+        :raises RuntimeError: 当前进程的既有 SIGINT handler 无法读取时抛出。
+        :raises OSError: 同步 fallback handler 安装失败时抛出。
+        :raises ValueError: 当前线程不允许安装同步 signal handler 时抛出。
         """
 
         loop = asyncio.get_running_loop()
@@ -72,11 +81,18 @@ class CliSigintMonitor:
         try:
             loop.add_signal_handler(signal.SIGINT, self.notify)
         except (NotImplementedError, RuntimeError):
-            self._installed = False
-            self._loop = None
-            self._previous_handler = None
+            self._installation_mode = _CliSigintInstallationMode.SYNCHRONOUS
+            self._loop = loop
+            self._previous_handler = previous_handler
+            try:
+                signal.signal(signal.SIGINT, self._notify_from_synchronous_handler)
+            except BaseException:
+                self._installation_mode = _CliSigintInstallationMode.NONE
+                self._loop = None
+                self._previous_handler = None
+                raise
             return
-        self._installed = True
+        self._installation_mode = _CliSigintInstallationMode.ASYNCIO
         self._loop = loop
         self._previous_handler = previous_handler
 
@@ -86,16 +102,19 @@ class CliSigintMonitor:
         :returns: ``None``。
         :raises OSError: 底层 SIGINT handler 恢复失败时抛出。
         :raises ValueError: 当前线程不允许恢复 signal handler 时抛出。
+        :raises RuntimeError: 已安装模式缺少对应恢复状态时抛出。
         """
 
-        if (
-            self._installed
-            and self._loop is not None
-            and self._previous_handler is not None
-        ):
+        if self._installation_mode is _CliSigintInstallationMode.ASYNCIO:
+            if self._loop is None or self._previous_handler is None:
+                raise RuntimeError("asyncio SIGINT installation state is incomplete")
             self._loop.remove_signal_handler(signal.SIGINT)
             signal.signal(signal.SIGINT, self._previous_handler)
-        self._installed = False
+        elif self._installation_mode is _CliSigintInstallationMode.SYNCHRONOUS:
+            if self._loop is None or self._previous_handler is None:
+                raise RuntimeError("synchronous SIGINT installation state is incomplete")
+            signal.signal(signal.SIGINT, self._previous_handler)
+        self._installation_mode = _CliSigintInstallationMode.NONE
         self._loop = None
         self._previous_handler = None
 
@@ -114,6 +133,24 @@ class CliSigintMonitor:
 
         self.count += 1
         self._event.set()
+
+    def _notify_from_synchronous_handler(
+        self,
+        _signal_number: int,
+        _frame: FrameType | None,
+    ) -> None:
+        """把同步 Python signal handler 通知投递回已捕获事件循环。
+
+        :param _signal_number: ``signal.signal`` 传入的 SIGINT 编号。
+        :param _frame: ``signal.signal`` 传入的当前栈帧。
+        :returns: ``None``。
+        :raises RuntimeError: 同步安装状态缺少事件循环时抛出。
+        """
+
+        loop = self._loop
+        if self._installation_mode is not _CliSigintInstallationMode.SYNCHRONOUS or loop is None:
+            raise RuntimeError("synchronous SIGINT installation state is incomplete")
+        loop.call_soon_threadsafe(self.notify)
 
     async def wait_next(self, observed_count: int) -> int:
         """等待下一次 SIGINT。
@@ -190,13 +227,9 @@ def resolve_explicit_config_dir(
     try:
         resolved.relative_to(workspace_root)
     except ValueError as exc:
-        raise error_factory(
-            f"{CONFIG_DIR_OPTION_NAME} must stay inside workspace root: {resolved}"
-        ) from exc
+        raise error_factory(f"{CONFIG_DIR_OPTION_NAME} must stay inside workspace root: {resolved}") from exc
     if not resolved.is_dir():
-        raise error_factory(
-            f"{CONFIG_DIR_OPTION_NAME} is not a directory: {resolved}"
-        )
+        raise error_factory(f"{CONFIG_DIR_OPTION_NAME} is not a directory: {resolved}")
     return resolved
 
 
@@ -273,9 +306,7 @@ def service_run_overrides_from_args(
                 field_name=FALLBACK_PROMPT_OPTION_NAME,
                 error_factory=error_factory,
             ),
-            max_consecutive_failed_tool_batches=(
-                args.max_consecutive_failed_tool_batches
-            ),
+            max_consecutive_failed_tool_batches=(args.max_consecutive_failed_tool_batches),
         )
     except ValueError as exc:
         raise error_factory(str(exc)) from exc

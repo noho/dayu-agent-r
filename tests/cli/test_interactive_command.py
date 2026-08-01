@@ -4,23 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import io
+import signal
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from types import TracebackType
-from typing import cast
+from types import FrameType, TracebackType
+from typing import TypeAlias, cast
 
 import pytest
 
+import dayu.cli.agent_entrypoint as agent_entrypoint
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
-from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.composer import (
+    InteractiveCancelSource,
+    InteractiveComposerEvent,
+    InteractiveComposerEventKind,
+    InteractiveComposerPhase,
+)
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
-from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
@@ -92,6 +97,7 @@ _CURRENT_TIME_TEXT = (
     "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
     "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
 )
+_TestSignalHandler: TypeAlias = signal.Handlers | int | Callable[[int, FrameType | None], None]
 _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
     ("--debug-sse",),
     ("--debug-tool-delta",),
@@ -143,6 +149,7 @@ class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
+    cancelled_count: int
     _items: tuple[HostSessionEvent, ...]
     _item_index: int
     _changed: asyncio.Event
@@ -156,6 +163,7 @@ class _FakeHostEventIterator:
         """
 
         self.closed_count = 0
+        self.cancelled_count = 0
         self._items = ()
         self._item_index = 0
         self._changed = asyncio.Event()
@@ -181,7 +189,11 @@ class _FakeHostEventIterator:
             if self._closed:
                 raise StopAsyncIteration
             self._changed.clear()
-            await self._changed.wait()
+            try:
+                await self._changed.wait()
+            except asyncio.CancelledError:
+                self.cancelled_count += 1
+                raise
         item = self._items[self._item_index]
         self._item_index += 1
         return item
@@ -465,23 +477,121 @@ class _FakeHost:
         return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
 
 
-class _DurablyAcceptedDelayedResponseHost(_FakeHost):
-    """模拟 interactive Run 已 durable accepted、但 submit response 延迟的 Host。"""
+class _ControlledInteractiveHost(_FakeHost):
+    """为 current/queued/cancel terminal race 提供显式 barrier 的 Host fake。"""
 
-    committed: asyncio.Event
-    release_response: asyncio.Event
+    submit_accepted: asyncio.Event
+    cancel_started: asyncio.Event
+    release_cancel_terminal: asyncio.Event
+    cancel_waiter_cancelled: bool
+    _run_watchers: dict[str, _FakeHostEventIterator]
 
     def __init__(self) -> None:
-        """初始化 durable acceptance 与 response barrier。
+        """初始化可控 acceptance、cancel 与 terminal barriers。
 
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
-        super().__init__(
-            cancel_status=HostTerminalStatus.CANCELLED,
-            run_statuses=(RunStatus.RUNNING,),
+        super().__init__(run_statuses=(RunStatus.RUNNING,))
+        self.submit_accepted = asyncio.Event()
+        self.cancel_started = asyncio.Event()
+        self.release_cancel_terminal = asyncio.Event()
+        self.cancel_waiter_cancelled = False
+        self._run_watchers = {}
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """接受 current/queued Run，并把对应 submit watcher 绑定到 Run id。
+
+        :param session_id: 目标 Session id。
+        :param request: Host submit request。
+        :returns: accepted current 或 queued snapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append(request)
+        self._submit_index += 1
+        run_id = f"run-{self._submit_index}"
+        self._run_watchers[run_id] = self.watchers[-1]
+        self.submit_accepted.set()
+        return FollowupSnapshot(
+            accepted_input_ref=f"input-{self._submit_index}",
+            behavior=FollowupBehavior.QUEUE,
+            accepted_run_id=run_id,
+            accepted_run_status=(RunStatus.RUNNING if self._submit_index == 1 else RunStatus.QUEUED),
+            command_watermark=HostStreamCursor(event_sequence=self._submit_index),
+            queued_run_id=None if self._submit_index == 1 else run_id,
+            target_run_id=None,
         )
+
+    async def cancel_run(
+        self,
+        run_id: str,
+        request: CancelRunRequest,
+    ) -> RunSnapshot:
+        """记录 single cancel，并在 barrier 释放后同时通知两个 canonical waiter。
+
+        :param run_id: 待取消 Run id。
+        :param request: Host cancel request。
+        :returns: cancelling Run snapshot。
+        :raises asyncio.CancelledError: cancel canonical waiter 被错误取消时透传。
+        """
+
+        self.calls.append(f"cancel:{run_id}")
+        self.cancel_requests.append(request)
+        cancel_watcher = self.watchers[-1]
+        self.cancel_started.set()
+        try:
+            await self.release_cancel_terminal.wait()
+        except asyncio.CancelledError:
+            self.cancel_waiter_cancelled = True
+            raise
+        terminal = _terminal_event(
+            run_id=run_id,
+            status=HostTerminalStatus.CANCELLED,
+        )
+        await self._run_watchers[run_id].push(terminal)
+        await cancel_watcher.push(terminal)
+        await asyncio.sleep(0)
+        return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
+
+    async def finish_run(
+        self,
+        run_id: str,
+        *,
+        status: HostTerminalStatus = HostTerminalStatus.SUCCEEDED,
+    ) -> None:
+        """向指定 submit canonical waiter 发布 terminal。
+
+        :param run_id: 待完成 Run id。
+        :param status: terminal status。
+        :returns: ``None``。
+        :raises KeyError: Run 尚未 accepted 时抛出。
+        """
+
+        await self._run_watchers[run_id].push(_terminal_event(run_id=run_id, status=status))
+        await asyncio.sleep(0)
+
+
+class _DelayedAcceptanceControlledHost(_ControlledInteractiveHost):
+    """把第一轮 durable acceptance 与 public submit response 分离。"""
+
+    committed: asyncio.Event
+    release_response: asyncio.Event
+
+    def __init__(self) -> None:
+        """初始化第一轮 acceptance response barrier。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
         self.committed = asyncio.Event()
         self.release_response = asyncio.Event()
 
@@ -490,27 +600,77 @@ class _DurablyAcceptedDelayedResponseHost(_FakeHost):
         session_id: str,
         request: SubmitFollowupRequest,
     ) -> FollowupSnapshot:
-        """记录 durable acceptance，并等待测试释放 public response。
+        """先记录 durable acceptance，再等待测试释放 response。
 
         :param session_id: 目标 Session id。
-        :param request: SubmitFollowupRequest。
-        :returns: accepted Run 的 FollowupSnapshot。
-        :raises asyncio.CancelledError: response barrier 被取消时透传。
+        :param request: Host submit request。
+        :returns: accepted snapshot。
+        :raises asyncio.CancelledError: acceptance barrier 语义回归时透传。
         """
 
-        self.calls.append(f"submit:{session_id}")
-        self.submit_requests.append(request)
+        snapshot = await super().submit_followup(session_id, request)
         self.committed.set()
         await self.release_response.wait()
-        return FollowupSnapshot(
-            accepted_input_ref="input-1",
-            behavior=FollowupBehavior.QUEUE,
-            accepted_run_id="run-1",
-            accepted_run_status=RunStatus.RUNNING,
-            command_watermark=HostStreamCursor(event_sequence=1),
-            queued_run_id=None,
-            target_run_id=None,
-        )
+        return snapshot
+
+
+class _DelayedQueuedResponseHost(_ControlledInteractiveHost):
+    """只延迟 sole queued submit 的 public acceptance response。"""
+
+    queued_committed: asyncio.Event
+    release_queued_response: asyncio.Event
+
+    def __init__(self) -> None:
+        """初始化 queued acceptance response barrier。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.queued_committed = asyncio.Event()
+        self.release_queued_response = asyncio.Event()
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """第二轮先 durable accept，再延迟 public response。
+
+        :param session_id: 目标 Session id。
+        :param request: Host submit request。
+        :returns: accepted snapshot。
+        :raises asyncio.CancelledError: queued task 被错误取消时透传。
+        """
+
+        snapshot = await super().submit_followup(session_id, request)
+        if len(self.submit_requests) == 2:
+            self.queued_committed.set()
+            await self.release_queued_response.wait()
+        return snapshot
+
+
+class _FailingCancelControlledHost(_ControlledInteractiveHost):
+    """让 Host cancel waiter 在 submit terminal 前失败的可控 fake。"""
+
+    async def cancel_run(
+        self,
+        run_id: str,
+        request: CancelRunRequest,
+    ) -> RunSnapshot:
+        """记录 single cancel 后立即抛出稳定 Host cancel failure。
+
+        :param run_id: 待取消 Run id。
+        :param request: Host cancel request。
+        :returns: 正常路径不会返回。
+        :raises RuntimeError: 始终抛出，用于验证 cancel-error owner。
+        """
+
+        self.calls.append(f"cancel:{run_id}")
+        self.cancel_requests.append(request)
+        self.cancel_started.set()
+        raise RuntimeError("cancel waiter failed")
 
 
 class _FakeOpenHostContext:
@@ -555,63 +715,38 @@ class _FakeOpenHostContext:
         return None
 
 
-class _InputReader:
-    """测试用输入读取器。"""
-
-    _remaining: list[str]
-
-    def __init__(self, values: tuple[str, ...]) -> None:
-        """初始化输入读取器。
-
-        :param values: 依次返回的输入文本。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self._remaining = list(values)
-
-    def __call__(self, _prompt: str) -> str:
-        """读取下一条测试输入。
-
-        :param _prompt: 输入提示文本。
-        :returns: 下一条用户输入。
-        :raises EOFError: 输入耗尽时抛出。
-        """
-
-        if not self._remaining:
-            raise EOFError
-        return self._remaining.pop(0)
-
-
-class _KeyboardInterruptInputReader:
-    """测试用输入态 Ctrl-C 读取器。"""
-
-    def __call__(self, _prompt: str) -> str:
-        """模拟输入态 Ctrl-C。
-
-        :param _prompt: 输入提示文本。
-        :returns: 正常路径不会返回。
-        :raises KeyboardInterrupt: 始终抛出，用于固定输入态 Ctrl-C 语义。
-        """
-
-        raise KeyboardInterrupt
-
-
-@dataclass(frozen=True, slots=True)
 class _ComposerReadInterrupt:
     """测试 composer 读取异常步骤。"""
 
     exception_type: type[BaseException]
 
+    def __init__(self, exception_type: type[BaseException]) -> None:
+        """初始化兼容旧输入脚本语义的 typed event 步骤。
 
-_ComposerReadStep = str | _ComposerReadInterrupt
+        :param exception_type: 待投影为 typed composer event 的异常类型。
+        :returns: ``None``。
+        :raises ValueError: 异常类型不是 ``KeyboardInterrupt`` 或 ``EOFError`` 时抛出。
+        """
+
+        if exception_type not in {KeyboardInterrupt, EOFError}:
+            raise ValueError("unsupported scripted composer interrupt type")
+        self.exception_type = exception_type
+
+
+_ComposerReadStep = str | _ComposerReadInterrupt | InteractiveComposerEvent
 
 
 class _ScriptedComposer:
-    """按脚本返回输入或抛出异常的测试 composer。"""
+    """按脚本返回 typed event 的测试 composer。"""
 
     prompt_calls: list[str]
+    phase_calls: list[InteractiveComposerPhase]
+    accepted_history_flags: list[bool]
     _remaining: list[_ComposerReadStep]
+    _pending_submit: bool
+    _revision: int
+    _phase: InteractiveComposerPhase
+    _phase_changed: asyncio.Event
 
     def __init__(self, steps: tuple[_ComposerReadStep, ...]) -> None:
         """初始化 scripted composer。
@@ -622,47 +757,295 @@ class _ScriptedComposer:
         """
 
         self.prompt_calls = []
+        self.phase_calls = []
+        self.accepted_history_flags = []
         self._remaining = list(steps)
+        self._pending_submit = False
+        self._revision = 0
+        self._phase = InteractiveComposerPhase.IDLE
+        self._phase_changed = asyncio.Event()
 
-    async def read(self, prompt: str) -> str:
-        """读取下一条脚本输入。
+    def set_phase(self, phase: InteractiveComposerPhase) -> None:
+        """记录 REPL phase 更新。
+
+        :param phase: 新 composer phase。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.phase_calls.append(phase)
+        self._phase = phase
+        self._phase_changed.set()
+
+    def accept_submit(self, *, record_history: bool) -> None:
+        """确认上一份 scripted submit。
+
+        :param record_history: REPL 是否要求记录 history。
+        :returns: ``None``。
+        :raises RuntimeError: 没有 pending submit 时抛出。
+        """
+
+        if not self._pending_submit:
+            raise RuntimeError("scripted composer has no pending submit")
+        self._pending_submit = False
+        self.accepted_history_flags.append(record_history)
+
+    async def read_event(self, prompt: str) -> InteractiveComposerEvent:
+        """读取下一条 scripted typed event。
 
         :param prompt: 输入提示文本。
-        :returns: 脚本中的输入文本。
-        :raises EOFError: 脚本耗尽或脚本要求 EOF 时抛出。
-        :raises KeyboardInterrupt: 脚本要求输入态中断时抛出。
+        :returns: 脚本中的 typed event。
+        :raises Exception: 不主动抛出异常。
         """
 
         self.prompt_calls.append(prompt)
         if not self._remaining:
-            raise EOFError
+            while self._phase is not InteractiveComposerPhase.IDLE:
+                self._phase_changed.clear()
+                await self._phase_changed.wait()
+            return InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.EOF,
+                input_revision=self._revision,
+            )
         step = self._remaining.pop(0)
         if isinstance(step, str):
+            self._revision += 1
+            self._pending_submit = True
+            return InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.SUBMIT,
+                draft=step,
+                input_revision=self._revision,
+            )
+        if isinstance(step, InteractiveComposerEvent):
+            self._pending_submit = step.kind is InteractiveComposerEventKind.SUBMIT
             return step
-        raise step.exception_type()
+        if step.exception_type is EOFError:
+            return InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.EOF,
+                input_revision=self._revision,
+            )
+        if step.exception_type is KeyboardInterrupt:
+            return InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
+                input_revision=self._revision,
+            )
+        raise AssertionError(f"unsupported composer interrupt: {step.exception_type}")
 
 
-class _AutoSigintMonitor(CliSigintMonitor):
-    """测试用一次 SIGINT monitor。"""
+class _BarrierScriptedComposer(_ScriptedComposer):
+    """在指定 read call 前提供 terminal/Enter 顺序 barrier。"""
 
-    def install(self) -> None:
-        """测试中不安装真实 OS signal handler。"""
+    blocked_call_index: int
+    read_entered: asyncio.Event
+    release_read: asyncio.Event
 
-        return
+    def __init__(
+        self,
+        steps: tuple[_ComposerReadStep, ...],
+        *,
+        blocked_call_index: int,
+    ) -> None:
+        """初始化 composer read barrier。
 
-    def close(self) -> None:
-        """测试中无需恢复 OS signal handler。"""
+        :param steps: scripted event 序列。
+        :param blocked_call_index: 从一开始计数的阻塞 read 调用序号。
+        :returns: ``None``。
+        :raises ValueError: 阻塞序号小于一时抛出。
+        """
 
-        return
+        if blocked_call_index < 1:
+            raise ValueError("blocked_call_index must be positive")
+        super().__init__(steps)
+        self.blocked_call_index = blocked_call_index
+        self.read_entered = asyncio.Event()
+        self.release_read = asyncio.Event()
 
-    async def wait_next(self, observed_count: int) -> int:
-        """等待 submit callback 记录 run id 后触发一次 SIGINT。"""
+    async def read_event(self, prompt: str) -> InteractiveComposerEvent:
+        """在指定调用先等待显式 release，再返回 scripted event。
 
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        if self.count <= observed_count:
-            self.notify()
-        return self.count
+        :param prompt: 输入提示文本。
+        :returns: scripted typed event。
+        :raises Exception: parent composer 失败时向上透传。
+        """
+
+        call_index = len(self.prompt_calls) + 1
+        if call_index == self.blocked_call_index:
+            self.read_entered.set()
+            await self.release_read.wait()
+        return await super().read_event(prompt)
+
+
+class _IdleSequencedComposer(_ScriptedComposer):
+    """仅在 IDLE phase 投递下一份 submit 的测试 composer。"""
+
+    async def read_event(self, prompt: str) -> InteractiveComposerEvent:
+        """等待 IDLE 后读取下一条 scripted event。
+
+        :param prompt: 输入提示文本。
+        :returns: parent composer 产生的 typed event。
+        :raises Exception: parent composer 失败时向上透传。
+        """
+
+        while self._phase is not InteractiveComposerPhase.IDLE:
+            self._phase_changed.clear()
+            await self._phase_changed.wait()
+        return await super().read_event(prompt)
+
+
+class _ReportedTty(io.StringIO):
+    """只用于强制 execute 进入显式 composer TTY path 的文本流。"""
+
+    def isatty(self) -> bool:
+        """报告 TTY capability。
+
+        :returns: 恒为 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+
+def _install_cli_tty_composer(
+    monkeypatch: pytest.MonkeyPatch,
+    steps: tuple[_ComposerReadStep, ...],
+) -> _ScriptedComposer:
+    """让真实 CLI main 走显式 typed composer TTY path。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param steps: scripted composer event/input 序列。
+    :returns: 安装到 session execution 的 composer。
+    :raises Exception: monkeypatch 设置失败时向上透传。
+    """
+
+    composer = _ScriptedComposer(steps)
+    monkeypatch.setattr(session_execution.sys, "stdin", _ReportedTty())
+    monkeypatch.setattr(
+        session_execution,
+        "new_interactive_composer",
+        lambda: composer,
+    )
+    return composer
+
+
+def _install_cli_pipe_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    data: bytes,
+) -> io.TextIOWrapper:
+    """安装带显式 ``buffer`` 的真实 non-TTY stdin。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param data: whole stdin 原始 bytes。
+    :returns: 安装后的 TextIOWrapper，供测试保持生命周期。
+    :raises Exception: stream 构造或 monkeypatch 失败时向上透传。
+    """
+
+    stream = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8")
+    monkeypatch.setattr(session_execution.sys, "stdin", stream)
+    return stream
+
+
+class _SyncSigintFallbackHarness:
+    """模拟不支持 asyncio signal API 的同步 signal owner。"""
+
+    current_handler: _TestSignalHandler
+    installed: asyncio.Event
+    signal_calls: list[_TestSignalHandler]
+
+    def __init__(self) -> None:
+        """初始化 previous handler 与调用记录。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.current_handler = signal.SIG_IGN
+        self.installed = asyncio.Event()
+        self.signal_calls = []
+
+    def getsignal(self, _signal_number: int) -> _TestSignalHandler:
+        """返回当前测试 handler。
+
+        :param _signal_number: 待读取的 signal 编号。
+        :returns: 当前测试 handler。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.current_handler
+
+    def set_signal_handler(
+        self,
+        _signal_number: int,
+        handler: _TestSignalHandler,
+    ) -> _TestSignalHandler:
+        """记录同步安装或恢复，并更新当前 handler。
+
+        :param _signal_number: 待设置的 signal 编号。
+        :param handler: 新 handler。
+        :returns: 被替换的 previous handler。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        previous = self.current_handler
+        self.current_handler = handler
+        self.signal_calls.append(handler)
+        if callable(handler):
+            self.installed.set()
+        return previous
+
+    def reject_asyncio_handler(
+        self,
+        _signal_number: int,
+        _callback: Callable[[], None],
+    ) -> None:
+        """模拟事件循环不支持 ``add_signal_handler``。
+
+        :param _signal_number: 待设置的 signal 编号。
+        :param _callback: asyncio handler callback。
+        :returns: 正常路径不返回。
+        :raises NotImplementedError: 始终抛出以进入同步 fallback。
+        """
+
+        raise NotImplementedError("asyncio signal handlers are unavailable")
+
+    def reject_asyncio_remove(self, _signal_number: int) -> bool:
+        """拒绝 fallback close 错误调用 asyncio remove API。
+
+        :param _signal_number: 待移除的 signal 编号。
+        :returns: 正常路径不返回。
+        :raises AssertionError: 始终抛出以证明恢复模式同源。
+        """
+
+        raise AssertionError("synchronous fallback must not call remove_signal_handler")
+
+    def installed_handler(self) -> Callable[[int, FrameType | None], None]:
+        """返回 monitor 安装的同步 callable handler。
+
+        :returns: 已安装的同步 handler。
+        :raises AssertionError: 当前 handler 不是 callable 时抛出。
+        """
+
+        if not callable(self.current_handler):
+            raise AssertionError("synchronous SIGINT handler was not installed")
+        return self.current_handler
+
+
+def _install_sync_sigint_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _SyncSigintFallbackHarness:
+    """安装不支持 asyncio signal API 的确定性测试环境。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: 可触发与检查同步 handler 的 harness。
+    :raises Exception: monkeypatch 失败时向上透传。
+    """
+
+    harness = _SyncSigintFallbackHarness()
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(signal, "getsignal", harness.getsignal)
+    monkeypatch.setattr(signal, "signal", harness.set_signal_handler)
+    monkeypatch.setattr(loop, "add_signal_handler", harness.reject_asyncio_handler)
+    monkeypatch.setattr(loop, "remove_signal_handler", harness.reject_asyncio_remove)
+    return harness
 
 
 class _NoopSigintMonitor(CliSigintMonitor):
@@ -698,172 +1081,32 @@ class _NoopSigintMonitor(CliSigintMonitor):
         return observed_count
 
 
-class _FakeRunningKeyMonitor:
-    """测试用运行态按键 monitor。"""
+class _ManualSigintMonitor(CliSigintMonitor):
+    """测试可逐次触发并观察消费进度的 OS SIGINT monitor。"""
 
-    started_count: int
-    closed_count: int
-    _actions: tuple[RunningKeyAction, ...]
-    _action_index: int
-    _closed_event: asyncio.Event
-    _delay_ticks: int
+    observed_counts: list[int]
 
-    def __init__(
-        self,
-        actions: tuple[RunningKeyAction, ...],
-        *,
-        delay_ticks: int = 0,
-    ) -> None:
-        """初始化 fake monitor。
+    def __init__(self) -> None:
+        """初始化手动 SIGINT 计数与消费记录。
 
-        :param actions: 依次返回的运行态按键动作。
-        :param delay_ticks: 返回每个动作前等待的 event loop tick 数。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.started_count = 0
-        self.closed_count = 0
-        self._actions = actions
-        self._action_index = 0
-        self._closed_event = asyncio.Event()
-        self._delay_ticks = delay_ticks
-
-    def start(self) -> None:
-        """记录 monitor 启动。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.started_count += 1
-
-    async def wait_next(self) -> RunningKeyAction:
-        """返回下一条预设按键动作。
-
-        :returns: 运行态按键动作。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
-        """
-
-        for _tick_index in range(self._delay_ticks):
-            await asyncio.sleep(0)
-        if self._action_index < len(self._actions):
-            action = self._actions[self._action_index]
-            self._action_index += 1
-            return action
-        await self._closed_event.wait()
-        raise asyncio.CancelledError
-
-    def close(self) -> None:
-        """记录 monitor 关闭。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.closed_count += 1
-        self._closed_event.set()
-
-
-class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
-    """测试用第二次 SIGINT monitor。"""
-
-    host: _FakeHost
-
-    def __init__(self, host: _FakeHost) -> None:
-        """初始化 monitor。
-
-        :param host: fake Host。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         super().__init__()
-        self.host = host
-
-    def install(self) -> None:
-        """测试中不安装真实 OS signal handler。"""
-
-        return
-
-    def close(self) -> None:
-        """测试中无需恢复 OS signal handler。"""
-
-        return
+        self.observed_counts = []
 
     async def wait_next(self, observed_count: int) -> int:
-        """第一次立即触发，第二次等 cancel 请求已记录后触发。
+        """等待下一次手动通知并记录 driver 已消费的新计数。
 
-        :param observed_count: 已观察到的 SIGINT 计数。
+        :param observed_count: driver 已观察的 SIGINT 计数。
         :returns: 新的 SIGINT 计数。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        :raises asyncio.CancelledError: driver cleanup 取消等待时透传。
         """
 
-        if observed_count == 0:
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            self.notify()
-            return self.count
-        while not self.host.cancel_requests:
-            await asyncio.sleep(0)
-        self.notify()
-        return self.count
-
-
-class _TwoSigintsBeforeSubmitResponseMonitor(CliSigintMonitor):
-    """在 durable acceptance 后、submit response 前连续触发两次 SIGINT。"""
-
-    host: _DurablyAcceptedDelayedResponseHost
-    closed_count: int
-
-    def __init__(self, host: _DurablyAcceptedDelayedResponseHost) -> None:
-        """保存 response barrier Host。
-
-        :param host: 提供 commit/response barrier 的 fake Host。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        super().__init__()
-        self.host = host
-        self.closed_count = 0
-
-    def install(self) -> None:
-        """测试中不安装真实 OS signal handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return
-
-    def close(self) -> None:
-        """记录 interactive turn 已关闭 monitor。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.closed_count += 1
-
-    async def wait_next(self, observed_count: int) -> int:
-        """依次触发两次 SIGINT，第二次同时释放 submit response。
-
-        :param observed_count: 调用方已经观察的 SIGINT 计数。
-        :returns: 第一次或第二次 SIGINT 后的新计数；后续调用保持等待。
-        :raises asyncio.CancelledError: 第三次等待由 lifecycle cleanup 取消时透传。
-        """
-
-        if observed_count == 0:
-            await self.host.committed.wait()
-            self.notify()
-            return self.count
-        if observed_count == 1:
-            self.notify()
-            self.host.release_response.set()
-            return self.count
-        await asyncio.Event().wait()
-        return observed_count
+        new_count = await super().wait_next(observed_count)
+        self.observed_counts.append(new_count)
+        return new_count
 
 
 def test_interactive_label_targets_shared_agent_slot_and_default_context(
@@ -897,11 +1140,7 @@ def test_interactive_label_targets_shared_agent_slot_and_default_context(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("请总结收入变化",)),
-    )
+    _install_cli_tty_composer(monkeypatch, ("请总结收入变化",))
 
     exit_code = cli_main.main(
         (
@@ -925,13 +1164,151 @@ def test_interactive_label_targets_shared_agent_slot_and_default_context(
         _FINS_DEFAULT_SUBJECT_SLOT,
         _CURRENT_TIME_SLOT,
     )
-    assert (
-        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] == ""
-    )
+    assert captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] == ""
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
     assert fake_host.ensure_requests[0].scope == "cli.agent"
     assert fake_host.ensure_requests[0].slot_key == "cli.agent.earnings"
     assert fake_host.create_requests == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_prompt"),
+    (
+        (b"", None),
+        (b" \t\r\n", None),
+        (b"single line\n", "single line"),
+        ("第一行\n第二行".encode(), "第一行\n第二行"),
+        (b" first\r\nsecond\r\n ", "first\nsecond"),
+        (b"first\rsecond", "first\nsecond"),
+        (b"no-final-newline", "no-final-newline"),
+        (b"left\x04right", "left\x04right"),
+    ),
+)
+def test_interactive_non_tty_reads_whole_stdin_as_zero_or_one_batch(
+    raw: bytes,
+    expected_prompt: str | None,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pipe matrix 必须只产生零或一个 QUEUE Run 且从不输出 prompt。
+
+    :param raw: whole stdin 原始 bytes。
+    :param expected_prompt: outer trim/换行规范化后的预期输入。
+    :param tmp_path: pytest 临时 workspace。
+    :param capsys: pytest 输出捕获。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: batch 数量、文本或输出通道不符合契约时抛出。
+    """
+
+    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
+    stdin_stream = _install_cli_pipe_stdin(monkeypatch, raw)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+    stdin_stream.detach()
+
+    assert exit_code == EXIT_SUCCESS
+    assert "dayu> " not in captured.out
+    assert "dayu> " not in captured.err
+    if expected_prompt is None:
+        assert fake_host.submit_requests == []
+        assert captured.out == ""
+    else:
+        assert len(fake_host.submit_requests) == 1
+        request = fake_host.submit_requests[0]
+        assert request.user_prompt == expected_prompt
+        assert request.behavior is FollowupBehavior.QUEUE
+        assert request.target_run_id is None
+        assert captured.out.strip() == "answer for run-1"
+
+
+def test_interactive_non_tty_invalid_utf8_is_stable_and_redacted(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """invalid UTF-8 必须返回稳定用法错误且不泄漏 bytes/codec/traceback。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param capsys: pytest 输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 错误不稳定或泄漏输入 payload 时抛出。
+    """
+
+    fake_host = _FakeHost()
+    stdin_stream = _install_cli_pipe_stdin(monkeypatch, b"secret\xffpayload")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+    stdin_stream.detach()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "interactive stdin is not valid UTF-8" in captured.err
+    assert "secret" not in captured.err
+    assert "payload" not in captured.err
+    assert "UnicodeDecodeError" not in captured.err
+    assert "Traceback" not in captured.err
+    assert fake_host.submit_requests == []
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    (
+        (HostTerminalStatus.FAILED, EXIT_SUCCESS),
+        (HostTerminalStatus.CANCELLED, EXIT_SUCCESS),
+        (HostTerminalStatus.LOST, EXIT_FAILURE),
+    ),
+)
+def test_interactive_non_tty_exits_after_first_terminal(
+    terminal_status: HostTerminalStatus,
+    expected_exit_code: int,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """non-TTY 任意 terminal 都必须在唯一 Run 后结束进程。
+
+    :param terminal_status: 唯一 Run 的 terminal status。
+    :param expected_exit_code: frozen terminal renderer 退出码。
+    :param tmp_path: pytest 临时 workspace。
+    :param capsys: pytest 输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: terminal 后仍读下一 batch 或启动第二 Run 时抛出。
+    """
+
+    fake_host = _FakeHost(submit_statuses=(terminal_status,))
+    stdin_stream = _install_cli_pipe_stdin(monkeypatch, b"only batch")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+    stdin_stream.detach()
+
+    assert exit_code == expected_exit_code
+    assert len(fake_host.submit_requests) == 1
+    assert "dayu> " not in captured.out
+    assert "dayu> " not in captured.err
 
 
 @pytest.mark.asyncio
@@ -984,7 +1361,7 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
-        input_reader=_input_reader(("第一轮", "第二轮")),
+        composer=_ScriptedComposer(("第一轮", "第二轮")),
         sigint_monitor_factory=_NoopSigintMonitor,
     )
     captured = capsys.readouterr()
@@ -1074,19 +1451,6 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
             seen_terminal_event_ids=frozenset({"terminal-startup"}),
         )
 
-    def input_reader(prompt: str) -> str:
-        """记录输入读取顺序。
-
-        :param prompt: 输入提示文本。
-        :returns: 第一轮用户输入。
-        :raises EOFError: 第二次读取时表示输入结束。
-        """
-
-        events.append(f"input:{prompt}")
-        if events.count(f"input:{prompt}") > 1:
-            raise EOFError
-        return "第一轮"
-
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.setattr(
         session_execution,
@@ -1094,11 +1458,12 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
         fake_startup_reconnect,
     )
 
+    composer = _ScriptedComposer(("第一轮",))
     exit_code = await session_execution.execute_interactive_on_session(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
-        input_reader=input_reader,
+        composer=composer,
         sigint_monitor_factory=_NoopSigintMonitor,
     )
 
@@ -1107,12 +1472,105 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
         session_id="session-existing",
     )
     assert exit_code == EXIT_SUCCESS
-    assert events[:2] == ["startup:session-existing", "input:dayu> "]
+    assert events == ["startup:session-existing"]
+    assert composer.prompt_calls == ["dayu> ", "dayu> "]
     assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=5)
     assert cursor_record.seen_terminal_event_ids == (
         "terminal-startup",
         "terminal-run-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_interactive_startup_single_sigint_cleans_up_and_returns_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """startup 一次 OS SIGINT 必须 cleanup、exit 130 且不创建 Run。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: observation/attachment 未收口或创建 Run 时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await session_execution.prepare_interactive_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
+    )
+    fake_host = _FakeHost()
+    startup_cancelled = asyncio.Event()
+    fallback = _install_sync_sigint_fallback(monkeypatch)
+    monitor = CliSigintMonitor()
+
+    async def blocking_startup(
+        *,
+        host: Host,
+        prepared: session_execution.PreparedInteractiveSessionExecution,
+        session_id: str,
+    ) -> int:
+        """阻塞 startup 直到 invocation SIGINT 取消本地 observation。
+
+        :param host: fake Host。
+        :param prepared: interactive prepare result。
+        :param session_id: startup Session id。
+        :returns: 正常路径不会返回。
+        :raises asyncio.CancelledError: startup task 被安全取消时透传。
+        """
+
+        del host, prepared, session_id
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            startup_cancelled.set()
+            raise
+        raise AssertionError("startup should be cancelled")
+
+    monkeypatch.setattr(
+        session_execution,
+        "_run_existing_session_startup_reconnect",
+        blocking_startup,
+    )
+
+    execution_task = asyncio.create_task(
+        session_execution.execute_interactive_on_session(
+            host=cast(Host, fake_host),
+            prepared=prepared,
+            session_id="session-existing",
+            composer=_ScriptedComposer(()),
+            sigint_monitor_factory=lambda: monitor,
+        )
+    )
+    await asyncio.wait_for(fallback.installed.wait(), timeout=2.0)
+    fallback.installed_handler()(signal.SIGINT, None)
+    exit_code = await asyncio.wait_for(execution_task, timeout=2.0)
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert monitor.count == 1
+    assert len(fallback.signal_calls) == 2
+    assert callable(fallback.signal_calls[0])
+    assert fallback.signal_calls[1] is signal.SIG_IGN
+    assert fallback.current_handler is signal.SIG_IGN
+    assert startup_cancelled.is_set()
+    assert fake_host.submit_requests == []
+    assert fake_host.cancel_requests == []
+    assert [attachment.close_count for attachment in fake_host.attachments] == [1]
 
 
 @pytest.mark.asyncio
@@ -1196,7 +1654,7 @@ async def test_interactive_startup_reconnect_advances_terminal_cursor_after_rend
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
-        input_reader=_input_reader(()),
+        composer=_ScriptedComposer(()),
         sigint_monitor_factory=_NoopSigintMonitor,
     )
 
@@ -1284,7 +1742,7 @@ async def test_interactive_startup_cursor_write_failure_propagates_after_termina
             host=cast(Host, fake_host),
             prepared=prepared,
             session_id="session-existing",
-            input_reader=_input_reader(()),
+            composer=_ScriptedComposer(()),
             sigint_monitor_factory=_NoopSigintMonitor,
         )
 
@@ -1344,11 +1802,7 @@ def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("请总结收入变化",)),
-    )
+    _install_cli_tty_composer(monkeypatch, ("请总结收入变化",))
 
     exit_code = cli_main.main(
         (
@@ -1387,7 +1841,7 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
         )
     )
 
-    exit_code = await session_execution._run_interactive_repl(
+    exit_code = await session_execution._drive_interactive_tty_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
@@ -1395,7 +1849,7 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
         session_id="session-1",
         run_overrides=ServiceRunOverrides(),
         composer=composer,
-        sigint_monitor_factory=_NoopSigintMonitor,
+        sigint_monitor=_NoopSigintMonitor(),
     )
 
     assert exit_code == EXIT_SUCCESS
@@ -1417,10 +1871,12 @@ def test_interactive_second_consecutive_input_keyboard_interrupt_exits_without_r
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _KeyboardInterruptInputReader(),
+    _install_cli_tty_composer(
+        monkeypatch,
+        (
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            _ComposerReadInterrupt(KeyboardInterrupt),
+        ),
     )
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
@@ -1453,7 +1909,7 @@ async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pend
         )
     )
 
-    exit_code = await session_execution._run_interactive_repl(
+    exit_code = await session_execution._drive_interactive_tty_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
@@ -1461,11 +1917,11 @@ async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pend
         session_id="session-1",
         run_overrides=ServiceRunOverrides(),
         composer=composer,
-        sigint_monitor_factory=_NoopSigintMonitor,
+        sigint_monitor=_NoopSigintMonitor(),
     )
 
     assert exit_code == EXIT_SUCCESS
-    assert composer.prompt_calls == ["dayu> ", "dayu> ", "dayu> ", "dayu> "]
+    assert composer.prompt_calls == ["dayu> "] * 5
     assert len(fake_host.submit_requests) == 1
     assert fake_host.submit_requests[0].user_prompt == "请总结收入变化"
     assert fake_host.cancel_requests == []
@@ -1512,11 +1968,7 @@ def test_interactive_two_turns_use_same_session_and_independent_watchers(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("第一轮", "第二轮")),
-    )
+    _install_cli_tty_composer(monkeypatch, ("第一轮", "第二轮"))
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
     captured = capsys.readouterr()
@@ -1565,11 +2017,7 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("第一轮", "第二轮")),
-    )
+    _install_cli_tty_composer(monkeypatch, ("第一轮", "第二轮"))
     monkeypatch.setattr(
         session_execution,
         "new_interactive_run_view",
@@ -1605,11 +2053,7 @@ def test_interactive_no_detail_omits_activity_and_keeps_final_answer_stdout(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("第一轮",)),
-    )
+    _install_cli_tty_composer(monkeypatch, ("第一轮",))
     monkeypatch.setattr(
         session_execution,
         "new_interactive_run_view",
@@ -1633,11 +2077,7 @@ def test_interactive_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppr
     """有 thinking event 时，``--thinking`` 与 ``--no-thinking`` 输出必须不同。"""
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("第一轮",)),
-    )
+    _install_cli_tty_composer(monkeypatch, ("第一轮",))
     monkeypatch.setattr(
         interactive_command,
         "open_host",
@@ -1652,11 +2092,7 @@ def test_interactive_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppr
     thinking_exit = cli_main.main(("interactive", "--base", str(tmp_path), "--thinking"))
     thinking_captured = capsys.readouterr()
 
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("第一轮",)),
-    )
+    _install_cli_tty_composer(monkeypatch, ("第一轮",))
     monkeypatch.setattr(
         interactive_command,
         "open_host",
@@ -1693,11 +2129,7 @@ def test_interactive_skips_blank_input_before_submit(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("   ", "有效问题")),
-    )
+    _install_cli_tty_composer(monkeypatch, ("   ", "有效问题"))
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
 
@@ -1726,11 +2158,9 @@ def test_interactive_failed_and_cancelled_continue_until_eof(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("失败轮", "取消轮", "成功轮")),
-    )
+    composer = _IdleSequencedComposer(("失败轮", "取消轮", "成功轮"))
+    monkeypatch.setattr(session_execution, "new_interactive_composer", lambda: composer)
+    monkeypatch.setattr(session_execution.sys, "stdin", _ReportedTty())
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
     captured = capsys.readouterr()
@@ -1757,11 +2187,7 @@ def test_interactive_lost_is_fatal(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        interactive_command,
-        "_read_user_input",
-        _input_reader(("触发 lost", "不应执行")),
-    )
+    _install_cli_tty_composer(monkeypatch, ("触发 lost",))
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
     captured = capsys.readouterr()
@@ -1822,7 +2248,7 @@ async def test_interactive_existing_session_advances_terminal_cursor_after_rende
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
-        input_reader=_input_reader(("触发非成功终态",)),
+        composer=_ScriptedComposer(("触发非成功终态",)),
         sigint_monitor_factory=_NoopSigintMonitor,
         run_startup_reconnect=False,
     )
@@ -1881,301 +2307,478 @@ async def test_interactive_turn_cursor_write_failure_propagates_after_terminal_r
             host=cast(Host, fake_host),
             prepared=prepared,
             session_id="session-existing",
-            input_reader=_input_reader(("触发终态",)),
+            composer=_ScriptedComposer(("触发终态",)),
             sigint_monitor_factory=_NoopSigintMonitor,
             run_startup_reconnect=False,
         )
 
 
 @pytest.mark.asyncio
-async def test_interactive_sigint_after_run_id_cancels_host_run(
+async def test_interactive_escape_crosses_pre_acceptance_barrier_once(
     tmp_path: Path,
 ) -> None:
-    """运行态第一次 SIGINT 应发完整 CancelRunRequest 并返回取消终态。"""
+    """pre-accept Escape 必须等 exact Run id 后只发一次 graceful cancel。
 
-    runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = session_execution.new_cli_invocation(
-        command_name="interactive",
-        scenario="interactive",
-        display_user="本地 CLI 用户",
-        ticker="AAPL",
-    )
-    fake_host = _FakeHost(
-        submit_statuses=(None,),
-        cancel_status=HostTerminalStatus.CANCELLED,
-        run_statuses=(RunStatus.RUNNING,),
-    )
-
-    result = await session_execution._submit_interactive_turn_handling_sigint(
-        host=cast(Host, fake_host),
-        runtime=runtime,
-        invocation=invocation,
-        session_id="session-1",
-        turn_index=1,
-        user_prompt="请总结收入变化",
-        run_overrides=ServiceRunOverrides(),
-        sigint_monitor=_AutoSigintMonitor(),
-    )
-
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
-    assert len(fake_host.cancel_requests) == 1
-    cancel_request = fake_host.cancel_requests[0]
-    assert cancel_request.reason == "cli_sigint"
-    assert cancel_request.mode is CancelMode.GRACEFUL
-    assert cancel_request.client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert cancel_request.context.operation_context.operation_name == ("dayu_cli.interactive.cancel_run")
-
-
-@pytest.mark.asyncio
-async def test_interactive_double_sigint_during_acceptance_handoff_cancels_run(
-    tmp_path: Path,
-) -> None:
-    """acceptance handoff 内连续 SIGINT 仍必须对已接受 Run 做 canonical cancel。
-
-    :param tmp_path: pytest 临时 workspace root。
+    :param tmp_path: pytest 临时 workspace。
     :returns: ``None``。
-    :raises Exception: accepted handoff、cancel 或 terminal 断言失败时抛出。
+    :raises AssertionError: acceptance barrier 或 single cancel 语义不符时抛出。
     """
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    fake_host = _DurablyAcceptedDelayedResponseHost()
-    sigint_monitor = _TwoSigintsBeforeSubmitResponseMonitor(fake_host)
-
-    result = await session_execution._submit_interactive_turn_handling_sigint(
-        host=cast(Host, fake_host),
-        runtime=runtime,
-        invocation=session_execution.new_cli_invocation(
-            command_name="interactive",
-            scenario="interactive",
-            display_user="本地 CLI 用户",
-            ticker="AAPL",
-        ),
-        session_id="session-1",
-        turn_index=1,
-        user_prompt="请总结收入变化",
-        run_overrides=ServiceRunOverrides(),
-        sigint_monitor=sigint_monitor,
-    )
-
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
-    assert len(fake_host.cancel_requests) == 1
-    assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
-    assert sigint_monitor.count == 2
-    assert sigint_monitor.closed_count == 1
-
-
-@pytest.mark.asyncio
-async def test_interactive_esc_requests_cancel_after_run_id(
-    tmp_path: Path,
-) -> None:
-    """interactive 运行态 Esc 应请求取消当前 accepted Run。"""
-
-    runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = session_execution.new_cli_invocation(
-        command_name="interactive",
-        scenario="interactive",
-        display_user="本地 CLI 用户",
-        ticker="AAPL",
-    )
-    fake_host = _FakeHost(
-        submit_statuses=(None,),
-        cancel_status=HostTerminalStatus.CANCELLED,
-        run_statuses=(RunStatus.RUNNING,),
-    )
-    stderr = io.StringIO()
-    run_view = TerminalInteractiveRunView(
-        stderr=stderr,
-        options=InteractiveRunViewOptions(
-            enabled=True,
-            terminal_control=True,
-            terminal_columns=80,
-        ),
-    )
-    thinking_renderer = CliThinkingRenderer(
-        stderr=stderr,
-        options=CliThinkingRendererOptions(
-            enabled=True,
-            terminal_control=True,
-            terminal_columns=80,
-        ),
-    )
-    key_monitor = _FakeRunningKeyMonitor(
-        (RunningKeyAction.CANCEL_RUN,),
-        delay_ticks=2,
-    )
-    thinking_renderer.record(
-        _entrypoint_thinking(
-            dedupe_key="thinking-before-esc",
-            text_delta="The user is asking",
+    host = _DelayedAcceptanceControlledHost()
+    composer = _ScriptedComposer(
+        (
+            "第一轮",
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
+                cancel_source=InteractiveCancelSource.ESCAPE,
+            ),
         )
     )
-
-    runtime_display = RuntimeDisplayController(
-        activity_display=run_view,
-        thinking_display=thinking_renderer,
-    )
-    await runtime_display.install_runtime_line_guard()
-    result = await session_execution._submit_interactive_turn_handling_sigint(
-        host=cast(Host, fake_host),
+    driver = _start_tty_driver(
+        host=host,
         runtime=runtime,
-        invocation=invocation,
-        session_id="session-1",
-        turn_index=1,
-        user_prompt="请总结收入变化",
-        run_overrides=ServiceRunOverrides(),
-        sigint_monitor=_NoopSigintMonitor(),
-        run_view=run_view,
-        thinking_renderer=thinking_renderer,
-        runtime_display=runtime_display,
-        key_monitor=key_monitor,
+        workspace_root=tmp_path,
+        composer=composer,
     )
-    await runtime_display.aclose()
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
-    assert len(fake_host.cancel_requests) == 1
-    assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert "Thinking: The user is asking\r\x1b[2KInteractive: cancel requested" in (stderr.getvalue())
-    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
-    assert stderr.getvalue().count("Thinking:") == 1
-    assert key_monitor.started_count == 1
-    assert key_monitor.closed_count == 1
+    await asyncio.wait_for(host.committed.wait(), timeout=2.0)
+    assert host.cancel_requests == []
+    host.release_response.set()
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    host.release_cancel_terminal.set()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(host.cancel_requests) == 1
+    assert host.cancel_requests[0].mode is CancelMode.GRACEFUL
+    assert host.cancel_requests[0].reason == "cli_sigint"
+    assert not host.cancel_waiter_cancelled
 
 
 @pytest.mark.asyncio
-async def test_interactive_ctrl_t_switches_run_view_without_cancel(
+@pytest.mark.parametrize(
+    "cancel_source",
+    (InteractiveCancelSource.ESCAPE, InteractiveCancelSource.CTRL_C),
+)
+async def test_interactive_cancel_sources_merge_once_after_accepted_activity(
+    cancel_source: InteractiveCancelSource,
     tmp_path: Path,
 ) -> None:
-    """interactive 运行态 Ctrl+T 应切换 run view，且不得触发 Host cancel。"""
+    """accepted active turn 的 Escape/Ctrl+C 必须合并为 single cancel。
+
+    :param cancel_source: standalone Escape 或 composer Ctrl+C。
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: active cancel 次数或终态不符合契约时抛出。
+    """
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = session_execution.new_cli_invocation(
-        command_name="interactive",
-        scenario="interactive",
-        display_user="本地 CLI 用户",
-        ticker="AAPL",
+    host = _ControlledInteractiveHost()
+    cancel_event = InteractiveComposerEvent(
+        kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
+        cancel_source=cancel_source,
     )
-    fake_host = _FakeHost(
-        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
-        submit_activities=(True,),
+    composer = _BarrierScriptedComposer(
+        (
+            "第一轮",
+            cancel_event,
+            *((cancel_event,) if cancel_source is InteractiveCancelSource.ESCAPE else ()),
+        ),
+        blocked_call_index=2,
     )
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    await _wait_for_submit_count(host, 1)
+    await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
+    await host._run_watchers["run-1"].push(_thinking_event(run_id="run-1"))
+    await host._run_watchers["run-1"].push(_activity_event(run_id="run-1"))
+    composer.release_read.set()
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    host.release_cancel_terminal.set()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(host.cancel_requests) == 1
+    assert composer._remaining == []
+
+
+@pytest.mark.asyncio
+async def test_interactive_cancel_waiter_failure_propagates_before_submit_terminal(
+    tmp_path: Path,
+) -> None:
+    """cancel waiter 先失败时必须立即传播，不能永久等待 submit terminal。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: cancel failure 被吞掉、延迟或重复请求时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _FailingCancelControlledHost()
+    composer = _ScriptedComposer(
+        (
+            "current",
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
+                cancel_source=InteractiveCancelSource.ESCAPE,
+            ),
+        )
+    )
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    with pytest.raises(RuntimeError, match="cancel waiter failed"):
+        await asyncio.wait_for(driver, timeout=2.0)
+
+    assert len(host.cancel_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_interactive_ctrl_c_first_cancels_second_exits_and_third_is_noop(
+    tmp_path: Path,
+) -> None:
+    """active Ctrl+C 的 single-cancel/exit-after/no-op 矩阵不得取消 waiter。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: Ctrl+C 生命周期或 waiter ownership 回归时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    ctrl_c = InteractiveComposerEvent(
+        kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
+        cancel_source=InteractiveCancelSource.CTRL_C,
+    )
+    composer = _ScriptedComposer(("第一轮", ctrl_c, ctrl_c, ctrl_c))
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    await _wait_for_prompt_call_count(composer, 3)
+    assert not driver.done()
+    host.release_cancel_terminal.set()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert len(host.cancel_requests) == 1
+    assert len(composer._remaining) == 1
+    assert not host.cancel_waiter_cancelled
+
+
+@pytest.mark.asyncio
+async def test_interactive_os_sigint_first_second_and_third_follow_same_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同步 fallback 的 OS SIGINT 三次必须复用统一 active 生命周期。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: OS signal 与 composer Ctrl+C 生命周期不一致时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _ScriptedComposer(("current",))
+    monitor = _ManualSigintMonitor()
+    fallback = _install_sync_sigint_fallback(monkeypatch)
+    monitor.install()
+    try:
+        driver = _start_tty_driver(
+            host=host,
+            runtime=runtime,
+            workspace_root=tmp_path,
+            composer=composer,
+            sigint_monitor=monitor,
+        )
+
+        await _wait_for_submit_count(host, 1)
+        handler = fallback.installed_handler()
+        handler(signal.SIGINT, None)
+        await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+        await _wait_for_sigint_observation(monitor, 1)
+        handler(signal.SIGINT, None)
+        await _wait_for_sigint_observation(monitor, 2)
+        handler(signal.SIGINT, None)
+        await _wait_for_sigint_observation(monitor, 3)
+
+        assert not driver.done()
+        assert len(host.cancel_requests) == 1
+        host.release_cancel_terminal.set()
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+    finally:
+        monitor.close()
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert monitor.count == 3
+    assert len(host.cancel_requests) == 1
+    assert not host.cancel_waiter_cancelled
+    assert len(fallback.signal_calls) == 2
+    assert fallback.signal_calls[1] is signal.SIG_IGN
+    assert fallback.current_handler is signal.SIG_IGN
+
+
+@pytest.mark.asyncio
+async def test_interactive_typeahead_creates_sole_queue_and_preserves_rejected_draft(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """active Enter 只建 sole QUEUE；第二份 draft 保留且绝不 STEER。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param capsys: pytest 输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: queue 数量、behavior 或 draft ownership 回归时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _ScriptedComposer(("current", "queued", "kept draft"))
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    await _wait_for_submit_count(host, 2)
+    await _wait_for_prompt_call_count(composer, 3)
+    assert len(host.submit_requests) == 2
+    assert all(
+        request.behavior is FollowupBehavior.QUEUE and request.target_run_id is None for request in host.submit_requests
+    )
+    await host.finish_run("run-1")
+    await asyncio.sleep(0)
+    await host.finish_run("run-2")
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert [request.user_prompt for request in host.submit_requests] == [
+        "current",
+        "queued",
+    ]
+    assert composer.accepted_history_flags == [True, True]
+    assert composer._pending_submit
+    assert "one follow-up is already queued; draft kept" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_interactive_lost_waits_accepted_sole_queue_terminal_before_failure(
+    tmp_path: Path,
+) -> None:
+    """current LOST 后必须等待 accepted sole QUEUE 终态再失败退出。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: queued 被跳过、取消、重复提交或退出码错误时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _ScriptedComposer(("current", "queued"))
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    await _wait_for_submit_count(host, 2)
+    await host.finish_run("run-1", status=HostTerminalStatus.LOST)
+    await _wait_for_phase_call_count(
+        composer,
+        phase=InteractiveComposerPhase.RUNNING,
+        expected_count=2,
+    )
+
+    assert not driver.done()
+    assert [request.user_prompt for request in host.submit_requests] == [
+        "current",
+        "queued",
+    ]
+    assert all(
+        request.behavior is FollowupBehavior.QUEUE and request.target_run_id is None for request in host.submit_requests
+    )
+    assert host.cancel_requests == []
+
+    await host.finish_run("run-2")
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_FAILURE
+    assert len(host.submit_requests) == 2
+    assert host.cancel_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enter_before_terminal", (True, False))
+async def test_interactive_terminal_enter_race_submits_exactly_once(
+    enter_before_terminal: bool,
+    tmp_path: Path,
+) -> None:
+    """terminal/Enter 双序都必须得到两个且仅两个 QUEUE Run。
+
+    :param enter_before_terminal: 是否先释放第二份 Enter event。
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: generation 裁决重复或丢失 submit 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _BarrierScriptedComposer(
+        ("first", "second"),
+        blocked_call_index=2,
+    )
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    await _wait_for_submit_count(host, 1)
+    await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
+    if enter_before_terminal:
+        composer.release_read.set()
+        await _wait_for_submit_count(host, 2)
+        await host.finish_run("run-1")
+    else:
+        await host.finish_run("run-1")
+        composer.release_read.set()
+        await _wait_for_submit_count(host, 2)
+    await host.finish_run("run-2")
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert [request.user_prompt for request in host.submit_requests] == [
+        "first",
+        "second",
+    ]
+    assert all(
+        request.behavior is FollowupBehavior.QUEUE and request.target_run_id is None for request in host.submit_requests
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay_queued_response", (False, True))
+async def test_interactive_exit_after_cancel_waits_accepted_sole_queue_terminal(
+    delay_queued_response: bool,
+    tmp_path: Path,
+) -> None:
+    """exit-after-cancel 前后 accepted sole QUEUE 都必须恰好执行并终态。
+
+    :param delay_queued_response: 是否把 queued public response 延迟到 exit intent 后。
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: queued Run 被取消、重复或永久 queued 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host: _ControlledInteractiveHost
+    if delay_queued_response:
+        host = _DelayedQueuedResponseHost()
+    else:
+        host = _ControlledInteractiveHost()
+    ctrl_c = InteractiveComposerEvent(
+        kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
+        cancel_source=InteractiveCancelSource.CTRL_C,
+    )
+    composer = _ScriptedComposer(("current", "queued", ctrl_c, ctrl_c))
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+    )
+
+    await _wait_for_submit_count(host, 2)
+    if isinstance(host, _DelayedQueuedResponseHost):
+        await asyncio.wait_for(host.queued_committed.wait(), timeout=2.0)
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    await _wait_for_prompt_call_count(composer, 4)
+    host.release_cancel_terminal.set()
+    await asyncio.sleep(0)
+    assert not driver.done()
+    if isinstance(host, _DelayedQueuedResponseHost):
+        host.release_queued_response.set()
+        await asyncio.sleep(0)
+    await host.finish_run("run-2")
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert len(host.cancel_requests) == 1
+    assert len(host.submit_requests) == 2
+    assert host.submit_requests[1].behavior is FollowupBehavior.QUEUE
+    assert host.submit_requests[1].target_run_id is None
+    assert not host.cancel_waiter_cancelled
+
+
+@pytest.mark.asyncio
+async def test_interactive_ctrl_t_toggles_without_cancel(
+    tmp_path: Path,
+) -> None:
+    """active Ctrl+T 必须经 composer 切换 view，且不提交或取消 draft。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: view toggle 误触 submit/cancel 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
     stderr = io.StringIO()
     run_view = TerminalInteractiveRunView(
         stderr=stderr,
         options=InteractiveRunViewOptions(enabled=True),
     )
-    key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
-
-    runtime_display = RuntimeDisplayController(
+    composer = _ScriptedComposer(
+        (
+            "first",
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.TOGGLE_ACTIVITY,
+            ),
+        )
+    )
+    display = RuntimeDisplayController(
         activity_display=run_view,
         thinking_display=None,
     )
-    await runtime_display.install_runtime_line_guard()
-    result = await session_execution._submit_interactive_turn_handling_sigint(
-        host=cast(Host, fake_host),
+    await display.install_runtime_line_guard()
+    driver = _start_tty_driver(
+        host=host,
         runtime=runtime,
-        invocation=invocation,
-        session_id="session-1",
-        turn_index=1,
-        user_prompt="请总结收入变化",
-        run_overrides=ServiceRunOverrides(),
-        sigint_monitor=_NoopSigintMonitor(),
+        workspace_root=tmp_path,
+        composer=composer,
         run_view=run_view,
-        runtime_display=runtime_display,
-        key_monitor=key_monitor,
+        runtime_display=display,
     )
-    await runtime_display.aclose()
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.SUCCEEDED
-    assert fake_host.cancel_requests == []
-    assert run_view.activity_lines
+    await _wait_for_submit_count(host, 1)
+    await _wait_for_prompt_call_count(composer, 2)
+    await host.finish_run("run-1")
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+    await display.aclose()
+
+    assert exit_code == EXIT_SUCCESS
+    assert host.cancel_requests == []
     assert "[Interactive activity]" in stderr.getvalue()
-    assert "Activity hidden" not in stderr.getvalue()
-    assert key_monitor.started_count == 1
-    assert key_monitor.closed_count == 1
-
-
-@pytest.mark.asyncio
-async def test_interactive_second_sigint_exits_after_cancel_request(
-    tmp_path: Path,
-) -> None:
-    """运行态第二次 SIGINT 应本地退出 130，且已有 run 必须已发 cancel。"""
-
-    runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = session_execution.new_cli_invocation(
-        command_name="interactive",
-        scenario="interactive",
-        display_user="本地 CLI 用户",
-        ticker="AAPL",
-    )
-    fake_host = _FakeHost(
-        submit_statuses=(None,),
-        run_statuses=(RunStatus.RUNNING,),
-        block_cancel_after_record=True,
-    )
-
-    result = await session_execution._submit_interactive_turn_handling_sigint(
-        host=cast(Host, fake_host),
-        runtime=runtime,
-        invocation=invocation,
-        session_id="session-1",
-        turn_index=1,
-        user_prompt="请总结收入变化",
-        run_overrides=ServiceRunOverrides(),
-        sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
-    )
-
-    assert result is None
-    assert len(fake_host.cancel_requests) == 1
-    assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-
-
-@pytest.mark.asyncio
-async def test_interactive_repl_returns_130_on_second_sigint(
-    tmp_path: Path,
-) -> None:
-    """REPL 中第二次 SIGINT 应返回 130，且没有 terminal 时不得推进 cursor。
-
-    :param tmp_path: pytest 临时目录夹具。
-    :returns: ``None``。
-    :raises AssertionError: 退出码、cancel 请求或 cursor 水位错误时抛出。
-    """
-
-    runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = session_execution.new_cli_invocation(
-        command_name="interactive",
-        scenario="interactive",
-        display_user="本地 CLI 用户",
-        ticker="AAPL",
-    )
-    fake_host = _FakeHost(
-        submit_statuses=(None,),
-        run_statuses=(RunStatus.RUNNING,),
-        block_cancel_after_record=True,
-    )
-
-    exit_code = await session_execution._run_interactive_repl(
-        host=cast(Host, fake_host),
-        runtime=runtime,
-        workspace_root=tmp_path,
-        invocation=invocation,
-        session_id="session-1",
-        run_overrides=ServiceRunOverrides(),
-        input_reader=_input_reader(("请总结收入变化",)),
-        sigint_monitor_factory=lambda: _SecondSigintAfterCancelMonitor(fake_host),
-    )
-
-    assert exit_code == EXIT_KEYBOARD_INTERRUPT
-    assert len(fake_host.cancel_requests) == 1
-    cursor_record = await read_cli_terminal_cursor(
-        workspace_root=tmp_path,
-        session_id="session-1",
-    )
-    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=0)
-    assert cursor_record.seen_terminal_event_ids == ()
 
 
 def test_interactive_thinking_flags_are_display_options() -> None:
@@ -2270,125 +2873,219 @@ async def test_interactive_sigint_monitor_waits_for_notification() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_for_run_id_returns_none_when_second_sigint_wins() -> None:
-    """run id 尚未 accepted 时第二次 SIGINT 应取消 submit task 并返回本地退出 outcome。"""
+async def test_interactive_sync_sigint_handler_defers_notification_to_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同步 fallback handler 必须只向 loop 投递一次通知。
 
-    accepted_run = session_execution._InteractiveAcceptedRunState()
-    submit_task = asyncio.create_task(_never_finishes_terminal())
-    monitor = _ImmediateSecondSigintMonitor()
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: handler 同步修改状态或安装状态发布不完整时抛出。
+    """
 
-    result = await session_execution._wait_for_run_id_or_local_exit(
-        accepted_run=accepted_run,
-        submit_task=submit_task,
-        sigint_monitor=monitor,
-        observed_sigint_count=1,
-    )
+    fallback = _install_sync_sigint_fallback(monkeypatch)
+    monitor = CliSigintMonitor()
+    original_signal = fallback.set_signal_handler
 
-    assert isinstance(result, session_execution._LocalExitRequested)
-    assert submit_task.cancelled()
+    def install_after_state_is_visible(
+        signal_number: int,
+        handler: _TestSignalHandler,
+    ) -> _TestSignalHandler:
+        """确认完整状态先于同步 handler 安装可见。
+
+        :param signal_number: 待设置的 signal 编号。
+        :param handler: 新同步 handler。
+        :returns: 被替换的 previous handler。
+        :raises AssertionError: 安装时 owner 状态尚未完整发布时抛出。
+        """
+
+        if callable(handler):
+            assert monitor._installation_mode is agent_entrypoint._CliSigintInstallationMode.SYNCHRONOUS
+            assert monitor._loop is asyncio.get_running_loop()
+            assert monitor._previous_handler is signal.SIG_IGN
+        return original_signal(signal_number, handler)
+
+    monkeypatch.setattr(signal, "signal", install_after_state_is_visible)
+    monitor.install()
+    wait_task = asyncio.create_task(monitor.wait_next(0))
+    await asyncio.sleep(0)
+    try:
+        fallback.installed_handler()(signal.SIGINT, None)
+
+        assert monitor.count == 0
+        assert not wait_task.done()
+        assert await asyncio.wait_for(wait_task, timeout=2.0) == 1
+        assert monitor.count == 1
+    finally:
+        monitor.close()
+
+    restored_call_count = len(fallback.signal_calls)
+    monitor.close()
+    assert fallback.current_handler is signal.SIG_IGN
+    assert len(fallback.signal_calls) == restored_call_count
+    assert monitor._loop is None
 
 
 @pytest.mark.asyncio
-async def test_wait_for_run_id_keeps_acceptance_published_during_second_sigint() -> None:
-    """第二次 SIGINT 等待结束后不得丢弃 cancellation barrier 发布的 Run id。"""
+async def test_interactive_sync_sigint_install_failure_rolls_back_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同步 fallback 安装失败必须回滚为完整 NONE 状态。
 
-    accepted_run = session_execution._InteractiveAcceptedRunState()
-    submit_task = asyncio.create_task(
-        _accept_run_while_propagating_cancellation(accepted_run)
-    )
-    await asyncio.sleep(0)
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 安装失败后残留 mode、loop 或 previous 时抛出。
+    """
 
-    result = await session_execution._wait_for_run_id_or_local_exit(
-        accepted_run=accepted_run,
-        submit_task=submit_task,
-        sigint_monitor=_ImmediateSecondSigintMonitor(),
-        observed_sigint_count=1,
-    )
+    _install_sync_sigint_fallback(monkeypatch)
+    monitor = CliSigintMonitor()
 
-    assert isinstance(result, session_execution._RunIdAccepted)
-    assert result.run_id == "run-1"
-    assert submit_task.cancelled()
+    def fail_sync_install(
+        _signal_number: int,
+        _handler: _TestSignalHandler,
+    ) -> _TestSignalHandler:
+        """模拟底层同步 handler 安装失败。
 
+        :param _signal_number: 待设置的 signal 编号。
+        :param _handler: 待安装的同步 handler。
+        :returns: 正常路径不会返回。
+        :raises OSError: 始终抛出以验证 owner 回滚。
+        """
 
-@pytest.mark.asyncio
-async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_first() -> None:
-    """等待 run id 阶段 submit task 先返回成功终态时不得映射成本地 130。"""
+        raise OSError("synchronous handler install failed")
 
-    accepted_run = session_execution._InteractiveAcceptedRunState()
-    terminal = _terminal_result(status=HostTerminalStatus.SUCCEEDED)
-    submit_task = asyncio.create_task(_already_terminal(terminal))
-    await asyncio.sleep(0)
+    monkeypatch.setattr(signal, "signal", fail_sync_install)
 
-    result = await session_execution._wait_for_run_id_or_local_exit(
-        accepted_run=accepted_run,
-        submit_task=submit_task,
-        sigint_monitor=_NeverSigintMonitor(),
-        observed_sigint_count=1,
-    )
+    with pytest.raises(OSError, match="synchronous handler install failed"):
+        monitor.install()
 
-    assert isinstance(
-        result,
-        session_execution._SubmitCompletedWhileWaitingForRunId,
-    )
-    assert result.terminal is terminal
+    assert monitor._installation_mode is agent_entrypoint._CliSigintInstallationMode.NONE
+    assert monitor._loop is None
+    assert monitor._previous_handler is None
+    monitor.close()
 
 
-@pytest.mark.asyncio
-async def test_wait_for_run_id_propagates_submit_failure_when_submit_fails_first() -> None:
-    """等待 run id 阶段 submit task 先失败时必须向上透传 Host/API fatal。"""
+def _start_tty_driver(
+    *,
+    host: _ControlledInteractiveHost,
+    runtime: EntrypointRuntimeResult,
+    workspace_root: Path,
+    composer: _ScriptedComposer,
+    sigint_monitor: CliSigintMonitor | None = None,
+    run_view: TerminalInteractiveRunView | None = None,
+    runtime_display: RuntimeDisplayController | None = None,
+) -> asyncio.Task[int]:
+    """启动 owner-level interactive TTY driver task。
 
-    accepted_run = session_execution._InteractiveAcceptedRunState()
-    submit_task = asyncio.create_task(_raise_runtime_error_terminal())
-    await asyncio.sleep(0)
+    :param host: 可控 Host fake。
+    :param runtime: 真实 interactive runtime assembly。
+    :param workspace_root: 测试 workspace root。
+    :param composer: scripted typed composer。
+    :param sigint_monitor: 可选手动 SIGINT monitor；省略时永不触发。
+    :param run_view: 可选 terminal run view。
+    :param runtime_display: 可选串行 display controller。
+    :returns: 正在运行的 TTY driver task。
+    :raises Exception: task 创建失败时向上透传。
+    """
 
-    with pytest.raises(RuntimeError, match="host fatal"):
-        await session_execution._wait_for_run_id_or_local_exit(
-            accepted_run=accepted_run,
-            submit_task=submit_task,
-            sigint_monitor=_NeverSigintMonitor(),
-            observed_sigint_count=1,
+    return asyncio.create_task(
+        session_execution._drive_interactive_tty_repl(
+            host=cast(Host, host),
+            runtime=runtime,
+            workspace_root=workspace_root,
+            invocation=session_execution.new_cli_invocation(
+                command_name="interactive",
+                scenario="interactive",
+                display_user="本地 CLI 用户",
+                ticker=None,
+            ),
+            session_id="session-1",
+            run_overrides=ServiceRunOverrides(),
+            composer=composer,
+            sigint_monitor=(_NoopSigintMonitor() if sigint_monitor is None else sigint_monitor),
+            run_view=run_view,
+            runtime_display=runtime_display,
         )
-
-
-@pytest.mark.asyncio
-async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> None:
-    """第一次 SIGINT 竞争中若 submit 已终态，应直接返回 submit terminal。"""
-
-    accepted_run = session_execution._InteractiveAcceptedRunState()
-    accepted_run.record("run-1")
-    submit_task = asyncio.create_task(_already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED)))
-    await asyncio.sleep(0)
-    stderr = io.StringIO()
-    thinking_renderer = CliThinkingRenderer(
-        stderr=stderr,
-        options=CliThinkingRendererOptions(enabled=True),
     )
 
-    runtime_display = RuntimeDisplayController(
-        activity_display=None,
-        thinking_display=thinking_renderer,
-    )
-    result = await session_execution._cancel_interactive_turn_after_first_sigint(
-        host=cast(Host, _FakeHost()),
-        invocation=session_execution.new_cli_invocation(
-            command_name="interactive",
-            scenario="interactive",
-            display_user="本地 CLI 用户",
-            ticker="AAPL",
-        ),
-        turn_index=1,
-        accepted_run=accepted_run,
-        submit_task=submit_task,
-        sigint_monitor=_ImmediateSecondSigintMonitor(),
-        observed_sigint_count=1,
-        runtime_display=runtime_display,
-    )
-    await runtime_display.aclose()
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.SUCCEEDED
-    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-1"))
-    assert stderr.getvalue() == ""
+async def _wait_for_submit_count(
+    host: _ControlledInteractiveHost,
+    expected_count: int,
+) -> None:
+    """在有界 event-loop ticks 内等待 submit 请求数。
+
+    :param host: 可控 Host fake。
+    :param expected_count: 预期最小 submit 数。
+    :returns: ``None``。
+    :raises AssertionError: 有界等待内未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if len(host.submit_requests) >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"submit count did not reach {expected_count}")
+
+
+async def _wait_for_prompt_call_count(
+    composer: _ScriptedComposer,
+    expected_count: int,
+) -> None:
+    """在有界 event-loop ticks 内等待 composer read 次数。
+
+    :param composer: scripted composer。
+    :param expected_count: 预期最小 read 次数。
+    :returns: ``None``。
+    :raises AssertionError: 有界等待内未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if len(composer.prompt_calls) >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"prompt call count did not reach {expected_count}")
+
+
+async def _wait_for_phase_call_count(
+    composer: _ScriptedComposer,
+    *,
+    phase: InteractiveComposerPhase,
+    expected_count: int,
+) -> None:
+    """在有界 event-loop ticks 内等待指定 phase 调用次数。
+
+    :param composer: scripted composer。
+    :param phase: 待观察的 composer phase。
+    :param expected_count: 预期最小调用次数。
+    :returns: ``None``。
+    :raises AssertionError: 有界等待内未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if composer.phase_calls.count(phase) >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"phase {phase} count did not reach {expected_count}")
+
+
+async def _wait_for_sigint_observation(
+    monitor: _ManualSigintMonitor,
+    expected_count: int,
+) -> None:
+    """在有界 event-loop ticks 内等待 driver 消费 SIGINT 计数。
+
+    :param monitor: 手动 SIGINT monitor。
+    :param expected_count: 预期已消费的最新 SIGINT 计数。
+    :returns: ``None``。
+    :raises AssertionError: 有界等待内未消费预期计数时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if monitor.observed_counts and monitor.observed_counts[-1] >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"SIGINT observation did not reach {expected_count}")
 
 
 async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
@@ -2413,116 +3110,6 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
             env=_runtime_assembly_env(),
         )
     )
-
-
-def _input_reader(values: tuple[str, ...]) -> Callable[[str], str]:
-    """构造测试输入函数。
-
-    :param values: 依次返回的输入文本。
-    :returns: 输入函数；耗尽后抛 ``EOFError``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return _InputReader(values)
-
-
-class _ImmediateSecondSigintMonitor(CliSigintMonitor):
-    """测试用立即第二次 SIGINT monitor。"""
-
-    def install(self) -> None:
-        """测试中不安装真实 OS signal handler。"""
-
-        return
-
-    def close(self) -> None:
-        """测试中无需恢复 OS signal handler。"""
-
-        return
-
-    async def wait_next(self, observed_count: int) -> int:
-        """立即触发下一次 SIGINT。"""
-
-        if self.count <= observed_count:
-            self.count = observed_count
-            self.notify()
-        return self.count
-
-
-class _NeverSigintMonitor(CliSigintMonitor):
-    """测试用永不触发的 SIGINT monitor。"""
-
-    def install(self) -> None:
-        """测试中不安装真实 OS signal handler。"""
-
-        return
-
-    def close(self) -> None:
-        """测试中无需恢复 OS signal handler。"""
-
-        return
-
-    async def wait_next(self, observed_count: int) -> int:
-        """永不主动返回，等待任务取消。
-
-        :param observed_count: 已观察到的 SIGINT 计数。
-        :returns: 正常路径不会返回。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
-        """
-
-        await asyncio.Event().wait()
-        return observed_count
-
-
-async def _never_finishes_terminal() -> EntrypointRunTerminalResult:
-    """构造永不完成的 terminal task。
-
-    :returns: 正常路径不会返回。
-    :raises asyncio.CancelledError: task 被取消时透传。
-    """
-
-    await asyncio.Event().wait()
-    raise AssertionError("terminal task should be cancelled")
-
-
-async def _accept_run_while_propagating_cancellation(
-    accepted_run: session_execution._InteractiveAcceptedRunState,
-) -> EntrypointRunTerminalResult:
-    """在收到 caller cancellation 后发布 accepted Run id 并传播取消。
-
-    :param accepted_run: 待写入的 interactive accepted state。
-    :returns: 正常路径不会返回。
-    :raises asyncio.CancelledError: 发布 accepted Run id 后传播 caller cancellation。
-    """
-
-    try:
-        await asyncio.Event().wait()
-    except asyncio.CancelledError:
-        accepted_run.record("run-1")
-        raise
-    raise AssertionError("submit task should be cancelled")
-
-
-async def _already_terminal(
-    result: EntrypointRunTerminalResult,
-) -> EntrypointRunTerminalResult:
-    """返回已完成 terminal result。
-
-    :param result: 待返回的 terminal result。
-    :returns: 传入的 terminal result。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return result
-
-
-async def _raise_runtime_error_terminal() -> EntrypointRunTerminalResult:
-    """构造抛出 RuntimeError 的 terminal task。
-
-    :returns: 正常路径不会返回。
-    :raises RuntimeError: 始终抛出，用于验证 fatal 透传。
-    """
-
-    raise RuntimeError("host fatal")
 
 
 def _session_snapshot(*, session_id: str, slot: SessionSlotRef | None) -> SessionSnapshot:

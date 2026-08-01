@@ -448,27 +448,17 @@ def test_display_identity_from_slot_covers_shared_legacy_and_other_slots() -> No
     """
 
     anonymous = display_identity_from_slot(None)
-    labeled = display_identity_from_slot(
-        SessionSlotRef(scope="cli.agent", slot_key="cli.agent.proj.v1")
-    )
-    legacy_prompt = display_identity_from_slot(
-        SessionSlotRef(scope="cli.prompt", slot_key="cli.prompt.proj.v1")
-    )
+    labeled = display_identity_from_slot(SessionSlotRef(scope="cli.agent", slot_key="cli.agent.proj.v1"))
+    legacy_prompt = display_identity_from_slot(SessionSlotRef(scope="cli.prompt", slot_key="cli.prompt.proj.v1"))
     legacy_interactive = display_identity_from_slot(
         SessionSlotRef(
             scope="cli.interactive",
             slot_key="cli.interactive.earnings",
         )
     )
-    other_scope = display_identity_from_slot(
-        SessionSlotRef(scope="service.workflow", slot_key="workflow.alpha")
-    )
-    labeled_bad_prefix = display_identity_from_slot(
-        SessionSlotRef(scope="cli.agent", slot_key="not-cli.agent.alpha")
-    )
-    labeled_empty_suffix = display_identity_from_slot(
-        SessionSlotRef(scope="cli.agent", slot_key="cli.agent.")
-    )
+    other_scope = display_identity_from_slot(SessionSlotRef(scope="service.workflow", slot_key="workflow.alpha"))
+    labeled_bad_prefix = display_identity_from_slot(SessionSlotRef(scope="cli.agent", slot_key="not-cli.agent.alpha"))
+    labeled_empty_suffix = display_identity_from_slot(SessionSlotRef(scope="cli.agent", slot_key="cli.agent."))
 
     assert anonymous.kind is CliSessionDisplayKind.ANONYMOUS
     assert anonymous.label == "-"
@@ -705,24 +695,12 @@ def test_real_session_purge_succeeds_without_model_api_keys(
             db_path=admin_options.db_path,
             artifact_root=admin_options.artifact_root,
             create_parent_dirs=admin_options.create_parent_dirs,
-            sqlite_busy_timeout_seconds=(
-                admin_options.sqlite_busy_timeout_seconds
-            ),
-            sqlite_write_busy_retry_count=(
-                admin_options.sqlite_write_busy_retry_count
-            ),
-            sqlite_write_retry_initial_delay_seconds=(
-                admin_options.sqlite_write_retry_initial_delay_seconds
-            ),
-            sqlite_write_retry_backoff_multiplier=(
-                admin_options.sqlite_write_retry_backoff_multiplier
-            ),
-            sqlite_write_retry_max_delay_seconds=(
-                admin_options.sqlite_write_retry_max_delay_seconds
-            ),
-            payload_inline_threshold_bytes=(
-                admin_options.payload_inline_threshold_bytes
-            ),
+            sqlite_busy_timeout_seconds=(admin_options.sqlite_busy_timeout_seconds),
+            sqlite_write_busy_retry_count=(admin_options.sqlite_write_busy_retry_count),
+            sqlite_write_retry_initial_delay_seconds=(admin_options.sqlite_write_retry_initial_delay_seconds),
+            sqlite_write_retry_backoff_multiplier=(admin_options.sqlite_write_retry_backoff_multiplier),
+            sqlite_write_retry_max_delay_seconds=(admin_options.sqlite_write_retry_max_delay_seconds),
+            payload_inline_threshold_bytes=(admin_options.payload_inline_threshold_bytes),
             context_window_size=8192,
             reserved_output_tokens=1024,
         )
@@ -777,9 +755,7 @@ def test_session_purge_missing_yes_returns_usage_error() -> None:
     :raises AssertionError: 缺确认参数未被拒绝时抛出。
     """
 
-    assert cli_main.main(("session", "purge", "--session-id", "session-1")) == (
-        EXIT_USAGE_ERROR
-    )
+    assert cli_main.main(("session", "purge", "--session-id", "session-1")) == (EXIT_USAGE_ERROR)
 
 
 def test_session_purge_by_session_id_calls_host_purge(
@@ -1722,7 +1698,7 @@ def _install_fake_resume_execution(
         :raises Exception: 不主动抛出异常。
         """
 
-        del context_slot_values, usage_error_factory
+        del context_slot_values
         capture.prompt_prepare_calls.append(user_prompt)
         return session_execution.PreparedPromptSessionExecution(
             runtime=cast(
@@ -1796,7 +1772,7 @@ def _install_fake_resume_execution(
         :raises Exception: 不主动抛出异常。
         """
 
-        del context_slot_values, usage_error_factory
+        del context_slot_values
         capture.interactive_prepare_calls.append(args.mode or "")
         return session_execution.PreparedInteractiveSessionExecution(
             runtime=cast(
@@ -1811,6 +1787,7 @@ def _install_fake_resume_execution(
                 ticker=None,
             ),
             run_overrides=ServiceRunOverrides(),
+            usage_error_factory=usage_error_factory,
         )
 
     async def fake_execute_interactive_on_session(
@@ -1818,7 +1795,6 @@ def _install_fake_resume_execution(
         host: Host,
         prepared: session_execution.PreparedInteractiveSessionExecution,
         session_id: str,
-        input_reader: Callable[[str], str] | None = None,
         sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
         detail: bool = True,
         thinking: bool = True,
@@ -1828,7 +1804,6 @@ def _install_fake_resume_execution(
         :param host: fake Host。
         :param prepared: fake interactive prepared execution。
         :param session_id: 目标 Session id。
-        :param input_reader: 未使用的输入读取器。
         :param sigint_monitor_factory: 未使用的 SIGINT monitor 工厂。
         :param detail: 是否显示运行态 activity stream。
         :param thinking: 是否显示运行态 thinking 增量。

@@ -9,8 +9,7 @@ runtime prepare、submit/watch/cancel 和 startup reconnect 执行组合由
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from typing import Final
+from typing import BinaryIO, Final, TextIO
 
 from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import COMMAND_INTERACTIVE, ParsedCliArgs
@@ -48,7 +47,6 @@ from dayu.service.scene_context import (
     build_entrypoint_context_slot_values,
 )
 
-INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
 _LABEL_OPTION: Final[str] = "--label"
 _INTERACTIVE_OPERATION_CREATE_SESSION: Final[str] = "create_session"
 
@@ -90,14 +88,16 @@ def run_interactive_command(args: ParsedCliArgs) -> int:
 async def _run_interactive_command_async(
     args: ParsedCliArgs,
     *,
-    input_reader: Callable[[str], str] | None = None,
+    stdin: TextIO | None = None,
+    binary_stdin: BinaryIO | None = None,
     composer: InteractiveComposer | None = None,
 ) -> int:
     """异步执行 interactive command 主流程。
 
     :param args: argparse 已解析的 interactive 命令参数。
-    :param input_reader: 非 TTY 或测试路径使用的输入函数；``None`` 表示默认输入函数。
-    :param composer: 可注入 composer；``None`` 表示按 TTY policy 创建。
+    :param stdin: 用于 TTY capability 判定的文本输入流。
+    :param binary_stdin: non-TTY whole-stream 二进制输入。
+    :param composer: 可注入的 TTY composer。
     :returns: CLI 退出码。
     :raises CliInteractiveUsageError: 用户输入参数非法时抛出。
     :raises Exception: runtime assembly 或 Host public API 失败时向上抛出。
@@ -123,7 +123,8 @@ async def _run_interactive_command_async(
             run_startup_reconnect=args.label is not None,
             detail=args.detail,
             thinking=args.thinking,
-            input_reader=_read_user_input if input_reader is None else input_reader,
+            stdin=stdin,
+            binary_stdin=binary_stdin,
             composer=composer,
             sigint_monitor_factory=CliSigintMonitor,
         )
@@ -188,18 +189,6 @@ def build_interactive_context_slot_values() -> dict[str, JsonValue]:
             fmp_api_key=None,
         )
     )
-
-
-def _read_user_input(prompt: str) -> str:
-    """读取一行 interactive 用户输入。
-
-    :param prompt: 输入提示文本。
-    :returns: 用户输入文本。
-    :raises EOFError: 用户输入 Ctrl-D 时由 ``input`` 抛出。
-    :raises KeyboardInterrupt: 输入态 Ctrl-C 时由 ``input`` 抛出。
-    """
-
-    return input(prompt)
 
 
 __all__: tuple[str, ...] = (
