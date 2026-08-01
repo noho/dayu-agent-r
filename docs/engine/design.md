@@ -56,6 +56,13 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 若 `EngineEvent stream` 结束但没有产出 terminal event，聚合入口返回
 `EngineRunOutcomeFailed(error_code=EngineRunErrorCode.MISSING_TERMINAL)`。
 
+成功终态额外携带 required `SuccessfulRunnerResponseIdentity`：`FinalAnswerData.response_identity`
+与 `EngineRunOutcomeFinalAnswer.response_identity` 必须是同一 typed fact。它由实际终结回答的
+effective provider/model、该逻辑调用的 `RunnerRequestIdentity`、以及
+`provider_request_id_availability + provider_request_id` 组成；后两者只允许
+`present + non-empty id` 或 `unavailable + None`。普通 final、length continuation 后 final 与
+force-answer final 共用该 contract；失败、取消与挂起 outcome 不携带或伪造成功 identity。
+
 包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的 Dayu Agent 公共契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。当前包根也导出 Runner 请求身份与输入观测相关公共契约，包括 `ClientCorrelationPolicy`、`RunnerRequestIdentity`、`build_runner_request_identity`、`RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION`、`RunnerInputMessageProjection`、`RunnerInputToolCallProjection` 与 `runner_role_sequence_digest`。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
 
 Engine 失败码契约分为两类：Agent / Engine 已知失败使用
@@ -440,7 +447,7 @@ Engine 只观察 token，不持有取消治理真源。取消公共终态通过 
 - iteration 起点、Runner 调用期间、工具 handshake 前和 fallback Runner 调用前会观察取消。
 - RunnerEvent 已经被 Agent 消费后，相关 content、reasoning、usage、protocol error 或状态更新先被接受，再观察取消。
 - Runner 未完成时取消可以抢占本轮并收口为 `run_cancelled`。
-- Agent 以单一 typed `RunnerDoneData` 保存 Runner 完成 commit；finish reason 与 provider request id 只从该 fact 读取，不由分散字段或默认值反推。
+- Agent 以单一 typed `RunnerDoneData` 保存 Runner 完成 commit；finish reason 与 provider request id 只从该 fact 读取，不由分散字段或默认值反推。成功 final 在同一 owner boundary 把该 done fact 与当前 iteration 已持有的 `RunnerRequestIdentity`、实际 `RunnerSpec.provider/model` 组合成 `SuccessfulRunnerResponseIdentity`，随后原样投影到 final event 与 aggregate outcome；不得从 usage、配置、manifest、metadata 或相邻事件补建。
 - Runner 已 `done` 后，分类得到的 final / tool / failure 候选不能被迟到取消改写。
 - ToolExecutor 返回 completed / failed / cancelled outcome 后，Agent 先产出 `tool_result_accepted` 并注入 tool message；之后若观察到取消，只阻止下一轮 Runner，不丢失已接受工具结果。
 - ToolExecutor 返回 awaiting outcome 后，Agent 先产出 `tool_awaiting`，再产出 `run_suspended`；迟到取消不能吞掉 `await_spec` 或 snapshot。
@@ -492,7 +499,7 @@ Terminal event 类型固定为：
 | `provider_diagnostic` | `ProviderDiagnosticData` | provider / adapter 非致命诊断；不代表 run failure |
 | `provider_protocol_error` | `ProviderProtocolErrorData` | provider 协议解析错误；`error_code` 为 typed Engine error-code union |
 | `iteration_completed` | `IterationCompletedData` | 本轮 Runner done |
-| `final_answer` | `FinalAnswerData` | 最终回答终态 |
+| `final_answer` | `FinalAnswerData` | 最终回答终态；正文与产生它的 required 成功 Runner response identity 同源提交 |
 | `run_suspended` | `RunSuspendedData` | run 挂起终态 |
 | `run_cancelled` | `RunCancelledData` | run 取消终态 |
 | `run_failed` | `RunFailedData` | run 失败终态；`error_code` 为 `EngineRunErrorCode` 或 `RunnerSpecificErrorCode` |

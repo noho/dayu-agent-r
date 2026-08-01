@@ -521,6 +521,24 @@ Registry-level readiness proof 至少记录 inventories identity/version/digest�
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终
 validation result。`registry_status=ready` 只能由该 result 派生，禁止手工翻转 status 绕过校验。
 
+当前 Agent CLI capability inventory 还必须遵守这些 parser/source-of-truth 规则：`prompt` 与
+`interactive` leaf 都不包含 `--config`，root 前置 `--config` 也不能绕过 command-aware
+validation；`interactive` 不包含 `--ticker`，而 `prompt --ticker` 仍是 prompt 专属参数；有
+label 的 prompt/interactive 使用同一个 `cli.agent` Session slot，`prompt.P37-label-followup`
+只证明 prompt 同命令复用，不能标成 cross-command proof。workspace 中存在显式配置仍可作为
+precondition evidence，但不得把它登记为 command parameter claim。parser inventory 必须直接从
+`build_parser()` 导出完整 action 顺序、version 与 canonical digest；参数删除后，旧真实 argv 场景
+必须删除，不能改写成另一条 expected unknown-option oracle来保留 coverage 数量。
+
+interactive 的 parser inventory 与 dynamic branch inventory 是两份正交证据。当前实现的动态
+owner boundary 包括：TTY invocation 全程只有 composer 读取 stdin；non-TTY 读取 whole UTF-8
+stream 并至多提交一个 Run；standalone Escape 与 CSI/Alt/paste 分流；Ctrl+C cancel/exit-after-cancel；
+type-ahead 与唯一 accepted `QUEUE` handoff；fresh read-write attachment delayed orphan recovery。
+这些实现事实或 owner-level tests 不能直接变成 accepted scenario：仍须先实际执行 candidate、冻结
+目标 commit 的 observation report，再完成 evidence/ref/readiness validation。compactor 的真实成功
+response identity 同理必须由 live provider 与 durable accepted outcome 共同证明；fake/deterministic
+smoke 只能关闭 implementation finding，不能替代 provider evidence。
+
 本节的 parser leaf 指 parser inventory 中没有下级 subparser、可以执行 primary operation 或 read flow 的完整 command
 path。每个 leaf 都必须先建立 coverage obligations，而不是只规划一条 happy path。Mandatory dimensions 至少包括：
 

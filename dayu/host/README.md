@@ -509,6 +509,12 @@ reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该�
 
 每次 compactor proposal 都使用新的 Host-private linked attempt token：provider timeout 只取消当前 attempt child，Run / reactive operation parent 保持生命周期真源并拥有取消原因优先级。prepared proposal 先提交 runner-call manifest，再用同一个 child 重新观察 parent；proactive path 因此会在 provider 调用前重新读取 durable Run 前置条件，且不会跨 provider await 持有 Host transaction。
 
+proactive 与 reactive 两路 writer 共用 `compaction_terminal` 的 transaction-local commit permit。permit 以 operation request 与 trigger source 为真源：尚无 terminal 时允许当前 first committer，已有恰好一个 `CONTEXT_COMPACTED` 或 `CONTEXT_COMPACTION_FAILED` 时把迟到结果裁为 diagnostic-only no-op，出现多个 terminal 或身份不一致则 fail closed。writer 必须在 artifact 写入、terminal append、fallback 与 Attempt start 之前取得 permit，因此同一 operation 最多只有一个 canonical terminal，late loser 不产生第二份 artifact、fallback 或 execution。
+
+同一 live read-write Session 的 pre-start governance 由 scheduler-local single-flight owner 串行化。wake、queue promotion 与 periodic reconciliation 只设置同一个 flight 的待复查信号；当前 pass 完成后再以新的 `SessionWorkLease` 处理合并信号。caller cancellation 不取消共享 flight，attachment / scheduler close 会取消并等待它；fresh owner 仍只从 durable pending operation 恢复，不从进程内 signal 推断治理事实。
+
+LLM compactor 返回成功 candidate 时同时保留 Engine `FinalAnswerData.response_identity`。Host 接受或拒绝 proposal 的 durable payload 都直接绑定同一 operation、attempt number、proposal manifest ref/digest、candidate/output 与该成功 identity；identity 包含 effective provider/model、provider request id 的 present/unavailable 状态以及终止调用的 `RunnerRequestIdentity`。provider request id 不可用时显式保存 unavailable + `None`，不从配置 family、请求 manifest、usage 或相邻事件反推；endpoint、credential/header、secret 和 provider raw payload 不进入这些投影。
+
 compact attempt 被拒绝时，Host 会在 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` canonical payload 中保留 operation、attempt、failure stage、parser / validator、offending block locator、digest 与 diagnostic artifact ref 等小字段；若失败发生在 material projection 或 proposal 准备边界，raw previous compacted view / offending block text 只写入 Host diagnostic artifact，并通过 `payload_descriptors` 的 artifact descriptor 追踪，不进入 EventLog canonical payload、Conversation Memory、LLM-facing compact material 或普通 RunInput。
 
 ### Purge
@@ -678,6 +684,8 @@ scanner 在 durable actor 独占的连接上冻结本轮 `policy.now` 与 non-te
 positive orphan proof 需要 durable owner liveness 与本机进程证据支持，例如 owner 已 `STOPPED`、pid 缺失、pid 被复用且 start token / boot id 不匹配等。heartbeat stale 单独不构成 takeover proof；runtime lane TTL、projection lag 或 worker 没有返回也不构成 Host recovery truth。
 
 Session attachment 使用独立的 target recovery：read-write allocation 先处于 recovering，扫描只绑定目标 Session 的 fixed watermark 与有界 page；page commit 后才唤醒对应 dispatch / promotion，并在 target active cancel watchdog 与 recovery 全部收口后激活 attachment。read-only attachment 不运行 recovery，unattached opener 也不扫描其它 Session。稳定旧 Attempt 可以由原 scheduler 继续收口，但 detach 后不再获得新工作资格。
+
+若 fresh read-write attachment 的首次 fixed-`now` 扫描发现目标 Attempt 尚未达到 orphan stale threshold，attachment recovery owner 会按同一 policy deadline 安排一次 bounded delayed reclassification；到期后使用新的 `now` 重做 positive orphan proof 和 CAS。每个 attachment 至多持有一个该任务，close 会取消并等待它；因此既不会在阈值前提前恢复，也不要求用户再次重连才能触发阈值后的恢复。
 
 ### EngineEvent ingest
 

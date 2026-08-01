@@ -8202,166 +8202,6 @@
       "superseded_by": null
     },
     {
-      "scenario_id": "prompt.P25-config-missing",
-      "source_scenario_id": "P25-config-missing",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "negative",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config-missing"
-        ],
-        "precondition_state_ids": [
-          "fresh-empty"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "parameter:config-missing"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--config",
-          "missing-config",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<run-root>/repo",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "fresh-empty",
-        "workspace": "<run-root>/workspaces/P25-config-missing"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 90.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-20260731T011247Z",
-        "report_id": "prompt-20260731T011247Z/observed-behavior",
-        "report_sha256": "5d71ee302abedf40443b060e566ce6cb52eb0af463244806ba0dec55c9d9c1aa",
-        "relative_ref": "evidence/P25-config-missing",
-        "execution_outcome": "error",
-        "exit_code": 2,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.P26-config-outside",
-      "source_scenario_id": "P26-config-outside",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "negative",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config-escape"
-        ],
-        "precondition_state_ids": [
-          "fresh-empty"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "parameter:config-escape"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--config",
-          "../outside-config",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<run-root>/repo",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "fresh-empty",
-        "workspace": "<run-root>/workspaces/P26-config-outside"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 90.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-20260731T011247Z",
-        "report_id": "prompt-20260731T011247Z/observed-behavior",
-        "report_sha256": "5d71ee302abedf40443b060e566ce6cb52eb0af463244806ba0dec55c9d9c1aa",
-        "relative_ref": "evidence/P26-config-outside",
-        "execution_outcome": "error",
-        "exit_code": 2,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
       "scenario_id": "prompt.P27R-config-missing-models",
       "source_scenario_id": "P27R-config-missing-models",
       "version": 1,
@@ -9081,206 +8921,6 @@
       "superseded_by": null
     },
     {
-      "scenario_id": "prompt.P35-explicit-config-unicode-multiline",
-      "source_scenario_id": "P35-explicit-config-unicode-multiline",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config-valid",
-          "display:detail+thinking"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [
-          "input:unicode+multiline"
-        ],
-        "combination_high_risk_ids": [],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "parameter:config-valid",
-          "input:unicode+multiline",
-          "temperature:negative-finite",
-          "display:detail+thinking"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/P35-explicit-config-unicode-multiline",
-          "--config",
-          "config",
-          "--model",
-          "deepseek-v4-flash",
-          "--detail",
-          "--thinking",
-          "--temperature",
-          "-0.1",
-          "--max-iterations",
-          "1",
-          "第一行：请不要调用工具。\n第二行：只回复「多行_OK」。"
-        ],
-        "cwd": "<run-root>/repo",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/P35-explicit-config-unicode-multiline"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-20260731T011247Z",
-        "report_id": "prompt-20260731T011247Z/observed-behavior",
-        "report_sha256": "5d71ee302abedf40443b060e566ce6cb52eb0af463244806ba0dec55c9d9c1aa",
-        "relative_ref": "evidence/P35-explicit-config-unicode-multiline",
-        "execution_outcome": "error",
-        "exit_code": 1,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.P35R-explicit-config-positive",
-      "source_scenario_id": "P35R-explicit-config-positive",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:--config",
-          "parameter:--model",
-          "display:detail+thinking"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [
-          "input:unicode-multiline"
-        ],
-        "combination_high_risk_ids": [],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "parameter:--config",
-          "parameter:--model",
-          "input:unicode-multiline",
-          "display:detail+thinking"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/P35R-explicit-config-positive",
-          "--config",
-          "config",
-          "--model",
-          "deepseek-v4-flash",
-          "--temperature",
-          "0.2",
-          "--max-iterations",
-          "1",
-          "--detail",
-          "--thinking",
-          "第一行：不要调用工具。\n第二行：只回复“多行输入成功”。"
-        ],
-        "cwd": "<run-root>/repo",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/P35R-explicit-config-positive"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-20260731T011247Z",
-        "report_id": "prompt-20260731T011247Z/observed-behavior",
-        "report_sha256": "5d71ee302abedf40443b060e566ce6cb52eb0af463244806ba0dec55c9d9c1aa",
-        "relative_ref": "evidence/P35R-explicit-config-positive",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
       "scenario_id": "prompt.P36-label-first-tool-call",
       "source_scenario_id": "P36-label-first-tool-call",
       "version": 1,
@@ -9396,12 +9036,12 @@
         "input_class_ids": [],
         "combination_high_risk_ids": [],
         "cross_command_assertion_ids": [
-          "cross-command:label-session-reuse",
+          "same-command:prompt-label-session-reuse",
           "memory:second-turn",
           "runner-input:prior-turn"
         ],
         "raw_stable_claims": [
-          "cross-command:label-session-reuse",
+          "same-command:prompt-label-session-reuse",
           "memory:second-turn",
           "runner-input:prior-turn"
         ]
@@ -41396,268 +41036,6 @@
       "superseded_by": null
     },
     {
-      "scenario_id": "prompt.PC-PW-R2-01",
-      "source_scenario_id": "PC-PW-R2-01",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:2"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:2"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-01",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-01/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-01",
-          "--detail",
-          "--thinking",
-          "--fallback-mode",
-          "raise_error",
-          "--max-consecutive-failed-tool-batches",
-          "2",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-01"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-01",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-02",
-      "source_scenario_id": "PC-PW-R2-02",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:AAPL",
-          "parameter:label:default",
-          "parameter:detail:off",
-          "parameter:thinking:off",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:30",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:1"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:AAPL",
-          "parameter:label:default",
-          "parameter:detail:off",
-          "parameter:thinking:off",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:30",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:1"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-02",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-02/config",
-          "--ticker",
-          "AAPL",
-          "--no-detail",
-          "--no-thinking",
-          "--temperature",
-          "1.3",
-          "--tool-timeout-seconds",
-          "30",
-          "--max-iterations",
-          "3",
-          "--fallback-prompt",
-          "PAIRWISE_CUSTOM_FALLBACK",
-          "--max-consecutive-failed-tool-batches",
-          "1",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-02"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-02",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
       "scenario_id": "prompt.PC-PW-R2-03",
       "source_scenario_id": "PC-PW-R2-03",
       "version": 1,
@@ -41666,7 +41044,6 @@
       "path_kind": "positive",
       "coverage_claims": {
         "command_parameter_ids": [
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:default",
@@ -41690,7 +41067,6 @@
         "cross_command_assertion_ids": [],
         "raw_stable_claims": [
           "combination:pairwise",
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:default",
@@ -41796,7 +41172,6 @@
       "path_kind": "positive",
       "coverage_claims": {
         "command_parameter_ids": [
-          "parameter:config:default",
           "parameter:model:default",
           "parameter:ticker:AAPL",
           "parameter:label:present",
@@ -41820,7 +41195,6 @@
         "cross_command_assertion_ids": [],
         "raw_stable_claims": [
           "combination:pairwise",
-          "parameter:config:default",
           "parameter:model:default",
           "parameter:ticker:AAPL",
           "parameter:label:present",
@@ -41918,136 +41292,6 @@
       "superseded_by": null
     },
     {
-      "scenario_id": "prompt.PC-PW-R2-05",
-      "source_scenario_id": "PC-PW-R2-05",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:AAPL",
-          "parameter:label:present",
-          "parameter:detail:default",
-          "parameter:thinking:default",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:AAPL",
-          "parameter:label:present",
-          "parameter:detail:default",
-          "parameter:thinking:default",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-05",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-05/config",
-          "--ticker",
-          "AAPL",
-          "--label",
-          "pairwise-05",
-          "--temperature",
-          "0.2",
-          "--tool-timeout-seconds",
-          "0.5",
-          "--fallback-mode",
-          "raise_error",
-          "--max-consecutive-failed-tool-batches",
-          "1",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-05"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-05",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
       "scenario_id": "prompt.PC-PW-R2-06",
       "source_scenario_id": "PC-PW-R2-06",
       "version": 1,
@@ -42056,7 +41300,6 @@
       "path_kind": "positive",
       "coverage_claims": {
         "command_parameter_ids": [
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:present",
@@ -42080,7 +41323,6 @@
         "cross_command_assertion_ids": [],
         "raw_stable_claims": [
           "combination:pairwise",
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:present",
@@ -42174,136 +41416,6 @@
       "superseded_by": null
     },
     {
-      "scenario_id": "prompt.PC-PW-R2-07",
-      "source_scenario_id": "PC-PW-R2-07",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:AAPL",
-          "parameter:label:default",
-          "parameter:detail:on",
-          "parameter:thinking:off",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:2"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:AAPL",
-          "parameter:label:default",
-          "parameter:detail:on",
-          "parameter:thinking:off",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:2"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-07",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-07/config",
-          "--ticker",
-          "AAPL",
-          "--detail",
-          "--no-thinking",
-          "--max-iterations",
-          "1",
-          "--fallback-mode",
-          "force_answer",
-          "--fallback-prompt",
-          "PAIRWISE_CUSTOM_FALLBACK",
-          "--max-consecutive-failed-tool-batches",
-          "2",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-07"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-07",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
       "scenario_id": "prompt.PC-PW-R2-08",
       "source_scenario_id": "PC-PW-R2-08",
       "version": 1,
@@ -42312,7 +41424,6 @@
       "path_kind": "positive",
       "coverage_claims": {
         "command_parameter_ids": [
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:default",
@@ -42336,7 +41447,6 @@
         "cross_command_assertion_ids": [],
         "raw_stable_claims": [
           "combination:pairwise",
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:default",
@@ -42436,143 +41546,6 @@
       "superseded_by": null
     },
     {
-      "scenario_id": "prompt.PC-PW-R2-09",
-      "source_scenario_id": "PC-PW-R2-09",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:AAPL",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:default",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:2"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:AAPL",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:default",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:2"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-09",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-09/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--ticker",
-          "AAPL",
-          "--label",
-          "pairwise-09",
-          "--detail",
-          "--temperature",
-          "0.2",
-          "--tool-timeout-seconds",
-          "0.5",
-          "--max-iterations",
-          "3",
-          "--fallback-prompt",
-          "PAIRWISE_CUSTOM_FALLBACK",
-          "--max-consecutive-failed-tool-batches",
-          "2",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-09"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-09",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
       "scenario_id": "prompt.PC-PW-R2-10",
       "source_scenario_id": "PC-PW-R2-10",
       "version": 1,
@@ -42581,7 +41554,6 @@
       "path_kind": "positive",
       "coverage_claims": {
         "command_parameter_ids": [
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:default",
@@ -42605,7 +41577,6 @@
         "cross_command_assertion_ids": [],
         "raw_stable_claims": [
           "combination:pairwise",
-          "parameter:config:default",
           "parameter:model:explicit",
           "parameter:ticker:default",
           "parameter:label:default",
@@ -42687,1060 +41658,6 @@
         "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
         "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
         "relative_ref": "evidence/PC-PW-R2-10",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-11",
-      "source_scenario_id": "PC-PW-R2-11",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:off",
-          "parameter:thinking:off",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:default"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:default",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:off",
-          "parameter:thinking:off",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:default"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-11",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-11/config",
-          "--label",
-          "pairwise-11",
-          "--no-detail",
-          "--no-thinking",
-          "--temperature",
-          "0.2",
-          "--tool-timeout-seconds",
-          "0.5",
-          "--fallback-mode",
-          "force_answer",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-11"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-11",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-12",
-      "source_scenario_id": "PC-PW-R2-12",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:off",
-          "parameter:thinking:default",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:30",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:off",
-          "parameter:thinking:default",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:30",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-12",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-12/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-12",
-          "--no-detail",
-          "--tool-timeout-seconds",
-          "30",
-          "--max-iterations",
-          "1",
-          "--fallback-mode",
-          "force_answer",
-          "--max-consecutive-failed-tool-batches",
-          "1",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-12"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-12",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-13",
-      "source_scenario_id": "PC-PW-R2-13",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:default",
-          "parameter:thinking:off",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:default"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:default",
-          "parameter:thinking:off",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:custom",
-          "parameter:failed_batches:default"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-13",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-13/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-13",
-          "--no-thinking",
-          "--temperature",
-          "1.3",
-          "--max-iterations",
-          "3",
-          "--fallback-mode",
-          "raise_error",
-          "--fallback-prompt",
-          "PAIRWISE_CUSTOM_FALLBACK",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-13"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-13",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-14",
-      "source_scenario_id": "PC-PW-R2-14",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:default",
-          "parameter:thinking:on",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:30",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:2"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:default",
-          "parameter:thinking:on",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:30",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:2"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-14",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-14/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-14",
-          "--thinking",
-          "--temperature",
-          "0.2",
-          "--tool-timeout-seconds",
-          "30",
-          "--max-consecutive-failed-tool-batches",
-          "2",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-14"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-14",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-15",
-      "source_scenario_id": "PC-PW-R2-15",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:default",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-15",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-15/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-15",
-          "--detail",
-          "--thinking",
-          "--tool-timeout-seconds",
-          "0.5",
-          "--max-iterations",
-          "1",
-          "--fallback-mode",
-          "raise_error",
-          "--max-consecutive-failed-tool-batches",
-          "1",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-15"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-15",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-16",
-      "source_scenario_id": "PC-PW-R2-16",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:default",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:default"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:default",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:3",
-          "parameter:fallback_mode:force_answer",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:default"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-16",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-16/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-16",
-          "--detail",
-          "--temperature",
-          "1.3",
-          "--max-iterations",
-          "3",
-          "--fallback-mode",
-          "force_answer",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-16"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-16",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-17",
-      "source_scenario_id": "PC-PW-R2-17",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:1.3",
-          "parameter:tool_timeout:0.5",
-          "parameter:max_iterations:1",
-          "parameter:fallback_mode:default",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:1"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-17",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-17/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-17",
-          "--detail",
-          "--thinking",
-          "--temperature",
-          "1.3",
-          "--tool-timeout-seconds",
-          "0.5",
-          "--max-iterations",
-          "1",
-          "--max-consecutive-failed-tool-batches",
-          "1",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-17"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-17",
-        "execution_outcome": "success",
-        "exit_code": 0,
-        "evidence_status": "sufficient",
-        "gap_kind": "none"
-      },
-      "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
-      "applicable_from": "next-prompt-conformance-run",
-      "supersedes": null,
-      "superseded_by": null
-    },
-    {
-      "scenario_id": "prompt.PC-PW-R2-18",
-      "source_scenario_id": "PC-PW-R2-18",
-      "version": 1,
-      "status": "accepted",
-      "command": "prompt",
-      "path_kind": "positive",
-      "coverage_claims": {
-        "command_parameter_ids": [
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:default"
-        ],
-        "precondition_state_ids": [
-          "init-deepseek-config-explicit"
-        ],
-        "interactive_branch_option_ids": [],
-        "input_class_ids": [],
-        "combination_high_risk_ids": [
-          "combination:pairwise"
-        ],
-        "cross_command_assertion_ids": [],
-        "raw_stable_claims": [
-          "combination:pairwise",
-          "parameter:config:explicit",
-          "parameter:model:explicit",
-          "parameter:ticker:default",
-          "parameter:label:present",
-          "parameter:detail:on",
-          "parameter:thinking:on",
-          "parameter:temperature:0.2",
-          "parameter:tool_timeout:default",
-          "parameter:max_iterations:default",
-          "parameter:fallback_mode:raise_error",
-          "parameter:fallback_prompt:default",
-          "parameter:failed_batches:default"
-        ]
-      },
-      "invocation": {
-        "argv": [
-          "dayu-cli",
-          "prompt",
-          "--base",
-          "<run-root>/workspaces/PC-PW-R2-18",
-          "--config",
-          "<run-root>/workspaces/PC-PW-R2-18/config",
-          "--model",
-          "deepseek-v4-flash",
-          "--label",
-          "pairwise-18",
-          "--detail",
-          "--thinking",
-          "--temperature",
-          "0.2",
-          "--fallback-mode",
-          "raise_error",
-          "不要调用任何工具。只回复：PROMPT_OK"
-        ],
-        "cwd": "<repo-root>",
-        "stdin": "EOF",
-        "key_actions": [],
-        "key_action_timeline": [],
-        "raw_non_utf8_argv": {},
-        "unset_environment_names": []
-      },
-      "precondition": {
-        "state_id": "init-deepseek-config-explicit",
-        "workspace": "<run-root>/workspaces/PC-PW-R2-18"
-      },
-      "accepted_oracle_refs": [
-        "cli.prompt.core-execution@1"
-      ],
-      "oracle_predicate_refs": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "correctness_surfaces": [
-        "prompt.03-single-run-model-override",
-        "prompt.07-finite-temperature-forwarding",
-        "prompt.08-label-continuity-and-tool-evidence",
-        "prompt.11b-consecutive-failed-tool-batches",
-        "prompt.21-deterministic-exit-code-classification"
-      ],
-      "authorization_requirements": [
-        "ci-owned-workspace-write",
-        "real-provider-and-tool-use-when-invocation-reaches-runtime"
-      ],
-      "resource_budget": {
-        "timeout_seconds": 300.0,
-        "mock_fake_policy": "forbidden"
-      },
-      "required_evidence": [
-        "conversation-memory",
-        "event-log",
-        "exact-argv-and-input",
-        "exit-code-or-signal",
-        "filesystem-before-after",
-        "host-public-terminal",
-        "runner-input-reconstruction",
-        "screen-or-stdout-stderr",
-        "sqlite-before-after-or-not-applicable-proof",
-        "tool-trace"
-      ],
-      "observed_evidence": {
-        "bundle_id": "prompt-coverage-20260731TYgqzXg",
-        "report_id": "prompt-coverage-20260731TYgqzXg/observed-behavior",
-        "report_sha256": "d7fa272e523029e5f00c7aa31cc3ea213596295b98d56751ab1dd3f9ab17df1b",
-        "relative_ref": "evidence/PC-PW-R2-18",
         "execution_outcome": "success",
         "exit_code": 0,
         "evidence_status": "sufficient",
@@ -44830,266 +42747,289 @@
   ],
   "readiness_proof": {
     "proof_version": 1,
-    "generated_at": "2026-07-31",
+    "generated_at": "2026-08-01T18:34:56Z",
     "prompt": {
       "validation_result": "ready",
       "parser_inventory": {
         "inventory_id": "dayu.cli.arg_parsing.build_parser:prompt",
-        "inventory_version": 1,
-        "source_commit": "a34921575270b83c63d0c44224b4c8c3150f3d36",
+        "inventory_version": 2,
         "leaf": "prompt",
         "parameters": [
           {
+            "choices": null,
             "dest": "help",
+            "nargs": "0",
             "option_strings": [
               "-h",
               "--help"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "workspace_root",
+            "nargs": "None",
             "option_strings": [
               "--base",
               "-b",
               "--workspace"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
-            "dest": "log_level",
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "None",
             "option_strings": [
               "--log-level"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": [
-              "debug",
-              "verbose",
-              "info",
-              "warn",
-              "error",
-              "critical"
-            ],
-            "type": null
+            "type": "_parse_public_log_level"
           },
           {
-            "dest": "log_file",
-            "option_strings": [
-              "--log-file"
-            ],
-            "required": false,
-            "nargs": "None",
             "choices": null,
-            "type": null
-          },
-          {
-            "dest": "log_level",
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
             "option_strings": [
               "--debug"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
-            "dest": "debug_stream",
-            "option_strings": [
-              "--debug-stream"
-            ],
-            "required": false,
-            "nargs": "0",
             "choices": null,
-            "type": null
-          },
-          {
-            "dest": "log_level",
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
             "option_strings": [
               "--verbose"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
-            "dest": "log_level",
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
             "option_strings": [
               "--info"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
-            "dest": "log_level",
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
+            "option_strings": [
+              "--warn"
+            ],
+            "required": false,
+            "type": null
+          },
+          {
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
+            "option_strings": [
+              "--warning"
+            ],
+            "required": false,
+            "type": null
+          },
+          {
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
+            "option_strings": [
+              "--error"
+            ],
+            "required": false,
+            "type": null
+          },
+          {
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
+            "option_strings": [
+              "--critical"
+            ],
+            "required": false,
+            "type": null
+          },
+          {
+            "choices": null,
+            "dest": "_command_log_level_selectors",
+            "nargs": "0",
             "option_strings": [
               "--quiet"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
-            "dest": "config_dir",
+            "choices": null,
+            "dest": "log_file",
+            "nargs": "None",
             "option_strings": [
-              "--config"
+              "--log-file"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
+            "dest": "debug_stream",
+            "nargs": "0",
+            "option_strings": [
+              "--debug-stream"
+            ],
+            "required": false,
+            "type": null
+          },
+          {
+            "choices": null,
             "dest": "prompt",
+            "nargs": "None",
             "option_strings": [],
             "required": true,
-            "nargs": "None",
-            "choices": null,
             "type": "_non_empty_prompt"
           },
           {
+            "choices": null,
             "dest": "ticker",
+            "nargs": "None",
             "option_strings": [
               "--ticker"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "label",
+            "nargs": "None",
             "option_strings": [
               "--label"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "detail",
+            "nargs": "0",
             "option_strings": [
               "--detail"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "detail",
+            "nargs": "0",
             "option_strings": [
               "--no-detail"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "model",
+            "nargs": "None",
             "option_strings": [
               "--model",
               "-m"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "thinking",
+            "nargs": "0",
             "option_strings": [
               "--thinking"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "thinking",
+            "nargs": "0",
             "option_strings": [
               "--no-thinking"
             ],
             "required": false,
-            "nargs": "0",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "temperature",
+            "nargs": "None",
             "option_strings": [
               "--temperature"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": "float"
           },
           {
+            "choices": null,
             "dest": "tool_timeout_seconds",
+            "nargs": "None",
             "option_strings": [
               "--tool-timeout-seconds"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": "float"
           },
           {
+            "choices": null,
             "dest": "max_iterations",
+            "nargs": "None",
             "option_strings": [
               "--max-iterations"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": "int"
           },
           {
+            "choices": null,
             "dest": "fallback_mode",
+            "nargs": "None",
             "option_strings": [
               "--fallback-mode"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "fallback_prompt",
+            "nargs": "None",
             "option_strings": [
               "--fallback-prompt"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": null
           },
           {
+            "choices": null,
             "dest": "max_consecutive_failed_tool_batches",
+            "nargs": "None",
             "option_strings": [
               "--max-consecutive-failed-tool-batches"
             ],
             "required": false,
-            "nargs": "None",
-            "choices": null,
             "type": "int"
           }
         ],
-        "sha256": "ca66b4e2755f763253c9b475ed3b1374c64d111acc32a5c71fa36ffe306d57f1"
+        "sha256": "e83f3d12ab5eba99cdfb586e5b15cd99e01451c23b66ec2f9d7dd7ce94f1b9b3",
+        "source_commit": "9ad45cf717f192b12f411d03332b971f30aff472"
       },
       "interactive_inventory": {
         "inventory_id": "dayu.cli.prompt.runtime-keys",
@@ -45118,16 +43058,16 @@
         ],
         "sha256": "0d5f5d9189c1905357043e07f6a4e678578240b5bc754fe59917637044eee59e"
       },
-      "mandatory_obligation_count": 400,
-      "covered_obligation_count": 400,
+      "mandatory_obligation_count": 383,
+      "covered_obligation_count": 383,
       "gap_count": 0,
-      "accepted_scenario_count": 400,
+      "accepted_scenario_count": 383,
       "coverage_dimension_scenario_counts": {
-        "command_parameter_ids": 50,
-        "precondition_state_ids": 400,
+        "command_parameter_ids": 33,
+        "precondition_state_ids": 383,
         "interactive_branch_option_ids": 16,
-        "input_class_ids": 10,
-        "combination_high_risk_ids": 332,
+        "input_class_ids": 8,
+        "combination_high_risk_ids": 319,
         "cross_command_assertion_ids": 5
       },
       "user_adjudication_identity": "cli.prompt.core-execution@1:user-adjudication:2026-07-31",
@@ -45157,14 +43097,7 @@
       "accepted_oracle_refs": [
         "cli.prompt.core-execution@1"
       ],
-      "implementation_findings_do_not_reduce_readiness": [
-        "prompt.cancel-closeout-reason-ui-leak",
-        "prompt.repeated-ctrl-c-not-graceful",
-        "prompt.startup-ctrl-c-traceback-or-signal-exit",
-        "prompt.logging-selector-and-debug-stream-contract",
-        "prompt.log-file-missing-parent-exit-code",
-        "prompt.invalid-utf8-owner-and-exit-code"
-      ]
+      "implementation_findings_do_not_reduce_readiness": []
     },
     "global": {
       "validation_result": "calibration",

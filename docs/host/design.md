@@ -3657,6 +3657,7 @@ reactive provider context overflow 通常没有可靠 usage 或 budget state。�
 - proactive path 在 dispatch 前使用估算输入决定是否触发 compact 或禁止 dispatch；proactive compact operation 的 bounded repair attempts 全部耗尽后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。
 - reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；它接受 quality 通过的 compact 结果，随后用真实 recovery dispatch / Engine overflow 闭环判断是否还需要下一次 reactive compact。
 - 每个 Run / input snapshot 的 proactive trigger 固定最多启动一个 durable compaction operation；这是Host状态机不变量，不是可配置次数预算。正常成功、semantic repair、tier 1-3 recovery与tier 4/5 fallback都在该operation内收敛；不得通过第二条proactive `CONTEXT_COMPACTION_REQUESTED`重试同一snapshot。若Host在request committed后、operation terminal前退出，fresh`READ_WRITE` attachment只能恢复同一operation，并把已durable记录的proposal manifests / rejected attempts计入`max_compaction_attempts_per_operation`；无法可信恢复时按同一operation fail / fallback，不得新建operation。reactive trigger每次Engine overflow最多启动一个operation，但同一Run可在`max_reactive_compactions_per_run`上限内多次reactive compact，默认上限为2。一个operation内可以包含Host-owned bounded semantic repair attempts，但不得启动无界compact loop。
+- 同一 live read-write Session 的 pre-start governance 必须由 scheduler-local single-flight owner 串行化。admission wake、queue promotion wake 与 periodic owned-session reconciliation 只能合并为同一 live flight 的 pending signal；当前 pass 完成后，若有 pending signal，必须取得新的 `SessionWorkLease` 再执行下一 pass。lease 只表达生命周期访问权，不可被当成互斥锁。caller cancellation 不取消共享 flight；attachment / scheduler close 必须取消并等待它。fresh owner 只能从 durable pending operation 恢复治理，不读取前任 opener 的内存 signal。由此，同一 Session 同时至多有一个 pre-start compactor 调用和一个 promotion/governance decision，但不同 Session 仍可并发。
 - `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt、reactive material
   block pass proposal 与后续 whole-candidate semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
   调用总数；默认 packaged policy 为 5 次。代码 fallback 默认值与 execution profile 默认值必须保持一致，避免同一 Host 在不同装配路径下出现不同 compact retry 语义。该字段不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
@@ -3778,6 +3779,16 @@ CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, inpu
   -> CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
 ```
 
+`CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` 的唯一语义 owner 是 Host
+compaction terminal transaction helper，且 proactive 与 reactive writer 必须复用同一个
+trigger-aware contract。helper 在 transaction 内读取 operation request 与既有 terminals：零 terminal
+时向当前 writer 发放 commit permit；恰好一个 matching terminal 时把重入或迟到结果裁为
+diagnostic-only no-op；多个 terminal、wrong trigger、wrong operation 或缺失 request 一律 fail closed。
+writer 必须在 artifact 写入、terminal append、fallback、Attempt start 与 wake 之前取得 permit。
+因此每个 operation 精确一个 canonical terminal，first committer 的 reason/outcome 保持不变，late
+provider result 不能创建第二份 artifact、第二个 fallback 或第二个 execution；该 helper 只理解
+compaction request/trigger/terminal，不扩展为通用 terminal framework。
+
 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` 是 Host governance diagnostic canonical fact，用于回答尝试次数、失败类别、是否 exhaust budget 和最终接受的是哪次 attempt。内部 EventLog 可以在 effective execution canonical fact 中保存 resolved provider headers / API key，但 compact request、attempt rejection diagnostic、artifact、Tool Trace、audit、HostEvent、memory / evidence、LLM-facing material 与日志都不得包含这些 secret 明文。完整 raw prompt、完整 provider payload、大 raw candidate、provider error body 或 repair prompt 如需保留，必须写受控 artifact / diagnostic ref，并在进入任何 public、LLM-facing、audit、trace 或 log projection 前由其 source owner 做敏感信息过滤与有界化。
 
 HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
@@ -3879,9 +3890,11 @@ reactive path 约束：
 - proactive compact failure 在 dispatch 前先完成 tier 1-3 compact recovery fallback；若仍失败且 policy 允许 dispatch fallback，再尝试 tier 4 floor-only / tier 5 current-input-only。tier 4/5 fallback 预算通过时允许创建 Attempt，但不得写 `CONTEXT_COMPACTED` 或 memory projection。fallback 仍超预算或 policy 不允许 fallback 时，Run 按 failure policy 收口，后续引入 `REJECTED` 后应归入 governance rejection，不得进入 `RECOVERING`。
 - reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Host 可按 policy 完成 tier 1-3 compact recovery fallback，仍失败后再尝试 tier 4/5 dispatch fallback，并在 fallback 预算通过时创建新的 recovery Attempt。fallback 仍超预算或 policy 不允许 fallback 时，Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
 - `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 operation id、trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor、retry / repair budget snapshot 和 reason。
-- `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision。
-- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、accepted candidate digest、prompt-local label mapping refs、source boundary refs、accepted evidence mapping refs、quality check result、budget after compact 与 projection signal。
+- `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision；若 rejection 发生在 Engine 已返回成功 final 之后，还必须绑定产生被拒 candidate 的 `SuccessfulRunnerResponseIdentity`。
+- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、accepted candidate digest、prompt-local label mapping refs、source boundary refs、accepted evidence mapping refs、quality check result、budget after compact、projection signal，以及产生 accepted candidate 的 required `SuccessfulRunnerResponseIdentity`。
 - `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs；若 policy decision 采用 tier 4/5 dispatch fallback，还必须记录 fallback tier、fallback input window / digest、fallback budget result，以及 fallback 后是 dispatch 还是 fail closed。
+
+`SuccessfulRunnerResponseIdentity` 必须直接来自同一个 compactor Engine success terminal，并包含 effective provider/model、终止调用的 `RunnerRequestIdentity` 以及严格配对的 provider request id availability/value。每个 Host semantic attempt 都重新准备一个 compactor `AgentRunRequest`，identity 必须与该 attempt 的 `compactor_engine_run_id`、proposal manifest、candidate/output 同源；Engine 内部 length continuation 的最终 runner call index 必须如实保留。provider request id 不可用时只允许 `unavailable + None`。不得从 Service model family、配置、manifest、usage、相邻 event 或时间顺序反推 response identity；endpoint、credential ref/value、headers、secret 和 provider raw request/response payload 不进入 accepted/rejected durable payload、artifact projection、trace、memory 或 LLM-facing material。
 
 compact 不变量：
 
@@ -3931,7 +3944,7 @@ Recovery 的输入只能是 Host durable truth：Run / Attempt indexes、EventLo
 
 fresh attachment 的 access mode 只能在 mutex acquire 完成后确定；`READ_WRITE` attachment 必须在对外 successful return 前完成目标 Session 的全部 recovery pages 与 commit 后 wake。任一 batch、cursor invariant 或 wake bridge 失败时，attach 必须清理局部分配、释放 mutex 并失败，不能返回一个表面可写但 recovery 未完成的 attachment。固定 watermark 之后新接受、且 keyset 高于该 watermark 的 Run 留给下一轮 scan，避免 attach 扫描因并发 admission 无限延长。
 
-fresh `READ_WRITE` attachment 若在旧 owner heartbeat 到达 `stale_after` 前立即 attach，首次 scan 的 `OWNER_STILL_LIVE` / `ORPHAN_INCONCLUSIVE` 不能解除该 attachment 对目标 Session 的 unfinished-recovery obligation。只要该 attachment 仍存活且目标 Run 仍未终结，它必须按旧 owner row 的 heartbeat、policy threshold 与进程身份安排 target-scoped delayed reconcile；到达最早可重新判定时点后读取新的真实 `now` 并重新执行同一 positive-orphan classifier。该 reconcile 仍必须服从固定 watermark、bounded page、CAS、positive proof 与每 Run recovery dispatch 上限，不能轮询 takeover，也不能因 mutex 已取得而提前恢复；但不得让一个在 threshold 前立即重连的用户永久看到旧 Run 停留 `RUNNING`，或要求用户在 threshold 后再次手工重启客户端才能触发恢复。attachment 关闭时取消尚未开始的本地 delayed wake不会写任何治理事实；后续 fresh writer重新承担同一obligation。
+fresh `READ_WRITE` attachment 若在旧 owner heartbeat 到达 `stale_after` 前立即 attach，首次 scan 的 `OWNER_STILL_LIVE` / `ORPHAN_INCONCLUSIVE` 不能解除该 attachment 对目标 Session 的 unfinished-recovery obligation。只要该 attachment 仍存活且目标 Run 仍未终结，当前 attachment recovery owner 必须按旧 owner row 的 heartbeat、policy threshold 与进程身份安排单个 target-scoped、bounded delayed reclassification task；到达最早可重新判定时点后读取新的真实 `now` 并重新执行同一 positive-orphan classifier。该 reclassification 仍必须服从固定 watermark、bounded page、CAS、positive proof 与每 Run recovery dispatch 上限，不能轮询 takeover，也不能因 mutex 已取得而提前恢复；但不得让一个在 threshold 前立即重连的用户永久看到旧 Run 停留 `RUNNING`，或要求用户在 threshold 后再次手工重启客户端才能触发恢复。attachment 关闭时必须取消并 join 尚未完成的 delayed task；取消本地 task 不写任何治理事实，后续 fresh writer 重新承担同一 obligation。`READ_ONLY` attachment 不安排该 task，也不执行任何 target recovery scan。
 
 Recovery scan semantic path：
 

@@ -69,7 +69,7 @@ flowchart TD
 
 ## 稳定边界
 
-- `UI` 当前主要是外部调用者角色；本手册只把已经实现并发布的 package 作为稳定边界。当前 CLI 在选定 Session 后显式取得并持有 Host public attachment，随后才通过 Service / Host public view 发起动作和订阅结果；attachment 与 UI 会话同生命周期，UI 不写 Host truth。
+- `UI` 当前主要是外部调用者角色；本手册只把已经实现并发布的 package 作为稳定边界。当前 CLI 在选定 Session 后显式取得并持有 Host public attachment，随后才通过 Service / Host public view 发起动作和订阅结果；attachment 与 UI 会话同生命周期，UI 不写 Host truth。`prompt` 与 `interactive` 的有 label 入口复用同一个 `cli.agent` slot owner；无 label invocation 各自创建 fresh anonymous Session。TTY interactive 的 composer 是整个 invocation 的唯一 stdin owner，non-TTY interactive 则把整个 UTF-8 stream 作为一个 follow-up。
 - `dayu.service` 是 Host 外部 composition boundary。execution assembly 把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`；admin assembly 只从 Host runtime storage config 映射 `OpenHostAdminOptions`，不加载 scene、tool、model 或 secret。Service 还提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up sole-consumer terminal observation、typed delivery interruption durable recovery 与 cancel request 构造；事件 watcher 只表达订阅，不授予、缓存或推断 Session 修改权限。Fins direct 命令入口通过 `dayu.service.fins_direct` 暴露 `AsyncIterator[FinsEvent]`，不伪装成 Host Run，也不把 CLI 操作建模为 durable job。Tool Trace operator 入口由 Service 发现显式文件/目录布局，调用 Host public Analyzer，再按 JSON→Markdown 固定顺序逐文件原子替换同一 structured report 的两个输出；双文件不构成事务。
 - `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、Session Event Delivery、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
 - `dayu.engine` 是单次 run 执行边界。它不导入 Host，不读取 Host durable store，不管理 Session / Run / Attempt，不发现工具，不持有工具权限或财报业务语义。
@@ -126,9 +126,13 @@ wait callback completion 是 wait-resume 的 transport-facing 入口形态。Ser
 
 proactive compact 由 Host context budget 在 Attempt 创建前触发；reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该事件来自 provider 明确报告输入上下文溢出，不来自 final candidate 的 `finish_reason=LENGTH`。`LENGTH` 表示达到模型输出上限，属于 Engine length continuation / degraded answer 机制。Compact 执行、candidate 校验、artifact 写入、recovery Attempt 创建与 fallback / failure / cancel 收口都由 Host 治理。
 
+同一 Session 的 pre-start governance 由 Host scheduler-local single-flight 串行化；多个 wake / periodic signal 只合并为同一 live flight 的后续检查，不并发运行 compactor。每个 proactive 或 reactive compaction operation 的成功/失败终态由 Host 共享 terminal owner 在 transaction 内 first-committer-wins，迟到结果不能再写 artifact、terminal、fallback 或启动 Attempt。Engine 的成功 final contract 同时携带终止该回答的 Runner response identity；Host compactor 直接保留这份 identity，并把 accepted / rejected outcome 与同一 operation、attempt、proposal manifest 和 candidate/output 绑定，不从 Service 配置、manifest 或相邻事件反推 provider 响应。
+
 ### Startup recovery
 
 如果 LLM / Engine 未返回时 Host 进程退出，Host 不在退出瞬间伪造 terminal facts。下次 `open_host` 启动时，startup recovery scanner 基于 durable Run / Attempt / dispatch / owner liveness truth 做 positive orphan proof 分类；只有证据成立时才 closeout 旧 Attempt 或创建 recovery Attempt。runtime lane TTL、projection lag 或 worker 没返回本身不构成 recovery truth。
+
+fresh read-write attachment 的首次目标扫描如果尚未达到 orphan stale threshold，会由 attachment owner 安排一次 bounded delayed reclassification；到期后使用新的 `now` 重做 positive proof，并在 attachment close 时取消并等待该任务。read-only attachment 不运行该恢复路径。
 
 ### 投递与派生视图
 

@@ -186,6 +186,7 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 - `RunnerSpec`：Runner 规约，包含 provider、model、endpoint、API key 引用、headers、client correlation policy、tool / stream capability、timeout、retry、provider 请求扩展、SSE idle 配置。
 - `RunnerCallOptions`：单次 Runner 调用参数，包含 `temperature`、`max_tokens`、`top_p`、`stream`。
 - `RunnerRequestIdentity`：单次逻辑 Runner 调用身份，包含 `run_id`、可选且成对出现的 `attempt_id` / `execution_id`、`iteration_id`、`iteration_index`、`runner_call_index` 和派生 `client_correlation_id`。
+- `SuccessfulRunnerResponseIdentity`：实际终结成功回答的 Runner response identity，包含 effective provider/model、同一次 `RunnerRequestIdentity`，以及严格成对的 provider request id `present + value` 或 `unavailable + None`。
 - `ProviderRequestExtension`：provider 请求扩展封闭联合，当前成员包括 OpenAI reasoning、Anthropic thinking、DeepSeek thinking、MiMo thinking、Gemini thinking、Qwen thinking。
 - `ClientCorrelationPolicy`：客户端关联 id 的 provider 协议 outbound 映射策略，当前支持 `DISABLED` 与 `OPENAI_X_CLIENT_REQUEST_ID`。
 
@@ -243,7 +244,7 @@ Stream 术语固定如下：
 - `SSE stream` / provider streaming：Runner 与 provider 之间的传输能力，由 `RunnerCallOptions.stream`、`RunnerSpec.supports_streaming`、`supports_stream_usage` 和 SSE idle 配置控制。
 - `Host event stream`：Host 从 EventLog `event_sequence` cursor 派生的订阅 / 补读流，不属于 Engine 能力面。
 
-`EngineEvent.metadata` 只是中性 observer / debug hint。契约事实必须进入强类型 `data` 字段，不得放进 metadata 让调用方解析。
+`EngineEvent.metadata` 只是中性 observer / debug hint。契约事实必须进入强类型 `data` 字段，不得放进 metadata 让调用方解析。成功终态的 `FinalAnswerData.response_identity` 与聚合结果 `EngineRunOutcomeFinalAnswer.response_identity` 是同一个 required typed fact；调用方不应从 iteration preview、usage、配置或 metadata 重建它。
 
 ## 主要组件
 
@@ -254,7 +255,7 @@ Stream 术语固定如下：
 - 校验运行槽位，防止同一 Agent 实例并发复用。
 - 产出 `iteration_started` 并构造每次逻辑 Runner 调用的 `RunnerRequestIdentity`。
 - 消费 RunnerEvent，提升为 EngineEvent 或 run decision。
-- 根据 final answer、tool calls、provider failure、context overflow、continuation 和 fallback 选择下一步。
+- 根据 final answer、tool calls、provider failure、context overflow、continuation 和 fallback 选择下一步；接受成功 final 时把实际终止调用的 request identity、effective provider/model 与 `RunnerDoneData.provider_request_id` 组成 `SuccessfulRunnerResponseIdentity`，并原样投影到 event 与 aggregate outcome。
 - 通过 `ToolExecutor` 执行工具批次，并处理 completed / failed / cancelled / awaiting outcome。
 - 在终态路径和生成器关闭路径幂等关闭 Runner。
 
@@ -473,7 +474,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent stream 结束；提升到 E
 
 取消 token 的语义是阻止未来工作，不撤回已接受事实。Agent 在迭代前、Runner 事件消费后、工具执行等待边界、工具结果注入后和下一轮工作开始前观察 token。取消赢得当前边界时，Engine 以 `run_cancelled` 与 `EngineRunOutcomeCancelled` 收口。
 
-Agent 使用单一 typed `RunnerDoneData` 作为 Runner iteration commit，finish reason 与 provider request id 都从该 fact 读取。已经提升的 RunnerEvent、Runner done 后分类得到的 final / tool / failure candidate、已经 accepted 的普通工具结果和已经返回的 awaiting outcome 不会被迟到取消改写。
+Agent 使用单一 typed `RunnerDoneData` 作为 Runner iteration commit，finish reason 与 provider request id 都从该 fact 读取。成功 final 必须把该 done fact 与当前 iteration 已持有的 `RunnerRequestIdentity`、实际 `RunnerSpec.provider/model` 组合成 required `SuccessfulRunnerResponseIdentity`；provider request id 缺失时使用显式 unavailable 状态和 `None`，不伪造 id。普通 final、length continuation 后 final 与 force-answer final 都遵守同一 owner contract。已经提升的 RunnerEvent、Runner done 后分类得到的 final / tool / failure candidate、已经 accepted 的普通工具结果和已经返回的 awaiting outcome 不会被迟到取消改写。
 
 ### 工具握手 timeout
 

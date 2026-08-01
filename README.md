@@ -170,7 +170,7 @@ dayu-cli <command> --help
 | 参数 | 说明 |
 |---|---|
 | `--base` / `--workspace` | 工作区根目录，默认 `./workspace` |
-| `--config` | 除 `init` 外，Agent / Session runtime 使用的显式配置目录；相对路径必须位于工作区内 |
+| `--config` | 部分独立 runtime 命令使用的显式配置目录；`prompt`、`interactive` 及其 `session resume` 模式不接受该参数，统一读取工作区 `config/` 或包内默认配置 |
 | `--log-level LEVEL` | 可选 `debug`、`verbose`、`info`、`warning`、`error`、`critical`、`quiet`；`warn` 与 `warning` 等价 |
 | `--debug` / `--verbose` / `--info` / `--warning` / `--error` / `--critical` / `--quiet` | 对应日志等级的快捷参数；同时保留与 `--warning` 等价的 `--warn` |
 | `--debug-stream` | 额外打开高频 stream/SSE 诊断，不改变普通日志等级；不可与 `quiet` 组合 |
@@ -218,16 +218,26 @@ dayu-cli prompt "总结最新财报的主要风险" --ticker AAPL
 ### 4.2 多轮交互
 
 ```bash
-dayu-cli interactive --ticker AAPL
-dayu-cli interactive --ticker AAPL --label earnings
+dayu-cli interactive
+dayu-cli interactive --label earnings
 ```
 
 不传 `--label` 时，每次启动创建一个新的未绑定 Session；传入 label 时复用
-`cli.interactive.<label>` 对应 Session。`interactive --ticker` 与 `prompt --ticker`
-使用同一个模型可读 scene context 规则。
+`cli.agent.<label>` 对应 Session。`prompt --label earnings` 与
+`interactive --label earnings` 使用同一个 label owner 和同一个 Session；旧
+`cli.prompt.*` / `cli.interactive.*` slot 不会被自动读取或迁移。`interactive`
+不接受 `--ticker`；需要指定分析主体时，请直接写在本轮输入中。
 
-交互输入态使用 `Ctrl-D` 退出。运行态第一次 `Ctrl-C` 请求取消当前任务；任务仍在
-收口时再次 `Ctrl-C` 会让本地 CLI 退出。
+TTY 输入中，Enter 提交，`Ctrl+J` 或支持 xterm Shift+Enter 序列的终端插入换行；
+运行期间键入的 draft 会保留到当前任务收口，Enter 最多排入一个后续问题并在当前任务
+终态后执行。独立 Escape 或第一次 `Ctrl+C` 请求取消当前任务；取消收口期间再次
+`Ctrl+C` 只登记“收口后退出”，CLI 仍会等待当前 canonical terminal 和已经 accepted
+的唯一后续任务完成，再以 130 退出。CSI、Alt 和 bracketed paste 不会因 Escape 前缀
+误触发取消。
+
+空闲且输入为空时，`Ctrl-D` 正常退出；运行期间 `Ctrl-D` 不取消任务。stdin 不是 TTY
+时，`interactive` 会读取整个 UTF-8 输入流，只做一次提交，不显示提示符，也不把换行
+拆成多个 Run；空白流不提交，非法 UTF-8 作为稳定用法错误退出。
 
 ## 5. 下载、上传与预处理
 
@@ -357,15 +367,16 @@ dayu-cli session resume \
   "继续分析现金流"
 ```
 
-通过 label 恢复 interactive Session 时必须给出 kind：
+通过 label 恢复 interactive Session：
 
 ```bash
 dayu-cli session resume \
   --label earnings \
-  --kind interactive \
-  --mode interactive \
-  --ticker AAPL
+  --mode interactive
 ```
+
+label selector 不再接受 `--kind`。`--mode` 只选择本次输入方式；prompt 模式仍可使用
+`--ticker`，interactive 模式不接受 `--ticker`。两个模式也都不接受显式 `--config`。
 
 清理 Session 需要显式确认；CLI 不会自动 close 或 cancel：
 
