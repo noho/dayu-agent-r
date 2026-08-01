@@ -585,17 +585,67 @@ override、delegate 或消费 `ContextCompactor` / prepared-compactor typed retu
 | `tests/host/test_submit_followup_public_contract.py` | `FA(1)` |
 | `tests/host/test_watch_session_events.py` | `FA(1)` |
 
-机械闭包总计 25 个去重文件：35 个 `FinalAnswerData(...)` 直接构造、4 个
-`EngineRunOutcomeFinalAnswer(...)` 直接构造，以及 7 个 `ContextCompactor`
-typed-return 相关文件；其中 5 个已在上方 owner-level 清单，新增 allowed-file
-缺口为 20 个。实现前必须重跑同一 inventory；若 HEAD 之后出现新直接构造点，先退回
+上述第一 amendment 的 tests/test-support 机械闭包总计 25 个去重文件：35 个
+`FinalAnswerData(...)` 直接构造、4 个 `EngineRunOutcomeFinalAnswer(...)` 直接构造，以及
+7 个 `ContextCompactor` typed-return 相关文件；其中 5 个已在上方 owner-level 清单，
+当时新增 allowed-file 缺口为 20 个。
+
+第三次 accepted-plan premise invalidation 在 accepted HEAD
+`e7f578dc7bdfafb51a859be2db584300e08f81fb` 证明第一 amendment 只枚举 `tests/`，遗漏了
+全量 `python -m pyright dayu/ tests/ utils/` 必然覆盖的两个既有 smoke consumer。二者与
+上述 25-file tests closure 无重叠，且 `utils/` 没有 `ContextCompactor` typed-return hit：
+
+| 文件 | accepted HEAD 精确调用行证据 | S5 boundary 状态 |
+|---|---|---|
+| `utils/smoke_host_public_awaiting_entrypoint.py` | `FinalAnswerData(...)`：2010 | 第三次 amendment 新增；只允许 required identity 机械迁移 |
+| `utils/smoke_host_public_conversation_memory_scenarios.py` | `EngineRunOutcomeFinalAnswer(...)`：1748、1794；`FinalAnswerData(...)`：1843 | 第三次 amendment 新增；只允许 required identity 机械迁移 |
+
+完整 tests+utils identity/typed-return closure 因此精确为：`FinalAnswerData(...)` 37 calls /
+21 files、`EngineRunOutcomeFinalAnswer(...)` 6 calls / 4 files、`ContextCompactor`
+typed-return 7 files，三类去重 union 27 files。S5 实现前必须在 `tests/` 与 `utils/` 上重跑
+同一 inventory；若 accepted HEAD 之后出现新直接构造点或 typed-return file，先退回
 controller 修订 allowed files，不得在未列文件中补 default/fallback。
 
-所有机械调用点必须从该 fake/event/outcome 的同一次测试输入构造
+所有 tests 与 utils 机械调用点必须从该 fake/event/outcome 的同一次 typed invocation/input 构造
 `SuccessfulRunnerResponseIdentity`：run、iteration、attempt/execution、provider/model
-与 provider request id availability 必须同源。没有 provider request id 的测试明确使用
+与 provider request id availability 必须同源。没有 provider request id 的 fixture/smoke 明确使用
 `UNAVAILABLE + None`；不得复用相邻 Run/iteration/compactor attempt 的 identity，不得
 增加 optional default、兼容构造签名、全局万能 identity fixture 或下游补值。
+
+两个 utils 文件的唯一 allowed delta 冻结如下；它们是 smoke fixture consumer，不获得
+Engine identity 业务规则所有权：
+
+1. 每个文件只可增加构造 required `SuccessfulRunnerResponseIdentity` 所需的精确 imports、
+   module-level private smoke identity 常量/窄 helper，以及 4 个 direct constructors 的 required
+   `response_identity` 实参。两个文件分别定义 file-local
+   `_unavailable_smoke_response_identity(*, request, iteration_id, iteration_index, runner_call_index)`；
+   所有参数 required 且无 default。不得新增跨文件共享 helper或通用
+   identity builder。
+2. `utils/smoke_host_public_awaiting_entrypoint.py::_AnswerHandle.events()` 必须从已持有的
+   `self._request` 构造 identity：`run_id/attempt_id/execution_id` 直接取该 request，
+   provider/model 直接取 `self._request.runner_spec.provider/model`；该 synthetic smoke request
+   只模拟一个成功 Runner call，所以由调用点显式传
+   `_ANSWER_RESPONSE_ITERATION_ID = "awaiting-smoke-answer-iteration"`、
+   `_SMOKE_RESPONSE_ITERATION_INDEX = 0`、`_SMOKE_RESPONSE_RUNNER_CALL_INDEX = 1`，provider request id 使用
+   `UNAVAILABLE + None`。
+3. `utils/smoke_host_public_conversation_memory_scenarios.py` 中
+   `_DeterministicCompactWorker.accept()` 已同时持有 `AttemptDispatchSnapshot` 与同一次
+   `AgentRunRequest`；它必须从该 request 构造 identity，并把 required typed value 显式传给
+   `_final_answer_event(...)`，后者新增无 default 的 required typed 参数并只机械写入
+   `FinalAnswerData.response_identity`。`_AcceptingSmokeCompactorRunner.__call__()` 与
+   `_RejectingSmokeCompactorRunner.__call__()` 分别从各自收到的 compactor
+   `AgentRunRequest` 构造并写入 outcome identity。三处均直接使用 request 的
+   `run_id/attempt_id/execution_id` 与 `runner_spec.provider/model`；ordinary final、accepting
+   compactor、rejecting compactor 的调用点分别显式传
+   `"smoke-final-answer-iteration"`、`"smoke-accepting-compactor-iteration"`、
+   `"smoke-rejecting-compactor-iteration"` 三个 module-level private 常量，并共同显式传
+   `_SMOKE_RESPONSE_ITERATION_INDEX = 0`、`_SMOKE_RESPONSE_RUNNER_CALL_INDEX = 1`。provider request id
+   使用 `UNAVAILABLE + None`；不同 Host compactor attempt 依靠各自 request.run_id 保持身份
+   分离。
+4. identity 不得从 runtime/workspace config、manifest、CLI 参数、相邻 event、输出文本、
+   provider family 或 smoke 全局状态反推。迁移不得改变调用次数、scene/suite、worker/compactor
+   分支、provider 配置、输出文本/marker、CLI oracle、artifact/EventLog 断言或异常语义；不得为
+   identity 增加新的输出。
 
 S5 另有一个独立的 strict durable builder 调用闭包。§9.4 将
 `CONTEXT_COMPACTED.successful_response_identity` 固定为 required mapping，并将
@@ -626,9 +676,20 @@ boundary，不是完整调用迁移范围；原已允许的 3 个文件同样必
 
 该 inventory 精确为 accepted builder `8 calls / 6 files`、rejected builder
 `7 calls / 4 files`、去重 `8 files`；其中 3 个文件此前已在 S5 owner-level / behavior
-test 清单，新增 allowed-file 缺口精确为后 5 个文件。第一 amendment 的 25-file
-identity/typed-return closure 原样保留；按本次新增 allowed-file delta 计，S5 枚举的
-机械闭包总 union 从 25 增至 30 个去重 test/test-support files。
+test 清单，新增 allowed-file 缺口精确为后 5 个文件。第一 amendment 的 25-file tests
+identity/typed-return closure 原样保留；第三次 amendment 加入与其无重叠的 2 个 utils 后，
+完整 tests+utils identity/typed-return closure 为 27 files。该 27-file closure 与完整 8-file
+builder closure 的 overlap 精确为 2 files：`tests/host/test_compaction_operation.py`、
+`tests/host/test_dispatch_scheduler.py`。因此 builder closure 相对 27-file closure 的 set
+difference 精确为 6 files：`tests/host/test_context_compact_events.py`、
+`tests/host/test_memory_projection.py`、`tests/host/test_compaction_terminal.py`、
+`tests/host/test_run_input_builder.py`、`tests/host/test_compact_material.py`、
+`tests/host/test_proactive_compaction_operation.py`。其中
+`tests/host/test_context_compact_events.py` 在第二次 amendment 前已经属于 S5 allowed owner
+tests，但没有 FA/OA/CR hit；其余 5 files 才是第二次 amendment 新增的 allowed-file delta。
+完整 S5 枚举 mechanical union 必须按全集去重为
+`27 identity/typed-return + 8 builder - 2 overlap = 33 files`；不得把 5-file allowed-file delta
+误当作 builder closure 相对 identity closure 的完整 set difference。
 
 Base HEAD 的 15 个 call 都尚未携带该参数，因为 owner signature 也尚未扩展；不得暗示
 这些测试已经拥有可直接复用的 runtime response identity。这 15 个 direct call sites 的
@@ -970,6 +1031,32 @@ Smoke分三层，不能互相冒充：
 2. POSIX PTY smoke：真实PTY exact bytes与terminal restore；非POSIX记录capability/skip，不拿pipe代替。
 3. 按 `docs/cli_ci.md` 执行有授权的真实CLI scenario并冻结evidence；本WU不创建新通用harness。真实provider successful compaction若未执行，只报告行为项29/G06外部证据未关闭，不用fake替代。
 
+第三次 amendment 放行的两个既有 utils smoke 不新增测试，也不承担 coverage 指标；required
+identity 迁移必须由全量 pyright、post-inventory、后续 code review 与以下既有 smoke 验证共同
+关闭。命令不得改变 suite、provider 配置或输出 oracle：
+
+```bash
+python utils/smoke_host_public_awaiting_entrypoint.py \
+  --workspace-root workspace/tmp/wu-cli-interactive-02-s5-awaiting-identity
+
+DEEPSEEK_API_KEY=test-provider-key \
+python utils/smoke_host_public_conversation_memory_scenarios.py \
+  --suite memory-reactive-compact \
+  --log-level CRITICAL
+
+DEEPSEEK_API_KEY=test-provider-key \
+python utils/smoke_host_public_conversation_memory_scenarios.py \
+  --suite memory-compact-fallback \
+  --pressure-mode auto \
+  --log-level CRITICAL
+```
+
+awaiting smoke 必须保持既有 11-phase public Host/Service path 与最终 pass marker；
+`memory-reactive-compact` 必须覆盖 accepting compactor outcome 与 ordinary final event，
+`memory-compact-fallback` 必须覆盖 rejecting compactor outcome 与 ordinary final event。三条命令的
+既有场景、stdout marker、CLI oracle 和 provider assembly 断言不得改变；本次迁移只让它们在
+required typed contract 下继续成立。
+
 完整类型检查：
 
 ```bash
@@ -979,28 +1066,95 @@ python -m pyright dayu/ tests/ utils/
 S5 implementation 前后都重跑 required-constructor / typed-return inventory：
 
 ```bash
-rg -n --glob '*.py' '\bFinalAnswerData\s*\(' tests
-rg -n --glob '*.py' '\bEngineRunOutcomeFinalAnswer\s*\(' tests
+rg -n --glob '*.py' '\bFinalAnswerData\s*\(' tests utils
+rg -n --glob '*.py' '\bEngineRunOutcomeFinalAnswer\s*\(' tests utils
 rg -n --glob '*.py' \
   '\b(ContextCompactor|FakeContextCompactor|prepare_compactor_proposal_run_input|run_prepared_compactor_proposal)\b' \
-  tests
+  tests utils
 rg -n --glob '*.py' '\bbuild_context_compacted_payload\s*\(' tests/host
 rg -n --glob '*.py' \
   '\bbuild_context_compaction_attempt_rejected_payload\s*\(' tests/host
 ```
 
-以 §9.1 的两组 HEAD 基线为 closure 起点：第一 amendment 的 identity/typed-return
-inventory 保持 25-file closure；durable builder pre-inventory 必须重现 accepted
+除逐类核对 calls/files 外，pre/post 都必须执行以下完整五类 pattern 去重检查；该检查直接构造
+27-file identity/typed-return closure 与 8-file builder closure，验证 exact overlap、builder-only
+set difference 和 33-file union，不得只把 allowed-file delta 相加：
+
+```bash
+identity_files="$(
+  {
+    rg -l --glob '*.py' '\bFinalAnswerData\s*\(' tests utils
+    rg -l --glob '*.py' '\bEngineRunOutcomeFinalAnswer\s*\(' tests utils
+    rg -l --glob '*.py' \
+      '\b(ContextCompactor|FakeContextCompactor|prepare_compactor_proposal_run_input|run_prepared_compactor_proposal)\b' \
+      tests utils
+  } | sort -u
+)"
+builder_files="$(
+  {
+    rg -l --glob '*.py' '\bbuild_context_compacted_payload\s*\(' tests/host
+    rg -l --glob '*.py' \
+      '\bbuild_context_compaction_attempt_rejected_payload\s*\(' tests/host
+  } | sort -u
+)"
+overlap_files="$(
+  comm -12 \
+    <(printf '%s\n' "$identity_files") \
+    <(printf '%s\n' "$builder_files")
+)"
+builder_only_files="$(
+  comm -13 \
+    <(printf '%s\n' "$identity_files") \
+    <(printf '%s\n' "$builder_files")
+)"
+mechanical_files="$(
+  {
+    printf '%s\n' "$identity_files"
+    printf '%s\n' "$builder_files"
+  } | sort -u
+)"
+
+test "$(printf '%s\n' "$identity_files" | wc -l | tr -d ' ')" -eq 27
+test "$(printf '%s\n' "$builder_files" | wc -l | tr -d ' ')" -eq 8
+test "$(printf '%s\n' "$overlap_files" | wc -l | tr -d ' ')" -eq 2
+test "$(printf '%s\n' "$builder_only_files" | wc -l | tr -d ' ')" -eq 6
+test "$(printf '%s\n' "$mechanical_files" | wc -l | tr -d ' ')" -eq 33
+diff -u \
+  <(printf '%s\n' \
+    tests/host/test_compaction_operation.py \
+    tests/host/test_dispatch_scheduler.py) \
+  <(printf '%s\n' "$overlap_files")
+diff -u \
+  <(printf '%s\n' \
+    tests/host/test_compact_material.py \
+    tests/host/test_compaction_terminal.py \
+    tests/host/test_context_compact_events.py \
+    tests/host/test_memory_projection.py \
+    tests/host/test_proactive_compaction_operation.py \
+    tests/host/test_run_input_builder.py) \
+  <(printf '%s\n' "$builder_only_files")
+```
+
+以 §9.1 的三组 HEAD 基线为 closure 起点：第一 amendment 的 25-file tests
+identity/typed-return inventory 与第三次 amendment 的 2-file utils delta 必须合并重现
+`FA 37 calls / 21 files`、`OA 6 calls / 4 files`、`CR 7 files`、union `27 files`；两个 utils
+文件必须仍与既有 25-file tests closure 无重叠，且 utils 仍无 CR hit。durable builder
+pre-inventory 必须重现 accepted
 `8 calls / 6 files`、rejected `7 calls / 4 files`、union `8 files` 与表中 exact paths。
-implementation 后重跑同一 inventory；新增 builder hit 只能位于 S5 allowed owner tests，
+两组闭包的 overlap 必须精确为 `test_compaction_operation.py` 与
+`test_dispatch_scheduler.py`，builder-only set difference 必须为上述 6 files，完整 S5 枚举
+mechanical union 必须重现 `27 + 8 - 2 = 33 files`。第二次 amendment 新增 allowed-file delta
+仍是 5 files；`test_context_compact_events.py` 是早已允许但不在 27-file identity closure 的第六个
+builder-only file，allowed delta 不得改称 6。implementation 后重跑完全相同的 inventory；新增
+identity/typed-return hit 只能位于 S5 allowed tests/utils，新增 builder hit 只能位于 S5 allowed owner tests，
 任何新文件 hit、遗漏的 8-file / 15-call 迁移或无法按 exact payload contract 迁移的调用点
-都必须停止并退回 controller，不得在范围外修改。5-file delta 只参与 allowed-file scope
-检查。pyright 必须证明不存在漏传 required field、
+都必须停止并退回 controller，不得在范围外修改。2-file utils delta 与 5-file builder delta
+都只参与对应 allowed-file scope 检查。pyright 必须证明不存在漏传 required field、
 旧 `ConversationCompactOutputVNext` return annotation 或 candidate/proposal 混用；不得用
 `type: ignore`、仅为掩盖不匹配的 cast、optional/default、manifest/config 反推、loose
 payload 或兼容 overload 消音。
 
-覆盖率：对所有S1-S5新增/修改生产文件运行branch coverage，使用coverage JSON逐文件检查 `percent_covered >= 80`，不能只看aggregate；未达到则补owner/反例/race tests，不加pragma或排除。`utils/` 无新增脚本，因而不适用其豁免。
+覆盖率：对所有S1-S5新增/修改生产文件运行branch coverage，使用coverage JSON逐文件检查 `percent_covered >= 80`，不能只看aggregate；未达到则补owner/反例/race tests，不加pragma或排除。两个既有 `utils/` smoke 文件按项目规则不新增测试、无 coverage 要求，但必须通过上述全量 pyright、post-inventory、相关既有 smoke 与后续 code review；该豁免不得扩散到 production/tests。
 
 Registry/docs检查：
 
@@ -1117,7 +1271,11 @@ PTY 环境依赖已按 §12.1 分类为 allowed platform/capability variant：PO
 
 - [ ] Engine final/outcome required success identity。
 - [ ] `dayu/host/context_events.py` owner 先给两个 strict builder 增加无 default 的 required typed `successful_response_identity` 参数，再机械迁移全部 8 files / 15 calls；5-file delta 只表示新增 allowed-file boundary。
-- [ ] §9.1 第一 amendment 的 25-file identity/typed-return closure 完整保留；durable builder inventory 重现 8 accepted calls / 6 files、7 rejected calls / 4 files、8-file union，3 个既有 allowed tests 与 5-file delta 全部闭合，S5 枚举机械总 union 为 30 个去重文件。
+- [ ] §9.1 第一 amendment 的 25-file tests identity/typed-return closure 完整保留；第三次 amendment 的 2-file utils delta 闭合后，完整 tests+utils inventory 重现 FA 37 calls / 21 files、OA 6 calls / 4 files、CR 7 files、27-file union，utils 无 CR hit且与既有 25-file tests closure 无重叠。
+- [ ] durable builder inventory 重现 8 accepted calls / 6 files、7 rejected calls / 4 files、8-file union；它与 27-file identity/typed-return closure 的 overlap 精确为 `test_compaction_operation.py`、`test_dispatch_scheduler.py`，builder-only set difference 精确为 6 files，其中 `test_context_compact_events.py` 早已属于 S5 allowed owner tests，其余 5 files 才是第二次 amendment 新增 allowed-file delta；完整五类 pattern 去重重现 `27 + 8 - 2 = 33` files。
+- [ ] `utils/smoke_host_public_awaiting_entrypoint.py` 精确迁移 1 个 `FinalAnswerData(...)`，`utils/smoke_host_public_conversation_memory_scenarios.py` 精确迁移 1 个 `FinalAnswerData(...)` 与 2 个 `EngineRunOutcomeFinalAnswer(...)`；每个 identity 都从该 smoke invocation 已有的 `AgentRunRequest` 直接取得 run/attempt/execution 与 `runner_spec.provider/model`，显式使用该 synthetic 单调用的 deterministic iteration id、index 0/call 1 和 `UNAVAILABLE + None`，不从 config/manifest/相邻 event 推断。
+- [ ] 两个 utils 只增加精确 imports、file-local private 常量/窄 helper、required identity 参数构造/透传；零跨文件万能 helper，零 default/optional/compatibility，且 smoke scene/suite、分支、provider 配置、输出/marker、CLI oracle、artifact/EventLog 断言与异常语义零变化。
+- [ ] 两个 utils 不新增测试且不计 coverage；全量 `python -m pyright dayu/ tests/ utils/`、post-inventory、public awaiting smoke、`memory-reactive-compact`、`memory-compact-fallback` 与后续 code review 全部通过。
 - [ ] contract/projection/material/run-input 等未执行真实 Engine 且 helper 无 run context 时，caller 使用当前 helper/call site 实际已有的显式、非敏感且足以区分 event 的上下文（例如 case label、`operation_id`、attempt/run id 或显式 ordinal），由该文件 private typed factory 生成 deterministic、event-unique typed identity，再作为 required 参数显式传给 payload helper；具体输入维度与参数名以现有 helper/call site 为准，不要求虚构不存在的维度；已有 manifest / compactor Engine run 时 caller 显式传对应 run id 给 factory。
 - [ ] file-local identity factory / payload helper 内零 default、零硬编码共享 singleton、零跨文件万能 helper、零 manifest/sibling 反推；identity 与同 event 的 sibling run/operation/attempt/manifest 语义一致，且不冒充 provider continuity evidence。
 - [ ] mapping/null 分类按 event 语义冻结：`CONTEXT_COMPACTED` 恒为 mapping；post-success parse/schema/semantic/quality/budget rejected 为 mapping；仅 transport/timeout/cancel/Engine failed no-final 为 `null`；proactive orphan/incomplete/exhausted 三个调用均生成 `quality_check_rejected` event，三者 `successful_response_identity` 均为 mapping。
@@ -1223,6 +1381,38 @@ Controller adjudication §3、§6 与 §7 的 accepted findings 在 plan artifac
 unclassified residual risk。第二次 amendment 是否通过 review loop 必须由 MiMo 与 AgentDS
 后续 simultaneous independent final dual re-review durable artifacts 裁决；本次不生成
 re-review artifact，不创建 accepted plan amendment commit，也不进入 implementation。
+
+上述段落与既有表格是第二次 amendment 的 accepted 历史 trace，保持原文，不重写已有 review
+artifact。第三次 S5/F13 tests+utils identity closure premise invalidation 由 Controller 在 accepted
+HEAD `e7f578dc7bdfafb51a859be2db584300e08f81fb` 直接复核，本轮只追加以下 amendment trace：
+
+| Review item | Controller decision | Fix status | Plan 落点/理由 |
+|---|---|---|---|
+| utils required-identity closure omission | `accepted-plan premise invalidation` | 已修复 | §9.1：补入 `utils/smoke_host_public_awaiting_entrypoint.py` 的 `FA(1)` 与 `utils/smoke_host_public_conversation_memory_scenarios.py` 的 `FA(1)+OA(2)`；冻结完整 tests+utils `FA 37/21`、`OA 6/4`、`CR 7 files`、union 27，utils 无 CR hit且两文件与既有 25-file tests closure 无重叠 |
+| S5 mechanical total union | `accepted arithmetic correction / superseded by full-set recomputation` | 已修复 | §9.1、§10.5、§13：完整集合按 27-file identity/typed-return closure 与 8-file builder closure、2-file overlap 去重为 `27 + 8 - 2 = 33`；第二次 amendment 的 5-file allowed-file delta 原样保留，不再误用于 union 算术 |
+| utils semantic owner / exact delta | `accepted owner-preserving expansion` | 已修复 | §9.1、§13：Engine success terminal identity contract 仍是 owner；两个 smoke consumer 只从各自 `AgentRunRequest` 的显式 run/attempt/execution 与 `runner_spec.provider/model` 构造/透传 required typed identity，provider id 用 `UNAVAILABLE + None`；禁止 config/manifest 推断、共享万能 helper与场景/输出/oracle/provider 配置变化 |
+| utils validation closure | `accepted validation correction` | 已修复 | §10.5、§13：pre/post inventory 扩至 `tests utils`，全量 pyright 保持 `dayu/ tests/ utils/`；两个 utils 按项目规则不新增测试/coverage，但必须通过相关既有 smoke 与后续 code review |
+
+第三次 amendment initial dual review 与 Controller 算术裁决只追加以下 fix trace；MiMo/AgentDS
+review 和 Controller adjudication artifacts 均保留原文，不把 AgentDS 的错误 pass 当作 acceptance：
+
+| Review item | Controller decision | Fix status | Plan 落点/理由 |
+|---|---|---|---|
+| MiMo finding 001 | `accepted-medium-with-terminology-correction` | 已修复（`accepted-fixed`） | §9.1、§10.5、§13、§15：total union 修为 33，显式冻结 27/8/2 overlap、6-file builder-only set difference 与 5-file allowed-file delta 的术语边界；§10.5 用完整五类 pattern 直接去重验证 33 |
+| AgentDS A5 / final pass | `rejected-set-arithmetic` | 不适用 | AgentDS 将 5-file 新增 allowed-file delta 当成完整 builder-only set difference，未验证 27-file 与 8-file closure 的实际 2-file overlap，因此该 arithmetic conclusion 被拒绝；其关于 exact 2-file/4-call、semantic owner、identity source、cardinality、`UNAVAILABLE + None`、scope 与 validation 的其它直接证据继续接受 |
+
+本轮裁决与两路 review 的历史 artifacts 保持不变：
+
+- `docs/reviews/gateflow-wu-cli-interactive-02-s5-utils-closure-amendment-review-adjudication-20260802.md`
+- `docs/reviews/plan-review-20260802-000526.md`
+- `docs/reviews/plan-review-20260802-000107.md`
+
+本轮 amendment proposal 路径为
+`docs/reviews/wu-cli-interactive-02-s5-f13-utils-closure-plan-amendment-proposal-codex.md`。
+本轮不生成 plan review/re-review artifact，不执行 implementation，不创建 accepted plan amendment
+commit，也不 push/PR。当前唯一 next gate 是 MiMo 与 AgentDS simultaneous independent
+re-review；两路独立 durable re-review artifacts 与 Controller 最终裁决完成前不得恢复 S5
+implementation。
 
 ## 16. Plan gate closeout
 
