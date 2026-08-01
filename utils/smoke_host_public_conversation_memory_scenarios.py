@@ -70,6 +70,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 import dayu.host.llm_compaction as llm_compaction
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -167,6 +172,15 @@ _PROVIDER_IMPORT_DISPLAY_PATH: Final[str] = "__main__:discover_smoke_tools"
 _PROVIDER_VERSION: Final[str] = "v1"
 _CLIENT_REQUEST_PREFIX: Final[str] = "manual-smoke-conversation-memory-scenarios"
 _DEFAULT_USER_ID: Final[str] = "manual-smoke-user"
+_SMOKE_FINAL_ANSWER_ITERATION_ID: Final[str] = "smoke-final-answer-iteration"
+_SMOKE_ACCEPTING_COMPACTOR_ITERATION_ID: Final[str] = (
+    "smoke-accepting-compactor-iteration"
+)
+_SMOKE_REJECTING_COMPACTOR_ITERATION_ID: Final[str] = (
+    "smoke-rejecting-compactor-iteration"
+)
+_SMOKE_RESPONSE_ITERATION_INDEX: Final[int] = 0
+_SMOKE_RESPONSE_RUNNER_CALL_INDEX: Final[int] = 1
 _UNKNOWN_FACT_KEY: Final[str] = "_UNKNOWN_FACT_KEY"
 _STDOUT_PRESSURE_DISABLED: Final[str] = "SMOKE PRESSURE disabled"
 _STDOUT_TOOL_CALLS_BY_KEY: Final[str] = "SMOKE TOOL_CALLS_BY_KEY"
@@ -1622,6 +1636,41 @@ class _SingleEventWorkerHandle:
         del reason
 
 
+def _unavailable_smoke_response_identity(
+    *,
+    request: AgentRunRequest,
+    iteration_id: str,
+    iteration_index: int,
+    runner_call_index: int,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与当前 synthetic Runner call 同源的不可用 provider identity。
+
+    :param request: 当前 smoke invocation 实际使用的 Engine request。
+    :param iteration_id: 当前 synthetic Runner iteration id。
+    :param iteration_index: 当前 synthetic Runner iteration 序号。
+    :param runner_call_index: 当前 request 内的 Runner call 序号。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request 或 iteration/call identity 非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=iteration_id,
+            iteration_index=iteration_index,
+            runner_call_index=runner_call_index,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 class _DeterministicCompactWorker:
     """deterministic compact smoke 的普通 worker。
 
@@ -1663,6 +1712,12 @@ class _DeterministicCompactWorker:
             event=_final_answer_event(
                 snapshot,
                 f"{_SMOKE_FINAL_ANSWER_PREFIX}: {len(self._factory.requests)}",
+                response_identity=_unavailable_smoke_response_identity(
+                    request=request,
+                    iteration_id=_SMOKE_FINAL_ANSWER_ITERATION_ID,
+                    iteration_index=_SMOKE_RESPONSE_ITERATION_INDEX,
+                    runner_call_index=_SMOKE_RESPONSE_RUNNER_CALL_INDEX,
+                ),
             ),
         )
 
@@ -1752,6 +1807,12 @@ class _AcceptingSmokeCompactorRunner:
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_unavailable_smoke_response_identity(
+                request=request,
+                iteration_id=_SMOKE_ACCEPTING_COMPACTOR_ITERATION_ID,
+                iteration_index=_SMOKE_RESPONSE_ITERATION_INDEX,
+                runner_call_index=_SMOKE_RESPONSE_RUNNER_CALL_INDEX,
+            ),
         )
 
 
@@ -1798,6 +1859,12 @@ class _RejectingSmokeCompactorRunner:
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_unavailable_smoke_response_identity(
+                request=request,
+                iteration_id=_SMOKE_REJECTING_COMPACTOR_ITERATION_ID,
+                iteration_index=_SMOKE_RESPONSE_ITERATION_INDEX,
+                runner_call_index=_SMOKE_RESPONSE_RUNNER_CALL_INDEX,
+            ),
         )
 
 
@@ -1824,11 +1891,17 @@ def _reactive_compaction_requested_event(snapshot: AttemptDispatchSnapshot) -> E
     )
 
 
-def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> EngineEvent:
+def _final_answer_event(
+    snapshot: AttemptDispatchSnapshot,
+    content: str,
+    *,
+    response_identity: SuccessfulRunnerResponseIdentity,
+) -> EngineEvent:
     """构造 final answer Engine event。
 
     :param snapshot: 当前 dispatch snapshot。
     :param content: final answer 文本。
+    :param response_identity: 产出该 final 的同一次成功 Runner call 身份。
     :returns: EngineEvent。
     :raises ValueError: content 为空时抛出。
     """
@@ -1845,6 +1918,7 @@ def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> Engi
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=response_identity,
         ),
         metadata=None,
     )

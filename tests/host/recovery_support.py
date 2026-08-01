@@ -27,6 +27,11 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host import (
     AttemptDispatchSnapshot,
     HostEventKind,
@@ -74,6 +79,34 @@ _INITIAL_CHECKPOINT_SEQUENCE = 0
 _NOW_TEXT = "2026-05-19T00:00:00.000000Z"
 
 
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 recovery worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:recovery-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AcceptedAttemptMarker:
     """已被 worker accept 的 Attempt 标记。
@@ -99,12 +132,14 @@ class BlockingFinalAnswerHandle:
     def __init__(
         self,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         release_marker: pathlib.Path,
         content_prefix: str,
     ) -> None:
         """初始化 handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param release_marker: 释放事件文件。
         :param content_prefix: final answer 内容前缀。
         :returns: ``None``。
@@ -114,6 +149,7 @@ class BlockingFinalAnswerHandle:
         if content_prefix.strip() == "":
             raise ValueError("content_prefix must be non-empty")
         self._snapshot = snapshot
+        self._request = request
         self._release_marker = release_marker
         self._content_prefix = content_prefix
 
@@ -144,6 +180,9 @@ class BlockingFinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -193,7 +232,6 @@ class BlockingFinalAnswerWorker:
         :returns: 受控 final answer handle。
         """
 
-        del request
         write_accepted_marker(
             self._factory.accepted_marker,
             AcceptedAttemptMarker(
@@ -204,6 +242,7 @@ class BlockingFinalAnswerWorker:
         )
         return BlockingFinalAnswerHandle(
             snapshot,
+            request,
             self._factory.release_marker,
             self._factory.content_prefix,
         )
@@ -257,18 +296,21 @@ class AsyncControlledFinalAnswerHandle:
     def __init__(
         self,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         release_event: asyncio.Event,
         content_prefix: str,
     ) -> None:
         """初始化 handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param release_event: 释放事件。
         :param content_prefix: final answer 内容前缀。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._release_event = release_event
         self._content_prefix = content_prefix
 
@@ -298,6 +340,9 @@ class AsyncControlledFinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -347,11 +392,11 @@ class AsyncControlledFinalAnswerWorker:
         :returns: 事件受控 handle。
         """
 
-        del request
         self._factory.snapshots.append(snapshot)
         self._factory.accepted_event.set()
         return AsyncControlledFinalAnswerHandle(
             snapshot,
+            request,
             self._factory.release_event,
             self._factory.content_prefix,
         )

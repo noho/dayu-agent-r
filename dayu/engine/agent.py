@@ -122,7 +122,9 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
     RunnerRequestIdentity,
+    SuccessfulRunnerResponseIdentity,
     build_runner_request_identity,
 )
 from dayu.engine._default_runner import build_default_runner
@@ -567,12 +569,51 @@ def _set_first_failure_candidate(
 
 @dataclass(frozen=True, slots=True)
 class _FinalDecision:
-    """普通最终回答决策。"""
+    """普通最终回答决策。
+
+    :param content: 最终回答正文。
+    :param filtered: 是否经过过滤器处理。
+    :param degraded: 是否为降级回答。
+    :param finish_reason: 实际终结成功 Runner 调用的完成原因。
+    :param response_identity: 实际终结成功 Runner 调用的响应身份。
+    """
 
     content: str
     filtered: bool
     degraded: bool
     finish_reason: FinishReason
+    response_identity: SuccessfulRunnerResponseIdentity
+
+
+def _successful_response_identity(
+    *,
+    request: AgentRunRequest,
+    state: _IterationState,
+    runner_done: RunnerDoneData,
+) -> SuccessfulRunnerResponseIdentity:
+    """从同一次成功 Runner call 的 owner facts 构造响应身份。
+
+    :param request: 当前 Engine run 请求，用于取得实际 Runner provider/model。
+    :param state: 当前 Runner call 的消费状态与请求身份。
+    :param runner_done: 当前 Runner call 的成功完成事实。
+    :returns: 与当前 call 同源的安全成功响应身份。
+    :raises ValueError: provider/model 或 provider request id 不满足成功身份
+        契约时抛出。
+    """
+
+    provider_request_id = runner_done.provider_request_id
+    availability = (
+        ProviderRequestIdAvailability.UNAVAILABLE
+        if provider_request_id is None
+        else ProviderRequestIdAvailability.PRESENT
+    )
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=state.request_identity,
+        provider_request_id_availability=availability,
+        provider_request_id=provider_request_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1102,6 +1143,7 @@ class _AsyncAgent:
                 filtered=decision.filtered,
                 degraded=True,
                 finish_reason=decision.finish_reason,
+                response_identity=decision.response_identity,
             )
         return decision
 
@@ -1150,6 +1192,7 @@ class _AsyncAgent:
                 filtered=decision.filtered,
                 degraded=True,
                 finish_reason=decision.finish_reason,
+                response_identity=decision.response_identity,
             )
 
         if decision.content:
@@ -1881,6 +1924,11 @@ class _AsyncAgent:
             filtered=filtered,
             degraded=degraded or filtered,
             finish_reason=finish_reason,
+            response_identity=_successful_response_identity(
+                request=self._request,
+                state=state,
+                runner_done=runner_done,
+            ),
         )
 
     async def _execute_tool_batch(
@@ -2451,6 +2499,7 @@ class _AsyncAgent:
                 filtered=decision.filtered,
                 degraded=decision.degraded,
                 finish_reason=decision.finish_reason,
+                response_identity=decision.response_identity,
             )
         )
 
@@ -3015,6 +3064,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             filtered=data.filtered,
             degraded=data.degraded,
             finish_reason=data.finish_reason,
+            response_identity=data.response_identity,
         )
     if terminal.type is EngineEventType.RUN_FAILED and isinstance(data, RunFailedData):
         return EngineRunOutcomeFailed(

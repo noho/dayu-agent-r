@@ -276,7 +276,11 @@ async def _candidate_bundle() -> tuple[
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request, ControllableCancellationToken())
+    proposal = await FakeContextCompactor().compact(
+        request,
+        ControllableCancellationToken(),
+    )
+    candidate = proposal.candidate
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )

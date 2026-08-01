@@ -21,6 +21,7 @@ from uuid import uuid4
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.engine.contracts.engine_events import RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
@@ -37,11 +38,14 @@ from dayu.host.compaction import (
     CompactMaterialBlock,
     CompactQualityCheckResultVNext,
     CompactionRequest,
+    CompactorProposal,
+    CompactorProposalError,
     ContextCompactor,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
 )
 from dayu.host.context_budget import estimate_post_compact_budget
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_governance import check_conversation_compact_output_vnext
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
@@ -142,24 +146,6 @@ class CompactorProposalRunInput:
     compactor_input_projection_digest: str
 
 
-@dataclass(frozen=True, slots=True)
-class CompactorProposalManifestReference:
-    """已持久化 compactor proposal manifest 引用。
-
-    :param manifest_event_id: ``RUNNER_CALL_INPUT_ASSEMBLED`` event id。
-    :param manifest_payload_ref: runner-call manifest payload descriptor ref。
-    :param manifest_digest: runner-call manifest body digest。
-    :param compactor_input_projection_ref: compactor input projection descriptor ref。
-    :param compactor_input_projection_digest: compactor input projection digest。
-    """
-
-    manifest_event_id: str
-    manifest_payload_ref: str
-    manifest_digest: str
-    compactor_input_projection_ref: str
-    compactor_input_projection_digest: str
-
-
 @runtime_checkable
 class CompactorProposalPreparedCompactor(Protocol):
     """支持同源 proposal input 观测的 compactor 能力协议。"""
@@ -187,11 +173,11 @@ class CompactorProposalPreparedCompactor(Protocol):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行已准备的 compactor proposal runner call。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
-        :returns: vNext compact output candidate。
+        :returns: 与实际成功 Runner call 身份配对的 vNext proposal。
         """
 
         ...
@@ -361,6 +347,9 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 compactor_input_projection_digest=(
                     prepared_input.compactor_input_projection_digest
                 ),
+                compaction_operation_id=compaction_operation_id,
+                compaction_attempt_number=compaction_attempt_number,
+                compactor_engine_run_id=prepared_input.compactor_engine_run_id,
             )
 
         return self._transaction_runner.run_write(_operation)
@@ -477,8 +466,10 @@ class CompactionAttemptRejected:
     :param diagnostic_refs: quality / parse / budget 诊断 ref。
     :param next_policy_decision: 下一步 policy decision。
     :param budget_after_attempted_compact: attempt 后预算；未知时为 ``None``。
-    :param proposal_manifest_ref: 对应该 proposal attempt 的 manifest ref。
-    :param proposal_manifest_digest: 对应该 proposal attempt 的 manifest digest。
+    :param proposal_manifest_reference: 对应该 proposal attempt 的 typed manifest
+        reference；尚未记录时为 ``None``。
+    :param successful_response_identity: 本 attempt 获得成功 Engine final 时的
+        同源响应身份；尚未取得成功 final 时为 ``None``。
     :param diagnostic: material / proposal failure diagnostic；没有额外
         artifact 时为 ``None``。
     """
@@ -490,8 +481,8 @@ class CompactionAttemptRejected:
     diagnostic_refs: tuple[str, ...]
     next_policy_decision: CompactionNextPolicyDecision
     budget_after_attempted_compact: int | None
-    proposal_manifest_ref: str | None
-    proposal_manifest_digest: str | None
+    proposal_manifest_reference: CompactorProposalManifestReference | None
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None
     diagnostic: CompactionRejectedAttemptDiagnostic | None = None
 
 
@@ -507,8 +498,10 @@ class CompactionOperationResult:
         ``None``。
     :param accepted_attempt_number: 被接受的全局 attempt number；失败时为
         ``None``。
-    :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
-    :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
+    :param accepted_proposal_manifest_reference: accepted proposal 对应的 typed
+        manifest reference；失败时为 ``None``。
+    :param accepted_successful_response_identity: accepted candidate 对应的实际
+        成功 Engine final 身份；operation 失败时为 ``None``。
     """
 
     accepted_candidate: ConversationCompactOutputVNext | None
@@ -517,8 +510,8 @@ class CompactionOperationResult:
     failure_reason: str | None
     budget_after_attempted_compact: int | None
     accepted_attempt_number: int | None
-    accepted_proposal_manifest_ref: str | None = None
-    accepted_proposal_manifest_digest: str | None = None
+    accepted_successful_response_identity: SuccessfulRunnerResponseIdentity | None
+    accepted_proposal_manifest_reference: CompactorProposalManifestReference | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,11 +522,13 @@ class _CompactorProposalAttempt:
     :param candidate: compactor 返回的 candidate。
     :param proposal_manifest_reference: 调用前写入的 manifest ref；未记录时为
         ``None``。
+    :param successful_response_identity: 产生 candidate 的成功 Runner call 身份。
     """
 
     compact_input: ConversationCompactInputVNext
     candidate: ConversationCompactOutputVNext
     proposal_manifest_reference: CompactorProposalManifestReference | None
+    successful_response_identity: SuccessfulRunnerResponseIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,10 +537,13 @@ class _CompactorProposalExecutionError(Exception):
 
     :param original_exception: 原始 proposal 异常。
     :param proposal_manifest_reference: 已写 manifest ref。
+    :param successful_response_identity: 失败发生在成功 Engine final 之后时的
+        同源响应身份；否则为 ``None``。
     """
 
     original_exception: Exception
     proposal_manifest_reference: CompactorProposalManifestReference | None
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,6 +760,9 @@ async def _run_compaction_operation(
     accepted_quality: CompactQualityCheckResultVNext | None = None
     accepted_manifest_reference: CompactorProposalManifestReference | None = None
     accepted_attempt_number: int | None = None
+    accepted_successful_response_identity: (
+        SuccessfulRunnerResponseIdentity | None
+    ) = None
     attempt_number = first_attempt_number
     for pass_request in requests:
         pass_accepted = False
@@ -777,6 +778,7 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=last_budget,
                     diagnostic_suffix=_cancellation_suffix(cancellation_token),
                     proposal_manifest_reference=proposal_manifest_reference,
+                    successful_response_identity=None,
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -791,8 +793,8 @@ async def _run_compaction_operation(
                     failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
                     accepted_attempt_number=None,
-                    accepted_proposal_manifest_ref=None,
-                    accepted_proposal_manifest_digest=None,
+                    accepted_successful_response_identity=None,
+                    accepted_proposal_manifest_reference=None,
                 )
             repairable = attempt_number < max_attempt_number
             next_decision = _NEXT_DECISION_RETRY_REPAIR if repairable else _NEXT_DECISION_FAIL_COMPACTION
@@ -832,6 +834,9 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=None,
                     diagnostic_suffix=diagnostic_suffix,
                     proposal_manifest_reference=proposal_manifest_reference,
+                    successful_response_identity=(
+                        exc.successful_response_identity
+                    ),
                     diagnostic=diagnostic,
                 )
                 rejected.append(rejected_attempt)
@@ -848,8 +853,8 @@ async def _run_compaction_operation(
                         failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
                         accepted_attempt_number=None,
-                        accepted_proposal_manifest_ref=None,
-                        accepted_proposal_manifest_digest=None,
+                        accepted_successful_response_identity=None,
+                        accepted_proposal_manifest_reference=None,
                     )
                 attempt_number += 1
                 continue
@@ -864,6 +869,7 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=last_budget,
                     diagnostic_suffix=_cancellation_suffix(cancellation_token),
                     proposal_manifest_reference=proposal_manifest_reference,
+                    successful_response_identity=None,
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -878,8 +884,8 @@ async def _run_compaction_operation(
                     failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
                     accepted_attempt_number=None,
-                    accepted_proposal_manifest_ref=None,
-                    accepted_proposal_manifest_digest=None,
+                    accepted_successful_response_identity=None,
+                    accepted_proposal_manifest_reference=None,
                 )
             except Exception as exc:
                 diagnostic_suffix = _exception_diagnostic_suffix(exc)
@@ -901,6 +907,7 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=None,
                     diagnostic_suffix=diagnostic_suffix,
                     proposal_manifest_reference=proposal_manifest_reference,
+                    successful_response_identity=None,
                     diagnostic=diagnostic,
                 )
                 rejected.append(rejected_attempt)
@@ -917,8 +924,8 @@ async def _run_compaction_operation(
                         failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
                         accepted_attempt_number=None,
-                        accepted_proposal_manifest_ref=None,
-                        accepted_proposal_manifest_digest=None,
+                        accepted_successful_response_identity=None,
+                        accepted_proposal_manifest_reference=None,
                     )
                 attempt_number += 1
                 continue
@@ -937,6 +944,9 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=last_budget,
                     diagnostic_suffix=_quality_suffix_vnext(quality),
                     proposal_manifest_reference=proposal_manifest_reference,
+                    successful_response_identity=(
+                        proposal.successful_response_identity
+                    ),
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -952,8 +962,8 @@ async def _run_compaction_operation(
                         failure_reason=_FAILURE_QUALITY_CHECK_REJECTED.value,
                         budget_after_attempted_compact=last_budget,
                         accepted_attempt_number=None,
-                        accepted_proposal_manifest_ref=None,
-                        accepted_proposal_manifest_digest=None,
+                        accepted_successful_response_identity=None,
+                        accepted_proposal_manifest_reference=None,
                     )
                 attempt_number += 1
                 continue
@@ -969,6 +979,9 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=last_budget,
                     diagnostic_suffix=_DIAGNOSTIC_SUFFIX_HARD_THRESHOLD,
                     proposal_manifest_reference=proposal_manifest_reference,
+                    successful_response_identity=(
+                        proposal.successful_response_identity
+                    ),
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -984,16 +997,25 @@ async def _run_compaction_operation(
                         failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT.value,
                         budget_after_attempted_compact=last_budget,
                         accepted_attempt_number=None,
-                        accepted_proposal_manifest_ref=None,
-                        accepted_proposal_manifest_digest=None,
+                        accepted_successful_response_identity=None,
+                        accepted_proposal_manifest_reference=None,
                     )
                 attempt_number += 1
                 continue
             pass_accepted = True
-            accepted_candidate = candidate
-            accepted_quality = quality
-            accepted_manifest_reference = proposal_manifest_reference
-            accepted_attempt_number = attempt_number
+            (
+                accepted_candidate,
+                accepted_quality,
+                accepted_manifest_reference,
+                accepted_attempt_number,
+                accepted_successful_response_identity,
+            ) = (
+                candidate,
+                quality,
+                proposal_manifest_reference,
+                attempt_number,
+                proposal.successful_response_identity,
+            )
             attempt_number += 1
         if not pass_accepted:
             return CompactionOperationResult(
@@ -1003,8 +1025,8 @@ async def _run_compaction_operation(
                 failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
                 budget_after_attempted_compact=last_budget,
                 accepted_attempt_number=None,
-                accepted_proposal_manifest_ref=None,
-                accepted_proposal_manifest_digest=None,
+                accepted_successful_response_identity=None,
+                accepted_proposal_manifest_reference=None,
             )
     if accepted_candidate is None or accepted_quality is None:
         return CompactionOperationResult(
@@ -1014,8 +1036,8 @@ async def _run_compaction_operation(
             failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
             budget_after_attempted_compact=last_budget,
             accepted_attempt_number=None,
-            accepted_proposal_manifest_ref=None,
-            accepted_proposal_manifest_digest=None,
+            accepted_successful_response_identity=None,
+            accepted_proposal_manifest_reference=None,
         )
     return CompactionOperationResult(
         accepted_candidate=accepted_candidate,
@@ -1024,16 +1046,10 @@ async def _run_compaction_operation(
         failure_reason=None,
         budget_after_attempted_compact=last_budget,
         accepted_attempt_number=accepted_attempt_number,
-        accepted_proposal_manifest_ref=(
-            None
-            if accepted_manifest_reference is None
-            else accepted_manifest_reference.manifest_payload_ref
+        accepted_successful_response_identity=(
+            accepted_successful_response_identity
         ),
-        accepted_proposal_manifest_digest=(
-            None
-            if accepted_manifest_reference is None
-            else accepted_manifest_reference.manifest_digest
-        ),
+        accepted_proposal_manifest_reference=accepted_manifest_reference,
     )
 
 
@@ -1120,7 +1136,7 @@ async def _prepare_compactor_proposal(
             proposal_manifest_reference=manifest_reference,
         )
         try:
-            candidate = await compactor.run_prepared_compactor_proposal(
+            proposal = await compactor.run_prepared_compactor_proposal(
                 prepared_input
             )
         except asyncio.CancelledError as exc:
@@ -1129,15 +1145,40 @@ async def _prepare_compactor_proposal(
             raise _CompactorProposalCancelledError(
                 proposal_manifest_reference=manifest_reference,
             ) from exc
+        except CompactorProposalError as exc:
+            raise _CompactorProposalExecutionError(
+                original_exception=exc,
+                proposal_manifest_reference=manifest_reference,
+                successful_response_identity=(
+                    exc.successful_response_identity
+                ),
+            ) from exc
         except Exception as exc:
             raise _CompactorProposalExecutionError(
                 original_exception=exc,
                 proposal_manifest_reference=manifest_reference,
+                successful_response_identity=None,
+            ) from exc
+        try:
+            _validate_prepared_proposal_identity(
+                prepared_input=prepared_input,
+                proposal=proposal,
+            )
+        except CompactorProposalError as exc:
+            raise _CompactorProposalExecutionError(
+                original_exception=exc,
+                proposal_manifest_reference=manifest_reference,
+                successful_response_identity=(
+                    exc.successful_response_identity
+                ),
             ) from exc
         return _CompactorProposalAttempt(
             compact_input=prepared_input.compact_input,
-            candidate=candidate,
+            candidate=proposal.candidate,
             proposal_manifest_reference=manifest_reference,
+            successful_response_identity=(
+                proposal.successful_response_identity
+            ),
         )
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
@@ -1147,17 +1188,24 @@ async def _prepare_compactor_proposal(
         proposal_manifest_reference=None,
     )
     try:
-        candidate = await compactor.compact(request, cancellation_token)
+        proposal = await compactor.compact(request, cancellation_token)
     except asyncio.CancelledError as exc:
         if not cancellation_token.is_cancelled():
             raise
         raise _CompactorProposalCancelledError(
             proposal_manifest_reference=None,
         ) from exc
+    except CompactorProposalError as exc:
+        raise _CompactorProposalExecutionError(
+            original_exception=exc,
+            proposal_manifest_reference=None,
+            successful_response_identity=exc.successful_response_identity,
+        ) from exc
     return _CompactorProposalAttempt(
         compact_input=compact_input,
-        candidate=candidate,
+        candidate=proposal.candidate,
         proposal_manifest_reference=None,
+        successful_response_identity=proposal.successful_response_identity,
     )
 
 
@@ -1208,12 +1256,58 @@ def _record_compactor_proposal_manifest(
         return None
     if compaction_operation_id is None:
         raise ValueError("compaction_operation_id is required for proposal manifest")
-    return recorder.record_compactor_proposal_manifest(
+    reference = recorder.record_compactor_proposal_manifest(
         request=request,
         prepared_input=prepared_input,
         compaction_operation_id=compaction_operation_id,
         compaction_attempt_number=compaction_attempt_number,
     )
+    if reference.compaction_operation_id != compaction_operation_id:
+        raise ValueError("proposal manifest operation id mismatch")
+    if reference.compaction_attempt_number != compaction_attempt_number:
+        raise ValueError("proposal manifest attempt number mismatch")
+    if reference.compactor_engine_run_id != prepared_input.compactor_engine_run_id:
+        raise ValueError("proposal manifest compactor Engine run id mismatch")
+    return reference
+
+
+def _validate_prepared_proposal_identity(
+    *,
+    prepared_input: CompactorProposalRunInput,
+    proposal: CompactorProposal,
+) -> None:
+    """校验 prepared proposal 与同一次成功 Engine call 绑定。
+
+    :param prepared_input: 当前 Host attempt 冻结的 Engine request input。
+    :param proposal: compactor 返回的 candidate/identity 配对值。
+    :returns: 无返回值。
+    :raises CompactorProposalError: Engine run、ordinary attempt/execution 或
+        effective provider/model 与 prepared request 不一致时抛出。
+    """
+
+    response_identity = proposal.successful_response_identity
+    request_identity = response_identity.runner_request_identity
+    if request_identity.run_id != prepared_input.compactor_engine_run_id:
+        raise CompactorProposalError(
+            "compactor proposal Engine run identity mismatch",
+            successful_response_identity=response_identity,
+        )
+    if request_identity.attempt_id is not None or request_identity.execution_id is not None:
+        raise CompactorProposalError(
+            "compactor proposal must not use ordinary attempt identity",
+            successful_response_identity=response_identity,
+        )
+    runner_spec = prepared_input.agent_request.runner_spec
+    if response_identity.effective_provider != runner_spec.provider:
+        raise CompactorProposalError(
+            "compactor proposal effective provider mismatch",
+            successful_response_identity=response_identity,
+        )
+    if response_identity.effective_model != runner_spec.model:
+        raise CompactorProposalError(
+            "compactor proposal effective model mismatch",
+            successful_response_identity=response_identity,
+        )
 
 
 def write_compaction_rejected_attempt_diagnostic_artifact(
@@ -2024,6 +2118,7 @@ def _attempt_rejected(
     budget_after_attempted_compact: int | None,
     diagnostic_suffix: str,
     proposal_manifest_reference: CompactorProposalManifestReference | None,
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None,
     diagnostic: CompactionRejectedAttemptDiagnostic | None = None,
 ) -> CompactionAttemptRejected:
     """构造 attempt reject 摘要。
@@ -2036,6 +2131,8 @@ def _attempt_rejected(
     :param budget_after_attempted_compact: attempt 后预算。
     :param diagnostic_suffix: 诊断 ref 后缀。
     :param proposal_manifest_reference: proposal manifest ref。
+    :param successful_response_identity: 本 attempt 已取得成功 Engine final 时
+        的同源响应身份；没有成功 final 时为 ``None``。
     :param diagnostic: material / proposal failure diagnostic。
     :returns: attempt reject 摘要。
     """
@@ -2051,16 +2148,8 @@ def _attempt_rejected(
         ),
         next_policy_decision=next_policy_decision,
         budget_after_attempted_compact=budget_after_attempted_compact,
-        proposal_manifest_ref=(
-            None
-            if proposal_manifest_reference is None
-            else proposal_manifest_reference.manifest_payload_ref
-        ),
-        proposal_manifest_digest=(
-            None
-            if proposal_manifest_reference is None
-            else proposal_manifest_reference.manifest_digest
-        ),
+        proposal_manifest_reference=proposal_manifest_reference,
+        successful_response_identity=successful_response_identity,
         diagnostic=diagnostic,
     )
 

@@ -25,6 +25,11 @@ from dayu.engine.contracts.engine_events import (
     RunCancelledData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AuthorizationClaim,
@@ -509,6 +514,7 @@ class _CancelAwareHandle:
         self._cancelled = asyncio.Event()
         self._session_id: str | None = None
         self._run_id: str | None = None
+        self._request: AgentRunRequest | None = None
         self.cancel_reasons: list[str] = []
         self.cancel_thread_ids: list[int] = []
         self.closed = False
@@ -539,6 +545,7 @@ class _CancelAwareHandle:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=self._bound_response_identity(),
                 ),
                 metadata=None,
             )
@@ -572,15 +579,34 @@ class _CancelAwareHandle:
         self.cancel_thread_ids.append(threading.get_ident())
         self._cancelled.set()
 
-    def bind_snapshot(self, snapshot: AttemptDispatchSnapshot) -> None:
-        """绑定 worker accept 时的 Host dispatch identity。
+    def bind_dispatch(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> None:
+        """绑定 worker accept 时的 Host dispatch 与 Engine request identity。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :returns: ``None``。
         """
 
         self._session_id = snapshot.session_id
         self._run_id = snapshot.run_id
+        self._request = request
+
+    def _bound_response_identity(self) -> SuccessfulRunnerResponseIdentity:
+        """返回与当前绑定 request 同源的成功响应身份。
+
+        :returns: provider request id 明确不可用的成功响应身份。
+        :raises RuntimeError: worker 尚未绑定 request 时抛出。
+        :raises ValueError: request identity 字段非法时抛出。
+        """
+
+        request = self._request
+        if request is None:
+            raise RuntimeError("worker Engine request is not bound")
+        return _successful_response_identity(request)
 
     async def close(self) -> None:
         """关闭 fake handle。
@@ -627,6 +653,7 @@ class _CancelClosingHandle:
         self._cancelled = asyncio.Event()
         self.closed = asyncio.Event()
         self.cancel_reasons: list[str] = []
+        self._request: AgentRunRequest | None = None
 
     @property
     def local_worker_id(self) -> str:
@@ -657,6 +684,7 @@ class _CancelClosingHandle:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=self._bound_response_identity(),
                 ),
                 metadata=None,
             )
@@ -671,14 +699,33 @@ class _CancelClosingHandle:
         self.cancel_reasons.append(reason)
         self._cancelled.set()
 
-    def bind_snapshot(self, snapshot: AttemptDispatchSnapshot) -> None:
-        """绑定 worker accept 快照。
+    def bind_dispatch(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> None:
+        """绑定 worker accept 快照与 Engine request。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :returns: ``None``。
         """
 
         del snapshot
+        self._request = request
+
+    def _bound_response_identity(self) -> SuccessfulRunnerResponseIdentity:
+        """返回与当前绑定 request 同源的成功响应身份。
+
+        :returns: provider request id 明确不可用的成功响应身份。
+        :raises RuntimeError: worker 尚未绑定 request 时抛出。
+        :raises ValueError: request identity 字段非法时抛出。
+        """
+
+        request = self._request
+        if request is None:
+            raise RuntimeError("worker Engine request is not bound")
+        return _successful_response_identity(request)
 
     async def close(self) -> None:
         """关闭 fake handle。
@@ -711,9 +758,36 @@ class _FakeWorker:
         :returns: fake handle。
         """
 
-        del request
-        self._handle.bind_snapshot(snapshot)
+        self._handle.bind_dispatch(snapshot, request)
         return self._handle
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 active-cancel worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:active-cancel-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 class _FakeWorkerFactory:

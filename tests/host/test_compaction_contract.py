@@ -25,6 +25,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactQualityIssueVNext,
     CompactSegmentTrigger,
+    CompactorProposal,
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
@@ -73,8 +74,13 @@ async def test_context_compactor_single_public_compact_returns_vnext_output() ->
     """ContextCompactor 只通过 compact() 返回 vNext output。"""
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request, ControllableCancellationToken())
+    proposal = await FakeContextCompactor().compact(
+        request,
+        ControllableCancellationToken(),
+    )
+    candidate = proposal.candidate
 
+    assert isinstance(proposal, CompactorProposal)
     assert isinstance(candidate, ConversationCompactOutputVNext)
     assert candidate.schema_version == CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
     assert len(candidate.evidence_backed_facts) == 1
@@ -147,9 +153,15 @@ async def test_vnext_quality_checker_accepts_fake_candidate() -> None:
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )
-    candidate = await FakeContextCompactor().compact(request, ControllableCancellationToken())
+    proposal = await FakeContextCompactor().compact(
+        request,
+        ControllableCancellationToken(),
+    )
 
-    result = check_conversation_compact_output_vnext(compact_input, candidate)
+    result = check_conversation_compact_output_vnext(
+        compact_input,
+        proposal.candidate,
+    )
 
     assert result.accepted is True
     assert result.rejection_reasons == ()

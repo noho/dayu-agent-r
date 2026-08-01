@@ -55,7 +55,12 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
     RunnerToolCallsCompletedData,
 )
-from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    RunnerRequestIdentity,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     DeepSeekThinkingExtension,
@@ -258,6 +263,34 @@ class PublicWaitingRun:
     wait_id: str
 
 
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 deterministic worker request 同源的成功响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:final-answer",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 class FinalAnswerHandle:
     """立即产出 final answer 的 deterministic worker handle。
 
@@ -265,10 +298,16 @@ class FinalAnswerHandle:
     :param content: final answer 文本。
     """
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot, content: str) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+        content: str,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param content: final answer 文本。
         :returns: ``None``。
         :raises ValueError: content 为空时抛出。
@@ -277,6 +316,7 @@ class FinalAnswerHandle:
         if content.strip() == "":
             raise ValueError("content must be non-empty")
         self._snapshot = snapshot
+        self._request = request
         self._content = content
 
     @property
@@ -306,6 +346,9 @@ class FinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -361,7 +404,7 @@ class FinalAnswerWorker:
         self._factory.snapshots.append(snapshot)
         self._factory.accepted.set()
         content = f"final:{len(self._factory.requests)}:{snapshot.run_id}"
-        return FinalAnswerHandle(snapshot, content)
+        return FinalAnswerHandle(snapshot, request, content)
 
 
 class FinalAnswerWorkerFactory:
@@ -471,7 +514,11 @@ class _AwaitingThenFinalWorker:
         self._factory.accepted.set()
         if len(self._factory.requests) == 1:
             return _AgentBackedHandle(snapshot, request, _AwaitingToolRunner())
-        return FinalAnswerHandle(snapshot, f"resolved:{snapshot.run_id}")
+        return FinalAnswerHandle(
+            snapshot,
+            request,
+            f"resolved:{snapshot.run_id}",
+        )
 
 
 class _ToolCallingWorker:

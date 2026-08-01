@@ -25,6 +25,11 @@ from dayu.engine.contracts.engine_events import (
     ToolCallDeltaData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host import (
     AttemptDispatchSnapshot,
     LocalEngineWorker,
@@ -198,10 +203,13 @@ class _TransientStreamWorker:
         :raises Exception: 本方法不主动抛出异常。
         """
 
-        del request
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_event.set()
-        return _TransientStreamHandle(snapshot=snapshot, factory=self._factory)
+        return _TransientStreamHandle(
+            snapshot=snapshot,
+            request=request,
+            factory=self._factory,
+        )
 
 
 class _TransientStreamHandle:
@@ -211,17 +219,20 @@ class _TransientStreamHandle:
         self,
         *,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         factory: TransientStreamWorkerFactory,
     ) -> None:
         """初始化测试 handle。
 
         :param snapshot: 当前 Attempt dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param factory: 共享配置与 barrier 的 factory。
         :returns: 无返回值。
         :raises Exception: 本构造函数不主动抛出异常。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._factory = factory
 
     @property
@@ -260,6 +271,7 @@ class _TransientStreamHandle:
             await self._factory.terminal_release_event.wait()
         yield _final_answer_event(
             self._snapshot,
+            request=self._request,
             content=self._factory.final_answer,
         )
 
@@ -491,11 +503,13 @@ def _tool_call_delta_event(
 def _final_answer_event(
     snapshot: AttemptDispatchSnapshot,
     *,
+    request: AgentRunRequest,
     content: str,
 ) -> EngineEvent:
     """构造成功 final answer EngineEvent。
 
     :param snapshot: 当前 Attempt dispatch snapshot。
+    :param request: 当前 dispatch 的 Engine request。
     :param content: 最终回答正文。
     :returns: final answer EngineEvent。
     :raises ValueError: EngineEvent contract 校验失败时抛出。
@@ -511,8 +525,37 @@ def _final_answer_event(
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_successful_response_identity(request),
         ),
         metadata=None,
+    )
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 transient worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:transient-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
     )
 
 

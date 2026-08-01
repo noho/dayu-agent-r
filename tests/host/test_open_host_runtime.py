@@ -27,6 +27,11 @@ from dayu.engine.contracts.engine_events import (
     ReasoningDeltaData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -149,17 +154,51 @@ _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
 _PROMOTION_BARRIER_EXPIRED_AT = datetime(2026, 5, 18, 3, 0, 0, tzinfo=UTC)
 
 
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 open-host worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:open-host-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 class _FinalAnswerHandle:
     """测试用立即产出 final answer 的 worker handle。"""
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
 
     @property
     def local_worker_id(self) -> str:
@@ -186,6 +225,9 @@ class _FinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -235,7 +277,7 @@ class _FinalAnswerWorker:
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_requests.append(request)
         self._factory.accepted_event.set()
-        return _FinalAnswerHandle(snapshot)
+        return _FinalAnswerHandle(snapshot, request)
 
 
 class _FinalAnswerWorkerFactory:
@@ -268,16 +310,19 @@ class _ControlledFinalAnswerHandle:
     def __init__(
         self,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         release_event: asyncio.Event,
     ) -> None:
         """初始化 handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param release_event: 控制 final answer 产出的事件。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._release_event = release_event
 
     @property
@@ -306,6 +351,9 @@ class _ControlledFinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -356,6 +404,7 @@ class _ControlledFinalAnswerWorker:
         self._factory.accepted_requests.append(request)
         handle = _ControlledFinalAnswerHandle(
             snapshot,
+            request,
             self._factory.release_event,
         )
         self._factory.accepted_event.set()
@@ -394,18 +443,21 @@ class _TransientThenFinalHandle:
         self,
         *,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         release_event: asyncio.Event,
         index: int,
     ) -> None:
         """初始化确定性两阶段 worker handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param release_event: terminal 释放 barrier。
         :param index: factory 分配的 worker 序号。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._release_event = release_event
         self._index = index
 
@@ -446,6 +498,9 @@ class _TransientThenFinalHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -499,11 +554,11 @@ class _TransientThenFinalWorker:
         :returns: 两阶段 worker handle。
         """
 
-        del request
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_queue.put_nowait(self._index)
         return _TransientThenFinalHandle(
             snapshot=snapshot,
+            request=request,
             release_event=self._factory.release_events[self._index],
             index=self._index,
         )

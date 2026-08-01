@@ -32,6 +32,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.contracts.json_value import JsonValue
@@ -87,6 +92,7 @@ from dayu.host.compaction import (
     CompactCandidateDiagnosticVNext,
     CompactQualityCheckResultVNext,
     CompactionRequest,
+    CompactorProposal,
     ContextCompactor,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
@@ -110,10 +116,10 @@ from dayu.host.compact_pipeline import (
 )
 from dayu.host.compaction_operation import (
     CompactionOperationResult,
-    CompactorProposalManifestReference,
     CompactorProposalRunInput,
     DurableCompactorProposalManifestRecorder,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_budget import (
     ContextBudgetDecision,
     ContextEstimateMethod,
@@ -304,6 +310,62 @@ from dayu.runtime.lane import (
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
+_COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT = 2
+
+
+def _successful_response_identity_for_agent_request(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 dispatch fixture 的 Engine request 同源的成功响应身份。
+
+    :param request: 当前 worker/compactor 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:dispatch-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 dispatch durable fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:{attempt_number}",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:{attempt_number}",
+        manifest_digest=_CALL_CONTEXT_DIGEST,
+        compactor_input_projection_ref=f"projection:{operation_id}:{attempt_number}",
+        compactor_input_projection_digest=_CALL_CONTEXT_DIGEST,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
+
+
 _LANE_NAME = "llm"
 
 
@@ -643,6 +705,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.fail_run = fail_run
         self.calls = 0
         self.prepared_requests: list[CompactionRequest] = []
@@ -701,7 +764,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 prepared proposal。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -713,9 +776,17 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         self.calls += 1
         if self.fail_run:
             raise RuntimeError("prepared proposal failed")
-        return await super().compact(
+        proposal = await super().compact(
             self._latest_prepared_request(),
             prepared_input.agent_request.cancellation_token,
+        )
+        return CompactorProposal(
+            candidate=proposal.candidate,
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(
+                    prepared_input.agent_request
+                )
+            ),
         )
 
     def _latest_prepared_request(self) -> CompactionRequest:
@@ -748,7 +819,7 @@ class _TransactionReadableCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 prepared proposal 并验证当前不在外层 write transaction 内。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -771,12 +842,13 @@ class _StaleMutatingCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """先把源 Run 失败收口，再返回 candidate。
 
         :param request: compaction request。
@@ -818,13 +890,14 @@ class _TerminalWinningProactiveCompactor(FakeContextCompactor):
         :raises Exception: 不主动抛出异常。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
 
     async def compact(
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """先提交 failed first truth，再返回 late accepted candidate。
 
         :param request: proactive compaction request。
@@ -909,26 +982,31 @@ class _QualityRejectOnceCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """构造一次可修复 quality rejection。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
         :returns: compaction candidate。
         """
 
-        candidate = await super().run_prepared_compactor_proposal(prepared_input)
+        proposal = await super().run_prepared_compactor_proposal(prepared_input)
         if self.calls == 1:
-            return replace(
-                candidate,
-                diagnostics=(
-                    CompactCandidateDiagnosticVNext(
-                        code="invalid-current-anchor",
-                        text="invalid current anchor citation",
-                        source_labels=("C1",),
+            return CompactorProposal(
+                candidate=replace(
+                    proposal.candidate,
+                    diagnostics=(
+                        CompactCandidateDiagnosticVNext(
+                            code="invalid-current-anchor",
+                            text="invalid current anchor citation",
+                            source_labels=("C1",),
+                        ),
                     ),
                 ),
+                successful_response_identity=(
+                    proposal.successful_response_identity
+                ),
             )
-        return candidate
+        return proposal
 
 
 class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
@@ -949,7 +1027,7 @@ class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """进入 provider 后等待测试释放。
 
         :param prepared_input: 已提交 manifest 的 proposal input。
@@ -987,7 +1065,7 @@ class _CrashAtPreparedAttemptCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """前序 attempts 模拟 proposal failure，目标 attempt 触发进程级 crash。
 
         :param prepared_input: 已提交 manifest 的 proposal input。
@@ -1015,7 +1093,7 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """构造短 summary，避免测试 fixture 触发 compact 后预算拒绝。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -1024,17 +1102,24 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
         """
 
         source_label = _first_citable_compact_input_label(prepared_input)
-        return ConversationCompactOutputVNext(
-            schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-            session_summary=SessionSummaryCandidateVNext(
-                summary_text="rolled",
-                source_labels=(source_label,),
+        return CompactorProposal(
+            candidate=ConversationCompactOutputVNext(
+                schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+                session_summary=SessionSummaryCandidateVNext(
+                    summary_text="rolled",
+                    source_labels=(source_label,),
+                ),
+                evidence_backed_facts=(),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity_items=(),
+                diagnostics=(),
             ),
-            evidence_backed_facts=(),
-            answer_anchors=(),
-            forward_intents=(),
-            reference_continuity_items=(),
-            diagnostics=(),
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(
+                    prepared_input.agent_request
+                )
+            ),
         )
 
 
@@ -1064,7 +1149,7 @@ class _RecoveryScenarioCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """按调用序号失败或返回最小 accepted summary。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -1081,17 +1166,24 @@ class _RecoveryScenarioCompactor(_PreparedManifestProactiveCompactor):
         if self.calls != self._accept_call:
             raise RuntimeError("recovery scenario proposal failed")
         label = _first_citable_compact_input_label(prepared_input)
-        return ConversationCompactOutputVNext(
-            schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-            session_summary=SessionSummaryCandidateVNext(
-                summary_text=f"recovery summary {self.calls}",
-                source_labels=(label,),
+        return CompactorProposal(
+            candidate=ConversationCompactOutputVNext(
+                schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+                session_summary=SessionSummaryCandidateVNext(
+                    summary_text=f"recovery summary {self.calls}",
+                    source_labels=(label,),
+                ),
+                evidence_backed_facts=(),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity_items=(),
+                diagnostics=(),
             ),
-            evidence_backed_facts=(),
-            answer_anchors=(),
-            forward_intents=(),
-            reference_continuity_items=(),
-            diagnostics=(),
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(
+                    prepared_input.agent_request
+                )
+            ),
         )
 
 
@@ -1884,6 +1976,11 @@ class _ReactiveRecoveryWorker:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=(
+                        _successful_response_identity_for_agent_request(
+                            request
+                        )
+                    ),
                 ),
                 metadata=None,
             )
@@ -2141,6 +2238,11 @@ class _FinalAnswerWorker:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=(
+                        _successful_response_identity_for_agent_request(
+                            request
+                        )
+                    ),
                 ),
                 metadata=None,
             ),
@@ -5001,6 +5103,11 @@ async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_e
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=(
+                        _successful_response_identity_for_agent_request(
+                            request
+                        )
+                    ),
                 ),
                 metadata=None,
             )
@@ -6661,7 +6768,7 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
 async def test_proactive_late_accepted_result_preserves_first_failed_truth(
     tmp_path: Path,
 ) -> None:
-    """I0543 late accepted result 必须零 artifact/event/fallback/start。
+    """I0543 late accepted result 只保留 provider 前已提交的 manifest evidence。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -6703,6 +6810,10 @@ async def test_proactive_late_accepted_result_preserves_first_failed_truth(
                 store.transaction_runner,
                 CONTEXT_COMPACTION_ATTEMPT_REJECTED,
             ) == 0
+            assert _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            ) == 1
             assert _event_payload(failed)["failure_reason"] == (
                 "concurrent_governance_winner"
             )
@@ -6716,7 +6827,10 @@ async def test_proactive_late_accepted_result_preserves_first_failed_truth(
             descriptor_count_after = _payload_descriptor_count(
                 store.transaction_runner
             )
-            assert descriptor_count_after == descriptor_count_before
+            assert descriptor_count_after == (
+                descriptor_count_before
+                + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT
+            )
         finally:
             await scheduler.close()
 
@@ -6853,6 +6967,8 @@ async def test_proactive_same_operation_terminal_contenders_preserve_first_truth
                     failure_reason="contending_provider_failure",
                     budget_after_attempted_compact=None,
                     accepted_attempt_number=None,
+                    accepted_successful_response_identity=None,
+                    accepted_proposal_manifest_reference=None,
                 )
 
             monkeypatch.setattr(
@@ -10499,6 +10615,34 @@ def _append_previous_compacted_event(
 
     def _operation(transaction: HostTransaction) -> None:
         operation_id = f"operation-{event_id}"
+        compactor_agent_request = AgentRunRequest(
+            run_id=f"compactor-run:{operation_id}:1",
+            session_id=f"context-compactor:{session_id}",
+            attempt_id=None,
+            execution_id=None,
+            messages=(
+                SystemMessage(
+                    role=AgentMessageRole.SYSTEM,
+                    content="system",
+                ),
+                UserMessage(
+                    role=AgentMessageRole.USER,
+                    content="previous compact fixture",
+                ),
+            ),
+            disable_tools=True,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=False,
+            ),
+            agent_policy=_agent_policy(False),
+            tool_schemas=(),
+            tool_executor=NoToolExecutor(),
+            cancellation_token=_HostCancellationToken(),
+        )
         EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -10571,6 +10715,20 @@ def _append_previous_compacted_event(
                     source_boundary_refs=("source-boundary:previous",),
                     accepted_evidence_mapping_refs=("evidence:previous",),
                     projection_signal="project_memory",
+                    successful_response_identity=(
+                        _successful_response_identity_for_agent_request(
+                            compactor_agent_request
+                        )
+                    ),
+                    accepted_proposal_manifest_reference=(
+                        _proposal_manifest_reference(
+                            operation_id=operation_id,
+                            attempt_number=1,
+                            compactor_engine_run_id=(
+                                compactor_agent_request.run_id
+                            ),
+                        )
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -11428,6 +11586,8 @@ def _append_proactive_rejection_after_terminal(
                     diagnostic_refs=("diagnostic:after-terminal",),
                     next_policy_decision="fail_operation",
                     budget_after_attempted_compact=None,
+                    successful_response_identity=None,
+                    proposal_manifest_reference=None,
                 ),
                 payload_ref=None,
                 payload_digest=None,

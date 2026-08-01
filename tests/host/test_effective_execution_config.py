@@ -22,6 +22,11 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.messages import AgentMessageRole
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
@@ -161,15 +166,21 @@ class _ReadEventById:
 class _FinalHandle:
     """测试用成功终态 worker handle。"""
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :returns: ``None``。
         :raises: 无主动抛出。
         """
 
         self._snapshot = snapshot
+        self._request = request
 
     @property
     def local_worker_id(self) -> str:
@@ -198,6 +209,9 @@ class _FinalHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -249,7 +263,35 @@ class _RecordingWorker:
         self._factory.snapshots.append(snapshot)
         self._factory.requests.append(request)
         self._factory.accepted.set()
-        return _FinalHandle(snapshot)
+        return _FinalHandle(snapshot, request)
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 effective-config worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:effective-config-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 class _RecordingWorkerFactory:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import TypeGuard
 
@@ -25,6 +26,11 @@ from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
     RunnerSpec,
+)
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
 )
 from dayu.host.compact_material import (
     InitialEvidenceMaterial,
@@ -753,6 +759,7 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
     """
 
     calls: list[AgentRunRequest] = []
+    returned_identities: list[SuccessfulRunnerResponseIdentity] = []
 
     async def fake_run(request: AgentRunRequest) -> AgentRunResult:
         """返回 deterministic vNext final answer。
@@ -765,17 +772,34 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
         compact_input = conversation_compact_input_vnext_from_material_pack(
             _request().material_pack
         )
-        return _final(
-            fake_compaction_proposal_from_material_json(
+        outcome = _final(
+            request=request,
+            content=fake_compaction_proposal_from_material_json(
                 _compact_input_json(compact_input)
-            )
+            ),
+            finish_reason=FinishReason.STOP,
+            provider_request_id="provider-request-compactor",
         )
+        returned_identities.append(outcome.response_identity)
+        return outcome
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
-    candidate = await _llm_compactor().compact(_request(), ControllableCancellationToken())
+    proposal = await _llm_compactor().compact(
+        _request(),
+        ControllableCancellationToken(),
+    )
 
-    assert isinstance(candidate, ConversationCompactOutputVNext)
+    assert isinstance(proposal.candidate, ConversationCompactOutputVNext)
+    assert proposal.successful_response_identity == returned_identities[0]
+    assert (
+        proposal.successful_response_identity.runner_request_identity.run_id
+        == calls[0].run_id
+    )
+    assert (
+        proposal.successful_response_identity.provider_request_id
+        == "provider-request-compactor"
+    )
     assert len(calls) == 1
     request = calls[0]
     assert request.disable_tools is True
@@ -826,8 +850,288 @@ async def test_llm_context_compactor_rejects_non_final_outcome(
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
-    with pytest.raises(LLMCompactionProposalError, match="<redacted>"):
+    with pytest.raises(LLMCompactionProposalError, match="<redacted>") as exc_info:
         await _llm_compactor().compact(_request(), ControllableCancellationToken())
+    assert exc_info.value.successful_response_identity is None
+    assert "secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mismatch_kind", "expected_message"),
+    [
+        ("run_id", "Engine run identity mismatch"),
+        ("ordinary_identity", "must not use ordinary attempt identity"),
+        ("provider", "effective provider mismatch"),
+        ("model", "effective model mismatch"),
+    ],
+)
+async def test_llm_context_compactor_rejects_cross_wired_success_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch_kind: str,
+    expected_message: str,
+) -> None:
+    """prepared request 与 final response identity 串线时 fail-closed。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param mismatch_kind: 待注入的串线字段类别。
+    :param expected_message: 对应 owner-level 拒绝消息。
+    :returns: ``None``。
+    :raises AssertionError: Host 接受串线 identity 或丢失失败 identity 时抛出。
+    """
+
+    returned_identities: list[SuccessfulRunnerResponseIdentity] = []
+
+    async def fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """返回 identity 与 prepared request 不匹配的成功 final。
+
+        :param request: 当前 prepared Engine request。
+        :returns: 携带指定串线 identity 的 final outcome。
+        :raises ValueError: 测试 identity 构造非法时抛出。
+        """
+
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            _request().material_pack
+        )
+        outcome = _final(
+            request=request,
+            content=fake_compaction_proposal_from_material_json(
+                _compact_input_json(compact_input)
+            ),
+            finish_reason=FinishReason.STOP,
+            provider_request_id="provider-request-mismatch",
+        )
+        identity = outcome.response_identity
+        request_identity = identity.runner_request_identity
+        if mismatch_kind == "run_id":
+            request_identity = build_runner_request_identity(
+                run_id=f"{request.run_id}-cross-wired",
+                attempt_id=None,
+                execution_id=None,
+                iteration_id=request_identity.iteration_id,
+                iteration_index=request_identity.iteration_index,
+                runner_call_index=request_identity.runner_call_index,
+            )
+            identity = replace(
+                identity,
+                runner_request_identity=request_identity,
+            )
+        elif mismatch_kind == "ordinary_identity":
+            request_identity = build_runner_request_identity(
+                run_id=request.run_id,
+                attempt_id="ordinary-attempt",
+                execution_id="ordinary-execution",
+                iteration_id=request_identity.iteration_id,
+                iteration_index=request_identity.iteration_index,
+                runner_call_index=request_identity.runner_call_index,
+            )
+            identity = replace(
+                identity,
+                runner_request_identity=request_identity,
+            )
+        elif mismatch_kind == "provider":
+            identity = replace(identity, effective_provider="cross-wired-provider")
+        elif mismatch_kind == "model":
+            identity = replace(identity, effective_model="cross-wired-model")
+        else:
+            raise AssertionError("unsupported mismatch kind")
+        returned_identities.append(identity)
+        return replace(outcome, response_identity=identity)
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=expected_message,
+    ) as exc_info:
+        await _llm_compactor().compact(
+            _request(),
+            ControllableCancellationToken(),
+        )
+
+    assert exc_info.value.successful_response_identity == returned_identities[0]
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_length_error_keeps_success_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LENGTH 已成功 final 的 proposal error 保留同一次 response identity。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: LENGTH 错误丢失成功 response identity 时抛出。
+    """
+
+    returned_identities: list[SuccessfulRunnerResponseIdentity] = []
+
+    async def fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """返回带 provider request id 的 LENGTH final。
+
+        :param request: 当前 prepared Engine request。
+        :returns: LENGTH final outcome。
+        """
+
+        outcome = _final(
+            request=request,
+            content="truncated proposal",
+            finish_reason=FinishReason.LENGTH,
+            provider_request_id="provider-request-length",
+        )
+        returned_identities.append(outcome.response_identity)
+        return outcome
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="finish_reason=length",
+    ) as exc_info:
+        await _llm_compactor().compact(
+            _request(),
+            ControllableCancellationToken(),
+        )
+
+    assert exc_info.value.successful_response_identity == returned_identities[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "expected_message"),
+    [
+        ("not-json", "not valid JSON"),
+        ("{}", "schema invalid"),
+    ],
+)
+async def test_llm_context_compactor_parse_errors_keep_success_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    expected_message: str,
+) -> None:
+    """成功 final 后的 parse/schema rejection 保留同源 identity。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param content: 触发 parse 或 schema rejection 的 final 文本。
+    :param expected_message: 对应解析失败消息。
+    :returns: ``None``。
+    :raises AssertionError: parse/schema 错误丢失成功 identity 时抛出。
+    """
+
+    returned_identities: list[SuccessfulRunnerResponseIdentity] = []
+
+    async def fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """返回带 provider request id 的非法 proposal final。
+
+        :param request: 当前 prepared Engine request。
+        :returns: 内容非法但 Engine 成功的 final outcome。
+        """
+
+        outcome = _final(
+            request=request,
+            content=content,
+            finish_reason=FinishReason.STOP,
+            provider_request_id="provider-request-invalid-proposal",
+        )
+        returned_identities.append(outcome.response_identity)
+        return outcome
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=expected_message,
+    ) as exc_info:
+        await _llm_compactor().compact(
+            _request(),
+            ControllableCancellationToken(),
+        )
+
+    assert exc_info.value.successful_response_identity == returned_identities[0]
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_unavailable_provider_id_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provider request id 不可用时仍返回显式 UNAVAILABLE identity。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: Host 以缺省值代替显式不可用状态时抛出。
+    """
+
+    async def fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """返回 provider request id 不可用的合法 final。
+
+        :param request: 当前 prepared Engine request。
+        :returns: 合法 final outcome。
+        """
+
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            _request().material_pack
+        )
+        return _final(
+            request=request,
+            content=fake_compaction_proposal_from_material_json(
+                _compact_input_json(compact_input)
+            ),
+            finish_reason=FinishReason.STOP,
+            provider_request_id=None,
+        )
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
+
+    proposal = await _llm_compactor().compact(
+        _request(),
+        ControllableCancellationToken(),
+    )
+
+    assert proposal.successful_response_identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.UNAVAILABLE
+    )
+    assert proposal.successful_response_identity.provider_request_id is None
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_timeout_has_no_success_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功 final 前 timeout 必须为 null identity 并通知 Host token。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: timeout 被伪造成成功 response identity 时抛出。
+    """
+
+    async def fake_run(
+        request: AgentRunRequest,
+        *,
+        timeout_seconds: float,
+    ) -> AgentRunResult:
+        """模拟 Engine public runner timeout。
+
+        :param request: 当前 prepared Engine request。
+        :param timeout_seconds: Host 传入的 proposal timeout。
+        :returns: 不会返回。
+        :raises TimeoutError: 始终抛出。
+        """
+
+        del request, timeout_seconds
+        raise TimeoutError("provider timeout api_key=secret")
+
+    monkeypatch.setattr(llm_compaction_module, "_run_agent_request", fake_run)
+    token = ControllableCancellationToken()
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="compactor proposal timed out",
+    ) as exc_info:
+        await _llm_compactor().compact(_request(), token)
+
+    assert exc_info.value.successful_response_identity is None
+    assert token.is_cancelled()
+    assert token.cancel_reason() == "compactor_proposal_timeout"
+    assert "secret" not in str(exc_info.value)
 
 
 def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, JsonValue]:
@@ -1104,21 +1408,50 @@ def _request_with_long_input_material() -> CompactionRequest:
     )
 
 
-def _final(content: str, *, finish_reason: FinishReason = FinishReason.STOP) -> EngineRunOutcomeFinalAnswer:
+def _final(
+    content: str,
+    *,
+    request: AgentRunRequest,
+    finish_reason: FinishReason,
+    provider_request_id: str | None,
+) -> EngineRunOutcomeFinalAnswer:
     """构造 final answer outcome。
 
     :param content: final answer 文本。
+    :param request: 产出该 final 的同一次 Engine request。
     :param finish_reason: final answer finish reason。
+    :param provider_request_id: provider 返回的 request id；不可用时为
+        ``None``。
     :returns: EngineRunOutcomeFinalAnswer。
+    :raises ValueError: request identity 或 provider id 配对非法时抛出。
     """
 
+    request_identity = build_runner_request_identity(
+        run_id=request.run_id,
+        attempt_id=request.attempt_id,
+        execution_id=request.execution_id,
+        iteration_id=f"{request.run_id}-iteration-1",
+        iteration_index=0,
+        runner_call_index=1,
+    )
     return EngineRunOutcomeFinalAnswer(
-        session_id="session-1",
-        run_id="run-1",
+        session_id=request.session_id,
+        run_id=request.run_id,
         content=content,
         filtered=False,
         degraded=False,
         finish_reason=finish_reason,
+        response_identity=SuccessfulRunnerResponseIdentity(
+            effective_provider=request.runner_spec.provider,
+            effective_model=request.runner_spec.model,
+            runner_request_identity=request_identity,
+            provider_request_id_availability=(
+                ProviderRequestIdAvailability.UNAVAILABLE
+                if provider_request_id is None
+                else ProviderRequestIdAvailability.PRESENT
+            ),
+            provider_request_id=provider_request_id,
+        ),
     )
 
 

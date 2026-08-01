@@ -12,6 +12,11 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
@@ -204,6 +209,7 @@ from dayu.host.memory import (
     digest_memory_projection_policy,
 )
 from dayu.host.projection import ProjectionRunner
+from dayu.host.context_events import CompactorProposalManifestReference
 from tests.host.memory_snapshot_factories import (
     current_input_memory_snapshot,
     recalculate_memory_snapshot_digest,
@@ -229,6 +235,60 @@ _POLICY_REF = "policy-snapshot-p5-s2"
 _CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _successful_response_identity(
+    *,
+    operation_id: str,
+    compactor_engine_run_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造 run-input fixture 的 event-unique response identity。
+
+    :param operation_id: 当前 compaction operation id。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: deterministic、非敏感的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{operation_id}:accepted-iteration",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 run-input fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:1",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:1",
+        manifest_digest=_DIGEST_A,
+        compactor_input_projection_ref=f"projection:{operation_id}:1",
+        compactor_input_projection_digest=_DIGEST_B,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=1,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
 _R03_CITATION_OBJECT: dict[str, JsonValue] = {
     "document_id": "MSFT-10K-2025",
     "source_type": "sec_filing",
@@ -7150,6 +7210,14 @@ def _compact_payload(
             source_boundary_refs=("event-memory-raw-user",),
             accepted_evidence_mapping_refs=("evidence:memory-tool",),
             projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=_successful_response_identity(
+                operation_id=operation_id,
+                compactor_engine_run_id=f"compactor-run:{operation_id}:1",
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id=operation_id,
+                compactor_engine_run_id=f"compactor-run:{operation_id}:1",
+            ),
         )
     )
 

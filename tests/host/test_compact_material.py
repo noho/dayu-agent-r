@@ -12,6 +12,11 @@ from typing import NamedTuple
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host.accepted_tool_outcome import accepted_tool_outcome_json
@@ -137,11 +142,66 @@ from tests.host.memory_snapshot_factories import (
     memory_snapshot_cursor,
     recalculate_memory_snapshot_digest,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 
 _SESSION_ID = "session-compact-material"
 _POLICY_DIGEST = "policy-digest-compact-material"
 _NOW = "2026-05-24T00:00:00.000000Z"
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _successful_response_identity(
+    *,
+    operation_id: str,
+    compactor_engine_run_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造 compact-material fixture 的 event-unique response identity。
+
+    :param operation_id: 当前 compaction operation id。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: deterministic、非敏感的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{operation_id}:accepted-iteration",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 compact-material fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:1",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:1",
+        manifest_digest=_DIGEST,
+        compactor_input_projection_ref=f"projection:{operation_id}:1",
+        compactor_input_projection_digest=_DIGEST,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=1,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
 _LONG_EVIDENCE_TEXT_CHAR_COUNT = 5000
 _CURRENT_VNEXT_MATERIAL_KEYS = (
     "previous_compacted_view",
@@ -3617,6 +3677,18 @@ def _compacted_payload(
             source_boundary_refs=("source-boundary:test",),
             accepted_evidence_mapping_refs=accepted_evidence_refs,
             projection_signal="project_memory",
+            successful_response_identity=_successful_response_identity(
+                operation_id="operation-compact-test",
+                compactor_engine_run_id=(
+                    "compactor-run:operation-compact-test:1"
+                ),
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="operation-compact-test",
+                compactor_engine_run_id=(
+                    "compactor-run:operation-compact-test:1"
+                ),
+            ),
         )
     )
 

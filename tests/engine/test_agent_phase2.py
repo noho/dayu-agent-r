@@ -81,7 +81,10 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
-from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    RunnerRequestIdentity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -592,6 +595,7 @@ def _assert_single_terminal_at_end(events: Sequence[EngineEvent]) -> None:
 async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     """无工具成功 run 会提升 RunnerEvent 并由 Agent 产出 final_answer。"""
 
+    request = _request()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -621,12 +625,13 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
             _event(
                 RunnerEventType.RUNNER_DONE,
                 RunnerDoneData(
-                    finish_reason=FinishReason.STOP, provider_request_id=None
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req-final",
                 ),
             ),
         )
     )
-    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+    events = await _collect(_AsyncAgent(request=request, runner=runner))
 
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
@@ -654,6 +659,16 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert request_identity.iteration_index == 0
     assert request_identity.runner_call_index == 1
     assert request_identity.client_correlation_id.startswith("dayu-")
+    assert final.data.response_identity.effective_provider == (
+        request.runner_spec.provider
+    )
+    assert final.data.response_identity.effective_model == request.runner_spec.model
+    assert final.data.response_identity.runner_request_identity == request_identity
+    assert final.data.response_identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.PRESENT
+    )
+    assert final.data.response_identity.provider_request_id == "req-final"
+    assert final.data.response_identity.provider_request_id != "req-usage"
     iteration_completed = [
         event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]
@@ -1913,6 +1928,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
     """LENGTH 无续写预算时降级 final；CONTENT_FILTER 不消费 continuation。"""
 
     for finish_reason in (FinishReason.LENGTH, FinishReason.CONTENT_FILTER):
+        request = _request()
         runner = _ScriptedRunner(
             events=(
                 _event(
@@ -1930,7 +1946,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
                 ),
             )
         )
-        events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+        events = await _collect(_AsyncAgent(request=request, runner=runner))
         assert _final_event(events).type is EngineEventType.FINAL_ANSWER
         assert isinstance(events[-1].data, FinalAnswerData)
         assert events[-1].data.finish_reason is finish_reason
@@ -1939,6 +1955,21 @@ async def test_length_and_content_filter_final_boundaries() -> None:
         )
         assert events[-1].data.degraded is True
         assert runner.call_count == 1
+        assert runner.request_identities_seen[0] is not None
+        assert (
+            events[-1].data.response_identity.runner_request_identity
+            == runner.request_identities_seen[0]
+        )
+        assert events[-1].data.response_identity.effective_provider == (
+            request.runner_spec.provider
+        )
+        assert events[-1].data.response_identity.effective_model == (
+            request.runner_spec.model
+        )
+        assert events[-1].data.response_identity.provider_request_id_availability is (
+            ProviderRequestIdAvailability.UNAVAILABLE
+        )
+        assert events[-1].data.response_identity.provider_request_id is None
 
 
 @pytest.mark.asyncio
@@ -2176,6 +2207,12 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
         )
         result = await agent_module.run_agent_and_wait(current_request)
         assert isinstance(result, expected_type)
+        if isinstance(result, EngineRunOutcomeFinalAnswer):
+            assert runner.request_identities_seen[0] is not None
+            assert (
+                result.response_identity.runner_request_identity
+                == runner.request_identities_seen[0]
+            )
 
 
 @pytest.mark.asyncio

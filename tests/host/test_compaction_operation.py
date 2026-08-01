@@ -20,6 +20,11 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -37,16 +42,19 @@ from dayu.host.compaction import (
     CompactSegmentTrigger,
     CompactQualityCheckResultVNext,
     CompactQualityIssueVNext,
+    CompactorProposal,
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
 )
 from dayu.host.compaction_operation import run_compaction_operation
 from dayu.host.compaction_operation import (
-    CompactorProposalManifestReference,
     CompactorProposalRunInput,
 )
-from dayu.host.context_events import build_context_compaction_attempt_rejected_payload
+from dayu.host.context_events import (
+    CompactorProposalManifestReference,
+    build_context_compaction_attempt_rejected_payload,
+)
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import sha256_digest_json
@@ -73,12 +81,13 @@ class _FailOnceCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行可重试 proposal。
 
         :param request: compaction request。
@@ -98,7 +107,7 @@ class _AlwaysFailingCompactor(FakeContextCompactor):
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """模拟 proposal failure。
 
         :param request: compaction request。
@@ -123,11 +132,12 @@ class _SensitiveFailingCompactor(FakeContextCompactor):
         :raises Exception: 不主动抛出异常。
         """
 
+        super().__init__()
         self._exception_message = exception_message
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """模拟 provider 错误消息携带 secret。
 
         :param request: compaction request。
@@ -146,7 +156,7 @@ class _EmptyMessageFailingCompactor(FakeContextCompactor):
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """模拟 provider 抛出空消息异常。
 
         :param request: compaction request。
@@ -170,12 +180,13 @@ class _CancelAfterFailureCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._token = token
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """首次 proposal 失败并在重试前请求取消。
 
         :param request: compaction request。
@@ -200,12 +211,13 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """返回可修复 quality rejection 后的成功 candidate。
 
         :param request: compaction request。
@@ -214,17 +226,23 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        proposal = await self._fake.compact(request, cancellation_token)
+        candidate = proposal.candidate
         if self.calls == 1:
             assert candidate.session_summary is not None
-            return replace(
-                candidate,
-                session_summary=replace(
-                    candidate.session_summary,
-                    source_labels=("C1",),
+            return CompactorProposal(
+                candidate=replace(
+                    candidate,
+                    session_summary=replace(
+                        candidate.session_summary,
+                        source_labels=("C1",),
+                    ),
+                ),
+                successful_response_identity=(
+                    proposal.successful_response_identity
                 ),
             )
-        return candidate
+        return proposal
 
 
 class _HardThresholdOnceCompactor(FakeContextCompactor):
@@ -236,12 +254,13 @@ class _HardThresholdOnceCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """返回 hard-threshold rejection 后的成功 candidate。
 
         :param request: compaction request。
@@ -250,17 +269,23 @@ class _HardThresholdOnceCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        proposal = await self._fake.compact(request, cancellation_token)
+        candidate = proposal.candidate
         if self.calls == 1:
             assert candidate.session_summary is not None
-            return replace(
-                candidate,
-                session_summary=replace(
-                    candidate.session_summary,
-                    summary_text="x" * 2000,
+            return CompactorProposal(
+                candidate=replace(
+                    candidate,
+                    session_summary=replace(
+                        candidate.session_summary,
+                        summary_text="x" * 2000,
+                    ),
+                ),
+                successful_response_identity=(
+                    proposal.successful_response_identity
                 ),
             )
-        return candidate
+        return proposal
 
 
 class _DiagnosticsOnlyLargeCompactor(FakeContextCompactor):
@@ -272,11 +297,12 @@ class _DiagnosticsOnlyLargeCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """返回只在 diagnostics 中携带大文本的 candidate。
 
         :param request: compaction request。
@@ -284,15 +310,18 @@ class _DiagnosticsOnlyLargeCompactor(FakeContextCompactor):
         :returns: compaction candidate。
         """
 
-        candidate = await self._fake.compact(request, cancellation_token)
-        return replace(
-            candidate,
-            diagnostics=(
-                CompactCandidateDiagnosticVNext(
-                    code="large_diagnostic",
-                    text="diagnostic text " * 200,
+        proposal = await self._fake.compact(request, cancellation_token)
+        return CompactorProposal(
+            candidate=replace(
+                proposal.candidate,
+                diagnostics=(
+                    CompactCandidateDiagnosticVNext(
+                        code="large_diagnostic",
+                        text="diagnostic text " * 200,
+                    ),
                 ),
             ),
+            successful_response_identity=proposal.successful_response_identity,
         )
 
 
@@ -305,12 +334,13 @@ class _RecordingCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.requests: list[CompactionRequest] = []
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """记录 request 并返回 fake candidate。
 
         :param request: compaction request。
@@ -331,12 +361,13 @@ class _DistinctFactPassCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """返回带 pass 差异的 accepted vNext fact tuple。
 
         :param request: compaction request。
@@ -345,17 +376,23 @@ class _DistinctFactPassCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        proposal = await self._fake.compact(request, cancellation_token)
+        candidate = proposal.candidate
         assert len(candidate.evidence_backed_facts) > 0
         first_fact = candidate.evidence_backed_facts[0]
-        return replace(
-            candidate,
-            evidence_backed_facts=(
-                replace(
-                    first_fact,
-                    claim_text=f"whole vNext fact tuple from pass {self.calls}",
+        return CompactorProposal(
+            candidate=replace(
+                candidate,
+                evidence_backed_facts=(
+                    replace(
+                        first_fact,
+                        claim_text=(
+                            f"whole vNext fact tuple from pass {self.calls}"
+                        ),
+                    ),
                 ),
             ),
+            successful_response_identity=proposal.successful_response_identity,
         )
 
 
@@ -368,12 +405,13 @@ class _SecondPassFailingCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """第二次调用抛出 proposal failure。
 
         :param request: compaction request。
@@ -397,12 +435,13 @@ class _DistinctPassCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.calls = 0
         self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """返回带 pass 差异的 accepted candidate。
 
         :param request: compaction request。
@@ -411,14 +450,20 @@ class _DistinctPassCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        proposal = await self._fake.compact(request, cancellation_token)
+        candidate = proposal.candidate
         assert candidate.session_summary is not None
-        return replace(
-            candidate,
-            session_summary=replace(
-                candidate.session_summary,
-                summary_text=f"whole vNext candidate from pass {self.calls}",
+        return CompactorProposal(
+            candidate=replace(
+                candidate,
+                session_summary=replace(
+                    candidate.session_summary,
+                    summary_text=(
+                        f"whole vNext candidate from pass {self.calls}"
+                    ),
+                ),
             ),
+            successful_response_identity=proposal.successful_response_identity,
         )
 
 
@@ -484,6 +529,9 @@ class _RecordingProposalManifestRecorder:
             compactor_input_projection_digest=(
                 prepared_input.compactor_input_projection_digest
             ),
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+            compactor_engine_run_id=prepared_input.compactor_engine_run_id,
         )
         self.references.append(reference)
         return reference
@@ -500,6 +548,7 @@ class _PreparedManifestCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.events = events
         self.fail_run = fail_run
         self._fake = FakeContextCompactor()
@@ -553,7 +602,7 @@ class _PreparedManifestCompactor(FakeContextCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 prepared proposal。
 
         :param prepared_input: prepared proposal input。
@@ -564,9 +613,17 @@ class _PreparedManifestCompactor(FakeContextCompactor):
         self.events.append("run")
         if self.fail_run:
             raise RuntimeError("prepared proposal failed")
-        return await self._fake.compact(
+        proposal = await self._fake.compact(
             _request(),
             prepared_input.agent_request.cancellation_token,
+        )
+        return CompactorProposal(
+            candidate=proposal.candidate,
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(
+                    prepared_input.agent_request
+                )
+            ),
         )
 
 
@@ -587,7 +644,7 @@ class _PreparedCancelledCompactor(_PreparedManifestCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """模拟 Host cancellation 已生效后的 proposal 取消。
 
         :param prepared_input: prepared proposal input。
@@ -671,6 +728,34 @@ def _runner_spec() -> RunnerSpec:
     )
 
 
+def _successful_response_identity_for_agent_request(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与当前 prepared Agent request 严格绑定的测试成功身份。
+
+    :param request: 当前 prepared compactor Engine request。
+    :returns: provider request id 不可用的同源成功响应身份。
+    :raises ValueError: request 身份字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:iteration:0",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_compaction_operation_retries_async_proposal_failure() -> None:
     """operation await async compactor，并保留 proposal failure 后 retry 行为。"""
@@ -712,11 +797,17 @@ async def test_run_compaction_operation_records_prepared_proposal_manifest_befor
 
     assert events == ["prepare", "record", "run"]
     assert result.accepted_candidate is not None
-    assert result.accepted_proposal_manifest_ref == (
+    assert result.accepted_proposal_manifest_reference is not None
+    assert result.accepted_proposal_manifest_reference.manifest_payload_ref == (
         "runner-call-manifest:operation-prepared-accepted:1"
     )
-    assert result.accepted_proposal_manifest_digest == (
+    assert result.accepted_proposal_manifest_reference.manifest_digest == (
         recorder.references[0].manifest_digest
+    )
+    assert result.accepted_successful_response_identity is not None
+    assert (
+        result.accepted_successful_response_identity.runner_request_identity.run_id
+        == recorder.references[0].compactor_engine_run_id
     )
     assert len(result.rejected_attempts) == 0
 
@@ -801,10 +892,15 @@ async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest
     assert result.accepted_candidate is None
     assert len(result.rejected_attempts) == 1
     rejected = result.rejected_attempts[0]
-    assert rejected.proposal_manifest_ref == (
+    assert rejected.proposal_manifest_reference is not None
+    assert rejected.proposal_manifest_reference.manifest_payload_ref == (
         "runner-call-manifest:operation-prepared-failed:1"
     )
-    assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+    assert (
+        rejected.proposal_manifest_reference.manifest_digest
+        == recorder.references[0].manifest_digest
+    )
+    assert rejected.successful_response_identity is None
 
 
 @pytest.mark.asyncio
@@ -834,47 +930,37 @@ async def test_run_compaction_operation_cancelled_proposal_keeps_manifest_ref() 
         compaction_operation.CompactionFailureCategory.CANCELLATION_REQUESTED
     )
     assert rejected.repairable is False
-    assert rejected.proposal_manifest_ref == (
+    assert rejected.proposal_manifest_reference is not None
+    assert rejected.proposal_manifest_reference.manifest_payload_ref == (
         "runner-call-manifest:operation-prepared-cancelled:1"
     )
-    assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+    assert (
+        rejected.proposal_manifest_reference.manifest_digest
+        == recorder.references[0].manifest_digest
+    )
+    assert rejected.successful_response_identity is None
     assert "host_cancelled_during_proposal" in rejected.diagnostic_refs[0]
 
 
 def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> None:
-    """accepted compaction 缺 proposal manifest ref/digest 时 fail-closed。"""
+    """accepted compaction 缺 typed proposal manifest 时 fail-closed。"""
 
-    missing_ref = compaction_operation.CompactionOperationResult(
+    result = compaction_operation.CompactionOperationResult(
         accepted_candidate=None,
         quality_result=None,
         rejected_attempts=(),
         failure_reason=None,
         budget_after_attempted_compact=10,
         accepted_attempt_number=1,
-        accepted_proposal_manifest_ref=None,
-        accepted_proposal_manifest_digest=_DIGEST,
-    )
-    missing_digest = compaction_operation.CompactionOperationResult(
-        accepted_candidate=None,
-        quality_result=None,
-        rejected_attempts=(),
-        failure_reason=None,
-        budget_after_attempted_compact=10,
-        accepted_attempt_number=1,
-        accepted_proposal_manifest_ref="runner-call-manifest:test",
-        accepted_proposal_manifest_digest=None,
+        accepted_successful_response_identity=None,
+        accepted_proposal_manifest_reference=None,
     )
 
     with pytest.raises(
         RuntimeError,
-        match="accepted compaction is missing proposal manifest ref",
+        match="accepted compaction is missing proposal manifest reference",
     ):
-        dispatch._required_compactor_manifest_ref(missing_ref)
-    with pytest.raises(
-        RuntimeError,
-        match="accepted compaction is missing proposal manifest digest",
-    ):
-        dispatch._required_compactor_manifest_digest(missing_digest)
+        dispatch._required_compactor_manifest_reference(result)
 
 
 @pytest.mark.asyncio
@@ -882,12 +968,16 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
     """quality_check_rejected 后 retry，并接受第二次 candidate。"""
 
     compactor = _QualityRejectOnceCompactor()
+    manifest_events: list[str] = []
+    recorder = _RecordingProposalManifestRecorder(manifest_events)
     result = await run_compaction_operation(
         request=_request(),
         compactor=compactor,
         first_attempt_number=1,
         max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-quality-rejected",
+        proposal_manifest_recorder=recorder,
     )
 
     assert compactor.calls == 2
@@ -911,6 +1001,24 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
         is compaction_operation.CompactionNextPolicyDecision.RETRY_SEMANTIC_REPAIR
     )
     assert rejected.repairable is True
+    assert rejected.proposal_manifest_reference is not None
+    assert rejected.successful_response_identity is not None
+    assert rejected.proposal_manifest_reference == recorder.references[0]
+    assert (
+        rejected.successful_response_identity.runner_request_identity.run_id
+        == recorder.references[0].compactor_engine_run_id
+    )
+    assert result.accepted_successful_response_identity is not None
+    assert result.accepted_proposal_manifest_reference == recorder.references[1]
+    assert (
+        result.accepted_successful_response_identity.runner_request_identity.run_id
+        == recorder.references[1].compactor_engine_run_id
+    )
+    assert (
+        rejected.successful_response_identity
+        != result.accepted_successful_response_identity
+    )
+    assert manifest_events == ["record", "record"]
     payload = build_context_compaction_attempt_rejected_payload(
         operation_id="operation-quality-rejected",
         attempt_number=rejected.attempt_number,
@@ -920,6 +1028,8 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
         diagnostic_refs=rejected.diagnostic_refs,
         next_policy_decision=rejected.next_policy_decision.value,
         budget_after_attempted_compact=rejected.budget_after_attempted_compact,
+        successful_response_identity=rejected.successful_response_identity,
+        proposal_manifest_reference=rejected.proposal_manifest_reference,
     )
     assert payload["failure_category"] == "quality_check_rejected"
     assert payload["next_policy_decision"] == "retry_semantic_repair"
@@ -931,12 +1041,16 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
     """proactive hard_threshold_after_compact 后 retry，并接受第二次 candidate。"""
 
     compactor = _HardThresholdOnceCompactor()
+    manifest_events: list[str] = []
+    recorder = _RecordingProposalManifestRecorder(manifest_events)
     result = await run_compaction_operation(
         request=_request(),
         compactor=compactor,
         first_attempt_number=1,
         max_attempt_number=2,
         cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-hard-threshold-rejected",
+        proposal_manifest_recorder=recorder,
     )
 
     assert compactor.calls == 2
@@ -950,7 +1064,25 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
         result.rejected_attempts[0].failure_category
         is compaction_operation.CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
     )
-    assert result.rejected_attempts[0].repairable is True
+    rejected = result.rejected_attempts[0]
+    assert rejected.repairable is True
+    assert rejected.successful_response_identity is not None
+    assert rejected.proposal_manifest_reference == recorder.references[0]
+    assert (
+        rejected.successful_response_identity.runner_request_identity.run_id
+        == recorder.references[0].compactor_engine_run_id
+    )
+    assert result.accepted_successful_response_identity is not None
+    assert result.accepted_proposal_manifest_reference == recorder.references[1]
+    assert (
+        result.accepted_successful_response_identity.runner_request_identity.run_id
+        == recorder.references[1].compactor_engine_run_id
+    )
+    assert (
+        rejected.successful_response_identity
+        != result.accepted_successful_response_identity
+    )
+    assert manifest_events == ["record", "record"]
     assert result.failure_reason is None
 
 

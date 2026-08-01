@@ -39,6 +39,7 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
     AnswerAnchorCandidateVNext,
@@ -52,6 +53,8 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CONVERSATION_COMPACT_SUMMARY_SOURCE_SECTIONS_VNEXT,
     CompactionRequest,
+    CompactorProposal,
+    CompactorProposalError,
     ConversationCompactInputVNext,
     ConversationCompactLabelSectionVNext,
     ConversationCompactOutputVNext,
@@ -129,12 +132,13 @@ class _CancellationSignalToken(CancellationToken, Protocol):
         ...
 
 
-class LLMCompactionProposalError(RuntimeError):
+class LLMCompactionProposalError(CompactorProposalError):
     """LLM compaction 单次 proposal 失败。
 
     :param message: 中性失败描述。
+    :param successful_response_identity: 本次失败发生在成功 Engine final 之后
+        时对应的响应身份；尚未取得成功 final 时为 ``None``。
     """
-
 
 class _RejectingToolExecutor(ToolExecutor):
     """禁用工具 compactor 的 rejecting executor。
@@ -212,12 +216,12 @@ class LLMContextCompactor(ContextCompactor):
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行一次 vNext LLM compaction proposal。
 
         :param request: Host 构造的 immutable compaction request。
         :param cancellation_token: Host run lifecycle 注入的真实取消 token。
-        :returns: vNext compact output candidate。
+        :returns: 与实际成功 Runner call 身份配对的 vNext proposal。
         :raises TypeError: request 类型非法时抛出。
         :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
         :raises Exception: Engine runner / provider 调用失败时透传。
@@ -301,12 +305,12 @@ class LLMContextCompactor(ContextCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行已准备的 compactor proposal runner call。
 
         :param prepared_input: 由 ``prepare_compactor_proposal_run_input``
             返回的同源 proposal input。
-        :returns: vNext compact output candidate。
+        :returns: 与实际成功 Runner call 身份配对的 vNext proposal。
         :raises TypeError: prepared_input 类型非法时抛出。
         :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
         :raises Exception: Engine runner / provider 调用失败时透传。
@@ -323,15 +327,78 @@ class LLMContextCompactor(ContextCompactor):
             _signal_timeout_cancellation(
                 prepared_input.agent_request.cancellation_token
             )
-            raise LLMCompactionProposalError(_COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE) from exc
+            raise LLMCompactionProposalError(
+                _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE,
+                successful_response_identity=None,
+            ) from exc
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
-            raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
-        if outcome.finish_reason is FinishReason.LENGTH:
-            raise LLMCompactionProposalError("compactor proposal was truncated finish_reason=length")
-        return parse_conversation_compact_output_vnext(
-            prepared_input.compact_input,
-            outcome.content,
+            raise LLMCompactionProposalError(
+                _non_final_outcome_message(outcome),
+                successful_response_identity=None,
+            )
+        response_identity = _validated_prepared_response_identity(
+            prepared_input=prepared_input,
+            outcome=outcome,
         )
+        if outcome.finish_reason is FinishReason.LENGTH:
+            raise LLMCompactionProposalError(
+                "compactor proposal was truncated finish_reason=length",
+                successful_response_identity=response_identity,
+            )
+        try:
+            candidate = parse_conversation_compact_output_vnext(
+                prepared_input.compact_input,
+                outcome.content,
+            )
+        except LLMCompactionProposalError as exc:
+            raise LLMCompactionProposalError(
+                str(exc),
+                successful_response_identity=response_identity,
+            ) from exc
+        return CompactorProposal(
+            candidate=candidate,
+            successful_response_identity=response_identity,
+        )
+
+
+def _validated_prepared_response_identity(
+    *,
+    prepared_input: CompactorProposalRunInput,
+    outcome: EngineRunOutcomeFinalAnswer,
+) -> SuccessfulRunnerResponseIdentity:
+    """校验成功 Engine final 与 prepared compactor call 完全同源。
+
+    :param prepared_input: 当前 Host attempt 已冻结的真实 Engine request。
+    :param outcome: Engine 返回的成功 final outcome。
+    :returns: 校验通过的成功响应身份。
+    :raises LLMCompactionProposalError: Engine run、ordinary attempt/execution
+        或 effective provider/model 与 prepared request 不一致时抛出。
+    """
+
+    response_identity = outcome.response_identity
+    request_identity = response_identity.runner_request_identity
+    if request_identity.run_id != prepared_input.compactor_engine_run_id:
+        raise LLMCompactionProposalError(
+            "compactor successful response Engine run identity mismatch",
+            successful_response_identity=response_identity,
+        )
+    if request_identity.attempt_id is not None or request_identity.execution_id is not None:
+        raise LLMCompactionProposalError(
+            "compactor successful response must not use ordinary attempt identity",
+            successful_response_identity=response_identity,
+        )
+    runner_spec = prepared_input.agent_request.runner_spec
+    if response_identity.effective_provider != runner_spec.provider:
+        raise LLMCompactionProposalError(
+            "compactor successful response effective provider mismatch",
+            successful_response_identity=response_identity,
+        )
+    if response_identity.effective_model != runner_spec.model:
+        raise LLMCompactionProposalError(
+            "compactor successful response effective model mismatch",
+            successful_response_identity=response_identity,
+        )
+    return response_identity
 
 
 
@@ -576,7 +643,10 @@ def parse_conversation_compact_output_vnext(
         candidate = _parse_vnext_proposal(final_answer)
         _validate_vnext_candidate_source_labels(request, candidate)
     except (KeyError, TypeError, ValueError) as exc:
-        raise LLMCompactionProposalError(f"compactor vNext proposal schema invalid: {exc}") from exc
+        raise LLMCompactionProposalError(
+            f"compactor vNext proposal schema invalid: {exc}",
+            successful_response_identity=None,
+        ) from exc
     return candidate
 
 
@@ -590,11 +660,17 @@ def _parse_vnext_proposal(final_answer: str) -> ConversationCompactOutputVNext:
 
     raw = final_answer.strip()
     if len(raw) < _MIN_PROPOSAL_LENGTH:
-        raise LLMCompactionProposalError("compactor vNext proposal is empty")
+        raise LLMCompactionProposalError(
+            "compactor vNext proposal is empty",
+            successful_response_identity=None,
+        )
     try:
         parsed: JsonValue = json.loads(raw)
     except JSONDecodeError as exc:
-        raise LLMCompactionProposalError(f"compactor vNext proposal is not valid JSON: {exc.msg}") from exc
+        raise LLMCompactionProposalError(
+            f"compactor vNext proposal is not valid JSON: {exc.msg}",
+            successful_response_identity=None,
+        ) from exc
     proposal = _json_object(parsed, "proposal")
     schema_version = _required_string(
         proposal,

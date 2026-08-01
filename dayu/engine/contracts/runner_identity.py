@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from enum import StrEnum
 
 _CLIENT_CORRELATION_PREFIX: str = "dayu-"
 _SHA256_HEX_LENGTH: int = 64
@@ -22,6 +23,13 @@ _PART_SEPARATOR: str = "|"
 _PART_FIELD_SEPARATOR: str = ":"
 
 _CanonicalIdentityParts = tuple[str, str | None, str | None, str, int, int]
+
+
+class ProviderRequestIdAvailability(StrEnum):
+    """成功响应中的 provider request id 可用性。"""
+
+    PRESENT = "present"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +86,70 @@ class RunnerRequestIdentity:
             raise ValueError(
                 "RunnerRequestIdentity.client_correlation_id must match "
                 "the canonical identity tuple"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessfulRunnerResponseIdentity:
+    """实际终结成功 Runner 调用的安全响应身份。
+
+    :param effective_provider: 实际调用的 provider 标识。
+    :param effective_model: 实际调用的 provider model 标识。
+    :param runner_request_identity: 同一次逻辑 Runner 调用的请求身份。
+    :param provider_request_id_availability: provider request id 是否可用。
+    :param provider_request_id: provider 返回的 request id；不可用时为
+        ``None``。
+    """
+
+    effective_provider: str
+    effective_model: str
+    runner_request_identity: RunnerRequestIdentity
+    provider_request_id_availability: ProviderRequestIdAvailability
+    provider_request_id: str | None
+
+    def __post_init__(self) -> None:
+        """校验成功响应身份的严格字段不变量。
+
+        :returns: 无返回值。
+        :raises TypeError: 请求身份或 availability 不是对应强类型时抛出。
+        :raises ValueError: provider/model 为空，或 availability 与 provider
+            request id 未严格成对时抛出。
+        """
+
+        _validate_non_empty_text("effective_provider", self.effective_provider)
+        _validate_non_empty_text("effective_model", self.effective_model)
+        if not isinstance(self.runner_request_identity, RunnerRequestIdentity):
+            raise TypeError(
+                "SuccessfulRunnerResponseIdentity.runner_request_identity "
+                "must be RunnerRequestIdentity"
+            )
+        if not isinstance(
+            self.provider_request_id_availability,
+            ProviderRequestIdAvailability,
+        ):
+            raise TypeError(
+                "SuccessfulRunnerResponseIdentity."
+                "provider_request_id_availability must be "
+                "ProviderRequestIdAvailability"
+            )
+        if (
+            self.provider_request_id_availability
+            is ProviderRequestIdAvailability.PRESENT
+        ):
+            if self.provider_request_id is None:
+                raise ValueError(
+                    "SuccessfulRunnerResponseIdentity.provider_request_id "
+                    "must be present when availability is present"
+                )
+            _validate_non_empty_text(
+                "provider_request_id",
+                self.provider_request_id,
+            )
+            return
+        if self.provider_request_id is not None:
+            raise ValueError(
+                "SuccessfulRunnerResponseIdentity.provider_request_id must be "
+                "None when availability is unavailable"
             )
 
 
@@ -309,4 +381,9 @@ def _is_lowercase_hex_char(char: str) -> bool:
     return ("0" <= char <= "9") or ("a" <= char <= "f")
 
 
-__all__ = ["RunnerRequestIdentity", "build_runner_request_identity"]
+__all__ = [
+    "ProviderRequestIdAvailability",
+    "RunnerRequestIdentity",
+    "SuccessfulRunnerResponseIdentity",
+    "build_runner_request_identity",
+]

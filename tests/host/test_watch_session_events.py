@@ -28,6 +28,11 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -2741,6 +2746,22 @@ def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> Engi
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=SuccessfulRunnerResponseIdentity(
+                effective_provider="test",
+                effective_model="test-model",
+                runner_request_identity=build_runner_request_identity(
+                    run_id=snapshot.run_id,
+                    attempt_id=snapshot.attempt_id,
+                    execution_id=snapshot.execution_id,
+                    iteration_id=f"{snapshot.run_id}:watch-final",
+                    iteration_index=0,
+                    runner_call_index=1,
+                ),
+                provider_request_id_availability=(
+                    ProviderRequestIdAvailability.UNAVAILABLE
+                ),
+                provider_request_id=None,
+            ),
         ),
         metadata=None,
     )

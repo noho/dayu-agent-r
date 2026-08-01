@@ -40,6 +40,11 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import RunnerCallOptions
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -1183,6 +1188,10 @@ class FakeCompactorRunAgent:
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_successful_response_identity(
+                request,
+                iteration_id=f"{request.run_id}:accepted-compactor",
+            ),
         )
 
 
@@ -1227,6 +1236,10 @@ class RejectingCompactorRunAgent:
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_successful_response_identity(
+                request,
+                iteration_id=f"{request.run_id}:rejected-compactor",
+            ),
         )
 
 
@@ -1326,7 +1339,11 @@ class _ReactivePublicWorker:
             )
         return _PublicSingleEventHandle(
             worker_id=_PUBLIC_FINAL_WORKER_ID,
-            event=_final_answer_event(snapshot, _PUBLIC_REACTIVE_FINAL_CONTENT),
+            event=_final_answer_event(
+                snapshot,
+                request,
+                _PUBLIC_REACTIVE_FINAL_CONTENT,
+            ),
         )
 
 
@@ -1470,10 +1487,15 @@ def _reactive_compaction_requested_event(
     )
 
 
-def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> EngineEvent:
+def _final_answer_event(
+    snapshot: AttemptDispatchSnapshot,
+    request: AgentRunRequest,
+    content: str,
+) -> EngineEvent:
     """构造 public smoke 用 final answer 事件。
 
     :param snapshot: dispatch snapshot。
+    :param request: 当前 ordinary worker 实际收到的 Engine request。
     :param content: final answer 正文。
     :returns: EngineEvent。
     :raises ValueError: content 为空时抛出。
@@ -1491,8 +1513,43 @@ def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> Engi
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_successful_response_identity(
+                request,
+                iteration_id=f"{request.run_id}:ordinary-final",
+            ),
         ),
         metadata=None,
+    )
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+    *,
+    iteration_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 public compact smoke request 同源的测试响应身份。
+
+    :param request: 当前 invocation 实际使用的 Engine request。
+    :param iteration_id: 当前 synthetic Runner iteration id。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=iteration_id,
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
     )
 
 

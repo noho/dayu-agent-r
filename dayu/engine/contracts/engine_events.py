@@ -24,6 +24,7 @@ from dayu.engine.contracts.error_codes import (
     validate_engine_error_code,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner_events import (
     RunnerDiagnosticSeverity,
@@ -436,12 +437,14 @@ class FinalAnswerData:
     :param filtered: 是否经过过滤器处理。
     :param degraded: 是否为降级回答。
     :param finish_reason: 完成原因。
+    :param response_identity: 实际终结本次 Engine run 的成功 Runner 调用身份。
     """
 
     content: str
     filtered: bool
     degraded: bool
     finish_reason: FinishReason
+    response_identity: SuccessfulRunnerResponseIdentity
 
 
 @dataclass(frozen=True, slots=True)

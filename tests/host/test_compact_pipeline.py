@@ -7,6 +7,11 @@ from dataclasses import dataclass, replace
 import pytest
 
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.api import RunStatus
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.compact_material import (
@@ -243,6 +248,10 @@ def test_compacted_payload_input_derives_semantic_refs() -> None:
         accepted_attempt_number=2,
         accepted_proposal_manifest_ref="manifest-ref",
         accepted_proposal_manifest_digest=_DIGEST,
+        successful_response_identity=_successful_response_identity(
+            run_id=f"compactor:{plan.request.run_id}:attempt:2",
+            iteration_id="compact-pipeline-accepted",
+        ),
     )
 
     assert "prompt-label:E1" in payload_input.prompt_local_label_mapping_refs
@@ -250,6 +259,37 @@ def test_compacted_payload_input_derives_semantic_refs() -> None:
     assert payload_input.accepted_evidence_mapping_refs == ("evidence:old",)
     assert payload_input.source_boundary_refs[0] == plan.request.current_input_ref
     assert payload_input.accepted_attempt_number == 2
+
+
+def _successful_response_identity(
+    *,
+    run_id: str,
+    iteration_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造 compact-pipeline fixture 的 event-unique typed identity。
+
+    :param run_id: 当前 fixture 显式提供的 compactor Engine run id。
+    :param iteration_id: 当前 fixture 显式提供的 iteration id。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=iteration_id,
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 def test_fallback_decision_input_dispatch_and_fail_closed() -> None:

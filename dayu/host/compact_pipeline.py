@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.engine.contracts.messages import (
     AgentMessage,
     AgentMessageRole,
@@ -268,6 +269,8 @@ class CompactPipelineAcceptedPayloadInput:
     :param accepted_attempt_number: accepted proposal attempt number。
     :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
     :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
+    :param successful_response_identity: accepted candidate 对应的实际成功
+        Runner call 身份。
     :param prompt_local_label_mapping_refs: prompt-local label mapping refs。
     :param source_boundary_refs: source boundary refs。
     :param accepted_evidence_mapping_refs: candidate 绑定的 accepted evidence refs。
@@ -280,6 +283,7 @@ class CompactPipelineAcceptedPayloadInput:
     accepted_attempt_number: int
     accepted_proposal_manifest_ref: str | None
     accepted_proposal_manifest_digest: str | None
+    successful_response_identity: SuccessfulRunnerResponseIdentity
     prompt_local_label_mapping_refs: tuple[str, ...]
     source_boundary_refs: tuple[str, ...]
     accepted_evidence_mapping_refs: tuple[str, ...]
@@ -626,6 +630,7 @@ def build_compacted_payload_input(
     accepted_attempt_number: int,
     accepted_proposal_manifest_ref: str | None,
     accepted_proposal_manifest_digest: str | None,
+    successful_response_identity: SuccessfulRunnerResponseIdentity,
 ) -> CompactPipelineAcceptedPayloadInput:
     """构造 accepted compact payload semantic input。
 
@@ -636,6 +641,8 @@ def build_compacted_payload_input(
     :param accepted_attempt_number: accepted proposal attempt number。
     :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
     :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
+    :param successful_response_identity: accepted candidate 对应的实际成功
+        Runner call 身份。
     :returns: accepted payload input。
     """
 
@@ -647,6 +654,7 @@ def build_compacted_payload_input(
         accepted_attempt_number=accepted_attempt_number,
         accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
         accepted_proposal_manifest_digest=accepted_proposal_manifest_digest,
+        successful_response_identity=successful_response_identity,
         prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
         source_boundary_refs=source_boundary_refs(request),
         accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(

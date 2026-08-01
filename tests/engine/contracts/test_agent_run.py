@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
 from typing import cast
 
@@ -11,7 +12,10 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
 from dayu.engine.contracts.agent_policy import AgentPolicy
-from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.agent_run import (
+    AgentRunRequest,
+    EngineRunOutcomeFinalAnswer,
+)
 from dayu.engine.contracts.messages import (
     AgentMessage,
     AgentMessageRole,
@@ -121,6 +125,30 @@ def test_agent_run_request_accepts_attempt_execution_pair() -> None:
 
     assert request.attempt_id == "attempt-contract"
     assert request.execution_id == "execution-contract"
+
+
+def test_final_outcome_requires_successful_response_identity() -> None:
+    """Engine final outcome 的响应身份字段必须存在且无默认值。"""
+
+    fields = {
+        field.name: field
+        for field in dataclasses.fields(EngineRunOutcomeFinalAnswer)
+    }
+
+    assert set(fields) == {
+        "session_id",
+        "run_id",
+        "content",
+        "filtered",
+        "degraded",
+        "finish_reason",
+        "response_identity",
+    }
+    assert fields["response_identity"].default is dataclasses.MISSING
+    assert (
+        fields["response_identity"].default_factory
+        is dataclasses.MISSING
+    )
 
 
 def _request(

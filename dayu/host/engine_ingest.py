@@ -54,6 +54,7 @@ from dayu.engine.contracts.engine_events import (
     UsageReportedData,
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
     RunnerCallHotDiagnostic,
@@ -123,6 +124,7 @@ from dayu.host.compaction_operation import (
     run_compaction_operation,
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.compaction_terminal import (
     COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
     CompactionOperationTerminalDisposition,
@@ -2916,6 +2918,8 @@ class EngineEventIngestor:
                 failure_reason="compactor_or_artifact_store_missing",
                 budget_after_attempted_compact=None,
                 accepted_attempt_number=None,
+                accepted_successful_response_identity=None,
+                accepted_proposal_manifest_reference=None,
             )
         else:
             operation_result = await run_compaction_operation(
@@ -3113,11 +3117,11 @@ class EngineEventIngestor:
                     if operation_result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
-                accepted_proposal_manifest_ref=(
-                    operation_result.accepted_proposal_manifest_ref
+                accepted_proposal_manifest_reference=(
+                    _required_compactor_manifest_reference(operation_result)
                 ),
-                accepted_proposal_manifest_digest=(
-                    operation_result.accepted_proposal_manifest_digest
+                successful_response_identity=(
+                    _required_successful_response_identity(operation_result)
                 ),
             )
             return _ReactiveRecoveryAccepted(
@@ -3170,8 +3174,8 @@ class EngineEventIngestor:
         candidate: ConversationCompactOutputVNext,
         quality: CompactQualityCheckResultVNext,
         budget_after_compact: int,
-        accepted_proposal_manifest_ref: str | None,
-        accepted_proposal_manifest_digest: str | None,
+        accepted_proposal_manifest_reference: CompactorProposalManifestReference,
+        successful_response_identity: SuccessfulRunnerResponseIdentity,
     ) -> EventLogRow:
         """写入 reactive accepted compact artifact 与 fact。
 
@@ -3184,8 +3188,10 @@ class EngineEventIngestor:
         :param candidate: accepted vNext compaction candidate。
         :param quality: accepted vNext quality result。
         :param budget_after_compact: Host 估算的 compact 后预算。
-        :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
-        :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
+        :param accepted_proposal_manifest_reference: accepted proposal 对应的
+            typed manifest reference。
+        :param successful_response_identity: accepted candidate 对应的实际成功
+            Runner call 身份。
         :returns: ``CONTEXT_COMPACTED`` row。
         """
 
@@ -3259,10 +3265,10 @@ class EngineEventIngestor:
                     source_boundary_refs=source_boundary_refs(request),
                     accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
                     projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
-                    accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
-                    accepted_proposal_manifest_digest=(
-                        accepted_proposal_manifest_digest
+                    accepted_proposal_manifest_reference=(
+                        accepted_proposal_manifest_reference
                     ),
+                    successful_response_identity=successful_response_identity,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -3410,8 +3416,12 @@ class EngineEventIngestor:
                     budget_after_attempted_compact=(
                         rejected.budget_after_attempted_compact
                     ),
-                    proposal_manifest_ref=rejected.proposal_manifest_ref,
-                    proposal_manifest_digest=rejected.proposal_manifest_digest,
+                    proposal_manifest_reference=(
+                        rejected.proposal_manifest_reference
+                    ),
+                    successful_response_identity=(
+                        rejected.successful_response_identity
+                    ),
                     diagnostic_artifact_ref=(
                         None
                         if diagnostic_reference is None
@@ -8802,6 +8812,42 @@ def _required_accepted_attempt_number(result: CompactionOperationResult) -> int:
     value = result.accepted_attempt_number
     if value is None or value <= 0:
         raise RuntimeError("accepted compaction is missing accepted attempt number")
+    return value
+
+
+def _required_successful_response_identity(
+    result: CompactionOperationResult,
+) -> SuccessfulRunnerResponseIdentity:
+    """返回 accepted compaction 的成功响应身份。
+
+    :param result: 已由 operation owner 生成的结果。
+    :returns: accepted candidate 对应的成功 Runner call 身份。
+    :raises RuntimeError: accepted result 缺少成功响应身份时抛出。
+    """
+
+    value = result.accepted_successful_response_identity
+    if value is None:
+        raise RuntimeError(
+            "accepted compaction is missing successful response identity"
+        )
+    return value
+
+
+def _required_compactor_manifest_reference(
+    result: CompactionOperationResult,
+) -> CompactorProposalManifestReference:
+    """返回 accepted compaction 的 typed manifest reference。
+
+    :param result: 已由 operation owner 生成的结果。
+    :returns: accepted proposal 对应的 typed manifest reference。
+    :raises RuntimeError: accepted result 缺少 manifest reference 时抛出。
+    """
+
+    value = result.accepted_proposal_manifest_reference
+    if value is None:
+        raise RuntimeError(
+            "accepted compaction is missing proposal manifest reference"
+        )
     return value
 
 

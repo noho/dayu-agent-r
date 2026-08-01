@@ -18,6 +18,11 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -36,10 +41,10 @@ from dayu.host.compaction import (
     CompactionRequest,
 )
 from dayu.host.compaction_operation import (
-    CompactorProposalManifestReference,
     CompactorProposalRunInput,
     run_compaction_operation,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.llm_compaction import LLMContextCompactor
@@ -88,6 +93,9 @@ class _CancellingManifestRecorder:
             compactor_input_projection_digest=(
                 prepared_input.compactor_input_projection_digest
             ),
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+            compactor_engine_run_id=prepared_input.compactor_engine_run_id,
         )
         self._parent.request_cancel(_PARENT_REASON)
         return self.reference
@@ -124,7 +132,10 @@ async def test_attempt_timeout_does_not_cancel_parent_or_next_attempt(
         if len(observed_tokens) == 1:
             raise TimeoutError("attempt one timeout")
         assert agent_request.cancellation_token.is_cancelled() is False
-        return _valid_final_answer(request)
+        return _valid_final_answer(
+            request=request,
+            agent_request=agent_request,
+        )
 
     monkeypatch.setattr(
         llm_compaction,
@@ -353,9 +364,12 @@ async def test_manifest_post_write_recheck_blocks_provider_and_keeps_reference(
         """
 
         nonlocal provider_calls
-        del agent_request, timeout_seconds
+        del timeout_seconds
         provider_calls += 1
-        return _valid_final_answer(_request())
+        return _valid_final_answer(
+            request=_request(),
+            agent_request=agent_request,
+        )
 
     monkeypatch.setattr(llm_compaction, "_run_agent_request", forbidden_runner)
     result = await run_compaction_operation(
@@ -371,8 +385,11 @@ async def test_manifest_post_write_recheck_blocks_provider_and_keeps_reference(
     assert provider_calls == 0
     assert recorder.reference is not None
     assert result.failure_reason == "cancellation_requested"
-    assert result.rejected_attempts[0].proposal_manifest_ref == (
-        recorder.reference.manifest_payload_ref
+    assert result.rejected_attempts[0].proposal_manifest_reference is not None
+    assert (
+        result.rejected_attempts[0]
+        .proposal_manifest_reference.manifest_payload_ref
+        == recorder.reference.manifest_payload_ref
     )
 
 
@@ -475,10 +492,15 @@ def _request() -> CompactionRequest:
     )
 
 
-def _valid_final_answer(request: CompactionRequest) -> EngineRunOutcomeFinalAnswer:
+def _valid_final_answer(
+    *,
+    request: CompactionRequest,
+    agent_request: AgentRunRequest,
+) -> EngineRunOutcomeFinalAnswer:
     """从 request 构造合法 deterministic compactor final answer。
 
     :param request: compaction request。
+    :param agent_request: 产出该 final 的同一次 compactor Engine request。
     :returns: Engine final answer。
     """
 
@@ -487,12 +509,28 @@ def _valid_final_answer(request: CompactionRequest) -> EngineRunOutcomeFinalAnsw
     )
     material_json = cast(Mapping[str, JsonValue], compact_input.to_json())
     return EngineRunOutcomeFinalAnswer(
-        session_id="context-compactor:test",
-        run_id="compactor-run-test",
+        session_id=agent_request.session_id,
+        run_id=agent_request.run_id,
         content=fake_compaction_proposal_from_material_json(
             material_json
         ),
         filtered=False,
         degraded=False,
         finish_reason=FinishReason.STOP,
+        response_identity=SuccessfulRunnerResponseIdentity(
+            effective_provider=agent_request.runner_spec.provider,
+            effective_model=agent_request.runner_spec.model,
+            runner_request_identity=build_runner_request_identity(
+                run_id=agent_request.run_id,
+                attempt_id=agent_request.attempt_id,
+                execution_id=agent_request.execution_id,
+                iteration_id=f"{agent_request.run_id}:compactor-final",
+                iteration_index=0,
+                runner_call_index=1,
+            ),
+            provider_request_id_availability=(
+                ProviderRequestIdAvailability.UNAVAILABLE
+            ),
+            provider_request_id=None,
+        ),
     )

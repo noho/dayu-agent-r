@@ -75,7 +75,9 @@ from dayu.engine.contracts.messages import (
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
     RunnerRequestIdentity,
+    SuccessfulRunnerResponseIdentity,
     build_runner_request_identity,
 )
 from dayu.engine.contracts.tool_records import (
@@ -164,6 +166,7 @@ __all__ = [
     "ProviderDiagnosticData",
     "ProviderProtocolErrorData",
     "ProviderRequestExtension",
+    "ProviderRequestIdAvailability",
     "QwenThinkingExtension",
     "ReasoningDeltaData",
     "RUN_SUSPENDED_REASON_TOOL_AWAITING",
@@ -191,6 +194,7 @@ __all__ = [
     "RunnerSpecificErrorCode",
     "RunnerSpecificErrorSource",
     "RunnerSpec",
+    "SuccessfulRunnerResponseIdentity",
     "RunnerToolCallDeltaData",
     "RunnerToolCallsCompletedData",
     "RunnerUsageRecordedData",

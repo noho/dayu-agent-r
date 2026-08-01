@@ -83,6 +83,11 @@ from dayu.engine.contracts.runner_events import (
     RunnerDiagnosticSeverity,
     RunnerDiagnosticSource,
 )
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AssistantToolCallBatchSnapshot,
@@ -148,7 +153,7 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactQualityCheckResultVNext,
     CompactionRequest,
-    ConversationCompactOutputVNext,
+    CompactorProposal,
     ContextCompactor,
 )
 from dayu.host.compaction_operation import (
@@ -156,6 +161,7 @@ from dayu.host.compaction_operation import (
     CompactorProposalManifestRecorder,
     CompactorProposalRunInput,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
@@ -293,6 +299,93 @@ from dayu.host.engine_ingest import (
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "engine-ingest-test"})
+_COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT = 2
+
+
+def _successful_response_identity(
+    *,
+    run_id: str,
+    attempt_id: str | None,
+    execution_id: str | None,
+    iteration_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 Engine ingest fixture identity 同源的成功响应身份。
+
+    :param run_id: 当前 Engine run id。
+    :param attempt_id: 当前 ordinary Attempt id；compactor fixture 为 ``None``。
+    :param execution_id: 当前 execution id；compactor fixture 为 ``None``。
+    :param iteration_id: 当前 synthetic Runner iteration id。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test",
+        effective_model="test-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            iteration_id=iteration_id,
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _successful_response_identity_for_agent_request(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 prepared compactor request 同源的成功响应身份。
+
+    :param request: 当前 prepared compactor Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:prepared-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 Engine ingest durable fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:{attempt_number}",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:{attempt_number}",
+        manifest_digest=_CALL_CONTEXT_DIGEST,
+        compactor_input_projection_ref=f"projection:{operation_id}:{attempt_number}",
+        compactor_input_projection_digest=_CALL_CONTEXT_DIGEST,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
 _REACTIVE_POLICY_REF = "test-reactive-policy"
 _ORIGINAL_INGEST_VALIDATED_OPERATION_CALL = (
     engine_ingest_module._IngestValidatedOperation.__call__
@@ -430,12 +523,13 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
         self.calls = 0
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 vNext compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
@@ -461,12 +555,13 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
         self.calls = 0
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """推进 durable input sequence 后返回旧 snapshot 的 vNext candidate。
 
         :param request: compaction request。
@@ -490,13 +585,14 @@ class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
         :raises Exception: 不主动抛出异常。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
 
     async def compact(
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """提交两个同 operation failed terminal 后返回 accepted candidate。
 
         :param request: reactive compaction request。
@@ -561,7 +657,7 @@ class _RaisingCompactor(FakeContextCompactor):
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """抛出 vNext proposal 失败。
 
         :param request: compaction request。
@@ -601,6 +697,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.fail_run = fail_run
         self.calls = 0
         self._prepared_request: CompactionRequest | None = None
@@ -654,7 +751,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 prepared proposal。
 
         :param prepared_input: prepared proposal input。
@@ -668,9 +765,17 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         request = self._prepared_request
         if request is None:
             raise AssertionError("prepared request is missing")
-        return await super().compact(
+        proposal = await super().compact(
             request,
             prepared_input.agent_request.cancellation_token,
+        )
+        return CompactorProposal(
+            candidate=proposal.candidate,
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(
+                    prepared_input.agent_request
+                )
+            ),
         )
 
 
@@ -877,6 +982,12 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    iteration_id="final-answer-closeout",
+                ),
             ),
             event_type=EngineEventType.FINAL_ANSWER,
         )
@@ -935,6 +1046,12 @@ def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=_successful_response_identity(
+                run_id="run-terminal-plan",
+                attempt_id="attempt-terminal-plan",
+                execution_id="execution-terminal-plan",
+                iteration_id="terminal-plan-final",
+            ),
         )
     )
     failed = engine_ingest_module._run_failed_plan(
@@ -1956,7 +2073,7 @@ async def test_reactive_start_precondition_miss_rolls_back_candidate_and_manifes
         assert _event_count(
             store.transaction_runner,
             "RUNNER_CALL_INPUT_ASSEMBLED",
-        ) == 1
+        ) == 2
         assert _event_count(
             store.transaction_runner,
             CONTEXT_BUDGET_EVALUATED,
@@ -1967,7 +2084,11 @@ async def test_reactive_start_precondition_miss_rolls_back_candidate_and_manifes
                 TABLE_PAYLOAD_DESCRIPTORS,
             )
         )
-        assert descriptor_count_after == descriptor_count_before + 1
+        assert descriptor_count_after == (
+            descriptor_count_before
+            + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT
+            + 1
+        )
         assert wakeup.dispatches == []
 
 
@@ -2122,6 +2243,10 @@ async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_
             store.transaction_runner,
             CONTEXT_COMPACTION_ATTEMPT_REJECTED,
         ) == 0
+        assert _event_count(
+            store.transaction_runner,
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+        ) == 2
         assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
@@ -2133,7 +2258,10 @@ async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_
                 TABLE_PAYLOAD_DESCRIPTORS,
             )
         )
-        assert descriptor_count_after == descriptor_count_before
+        assert descriptor_count_after == (
+            descriptor_count_before
+            + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT
+        )
 
 
 @pytest.mark.parametrize("winner_compacted", (True, False))
@@ -2209,6 +2337,8 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
             assert first_attempt_number == 1
             assert max_attempt_number == pending.policy.max_compaction_attempts_per_operation
             assert compaction_operation_id == pending.operation_id
+            if compaction_operation_id is None:
+                raise AssertionError("compaction operation id is required")
             contender_index = entered_count
             entered_count += 1
             if entered_count == 2:
@@ -2220,12 +2350,16 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
                 else not winner_compacted
             )
             if contender_compacted:
-                accepted_candidate = await FakeContextCompactor().compact(
+                proposal = await FakeContextCompactor().compact(
                     request,
                     cancellation_token,
                 )
+                compactor_engine_run_id = (
+                    proposal.successful_response_identity
+                    .runner_request_identity.run_id
+                )
                 return CompactionOperationResult(
-                    accepted_candidate=accepted_candidate,
+                    accepted_candidate=proposal.candidate,
                     quality_result=CompactQualityCheckResultVNext(
                         accepted=True,
                         rejection_reasons=(),
@@ -2236,6 +2370,16 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
                         pending.estimate.estimated_input_tokens
                     ),
                     accepted_attempt_number=1,
+                    accepted_successful_response_identity=(
+                        proposal.successful_response_identity
+                    ),
+                    accepted_proposal_manifest_reference=(
+                        _proposal_manifest_reference(
+                            operation_id=compaction_operation_id,
+                            attempt_number=1,
+                            compactor_engine_run_id=compactor_engine_run_id,
+                        )
+                    ),
                 )
             return CompactionOperationResult(
                 accepted_candidate=None,
@@ -2244,6 +2388,8 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
                 failure_reason="contending_provider_failure",
                 budget_after_attempted_compact=None,
                 accepted_attempt_number=None,
+                accepted_successful_response_identity=None,
+                accepted_proposal_manifest_reference=None,
             )
 
         monkeypatch.setattr(
@@ -3712,6 +3858,12 @@ def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    iteration_id="duplicate-final",
+                ),
             ),
             event_type=EngineEventType.FINAL_ANSWER,
         )
@@ -3767,6 +3919,12 @@ def test_stale_execution_id_is_rejected_diagnostic(tmp_path: Path) -> None:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    run_id=stale.run_id,
+                    attempt_id=stale.attempt_id,
+                    execution_id=stale.execution_id,
+                    iteration_id="stale-execution-final",
+                ),
             ),
             event_type=EngineEventType.FINAL_ANSWER,
         )
@@ -4308,6 +4466,12 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    iteration_id="late-terminal-first-final",
+                ),
             ),
             event_type=EngineEventType.FINAL_ANSWER,
         )
@@ -4352,6 +4516,12 @@ def test_late_reasoning_delta_is_rejected_before_transient_publish(
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    iteration_id="late-reasoning-first-final",
+                ),
             ),
             event_type=EngineEventType.FINAL_ANSWER,
         )
@@ -4534,6 +4704,12 @@ def test_late_final_answer_after_run_cancelling_is_rejected_with_diagnostic(
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    iteration_id="cancelling-late-final",
+                ),
             ),
             event_type=EngineEventType.FINAL_ANSWER,
         )
@@ -5040,6 +5216,12 @@ def test_engine_terminal_invalid_state_rolls_back_payload_and_events(
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=_successful_response_identity(
+                        run_id=seeded.run_id,
+                        attempt_id=seeded.attempt_id,
+                        execution_id=seeded.execution_id,
+                        iteration_id="invalid-state-final",
+                    ),
                 ),
                 event_type=EngineEventType.FINAL_ANSWER,
             )
@@ -5122,6 +5304,12 @@ def test_engine_terminal_cas_lost_rolls_back_real_payload_repository(
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=_successful_response_identity(
+                        run_id=seeded.run_id,
+                        attempt_id=seeded.attempt_id,
+                        execution_id=seeded.execution_id,
+                        iteration_id="cas-lost-final",
+                    ),
                 ),
                 event_type=EngineEventType.FINAL_ANSWER,
             )
@@ -5304,6 +5492,12 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=_successful_response_identity(
+                        run_id=seeded.run_id,
+                        attempt_id=seeded.attempt_id,
+                        execution_id=seeded.execution_id,
+                        iteration_id="wrong-shape-final",
+                    ),
                 ),
                 event_type=EngineEventType.RUN_FAILED,
             )

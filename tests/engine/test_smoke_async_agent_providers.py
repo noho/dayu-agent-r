@@ -9,6 +9,11 @@ import pytest
 
 from dayu.engine import EngineEvent, EngineEventType, FinalAnswerData
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     DeepSeekThinkingExtension,
     GeminiThinkingExtension,
@@ -76,6 +81,22 @@ def test_build_request_uses_env_key_without_printing_it() -> None:
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
+            response_identity=SuccessfulRunnerResponseIdentity(
+                effective_provider=request.runner_spec.provider,
+                effective_model=request.runner_spec.model,
+                runner_request_identity=build_runner_request_identity(
+                    run_id=request.run_id,
+                    attempt_id=request.attempt_id,
+                    execution_id=request.execution_id,
+                    iteration_id=f"{request.run_id}:answer",
+                    iteration_index=0,
+                    runner_call_index=1,
+                ),
+                provider_request_id_availability=(
+                    ProviderRequestIdAvailability.UNAVAILABLE
+                ),
+                provider_request_id=None,
+            ),
         ),
         metadata=None,
     )

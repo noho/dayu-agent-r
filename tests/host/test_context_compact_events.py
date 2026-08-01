@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import dayu.host.context_events as context_events_module
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.api import HostEventClass, HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
     AnswerAnchorCandidateVNext,
@@ -43,6 +51,7 @@ from dayu.host.context_events import (
     validate_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import EventClass, EventLogRow
 from dayu.host.durable.connection import open_host_durable_store
@@ -59,6 +68,82 @@ _FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
 _FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
 _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
 _FIELD_FALLBACK_BUDGET_RESULT = "fallback_budget_result"
+
+
+def test_context_events_owner_exports_compactor_manifest_reference() -> None:
+    """Context event owner 必须直接导出 compactor manifest 引用契约。
+
+    :returns: ``None``。
+    :raises AssertionError: manifest 引用类型未由 owner 模块导出时抛出。
+    """
+
+    assert "CompactorProposalManifestReference" in context_events_module.__all__
+
+
+def _successful_response_identity(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与当前 durable event fixture 同源的成功响应身份。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: deterministic、非敏感且 event-unique 的 typed identity。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{operation_id}:attempt:{attempt_number}:iteration",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+    manifest_payload_ref: str,
+    manifest_digest: str,
+) -> CompactorProposalManifestReference:
+    """构造与当前 durable event fixture 同源的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :param manifest_payload_ref: 当前 fixture 的 manifest payload ref。
+    :param manifest_digest: 当前 fixture 的 manifest digest。
+    :returns: 与 operation/attempt/run 显式绑定的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:{attempt_number}",
+        manifest_payload_ref=manifest_payload_ref,
+        manifest_digest=manifest_digest,
+        compactor_input_projection_ref=(
+            f"projection:{operation_id}:{attempt_number}"
+        ),
+        compactor_input_projection_digest=_DIGEST_B,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
 
 
 def test_requested_payload_builder_accepts_proactive_without_attempt() -> None:
@@ -506,33 +591,129 @@ def test_compacted_payload_rejects_rejected_quality_result() -> None:
             source_boundary_refs=("event-user-1",),
             accepted_evidence_mapping_refs=("evidence:accepted-1",),
             projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=_successful_response_identity(
+                operation_id="event-context-compaction-requested-rejected",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:rejected-quality",
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="event-context-compaction-requested-rejected",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:rejected-quality",
+                manifest_payload_ref="runner-call-manifest:rejected-quality",
+                manifest_digest=_DIGEST_A,
+            ),
         )
 
 
-def test_compacted_payload_records_accepted_proposal_manifest_reference() -> None:
-    """accepted outcome payload 反向引用 accepted proposal manifest。"""
+@pytest.mark.parametrize(
+    ("binding_field", "expected_message"),
+    [
+        (None, None),
+        ("operation_id", "operation id mismatch"),
+        ("attempt_number", "attempt number mismatch"),
+        ("engine_run_id", "Engine run id mismatch"),
+    ],
+)
+def test_compacted_payload_records_accepted_proposal_manifest_reference(
+    binding_field: str | None,
+    expected_message: str | None,
+) -> None:
+    """accepted payload 记录同源 manifest，并拒绝三类 sibling 串线。
 
-    payload = build_context_compacted_payload(
-        operation_id="event-context-compaction-requested-accepted",
-        accepted_attempt_number=1,
-        compact_artifact_ref="compact-artifact:abc",
-        compact_artifact_digest=_DIGEST_B,
-        accepted_candidate=_candidate(),
-        quality_check_result=_quality_result(),
-        budget_after_compact=512,
-        prompt_local_label_mapping_refs=("prompt-label:E1",),
-        source_boundary_refs=("event-user-1",),
-        accepted_evidence_mapping_refs=("evidence:accepted-1",),
-        projection_signal="conversation_memory_projection_catchup",
-        accepted_proposal_manifest_ref="runner-call-manifest:accepted",
-        accepted_proposal_manifest_digest=_DIGEST_A,
+    :param binding_field: 待串线的 manifest binding 字段；正例为 ``None``。
+    :param expected_message: 负例 owner-level 拒绝消息；正例为 ``None``。
+    :returns: ``None``。
+    :raises AssertionError: 正例丢失 identity/manifest 或负例未 fail-closed 时抛出。
+    """
+
+    operation_id = "event-context-compaction-requested-accepted"
+    attempt_number = 1
+    engine_run_id = "compactor-run:accepted"
+    identity = _successful_response_identity(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+        compactor_engine_run_id=engine_run_id,
     )
+    manifest_reference = _proposal_manifest_reference(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+        compactor_engine_run_id=engine_run_id,
+        manifest_payload_ref="runner-call-manifest:accepted",
+        manifest_digest=_DIGEST_A,
+    )
+    if binding_field == "operation_id":
+        manifest_reference = replace(
+            manifest_reference,
+            compaction_operation_id="sibling-operation",
+        )
+    elif binding_field == "attempt_number":
+        manifest_reference = replace(
+            manifest_reference,
+            compaction_attempt_number=2,
+        )
+    elif binding_field == "engine_run_id":
+        manifest_reference = replace(
+            manifest_reference,
+            compactor_engine_run_id="sibling-compactor-run",
+        )
+    elif binding_field is not None:
+        raise AssertionError("unsupported binding field")
+    expected_context = (
+        nullcontext()
+        if expected_message is None
+        else pytest.raises(ValueError, match=expected_message)
+    )
+    payload: Mapping[str, JsonValue] | None = None
+    with expected_context:
+        payload = build_context_compacted_payload(
+            operation_id=operation_id,
+            accepted_attempt_number=1,
+            compact_artifact_ref="compact-artifact:abc",
+            compact_artifact_digest=_DIGEST_B,
+            accepted_candidate=_candidate(),
+            quality_check_result=_quality_result(),
+            budget_after_compact=512,
+            prompt_local_label_mapping_refs=("prompt-label:E1",),
+            source_boundary_refs=("event-user-1",),
+            accepted_evidence_mapping_refs=("evidence:accepted-1",),
+            projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=identity,
+            accepted_proposal_manifest_reference=manifest_reference,
+        )
 
+    if expected_message is not None:
+        return
+    assert payload is not None
     validate_context_compacted_payload(payload)
     assert payload["accepted_proposal_manifest_ref"] == (
         "runner-call-manifest:accepted"
     )
     assert payload["accepted_proposal_manifest_digest"] == _DIGEST_A
+    successful_response_identity = cast(
+        Mapping[str, JsonValue],
+        payload["successful_response_identity"],
+    )
+    assert set(successful_response_identity) == {
+        "effective_provider",
+        "effective_model",
+        "runner_request_identity",
+        "provider_request_id_availability",
+        "provider_request_id",
+    }
+    runner_request_identity = cast(
+        Mapping[str, JsonValue],
+        successful_response_identity["runner_request_identity"],
+    )
+    assert set(runner_request_identity) == {
+        "run_id",
+        "attempt_id",
+        "execution_id",
+        "iteration_id",
+        "iteration_index",
+        "runner_call_index",
+        "client_correlation_id",
+    }
 
 
 def test_compacted_payload_requires_proposal_manifest_ref_digest_pair() -> None:
@@ -543,6 +724,138 @@ def test_compacted_payload_requires_proposal_manifest_ref_digest_pair() -> None:
     payload["accepted_proposal_manifest_digest"] = None
 
     with pytest.raises(ValueError, match="accepted_proposal_manifest"):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_requires_non_null_proposal_manifest_pair() -> None:
+    """accepted proposal manifest ref / digest 均不得为 null。
+
+    :returns: ``None``。
+    :raises AssertionError: accepted payload 接受无 manifest 记录时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    payload["accepted_proposal_manifest_ref"] = None
+    payload["accepted_proposal_manifest_digest"] = None
+
+    with pytest.raises(ValueError, match="accepted_proposal_manifest_ref"):
+        validate_context_compacted_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("nested", "field_name"),
+    [
+        (False, "endpoint"),
+        (False, "credential"),
+        (False, "Authorization"),
+        (False, "provider_payload"),
+        (True, "headers"),
+        (True, "cookie"),
+        (True, "secret"),
+    ],
+)
+def test_compacted_payload_identity_rejects_secret_bearing_extra_fields(
+    nested: bool,
+    field_name: str,
+) -> None:
+    """strict identity object 拒绝 endpoint/credential/header/payload 等字段。
+
+    :param nested: 是否向 runner_request_identity 注入字段。
+    :param field_name: 待注入的敏感字段名。
+    :returns: ``None``。
+    :raises AssertionError: durable identity 接受敏感扩展字段或泄露值时抛出。
+    """
+
+    secret_value = "S5-CANARY-DO-NOT-PERSIST"
+    payload = _valid_compacted_payload()
+    identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    if nested:
+        runner_identity = dict(
+            cast(
+                Mapping[str, JsonValue],
+                identity["runner_request_identity"],
+            )
+        )
+        runner_identity[field_name] = secret_value
+        identity["runner_request_identity"] = runner_identity
+    else:
+        identity[field_name] = secret_value
+    payload["successful_response_identity"] = identity
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_context_compacted_payload(payload)
+    assert secret_value not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "renamed", "extra"])
+def test_compacted_payload_identity_requires_exact_nested_fields(
+    mutation: str,
+) -> None:
+    """runner request identity nested object 拒绝缺失、改名与额外字段。
+
+    :param mutation: nested object 结构破坏方式。
+    :returns: ``None``。
+    :raises AssertionError: strict nested schema 接受结构漂移时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    runner_identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            identity["runner_request_identity"],
+        )
+    )
+    if mutation == "missing":
+        del runner_identity["runner_call_index"]
+    elif mutation == "renamed":
+        runner_identity["call_index"] = runner_identity.pop("runner_call_index")
+    elif mutation == "extra":
+        runner_identity["response_index"] = 1
+    else:
+        raise AssertionError("unsupported nested mutation")
+    identity["runner_request_identity"] = runner_identity
+    payload["successful_response_identity"] = identity
+
+    with pytest.raises(ValueError):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_identity_rejects_noncanonical_client_correlation() -> None:
+    """durable identity 不接受由别处复制的 client correlation id。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 接受非 canonical 派生值时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    runner_identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            identity["runner_request_identity"],
+        )
+    )
+    runner_identity["client_correlation_id"] = "dayu-cross-wired"
+    identity["runner_request_identity"] = runner_identity
+    payload["successful_response_identity"] = identity
+
+    with pytest.raises(ValueError, match="not canonical"):
         validate_context_compacted_payload(payload)
 
 
@@ -791,8 +1104,18 @@ def test_attempt_rejected_payload_builder_and_validator() -> None:
             diagnostic_refs=("diagnostic:1",),
             next_policy_decision="retry_semantic_repair",
             budget_after_attempted_compact=128,
-            proposal_manifest_ref="runner-call-manifest:rejected",
-            proposal_manifest_digest=_DIGEST_A,
+            successful_response_identity=_successful_response_identity(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+            ),
+            proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+                manifest_payload_ref="runner-call-manifest:rejected",
+                manifest_digest=_DIGEST_A,
+            ),
             diagnostic_artifact_ref="compaction-diagnostic:event-1",
             diagnostic_artifact_digest=_DIGEST_B,
             failure_stage="previous_compacted_view_parse",
@@ -839,13 +1162,67 @@ def test_attempt_rejected_payload_requires_proposal_manifest_ref_digest_pair() -
             diagnostic_refs=("diagnostic:1",),
             next_policy_decision="retry_semantic_repair",
             budget_after_attempted_compact=128,
-            proposal_manifest_ref="runner-call-manifest:rejected",
-            proposal_manifest_digest=_DIGEST_A,
+            successful_response_identity=_successful_response_identity(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+            ),
+            proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+                manifest_payload_ref="runner-call-manifest:rejected",
+                manifest_digest=_DIGEST_A,
+            ),
         )
     )
     payload["proposal_manifest_digest"] = None
 
     with pytest.raises(ValueError, match="proposal_manifest"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_quality_rejected_payload_requires_success_identity() -> None:
+    """quality rejection 必须保留成功 final 的 identity 与 manifest。
+
+    :returns: ``None``。
+    :raises AssertionError: quality rejection 接受 null identity 时抛出。
+    """
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["successful_response_identity"] = None
+
+    with pytest.raises(ValueError, match="requires successful response identity"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_rejected_payload_success_identity_requires_manifest() -> None:
+    """任意 post-final rejection 的成功 identity 不得脱离 proposal manifest。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 接受无 manifest 的成功 identity 时抛出。
+    """
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["failure_category"] = "proposal_failed"
+    payload["proposal_manifest_ref"] = None
+    payload["proposal_manifest_digest"] = None
+
+    with pytest.raises(ValueError, match="requires proposal manifest reference"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_cancelled_rejected_payload_forbids_success_identity() -> None:
+    """成功 final 前 cancellation rejection 必须持久化 null identity。
+
+    :returns: ``None``。
+    :raises AssertionError: cancellation 被伪造成成功 final 时抛出。
+    """
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["failure_category"] = "cancellation_requested"
+
+    with pytest.raises(ValueError, match="forbids successful response identity"):
         validate_context_compaction_attempt_rejected_payload(payload)
 
 
@@ -862,6 +1239,8 @@ def test_attempt_rejected_payload_requires_diagnostic_artifact_ref_digest_pair()
             diagnostic_refs=("diagnostic:1",),
             next_policy_decision="fail_compaction",
             budget_after_attempted_compact=None,
+            successful_response_identity=None,
+            proposal_manifest_reference=None,
             diagnostic_artifact_ref="compaction-diagnostic:event-1",
             diagnostic_artifact_digest=_DIGEST_A,
         )
@@ -1026,6 +1405,18 @@ def _valid_attempt_rejected_payload() -> Mapping[str, JsonValue]:
         diagnostic_refs=("diagnostic:1",),
         next_policy_decision="fail_compaction",
         budget_after_attempted_compact=None,
+        successful_response_identity=_successful_response_identity(
+            operation_id="operation-1",
+            attempt_number=1,
+            compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+        ),
+        proposal_manifest_reference=_proposal_manifest_reference(
+            operation_id="operation-1",
+            attempt_number=1,
+            compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+            manifest_payload_ref="runner-call-manifest:rejected",
+            manifest_digest=_DIGEST_A,
+        ),
     )
 
 
@@ -1125,6 +1516,18 @@ def _valid_compacted_payload() -> dict[str, JsonValue]:
             source_boundary_refs=("event-user-1", "evidence:accepted-1"),
             accepted_evidence_mapping_refs=("evidence:accepted-1",),
             projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=_successful_response_identity(
+                operation_id="event-context-compaction-requested-accepted",
+                attempt_number=2,
+                compactor_engine_run_id="compactor-run:accepted:attempt-2",
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="event-context-compaction-requested-accepted",
+                attempt_number=2,
+                compactor_engine_run_id="compactor-run:accepted:attempt-2",
+                manifest_payload_ref="runner-call-manifest:accepted:attempt-2",
+                manifest_digest=_DIGEST_A,
+            ),
         )
     )
 

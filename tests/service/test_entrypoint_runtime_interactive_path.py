@@ -30,6 +30,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AssistantMessage, UserMessage
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
@@ -236,22 +241,26 @@ class _FreshQueuedLifecycleFinalHandle:
 
     _factory: _FreshQueuedLifecycleWorkerFactory
     _snapshot: AttemptDispatchSnapshot
+    _request: AgentRunRequest
 
     def __init__(
         self,
         factory: _FreshQueuedLifecycleWorkerFactory,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
     ) -> None:
         """保存 promoted queued dispatch identity。
 
         :param factory: 生命周期 worker factory。
         :param snapshot: promoted queued dispatch snapshot。
+        :param request: promoted queued Run 的 Engine request。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         self._factory = factory
         self._snapshot = snapshot
+        self._request = request
 
     @property
     def local_worker_id(self) -> str:
@@ -280,6 +289,9 @@ class _FreshQueuedLifecycleFinalHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -338,8 +350,40 @@ class _FreshQueuedLifecycleWorker:
             return _FreshQueuedLifecycleCurrentHandle(self._factory, snapshot)
         if len(self._factory.snapshots) == 2:
             self._factory.queued_promoted.set()
-            return _FreshQueuedLifecycleFinalHandle(self._factory, snapshot)
+            return _FreshQueuedLifecycleFinalHandle(
+                self._factory,
+                snapshot,
+                request,
+            )
         raise RuntimeError("fresh queued lifecycle dispatched more than two Runs")
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 queued final 的 Engine request 同源的测试响应身份。
+
+    :param request: promoted queued Run 的真实 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:queued-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 class _FreshQueuedLifecycleWorkerFactory:

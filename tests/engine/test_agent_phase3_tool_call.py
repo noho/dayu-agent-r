@@ -72,7 +72,10 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
 )
-from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    RunnerRequestIdentity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -514,12 +517,17 @@ def _tool_script(
 
 
 def _final_script(
-    content: str, *, finish_reason: FinishReason = FinishReason.STOP
+    content: str,
+    *,
+    finish_reason: FinishReason = FinishReason.STOP,
+    provider_request_id: str | None = None,
 ) -> tuple[RunnerEvent, ...]:
     """构造最终回答 Runner 脚本。
 
     :param content: 最终正文。
     :param finish_reason: 完成原因。
+    :param provider_request_id: provider 返回的 request id；不可用时为
+        ``None``。
     :returns: RunnerEvent 元组。
     :raises Exception: 不主动抛出异常。
     """
@@ -534,7 +542,10 @@ def _final_script(
         ),
         _event(
             RunnerEventType.RUNNER_DONE,
-            RunnerDoneData(finish_reason=finish_reason, provider_request_id=None),
+            RunnerDoneData(
+                finish_reason=finish_reason,
+                provider_request_id=provider_request_id,
+            ),
         ),
     )
 
@@ -2087,12 +2098,16 @@ async def test_max_iterations_force_answer_and_raise_error() -> None:
     """最后一轮工具照常执行，随后按 fallback mode 收口。"""
 
     force_executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
+    force_request = _request(executor=force_executor, max_iterations=1)
     force_runner = _ScriptedRunner(
-        scripts=(_tool_script(_tool_call("tc_1")), _final_script("forced"))
+        scripts=(
+            _tool_script(_tool_call("tc_1")),
+            _final_script("forced", provider_request_id="req-force-final"),
+        )
     )
     force_events = await _collect(
         _AsyncAgent(
-            request=_request(executor=force_executor, max_iterations=1),
+            request=force_request,
             runner=force_runner,
         )
     )
@@ -2104,6 +2119,22 @@ async def test_max_iterations_force_answer_and_raise_error() -> None:
     assert len(force_executor.requests) == 1
     assert force_runner.tools_seen[1] == ()
     assert isinstance(force_runner.messages_seen[1][-1], UserMessage)
+    assert force_runner.request_identities_seen[1] is not None
+    assert force_terminal.data.response_identity.runner_request_identity == (
+        force_runner.request_identities_seen[1]
+    )
+    assert force_terminal.data.response_identity.effective_provider == (
+        force_request.runner_spec.provider
+    )
+    assert force_terminal.data.response_identity.effective_model == (
+        force_request.runner_spec.model
+    )
+    assert force_terminal.data.response_identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.PRESENT
+    )
+    assert force_terminal.data.response_identity.provider_request_id == (
+        "req-force-final"
+    )
 
     raise_executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
     raise_events = await _collect(
@@ -2291,23 +2322,35 @@ async def test_normal_final_empty_content_is_fail_closed() -> None:
 async def test_content_filter_is_degraded_final() -> None:
     """content_filter final answer 必须 filtered=True 且 degraded=True。"""
 
+    request = _request()
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script(
+                "filtered",
+                finish_reason=FinishReason.CONTENT_FILTER,
+            ),
+        )
+    )
     events = await _collect(
         _AsyncAgent(
-            request=_request(),
-            runner=_ScriptedRunner(
-                scripts=(
-                    _final_script(
-                        "filtered",
-                        finish_reason=FinishReason.CONTENT_FILTER,
-                    ),
-                )
-            ),
+            request=request,
+            runner=runner,
         )
     )
 
     data = _final_data(events)
     assert data.filtered is True
     assert data.degraded is True
+    assert runner.request_identities_seen[0] is not None
+    assert data.response_identity.runner_request_identity == (
+        runner.request_identities_seen[0]
+    )
+    assert data.response_identity.effective_provider == request.runner_spec.provider
+    assert data.response_identity.effective_model == request.runner_spec.model
+    assert data.response_identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.UNAVAILABLE
+    )
+    assert data.response_identity.provider_request_id is None
 
 
 @pytest.mark.asyncio
@@ -2316,17 +2359,25 @@ async def test_length_continuation_appends_prompt_and_joins_content() -> None:
 
     runner = _ScriptedRunner(
         scripts=(
-            _final_script("partial ", finish_reason=FinishReason.LENGTH),
-            _final_script("continued"),
+            _final_script(
+                "partial ",
+                finish_reason=FinishReason.LENGTH,
+                provider_request_id="req-length-initial",
+            ),
+            _final_script(
+                "continued",
+                provider_request_id="req-length-terminal",
+            ),
         )
+    )
+    request = _request(
+        max_iterations=3,
+        continuation_max_attempts=2,
+        continuation_prompt="请从截断处继续。",
     )
     events = await _collect(
         _AsyncAgent(
-            request=_request(
-                max_iterations=3,
-                continuation_max_attempts=2,
-                continuation_prompt="请从截断处继续。",
-            ),
+            request=request,
             runner=runner,
         )
     )
@@ -2349,6 +2400,18 @@ async def test_length_continuation_appends_prompt_and_joins_content() -> None:
     ] == [1, 2]
     assert runner.request_identities_seen[1] is not None
     assert runner.request_identities_seen[1].iteration_id == "run_phase3_iteration_2"
+    assert data.response_identity.runner_request_identity == (
+        runner.request_identities_seen[1]
+    )
+    assert data.response_identity.runner_request_identity != (
+        runner.request_identities_seen[0]
+    )
+    assert data.response_identity.effective_provider == request.runner_spec.provider
+    assert data.response_identity.effective_model == request.runner_spec.model
+    assert data.response_identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.PRESENT
+    )
+    assert data.response_identity.provider_request_id == "req-length-terminal"
     iteration_completed = [
         event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]

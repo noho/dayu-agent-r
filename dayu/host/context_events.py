@@ -14,6 +14,11 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, TypeVar
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
     ConversationCompactOutputVNext,
@@ -829,6 +834,44 @@ CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 """Context compaction semantic attempt rejected canonical event type。"""
 
+
+@dataclass(frozen=True, slots=True)
+class CompactorProposalManifestReference:
+    """已持久化 compactor proposal manifest 的 durable binding 引用。
+
+    :param manifest_event_id: ``RUNNER_CALL_INPUT_ASSEMBLED`` event id。
+    :param manifest_payload_ref: runner-call manifest payload descriptor ref。
+    :param manifest_digest: runner-call manifest body digest。
+    :param compactor_input_projection_ref: compactor input projection descriptor ref。
+    :param compactor_input_projection_digest: compactor input projection digest。
+    :param compaction_operation_id: manifest 绑定的 Host compaction operation id。
+    :param compaction_attempt_number: manifest 绑定的 Host proposal attempt 序号。
+    :param compactor_engine_run_id: manifest 绑定的 compactor Engine run id。
+    """
+
+    manifest_event_id: str
+    manifest_payload_ref: str
+    manifest_digest: str
+    compactor_input_projection_ref: str
+    compactor_input_projection_digest: str
+    compaction_operation_id: str
+    compaction_attempt_number: int
+    compactor_engine_run_id: str
+
+    def __post_init__(self) -> None:
+        """校验 manifest reference 的绑定字段。
+
+        :returns: 无返回值。
+        :raises ValueError: operation/run id 为空或 attempt number 非正数时抛出。
+        """
+
+        if self.compaction_operation_id.strip() == "":
+            raise ValueError("compaction_operation_id must be non-empty")
+        if self.compaction_attempt_number <= 0:
+            raise ValueError("compaction_attempt_number must be positive")
+        if self.compactor_engine_run_id.strip() == "":
+            raise ValueError("compactor_engine_run_id must be non-empty")
+
 _FIELD_TRIGGER_SOURCE = "trigger_source"
 _FIELD_BUDGET_REASON = "budget_reason"
 _FIELD_BUDGET_SNAPSHOT_REF = "budget_snapshot_ref"
@@ -903,6 +946,39 @@ _FIELD_FALLBACK_BUDGET_RESULT = "fallback_budget_result"
 _FIELD_FALLBACK_ACTION = "fallback_action"
 _FIELD_ACCEPTED = "accepted"
 _FIELD_REJECTION_REASONS = "rejection_reasons"
+_FIELD_SUCCESSFUL_RESPONSE_IDENTITY = "successful_response_identity"
+_FIELD_EFFECTIVE_PROVIDER = "effective_provider"
+_FIELD_EFFECTIVE_MODEL = "effective_model"
+_FIELD_RUNNER_REQUEST_IDENTITY = "runner_request_identity"
+_FIELD_RUN_ID = "run_id"
+_FIELD_ITERATION_ID = "iteration_id"
+_FIELD_ITERATION_INDEX = "iteration_index"
+_FIELD_RUNNER_CALL_INDEX = "runner_call_index"
+_FIELD_PROVIDER_REQUEST_ID_AVAILABILITY = "provider_request_id_availability"
+
+_SUCCESSFUL_RESPONSE_IDENTITY_FIELDS = (
+    _FIELD_EFFECTIVE_PROVIDER,
+    _FIELD_EFFECTIVE_MODEL,
+    _FIELD_RUNNER_REQUEST_IDENTITY,
+    _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY,
+    _FIELD_PROVIDER_REQUEST_ID,
+)
+_RUNNER_REQUEST_IDENTITY_FIELDS = (
+    _FIELD_RUN_ID,
+    _FIELD_ATTEMPT_ID,
+    _FIELD_EXECUTION_ID,
+    _FIELD_ITERATION_ID,
+    _FIELD_ITERATION_INDEX,
+    _FIELD_RUNNER_CALL_INDEX,
+    _FIELD_CLIENT_CORRELATION_ID,
+)
+_POST_SUCCESS_REJECTION_CATEGORIES = frozenset(
+    (
+        "quality_check_rejected",
+        "hard_threshold_after_compact",
+    )
+)
+_NO_SUCCESS_REJECTION_CATEGORIES = frozenset(("cancellation_requested",))
 
 _REQUESTED_REQUIRED_FIELDS = (
     _FIELD_OPERATION_ID,
@@ -934,6 +1010,9 @@ _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_QUALITY_CHECK_RESULT,
     _FIELD_BUDGET_AFTER_COMPACT,
     _FIELD_PROJECTION_SIGNAL,
+    _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF,
+    _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST,
+    _FIELD_SUCCESSFUL_RESPONSE_IDENTITY,
 )
 _COMPACTED_OLD_FIELDS = frozenset(
     (
@@ -972,6 +1051,23 @@ _ATTEMPT_REJECTED_REQUIRED_FIELDS = (
     _FIELD_DIAGNOSTIC_REFS,
     _FIELD_NEXT_POLICY_DECISION,
     _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
+    _FIELD_PROPOSAL_MANIFEST_REF,
+    _FIELD_PROPOSAL_MANIFEST_DIGEST,
+    _FIELD_DIAGNOSTIC_ARTIFACT_REF,
+    _FIELD_DIAGNOSTIC_ARTIFACT_DIGEST,
+    _FIELD_FAILURE_STAGE,
+    _FIELD_DIAGNOSTIC_SUFFIX,
+    _FIELD_PARSER_OR_VALIDATOR,
+    _FIELD_EXCEPTION_CLASS,
+    _FIELD_EXCEPTION_MESSAGE,
+    _FIELD_OFFENDING_BLOCK_SECTION,
+    _FIELD_OFFENDING_BLOCK_KIND,
+    _FIELD_OFFENDING_BLOCK_LABEL,
+    _FIELD_OFFENDING_BLOCK_ORDINAL,
+    _FIELD_OFFENDING_BLOCK_TEXT_DIGEST,
+    _FIELD_OFFENDING_BLOCK_TEXT_LENGTH,
+    _FIELD_MATERIAL_PACK_DIGEST,
+    _FIELD_SUCCESSFUL_RESPONSE_IDENTITY,
 )
 _FALLBACK_ACTION_DISPATCH = "dispatch"
 _FALLBACK_ACTION_FAIL_CLOSED = "fail_closed"
@@ -1102,8 +1198,8 @@ def build_context_compacted_payload(
     source_boundary_refs: tuple[str, ...],
     accepted_evidence_mapping_refs: tuple[str, ...],
     projection_signal: str,
-    accepted_proposal_manifest_ref: str | None = None,
-    accepted_proposal_manifest_digest: str | None = None,
+    successful_response_identity: SuccessfulRunnerResponseIdentity,
+    accepted_proposal_manifest_reference: CompactorProposalManifestReference,
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTED`` payload。
 
@@ -1118,8 +1214,10 @@ def build_context_compacted_payload(
     :param source_boundary_refs: source boundary refs。
     :param accepted_evidence_mapping_refs: accepted evidence mapping refs。
     :param projection_signal: memory projection signal。
-    :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
-    :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
+    :param successful_response_identity: accepted candidate 对应的实际成功
+        Runner call 身份。
+    :param accepted_proposal_manifest_reference: 与 operation、attempt 和
+        compactor Engine run 同源的 typed manifest reference。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises TypeError: 输入类型非法时抛出。
     :raises ValueError: payload 结构非法时抛出。
@@ -1129,6 +1227,12 @@ def build_context_compacted_payload(
         raise TypeError("accepted_candidate must be ConversationCompactOutputVNext")
     if not isinstance(quality_check_result, CompactQualityCheckResultVNext):
         raise TypeError("quality_check_result must be CompactQualityCheckResultVNext")
+    _validate_successful_response_manifest_binding(
+        operation_id=operation_id,
+        attempt_number=accepted_attempt_number,
+        successful_response_identity=successful_response_identity,
+        proposal_manifest_reference=accepted_proposal_manifest_reference,
+    )
     payload: Mapping[str, JsonValue] = {
         _FIELD_OPERATION_ID: operation_id,
         _FIELD_ACCEPTED_ATTEMPT_NUMBER: accepted_attempt_number,
@@ -1146,8 +1250,15 @@ def build_context_compacted_payload(
         _FIELD_QUALITY_CHECK_RESULT: quality_check_result.to_json(),
         _FIELD_BUDGET_AFTER_COMPACT: budget_after_compact,
         _FIELD_PROJECTION_SIGNAL: projection_signal,
-        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF: accepted_proposal_manifest_ref,
-        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST: accepted_proposal_manifest_digest,
+        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF: (
+            accepted_proposal_manifest_reference.manifest_payload_ref
+        ),
+        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST: (
+            accepted_proposal_manifest_reference.manifest_digest
+        ),
+        _FIELD_SUCCESSFUL_RESPONSE_IDENTITY: _successful_response_identity_json(
+            successful_response_identity
+        ),
     }
     validate_context_compacted_payload(payload)
     return payload
@@ -1163,7 +1274,7 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     """
 
     _reject_old_compacted_fields(payload)
-    _require_fields(payload, _COMPACTED_REQUIRED_FIELDS)
+    _require_exact_fields(payload, _COMPACTED_REQUIRED_FIELDS)
     _required_text(payload, _FIELD_OPERATION_ID)
     _required_positive_int(payload, _FIELD_ACCEPTED_ATTEMPT_NUMBER)
     _required_digest(payload, _FIELD_ACCEPTED_CANDIDATE_DIGEST)
@@ -1176,10 +1287,10 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _validate_quality_check_result_vnext(payload)
     _required_non_negative_int(payload, _FIELD_BUDGET_AFTER_COMPACT)
     _required_text(payload, _FIELD_PROJECTION_SIGNAL)
-    _validate_optional_ref_digest_pair(
-        payload,
-        ref_field=_FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF,
-        digest_field=_FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST,
+    _required_text(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF)
+    _required_digest(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST)
+    _parse_successful_response_identity(
+        _required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY)
     )
 
 
@@ -1359,8 +1470,8 @@ def build_context_compaction_attempt_rejected_payload(
     diagnostic_refs: tuple[str, ...],
     next_policy_decision: str,
     budget_after_attempted_compact: int | None,
-    proposal_manifest_ref: str | None = None,
-    proposal_manifest_digest: str | None = None,
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
     diagnostic_artifact_ref: str | None = None,
     diagnostic_artifact_digest: str | None = None,
     failure_stage: str | None = None,
@@ -1387,10 +1498,10 @@ def build_context_compaction_attempt_rejected_payload(
     :param next_policy_decision: 下一步 Host policy decision。
     :param budget_after_attempted_compact: 本次 attempt 后预算；未知时为
         ``None``。
-    :param proposal_manifest_ref: 对应该 attempt 的 proposal manifest ref；
-        未发起 proposal call 时为 ``None``。
-    :param proposal_manifest_digest: 对应该 attempt 的 proposal manifest digest；
-        未发起 proposal call 时为 ``None``。
+    :param successful_response_identity: 本 attempt 已取得成功 Engine final
+        时的同源响应身份；没有成功 final 时为 ``None``。
+    :param proposal_manifest_reference: 对应该 attempt 的 typed proposal
+        manifest reference；未发起 proposal call 时为 ``None``。
     :param diagnostic_artifact_ref: material/proposal diagnostic artifact ref。
     :param diagnostic_artifact_digest: diagnostic artifact digest。
     :param failure_stage: 失败阶段分类。
@@ -1409,6 +1520,17 @@ def build_context_compaction_attempt_rejected_payload(
     :raises ValueError: payload 字段非法时抛出。
     """
 
+    if proposal_manifest_reference is not None:
+        _validate_successful_response_manifest_binding(
+            operation_id=operation_id,
+            attempt_number=attempt_number,
+            successful_response_identity=successful_response_identity,
+            proposal_manifest_reference=proposal_manifest_reference,
+        )
+    elif successful_response_identity is not None:
+        raise ValueError(
+            "successful response identity requires proposal manifest reference"
+        )
     payload: Mapping[str, JsonValue] = {
         _FIELD_OPERATION_ID: operation_id,
         _FIELD_ATTEMPT_NUMBER: attempt_number,
@@ -1420,8 +1542,16 @@ def build_context_compaction_attempt_rejected_payload(
         _FIELD_DIAGNOSTIC_REFS: _string_list_json(diagnostic_refs),
         _FIELD_NEXT_POLICY_DECISION: next_policy_decision,
         _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: budget_after_attempted_compact,
-        _FIELD_PROPOSAL_MANIFEST_REF: proposal_manifest_ref,
-        _FIELD_PROPOSAL_MANIFEST_DIGEST: proposal_manifest_digest,
+        _FIELD_PROPOSAL_MANIFEST_REF: (
+            None
+            if proposal_manifest_reference is None
+            else proposal_manifest_reference.manifest_payload_ref
+        ),
+        _FIELD_PROPOSAL_MANIFEST_DIGEST: (
+            None
+            if proposal_manifest_reference is None
+            else proposal_manifest_reference.manifest_digest
+        ),
         _FIELD_DIAGNOSTIC_ARTIFACT_REF: diagnostic_artifact_ref,
         _FIELD_DIAGNOSTIC_ARTIFACT_DIGEST: diagnostic_artifact_digest,
         _FIELD_FAILURE_STAGE: failure_stage,
@@ -1436,6 +1566,13 @@ def build_context_compaction_attempt_rejected_payload(
         _FIELD_OFFENDING_BLOCK_TEXT_DIGEST: offending_block_text_digest,
         _FIELD_OFFENDING_BLOCK_TEXT_LENGTH: offending_block_text_length,
         _FIELD_MATERIAL_PACK_DIGEST: material_pack_digest,
+        _FIELD_SUCCESSFUL_RESPONSE_IDENTITY: (
+            None
+            if successful_response_identity is None
+            else _successful_response_identity_json(
+                successful_response_identity
+            )
+        ),
     }
     validate_context_compaction_attempt_rejected_payload(payload)
     return payload
@@ -1451,10 +1588,10 @@ def validate_context_compaction_attempt_rejected_payload(
     :raises ValueError: payload 缺少必填字段或字段非法时抛出。
     """
 
-    _require_fields(payload, _ATTEMPT_REJECTED_REQUIRED_FIELDS)
+    _require_exact_fields(payload, _ATTEMPT_REJECTED_REQUIRED_FIELDS)
     _required_text(payload, _FIELD_OPERATION_ID)
     _required_positive_int(payload, _FIELD_ATTEMPT_NUMBER)
-    _required_text(payload, _FIELD_FAILURE_CATEGORY)
+    failure_category = _required_text(payload, _FIELD_FAILURE_CATEGORY)
     _required_bool(payload, _FIELD_REPAIRABLE)
     runner_refs = _required_text_list(payload, _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS)
     if len(runner_refs) == 0:
@@ -1486,6 +1623,168 @@ def validate_context_compaction_attempt_rejected_payload(
     _validate_optional_digest(payload, _FIELD_OFFENDING_BLOCK_TEXT_DIGEST)
     _optional_non_negative_int(payload, _FIELD_OFFENDING_BLOCK_TEXT_LENGTH)
     _validate_optional_digest(payload, _FIELD_MATERIAL_PACK_DIGEST)
+    successful_response_identity = payload.get(
+        _FIELD_SUCCESSFUL_RESPONSE_IDENTITY
+    )
+    proposal_manifest_ref = _optional_text(payload, _FIELD_PROPOSAL_MANIFEST_REF)
+    if successful_response_identity is not None:
+        if not isinstance(successful_response_identity, Mapping):
+            raise ValueError("successful_response_identity must be mapping or null")
+        _parse_successful_response_identity(successful_response_identity)
+        if proposal_manifest_ref is None:
+            raise ValueError(
+                "successful response identity requires proposal manifest reference"
+            )
+    if (
+        failure_category in _POST_SUCCESS_REJECTION_CATEGORIES
+        and successful_response_identity is None
+    ):
+        raise ValueError(
+            f"{failure_category} requires successful response identity"
+        )
+    if (
+        failure_category in _NO_SUCCESS_REJECTION_CATEGORIES
+        and successful_response_identity is not None
+    ):
+        raise ValueError(
+            f"{failure_category} forbids successful response identity"
+        )
+
+
+def _validate_successful_response_manifest_binding(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None,
+    proposal_manifest_reference: CompactorProposalManifestReference,
+) -> None:
+    """校验 durable event 的 operation/attempt/manifest/response 同源绑定。
+
+    :param operation_id: 当前 durable compaction operation id。
+    :param attempt_number: 当前 accepted/rejected proposal attempt number。
+    :param successful_response_identity: 当前 attempt 的成功响应身份；没有成功
+        final 时为 ``None``。
+    :param proposal_manifest_reference: 当前 attempt 已记录的 typed manifest
+        reference。
+    :returns: 无返回值。
+    :raises TypeError: manifest reference 类型非法时抛出。
+    :raises ValueError: operation、attempt 或 compactor Engine run 绑定不一致时
+        抛出。
+    """
+
+    if not isinstance(
+        proposal_manifest_reference,
+        CompactorProposalManifestReference,
+    ):
+        raise TypeError(
+            "proposal_manifest_reference must be "
+            "CompactorProposalManifestReference"
+        )
+    if proposal_manifest_reference.compaction_operation_id != operation_id:
+        raise ValueError("proposal manifest operation id mismatch")
+    if proposal_manifest_reference.compaction_attempt_number != attempt_number:
+        raise ValueError("proposal manifest attempt number mismatch")
+    if successful_response_identity is None:
+        return
+    if (
+        successful_response_identity.runner_request_identity.run_id
+        != proposal_manifest_reference.compactor_engine_run_id
+    ):
+        raise ValueError("successful response Engine run id mismatch")
+
+
+def _successful_response_identity_json(
+    identity: SuccessfulRunnerResponseIdentity,
+) -> Mapping[str, JsonValue]:
+    """序列化成功 Runner response identity 为 strict durable object。
+
+    :param identity: Engine success terminal 产生的 typed identity。
+    :returns: 不含 endpoint、credential、header 或 provider body 的 JSON object。
+    :raises TypeError: identity 类型非法时抛出。
+    """
+
+    if not isinstance(identity, SuccessfulRunnerResponseIdentity):
+        raise TypeError(
+            "successful_response_identity must be "
+            "SuccessfulRunnerResponseIdentity"
+        )
+    request_identity = identity.runner_request_identity
+    return {
+        _FIELD_EFFECTIVE_PROVIDER: identity.effective_provider,
+        _FIELD_EFFECTIVE_MODEL: identity.effective_model,
+        _FIELD_RUNNER_REQUEST_IDENTITY: {
+            _FIELD_RUN_ID: request_identity.run_id,
+            _FIELD_ATTEMPT_ID: request_identity.attempt_id,
+            _FIELD_EXECUTION_ID: request_identity.execution_id,
+            _FIELD_ITERATION_ID: request_identity.iteration_id,
+            _FIELD_ITERATION_INDEX: request_identity.iteration_index,
+            _FIELD_RUNNER_CALL_INDEX: request_identity.runner_call_index,
+            _FIELD_CLIENT_CORRELATION_ID: (
+                request_identity.client_correlation_id
+            ),
+        },
+        _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY: (
+            identity.provider_request_id_availability.value
+        ),
+        _FIELD_PROVIDER_REQUEST_ID: identity.provider_request_id,
+    }
+
+
+def _parse_successful_response_identity(
+    payload: Mapping[str, JsonValue],
+) -> SuccessfulRunnerResponseIdentity:
+    """从 strict durable object 重建成功 Runner response identity。
+
+    :param payload: nested ``successful_response_identity`` JSON object。
+    :returns: 完整校验过的 typed response identity。
+    :raises ValueError: 字段缺失、多余、类型非法、client correlation 非
+        canonical，或 compactor identity 错用 ordinary attempt/execution 时抛出。
+    """
+
+    _require_exact_fields(payload, _SUCCESSFUL_RESPONSE_IDENTITY_FIELDS)
+    runner_payload = _required_mapping(
+        payload,
+        _FIELD_RUNNER_REQUEST_IDENTITY,
+    )
+    _require_exact_fields(runner_payload, _RUNNER_REQUEST_IDENTITY_FIELDS)
+    attempt_id = _optional_text(runner_payload, _FIELD_ATTEMPT_ID)
+    execution_id = _optional_text(runner_payload, _FIELD_EXECUTION_ID)
+    if attempt_id is not None or execution_id is not None:
+        raise ValueError(
+            "compactor successful response attempt_id and execution_id must be null"
+        )
+    request_identity = build_runner_request_identity(
+        run_id=_required_text(runner_payload, _FIELD_RUN_ID),
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        iteration_id=_required_text(runner_payload, _FIELD_ITERATION_ID),
+        iteration_index=_required_non_negative_int(
+            runner_payload,
+            _FIELD_ITERATION_INDEX,
+        ),
+        runner_call_index=_required_positive_int(
+            runner_payload,
+            _FIELD_RUNNER_CALL_INDEX,
+        ),
+    )
+    client_correlation_id = _required_text(
+        runner_payload,
+        _FIELD_CLIENT_CORRELATION_ID,
+    )
+    if client_correlation_id != request_identity.client_correlation_id:
+        raise ValueError(
+            "runner_request_identity.client_correlation_id is not canonical"
+        )
+    availability = ProviderRequestIdAvailability(
+        _required_text(payload, _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY)
+    )
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=_required_text(payload, _FIELD_EFFECTIVE_PROVIDER),
+        effective_model=_required_text(payload, _FIELD_EFFECTIVE_MODEL),
+        runner_request_identity=request_identity,
+        provider_request_id_availability=availability,
+        provider_request_id=_optional_text(payload, _FIELD_PROVIDER_REQUEST_ID),
+    )
 
 
 def _string_list_json(values: tuple[str, ...]) -> list[JsonValue]:
@@ -1851,6 +2150,7 @@ __all__ = [
     "CONTEXT_COMPACTION_ATTEMPT_REJECTED",
     "CONTEXT_COMPACTION_FAILED",
     "CONTEXT_COMPACTION_REQUESTED",
+    "CompactorProposalManifestReference",
     "ContextBudgetEvaluatedPayload",
     "ContextBudgetEvaluationIdentity",
     "append_context_budget_evaluated_in_transaction",

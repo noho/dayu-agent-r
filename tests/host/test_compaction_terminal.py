@@ -11,6 +11,11 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactQualityCheckResultVNext,
@@ -22,6 +27,7 @@ from dayu.host.compaction_terminal import (
     CompactionTerminalCommitPermit,
     begin_compaction_terminal_commit_in_transaction,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_FAILED,
@@ -47,6 +53,64 @@ from dayu.host.durable.transaction import HostTransaction
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _successful_response_identity(
+    *,
+    operation_id: str,
+    ordinal: int,
+    compactor_engine_run_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造 compaction terminal fixture 的 event-unique response identity。
+
+    :param operation_id: 当前 compaction operation id。
+    :param ordinal: 当前 fixture 的显式 event ordinal。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: deterministic、非敏感的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{operation_id}:terminal:{ordinal}",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    ordinal: int,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 compaction terminal fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param ordinal: 当前 fixture 的显式 event ordinal。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:{ordinal}",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:{ordinal}",
+        manifest_digest=_DIGEST_A,
+        compactor_input_projection_ref=f"projection:{operation_id}:{ordinal}",
+        compactor_input_projection_digest=_DIGEST_B,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=1,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
 
 
 class _NonCanonicalTerminalEventLogStore(EventLogStore):
@@ -662,6 +726,16 @@ def _append_terminal(
             source_boundary_refs=("event-input-test",),
             accepted_evidence_mapping_refs=(),
             projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=_successful_response_identity(
+                operation_id=operation_id,
+                ordinal=ordinal,
+                compactor_engine_run_id=f"compactor-run:{operation_id}:{ordinal}",
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id=operation_id,
+                ordinal=ordinal,
+                compactor_engine_run_id=f"compactor-run:{operation_id}:{ordinal}",
+            ),
         )
     else:
         assert terminal_type == CONTEXT_COMPACTION_FAILED

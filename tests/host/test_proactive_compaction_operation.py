@@ -10,9 +10,28 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
+from dayu.engine.contracts.messages import (
+    AgentMessageRole,
+    SystemMessage,
+    UserMessage,
+)
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host.compact_material import (
     InitialHistoryMaterial,
     build_initial_material_pack,
+    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.host.compaction import (
@@ -20,10 +39,15 @@ from dayu.host.compaction import (
     CompactSegmentTrigger,
     CompactionRequest,
 )
+from dayu.host.compaction_operation import (
+    CompactorProposalRunInput,
+    DurableCompactorProposalManifestRecorder,
+)
 from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    CompactorProposalManifestReference,
     build_context_compaction_attempt_rejected_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
@@ -57,11 +81,43 @@ from dayu.host.proactive_compaction import (
     read_proactive_compaction_projection,
     validate_proactive_compaction_attempt_schedule,
 )
+from dayu.host.run_input import NoToolExecutor
+from tests.host.fake_cancellation import ControllableCancellationToken
 
 _NOW = datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC)
 _SESSION_ID = "session-proactive-owner"
 _RUN_ID = "run-proactive-owner"
 _DIGEST = sha256_digest_json({"fixture": "proactive-owner"})
+_FIXTURE_PROVIDER = "test-proactive-compactor"
+_FIXTURE_MODEL = "test-proactive-compactor-model"
+
+
+def _successful_response_identity_for_agent_request(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """从同一个 proposal AgentRunRequest 构造 fixture 成功响应身份。
+
+    :param request: manifest 与 identity 共用的 prepared Engine request。
+    :returns: provider request id 明确不可用的 typed identity。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:fixture-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 def _schedule_request(label: str) -> CompactionRequest:
@@ -110,6 +166,199 @@ def _schedule_request(label: str) -> CompactionRequest:
             safety_margin_tokens=20,
             estimator_digest=_DIGEST,
             overage_reason=None,
+        ),
+    )
+
+
+def _prepare_proposal_evidence(
+    *,
+    operation_id: str,
+    attempt_number: int,
+) -> tuple[CompactionRequest, CompactorProposalRunInput]:
+    """从一个 synthetic invocation 准备 manifest/identity 共用输入。
+
+    :param operation_id: 当前 proactive compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :returns: Host request 与同源 prepared Engine request input。
+    :raises Exception: test fake 或 contract 校验失败时透传。
+    """
+
+    request = _schedule_request(f"{operation_id}:{attempt_number}")
+    agent_request = _proposal_agent_request(
+        request=request,
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+    )
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        request.material_pack
+    )
+    projection: Mapping[str, JsonValue] = {
+        "projection_kind": "proactive_owner_fixture",
+        "compaction_request_digest": request.digest(),
+    }
+    roles = tuple(message.role.value for message in agent_request.messages)
+    prepared_input = CompactorProposalRunInput(
+        compact_input=compact_input,
+        agent_request=agent_request,
+        compaction_request_digest=request.digest(),
+        compactor_engine_run_id=agent_request.run_id,
+        message_count=len(agent_request.messages),
+        role_sequence_digest=runner_role_sequence_digest(roles),
+        system_prompt_asset_digest=sha256_digest_json(
+            {"prompt": "Proactive owner fixture system prompt."}
+        ),
+        user_prompt_template_digest=sha256_digest_json(
+            {"prompt": "Proactive owner fixture input."}
+        ),
+        user_prompt_digest=sha256_digest_json(
+            {"compaction_request_digest": request.digest()}
+        ),
+        compactor_input_projection=projection,
+        compactor_input_projection_digest=sha256_digest_json(projection),
+    )
+    return request, prepared_input
+
+
+def _proposal_agent_request(
+    *,
+    request: CompactionRequest,
+    operation_id: str,
+    attempt_number: int,
+) -> AgentRunRequest:
+    """构造 manifest 与 response identity 共用的 synthetic Engine request。
+
+    :param request: 当前 proactive compaction request。
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :returns: 无 ordinary attempt/execution 的同源 AgentRunRequest。
+    :raises ValueError: request contract 字段非法时抛出。
+    """
+
+    return AgentRunRequest(
+        run_id=f"proactive-compactor:{operation_id}:{attempt_number}",
+        session_id=f"context-compactor:{request.session_id}",
+        attempt_id=None,
+        execution_id=None,
+        messages=(
+            SystemMessage(
+                role=AgentMessageRole.SYSTEM,
+                content="Proactive owner fixture system prompt.",
+            ),
+            UserMessage(
+                role=AgentMessageRole.USER,
+                content="Proactive owner fixture input.",
+            ),
+        ),
+        disable_tools=True,
+        runner_spec=RunnerSpec(
+            provider=_FIXTURE_PROVIDER,
+            model=_FIXTURE_MODEL,
+            endpoint="https://example.invalid",
+            api_key_ref="env:TEST_PROACTIVE_COMPACTOR_API_KEY",
+            headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+            fallback_prompt="Proactive owner fixture fallback.",
+            continuation_prompt="Proactive owner fixture continuation.",
+        ),
+        tool_schemas=(),
+        tool_executor=NoToolExecutor(),
+        cancellation_token=ControllableCancellationToken(),
+    )
+
+
+def _recorded_proposal_evidence(
+    store: HostDurableStore,
+    *,
+    operation_id: str,
+    attempt_number: int,
+) -> tuple[SuccessfulRunnerResponseIdentity, CompactorProposalManifestReference]:
+    """记录 proposal manifest 并返回同一 request 派生的 sibling evidence。
+
+    :param store: 当前测试 durable store。
+    :param operation_id: 当前 proactive compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :returns: 同一 prepared AgentRunRequest 派生的 response identity 与 manifest。
+    :raises Exception: manifest 记录或 identity 校验失败时透传。
+    """
+
+    request, prepared_input = _prepare_proposal_evidence(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+    )
+    reference = DurableCompactorProposalManifestRecorder(
+        transaction_runner=store.transaction_runner,
+        event_log_store=EventLogStore(),
+        event_source="pytest",
+    ).record_compactor_proposal_manifest(
+        request=request,
+        prepared_input=prepared_input,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+    )
+    return (
+        _successful_response_identity_for_agent_request(
+            prepared_input.agent_request
+        ),
+        reference,
+    )
+
+
+def _unrecorded_proposal_evidence(
+    *,
+    operation_id: str,
+    attempt_number: int,
+) -> tuple[SuccessfulRunnerResponseIdentity, CompactorProposalManifestReference]:
+    """构造 orphan negative fixture 的同源但未持久化 sibling evidence。
+
+    :param operation_id: 故意缺少 request owner 的 operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :returns: 同一 prepared AgentRunRequest 派生的 identity 与未记录 manifest ref。
+    :raises Exception: test fixture contract 校验失败时透传。
+    """
+
+    _, prepared_input = _prepare_proposal_evidence(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+    )
+    return (
+        _successful_response_identity_for_agent_request(
+            prepared_input.agent_request
+        ),
+        CompactorProposalManifestReference(
+            manifest_event_id=(
+                f"unrecorded-manifest:{operation_id}:{attempt_number}"
+            ),
+            manifest_payload_ref=(
+                f"unrecorded-manifest-payload:{operation_id}:{attempt_number}"
+            ),
+            manifest_digest=prepared_input.role_sequence_digest,
+            compactor_input_projection_ref=(
+                f"unrecorded-projection:{operation_id}:{attempt_number}"
+            ),
+            compactor_input_projection_digest=(
+                prepared_input.compactor_input_projection_digest
+            ),
+            compaction_operation_id=operation_id,
+            compaction_attempt_number=attempt_number,
+            compactor_engine_run_id=prepared_input.compactor_engine_run_id,
         ),
     )
 
@@ -256,11 +505,15 @@ def _rejected_payload(
     operation_id: str,
     *,
     attempt_number: int,
+    successful_response_identity: SuccessfulRunnerResponseIdentity,
+    proposal_manifest_reference: CompactorProposalManifestReference,
 ) -> Mapping[str, JsonValue]:
     """构造 strict rejected attempt payload。
 
     :param operation_id: proactive operation id。
     :param attempt_number: 全局 attempt number。
+    :param successful_response_identity: quality rejection 前的成功 final 身份。
+    :param proposal_manifest_reference: 与 operation/attempt/run 同源的 manifest。
     :returns: strict rejected payload。
     :raises Exception: payload builder 校验失败时透传。
     """
@@ -274,6 +527,8 @@ def _rejected_payload(
         diagnostic_refs=(f"diagnostic:{attempt_number}",),
         next_policy_decision="retry_semantic_repair",
         budget_after_attempted_compact=81,
+        successful_response_identity=successful_response_identity,
+        proposal_manifest_reference=proposal_manifest_reference,
     )
 
 
@@ -536,8 +791,17 @@ def test_orphan_non_request_row_without_request_is_invalid(
     """
 
     orphan_operation_id = "orphan-operation-without-request"
+    orphan_identity, orphan_manifest = _unrecorded_proposal_evidence(
+        operation_id=orphan_operation_id,
+        attempt_number=1,
+    )
     payload = (
-        _rejected_payload(orphan_operation_id, attempt_number=1)
+        _rejected_payload(
+            orphan_operation_id,
+            attempt_number=1,
+            successful_response_identity=orphan_identity,
+            proposal_manifest_reference=orphan_manifest,
+        )
         if orphan_event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
         else _failed_payload(orphan_operation_id)
     )
@@ -662,11 +926,21 @@ def test_incomplete_projection_preserves_frozen_budget_and_rejection(
             event_type=CONTEXT_COMPACTION_REQUESTED,
             payload=_requested_payload(operation_id, max_attempt_number=3),
         )
+        successful_identity, proposal_manifest = _recorded_proposal_evidence(
+            store,
+            operation_id=operation_id,
+            attempt_number=1,
+        )
         _append_event(
             store,
             event_id="event-proactive-rejected-1",
             event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-            payload=_rejected_payload(operation_id, attempt_number=1),
+            payload=_rejected_payload(
+                operation_id,
+                attempt_number=1,
+                successful_response_identity=successful_identity,
+                proposal_manifest_reference=proposal_manifest,
+            ),
         )
         projection = _projection(store)
 
@@ -677,7 +951,7 @@ def test_incomplete_projection_preserves_frozen_budget_and_rejection(
     assert projection.state.max_attempt_number == 3
     assert projection.state.frozen_material_list_digest == _DIGEST
     assert projection.state.frozen_material_refs == ("event-input-owner",)
-    assert projection.state.prepared_attempt_numbers == ()
+    assert projection.state.prepared_attempt_numbers == (1,)
     assert projection.state.rejected_attempt_numbers == (1,)
     assert projection.state.next_attempt_number == 2
     assert projection.decision is ProactiveCompactionDecision.RESUME_EXISTING
@@ -702,11 +976,21 @@ def test_exhausted_incomplete_projection_fails_existing_operation(
             event_type=CONTEXT_COMPACTION_REQUESTED,
             payload=_requested_payload(operation_id, max_attempt_number=1),
         )
+        successful_identity, proposal_manifest = _recorded_proposal_evidence(
+            store,
+            operation_id=operation_id,
+            attempt_number=1,
+        )
         _append_event(
             store,
             event_id="event-proactive-rejected-exhausted",
             event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-            payload=_rejected_payload(operation_id, attempt_number=1),
+            payload=_rejected_payload(
+                operation_id,
+                attempt_number=1,
+                successful_response_identity=successful_identity,
+                proposal_manifest_reference=proposal_manifest,
+            ),
         )
         projection = _projection(store)
 

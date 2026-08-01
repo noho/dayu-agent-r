@@ -29,6 +29,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEventType,
     RunCancelledData,
 )
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.host.admission import (
     AdmissionWakeupPort,
     EffectiveToolFacts,
@@ -189,6 +190,7 @@ from dayu.host.compaction_operation import (
     run_compaction_attempt,
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.compaction_terminal import (
     COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
     CompactionOperationTerminalDisposition,
@@ -2545,11 +2547,11 @@ class HostDispatchScheduler:
                     if accepted_result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
-                accepted_proposal_manifest_ref=(
-                    _required_compactor_manifest_ref(accepted_result)
+                accepted_proposal_manifest_reference=(
+                    _required_compactor_manifest_reference(accepted_result)
                 ),
-                accepted_proposal_manifest_digest=(
-                    _required_compactor_manifest_digest(accepted_result)
+                successful_response_identity=(
+                    _required_successful_response_identity(accepted_result)
                 ),
             )
             return _ProactiveCompactionExecutionResult(
@@ -3351,8 +3353,8 @@ class HostDispatchScheduler:
         operation_id: str,
         accepted_attempt_number: int,
         budget_after_compact: int,
-        accepted_proposal_manifest_ref: str,
-        accepted_proposal_manifest_digest: str,
+        accepted_proposal_manifest_reference: CompactorProposalManifestReference,
+        successful_response_identity: SuccessfulRunnerResponseIdentity,
     ) -> int:
         """写入 accepted compact artifact 与 ``CONTEXT_COMPACTED`` fact。
 
@@ -3366,8 +3368,10 @@ class HostDispatchScheduler:
         :param operation_id: requested event id。
         :param accepted_attempt_number: accepted operation attempt number。
         :param budget_after_compact: Host 估算的 compact 后预算。
-        :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
-        :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
+        :param accepted_proposal_manifest_reference: accepted proposal 对应的
+            typed manifest reference。
+        :param successful_response_identity: accepted candidate 对应的实际成功
+            Runner call 身份。
         :returns: ``CONTEXT_COMPACTED`` event sequence。
         """
 
@@ -3439,8 +3443,10 @@ class HostDispatchScheduler:
                     source_boundary_refs=source_boundary_refs(request),
                     accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
                     projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
-                    accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
-                    accepted_proposal_manifest_digest=accepted_proposal_manifest_digest,
+                    accepted_proposal_manifest_reference=(
+                        accepted_proposal_manifest_reference
+                    ),
+                    successful_response_identity=successful_response_identity,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -3736,8 +3742,12 @@ class HostDispatchScheduler:
                     diagnostic_refs=rejected.diagnostic_refs,
                     next_policy_decision=rejected.next_policy_decision.value,
                     budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
-                    proposal_manifest_ref=rejected.proposal_manifest_ref,
-                    proposal_manifest_digest=rejected.proposal_manifest_digest,
+                    proposal_manifest_reference=(
+                        rejected.proposal_manifest_reference
+                    ),
+                    successful_response_identity=(
+                        rejected.successful_response_identity
+                    ),
                     diagnostic_artifact_ref=(
                         None
                         if diagnostic_reference is None
@@ -6244,31 +6254,39 @@ def _validate_proactive_resume_snapshot(
     validate_proactive_compaction_attempt_schedule(state, attempt_schedule)
 
 
-def _required_compactor_manifest_ref(result: CompactionOperationResult) -> str:
-    """读取 accepted proposal manifest ref。
+def _required_compactor_manifest_reference(
+    result: CompactionOperationResult,
+) -> CompactorProposalManifestReference:
+    """读取 accepted proposal typed manifest reference。
 
     :param result: compaction operation result。
-    :returns: accepted proposal manifest ref。
-    :raises RuntimeError: accepted result 缺少 manifest ref 时抛出。
+    :returns: accepted proposal typed manifest reference。
+    :raises RuntimeError: accepted result 缺少 manifest reference 时抛出。
     """
 
-    value = result.accepted_proposal_manifest_ref
-    if value is None or value.strip() == "":
-        raise RuntimeError("accepted compaction is missing proposal manifest ref")
+    value = result.accepted_proposal_manifest_reference
+    if value is None:
+        raise RuntimeError(
+            "accepted compaction is missing proposal manifest reference"
+        )
     return value
 
 
-def _required_compactor_manifest_digest(result: CompactionOperationResult) -> str:
-    """读取 accepted proposal manifest digest。
+def _required_successful_response_identity(
+    result: CompactionOperationResult,
+) -> SuccessfulRunnerResponseIdentity:
+    """读取 accepted compaction 的成功响应身份。
 
     :param result: compaction operation result。
-    :returns: accepted proposal manifest digest。
-    :raises RuntimeError: accepted result 缺少 manifest digest 时抛出。
+    :returns: accepted candidate 对应的成功 Runner call 身份。
+    :raises RuntimeError: accepted result 缺少成功响应身份时抛出。
     """
 
-    value = result.accepted_proposal_manifest_digest
-    if value is None or value.strip() == "":
-        raise RuntimeError("accepted compaction is missing proposal manifest digest")
+    value = result.accepted_successful_response_identity
+    if value is None:
+        raise RuntimeError(
+            "accepted compaction is missing successful response identity"
+        )
     return value
 
 

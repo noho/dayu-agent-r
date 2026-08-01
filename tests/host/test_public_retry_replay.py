@@ -20,6 +20,11 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -55,15 +60,22 @@ _BLOCK = "block"
 class _SequencedHandle:
     """按指定模式产出 Engine 事件的测试 handle。"""
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot, mode: str) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+        mode: str,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param mode: 事件模式。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._mode = mode
         self.cancel_reasons: list[str] = []
         self.events_started = asyncio.Event()
@@ -96,6 +108,9 @@ class _SequencedHandle:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=_successful_response_identity(
+                        self._request
+                    ),
                 ),
                 metadata=None,
             )
@@ -161,12 +176,40 @@ class _SequencedWorker:
         """
 
         mode = self._factory.next_mode()
-        handle = _SequencedHandle(snapshot, mode)
+        handle = _SequencedHandle(snapshot, request, mode)
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_requests.append(request)
         self._factory.handles.append(handle)
         self._factory.accepted_event.set()
         return handle
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 retry/replay worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:retry-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 class _SequencedWorkerFactory:

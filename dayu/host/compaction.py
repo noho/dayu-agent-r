@@ -14,6 +14,7 @@ from typing import Protocol
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
 )
@@ -1927,6 +1928,64 @@ class CompactionRequest:
         return self.material_pack.current_input_anchor.anchor_text
 
 
+@dataclass(frozen=True, slots=True)
+class CompactorProposal:
+    """一次成功 compactor Runner call 产生的配对 proposal。
+
+    :param candidate: 当前成功响应解析出的 compact candidate。
+    :param successful_response_identity: 产生该 candidate 的实际成功 Runner
+        call 身份。
+    """
+
+    candidate: ConversationCompactOutputVNext
+    successful_response_identity: SuccessfulRunnerResponseIdentity
+
+    def __post_init__(self) -> None:
+        """校验 proposal 的强类型配对值。
+
+        :returns: 无返回值。
+        :raises TypeError: candidate 或成功响应身份类型非法时抛出。
+        """
+
+        if not isinstance(self.candidate, ConversationCompactOutputVNext):
+            raise TypeError("CompactorProposal.candidate must be ConversationCompactOutputVNext")
+        if not isinstance(
+            self.successful_response_identity,
+            SuccessfulRunnerResponseIdentity,
+        ):
+            raise TypeError(
+                "CompactorProposal.successful_response_identity must be "
+                "SuccessfulRunnerResponseIdentity"
+            )
+
+
+class CompactorProposalError(RuntimeError):
+    """一次 compactor proposal 失败的 typed error contract。
+
+    :param message: 中性且安全的失败描述。
+    :param successful_response_identity: 已取得成功 Engine final 时的同源
+        response identity；没有成功 final 时为 ``None``。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        successful_response_identity: SuccessfulRunnerResponseIdentity | None,
+    ) -> None:
+        """初始化 proposal error。
+
+        :param message: 中性且安全的失败描述。
+        :param successful_response_identity: 已取得成功 Engine final 时的同源
+            response identity；没有成功 final 时为 ``None``。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(message)
+        self.successful_response_identity = successful_response_identity
+
+
 class ContextCompactor(Protocol):
     """vNext context compactor typed port。
 
@@ -1939,12 +1998,12 @@ class ContextCompactor(Protocol):
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """生成 vNext compaction output candidate。
 
         :param request: Host 构造的 compaction 请求。
         :param cancellation_token: Host 注入的真实取消 token。
-        :returns: vNext compaction output candidate。
+        :returns: 与实际成功 Runner call 身份配对的 vNext proposal。
         :raises RuntimeError: compactor 后端失败时可抛出运行时错误。
         """
 
@@ -2959,6 +3018,8 @@ __all__ = [
     "CompactSegmentSelection",
     "CompactSegmentTrigger",
     "CompactionRequest",
+    "CompactorProposal",
+    "CompactorProposalError",
     "ConversationCompactInputVNext",
     "ConversationCompactLabelSectionVNext",
     "ConversationCompactOutputVNext",
