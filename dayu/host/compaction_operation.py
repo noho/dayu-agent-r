@@ -513,6 +513,38 @@ class CompactionOperationResult:
     accepted_successful_response_identity: SuccessfulRunnerResponseIdentity | None
     accepted_proposal_manifest_reference: CompactorProposalManifestReference | None
 
+    def required_successful_response_identity(
+        self,
+    ) -> SuccessfulRunnerResponseIdentity:
+        """返回 accepted candidate 对应的成功响应身份。
+
+        :returns: accepted candidate 对应的成功 Runner call 身份。
+        :raises RuntimeError: accepted result 缺少成功响应身份时抛出。
+        """
+
+        value = self.accepted_successful_response_identity
+        if value is None:
+            raise RuntimeError(
+                "accepted compaction is missing successful response identity"
+            )
+        return value
+
+    def required_proposal_manifest_reference(
+        self,
+    ) -> CompactorProposalManifestReference:
+        """返回 accepted proposal 对应的 typed manifest reference。
+
+        :returns: accepted proposal 对应的 typed manifest reference。
+        :raises RuntimeError: accepted result 缺少 manifest reference 时抛出。
+        """
+
+        value = self.accepted_proposal_manifest_reference
+        if value is None:
+            raise RuntimeError(
+                "accepted compaction is missing proposal manifest reference"
+            )
+        return value
+
 
 @dataclass(frozen=True, slots=True)
 class _CompactorProposalAttempt:

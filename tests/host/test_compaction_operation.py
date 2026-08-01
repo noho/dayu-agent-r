@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 import pytest
 
 import dayu.host.compaction_operation as compaction_operation
-import dayu.host.dispatch as dispatch
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_executor import ToolExecutor
@@ -960,7 +959,33 @@ def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> N
         RuntimeError,
         match="accepted compaction is missing proposal manifest reference",
     ):
-        dispatch._required_compactor_manifest_reference(result)
+        result.required_proposal_manifest_reference()
+
+
+def test_accepted_compaction_missing_successful_response_identity_guard_fails_closed(
+) -> None:
+    """accepted compaction 缺成功响应身份时由 result owner fail-closed。
+
+    :returns: ``None``。
+    :raises AssertionError: owner 未以既有错误语义拒绝缺失身份时抛出。
+    """
+
+    result = compaction_operation.CompactionOperationResult(
+        accepted_candidate=None,
+        quality_result=None,
+        rejected_attempts=(),
+        failure_reason=None,
+        budget_after_attempted_compact=10,
+        accepted_attempt_number=1,
+        accepted_successful_response_identity=None,
+        accepted_proposal_manifest_reference=None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="accepted compaction is missing successful response identity",
+    ):
+        result.required_successful_response_identity()
 
 
 @pytest.mark.asyncio

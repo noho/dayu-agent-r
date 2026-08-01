@@ -2548,10 +2548,10 @@ class HostDispatchScheduler:
                     else pending.estimate.estimated_input_tokens
                 ),
                 accepted_proposal_manifest_reference=(
-                    _required_compactor_manifest_reference(accepted_result)
+                    accepted_result.required_proposal_manifest_reference()
                 ),
                 successful_response_identity=(
-                    _required_successful_response_identity(accepted_result)
+                    accepted_result.required_successful_response_identity()
                 ),
             )
             return _ProactiveCompactionExecutionResult(
@@ -6252,42 +6252,6 @@ def _validate_proactive_resume_snapshot(
     if state.frozen_material_refs != source_snapshot.material_source_refs:
         raise RuntimeError("proactive resume material refs changed")
     validate_proactive_compaction_attempt_schedule(state, attempt_schedule)
-
-
-def _required_compactor_manifest_reference(
-    result: CompactionOperationResult,
-) -> CompactorProposalManifestReference:
-    """读取 accepted proposal typed manifest reference。
-
-    :param result: compaction operation result。
-    :returns: accepted proposal typed manifest reference。
-    :raises RuntimeError: accepted result 缺少 manifest reference 时抛出。
-    """
-
-    value = result.accepted_proposal_manifest_reference
-    if value is None:
-        raise RuntimeError(
-            "accepted compaction is missing proposal manifest reference"
-        )
-    return value
-
-
-def _required_successful_response_identity(
-    result: CompactionOperationResult,
-) -> SuccessfulRunnerResponseIdentity:
-    """读取 accepted compaction 的成功响应身份。
-
-    :param result: compaction operation result。
-    :returns: accepted candidate 对应的成功 Runner call 身份。
-    :raises RuntimeError: accepted result 缺少成功响应身份时抛出。
-    """
-
-    value = result.accepted_successful_response_identity
-    if value is None:
-        raise RuntimeError(
-            "accepted compaction is missing successful response identity"
-        )
-    return value
 
 
 def _required_row_text(row: HostRow, field_name: str) -> str:

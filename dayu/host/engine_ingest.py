@@ -3118,10 +3118,10 @@ class EngineEventIngestor:
                     else pending.estimate.estimated_input_tokens
                 ),
                 accepted_proposal_manifest_reference=(
-                    _required_compactor_manifest_reference(operation_result)
+                    operation_result.required_proposal_manifest_reference()
                 ),
                 successful_response_identity=(
-                    _required_successful_response_identity(operation_result)
+                    operation_result.required_successful_response_identity()
                 ),
             )
             return _ReactiveRecoveryAccepted(
@@ -8812,42 +8812,6 @@ def _required_accepted_attempt_number(result: CompactionOperationResult) -> int:
     value = result.accepted_attempt_number
     if value is None or value <= 0:
         raise RuntimeError("accepted compaction is missing accepted attempt number")
-    return value
-
-
-def _required_successful_response_identity(
-    result: CompactionOperationResult,
-) -> SuccessfulRunnerResponseIdentity:
-    """返回 accepted compaction 的成功响应身份。
-
-    :param result: 已由 operation owner 生成的结果。
-    :returns: accepted candidate 对应的成功 Runner call 身份。
-    :raises RuntimeError: accepted result 缺少成功响应身份时抛出。
-    """
-
-    value = result.accepted_successful_response_identity
-    if value is None:
-        raise RuntimeError(
-            "accepted compaction is missing successful response identity"
-        )
-    return value
-
-
-def _required_compactor_manifest_reference(
-    result: CompactionOperationResult,
-) -> CompactorProposalManifestReference:
-    """返回 accepted compaction 的 typed manifest reference。
-
-    :param result: 已由 operation owner 生成的结果。
-    :returns: accepted proposal 对应的 typed manifest reference。
-    :raises RuntimeError: accepted result 缺少 manifest reference 时抛出。
-    """
-
-    value = result.accepted_proposal_manifest_reference
-    if value is None:
-        raise RuntimeError(
-            "accepted compaction is missing proposal manifest reference"
-        )
     return value
 
 
