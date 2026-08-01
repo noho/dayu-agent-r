@@ -529,7 +529,7 @@ Host生产代码：
 - `dayu/host/compact_pipeline.py`（只更新typed payload input的直接字段）
 - 对应package export文件（仅真实public contract，不做兼容re-export）
 
-测试只允许触及：
+S5 owner-level / behavior tests 只允许触及：
 
 - `tests/engine/contracts/test_runner_identity.py`
 - `tests/engine/test_engine_event_contract.py`
@@ -545,6 +545,57 @@ Host生产代码：
 - `tests/host/test_compact_pipeline.py`
 - `tests/host/test_package_exports.py`
 - `tests/host/test_import_boundary.py`
+
+此外，required success identity 与 `ContextCompactor` typed return 会让既有
+test/test-support 直接构造点发生必然类型错误。以下是基于
+HEAD `331d38dcaeebe3a929b7fa52d4e161a1c6504c55` 的完整机械闭包，也属于
+S5 allowed files；这只允许补齐 required typed value、解包/保留同一个 proposal
+identity 和随 contract 迁移类型标注，不允许借机改变测试场景、Host/Engine 行为或
+断言语义。
+
+表中 `FA(n)` 表示该文件有 `n` 个 `FinalAnswerData(...)` 直接构造，`OA(n)`
+表示有 `n` 个 `EngineRunOutcomeFinalAnswer(...)` 直接构造，`CR` 表示直接实现、
+override、delegate 或消费 `ContextCompactor` / prepared-compactor typed return。
+
+| 文件 | HEAD 直接证据 |
+|---|---|
+| `tests/engine/test_engine_event_contract.py` | `FA(2)` |
+| `tests/engine/test_smoke_async_agent_providers.py` | `FA(1)` |
+| `tests/service/test_entrypoint_runtime_interactive_path.py` | `FA(1)` |
+| `tests/host/fake_compaction.py` | `CR`；`FakeContextCompactor` 是测试 double owner |
+| `tests/host/public_smoke_support.py` | `FA(1)` |
+| `tests/host/recovery_support.py` | `FA(2)` |
+| `tests/host/stress_support.py` | `FA(1)` |
+| `tests/host/transient_stream_support.py` | `FA(1)` |
+| `tests/host/test_active_cancel_dispatch.py` | `FA(2)` |
+| `tests/host/test_compact_artifact_store.py` | `CR` |
+| `tests/host/test_compaction_cancellation_scope.py` | `OA(1)` |
+| `tests/host/test_compaction_contract.py` | `CR` |
+| `tests/host/test_compaction_operation.py` | `CR` |
+| `tests/host/test_dispatch_scheduler.py` | `FA(3) + CR` |
+| `tests/host/test_effective_execution_config.py` | `FA(1)` |
+| `tests/host/test_engine_ingest_mapping.py` | `FA(10) + CR` |
+| `tests/host/test_llm_compaction.py` | `OA(1) + CR` |
+| `tests/host/test_open_host_runtime.py` | `FA(3)` |
+| `tests/host/test_per_run_tool_selection.py` | `FA(1)` |
+| `tests/host/test_phase5_local_execution_integration.py` | `FA(1)` |
+| `tests/host/test_public_compact_smoke.py` | `FA(1) + OA(2)` |
+| `tests/host/test_public_retry_replay.py` | `FA(1)` |
+| `tests/host/test_recovery_dispatch.py` | `FA(1)` |
+| `tests/host/test_submit_followup_public_contract.py` | `FA(1)` |
+| `tests/host/test_watch_session_events.py` | `FA(1)` |
+
+机械闭包总计 25 个去重文件：35 个 `FinalAnswerData(...)` 直接构造、4 个
+`EngineRunOutcomeFinalAnswer(...)` 直接构造，以及 7 个 `ContextCompactor`
+typed-return 相关文件；其中 5 个已在上方 owner-level 清单，新增 allowed-file
+缺口为 20 个。实现前必须重跑同一 inventory；若 HEAD 之后出现新直接构造点，先退回
+controller 修订 allowed files，不得在未列文件中补 default/fallback。
+
+所有机械调用点必须从该 fake/event/outcome 的同一次测试输入构造
+`SuccessfulRunnerResponseIdentity`：run、iteration、attempt/execution、provider/model
+与 provider request id availability 必须同源。没有 provider request id 的测试明确使用
+`UNAVAILABLE + None`；不得复用相邻 Run/iteration/compactor attempt 的 identity，不得
+增加 optional default、兼容构造签名、全局万能 identity fixture 或下游补值。
 
 ### 9.2 Engine contract/schema changes
 
@@ -572,7 +623,7 @@ Host生产代码：
 
 代码已证明 `run_compaction_operation()` 在每个 Host proposal attempt 重新调用 `prepare_compactor_proposal_run_input()`；`_agent_request_vnext()` 用 `run_id=compactor_engine_run_id`、`attempt_id=None`、`execution_id=None` 构造新 request。Engine 内 `_runner_call_index` 从 0 开始且每次 Runner call 加 1。`LLMContextCompactor` 对最终 `EngineRunOutcomeFinalAnswer.finish_reason=LENGTH` 已明确 fail closed；若 Engine 在同 request 内 length continuation 后以非 LENGTH final 结束，只最后 call identity 可绑定该 accepted/rejected proposal。
 
-1. `compaction.py` 定义 `CompactorProposal`：`candidate` + required `SuccessfulRunnerResponseIdentity`。`ContextCompactor.compact()` 返回该类型；测试fake显式模拟identity，不用optional默认兼容旧fake。
+1. `compaction.py` 定义 `CompactorProposal`：`candidate` + required `SuccessfulRunnerResponseIdentity`。`ContextCompactor.compact()` 返回该类型。`tests/host/fake_compaction.py` 的外层 `FakeContextCompactor` 必须在 fake owner 内显式构造安全的完整 identity 并返回 `CompactorProposal`：使用非敏感 test-only provider/model、canonical `build_runner_request_identity()`、与该次 synthetic compactor invocation 同源的 run/iteration/call identity，`attempt_id/execution_id` 显式为 `None`，且无真实 provider id 时严格使用 `UNAVAILABLE + None`。不得给 proposal/identity 字段增加 optional default、不得保留旧 return signature 或 compatibility overload；candidate-only 的 `FakeConversationCompactorVNext` 仍只拥有 vNext candidate，不伪造 Engine identity。其它 custom compactor test double 若只是变换 candidate，必须机械保留同一个 proposal identity；若模拟另一成功 Runner call，则显式构造该次 call 自己的同源 identity。
 2. `LLMContextCompactor.run_prepared_compactor_proposal()`：
    - 只接受 `EngineRunOutcomeFinalAnswer`；
    - 校验 response identity 的 `request_identity.run_id == prepared_input.compactor_engine_run_id`、`request_identity.attempt_id is None`、`request_identity.execution_id is None`、effective provider/model 等于该 prepared `AgentRunRequest.runner_spec`；这两个 `None` 是 compactor Engine request contract，不表示 Host `compaction_attempt_number` 缺失；
@@ -639,6 +690,7 @@ RunnerSpec(provider/model only selected as effective call identity)
 - operation 其余 exact cases：first success accepted、provider failure、timeout/cancel、multi-pass；只有对应 Host attempt 确有 successful Engine final 的 rejected/accepted event 才携带 mapping，每个 event 都指向同 attempt manifest 和 compactor engine run。
 - proactive与reactive writers都传required accepted identity；缺失时transaction失败且不写artifact/event。
 - durable payload round-trip 重建 exact nested `runner_request_identity`，显式验证 null attempt/execution 与 Host `compaction_attempt_number` 不是同一字段；missing/extra/loose/renamed field 均拒绝。canary 分别放入 endpoint、credential value/ref、Authorization/header、secret 与 ordinary RunnerSpec，扫描 EventLog payload、artifact metadata、Host public diagnostic 确保不存在。
+- required-contract 机械闭包：HEAD inventory 中 35 个 `FinalAnswerData(...)`、4 个 `EngineRunOutcomeFinalAnswer(...)` 与 7 个 `ContextCompactor` typed-return 文件全部通过 pytest 与 pyright；每个 direct constructor 都显式提供同源 typed identity，candidate-transforming fake 保留 paired identity。不得用 dataclass/default factory、optional field、兼容 helper signature 或 loose test fixture 让遗漏调用点继续通过。
 
 ### 9.7 明确 non-goals
 
@@ -757,16 +809,49 @@ pytest tests/host/test_compaction_terminal.py \
   tests/host/test_context_compact_events.py \
   tests/host/test_engine_ingest_mapping.py -q
 
-pytest tests/engine/contracts tests/engine/test_agent_phase2.py \
-  tests/engine/test_agent_phase3_tool_call.py -q
+pytest tests/engine/contracts/test_runner_identity.py \
+  tests/engine/contracts/test_agent_run.py \
+  tests/engine/test_engine_event_contract.py \
+  tests/engine/test_agent_phase2.py \
+  tests/engine/test_agent_phase3_tool_call.py \
+  tests/engine/test_package_exports.py \
+  tests/engine/test_smoke_async_agent_providers.py -q
 
 pytest tests/host/test_llm_compaction.py \
+  tests/host/test_compaction_contract.py \
+  tests/host/test_compact_artifact_store.py \
   tests/host/test_compaction_operation.py \
   tests/host/test_context_compact_events.py \
   tests/host/test_dispatch_scheduler.py \
   tests/host/test_engine_ingest_mapping.py \
-  tests/host/test_compact_pipeline.py -q
+  tests/host/test_compact_pipeline.py \
+  tests/host/test_compaction_cancellation_scope.py \
+  tests/host/test_active_cancel_dispatch.py \
+  tests/host/test_effective_execution_config.py \
+  tests/host/test_open_host_runtime.py \
+  tests/host/test_per_run_tool_selection.py \
+  tests/host/test_phase5_local_execution_integration.py \
+  tests/host/test_public_compact_smoke.py \
+  tests/host/test_public_retry_replay.py \
+  tests/host/test_recovery_dispatch.py \
+  tests/host/test_submit_followup_public_contract.py \
+  tests/host/test_watch_session_events.py \
+  tests/host/test_package_exports.py \
+  tests/host/test_import_boundary.py -q
+
+pytest tests/service/test_entrypoint_runtime_interactive_path.py -q
 ```
+
+`tests/host/public_smoke_support.py`、`recovery_support.py`、`stress_support.py`
+与 `transient_stream_support.py` 是 test-support module，不把“pytest 对无 test module
+返回 no-tests”当验证。它们由下方完整 `tests/host` 回归和全量 pyright 关闭；回归必须
+实际收集其消费者，包括 recovery multiprocess、host production stress 与 transient
+delta/watch paths，不能只做 import smoke。
+
+`tests/host/fake_compaction.py` 同样是不可由 pytest 直接收集的 test-support module；
+其行为由上方已列消费者测试覆盖，typed return 由全量 pyright 关闭。
+`FakeContextCompactor` 的 identity 构造 owner 与 candidate-transforming fake 的 paired
+identity 保留规则以 §9.3 为唯一真源，本 validation 层不得重算或扩展这些规则。
 
 集成/回归：
 
@@ -783,11 +868,7 @@ pytest tests/host/test_context_anchor.py tests/host/test_context_budget.py \
   tests/host/test_public_session_attachment.py \
   tests/host/test_open_host_runtime.py tests/host/test_engine_ingest_mapping.py -q
 
-pytest tests/engine tests/host/test_llm_compaction.py \
-  tests/host/test_compaction_operation.py \
-  tests/host/test_context_compact_events.py \
-  tests/host/test_dispatch_scheduler.py \
-  tests/host/test_engine_ingest_mapping.py -q
+pytest tests/engine tests/host -q
 ```
 
 Smoke分三层，不能互相冒充：
@@ -801,6 +882,21 @@ Smoke分三层，不能互相冒充：
 ```bash
 python -m pyright dayu/ tests/ utils/
 ```
+
+S5 implementation 前后都重跑 required-constructor / typed-return inventory：
+
+```bash
+rg -n --glob '*.py' '\bFinalAnswerData\s*\(' tests
+rg -n --glob '*.py' '\bEngineRunOutcomeFinalAnswer\s*\(' tests
+rg -n --glob '*.py' \
+  '\b(ContextCompactor|FakeContextCompactor|prepare_compactor_proposal_run_input|run_prepared_compactor_proposal)\b' \
+  tests
+```
+
+以 §9.1 的 HEAD 基线为 closure 起点；implementation 新增 hit 只能位于 S5 allowed
+files 并接受同样 required typed contract。pyright 必须证明不存在漏传 required field、
+旧 `ConversationCompactOutputVNext` return annotation 或 candidate/proposal 混用；不得用
+`type: ignore`、仅为掩盖不匹配的 cast、optional/default 或兼容 overload 消音。
 
 覆盖率：对所有S1-S5新增/修改生产文件运行branch coverage，使用coverage JSON逐文件检查 `percent_covered >= 80`，不能只看aggregate；未达到则补owner/反例/race tests，不加pragma或排除。`utils/` 无新增脚本，因而不适用其豁免。
 
@@ -918,6 +1014,7 @@ PTY 环境依赖已按 §12.1 分类为 allowed platform/capability variant：PO
 ### S5
 
 - [ ] Engine final/outcome required success identity。
+- [ ] §9.1 的 25 个 test/test-support 机械闭包完成；`FakeContextCompactor` 显式构造安全 required identity，其它 direct constructor/typed-return 调用点只做同源机械迁移，零 optional default/兼容 signature。
 - [ ] Host accepted/rejected payload 按 operation id + Host attempt number + manifest + exact compactor Engine final identity 同源绑定。
 - [ ] RunnerRequestIdentity attempt/execution、runner_call_index、Host operation/attempt、compactor engine run/client/provider id 区分测试通过。
 - [ ] present/unavailable、final LENGTH fail-closed、failure/repair/multiattempt/ordinary+neighbor A/B/C 串线反例通过。
