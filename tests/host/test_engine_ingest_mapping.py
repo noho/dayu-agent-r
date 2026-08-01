@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -129,7 +130,11 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
     append_context_budget_evaluated_in_transaction,
+    build_context_compaction_failed_payload,
     parse_context_budget_evaluated_payload,
+)
+from dayu.host.compaction_terminal import (
+    COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
 )
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
@@ -141,6 +146,7 @@ from dayu.host.compact_material import (
 )
 from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    CompactQualityCheckResultVNext,
     CompactionRequest,
     ConversationCompactOutputVNext,
     ContextCompactor,
@@ -280,6 +286,7 @@ from dayu.host.waiting import (
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
     EngineEventIngestor,
+    EngineIngestResult,
     EngineIngestStatus,
     LocalEngineEnvelope,
 )
@@ -469,6 +476,83 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
 
         self.calls += 1
         _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
+        return await super().compact(request, cancellation_token)
+
+
+class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
+    """在 provider await 期间注入两个 reactive canonical terminal。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化损坏 terminal 注入 compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._transaction_runner = transaction_runner
+
+    async def compact(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """提交两个同 operation failed terminal 后返回 accepted candidate。
+
+        :param request: reactive compaction request。
+        :param cancellation_token: Host cancellation token。
+        :returns: fake accepted candidate。
+        :raises AssertionError: request canonical fact 不存在时抛出。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            """在单笔事务内追加两个 canonical terminal。
+
+            :param transaction: 当前 Host write transaction。
+            :returns: ``None``。
+            :raises AssertionError: request canonical fact 不存在时抛出。
+            """
+
+            requested = EventLogStore().read_latest_run_event_by_type(
+                transaction,
+                run_id=request.run_id,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+            )
+            assert requested is not None
+            for ordinal in (1, 2):
+                EventLogStore().append_event(
+                    transaction,
+                    EventLogAppendRequest(
+                        event_id=f"event-reactive-invalid-multiple-{ordinal}",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=request.session_id,
+                        run_id=request.run_id,
+                        attempt_id=request.attempt_id,
+                        execution_id=request.execution_id,
+                        event_type=CONTEXT_COMPACTION_FAILED,
+                        occurred_at=_NOW,
+                        actor="tester",
+                        source="pytest",
+                        client_request_id=None,
+                        idempotency_key=None,
+                        policy_decision=None,
+                        reason=None,
+                        payload_json=build_context_compaction_failed_payload(
+                            operation_id=requested.event_id,
+                            failure_reason=f"invalid_multiple_{ordinal}",
+                            policy_decision="fail_closed",
+                            retryable=False,
+                            attempt_count=0,
+                            retry_repair_budget_exhausted=False,
+                            diagnostic_refs=(f"diagnostic:{ordinal}",),
+                            budget_after_attempted_compact=None,
+                        ),
+                        payload_ref=None,
+                        payload_digest=None,
+                    ),
+                )
+
+        self._transaction_runner.run_write(_operation)
         return await super().compact(request, cancellation_token)
 
 
@@ -1983,6 +2067,265 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
         assert result.status is EngineIngestStatus.ACCEPTED
         assert compactor.calls == 1
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_start(
+    tmp_path: Path,
+) -> None:
+    """reactive caller 对 INVALID_MULTIPLE 抛稳定错误且不追加 durable 副作用。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: caller 追加第三 terminal、artifact 或 recovery start 时抛出。
+    """
+
+    artifact_root = tmp_path / "compact-artifacts"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+        descriptor_count_before = store.transaction_runner.run_read(
+            lambda transaction: _table_row_count(
+                transaction,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+        )
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=_InvalidMultipleReactiveCompactor(
+                store.transaction_runner
+            ),
+            compact_artifact_root=artifact_root,
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match=COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
+        ):
+            await ingestor.ingest_async(
+                _context_compaction_candidate(
+                    seeded,
+                    worker_event_index=162,
+                )
+            )
+
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 2
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        ) == 0
+        assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert wakeup.dispatches == []
+        assert _compact_artifact_files(artifact_root) == ()
+        descriptor_count_after = store.transaction_runner.run_read(
+            lambda transaction: _table_row_count(
+                transaction,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+        )
+        assert descriptor_count_after == descriptor_count_before
+
+
+@pytest.mark.parametrize("winner_compacted", (True, False))
+@pytest.mark.asyncio
+async def test_reactive_same_pending_terminal_race_preserves_first_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winner_compacted: bool,
+) -> None:
+    """同一 reactive pending 的相反结果并发只提交 first truth。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param winner_compacted: 首个获准结果是否为 compacted。
+    :returns: ``None``。
+    :raises AssertionError: late loser 写 artifact/event/fallback/start 时抛出。
+    """
+
+    artifact_root = tmp_path / "compact-artifacts"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            record_source_candidate=True,
+        )
+        wakeup = _WakeupSpy()
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=artifact_root,
+        )
+        candidate = _context_compaction_candidate(
+            seeded,
+            worker_event_index=163 if winner_compacted else 164,
+        )
+        pending = ingestor._ingest_before_reactive_compaction(candidate)
+        assert isinstance(pending, engine_ingest_module._ReactiveCompactPending)
+        entered_count = 0
+        both_entered = asyncio.Event()
+        releases = (asyncio.Event(), asyncio.Event())
+
+        async def _competing_operation(
+            *,
+            request: CompactionRequest,
+            compactor: ContextCompactor,
+            first_attempt_number: int,
+            max_attempt_number: int,
+            cancellation_token: CancellationToken,
+            pass_queue: tuple[CompactionRequest, ...] = (),
+            compaction_operation_id: str | None = None,
+            proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+        ) -> CompactionOperationResult:
+            """以 barrier 控制同 pending 两个相反 provider result 的返回顺序。
+
+            :param request: reactive root request。
+            :param compactor: 当前 compactor。
+            :param first_attempt_number: frozen first attempt。
+            :param max_attempt_number: frozen max attempt。
+            :param cancellation_token: Host cancellation token。
+            :param pass_queue: frozen reactive pass queue。
+            :param compaction_operation_id: request event 同源 operation id。
+            :param proposal_manifest_recorder: durable manifest recorder。
+            :returns: 当前 contender 对应 accepted 或 failed result。
+            :raises AssertionError: operation frozen identity 漂移时抛出。
+            """
+
+            nonlocal entered_count
+            del pass_queue, proposal_manifest_recorder
+            assert compactor is not None
+            assert first_attempt_number == 1
+            assert max_attempt_number == pending.policy.max_compaction_attempts_per_operation
+            assert compaction_operation_id == pending.operation_id
+            contender_index = entered_count
+            entered_count += 1
+            if entered_count == 2:
+                both_entered.set()
+            await releases[contender_index].wait()
+            contender_compacted = (
+                winner_compacted
+                if contender_index == 0
+                else not winner_compacted
+            )
+            if contender_compacted:
+                accepted_candidate = await FakeContextCompactor().compact(
+                    request,
+                    cancellation_token,
+                )
+                return CompactionOperationResult(
+                    accepted_candidate=accepted_candidate,
+                    quality_result=CompactQualityCheckResultVNext(
+                        accepted=True,
+                        rejection_reasons=(),
+                    ),
+                    rejected_attempts=(),
+                    failure_reason=None,
+                    budget_after_attempted_compact=(
+                        pending.estimate.estimated_input_tokens
+                    ),
+                    accepted_attempt_number=1,
+                )
+            return CompactionOperationResult(
+                accepted_candidate=None,
+                quality_result=None,
+                rejected_attempts=(),
+                failure_reason="contending_provider_failure",
+                budget_after_attempted_compact=None,
+                accepted_attempt_number=None,
+            )
+
+        monkeypatch.setattr(
+            engine_ingest_module,
+            "run_compaction_operation",
+            _competing_operation,
+        )
+        first = asyncio.create_task(ingestor._execute_reactive_compaction(pending))
+        late = asyncio.create_task(ingestor._execute_reactive_compaction(pending))
+        await asyncio.wait_for(both_entered.wait(), timeout=1)
+
+        releases[0].set()
+        winner = await first
+        assert isinstance(winner, engine_ingest_module._ReactiveRecoveryAccepted)
+        ingestor._complete_reactive_recovery(winner)
+        first_terminal_type = (
+            CONTEXT_COMPACTED
+            if winner_compacted
+            else CONTEXT_COMPACTION_FAILED
+        )
+        first_terminal = _latest_event(
+            store.transaction_runner,
+            first_terminal_type,
+        )
+        cursor_after_winner = _event_log_cursor(store.transaction_runner)
+        descriptor_count_after_winner = store.transaction_runner.run_read(
+            lambda transaction: _table_row_count(
+                transaction,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+        )
+        artifact_files_after_winner = _compact_artifact_files(artifact_root)
+        run_started_after_winner = _event_count(
+            store.transaction_runner,
+            "RUN_STARTED",
+        )
+        attempt_count_after_winner = _attempt_count(
+            store.transaction_runner,
+            seeded.run_id,
+        )
+
+        releases[1].set()
+        loser = await late
+
+        assert isinstance(loser, EngineIngestResult)
+        assert _events_after_cursor(
+            store.transaction_runner,
+            cursor_after_winner,
+        ) == ()
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == (
+            1 if winner_compacted else 0
+        )
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_COMPACTION_FAILED,
+        ) == (0 if winner_compacted else 1)
+        assert _event_count(
+            store.transaction_runner,
+            CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        ) == 0
+        assert _latest_event(
+            store.transaction_runner,
+            first_terminal_type,
+        ).event_id == first_terminal.event_id
+        assert _compact_artifact_files(artifact_root) == artifact_files_after_winner
+        assert store.transaction_runner.run_read(
+            lambda transaction: _table_row_count(
+                transaction,
+                TABLE_PAYLOAD_DESCRIPTORS,
+            )
+        ) == descriptor_count_after_winner
+        assert _event_count(
+            store.transaction_runner,
+            "RUN_STARTED",
+        ) == run_started_after_winner
+        assert _attempt_count(
+            store.transaction_runner,
+            seeded.run_id,
+        ) == attempt_count_after_winner
+        assert run_started_after_winner == 2
+        assert attempt_count_after_winner == 2
+        assert len(wakeup.dispatches) == 1
 
 
 @pytest.mark.asyncio
@@ -7491,6 +7834,64 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
         )
 
     return transaction_runner.run_read(_operation)
+
+
+def _event_log_cursor(transaction_runner: HostTransactionRunner) -> int:
+    """读取当前 EventLog 最大 sequence。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: 空日志返回零，否则返回最大 event sequence。
+    :raises Exception: durable read 失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        """在同一 read transaction 内读取当前尾游标。
+
+        :param transaction: 当前 Host read transaction。
+        :returns: 空日志返回零，否则返回最大 event sequence。
+        :raises Exception: EventLog read 失败时透传。
+        """
+
+        rows = EventLogStore().read_events_after(transaction, 0, limit=1000)
+        if not rows:
+            return 0
+        return rows[-1].event_sequence
+
+    return transaction_runner.run_read(_operation)
+
+
+def _events_after_cursor(
+    transaction_runner: HostTransactionRunner,
+    after_cursor: int,
+) -> tuple[EventLogRow, ...]:
+    """读取游标后新增的 EventLog rows。
+
+    :param transaction_runner: Host transaction runner。
+    :param after_cursor: 已提交 winner 后的 EventLog cursor。
+    :returns: 游标后的 rows。
+    :raises Exception: durable read 失败时透传。
+    """
+
+    return transaction_runner.run_read(
+        lambda transaction: EventLogStore().read_events_after(
+            transaction,
+            after_cursor,
+            limit=1000,
+        )
+    )
+
+
+def _compact_artifact_files(root: Path) -> tuple[Path, ...]:
+    """返回 compact artifact 根目录下的全部文件。
+
+    :param root: compact artifact 根目录。
+    :returns: 已存在文件路径，按路径排序。
+    :raises OSError: 文件系统枚举失败时透传。
+    """
+
+    if not root.exists():
+        return ()
+    return tuple(sorted(path for path in root.rglob("*") if path.is_file()))
 
 
 def _append_prepared_runner_call_manifest(

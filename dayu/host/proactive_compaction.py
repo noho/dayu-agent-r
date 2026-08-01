@@ -30,6 +30,12 @@ from dayu.host.context_events import (
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.compaction import CompactionRequest
+from dayu.host.compaction_terminal import (
+    CompactionOperationTerminalDisposition,
+    CompactionTerminalClosed,
+    CompactionTerminalCommitPermit,
+    begin_compaction_terminal_commit_in_transaction,
+)
 from dayu.host.durable.codec import is_sha256_digest
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogRow, EventLogStore
@@ -300,19 +306,36 @@ def read_proactive_compaction_projection(
     if run_id.strip() == "":
         raise ValueError("run_id must be non-empty")
     rows = _read_operation_rows(transaction, event_log_store, run_id=run_id)
+    operation_id = _earliest_safe_proactive_operation_id(
+        rows,
+        session_id=session_id,
+        run_id=run_id,
+    )
     try:
+        terminal_state: (
+            CompactionTerminalCommitPermit | CompactionTerminalClosed | None
+        ) = None
+        if operation_id is not None:
+            terminal_state = begin_compaction_terminal_commit_in_transaction(
+                transaction,
+                event_log_store,
+                operation_id=operation_id,
+                expected_trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+            )
+            if (
+                isinstance(terminal_state, CompactionTerminalClosed)
+                and terminal_state.disposition
+                is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
+            ):
+                raise HostDurableError("multiple proactive compaction terminals")
         state = _project_state(
             transaction,
             rows,
             session_id=session_id,
             run_id=run_id,
+            terminal_state=terminal_state,
         )
     except (HostDurableError, TypeError, ValueError) as exc:
-        operation_id = _earliest_safe_proactive_operation_id(
-            rows,
-            session_id=session_id,
-            run_id=run_id,
-        )
         compacted_sequence, failed_sequence = _terminal_evidence(rows)
         state = _invalid_state(
             operation_id=operation_id,
@@ -363,6 +386,9 @@ def _project_state(
     *,
     session_id: str,
     run_id: str,
+    terminal_state: (
+        CompactionTerminalCommitPermit | CompactionTerminalClosed | None
+    ),
 ) -> ProactiveCompactionState:
     """从已排序 rows 严格投影 proactive state。
 
@@ -370,6 +396,7 @@ def _project_state(
     :param rows: operation 相关 canonical rows。
     :param session_id: 目标 Session id。
     :param run_id: 目标 Run id。
+    :param terminal_state: shared terminal owner 的 transaction-local fresh 结果。
     :returns: durable state。
     :raises HostDurableError: canonical identity 或 payload 不变量损坏时抛出。
     """
@@ -426,7 +453,11 @@ def _project_state(
     prepared_manifests: dict[int, _PreparedProactiveManifest] = {}
     compacted_sequence: int | None = None
     failed_sequence: int | None = None
-    terminal_count = 0
+    terminal_sequence = (
+        terminal_state.first_terminal_event_sequence
+        if isinstance(terminal_state, CompactionTerminalClosed)
+        else None
+    )
     for row in rows:
         if row.event_type == CONTEXT_COMPACTION_REQUESTED:
             continue
@@ -474,7 +505,10 @@ def _project_state(
                     "manifest belongs to a second proactive operation"
                 )
             attempt_number = identity.compaction_attempt_number
-            if terminal_count > 0:
+            if (
+                terminal_sequence is not None
+                and row.event_sequence > terminal_sequence
+            ):
                 raise HostDurableError(
                     "proactive manifest was appended after operation terminal"
                 )
@@ -521,7 +555,10 @@ def _project_state(
                 raise HostDurableError(
                     "rejection belongs to a second proactive operation"
                 )
-            if terminal_count > 0:
+            if (
+                terminal_sequence is not None
+                and row.event_sequence > terminal_sequence
+            ):
                 raise HostDurableError(
                     "proactive rejection was appended after operation terminal"
                 )
@@ -560,14 +597,21 @@ def _project_state(
                 )
             if row_operation_id != operation_id:
                 raise HostDurableError("proactive compacted operation mismatch")
-            if terminal_count > 0:
-                raise HostDurableError("multiple proactive compaction terminals")
+            if (
+                not isinstance(terminal_state, CompactionTerminalClosed)
+                or terminal_state.disposition
+                is not CompactionOperationTerminalDisposition.COMPACTED
+                or terminal_state.first_terminal_event_sequence
+                != row.event_sequence
+            ):
+                raise HostDurableError(
+                    "proactive compacted terminal disagrees with terminal owner"
+                )
             _validate_compacted_manifest_reference(
                 payload,
                 prepared_manifests=prepared_manifests,
                 rejected_attempts=rejected_attempts,
             )
-            terminal_count += 1
             compacted_sequence = row.event_sequence
             continue
         if row.event_type == CONTEXT_COMPACTION_FAILED:
@@ -587,17 +631,22 @@ def _project_state(
                 )
             if row_operation_id != operation_id:
                 raise HostDurableError("proactive failed operation mismatch")
-            if terminal_count > 0:
-                raise HostDurableError("multiple proactive compaction terminals")
+            if (
+                not isinstance(terminal_state, CompactionTerminalClosed)
+                or terminal_state.disposition
+                is not CompactionOperationTerminalDisposition.FAILED
+                or terminal_state.first_terminal_event_sequence
+                != row.event_sequence
+            ):
+                raise HostDurableError(
+                    "proactive failed terminal disagrees with terminal owner"
+                )
             _validate_failed_attempt_count(
                 payload,
                 prepared_attempts=prepared_attempts,
                 rejected_attempts=rejected_attempts,
             )
-            terminal_count += 1
             failed_sequence = row.event_sequence
-    if terminal_count > 1:
-        raise HostDurableError("multiple proactive compaction terminals")
     if operation_id is None:
         return _absent_state()
     if (

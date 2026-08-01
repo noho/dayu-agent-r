@@ -189,6 +189,12 @@ from dayu.host.compaction_operation import (
     run_compaction_attempt,
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
+from dayu.host.compaction_terminal import (
+    COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
+    CompactionOperationTerminalDisposition,
+    CompactionTerminalClosed,
+    begin_compaction_terminal_commit_in_transaction,
+)
 from dayu.host.context_budget import (
     BudgetEstimate,
     BudgetEstimateInput,
@@ -456,6 +462,18 @@ class OwnedSessionReconciliationResult:
     leased_session_count: int
     dispatched_session_count: int
     skipped_session_count: int
+
+
+@dataclass(slots=True)
+class _PreStartGovernanceFlight:
+    """同一 Session 的 scheduler-local pre-start sole flight。
+
+    :param task: 执行 coalesced durable governance passes 的唯一 task。
+    :param rerun_requested: flight 运行期间是否收到新的 level-bit signal。
+    """
+
+    task: asyncio.Task[bool]
+    rerun_requested: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1353,6 +1371,8 @@ class HostDispatchScheduler:
         self._health_gate = health_gate
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._pre_start_flights: dict[str, _PreStartGovernanceFlight] = {}
+        self._promotion_pending_session_ids: set[str] = set()
         self._active_cancel_watchdog_event = asyncio.Event()
         self._active_cancel_watchdog_session_ids: set[str] = set()
         self._closed = False
@@ -1366,7 +1386,7 @@ class HostDispatchScheduler:
         self._owned_session_reconciliation_task: asyncio.Task[None] | None = None
         self._active_worker_cancel_reconciliation_task: asyncio.Task[None] | None = None
         self._active_cancel_watchdog_task: asyncio.Task[None] | None = None
-        self._active_tasks: set[asyncio.Task[None]] = set()
+        self._active_tasks: set[asyncio.Task[None] | asyncio.Task[bool]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
 
     def _bind_terminal_post_commit_port(
@@ -1554,6 +1574,13 @@ class HostDispatchScheduler:
             )
             return
         eligibility.release()
+        flight = self._pre_start_flights.get(session_id)
+        if flight is not None:
+            flight.rerun_requested = True
+            return
+        if session_id in self._promotion_pending_session_ids:
+            return
+        self._promotion_pending_session_ids.add(session_id)
         self._promotion_queue.put_nowait(session_id)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1726,22 +1753,96 @@ class HostDispatchScheduler:
         :param session_id: 目标 Session id。
         :returns: ``None``。
         :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises Exception: sole flight durable governance 失败时透传。
         """
 
         if self._closed:
             raise RuntimeError("HostDispatchScheduler is closed")
-        work_lease = self._session_new_work_access.try_acquire_new_work_lease(
+        await self._signal_pre_start_governance(session_id)
+
+    async def _signal_pre_start_governance(self, session_id: str) -> bool:
+        """把一个合格 signal 合并到目标 Session 的 sole flight 并等待结果。
+
+        signal 资格只来自当前 active READ_WRITE attachment；短暂取得的 lease
+        仅用于确认当前 signal 资格，实际 durable pass 会取得自己的 fresh lease。
+
+        :param session_id: 目标 Session id。
+        :returns: 本次共享 flight 任一 pass 创建 stable dispatch 时返回 ``True``。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises Exception: sole flight governance 失败时向所有 awaiter 透传。
+        """
+
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
+        eligibility = self._session_new_work_access.try_acquire_new_work_lease(
             session_id
         )
-        if work_lease is None:
-            return
+        if eligibility is None:
+            return False
+        eligibility.release()
+        flight = self._pre_start_flights.get(session_id)
+        if flight is not None:
+            flight.rerun_requested = True
+            return await asyncio.shield(flight.task)
+        task = asyncio.create_task(
+            self._run_pre_start_governance_flight(session_id)
+        )
+        flight = _PreStartGovernanceFlight(
+            task=task,
+            rerun_requested=False,
+        )
+        self._pre_start_flights[session_id] = flight
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
+        return await asyncio.shield(task)
+
+    async def _run_pre_start_governance_flight(self, session_id: str) -> bool:
+        """串行执行一个 Session 的全部 coalesced governance passes。
+
+        每个 pass 前清除 level bit，并在该 pass 内取得 fresh work lease。pass
+        返回后若 bit 再次置位，则从新的 durable truth 执行恰好一个后续 pass；
+        检查 bit 与删除 flight entry 之间没有 ``await``。
+
+        :param session_id: 目标 Session id。
+        :returns: 任一 pass 创建 stable pending dispatch 时返回 ``True``。
+        :raises RuntimeError: flight identity 丢失或 scheduler 已关闭时抛出。
+        :raises Exception: governance 或 durable mutation 失败时透传。
+        """
+
+        flight = self._pre_start_flights.get(session_id)
+        if flight is None:
+            raise RuntimeError("pre-start governance flight identity is missing")
+        dispatched = False
         try:
-            await self._run_queue_promotion_with_lease(
-                session_id,
-                work_lease=work_lease,
-            )
+            while True:
+                if self._closed:
+                    raise RuntimeError("HostDispatchScheduler is closed")
+                flight.rerun_requested = False
+                work_lease = (
+                    self._session_new_work_access.try_acquire_new_work_lease(
+                        session_id
+                    )
+                )
+                if work_lease is None:
+                    return dispatched
+                try:
+                    pass_dispatched = await self._run_queue_promotion_with_lease(
+                        session_id,
+                        work_lease=work_lease,
+                    )
+                finally:
+                    work_lease.release()
+                dispatched = dispatched or pass_dispatched
+                current = self._pre_start_flights.get(session_id)
+                if current is not flight:
+                    raise RuntimeError("pre-start governance flight identity changed")
+                if flight.rerun_requested:
+                    continue
+                del self._pre_start_flights[session_id]
+                return dispatched
         finally:
-            work_lease.release()
+            if self._pre_start_flights.get(session_id) is flight:
+                del self._pre_start_flights[session_id]
 
     async def _run_queue_promotion_with_lease(
         self,
@@ -2100,6 +2201,35 @@ class HostDispatchScheduler:
                             ),
                         ),
                     )
+                terminal_commit = begin_compaction_terminal_commit_in_transaction(
+                    transaction,
+                    self._event_log_store,
+                    operation_id=operation_id,
+                    expected_trigger_source=(
+                        ContextCompactionTriggerSource.PROACTIVE
+                    ),
+                )
+                if isinstance(terminal_commit, CompactionTerminalClosed):
+                    if (
+                        terminal_commit.disposition
+                        is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
+                    ):
+                        raise HostDurableError(
+                            COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR
+                        )
+                    _LOGGER.warning(
+                        "dispatch.compact.terminal_closed_noop operation_id=%s "
+                        "disposition=%s first_terminal_sequence=%s "
+                        "first_terminal_type=%s",
+                        operation_id,
+                        terminal_commit.disposition.value,
+                        terminal_commit.first_terminal_event_sequence,
+                        terminal_commit.first_terminal_event_type,
+                    )
+                    return _GovernanceStageResult(
+                        pending_dispatch=None,
+                        compact_accepted=None,
+                    )
                 if (
                     projection.state.compacted_event_sequence is not None
                     or projection.state.failed_event_sequence is not None
@@ -2289,6 +2419,33 @@ class HostDispatchScheduler:
         )
 
         def _operation(transaction: HostTransaction) -> _ProactiveCompactionExecutionResult:
+            terminal_commit = begin_compaction_terminal_commit_in_transaction(
+                transaction,
+                self._event_log_store,
+                operation_id=pending.operation_id,
+                expected_trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+            )
+            if isinstance(terminal_commit, CompactionTerminalClosed):
+                if (
+                    terminal_commit.disposition
+                    is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
+                ):
+                    raise HostDurableError(
+                        COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR
+                    )
+                _LOGGER.warning(
+                    "dispatch.compact.late_terminal_noop operation_id=%s "
+                    "disposition=%s first_terminal_sequence=%s "
+                    "first_terminal_type=%s",
+                    pending.operation_id,
+                    terminal_commit.disposition.value,
+                    terminal_commit.first_terminal_event_sequence,
+                    terminal_commit.first_terminal_event_type,
+                )
+                return _ProactiveCompactionExecutionResult(
+                    compacted_event_sequence=None,
+                    pending_dispatch=None,
+                )
             run = read_run_by_id(transaction, pending.run_id)
             if (
                 run is None
@@ -3033,6 +3190,35 @@ class HostDispatchScheduler:
                         )
                     )
                 )
+                terminal_commit = begin_compaction_terminal_commit_in_transaction(
+                    transaction,
+                    self._event_log_store,
+                    operation_id=operation_id,
+                    expected_trigger_source=(
+                        ContextCompactionTriggerSource.PROACTIVE
+                    ),
+                )
+                if isinstance(terminal_commit, CompactionTerminalClosed):
+                    if (
+                        terminal_commit.disposition
+                        is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
+                    ):
+                        raise HostDurableError(
+                            COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR
+                        )
+                    _LOGGER.warning(
+                        "dispatch.compact.resume_terminal_closed_noop "
+                        "operation_id=%s disposition=%s "
+                        "first_terminal_sequence=%s first_terminal_type=%s",
+                        operation_id,
+                        terminal_commit.disposition.value,
+                        terminal_commit.first_terminal_event_sequence,
+                        terminal_commit.first_terminal_event_type,
+                    )
+                    return _GovernanceStageResult(
+                        pending_dispatch=None,
+                        compact_accepted=None,
+                    )
                 fallback_outcome = (
                     self._append_compaction_failed_with_proactive_fallback(
                         transaction,
@@ -3077,6 +3263,33 @@ class HostDispatchScheduler:
                 compactor is not None,
                 artifact_root is not None,
             )
+            terminal_commit = begin_compaction_terminal_commit_in_transaction(
+                transaction,
+                self._event_log_store,
+                operation_id=operation_id,
+                expected_trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+            )
+            if isinstance(terminal_commit, CompactionTerminalClosed):
+                if (
+                    terminal_commit.disposition
+                    is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
+                ):
+                    raise HostDurableError(
+                        COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR
+                    )
+                _LOGGER.warning(
+                    "dispatch.compact.missing_compactor_terminal_closed_noop "
+                    "operation_id=%s disposition=%s "
+                    "first_terminal_sequence=%s first_terminal_type=%s",
+                    operation_id,
+                    terminal_commit.disposition.value,
+                    terminal_commit.first_terminal_event_sequence,
+                    terminal_commit.first_terminal_event_type,
+                )
+                return _GovernanceStageResult(
+                    pending_dispatch=None,
+                    compact_accepted=None,
+                )
             fallback_outcome = self._append_compaction_failed_with_proactive_fallback(
                 transaction,
                 run=run,
@@ -3786,13 +3999,8 @@ class HostDispatchScheduler:
                 skipped += 1
                 continue
             leased += 1
-            try:
-                did_dispatch = await self._run_queue_promotion_with_lease(
-                    session_id,
-                    work_lease=work_lease,
-                )
-            finally:
-                work_lease.release()
+            work_lease.release()
+            did_dispatch = await self._signal_pre_start_governance(session_id)
             if did_dispatch:
                 dispatched += 1
             else:
@@ -4238,8 +4446,9 @@ class HostDispatchScheduler:
         try:
             while not self._closed:
                 session_id = await self._promotion_queue.get()
+                self._promotion_pending_session_ids.discard(session_id)
                 try:
-                    await self.run_queue_promotion(session_id)
+                    await self._signal_pre_start_governance(session_id)
                 except RuntimeError as exc:
                     if self._closed:
                         _LOGGER.debug(
@@ -4351,9 +4560,28 @@ class HostDispatchScheduler:
         loop = asyncio.get_running_loop()
         loop.call_later(
             self._local_execution.dispatch_poll_interval_seconds,
-            self._promotion_queue.put_nowait,
+            self._enqueue_requeued_promotion,
             session_id,
         )
+
+    def _enqueue_requeued_promotion(self, session_id: str) -> None:
+        """在 transient backoff 后按同一 level-bit 规则重新投递 signal。
+
+        :param session_id: 需要重新检查 durable truth 的 Session id。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self._closed:
+            return
+        flight = self._pre_start_flights.get(session_id)
+        if flight is not None:
+            flight.rerun_requested = True
+            return
+        if session_id in self._promotion_pending_session_ids:
+            return
+        self._promotion_pending_session_ids.add(session_id)
+        self._promotion_queue.put_nowait(session_id)
 
     async def _dispatch_one(self, record: PendingDispatchRecord) -> str:
         """处理一个 dispatch wakeup。
@@ -6321,11 +6549,14 @@ def _diagnostic_offending_text_length(
     return None if offending is None else offending.text_length
 
 
-async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:
+async def _suppress_task_cancel(
+    task: asyncio.Task[None] | asyncio.Task[bool],
+) -> None:
     """等待 task 结束并吞掉取消异常。
 
     :param task: 待等待 task。
     :returns: ``None``。
+    :raises Exception: task 的非取消异常原样透传。
     """
 
     try:

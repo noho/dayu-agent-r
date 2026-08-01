@@ -123,6 +123,12 @@ from dayu.host.compaction_operation import (
     run_compaction_operation,
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
+from dayu.host.compaction_terminal import (
+    COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
+    CompactionOperationTerminalDisposition,
+    CompactionTerminalClosed,
+    begin_compaction_terminal_commit_in_transaction,
+)
 from dayu.host.context_budget import (
     CONTEXT_ESTIMATOR_CONTRACT,
     BudgetEstimate,
@@ -2879,6 +2885,9 @@ class EngineEventIngestor:
 
         :param pending: 已写 request/closeout fact 的 reactive compact。
         :returns: ingest result 或 accepted recovery 摘要。
+        :raises HostDurableError: terminal owner 或 durable outcome commit
+            fail closed 时抛出。
+        :raises Exception: compactor operation 失败时透传。
         """
 
         memory_policy = pending.memory_projection_policy
@@ -2929,6 +2938,30 @@ class EngineEventIngestor:
         def _operation(
             transaction: HostTransaction,
         ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
+            terminal_commit = begin_compaction_terminal_commit_in_transaction(
+                transaction,
+                self._event_log_store,
+                operation_id=pending.operation_id,
+                expected_trigger_source=ContextCompactionTriggerSource.REACTIVE,
+            )
+            if isinstance(terminal_commit, CompactionTerminalClosed):
+                if (
+                    terminal_commit.disposition
+                    is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
+                ):
+                    raise HostDurableError(
+                        COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR
+                    )
+                _LOGGER.warning(
+                    "engine_ingest.reactive_compact.late_terminal_noop "
+                    "operation_id=%s disposition=%s "
+                    "first_terminal_sequence=%s first_terminal_type=%s",
+                    pending.operation_id,
+                    terminal_commit.disposition.value,
+                    terminal_commit.first_terminal_event_sequence,
+                    terminal_commit.first_terminal_event_type,
+                )
+                return pending.result_prefix
             latest = self._validate_durable_context(
                 transaction, pending.context.candidate
             )

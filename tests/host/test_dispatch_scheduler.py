@@ -109,6 +109,7 @@ from dayu.host.compact_pipeline import (
     build_fallback_decision_input,
 )
 from dayu.host.compaction_operation import (
+    CompactionOperationResult,
     CompactorProposalManifestReference,
     CompactorProposalRunInput,
     DurableCompactorProposalManifestRecorder,
@@ -132,8 +133,12 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_REQUESTED,
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
+    build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
     parse_context_budget_evaluated_payload,
+)
+from dayu.host.compaction_terminal import (
+    COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -150,6 +155,7 @@ from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
 )
+from dayu.host.session_attachment import SessionWorkLease
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
     DuplicateGovernancePolicy,
@@ -733,6 +739,7 @@ class _TransactionReadableCompactor(_PreparedManifestProactiveCompactor):
 
         :param transaction_runner: Host transaction runner。
         :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
         """
 
         super().__init__()
@@ -800,6 +807,82 @@ class _StaleMutatingCompactor(FakeContextCompactor):
         return await self._fake.compact(request, cancellation_token)
 
 
+class _TerminalWinningProactiveCompactor(FakeContextCompactor):
+    """在 proactive provider await 内先提交同 operation failed terminal。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 first-terminal winner compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._transaction_runner = transaction_runner
+
+    async def compact(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """先提交 failed first truth，再返回 late accepted candidate。
+
+        :param request: proactive compaction request。
+        :param cancellation_token: Host cancellation token。
+        :returns: late accepted fake candidate。
+        :raises AssertionError: request canonical fact 不存在时抛出。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            """在独立 write transaction 内提交 first terminal truth。
+
+            :param transaction: 当前 Host write transaction。
+            :returns: ``None``。
+            :raises AssertionError: request canonical fact 不存在时抛出。
+            """
+
+            requested = EventLogStore().read_latest_run_event_by_type(
+                transaction,
+                run_id=request.run_id,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+            )
+            assert requested is not None
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-proactive-first-terminal-failed",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=request.session_id,
+                    run_id=request.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type=CONTEXT_COMPACTION_FAILED,
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=build_context_compaction_failed_payload(
+                        operation_id=requested.event_id,
+                        failure_reason="concurrent_governance_winner",
+                        policy_decision="fail_closed",
+                        retryable=False,
+                        attempt_count=0,
+                        retry_repair_budget_exhausted=False,
+                        diagnostic_refs=("diagnostic:first-winner",),
+                        budget_after_attempted_compact=None,
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+
+        self._transaction_runner.run_write(_operation)
+        return await super().compact(request, cancellation_token)
+
+
 class _RaisingCompactor(_PreparedManifestProactiveCompactor):
     """测试用 prepared proposal run 始终失败 compactor。"""
 
@@ -861,6 +944,7 @@ class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
         super().__init__()
         self.provider_entered = asyncio.Event()
         self.provider_release = asyncio.Event()
+        self.provider_calls = 0
 
     async def run_prepared_compactor_proposal(
         self,
@@ -873,6 +957,7 @@ class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
         :raises asyncio.CancelledError: caller 模拟 crash 时透传。
         """
 
+        self.provider_calls += 1
         self.provider_entered.set()
         await self.provider_release.wait()
         return await super().run_prepared_compactor_proposal(prepared_input)
@@ -5741,7 +5826,7 @@ async def test_second_proactive_compact_uses_previous_view_without_old_raw_repla
             await scheduler.run_queue_promotion(first.session_id)
             assert len(compactor.prepared_requests) == 1
             assert compactor.prepared_requests[0].material_pack.trace_material != ()
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_final_request_count(factory, 1)
             await _wait_for_run_status(
                 store.transaction_runner,
                 first.run_id,
@@ -5862,7 +5947,7 @@ async def test_wake_queue_promotion_logs_promotion_task_exception(
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
 
-        async def _raising_promotion(session_id: str) -> None:
+        async def _raising_promotion(session_id: str) -> bool:
             """模拟 promotion 内部异常。
 
             :param session_id: promotion session id。
@@ -5873,7 +5958,11 @@ async def test_wake_queue_promotion_logs_promotion_task_exception(
             del session_id
             raise RuntimeError("promotion failed")
 
-        monkeypatch.setattr(scheduler, "run_queue_promotion", _raising_promotion)
+        monkeypatch.setattr(
+            scheduler,
+            "_signal_pre_start_governance",
+            _raising_promotion,
+        )
         try:
             with caplog.at_level(logging.WARNING):
                 scheduler.wake_queue_promotion("session-promotion-error")
@@ -5898,18 +5987,23 @@ async def test_wake_queue_promotion_requeues_after_transient_exception(
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
+    :raises AssertionError: retry 次数不是精确两次时抛出。
     """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+        reconciliation_task = scheduler._owned_session_reconciliation_task
+        assert reconciliation_task is not None
+        reconciliation_task.cancel()
+        await host_dispatch._suppress_task_cancel(reconciliation_task)
         attempts = 0
         recovered = asyncio.Event()
 
-        async def _flaky_promotion(session_id: str) -> None:
+        async def _flaky_promotion(session_id: str) -> bool:
             """第一次失败，第二次记录恢复。
 
             :param session_id: promotion session id。
-            :returns: ``None``。
+            :returns: 第二次及后续调用返回未 dispatch。
             :raises RuntimeError: 第一次调用时模拟 transient failure。
             """
 
@@ -5919,8 +6013,13 @@ async def test_wake_queue_promotion_requeues_after_transient_exception(
             if attempts == 1:
                 raise RuntimeError("promotion transient")
             recovered.set()
+            return False
 
-        monkeypatch.setattr(scheduler, "run_queue_promotion", _flaky_promotion)
+        monkeypatch.setattr(
+            scheduler,
+            "_signal_pre_start_governance",
+            _flaky_promotion,
+        )
         try:
             scheduler.wake_queue_promotion("session-promotion-retry")
             await asyncio.wait_for(recovered.wait(), timeout=1)
@@ -5928,6 +6027,341 @@ async def test_wake_queue_promotion_requeues_after_transient_exception(
             assert attempts == 2
         finally:
             await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_flight_coalesces_wake_periodic_and_direct_signals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 Session 多 signal 只形成 sole flight 与一个 fresh no-op pass。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: signal 未合并、pass 未 fresh 重读或 flight 泄漏时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            dispatch_poll_interval_seconds=60.0,
+        )
+        first_pass_entered = asyncio.Event()
+        release_first_pass = asyncio.Event()
+        pass_count = 0
+
+        async def _barrier_pass(
+            session_id: str,
+            *,
+            work_lease: SessionWorkLease,
+        ) -> bool:
+            """阻塞首个 pass，并让 coalesced pass 执行 fresh no-op。
+
+            :param session_id: 当前 Session id。
+            :param work_lease: 当前 pass 独占生命周期的 fresh lease。
+            :returns: 始终返回未创建 dispatch。
+            :raises AssertionError: Session 或 lease 类型漂移时抛出。
+            """
+
+            nonlocal pass_count
+            assert session_id == "session-flight-coalesced"
+            assert isinstance(work_lease, SessionWorkLease)
+            pass_count += 1
+            if pass_count == 1:
+                first_pass_entered.set()
+                await release_first_pass.wait()
+            return False
+
+        monkeypatch.setattr(
+            scheduler,
+            "_run_queue_promotion_with_lease",
+            _barrier_pass,
+        )
+        first_signal = asyncio.create_task(
+            scheduler.run_queue_promotion("session-flight-coalesced")
+        )
+        try:
+            await asyncio.wait_for(first_pass_entered.wait(), timeout=1)
+            scheduler.wake_queue_promotion("session-flight-coalesced")
+            scheduler.wake_queue_promotion("session-flight-coalesced")
+            periodic_signal = asyncio.create_task(
+                scheduler.reconcile_owned_sessions_once(fixed_now=_NOW)
+            )
+            direct_signal = asyncio.create_task(
+                scheduler.run_queue_promotion("session-flight-coalesced")
+            )
+            await asyncio.sleep(0)
+
+            assert len(scheduler._pre_start_flights) == 1
+            assert scheduler._pre_start_flights[
+                "session-flight-coalesced"
+            ].rerun_requested is True
+
+            release_first_pass.set()
+            await asyncio.gather(first_signal, periodic_signal, direct_signal)
+
+            assert pass_count == 2
+            assert scheduler._pre_start_flights == {}
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_live_compactor_flight_coalesces_wake_and_periodic_without_recovery(
+    tmp_path: Path,
+) -> None:
+    """实际 compactor await 期间的多 signal 只要求 fresh no-op pass。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: live provider 被误恢复、attempt 重复或 flight 泄漏时抛出。
+    """
+
+    blocker = _BlockingAfterManifestCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-live-compactor-coalesced-flight",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(accepted_handle=_CloseCountingHandle()),
+            context_budget_policy=_soft_compact_policy(
+                max_compaction_attempts_per_operation=2,
+            ),
+            context_compactor=blocker,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            dispatch_poll_interval_seconds=60.0,
+        )
+        promotion = asyncio.create_task(
+            scheduler.run_queue_promotion(seeded.session_id)
+        )
+        try:
+            await asyncio.wait_for(blocker.provider_entered.wait(), timeout=2.0)
+            flight = scheduler._pre_start_flights[seeded.session_id]
+            projection_at_barrier = _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            )
+
+            assert len(scheduler._pre_start_flights) == 1
+            assert flight.task.done() is False
+            assert flight.rerun_requested is False
+            assert blocker.provider_calls == 1
+            assert len(blocker.prepared_requests) == 1
+            assert projection_at_barrier.state.prepared_attempt_numbers == (1,)
+            assert (
+                _event_types_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                ).count(CONTEXT_COMPACTION_REQUESTED)
+                == 1
+            )
+            assert _events_for_run_by_type(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTED,
+            ) == ()
+            assert _events_for_run_by_type(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            ) == ()
+
+            periodic_signal = asyncio.create_task(
+                scheduler.reconcile_owned_sessions_once(fixed_now=_NOW)
+            )
+            await asyncio.sleep(0)
+            assert periodic_signal.done() is False
+            assert scheduler._pre_start_flights[seeded.session_id] is flight
+            assert flight.rerun_requested is True
+
+            scheduler.wake_queue_promotion(seeded.session_id)
+            scheduler.wake_queue_promotion(seeded.session_id)
+            assert len(scheduler._pre_start_flights) == 1
+            assert scheduler._pre_start_flights[seeded.session_id] is flight
+            assert blocker.provider_calls == 1
+            assert len(blocker.prepared_requests) == 1
+            assert (
+                _read_proactive_projection(
+                    store.transaction_runner,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                ).state.prepared_attempt_numbers
+                == (1,)
+            )
+
+            blocker.provider_release.set()
+            await asyncio.gather(promotion, periodic_signal)
+
+            completed = _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            )
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            terminal_count = event_types.count(CONTEXT_COMPACTED) + (
+                event_types.count(CONTEXT_COMPACTION_FAILED)
+            )
+            assert scheduler._pre_start_flights == {}
+            assert blocker.provider_calls == 1
+            assert blocker.calls == 1
+            assert len(blocker.prepared_requests) == 1
+            assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == 1
+            assert terminal_count == 1
+            assert event_types.count(CONTEXT_COMPACTED) == 1
+            assert completed.state.phase is ProactiveCompactionPhase.COMPACTED
+            assert completed.state.prepared_attempt_numbers == (1,)
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+        finally:
+            blocker.provider_release.set()
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_flight_exit_boundary_signal_starts_fresh_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """flight 无 await 删除后的 signal 必须启动新的 fresh flight。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: exit-boundary signal 丢失或复用旧 flight 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            dispatch_poll_interval_seconds=60.0,
+        )
+        second_flight_entered = asyncio.Event()
+        pass_count = 0
+
+        async def _exit_boundary_pass(
+            session_id: str,
+            *,
+            work_lease: SessionWorkLease,
+        ) -> bool:
+            """首个 pass 返回前排队 signal，第二个 fresh flight 留下证据。
+
+            :param session_id: 当前 Session id。
+            :param work_lease: 当前 pass 的 fresh lease。
+            :returns: 始终返回未创建 dispatch。
+            :raises AssertionError: Session 或 lease 类型漂移时抛出。
+            """
+
+            nonlocal pass_count
+            assert session_id == "session-flight-exit-boundary"
+            assert isinstance(work_lease, SessionWorkLease)
+            pass_count += 1
+            if pass_count == 1:
+                asyncio.get_running_loop().call_soon(
+                    scheduler.wake_queue_promotion,
+                    session_id,
+                )
+            else:
+                second_flight_entered.set()
+            return False
+
+        monkeypatch.setattr(
+            scheduler,
+            "_run_queue_promotion_with_lease",
+            _exit_boundary_pass,
+        )
+        try:
+            await scheduler.run_queue_promotion("session-flight-exit-boundary")
+            await asyncio.wait_for(second_flight_entered.wait(), timeout=1)
+
+            assert pass_count == 2
+            assert scheduler._pre_start_flights == {}
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_flight_is_parallel_per_session_and_close_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不同 Session 可并行，awaiter 取消不取消 flight，close 统一收口。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: flight 被 caller 取消、跨 Session 串行或 close 泄漏时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            dispatch_poll_interval_seconds=60.0,
+        )
+        entered = {
+            "session-flight-a": asyncio.Event(),
+            "session-flight-b": asyncio.Event(),
+        }
+        blocker = asyncio.Event()
+
+        async def _parallel_pass(
+            session_id: str,
+            *,
+            work_lease: SessionWorkLease,
+        ) -> bool:
+            """记录两个 Session 并行进入并等待 scheduler close。
+
+            :param session_id: 当前 Session id。
+            :param work_lease: 当前 pass 的 fresh lease。
+            :returns: blocker 被释放后返回未创建 dispatch。
+            :raises AssertionError: Session 或 lease 类型漂移时抛出。
+            """
+
+            assert isinstance(work_lease, SessionWorkLease)
+            entered[session_id].set()
+            await blocker.wait()
+            return False
+
+        monkeypatch.setattr(
+            scheduler,
+            "_run_queue_promotion_with_lease",
+            _parallel_pass,
+        )
+        first = asyncio.create_task(
+            scheduler.run_queue_promotion("session-flight-a")
+        )
+        second = asyncio.create_task(
+            scheduler.run_queue_promotion("session-flight-b")
+        )
+        await asyncio.wait_for(entered["session-flight-a"].wait(), timeout=1)
+        await asyncio.wait_for(entered["session-flight-b"].wait(), timeout=1)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert scheduler._pre_start_flights["session-flight-a"].task.done() is False
+        assert scheduler._pre_start_flights["session-flight-b"].task.done() is False
+
+        await scheduler.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        assert scheduler._pre_start_flights == {}
 
 
 @pytest.mark.asyncio
@@ -5942,18 +6376,24 @@ async def test_scheduler_close_cancels_tracked_promotion_task(
         blocker = asyncio.Event()
         promotion_started = asyncio.Event()
 
-        async def _blocked_promotion(session_id: str) -> None:
+        async def _blocked_promotion(session_id: str) -> bool:
             """模拟长期运行的 promotion。
 
             :param session_id: promotion session id。
-            :returns: ``None``。
+            :returns: blocker 被释放后返回未 dispatch。
+            :raises asyncio.CancelledError: scheduler close 取消时透传。
             """
 
             del session_id
             promotion_started.set()
             await blocker.wait()
+            return False
 
-        monkeypatch.setattr(scheduler, "run_queue_promotion", _blocked_promotion)
+        monkeypatch.setattr(
+            scheduler,
+            "_signal_pre_start_governance",
+            _blocked_promotion,
+        )
         scheduler.wake_queue_promotion("session-promotion-close")
         await _wait_for_promotion_task_started(scheduler)
         await promotion_started.wait()
@@ -6213,6 +6653,362 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
                 expected_attempt_count=1,
                 expected_retry_repair_budget_exhausted=False,
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_late_accepted_result_preserves_first_failed_truth(
+    tmp_path: Path,
+) -> None:
+    """I0543 late accepted result 必须零 artifact/event/fallback/start。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: late loser 改写 first truth 或产生副作用时抛出。
+    """
+
+    artifact_root = tmp_path / "compact-artifacts"
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-first-terminal-wins",
+            display_text=_soft_threshold_prompt(),
+        )
+        descriptor_count_before = _payload_descriptor_count(
+            store.transaction_runner
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=_TerminalWinningProactiveCompactor(
+                store.transaction_runner
+            ),
+            compact_artifact_root=artifact_root,
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            ) == 0
+            assert _event_payload(failed)["failure_reason"] == (
+                "concurrent_governance_winner"
+            )
+            assert _event_count(store.transaction_runner, "RUN_STARTED") == 0
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == 0
+            assert factory.created == 0
+            assert _compact_artifact_files(artifact_root) == ()
+            descriptor_count_after = _payload_descriptor_count(
+                store.transaction_runner
+            )
+            assert descriptor_count_after == descriptor_count_before
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize("winner_compacted", (True, False))
+@pytest.mark.asyncio
+async def test_proactive_same_operation_terminal_contenders_preserve_first_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winner_compacted: bool,
+) -> None:
+    """两个 proactive outcome contender 的相反顺序只提交 first truth。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param winner_compacted: 首个获准 outcome 是否为 compacted。
+    :returns: ``None``。
+    :raises AssertionError: late loser 写 artifact/event/fallback/start 时抛出。
+    """
+
+    artifact_root = tmp_path / "compact-artifacts"
+    compactor = _PreparedManifestProactiveCompactor()
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id=(
+                "run-proactive-contender-compacted"
+                if winner_compacted
+                else "run-proactive-contender-failed"
+            ),
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(
+                max_compaction_attempts_per_operation=1,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=artifact_root,
+            dispatch_poll_interval_seconds=60.0,
+        )
+        captured: list[host_dispatch._GovernanceCompactPending] = []
+        original_execute = scheduler._execute_proactive_compaction
+
+        async def _capture_pending(
+            pending: host_dispatch._GovernanceCompactPending,
+        ) -> host_dispatch._ProactiveCompactionExecutionResult:
+            """只捕获 request-owned pending，不提交 outcome。
+
+            :param pending: 已持久化 proactive request 的 pending 摘要。
+            :returns: 不含 durable 后续动作的执行结果。
+            :raises Exception: 不主动抛出异常。
+            """
+
+            captured.append(pending)
+            return host_dispatch._ProactiveCompactionExecutionResult(
+                compacted_event_sequence=None,
+                pending_dispatch=None,
+            )
+
+        monkeypatch.setattr(
+            scheduler,
+            "_execute_proactive_compaction",
+            _capture_pending,
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            assert len(captured) == 1
+            pending = captured[0]
+            monkeypatch.setattr(
+                scheduler,
+                "_execute_proactive_compaction",
+                original_execute,
+            )
+            original_attempt = host_dispatch.run_compaction_attempt
+            entered_count = 0
+            both_entered = asyncio.Event()
+            releases = (asyncio.Event(), asyncio.Event())
+
+            async def _contending_attempt(
+                *,
+                request: CompactionRequest,
+                compactor: ContextCompactor,
+                attempt_number: int,
+                max_attempt_number: int,
+                cancellation_token: CancellationToken,
+                compaction_operation_id: str | None = None,
+                proposal_manifest_recorder: (
+                    DurableCompactorProposalManifestRecorder | None
+                ) = None,
+            ) -> CompactionOperationResult:
+                """在 provider/manifest 完成后 barrier 两个相反 outcome。
+
+                :param request: 当前 frozen attempt request。
+                :param compactor: proactive compactor。
+                :param attempt_number: 当前全局 attempt number。
+                :param max_attempt_number: frozen max attempt number。
+                :param cancellation_token: durable Run cancellation token。
+                :param compaction_operation_id: request 同源 operation id。
+                :param proposal_manifest_recorder: durable manifest recorder。
+                :returns: 当前 contender 的 accepted 或 failed outcome。
+                :raises Exception: 真实 proposal attempt 或 barrier 失败时透传。
+                """
+
+                nonlocal entered_count
+                accepted = await original_attempt(
+                    request=request,
+                    compactor=compactor,
+                    attempt_number=attempt_number,
+                    max_attempt_number=max_attempt_number,
+                    cancellation_token=cancellation_token,
+                    compaction_operation_id=compaction_operation_id,
+                    proposal_manifest_recorder=proposal_manifest_recorder,
+                )
+                contender_index = entered_count
+                entered_count += 1
+                if entered_count == 2:
+                    both_entered.set()
+                await releases[contender_index].wait()
+                contender_compacted = (
+                    winner_compacted
+                    if contender_index == 0
+                    else not winner_compacted
+                )
+                if contender_compacted:
+                    return accepted
+                return CompactionOperationResult(
+                    accepted_candidate=None,
+                    quality_result=None,
+                    rejected_attempts=(),
+                    failure_reason="contending_provider_failure",
+                    budget_after_attempted_compact=None,
+                    accepted_attempt_number=None,
+                )
+
+            monkeypatch.setattr(
+                host_dispatch,
+                "run_compaction_attempt",
+                _contending_attempt,
+            )
+            first = asyncio.create_task(original_execute(pending))
+            late = asyncio.create_task(original_execute(pending))
+            await asyncio.wait_for(both_entered.wait(), timeout=1)
+
+            releases[0].set()
+            winner = await first
+            first_terminal_type = (
+                CONTEXT_COMPACTED
+                if winner_compacted
+                else CONTEXT_COMPACTION_FAILED
+            )
+            first_terminal = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                first_terminal_type,
+            )
+            cursor_after_winner = _event_log_cursor(store.transaction_runner)
+            descriptor_count_after_winner = _payload_descriptor_count(
+                store.transaction_runner
+            )
+            artifacts_after_winner = _compact_artifact_files(artifact_root)
+            run_started_after_winner = _event_count(
+                store.transaction_runner,
+                "RUN_STARTED",
+            )
+            attempt_count_after_winner = _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            if winner_compacted:
+                assert winner.compacted_event_sequence == (
+                    first_terminal.event_sequence
+                )
+                assert winner.pending_dispatch is None
+            else:
+                assert winner.compacted_event_sequence is None
+                assert winner.pending_dispatch is not None
+
+            releases[1].set()
+            loser = await late
+
+            assert loser.compacted_event_sequence is None
+            assert loser.pending_dispatch is None
+            assert _event_log_types_after_cursor(
+                store.transaction_runner,
+                cursor_after_winner,
+            ) == ()
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == (
+                1 if winner_compacted else 0
+            )
+            assert _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_FAILED,
+            ) == (0 if winner_compacted else 1)
+            assert _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            ) == 0
+            assert _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                first_terminal_type,
+            ).event_id == first_terminal.event_id
+            if not winner_compacted:
+                assert _event_payload(first_terminal)["failure_reason"] == (
+                    "contending_provider_failure"
+                )
+            assert _compact_artifact_files(artifact_root) == artifacts_after_winner
+            assert len(artifacts_after_winner) == (
+                1 if winner_compacted else 0
+            )
+            assert _payload_descriptor_count(
+                store.transaction_runner
+            ) == descriptor_count_after_winner
+            assert _event_count(
+                store.transaction_runner,
+                "RUN_STARTED",
+            ) == run_started_after_winner
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == attempt_count_after_winner
+            assert run_started_after_winner == (
+                0 if winner_compacted else 1
+            )
+            assert attempt_count_after_winner == (
+                0 if winner_compacted else 1
+            )
+            assert factory.created == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_invalid_multiple_terminals_fail_closed_without_third_or_start(
+    tmp_path: Path,
+) -> None:
+    """proactive caller 对 INVALID_MULTIPLE 抛稳定错误且不改写 first truth。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: caller 追加第三 terminal、artifact 或 start 时抛出。
+    """
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-invalid-multiple",
+            display_text=_soft_threshold_prompt(),
+        )
+        operation_id = "operation-proactive-invalid-multiple"
+        _append_proactive_compaction_requested(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id=operation_id,
+        )
+        _append_duplicate_proactive_failed_terminals(
+            store.transaction_runner,
+            seeded=seeded,
+            operation_id=operation_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=_PreparedManifestProactiveCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            with pytest.raises(
+                HostDurableError,
+                match=COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
+            ):
+                await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_FAILED,
+            ) == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(store.transaction_runner, "RUN_STARTED") == 0
+            assert _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            ) == 0
+            assert factory.created == 0
+            assert _compact_artifact_files(tmp_path / "compact-artifacts") == ()
         finally:
             await scheduler.close()
 
@@ -7144,7 +7940,11 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
 
             assert compactor.calls == 4
             assert (
@@ -7216,7 +8016,11 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
 
             assert (
                 _event_count(
@@ -7273,7 +8077,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
 ) -> None:
     """proactive compact 缺 compactor 后 fallback 预算通过会创建 Attempt。"""
 
-    factory = _FakeWorkerFactory()
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     compact_artifact_root = tmp_path / "compact-artifacts"
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -7311,10 +8115,16 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
-            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+            assert _run_status(store.transaction_runner, seeded.run_id) is (
+                RunStatus.RUNNING
+            )
             event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
             assert event_types.index(CONTEXT_COMPACTION_FAILED) < event_types.index("RUN_STARTED")
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
@@ -7734,7 +8544,7 @@ async def test_reactive_compact_request_uses_latest_previous_view(
         try:
             await proactive_scheduler.run_queue_promotion(proactive.session_id)
             assert len(proactive_compactor.prepared_requests) == 1
-            assert (await proactive_scheduler.drain_once()).dispatched == 1
+            await _wait_for_final_request_count(final_factory, 1)
             await _wait_for_run_status(
                 store.transaction_runner,
                 proactive.run_id,
@@ -8536,6 +9346,7 @@ async def _open_scheduler(
     host_handle_id: str = "host-test",
     host_instance_identity: HostInstanceIdentity | None = None,
     terminal_port_factory: _RecordingTerminalPortFactory | None = None,
+    dispatch_poll_interval_seconds: float = 0.01,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -8557,6 +9368,7 @@ async def _open_scheduler(
     :param host_instance_identity: 可选 Host instance 身份；用于测试 handle
         与 instance id 不同的 owner 写入路径。
     :param terminal_port_factory: 可选 construction/bind recording factory。
+    :param dispatch_poll_interval_seconds: scheduler 后台 polling interval。
     :returns: scheduler。
     :raises Exception: lane controller 或 durable host instance 注册失败时透传。
     """
@@ -8569,7 +9381,7 @@ async def _open_scheduler(
         lane_claim_ttl_seconds=1.0,
         lane_heartbeat_interval_seconds=0.1,
         worker_startup_timeout_seconds=worker_startup_timeout_seconds,
-        dispatch_poll_interval_seconds=0.01,
+        dispatch_poll_interval_seconds=dispatch_poll_interval_seconds,
         runner_spec=_runner_spec(),
         runner_options=RunnerCallOptions(temperature=None, max_tokens=None, top_p=None, stream=False),
         agent_policy=agent_policy if agent_policy is not None else _agent_policy(False),
@@ -9276,6 +10088,65 @@ def _append_proactive_compaction_requested(
                 payload_digest=None,
             ),
         )
+
+    transaction_runner.run_write(_operation)
+
+
+def _append_duplicate_proactive_failed_terminals(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _AcceptedSeededRun,
+    operation_id: str,
+) -> None:
+    """为同一 proactive operation 注入两个 canonical failed terminal。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: accepted Run 摘要。
+    :param operation_id: 已提交 proactive request id。
+    :returns: ``None``。
+    :raises Exception: EventLog append 失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """在单笔事务中追加两个损坏 terminal facts。
+
+        :param transaction: 当前 Host write transaction。
+        :returns: ``None``。
+        :raises Exception: EventLog append 失败时透传。
+        """
+
+        for ordinal in (1, 2):
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=f"event-invalid-multiple-failed-{ordinal}",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type=CONTEXT_COMPACTION_FAILED,
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=build_context_compaction_failed_payload(
+                        operation_id=operation_id,
+                        failure_reason=f"invalid_multiple_{ordinal}",
+                        policy_decision="fail_closed",
+                        retryable=False,
+                        attempt_count=0,
+                        retry_repair_budget_exhausted=False,
+                        diagnostic_refs=(f"diagnostic:{ordinal}",),
+                        budget_after_attempted_compact=None,
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
 
     transaction_runner.run_write(_operation)
 
@@ -10259,6 +11130,35 @@ def _compact_artifact_files(root: Path) -> tuple[Path, ...]:
     if not root.exists():
         return ()
     return tuple(sorted(path for path in root.rglob("*") if path.is_file()))
+
+
+def _payload_descriptor_count(
+    transaction_runner: HostTransactionRunner,
+) -> int:
+    """统计 durable payload descriptor rows。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: descriptor row 数量。
+    :raises AssertionError: SQLite 未返回整数 count 时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        """在当前 read transaction 内统计 descriptor rows。
+
+        :param transaction: 当前 Host read transaction。
+        :returns: descriptor row 数量。
+        :raises AssertionError: SQLite 未返回整数 count 时抛出。
+        """
+
+        row = transaction.fetchone(
+            f"SELECT COUNT(*) AS total FROM {TABLE_PAYLOAD_DESCRIPTORS}"
+        )
+        assert row is not None
+        total = row.get("total")
+        assert isinstance(total, int)
+        return total
+
+    return transaction_runner.run_read(_operation)
 
 
 def _event_log_types_after_cursor(
