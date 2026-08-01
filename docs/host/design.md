@@ -3931,6 +3931,8 @@ Recovery 的输入只能是 Host durable truth：Run / Attempt indexes、EventLo
 
 fresh attachment 的 access mode 只能在 mutex acquire 完成后确定；`READ_WRITE` attachment 必须在对外 successful return 前完成目标 Session 的全部 recovery pages 与 commit 后 wake。任一 batch、cursor invariant 或 wake bridge 失败时，attach 必须清理局部分配、释放 mutex 并失败，不能返回一个表面可写但 recovery 未完成的 attachment。固定 watermark 之后新接受、且 keyset 高于该 watermark 的 Run 留给下一轮 scan，避免 attach 扫描因并发 admission 无限延长。
 
+fresh `READ_WRITE` attachment 若在旧 owner heartbeat 到达 `stale_after` 前立即 attach，首次 scan 的 `OWNER_STILL_LIVE` / `ORPHAN_INCONCLUSIVE` 不能解除该 attachment 对目标 Session 的 unfinished-recovery obligation。只要该 attachment 仍存活且目标 Run 仍未终结，它必须按旧 owner row 的 heartbeat、policy threshold 与进程身份安排 target-scoped delayed reconcile；到达最早可重新判定时点后读取新的真实 `now` 并重新执行同一 positive-orphan classifier。该 reconcile 仍必须服从固定 watermark、bounded page、CAS、positive proof 与每 Run recovery dispatch 上限，不能轮询 takeover，也不能因 mutex 已取得而提前恢复；但不得让一个在 threshold 前立即重连的用户永久看到旧 Run 停留 `RUNNING`，或要求用户在 threshold 后再次手工重启客户端才能触发恢复。attachment 关闭时取消尚未开始的本地 delayed wake不会写任何治理事实；后续 fresh writer重新承担同一obligation。
+
 Recovery scan semantic path：
 
 ```text
@@ -3966,6 +3968,7 @@ Phase 11 第一版 attachment recovery policy：
 
 - `ACCEPTED`、`QUEUED` 与 `WAITING` 都不是 orphan Attempt，不得因 attachment recovery scan 被推进到 `RECOVERING`。
 - `RUNNING` / `CANCELLING` 的旧 Attempt 只有在 positive orphan proof 成立后才能写入 `ATTEMPT_LOST`；随后如果用户输入、payload descriptor、tool fact reuse policy、memory / compact input refs 等必要 canonical facts足以重建 messages，则 Run 进入 `RECOVERING`，否则进入 `LOST`。目标 Session 的 attach recovery 先执行一次 watchdog tick，再由 scanner defer 剩余 accepted-cancel `CANCELLING` Run，避免正常 detach / reattach 把用户已取消的 Run 标为 `LOST`。
+- 带 durable accepted cancel facts 的 `CANCELLING` Run 只由 accepted-cancel watchdog / terminal closeout 推进到 `CANCELLED`；即使旧 execution owner 随后正常关闭、crash 或被 SIGKILL，也不得创建 recovery Attempt、恢复 provider 请求或重新执行 input。已经 terminal `CANCELLED` 的 Run 不属于 recovery scan 输入，后续任意 fresh attachment 只能按 cursor / Outbox contract 去重观察该终态，不得复活或改写。
 - `RECOVERING` Run 在未被用户取消且未超过 recovery policy 上限时，创建新的 Attempt 与新的 `execution_id`，并以 `RUN_STARTED(start_reason=recovery)` 重新派发；不得恢复旧 Engine / Agent / Runner / provider request。
 - 第一版每个 Run 最多允许一次 automatic recovery dispatch。若再次 attachment recovery scan 发现同一 Run 已消耗该上限，必须以结构化 reason 将 Run 收口为 `LOST`，不得无限创建新 Attempt，也不得伪造 `FAILED` 或 successful final answer。
 - owner heartbeat stale 但 positive orphan proof 不成立时，只能追加或投递 suspect diagnostic，不得写 `ATTEMPT_LOST`、`RUN_RECOVERING`、`RUN_LOST`，也不得取消或接管旧 Attempt。
