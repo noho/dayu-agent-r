@@ -597,6 +597,74 @@ controller 修订 allowed files，不得在未列文件中补 default/fallback�
 `UNAVAILABLE + None`；不得复用相邻 Run/iteration/compactor attempt 的 identity，不得
 增加 optional default、兼容构造签名、全局万能 identity fixture 或下游补值。
 
+S5 另有一个独立的 strict durable builder 调用闭包。§9.4 将
+`CONTEXT_COMPACTED.successful_response_identity` 固定为 required mapping，并将
+`CONTEXT_COMPACTION_ATTEMPT_REJECTED.successful_response_identity` 固定为 required
+field（值按对应 event 语义为 mapping 或 `null`）。S5 必须先由
+`dayu/host/context_events.py` owner 给 `build_context_compacted_payload(...)` 增加
+required typed `successful_response_identity: SuccessfulRunnerResponseIdentity` 参数，并给
+`build_context_compaction_attempt_rejected_payload(...)` 增加 required typed
+`successful_response_identity: SuccessfulRunnerResponseIdentity | None` 参数；两者都不得有
+default、optional call seam 或兼容 overload。owner signature 收紧后，再机械迁移全部
+8 个 consumer files 的 15 个 direct calls。后述 5-file delta 只表示新增 allowed-file
+boundary，不是完整调用迁移范围；原已允许的 3 个文件同样必须迁移。
+
+基于 HEAD `ec9342ed9e5584123618f6b5c5eba8e93e2aed94`，`CB(n)` 表示
+`build_context_compacted_payload(...)` 的 `n` 个 test calls，`RB(n)` 表示
+`build_context_compaction_attempt_rejected_payload(...)` 的 `n` 个 test calls：
+
+| 文件 | HEAD 直接证据 | S5 boundary 状态 |
+|---|---|---|
+| `tests/host/test_context_compact_events.py` | `CB(3) + RB(4)` | 已允许 |
+| `tests/host/test_compaction_operation.py` | `RB(1)` | 已允许 |
+| `tests/host/test_dispatch_scheduler.py` | `CB(1) + RB(1)` | 已允许 |
+| `tests/host/test_memory_projection.py` | `CB(1)` | 本 amendment 新增 |
+| `tests/host/test_compaction_terminal.py` | `CB(1)` | 本 amendment 新增 |
+| `tests/host/test_run_input_builder.py` | `CB(1)` | 本 amendment 新增 |
+| `tests/host/test_compact_material.py` | `CB(1)` | 本 amendment 新增 |
+| `tests/host/test_proactive_compaction_operation.py` | `RB(1)` | 本 amendment 新增 |
+
+该 inventory 精确为 accepted builder `8 calls / 6 files`、rejected builder
+`7 calls / 4 files`、去重 `8 files`；其中 3 个文件此前已在 S5 owner-level / behavior
+test 清单，新增 allowed-file 缺口精确为后 5 个文件。第一 amendment 的 25-file
+identity/typed-return closure 原样保留；按本次新增 allowed-file delta 计，S5 枚举的
+机械闭包总 union 从 25 增至 30 个去重 test/test-support files。
+
+Base HEAD 的 15 个 call 都尚未携带该参数，因为 owner signature 也尚未扩展；不得暗示
+这些测试已经拥有可直接复用的 runtime response identity。这 15 个 direct call sites 的
+durable-builder 迁移只允许补齐新增 required typed 参数或同步 exact payload fixture；5 个
+新增文件只是本次 allowed-file delta，整文件内也仅放行该机械变更，原已允许 3 个文件的
+其它 S5 owner-level 改动仍以本节既有清单为准。contract、projection、material、run-input
+等未执行真实 Engine 的测试，若 helper 没有 run context，每个受影响文件可在自己的 fixture
+owner 内定义 private typed identity factory。test/case caller 必须使用当前 helper/call site
+实际已有的显式、非敏感且足以区分 event 的上下文（例如 case label、`operation_id`、
+attempt/run id 或显式 ordinal），由该 factory 构造 deterministic 且对该 event 唯一的
+`SuccessfulRunnerResponseIdentity`；具体输入维度与参数名以现有 helper/call site 为准，不要求
+为统一形状虚构不存在的维度。caller 再把返回的 identity 作为 required 参数显式传给 payload
+helper。已有 proposal manifest / compactor Engine run context 时，caller 必须显式传入对应
+`compactor_engine_run_id` 给 factory。identity 必须与同一 event 的 sibling
+run/operation/attempt/manifest 语义一致，但 factory / payload helper 不得从 manifest 或其它
+sibling field 反推。它只证明 strict event contract fixture 自洽，不是 provider continuity
+evidence。factory / payload helper 内不得提供 default 或硬编码跨 event 共享 singleton；不得
+新增跨文件万能 helper、复用相邻 event/operation/attempt identity、依赖偶然 fixture 顺序，或
+用 loose dict patch 补字段。
+
+mapping / `null` 按 durable event 自身语义冻结，不按测试是否真的运行 Engine 选择：
+
+- `CONTEXT_COMPACTED` 始终为 mapping；
+- rejected attempt 的 parse/schema/semantic/quality/budget post-success category 为 mapping；
+- 只有 transport/timeout/cancel/Engine failed 且没有 successful final 时才为 `null`；
+- `tests/host/test_proactive_compaction_operation.py::_rejected_payload()` 的 orphan、incomplete、
+  exhausted 三个调用都通过该 helper 生成
+  `failure_category="quality_check_rejected"` event，因此三者的
+  `successful_response_identity` 都必须传 file-local typed mapping，不能因 projection 场景未
+  运行真实 Engine 而改为 `null`。
+
+原场景、状态转移、failure category 和行为断言不得改变。不得增加
+optional/default/compatibility path，不得从 manifest、config、provider family、相邻
+operation/attempt 或字符串反推 identity，不得接受 missing/extra/renamed field 或 loose
+payload。若机械迁移需要超出上述改动，必须停止并退回 controller 修订 plan。
+
 ### 9.2 Engine contract/schema changes
 
 1. 在 `runner_identity.py` 新增：
@@ -659,8 +727,8 @@ controller 修订 allowed files，不得在未列文件中补 default/fallback�
 
 规则：
 
-- `CONTEXT_COMPACTED.successful_response_identity` required；同一event已有 `operation_id`、`accepted_attempt_number`、accepted proposal manifest ref/digest、candidate digest、compact artifact ref/digest、quality与budget，因此一次canonical event完成operation/attempt/manifest/output/response绑定。
-- `CONTEXT_COMPACTION_ATTEMPT_REJECTED.successful_response_identity` 为required field但value可为mapping或null；有成功final后发生parse/quality/budget rejection时必须为mapping，未得到成功final的failure/cancel可为null。rejected event现有 attempt number与manifest ref/digest完成同源绑定。
+- `CONTEXT_COMPACTED.successful_response_identity` required 且始终为 mapping；同一event已有 `operation_id`、`accepted_attempt_number`、accepted proposal manifest ref/digest、candidate digest、compact artifact ref/digest、quality与budget，因此一次canonical event完成operation/attempt/manifest/output/response绑定。
+- `CONTEXT_COMPACTION_ATTEMPT_REJECTED.successful_response_identity` 为required field但value可为mapping或null；成功final后的parse/schema/semantic/quality/budget rejection必须为mapping，只有transport/timeout/cancel/Engine failed且没有successful final时才可为null。rejected event现有 attempt number与manifest ref/digest完成同源绑定。fixture 是否执行真实 Engine 不改变该分类。
 - availability=`unavailable` 时 `provider_request_id` 必须为 null；`present` 时必须非空。`runner_request_identity` 是 exact required object，`attempt_id` / `execution_id` 字段不得省略；compactor payload 中二者均必须为 null。client correlation 始终 required 并由该完整 `RunnerRequestIdentity` canonical 校验。
 - Host builder 在写 event 前校验 `runner_request_identity.run_id == manifest.compactor_identity.compactor_engine_run_id`，同时校验该 manifest 的 `compaction_operation_id` / `compaction_attempt_number` 等于当前 accepted/rejected Host attempt。strict durable parser 从 exact nested object 重建 typed identity，consumer 不得从 Host attempt number 补齐 Engine `attempt_id`、从 manifest 反推 client/provider id 或 loose parse。
 - payload exact-field validation拒绝endpoint、credential、api key/ref、headers、authorization、cookie、secret、完整request/response body等extra字段；fresh schema直接起库，不兼容旧payload。
@@ -691,6 +759,7 @@ RunnerSpec(provider/model only selected as effective call identity)
 - proactive与reactive writers都传required accepted identity；缺失时transaction失败且不写artifact/event。
 - durable payload round-trip 重建 exact nested `runner_request_identity`，显式验证 null attempt/execution 与 Host `compaction_attempt_number` 不是同一字段；missing/extra/loose/renamed field 均拒绝。canary 分别放入 endpoint、credential value/ref、Authorization/header、secret 与 ordinary RunnerSpec，扫描 EventLog payload、artifact metadata、Host public diagnostic 确保不存在。
 - required-contract 机械闭包：HEAD inventory 中 35 个 `FinalAnswerData(...)`、4 个 `EngineRunOutcomeFinalAnswer(...)` 与 7 个 `ContextCompactor` typed-return 文件全部通过 pytest 与 pyright；每个 direct constructor 都显式提供同源 typed identity，candidate-transforming fake 保留 paired identity。不得用 dataclass/default factory、optional field、兼容 helper signature 或 loose test fixture 让遗漏调用点继续通过。
+- strict durable builder 机械闭包：先断言两个 owner signatures 的 required typed 参数无 default，再断言 8 files / 15 calls 全部显式迁移；5-file 仅参与 allowed-file delta 检查。file-local contract fixture identity 必须 deterministic、非敏感且与 sibling run/operation/attempt/manifest 语义一致；accepted 与 post-success rejection 的 mapping 不得因测试未运行真实 Engine 而降为 `null`。
 
 ### 9.7 明确 non-goals
 
@@ -822,6 +891,11 @@ pytest tests/host/test_llm_compaction.py \
   tests/host/test_compact_artifact_store.py \
   tests/host/test_compaction_operation.py \
   tests/host/test_context_compact_events.py \
+  tests/host/test_memory_projection.py \
+  tests/host/test_compaction_terminal.py \
+  tests/host/test_run_input_builder.py \
+  tests/host/test_compact_material.py \
+  tests/host/test_proactive_compaction_operation.py \
   tests/host/test_dispatch_scheduler.py \
   tests/host/test_engine_ingest_mapping.py \
   tests/host/test_compact_pipeline.py \
@@ -862,7 +936,10 @@ pytest tests/cli tests/service/test_entrypoint_runtime.py \
 
 pytest tests/host/test_context_anchor.py tests/host/test_context_budget.py \
   tests/host/test_context_compact_events.py tests/host/test_memory_projection.py \
-  tests/host/test_run_input_builder.py tests/host/test_compaction_operation.py \
+  tests/host/test_compaction_terminal.py tests/host/test_run_input_builder.py \
+  tests/host/test_compact_material.py \
+  tests/host/test_proactive_compaction_operation.py \
+  tests/host/test_compaction_operation.py \
   tests/host/test_dispatch_scheduler.py tests/host/test_recovery_scan.py \
   tests/host/test_recovery_multiprocess.py \
   tests/host/test_public_session_attachment.py \
@@ -870,6 +947,22 @@ pytest tests/host/test_context_anchor.py tests/host/test_context_budget.py \
 
 pytest tests/engine tests/host -q
 ```
+
+上述 S5 focused Host 命令与 full affected Host/Engine 回归都必须实际收集完整 8-file / 15-call
+builder closure；不得把 5-file allowed delta 误当完整迁移范围，也不得只以 full suite 的
+间接通过替代 focused failure 定位。8 个文件的改动只验证 owner required typed argument、
+exact payload fixture 与 frozen mapping/null 分类是否闭合，不改变原测试断言所代表的业务
+场景。无 run context helper 的 caller 必须使用当前 helper/call site 实际已有的显式、非敏感且
+足以区分 event 的上下文（例如 case label、`operation_id`、attempt/run id 或显式 ordinal），
+由所在文件的 private typed factory 构造 deterministic、event-unique identity，再作为 required
+参数显式传给 payload helper；具体输入维度与参数名以现有 helper/call site 为准，不要求虚构
+不存在的维度。已有 manifest / compactor Engine run 时 caller 必须显式传对应 run id 给 factory。
+focused tests
+还必须证明 helper 内无 default、无硬编码共享 singleton、无跨文件万能 helper或从
+manifest/sibling fields 反推，并断言 identity 与 sibling run/operation/attempt/manifest
+一致。`test_proactive_compaction_operation.py` 的 orphan/incomplete/exhausted 三个调用都必须
+产生 `quality_check_rejected` event，且 `successful_response_identity` 全部为 mapping，不接受
+`null`。
 
 Smoke分三层，不能互相冒充：
 
@@ -891,12 +984,21 @@ rg -n --glob '*.py' '\bEngineRunOutcomeFinalAnswer\s*\(' tests
 rg -n --glob '*.py' \
   '\b(ContextCompactor|FakeContextCompactor|prepare_compactor_proposal_run_input|run_prepared_compactor_proposal)\b' \
   tests
+rg -n --glob '*.py' '\bbuild_context_compacted_payload\s*\(' tests/host
+rg -n --glob '*.py' \
+  '\bbuild_context_compaction_attempt_rejected_payload\s*\(' tests/host
 ```
 
-以 §9.1 的 HEAD 基线为 closure 起点；implementation 新增 hit 只能位于 S5 allowed
-files 并接受同样 required typed contract。pyright 必须证明不存在漏传 required field、
+以 §9.1 的两组 HEAD 基线为 closure 起点：第一 amendment 的 identity/typed-return
+inventory 保持 25-file closure；durable builder pre-inventory 必须重现 accepted
+`8 calls / 6 files`、rejected `7 calls / 4 files`、union `8 files` 与表中 exact paths。
+implementation 后重跑同一 inventory；新增 builder hit 只能位于 S5 allowed owner tests，
+任何新文件 hit、遗漏的 8-file / 15-call 迁移或无法按 exact payload contract 迁移的调用点
+都必须停止并退回 controller，不得在范围外修改。5-file delta 只参与 allowed-file scope
+检查。pyright 必须证明不存在漏传 required field、
 旧 `ConversationCompactOutputVNext` return annotation 或 candidate/proposal 混用；不得用
-`type: ignore`、仅为掩盖不匹配的 cast、optional/default 或兼容 overload 消音。
+`type: ignore`、仅为掩盖不匹配的 cast、optional/default、manifest/config 反推、loose
+payload 或兼容 overload 消音。
 
 覆盖率：对所有S1-S5新增/修改生产文件运行branch coverage，使用coverage JSON逐文件检查 `percent_covered >= 80`，不能只看aggregate；未达到则补owner/反例/race tests，不加pragma或排除。`utils/` 无新增脚本，因而不适用其豁免。
 
@@ -1014,7 +1116,12 @@ PTY 环境依赖已按 §12.1 分类为 allowed platform/capability variant：PO
 ### S5
 
 - [ ] Engine final/outcome required success identity。
-- [ ] §9.1 的 25 个 test/test-support 机械闭包完成；`FakeContextCompactor` 显式构造安全 required identity，其它 direct constructor/typed-return 调用点只做同源机械迁移，零 optional default/兼容 signature。
+- [ ] `dayu/host/context_events.py` owner 先给两个 strict builder 增加无 default 的 required typed `successful_response_identity` 参数，再机械迁移全部 8 files / 15 calls；5-file delta 只表示新增 allowed-file boundary。
+- [ ] §9.1 第一 amendment 的 25-file identity/typed-return closure 完整保留；durable builder inventory 重现 8 accepted calls / 6 files、7 rejected calls / 4 files、8-file union，3 个既有 allowed tests 与 5-file delta 全部闭合，S5 枚举机械总 union 为 30 个去重文件。
+- [ ] contract/projection/material/run-input 等未执行真实 Engine 且 helper 无 run context 时，caller 使用当前 helper/call site 实际已有的显式、非敏感且足以区分 event 的上下文（例如 case label、`operation_id`、attempt/run id 或显式 ordinal），由该文件 private typed factory 生成 deterministic、event-unique typed identity，再作为 required 参数显式传给 payload helper；具体输入维度与参数名以现有 helper/call site 为准，不要求虚构不存在的维度；已有 manifest / compactor Engine run 时 caller 显式传对应 run id 给 factory。
+- [ ] file-local identity factory / payload helper 内零 default、零硬编码共享 singleton、零跨文件万能 helper、零 manifest/sibling 反推；identity 与同 event 的 sibling run/operation/attempt/manifest 语义一致，且不冒充 provider continuity evidence。
+- [ ] mapping/null 分类按 event 语义冻结：`CONTEXT_COMPACTED` 恒为 mapping；post-success parse/schema/semantic/quality/budget rejected 为 mapping；仅 transport/timeout/cancel/Engine failed no-final 为 `null`；proactive orphan/incomplete/exhausted 三个调用均生成 `quality_check_rejected` event，三者 `successful_response_identity` 均为 mapping。
+- [ ] `FakeContextCompactor` 显式构造安全 required identity，其它 direct constructor/typed-return 调用点只做同源机械迁移，零 optional default/兼容 signature。
 - [ ] Host accepted/rejected payload 按 operation id + Host attempt number + manifest + exact compactor Engine final identity 同源绑定。
 - [ ] RunnerRequestIdentity attempt/execution、runner_call_index、Host operation/attempt、compactor engine run/client/provider id 区分测试通过。
 - [ ] present/unavailable、final LENGTH fail-closed、failure/repair/multiattempt/ordinary+neighbor A/B/C 串线反例通过。
@@ -1097,7 +1204,25 @@ Commit / push / PR:
 | OQ-02 | `closed-by-MiMo-001` | 已修复 | reactive writer 已纳入同一 F11 guard 和 S4 allowed files/tests |
 | PTY / OQ-03 | `allowed-variant` | 已分类 | §10.5、§12.1-§12.2：POSIX 真实 PTY，非 POSIX 记录 capability/skip，不用 pipe 替代；不阻塞 plan re-review |
 
-Accepted findings 在 plan artifact 层面已全部修复，没有 unclassified residual risk。是否通过 review loop 必须由后续 `re-review` durable artifact 裁决；本次不生成该 artifact，不创建 accepted plan commit。
+第二次 S5/F13 durable-builder amendment review 裁决与 accepted-finding fix：
+
+| Review item | Controller decision | Fix status | Plan 落点/理由 |
+|---|---|---|---|
+| MiMo-001 | `accepted-medium-clarification` | 已修复 | §9.1、§10.5、§13：先由 `context_events.py` owner 增加两个 required typed builder 参数，再迁移完整 8 files / 15 calls；5-file 仅是 allowed-file delta |
+| MiMo-002 | `accepted-concern / rejected-null-conclusion` | 已修复 | §9.1、§9.4、§10.5、§13：按 event semantic 冻结 mapping/null；proactive `quality_check_rejected` 必须 mapping，明确拒绝 reviewer 的三场景 `null` 建议 |
+| DS finding 2 | `accepted-medium-with-owner-correction` | 已修复 | §9.1、§10.5、§13：未运行真实 Engine 时由 file-local fixture owner 构造 deterministic、非敏感、typed identity，并保持 sibling 语义一致；不冒充 provider continuity evidence |
+| DS finding 1 | `rejected-historical-trace` | 不适用 | §16 `planned-new` 是 accepted original plan gate 的历史 validation trace，保持原文，不改写为当前工作树状态 |
+| MiMo re-review finding 001 | `accepted-low` | 已修复 | Proposal §6 已将当前 amendment 冻结的 file-local identity/fixture 风险分类改为 `fixed in current amendment`；plan §9.1/§10.5/§13 是对应规则真源 |
+| MiMo re-review finding 002 | `accepted-low` | 已修复 | §9.1、§10.5、§13 明确 orphan/incomplete/exhausted 三个调用均生成 `quality_check_rejected` event，三者 identity 均为 mapping |
+| AgentDS re-review finding 001 | `accepted-low-with-strategy` | 已修复 | §9.1、§10.5、§13 冻结 caller 的实际显式上下文 → file-local private typed factory → required identity 参数的数据流；已有 run context 显式传对应 run id，禁止 helper default、共享 singleton、跨文件万能 helper与反推 |
+| MiMo final finding 001 | `rejected-duplicate-inventory` | 不适用 | §9.1 已保留第一 amendment 的完整 25-file closure、本 amendment 的 8-file builder inventory 与 5-file delta，§10.5 要求重跑去重 inventory；不复制第三份 30-file 全清单 |
+| MiMo final finding 002 | `rejected-already-covered` | 不适用 | §9.1、§10.5、§13 已冻结 event uniqueness、sibling consistency、required argument 及 default/共享 singleton/反推禁止项；无需新增抽象 |
+| AgentDS final finding 001 | `accepted-low-clarification` | 已修复 | §9.1、§10.5、§13 将写死的 `case_label` / `operation_label` / `attempt_label` 改为 caller 使用当前 helper/call site 实际已有的显式、非敏感、足以区分 event 的上下文；不要求虚构不存在的维度，仍保持 deterministic、event-unique、sibling-consistent，并继续禁止 default、共享 singleton、跨文件万能 helper及 manifest/sibling 反推 |
+
+Controller adjudication §3、§6 与 §7 的 accepted findings 在 plan artifact 层面均已修复，没有
+unclassified residual risk。第二次 amendment 是否通过 review loop 必须由 MiMo 与 AgentDS
+后续 simultaneous independent final dual re-review durable artifacts 裁决；本次不生成
+re-review artifact，不创建 accepted plan amendment commit，也不进入 implementation。
 
 ## 16. Plan gate closeout
 
