@@ -169,12 +169,15 @@ class SessionAttachmentRecoveryAction:
     :param status: scan 时观察到的 Run 状态。
     :param decision: 分类决策。
     :param reason: 结构化原因。
+    :param retry_not_before: 当且仅当可解析 owner heartbeat 仍 recent 时，
+        classifier 同源产生的最早重新分类时点。
     """
 
     run_id: str
     status: RunStatus
     decision: SessionAttachmentRecoveryDecision
     reason: str
+    retry_not_before: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,12 +189,15 @@ class SessionAttachmentRecoveryScanResult:
     :param queue_promotion_sessions: 本次 scan 事务提交后唤醒 queue
         promotion 的 Session id。
     :param terminal_notices: 本次 transaction 提交的 exact terminal notices。
+    :param next_reconcile_at: 全部 action 中最早的有界重新分类建议；
+        无可调度 recent-heartbeat action 时为 ``None``。
     """
 
     actions: tuple[SessionAttachmentRecoveryAction, ...]
     pending_dispatches: tuple[PendingDispatchRecord, ...] = ()
     queue_promotion_sessions: tuple[str, ...] = ()
     terminal_notices: tuple[TerminalPostCommitNotice, ...] = ()
+    next_reconcile_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +284,7 @@ class _SessionAttachmentRecoveryBatchOperation:
                         key=lambda notice: notice.terminal_event_sequence,
                     )
                 ),
+                next_reconcile_at=_earliest_retry_not_before(actions),
             ),
             next_cursor=next_cursor,
             page_size=len(runs),
@@ -380,6 +387,7 @@ class SessionAttachmentRecoveryScanner:
             pending_dispatches=tuple(pending_dispatches),
             queue_promotion_sessions=tuple(queue_promotion_sessions),
             terminal_notices=tuple(terminal_notices),
+            next_reconcile_at=_earliest_retry_not_before(actions),
         )
 
     def _wake_after_committed_batch(self, result: SessionAttachmentRecoveryScanResult) -> None:
@@ -586,6 +594,7 @@ class SessionAttachmentRecoveryScanner:
                 run,
                 SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,
                 classification.reason,
+                retry_not_before=classification.retry_not_before,
             )
         if isinstance(classification, OrphanProofInconclusive):
             return _action(
@@ -1258,13 +1267,18 @@ def _startup_closeout_reason(status: RunStatus, recoverable: bool) -> str:
 
 
 def _action(
-    run: RunRow, decision: SessionAttachmentRecoveryDecision, reason: str
+    run: RunRow,
+    decision: SessionAttachmentRecoveryDecision,
+    reason: str,
+    *,
+    retry_not_before: datetime | None = None,
 ) -> SessionAttachmentRecoveryAction:
     """构造 scan action。
 
     :param run: 目标 Run row。
     :param decision: scan decision。
     :param reason: 结构化原因。
+    :param retry_not_before: 最早重新分类时点；无建议时为 ``None``。
     :returns: scan action。
     """
 
@@ -1273,7 +1287,33 @@ def _action(
         status=run.status,
         decision=decision,
         reason=reason,
+        retry_not_before=retry_not_before,
     )
+
+
+def _earliest_retry_not_before(
+    actions: list[SessionAttachmentRecoveryAction],
+) -> datetime | None:
+    """汇总一组 action 中最早的重新分类时点。
+
+    :param actions: 按 scanner 顺序产生的 actions。
+    :returns: 最早 aware datetime；全部无建议时为 ``None``。
+    :raises ValueError: action 携带的 deadline 缺少 timezone 时抛出。
+    """
+
+    deadlines = tuple(
+        action.retry_not_before
+        for action in actions
+        if action.retry_not_before is not None
+    )
+    if not deadlines:
+        return None
+    if any(
+        deadline.tzinfo is None or deadline.utcoffset() is None
+        for deadline in deadlines
+    ):
+        raise ValueError("recovery retry deadline must be timezone-aware")
+    return min(deadlines)
 
 
 def _action_from_mutation(

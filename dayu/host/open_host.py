@@ -188,6 +188,15 @@ _WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX = "wait-poller"
 _DURABLE_ACTOR_THREAD_NAME_SUFFIX = "durable-actor"
 """public durable actor worker thread 名称后缀。"""
 
+_DELAYED_ATTACHMENT_RECOVERY_TASK_NAME_PREFIX = "attachment-recovery"
+"""attachment delayed recovery task 的稳定名称前缀。"""
+
+_DELAYED_ATTACHMENT_RECOVERY_FATAL_COMPONENT = "attachment_recovery"
+"""delayed attachment recovery 向 execution health 报告的稳定组件名。"""
+
+_DELAYED_ATTACHMENT_RECOVERY_FATAL_REASON = "delayed_reconcile_failed"
+"""delayed attachment recovery 失败的安全低基数 reason。"""
+
 
 class _SessionEventReconciliationWaiter(Protocol):
     """单个 opener 拥有的 mailbox readiness / periodic timeout 等待端口。"""
@@ -687,6 +696,101 @@ class _SessionAttachmentRecoveryActorOperation:
         )
 
 
+def _utc_now() -> datetime:
+    """读取 Host attachment recovery 操作使用的当前 UTC 时间。
+
+    :returns: timezone-aware UTC datetime。
+    :raises Exception: 系统时钟读取错误由标准库透传。
+    """
+
+    return datetime.now(UTC)
+
+
+async def _sleep_until_recovery_deadline(deadline: datetime) -> None:
+    """把 UTC deadline 一次换算为 monotonic delay 并等待。
+
+    换算完成后只调用一次 ``asyncio.sleep``；因此等待期间的墙钟
+    跳变不会导致循环 polling 或重复换算。
+
+    :param deadline: classifier 同源产生的 UTC-aware deadline。
+    :returns: ``None``。
+    :raises ValueError: deadline 缺少 timezone 时抛出。
+    :raises asyncio.CancelledError: attachment 或 Host 在提交 actor 前关闭时抛出。
+    """
+
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise ValueError("recovery deadline must be timezone-aware")
+    delay_seconds = max(0.0, (deadline - _utc_now()).total_seconds())
+    await asyncio.sleep(delay_seconds)
+
+
+class _ManagedHostSessionAttachment(HostSessionAttachment):
+    """opener 拥有 delayed recovery cleanup 语义的 public attachment。
+
+    :param owner: 拥有 target delayed task 与 Host lifecycle 的 public handle。
+    :param attachment: registry 返回的底层 ACTIVE RW attachment。
+    """
+
+    __slots__ = ("_attachment", "_close_task", "_owner")
+
+    def __init__(
+        self,
+        *,
+        owner: "_PublicHostHandle",
+        attachment: HostSessionAttachment,
+    ) -> None:
+        """初始化 managed attachment。
+
+        :param owner: delayed recovery lifecycle owner。
+        :param attachment: 已激活的底层 RW attachment。
+        :returns: ``None``。
+        :raises ValueError: 底层 attachment 不是 READ_WRITE 时抛出。
+        """
+
+        if attachment.access_mode is not HostSessionAccessMode.READ_WRITE:
+            raise ValueError("managed attachment must be read-write")
+        self._owner = owner
+        self._attachment = attachment
+        self._close_task: asyncio.Task[None] | None = None
+
+    @property
+    def session_id(self) -> str:
+        """返回底层 attachment 的稳定 Session id。
+
+        :returns: Session id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._attachment.session_id
+
+    @property
+    def access_mode(self) -> HostSessionAccessMode:
+        """返回已冻结的 READ_WRITE mode。
+
+        :returns: ``HostSessionAccessMode.READ_WRITE``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._attachment.access_mode
+
+    async def aclose(self) -> None:
+        """取消并 join target delayed task 后关闭底层 attachment。
+
+        并发或重复 close 共享同一 cleanup task；当前 caller 取消不会取消
+        真实 cleanup，也不会越过已提交的 actor recovery future。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: 当前 caller 等待被取消时抛出。
+        :raises Exception: 底层 attachment cleanup 失败时透传。
+        """
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._owner._close_managed_attachment(self._attachment)
+            )
+        await asyncio.shield(self._close_task)
+
+
 def _run_callback_on_event_loop(
     loop: asyncio.AbstractEventLoop,
     callback: Callable[[], T],
@@ -990,6 +1094,7 @@ class _PublicHostHandle:
 
     __slots__ = (
         "_close_lock",
+        "_delayed_attachment_recovery_tasks",
         "_durable_actor",
         "_health_gate",
         "_host_handle_id",
@@ -1049,6 +1154,7 @@ class _PublicHostHandle:
         self._transient_delta_hub = transient_delta_hub
         self._wait_poller = wait_poller
         self._close_lock = asyncio.Lock()
+        self._delayed_attachment_recovery_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def attach_session(self, session_id: str) -> HostSessionAttachment:
         """显式 attach 已存在的 Session 并完成 RW target recovery。
@@ -1077,7 +1183,7 @@ class _PublicHostHandle:
             return allocation.activate()
 
         recovery_lease = allocation.acquire_recovery_work_lease()
-        fixed_now = datetime.now(UTC)
+        fixed_now = _utc_now()
         try:
             self._scheduler.tick_active_cancel_watchdog_for_session(
                 session_id,
@@ -1104,7 +1210,7 @@ class _PublicHostHandle:
         recovery_lease.release_when_done(recovery_future)
         health_lease.release_when_done(recovery_future)
         try:
-            await asyncio.shield(recovery_future)
+            recovery_result = await asyncio.shield(recovery_future)
         except asyncio.CancelledError:
             try:
                 await asyncio.shield(recovery_future)
@@ -1116,7 +1222,193 @@ class _PublicHostHandle:
             raise
         recovery_lease.release()
         health_lease.release()
-        return allocation.activate()
+        attachment = allocation.activate()
+        deadline = recovery_result.next_reconcile_at
+        if deadline is None:
+            return attachment
+        try:
+            self._schedule_delayed_attachment_recovery(
+                attachment,
+                deadline,
+            )
+        except BaseException:
+            await asyncio.shield(attachment.aclose())
+            raise
+        return _ManagedHostSessionAttachment(
+            owner=self,
+            attachment=attachment,
+        )
+
+    def _schedule_delayed_attachment_recovery(
+        self,
+        attachment: HostSessionAttachment,
+        deadline: datetime,
+    ) -> None:
+        """为成功激活的 RW attachment 登记至多一个 delayed task。
+
+        :param attachment: 已激活且持有 native mutex 的 RW attachment。
+        :param deadline: initial target scan 返回的 earliest deadline。
+        :returns: ``None``。
+        :raises RuntimeError: 同 Session 已存在 delayed task 时抛出。
+        :raises ValueError: attachment mode 或 deadline timezone 非法时抛出。
+        """
+
+        if attachment.access_mode is not HostSessionAccessMode.READ_WRITE:
+            raise ValueError("delayed recovery requires read-write attachment")
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            raise ValueError("recovery deadline must be timezone-aware")
+        session_id = attachment.session_id
+        if session_id in self._delayed_attachment_recovery_tasks:
+            raise RuntimeError("Session already has a delayed attachment recovery task")
+        task = asyncio.create_task(
+            self._run_delayed_attachment_recovery(
+                session_id=session_id,
+                deadline=deadline,
+            ),
+            name=(f"{_DELAYED_ATTACHMENT_RECOVERY_TASK_NAME_PREFIX}:{session_id}"),
+        )
+        self._delayed_attachment_recovery_tasks[session_id] = task
+
+    async def _run_delayed_attachment_recovery(
+        self,
+        *,
+        session_id: str,
+        deadline: datetime,
+    ) -> None:
+        """等待一次 deadline 后用 fresh now 提交同 target recovery scan。
+
+        task 不循环、不扫描其它 Session。若已提交 actor future，task 取消
+        会先 shield 等待该 future 收口；new-work lease 也绑定同一 future。
+
+        :param session_id: 当前 live RW attachment 的唯一 target Session id。
+        :param deadline: classifier 同源产生的最早重新分类时点。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: attachment 或 Host close 取消本 task 时抛出。
+        """
+
+        work_lease = None
+        actor_future: asyncio.Future[SessionAttachmentRecoveryScanResult] | None = None
+        try:
+            await _sleep_until_recovery_deadline(deadline)
+            work_lease = (
+                self._session_attachment_registry.try_acquire_new_work_lease(
+                    session_id
+                )
+            )
+            if work_lease is None:
+                return
+            actor_future = self._durable_actor.submit(
+                _SessionAttachmentRecoveryActorOperation(
+                    session_id=session_id,
+                    fixed_now=_utc_now(),
+                    wakeup_port=_ThreadsafeSchedulerWakeupPort(
+                        loop=asyncio.get_running_loop(),
+                        scheduler=self._scheduler,
+                    ),
+                    terminal_post_commit_port=(
+                        self._terminal_post_commit_coordinator
+                    ),
+                    recovery_owner_host_instance_id=(
+                        self._scheduler.host_instance_id
+                    ),
+                )
+            )
+            work_lease.release_when_done(actor_future)
+            work_lease = None
+            await asyncio.shield(actor_future)
+        except asyncio.CancelledError:
+            if actor_future is not None:
+                try:
+                    await asyncio.shield(actor_future)
+                except Exception as exc:
+                    await self._report_delayed_attachment_recovery_fatal(exc)
+            raise
+        except Exception as exc:
+            await self._report_delayed_attachment_recovery_fatal(exc)
+        finally:
+            if work_lease is not None:
+                work_lease.release()
+            current_task = asyncio.current_task()
+            if (
+                current_task is not None
+                and self._delayed_attachment_recovery_tasks.get(session_id)
+                is current_task
+            ):
+                del self._delayed_attachment_recovery_tasks[session_id]
+
+    async def _report_delayed_attachment_recovery_fatal(
+        self,
+        error: Exception,
+    ) -> None:
+        """用安全低基数语义报告 delayed recovery 失败。
+
+        :param error: delayed sleep、lease、actor submit/scan 产生的异常。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: 当前 task 被取消时，会先等待
+            fatal transition 收口再抛出。
+        """
+
+        _LOGGER.error(
+            "host.attachment_recovery.delayed_failed error_type=%s",
+            error.__class__.__name__,
+        )
+        fatal_task = asyncio.create_task(
+            self._health_gate.report_fatal(
+                component=_DELAYED_ATTACHMENT_RECOVERY_FATAL_COMPONENT,
+                reason_code=_DELAYED_ATTACHMENT_RECOVERY_FATAL_REASON,
+            )
+        )
+        try:
+            await asyncio.shield(fatal_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(fatal_task)
+            raise
+
+    async def _close_managed_attachment(
+        self,
+        attachment: HostSessionAttachment,
+    ) -> None:
+        """取消并 join target delayed task 后委托 registry attachment close。
+
+        :param attachment: 当前 managed RW attachment 的底层资源。
+        :returns: ``None``。
+        :raises Exception: 底层 attachment close 失败时透传。
+        """
+
+        await self._cancel_and_join_delayed_attachment_recovery(attachment.session_id)
+        await attachment.aclose()
+
+    async def _cancel_and_join_delayed_attachment_recovery(
+        self,
+        session_id: str,
+    ) -> None:
+        """取消并 join 单个 Session 已登记的 delayed task。
+
+        :param session_id: 要关闭的 attachment Session id。
+        :returns: ``None``。
+        :raises Exception: task 意外泄漏的非 cancellation 异常时透传。
+        """
+
+        task = self._delayed_attachment_recovery_tasks.pop(session_id, None)
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            return
+
+    async def _cancel_and_join_all_delayed_attachment_recoveries(self) -> None:
+        """取消并 join Host 持有的全部 delayed attachment tasks。
+
+        :returns: ``None``。
+        :raises Exception: 任一 task 意外泄漏的非 cancellation 异常时透传。
+        """
+
+        session_ids = tuple(self._delayed_attachment_recovery_tasks)
+        for session_id in session_ids:
+            await self._cancel_and_join_delayed_attachment_recovery(session_id)
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
@@ -1553,6 +1845,7 @@ class _PublicHostHandle:
         """
 
         self._session_attachment_registry.begin_host_close()
+        await self._cancel_and_join_all_delayed_attachment_recoveries()
         await self._health_gate.begin_closing()
         _LOGGER.info(
             "host.public_handle.close_start host_handle_id=%s",

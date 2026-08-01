@@ -167,12 +167,15 @@ class OwnerStillLive:
     :param pid: owner durable row 记录的 pid。
     :param reason: 结构化存活原因。
     :param heartbeat_at: durable row 中被分类的 heartbeat timestamp。
+    :param retry_not_before: 只有 heartbeat 仍 recent 时由同源时间与
+        stale threshold 派生的最早重新分类时点。
     """
 
     owner_host_instance_id: str
     pid: int
     reason: str
     heartbeat_at: str
+    retry_not_before: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,12 +269,13 @@ def classify_orphan_candidate(
             heartbeat_at=row.heartbeat_at,
             probe_error_code=None,
         )
-    if policy.now - heartbeat_at <= policy.stale_after:
+    if policy.now - heartbeat_at < policy.stale_after:
         return OwnerStillLive(
             owner_host_instance_id=candidate.owner_host_instance_id,
             pid=row.pid,
             reason=_LIVE_REASON_HEARTBEAT_RECENT,
             heartbeat_at=row.heartbeat_at,
+            retry_not_before=heartbeat_at + policy.stale_after,
         )
     return _classify_stale_owner(candidate.owner_host_instance_id, row, evidence)
 
@@ -348,6 +352,7 @@ def _classify_stale_owner(
             pid=row.pid,
             reason=_LIVE_REASON_PROCESS_IDENTITY_MATCHED,
             heartbeat_at=row.heartbeat_at,
+            retry_not_before=None,
         )
     return OrphanProofInconclusive(
         reason=_INCONCLUSIVE_REASON_PID_LIVE_WITHOUT_IDENTITY,

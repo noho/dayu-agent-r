@@ -151,6 +151,41 @@ def test_recent_heartbeat_owner_is_still_live_without_process_probe() -> None:
     )
     assert isinstance(result, OwnerStillLive)
     assert result.reason == "owner_heartbeat_recent"
+    assert result.retry_not_before == _NOW + timedelta(seconds=25)
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_age_seconds", "expected_type"),
+    (
+        (29, OwnerStillLive),
+        (30, PositiveOrphanProof),
+        (31, PositiveOrphanProof),
+    ),
+)
+def test_stale_threshold_boundary_is_recent_only_before_deadline(
+    heartbeat_age_seconds: int,
+    expected_type: type[OwnerStillLive] | type[PositiveOrphanProof],
+) -> None:
+    """threshold 前为 recent，等于或超过 threshold 即进入 stale。
+
+    :param heartbeat_age_seconds: heartbeat 相对 policy now 的 age。
+    :param expected_type: 预期的 typed classification。
+    :returns: ``None``。
+    :raises AssertionError: stale 边界或 deadline 派生错误时抛出。
+    """
+
+    result = classify_orphan_candidate(
+        _candidate(_row(heartbeat_age_seconds=heartbeat_age_seconds)),
+        _evidence(exists=False),
+        _policy(),
+    )
+
+    assert isinstance(result, expected_type)
+    if isinstance(result, OwnerStillLive):
+        assert result.reason == "owner_heartbeat_recent"
+        assert result.retry_not_before == (_NOW + timedelta(seconds=30 - heartbeat_age_seconds))
+    else:
+        assert result.reason == "owner_pid_missing"
 
 
 def test_stopped_owner_is_positive_orphan_proof_without_process_probe() -> None:
@@ -291,6 +326,7 @@ def test_live_pid_with_matching_identity_is_still_live() -> None:
     )
     assert isinstance(result, OwnerStillLive)
     assert result.reason == "owner_process_identity_matched"
+    assert result.retry_not_before is None
 
 
 def test_pid_reused_start_token_mismatch_is_positive_orphan_proof() -> None:

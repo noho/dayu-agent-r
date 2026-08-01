@@ -47,6 +47,8 @@ from dayu.host.durable.run_transition import (
     CreateQueuedRunInput,
     CreateRunningRunInput,
     StartGovernedRunInput,
+    RunTransitionResult,
+    StartupOrphanCloseInput,
     create_accepted_run_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
@@ -807,8 +809,110 @@ def test_scan_running_owner_heartbeat_recent_does_not_mutate_durable_rows(
         after = _active_run_observation(store.transaction_runner, "run-1")
         assert tuple(action.decision for action in result.actions) == (SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,)
         assert tuple(action.reason for action in result.actions) == (_REASON_OWNER_HEARTBEAT_RECENT,)
+        assert tuple(action.retry_not_before for action in result.actions) == (
+            datetime(2026, 5, 19, 3, 4, 30, tzinfo=UTC),
+        )
+        assert result.next_reconcile_at == datetime(2026, 5, 19, 3, 4, 30, tzinfo=UTC)
         assert after == before
         _assert_no_recovery_or_terminal_facts(store.transaction_runner)
+
+
+def test_scan_aggregates_earliest_recent_heartbeat_deadline_across_pages(
+    tmp_path: Path,
+) -> None:
+    """scanner 跨 bounded pages 聚合最早 recent-heartbeat deadline。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: target、page 或 earliest aggregate 错误时抛出。
+    """
+
+    run_ids = ("run-deadline-later", "run-deadline-earlier")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        for index, run_id in enumerate(run_ids):
+            _seed_running_dispatching_run(
+                store.transaction_runner,
+                run_id,
+                slot_key=f"deadline-{index}",
+            )
+        target_session_id = _run_session_id(
+            store.transaction_runner,
+            run_ids[0],
+        )
+        _remap_runs_to_target_session_without_active_indexes(
+            _options(tmp_path).db_path,
+            run_ids=run_ids,
+            target_session_id=target_session_id,
+        )
+
+        def set_distinct_owner_heartbeats(transaction: HostTransaction) -> None:
+            """为两个 current dispatch 设置不同 recent owner heartbeat。
+
+            :param transaction: Host write transaction。
+            :returns: ``None``。
+            :raises Exception: SQLite 写入失败时透传。
+            """
+
+            owners = (
+                (
+                    "host-deadline-later",
+                    "attempt-run-deadline-later",
+                    "2026-05-19T03:04:00.000000Z",
+                ),
+                (
+                    "host-deadline-earlier",
+                    "attempt-run-deadline-earlier",
+                    "2026-05-19T03:03:50.000000Z",
+                ),
+            )
+            for owner_id, attempt_id, heartbeat_at in owners:
+                transaction.execute(
+                    """
+                    INSERT INTO host_instances (
+                      host_instance_id,
+                      pid,
+                      process_start_token,
+                      boot_id,
+                      created_at,
+                      heartbeat_at,
+                      status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner_id,
+                        999_999,
+                        f"token-{owner_id}",
+                        None,
+                        heartbeat_at,
+                        heartbeat_at,
+                        "running",
+                    ),
+                )
+                transaction.execute(
+                    """
+                    UPDATE host_attempt_dispatch_records
+                    SET owner_host_instance_id = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (owner_id, attempt_id),
+                )
+
+        store.transaction_runner.run_write(set_distinct_owner_heartbeats)
+        result = SessionAttachmentRecoveryScanner(
+            session_id=target_session_id,
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
+            process_probe=_PidMissingProbe(),
+            batch_size=1,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,
+            SessionAttachmentRecoveryDecision.OWNER_STILL_LIVE,
+        )
+        assert result.next_reconcile_at == datetime(2026, 5, 19, 3, 4, 20, tzinfo=UTC)
 
 
 @pytest.mark.parametrize(
@@ -848,7 +952,81 @@ def test_scan_running_inconclusive_owner_proof_does_not_mutate_durable_rows(
         after = _active_run_observation(store.transaction_runner, "run-1")
         assert tuple(action.decision for action in result.actions) == (SessionAttachmentRecoveryDecision.ORPHAN_INCONCLUSIVE,)
         assert tuple(action.reason for action in result.actions) == (expected_reason,)
+        assert result.next_reconcile_at is None
         assert after == before
+        _assert_no_recovery_or_terminal_facts(store.transaction_runner)
+
+
+def test_scan_positive_orphan_cas_loser_has_no_schedule_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deadline 等待期间 CAS loser 不得补写事实或再调度。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: CAS loser 产生 mutation 或 schedule 时抛出。
+    """
+
+    def lose_cas(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        request: StartupOrphanCloseInput,
+    ) -> RunTransitionResult:
+        """模拟 positive proof 后 durable identity 已被其它 owner 改变。
+
+        :param transaction: Host write transaction。
+        :param event_log_store: EventLog owner。
+        :param request: orphan close CAS 输入。
+        :returns: typed ``CAS_LOST`` transition result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del transaction, event_log_store, request
+        return RunTransitionResult(
+            status=StateMutationStatus.CAS_LOST,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+            run_event=None,
+        )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-cas-loser")
+        before = _active_run_observation(
+            store.transaction_runner,
+            "run-cas-loser",
+        )
+        monkeypatch.setattr(
+            host_recovery,
+            "close_startup_orphan_attempt_in_transaction",
+            lose_cas,
+        )
+
+        result = SessionAttachmentRecoveryScanner(
+            session_id=_run_session_id(
+                store.transaction_runner,
+                "run-cas-loser",
+            ),
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            payload_store=PayloadStore(),
+            terminal_post_commit_port=_RecordingTerminalPort(),
+            process_probe=_PidMissingProbe(),
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            SessionAttachmentRecoveryDecision.CAS_LOST,
+        )
+        assert result.next_reconcile_at is None
+        assert (
+            _active_run_observation(
+                store.transaction_runner,
+                "run-cas-loser",
+            )
+            == before
+        )
         _assert_no_recovery_or_terminal_facts(store.transaction_runner)
 
 
