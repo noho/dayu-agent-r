@@ -9,14 +9,10 @@ runtime prepare、submit/watch/cancel 和 startup reconnect 执行组合由
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
 from typing import Final
 
-from dayu.cli.agent_entrypoint import (
-    CliSigintMonitor,
-    optional_stripped_text,
-)
+from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import COMMAND_INTERACTIVE, ParsedCliArgs
 from dayu.cli.composer import InteractiveComposer
 from dayu.cli.exit_codes import (
@@ -30,12 +26,12 @@ from dayu.cli.host_api_errors import (
     format_host_api_error,
 )
 from dayu.cli.host_context import (
+    CLI_AGENT_SESSION_SCOPE,
     CLI_INTERACTIVE_SCENARIO,
-    INTERACTIVE_SESSION_SCOPE,
     CliInvocation,
     build_interactive_host_context,
+    cli_label_slot_key,
     interactive_create_session_client_request_id,
-    interactive_slot_key,
 )
 from dayu.cli.output import render_cli_error
 from dayu.cli.session_execution import (
@@ -48,13 +44,11 @@ from dayu.host.open_host import open_host
 from dayu.runtime.location import RuntimeLocationError
 from dayu.service.entrypoint_runtime import ensure_or_create_entrypoint_session
 from dayu.service.scene_context import (
-    FMP_API_KEY_ENV,
     EntrypointContextSlotRequest,
     build_entrypoint_context_slot_values,
 )
 
 INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
-_TICKER_OPTION: Final[str] = "--ticker"
 _LABEL_OPTION: Final[str] = "--label"
 _INTERACTIVE_OPERATION_CREATE_SESSION: Final[str] = "create_session"
 
@@ -109,16 +103,11 @@ async def _run_interactive_command_async(
     :raises Exception: runtime assembly 或 Host public API 失败时向上抛出。
     """
 
-    ticker = _interactive_ticker(args)
     prepared = await prepare_interactive_session_execution(
         args,
         command_name=COMMAND_INTERACTIVE,
         scenario=CLI_INTERACTIVE_SCENARIO,
-        ticker=ticker,
-        context_slot_values=build_interactive_context_slot_values(
-            ticker=ticker,
-            fmp_api_key=os.environ.get(FMP_API_KEY_ENV),
-        ),
+        context_slot_values=build_interactive_context_slot_values(),
         usage_error_factory=CliInteractiveUsageError,
     )
     async with open_host(prepared.runtime.host_assembly.options) as host:
@@ -158,14 +147,14 @@ async def _ensure_interactive_session(
 
     if args.label is not None:
         try:
-            slot_key = interactive_slot_key(args.label)
+            slot_key = cli_label_slot_key(args.label)
         except ValueError as exc:
             raise CliInteractiveUsageError(f"{_LABEL_OPTION}: {exc}") from exc
         session = await ensure_or_create_entrypoint_session(
             host,
             create_new=False,
             bind_slot=True,
-            scope=INTERACTIVE_SESSION_SCOPE,
+            scope=CLI_AGENT_SESSION_SCOPE,
             slot_key=slot_key,
             metadata=(),
         )
@@ -186,43 +175,19 @@ async def _ensure_interactive_session(
     return session.session_id
 
 
-def _interactive_ticker(args: ParsedCliArgs) -> str | None:
-    """读取并校验 interactive 命令的 ticker 参数。
-
-    :param args: argparse 已解析的 interactive 兼容命令参数。
-    :returns: 裁剪后的 ticker；未提供时为 ``None``。
-    :raises CliInteractiveUsageError: ticker 为空白时抛出。
-    """
-
-    return optional_stripped_text(
-        args.ticker,
-        field_name=_TICKER_OPTION,
-        error_factory=CliInteractiveUsageError,
-    )
-
-
-def build_interactive_context_slot_values(
-    *,
-    ticker: str | None = None,
-    fmp_api_key: str | None = None,
-) -> dict[str, JsonValue]:
+def build_interactive_context_slot_values() -> dict[str, JsonValue]:
     """构造 interactive scene required context slots。
 
-    :param ticker: 用户显式提供的业务主体；未提供时为 ``None``。
-    :param fmp_api_key: 调用方显式读取的 FMP API key；缺失时回退到 ticker-only。
     :returns: 传给 ScenePrepare 的 context slot 值。
-    :raises CliInteractiveUsageError: ticker 形态非法时抛出。
+    :raises ValueError: 固定的默认 context 请求被底层契约拒绝时透传。
     """
 
-    try:
-        return build_entrypoint_context_slot_values(
-            EntrypointContextSlotRequest(
-                ticker=ticker,
-                fmp_api_key=fmp_api_key,
-            )
+    return build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker=None,
+            fmp_api_key=None,
         )
-    except ValueError as exc:
-        raise CliInteractiveUsageError(str(exc)) from exc
+    )
 
 
 def _read_user_input(prompt: str) -> str:

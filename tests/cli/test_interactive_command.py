@@ -866,12 +866,12 @@ class _TwoSigintsBeforeSubmitResponseMonitor(CliSigintMonitor):
         return observed_count
 
 
-def test_interactive_label_reuses_host_slot_and_fills_context_slots(
+def test_interactive_label_targets_shared_agent_slot_and_default_context(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--label`` 应复用 cli.interactive.<label> slot。"""
+    """``--label`` 应指向共享 Agent slot，并使用默认分析主体。"""
 
     fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
     captured_requests: list[EntrypointRuntimeRequest] = []
@@ -908,8 +908,6 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
             "interactive",
             "--base",
             str(tmp_path),
-            "--ticker",
-            " AAPL ",
             "--label",
             "earnings",
             "--model",
@@ -921,17 +919,18 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
+    assert captured_requests[0].explicit_config_dir is None
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert tuple(captured_requests[0].context_slot_values) == (
         _FINS_DEFAULT_SUBJECT_SLOT,
         _CURRENT_TIME_SLOT,
     )
     assert (
-        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 AAPL。"
+        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] == ""
     )
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
-    assert fake_host.ensure_requests[0].scope == "cli.interactive"
-    assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
+    assert fake_host.ensure_requests[0].scope == "cli.agent"
+    assert fake_host.ensure_requests[0].slot_key == "cli.agent.earnings"
     assert fake_host.create_requests == []
 
 
@@ -967,7 +966,6 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         args,
         command_name="session",
         scenario="interactive",
-        ticker=None,
         context_slot_values=interactive_command.build_interactive_context_slot_values(),
         usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
@@ -1037,7 +1035,6 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
         args,
         command_name="session",
         scenario="interactive",
-        ticker=None,
         context_slot_values=interactive_command.build_interactive_context_slot_values(),
         usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
@@ -1160,7 +1157,6 @@ async def test_interactive_startup_reconnect_advances_terminal_cursor_after_rend
         args,
         command_name="session",
         scenario="interactive",
-        ticker=None,
         context_slot_values=interactive_command.build_interactive_context_slot_values(),
         usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
@@ -1248,7 +1244,6 @@ async def test_interactive_startup_cursor_write_failure_propagates_after_termina
         args,
         command_name="session",
         scenario="interactive",
-        ticker=None,
         context_slot_values=interactive_command.build_interactive_context_slot_values(),
         usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
@@ -1496,51 +1491,6 @@ def test_interactive_empty_label_exits_with_usage_error(
 
     assert exit_code == EXIT_USAGE_ERROR
     assert "--label" in captured.err
-
-
-def test_interactive_explicit_config_outside_workspace_exits_with_usage_error(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """显式 config 目录逃逸 workspace 时应返回用法错误。"""
-
-    outside_config = tmp_path.parent / "outside-interactive-config"
-    outside_config.mkdir()
-
-    exit_code = cli_main.main(
-        (
-            "interactive",
-            "--base",
-            str(tmp_path),
-            "--config",
-            str(outside_config),
-        )
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "inside workspace root" in captured.err
-
-
-def test_interactive_explicit_config_missing_exits_with_usage_error(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """显式 config 目录不存在时应返回用法错误。"""
-
-    exit_code = cli_main.main(
-        (
-            "interactive",
-            "--base",
-            str(tmp_path),
-            "--config",
-            "missing-config",
-        )
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "not a directory" in captured.err
 
 
 def test_interactive_two_turns_use_same_session_and_independent_watchers(
@@ -1863,7 +1813,6 @@ async def test_interactive_existing_session_advances_terminal_cursor_after_rende
         args,
         command_name="session",
         scenario="interactive",
-        ticker=None,
         context_slot_values=interactive_command.build_interactive_context_slot_values(),
         usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
@@ -1922,7 +1871,6 @@ async def test_interactive_turn_cursor_write_failure_propagates_after_terminal_r
         args,
         command_name="session",
         scenario="interactive",
-        ticker=None,
         context_slot_values=interactive_command.build_interactive_context_slot_values(),
         usage_error_factory=interactive_command.CliInteractiveUsageError,
     )

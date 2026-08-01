@@ -67,7 +67,6 @@ SESSION_ACTION_LIST: str = "list"
 SESSION_ACTION_RESUME: str = "resume"
 SESSION_ACTION_PURGE: str = "purge"
 TOOL_TRACE_ACTION_ANALYZE: str = "analyze"
-SESSION_LABEL_KIND_CHOICES: tuple[str, ...] = ("prompt", "interactive")
 SESSION_RESUME_MODE_CHOICES: tuple[str, ...] = ("prompt", "interactive")
 
 CLI_COMMAND_NAMES: tuple[str, ...] = (
@@ -204,7 +203,6 @@ class ParsedCliArgs(argparse.Namespace):
     infer: bool
     session_action: str | None
     session_id: str | None
-    kind: str | None
     mode: str | None
     session_prompt: str | None
     yes: bool
@@ -248,8 +246,8 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
         ),
     )
     _register_init_command(subparsers, command_common_parent)
-    _register_prompt_command(subparsers, command_runtime_parent)
-    _register_interactive_command(subparsers, command_runtime_parent)
+    _register_prompt_command(subparsers, command_common_parent)
+    _register_interactive_command(subparsers, command_common_parent)
     _register_download_command(subparsers, command_runtime_parent)
     _register_upload_filing_command(subparsers, command_runtime_parent)
     _register_upload_material_command(subparsers, command_runtime_parent)
@@ -260,7 +258,8 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     _register_session_command(
         subparsers,
         command_parent=command_runtime_parent,
-        action_parent=action_runtime_parent,
+        action_common_parent=action_common_parent,
+        action_runtime_parent=action_runtime_parent,
     )
     _register_tool_trace_command(
         subparsers,
@@ -284,9 +283,35 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> ParsedCliArgs:
     namespace = parser.parse_args(effective_argv, namespace=_new_default_namespace())
     parsed_args = cast(ParsedCliArgs, namespace)
     _finalize_log_level_selection(parsed_args, parser=parser)
-    if parsed_args.command_name == COMMAND_INIT and parsed_args.config_dir is not None:
-        parser.error("init 命令不接受 --config")
+    _reject_disallowed_explicit_config(parsed_args, parser=parser)
     return parsed_args
+
+
+def _reject_disallowed_explicit_config(
+    parsed_args: ParsedCliArgs,
+    *,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """按最终命令路由拒绝不允许的显式配置参数。
+
+    :param parsed_args: argparse 已填充的类型化 namespace。
+    :param parser: 负责输出公共 usage diagnostic 的顶层 parser。
+    :returns: ``None``。
+    :raises SystemExit: init、prompt、interactive 或 session resume 携带
+        ``--config`` 时由 parser 以用法错误 2 退出。
+    """
+
+    if parsed_args.config_dir is None:
+        return
+    if parsed_args.command_name == COMMAND_INIT:
+        parser.error("init 命令不接受 --config")
+    if parsed_args.command_name in (COMMAND_PROMPT, COMMAND_INTERACTIVE):
+        parser.error(f"{parsed_args.command_name} 命令不接受 --config")
+    if (
+        parsed_args.command_name == COMMAND_SESSION
+        and parsed_args.session_action == SESSION_ACTION_RESUME
+    ):
+        parser.error("session resume 命令不接受 --config")
 
 
 def _require_valid_utf8_invocation(
@@ -388,7 +413,6 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.infer = False
     namespace.session_action = None
     namespace.session_id = None
-    namespace.kind = None
     namespace.mode = None
     namespace.session_prompt = None
     namespace.yes = False
@@ -612,7 +636,6 @@ def _register_interactive_command(
         command_name=COMMAND_INTERACTIVE,
         help_text="进入多轮财报分析交互模式。",
     )
-    parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
     _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
@@ -622,13 +645,15 @@ def _register_session_command(
     subparsers: CommandSubparserRegistry,
     *,
     command_parent: argparse.ArgumentParser,
-    action_parent: argparse.ArgumentParser,
+    action_common_parent: argparse.ArgumentParser,
+    action_runtime_parent: argparse.ArgumentParser,
 ) -> None:
     """注册 ``session`` 命令及其二级 action 参数。
 
     :param subparsers: 顶层 subparsers 注册器。
     :param command_parent: command scope 的 runtime 参数父解析器。
-    :param action_parent: action scope 的 runtime 参数父解析器。
+    :param action_common_parent: 不含显式配置参数的 action scope 父解析器。
+    :param action_runtime_parent: 含显式配置参数的 action scope 父解析器。
     :returns: ``None``。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
@@ -647,9 +672,9 @@ def _register_session_command(
             required=True,
         ),
     )
-    _register_session_list_action(action_subparsers, action_parent)
-    _register_session_resume_action(action_subparsers, action_parent)
-    _register_session_purge_action(action_subparsers, action_parent)
+    _register_session_list_action(action_subparsers, action_runtime_parent)
+    _register_session_resume_action(action_subparsers, action_common_parent)
+    _register_session_purge_action(action_subparsers, action_runtime_parent)
 
 
 def _register_tool_trace_command(
@@ -830,11 +855,6 @@ def _add_session_selector_arguments(parser: argparse.ArgumentParser) -> None:
     selector_group = parser.add_mutually_exclusive_group(required=True)
     selector_group.add_argument("--session-id", help="Host Session id。")
     selector_group.add_argument("--label", help="CLI Session label。")
-    parser.add_argument(
-        "--kind",
-        choices=SESSION_LABEL_KIND_CHOICES,
-        help="label 所属 CLI Session 类型。",
-    )
 
 
 def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:

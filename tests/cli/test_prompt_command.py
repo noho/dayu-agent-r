@@ -1313,11 +1313,12 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert "Activity:" in captured.err
     assert "工具批次完成" in captured.err
     assert captured_requests[0].scene_id == "prompt"
+    assert captured_requests[0].explicit_config_dir is None
     assert captured_requests[0].context_slot_values["fins_default_subject"] == "# 当前分析对象\n你正在分析的是 AAPL。"
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
-    assert fake_host.ensure_requests[0].scope == "cli.prompt"
-    assert fake_host.ensure_requests[0].slot_key == "cli.prompt.earnings"
+    assert fake_host.ensure_requests[0].scope == "cli.agent"
+    assert fake_host.ensure_requests[0].slot_key == "cli.agent.earnings"
     assert fake_host.calls[:3] == ["ensure_session", "watch:session-1", "submit:session-1"]
     assert fake_host.attach_session_ids == ["session-1"]
     assert [attachment.close_count for attachment in fake_host.attachments] == [1]
@@ -2329,6 +2330,28 @@ async def test_prompt_terminal_surfaces_display_close_failure_from_caller_lifecy
     assert fake_host.watchers[0].closed_count == 1
 
 
+def test_session_execution_appends_later_cleanup_error_to_existing_cause_chain() -> None:
+    """共享 lifecycle owner 必须保留首错并把后续 cleanup 错误追加到链尾。
+
+    :returns: ``None``。
+    :raises AssertionError: 首错 identity 或既有 cause 顺序被改写时抛出。
+    """
+
+    primary_error = RuntimeError("primary cleanup failed")
+    existing_cause = ValueError("existing cleanup cause")
+    later_error = OSError("later cleanup failed")
+    primary_error.__cause__ = existing_cause
+
+    combined_error = session_execution._combine_lifecycle_cleanup_errors(
+        primary_error,
+        later_error,
+    )
+
+    assert combined_error is primary_error
+    assert primary_error.__cause__ is existing_cause
+    assert existing_cause.__cause__ is later_error
+
+
 @pytest.mark.asyncio
 async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
     tmp_path: Path,
@@ -2727,53 +2750,6 @@ def test_prompt_invalid_ticker_exits_with_usage_error_without_traceback(
     assert "!@#$" in captured.err
     assert "Traceback" not in captured.err
     assert "Traceback" not in captured.out
-
-
-def test_prompt_explicit_config_outside_workspace_exits_with_usage_error(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """显式 config 目录逃逸 workspace 时应返回用法错误。"""
-
-    outside_config = tmp_path.parent / "outside-config"
-    outside_config.mkdir()
-
-    exit_code = cli_main.main(
-        (
-            "prompt",
-            "--base",
-            str(tmp_path),
-            "--config",
-            str(outside_config),
-            "请总结收入变化",
-        )
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "inside workspace root" in captured.err
-
-
-def test_prompt_explicit_config_missing_exits_with_usage_error(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """显式 config 目录不存在时应返回用法错误。"""
-
-    exit_code = cli_main.main(
-        (
-            "prompt",
-            "--base",
-            str(tmp_path),
-            "--config",
-            "missing-config",
-            "请总结收入变化",
-        )
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "not a directory" in captured.err
 
 
 @pytest.mark.asyncio

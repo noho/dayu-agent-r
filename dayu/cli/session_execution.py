@@ -24,7 +24,6 @@ from dayu.cli.agent_entrypoint import (
     cancel_and_await_task,
     optional_stripped_text,
     package_config_root,
-    resolve_explicit_config_dir,
     resolve_workspace_root,
     service_run_overrides_from_args,
 )
@@ -248,11 +247,6 @@ async def prepare_prompt_session_execution(
         args.workspace_root,
         error_factory=usage_error_factory,
     )
-    explicit_config_dir = resolve_explicit_config_dir(
-        config_dir=args.config_dir,
-        workspace_root=workspace_root,
-        error_factory=usage_error_factory,
-    )
     invocation = new_cli_invocation(
         command_name=command_name,
         scenario=scenario,
@@ -262,7 +256,6 @@ async def prepare_prompt_session_execution(
     runtime = await _prepare_session_runtime(
         args=args,
         workspace_root=workspace_root,
-        explicit_config_dir=explicit_config_dir,
         scenario=scenario,
         context_slot_values=context_slot_values,
         usage_error_factory=usage_error_factory,
@@ -284,7 +277,6 @@ async def prepare_interactive_session_execution(
     *,
     command_name: str,
     scenario: str,
-    ticker: str | None,
     context_slot_values: dict[str, JsonValue],
     usage_error_factory: _UsageErrorFactory,
 ) -> PreparedInteractiveSessionExecution:
@@ -293,7 +285,6 @@ async def prepare_interactive_session_execution(
     :param args: argparse 已解析的 interactive 兼容命令参数。
     :param command_name: 当前 CLI command 名称。
     :param scenario: interactive scene id。
-    :param ticker: 调用方已校验的业务主体；未提供时为 ``None``。
     :param context_slot_values: 调用方按 interactive 语义构造好的 context slot。
     :param usage_error_factory: 当前命令用法错误构造器。
     :returns: 已准备的 interactive existing-session 执行输入。
@@ -305,21 +296,15 @@ async def prepare_interactive_session_execution(
         args.workspace_root,
         error_factory=usage_error_factory,
     )
-    explicit_config_dir = resolve_explicit_config_dir(
-        config_dir=args.config_dir,
-        workspace_root=workspace_root,
-        error_factory=usage_error_factory,
-    )
     invocation = new_cli_invocation(
         command_name=command_name,
         scenario=scenario,
         display_user=DEFAULT_DISPLAY_USER,
-        ticker=ticker,
+        ticker=None,
     )
     runtime = await _prepare_session_runtime(
         args=args,
         workspace_root=workspace_root,
-        explicit_config_dir=explicit_config_dir,
         scenario=scenario,
         context_slot_values=context_slot_values,
         usage_error_factory=usage_error_factory,
@@ -492,7 +477,6 @@ async def _prepare_session_runtime(
     *,
     args: ParsedCliArgs,
     workspace_root: Path,
-    explicit_config_dir: Path | None,
     scenario: str,
     context_slot_values: dict[str, JsonValue],
     usage_error_factory: _UsageErrorFactory,
@@ -501,7 +485,6 @@ async def _prepare_session_runtime(
 
     :param args: argparse 已解析的兼容命令参数。
     :param workspace_root: 已解析 workspace 根目录。
-    :param explicit_config_dir: 显式配置目录；未提供时为 ``None``。
     :param scenario: Service scene id。
     :param context_slot_values: 调用方已经构造好的 context slot。
     :param usage_error_factory: 当前命令用法错误构造器。
@@ -514,7 +497,7 @@ async def _prepare_session_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=explicit_config_dir,
+            explicit_config_dir=None,
             scene_id=scenario,
             context_slot_values=context_slot_values,
             assembly_overrides=ServiceAssemblyOverrides(

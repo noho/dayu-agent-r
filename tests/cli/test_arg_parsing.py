@@ -52,7 +52,6 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--max-iterations",
     ),
     "interactive": (
-        "--ticker",
         "--label",
         "--detail",
         "--no-detail",
@@ -380,19 +379,23 @@ def test_command_help_contains_debug_stream(
     assert "SSE" in help_text
 
 
-def test_interactive_help_contains_optional_ticker(
+def test_agent_help_omits_removed_parameters(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """验证 ``interactive --help`` 包含 optional ``--ticker``。
+    """验证 Agent surface help 不暴露已删除参数。
 
     :param capsys: pytest 标准输出捕获夹具。
     :returns: ``None``。
-    :raises AssertionError: help 缺少 ``--ticker`` 时抛出。
+    :raises AssertionError: help 仍暴露已删除参数时抛出。
     """
 
-    help_text = _capture_help(capsys, ("interactive",))
+    prompt_help = _capture_help(capsys, ("prompt",))
+    interactive_help = _capture_help(capsys, ("interactive",))
 
-    assert "--ticker" in help_text
+    assert "--ticker" in prompt_help
+    assert "--config" not in prompt_help
+    assert "--ticker" not in interactive_help
+    assert "--config" not in interactive_help
 
 
 def test_tool_trace_analyze_help_and_required_arguments(
@@ -589,7 +592,6 @@ def test_root_readme_matches_current_cli_public_contract() -> None:
         "不生成 shell",
     ):
         assert removed_batch_contract not in readme
-    assert "interactive --ticker" in readme
 
 
 def test_session_action_help_contains_fixed_parser_shape(
@@ -607,11 +609,12 @@ def test_session_action_help_contains_fixed_parser_shape(
 
     assert "--session-id" in purge_help
     assert "--label" in purge_help
-    assert "--kind" in purge_help
+    assert "--kind" not in purge_help
     assert "--yes" in purge_help
     assert "--session-id" in resume_help
     assert "--label" in resume_help
-    assert "--kind" in resume_help
+    assert "--kind" not in resume_help
+    assert "--config" not in resume_help
     assert "--mode" in resume_help
 
 
@@ -1472,43 +1475,81 @@ def test_parse_args_accepts_global_options_before_and_after_command() -> None:
 @pytest.mark.parametrize(
     ("argv", "expected_config_dir"),
     (
-        (("--config", "config-prompt-before", "prompt", "hello"), "config-prompt-before"),
-        (("prompt", "hello", "--config", "config-prompt-after"), "config-prompt-after"),
-        (("--config", "config-interactive-before", "interactive"), "config-interactive-before"),
-        (("interactive", "--config", "config-interactive-after"), "config-interactive-after"),
         (
             (
                 "--config",
-                "config-session-before",
+                "config-download-before",
+                "download",
+                "--ticker",
+                "AAPL",
+            ),
+            "config-download-before",
+        ),
+        (
+            (
+                "download",
+                "--ticker",
+                "AAPL",
+                "--config",
+                "config-download-after",
+            ),
+            "config-download-after",
+        ),
+        (
+            ("--config", "config-session-list-before", "session", "list"),
+            "config-session-list-before",
+        ),
+        (
+            ("session", "--config", "config-session-list-command", "list"),
+            "config-session-list-command",
+        ),
+        (
+            ("session", "list", "--config", "config-session-list-after"),
+            "config-session-list-after",
+        ),
+        (
+            (
+                "--config",
+                "config-session-purge-before",
                 "session",
-                "resume",
+                "purge",
                 "--session-id",
                 "session-1",
-                "--mode",
-                "interactive",
+                "--yes",
             ),
-            "config-session-before",
+            "config-session-purge-before",
         ),
         (
             (
                 "session",
-                "resume",
+                "--config",
+                "config-session-purge-command",
+                "purge",
                 "--session-id",
                 "session-1",
-                "--mode",
-                "interactive",
-                "--config",
-                "config-session-after",
+                "--yes",
             ),
-            "config-session-after",
+            "config-session-purge-command",
+        ),
+        (
+            (
+                "session",
+                "purge",
+                "--session-id",
+                "session-1",
+                "--yes",
+                "--config",
+                "config-session-purge-after",
+            ),
+            "config-session-purge-after",
         ),
     ),
 )
-def test_runtime_commands_accept_config_before_and_after_command(
+def test_non_agent_runtime_commands_accept_config_before_and_after_command(
     argv: tuple[str, ...],
     expected_config_dir: str,
 ) -> None:
-    """非 init runtime 命令必须在 command 前后都接受 ``--config``。
+    """非 Agent runtime 命令必须继续接受 ``--config``。
 
     :param argv: 待解析的完整 CLI 参数。
     :param expected_config_dir: 预期的显式配置目录。
@@ -1519,6 +1560,114 @@ def test_runtime_commands_accept_config_before_and_after_command(
     args = parse_cli_args(argv)
 
     assert args.config_dir == expected_config_dir
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config", "removed-config", "prompt", "hello"),
+        ("prompt", "hello", "--config", "removed-config"),
+        ("--config", "removed-config", "interactive"),
+        ("interactive", "--config", "removed-config"),
+        (
+            "--config",
+            "removed-config",
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "prompt",
+            "hello",
+        ),
+        (
+            "session",
+            "--config",
+            "removed-config",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "interactive",
+        ),
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "interactive",
+            "--config",
+            "removed-config",
+        ),
+    ),
+)
+def test_agent_surfaces_reject_config_in_every_parser_position(
+    argv: tuple[str, ...],
+) -> None:
+    """Agent surface 必须在任何 parser 位置拒绝显式配置。
+
+    :param argv: 待解析的完整 CLI 参数。
+    :returns: ``None``。
+    :raises AssertionError: removed config 未返回用法错误 2 时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(argv)
+
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_interactive_rejects_removed_ticker_and_session_kind() -> None:
+    """interactive ticker 与 session kind 必须从 parser surface 消失。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一 removed 参数未返回用法错误 2 时抛出。
+    """
+
+    with pytest.raises(SystemExit) as ticker_error:
+        parse_cli_args(("interactive", "--ticker", "AAPL"))
+    with pytest.raises(SystemExit) as kind_error:
+        parse_cli_args(
+            (
+                "session",
+                "purge",
+                "--label",
+                "earnings",
+                "--kind",
+                "prompt",
+                "--yes",
+            )
+        )
+
+    assert ticker_error.value.code == EXIT_USAGE_ERROR
+    assert kind_error.value.code == EXIT_USAGE_ERROR
+
+
+def test_prompt_and_prompt_resume_keep_ticker() -> None:
+    """prompt 与 prompt-mode resume 必须保留 ticker 参数。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一 prompt surface 丢失 ticker 映射时抛出。
+    """
+
+    prompt_args = parse_cli_args(("prompt", "--ticker", "AAPL", "hello"))
+    resume_args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "prompt",
+            "--ticker",
+            "MSFT",
+            "hello",
+        )
+    )
+
+    assert prompt_args.ticker == "AAPL"
+    assert resume_args.ticker == "MSFT"
 
 
 @pytest.mark.parametrize(

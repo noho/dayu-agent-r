@@ -65,9 +65,8 @@ from dayu.cli.session_execution import (
     prepare_interactive_session_execution,
     prepare_prompt_session_execution,
 )
-from dayu.cli.session_identity import CliSessionLabelKind, slot_ref_for_cli_label
+from dayu.cli.session_identity import slot_ref_for_cli_label
 from dayu.host.api import (
-    Host,
     HostAdmin,
     HostApiError,
     HostApiErrorCode,
@@ -94,7 +93,6 @@ DEFAULT_PURGE_REASON: Final[str] = "cli_session_purge"
 _SESSION_CONTEXT_SCENARIO: Final[str] = "session"
 _SESSION_ID_OPTION: Final[str] = "--session-id"
 _LABEL_OPTION: Final[str] = "--label"
-_KIND_OPTION: Final[str] = "--kind"
 _MODE_OPTION: Final[str] = "--mode"
 _TICKER_OPTION: Final[str] = "--ticker"
 _REASON_OPTION: Final[str] = "--reason"
@@ -287,16 +285,12 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
                     target=_host_error_target(target),
                 )
     _reject_interactive_resume_prompt(args)
-    interactive_ticker = _resume_interactive_ticker(args)
+    _reject_interactive_resume_ticker(args)
     prepared_interactive = await prepare_interactive_session_execution(
         args,
         command_name=COMMAND_SESSION,
         scenario=CLI_INTERACTIVE_SCENARIO,
-        ticker=interactive_ticker,
-        context_slot_values=build_interactive_context_slot_values(
-            ticker=interactive_ticker,
-            fmp_api_key=os.environ.get(FMP_API_KEY_ENV),
-        ),
+        context_slot_values=build_interactive_context_slot_values(),
         usage_error_factory=CliSessionUsageError,
     )
     target = await _resolve_existing_session_target_with_admin(args)
@@ -402,8 +396,7 @@ async def _resolve_existing_session_target(
     )
     if label is None:
         raise CliSessionUsageError("session resume requires a selector")
-    kind = _require_label_kind(args.kind)
-    slot = slot_ref_for_cli_label(kind, label)
+    slot = slot_ref_for_cli_label(label)
     result = await host.list_sessions()
     for item in result.sessions:
         if item.slot == slot:
@@ -413,11 +406,11 @@ async def _resolve_existing_session_target(
                 )
             return _ExistingSessionTarget(
                 session_id=item.session_id,
-                selector=f"{_LABEL_OPTION} {label} {_KIND_OPTION} {kind.value}",
+                selector=f"{_LABEL_OPTION} {label}",
                 resolved_from_label=True,
             )
     raise CliSessionUsageError(
-        f"no session found for label {label!r} kind {kind.value!r}"
+        f"no session found for label {label!r}"
     )
 
 
@@ -473,16 +466,15 @@ async def _resolve_purge_target(
     )
     if label is None:
         raise CliSessionUsageError("session purge requires a selector")
-    kind = _require_label_kind(args.kind)
-    slot = slot_ref_for_cli_label(kind, label)
+    slot = slot_ref_for_cli_label(label)
     resolved_session_id = await _resolve_session_id_for_slot(host=host, slot=slot)
     if resolved_session_id is None:
         raise CliSessionUsageError(
-            f"no session found for label {label!r} kind {kind.value!r}"
+            f"no session found for label {label!r}"
         )
     return _PurgeTarget(
         session_id=resolved_session_id,
-        selector=f"{_LABEL_OPTION} {label} {_KIND_OPTION} {kind.value}",
+        selector=f"{_LABEL_OPTION} {label}",
         resolved_from_label=True,
     )
 
@@ -572,37 +564,18 @@ def _resume_prompt_ticker(args: ParsedCliArgs) -> str | None:
     )
 
 
-def _resume_interactive_ticker(args: ParsedCliArgs) -> str | None:
-    """读取 interactive resume 兼容执行的 ticker 参数。
+def _reject_interactive_resume_ticker(args: ParsedCliArgs) -> None:
+    """拒绝 interactive resume 携带 prompt 专属 ticker 参数。
 
     :param args: argparse 已解析的 session resume 命令参数。
-    :returns: 裁剪后的 ticker；未提供时为 ``None``。
-    :raises CliSessionUsageError: ticker 为空白时抛出。
+    :returns: ``None``。
+    :raises CliSessionUsageError: interactive mode 携带 ticker 时抛出。
     """
 
-    return optional_stripped_text(
-        args.ticker,
-        field_name=_TICKER_OPTION,
-        error_factory=CliSessionUsageError,
-    )
-
-
-def _require_label_kind(value: str | None) -> CliSessionLabelKind:
-    """校验并转换 label selector kind。
-
-    :param value: argparse 解析到的 ``--kind`` 值。
-    :returns: CLI Session label kind。
-    :raises CliSessionUsageError: ``--kind`` 缺失或非法时抛出。
-    """
-
-    if value is None:
-        raise CliSessionUsageError("--label requires --kind prompt|interactive")
-    try:
-        return CliSessionLabelKind(value)
-    except ValueError as exc:
+    if args.ticker is not None:
         raise CliSessionUsageError(
-            "--kind must be prompt or interactive"
-        ) from exc
+            "session resume --mode interactive does not accept --ticker"
+        )
 
 
 def _purge_reason(args: ParsedCliArgs) -> str:

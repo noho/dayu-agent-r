@@ -28,12 +28,12 @@ from dayu.cli.host_api_errors import (
     format_host_api_error,
 )
 from dayu.cli.host_context import (
+    CLI_AGENT_SESSION_SCOPE,
     CLI_PROMPT_SCENARIO,
-    PROMPT_SESSION_SCOPE,
     CliInvocation,
     build_prompt_host_context,
+    cli_label_slot_key,
     prompt_create_session_client_request_id,
-    prompt_slot_key,
 )
 from dayu.cli.output import render_cli_error
 from dayu.cli.session_execution import (
@@ -162,14 +162,14 @@ async def _ensure_prompt_session(
         )
         return session.session_id
     try:
-        slot_key = prompt_slot_key(args.label)
+        slot_key = cli_label_slot_key(args.label)
     except ValueError as exc:
         raise CliCommandUsageError(f"{_LABEL_OPTION}: {exc}") from exc
     session = await ensure_or_create_entrypoint_session(
         host,
         create_new=False,
         bind_slot=True,
-        scope=PROMPT_SESSION_SCOPE,
+        scope=CLI_AGENT_SESSION_SCOPE,
         slot_key=slot_key,
         metadata=(),
     )
