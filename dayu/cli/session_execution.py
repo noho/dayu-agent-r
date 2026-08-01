@@ -510,6 +510,7 @@ async def execute_interactive_on_session(
                     run_overrides=prepared.run_overrides,
                     binary_stdin=effective_binary_stdin,
                     usage_error_factory=prepared.usage_error_factory,
+                    sigint_monitor=sigint_monitor,
                     run_view=effective_run_view if detail else None,
                     thinking_renderer=effective_thinking_renderer,
                     runtime_display=runtime_display,
@@ -542,6 +543,7 @@ async def execute_interactive_on_session(
                 run_overrides=prepared.run_overrides,
                 binary_stdin=effective_binary_stdin,
                 usage_error_factory=prepared.usage_error_factory,
+                sigint_monitor=sigint_monitor,
                 run_view=effective_run_view if detail else None,
                 thinking_renderer=effective_thinking_renderer,
                 runtime_display=runtime_display,
@@ -1133,6 +1135,7 @@ async def _run_interactive_non_tty_batch(
     run_overrides: ServiceRunOverrides,
     binary_stdin: BinaryIO,
     usage_error_factory: _UsageErrorFactory,
+    sigint_monitor: CliSigintMonitor,
     run_view: InteractiveRunView | None,
     thinking_renderer: CliThinkingRenderer | None,
     runtime_display: RuntimeDisplayController | None,
@@ -1147,6 +1150,7 @@ async def _run_interactive_non_tty_batch(
     :param run_overrides: 本轮执行 override。
     :param binary_stdin: whole-stream 二进制输入。
     :param usage_error_factory: UTF-8 用法错误构造器。
+    :param sigint_monitor: invocation 唯一 OS SIGINT monitor。
     :param run_view: 可选 interactive run view。
     :param thinking_renderer: 可选 thinking renderer。
     :param runtime_display: 可选串行 display controller。
@@ -1173,14 +1177,136 @@ async def _run_interactive_non_tty_batch(
         thinking_renderer=thinking_renderer,
         runtime_display=runtime_display,
     )
-    terminal = await active.submit_task
-    return await _finish_interactive_terminal(
+    terminal, exit_after_cancel = await _wait_interactive_batch_terminal_handling_sigint(
+        host=host,
+        invocation=invocation,
+        active=active,
+        sigint_monitor=sigint_monitor,
+        runtime_display=runtime_display,
+    )
+    terminal_exit_code = await _finish_interactive_terminal(
         terminal=terminal,
         workspace_root=workspace_root,
         session_id=session_id,
         run_view=run_view,
         runtime_display=runtime_display,
     )
+    if exit_after_cancel:
+        return EXIT_KEYBOARD_INTERRUPT
+    return terminal_exit_code
+
+
+async def _wait_interactive_batch_terminal_handling_sigint(
+    *,
+    host: Host,
+    invocation: CliInvocation,
+    active: _InteractiveActiveTurn,
+    sigint_monitor: CliSigintMonitor,
+    runtime_display: RuntimeDisplayController | None,
+) -> tuple[EntrypointRunTerminalResult, bool]:
+    """等待 non-TTY active Run 终态并消费 invocation SIGINT。
+
+    第一次中断只登记 single graceful cancel；第二次只登记 terminal 后本地
+    ``130``；后续中断不再改变状态。submit 与 cancel canonical waiter 在正常
+    SIGINT 路径始终保留到 Host terminal，只有调用方异常取消本 helper 时才回收。
+
+    :param host: Host public handle。
+    :param invocation: 当前 CLI invocation 身份。
+    :param active: whole-batch 唯一 active turn。
+    :param sigint_monitor: invocation 唯一 OS SIGINT monitor。
+    :param runtime_display: 可选串行 display controller。
+    :returns: Host canonical terminal 与是否在其后返回 ``130``。
+    :raises Exception: submit、acceptance、cancel 或 terminal observation 失败时
+        向上透传。
+    """
+
+    observed_sigint_count = sigint_monitor.count
+    sigint_task: asyncio.Task[int] | None = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+    exit_after_cancel = False
+    normal_completion = False
+    try:
+        while True:
+            wait_tasks: set[asyncio.Task[InteractiveComposerCompletionResult]] = {
+                active.submit_task,
+            }
+            if sigint_task is not None:
+                wait_tasks.add(sigint_task)
+            if active.acceptance_task is not None and not active.acceptance_task.done():
+                wait_tasks.add(active.acceptance_task)
+            if active.cancel_task is not None and not active.cancel_task.done():
+                wait_tasks.add(active.cancel_task)
+            done, _pending = await asyncio.wait(
+                wait_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if active.submit_task in done:
+                terminal = await active.submit_task
+                cancel_error: BaseException | None = None
+                if active.cancel_task is not None:
+                    try:
+                        cancel_terminal = await active.cancel_task
+                        if cancel_terminal.run_id != terminal.run_id:
+                            raise RuntimeError("interactive cancel terminal run id mismatch")
+                    except BaseException as error:
+                        cancel_error = error
+                if active.acceptance_task is not None:
+                    await cancel_and_await_task(active.acceptance_task)
+                if cancel_error is not None:
+                    raise cancel_error
+                normal_completion = True
+                return terminal, exit_after_cancel
+
+            if (
+                active.acceptance_task is not None
+                and active.acceptance_task in done
+                and active.cancel_reason is not None
+                and active.cancel_task is None
+            ):
+                run_id = await active.acceptance_task
+                if runtime_display is not None:
+                    await runtime_display.render_cancel_requested()
+                active.cancel_task = _start_interactive_cancel_task(
+                    host=host,
+                    invocation=invocation,
+                    active=active,
+                    run_id=run_id,
+                )
+
+            if active.cancel_task is not None and active.cancel_task in done and active.submit_task not in done:
+                await active.cancel_task
+
+            if sigint_task is not None and sigint_task in done:
+                new_sigint_count = await sigint_task
+                sigint_task = None
+                pending_interrupts = new_sigint_count - observed_sigint_count
+                observed_sigint_count = new_sigint_count
+                if pending_interrupts > 0 and active.cancel_reason is None:
+                    await _request_interactive_cancel(
+                        host=host,
+                        invocation=invocation,
+                        active=active,
+                        reason=CLI_SIGINT_REASON,
+                        composer=None,
+                        runtime_display=runtime_display,
+                    )
+                    pending_interrupts -= 1
+                if pending_interrupts > 0 and not exit_after_cancel:
+                    exit_after_cancel = True
+                    if runtime_display is not None:
+                        await runtime_display.render_local_exit_after_cancel()
+
+            if sigint_task is None:
+                sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+    finally:
+        if sigint_task is not None:
+            await cancel_and_await_task(sigint_task)
+        if active.acceptance_task is not None and not active.acceptance_task.done():
+            await cancel_and_await_task(active.acceptance_task)
+        if not normal_completion:
+            if active.cancel_task is not None:
+                await cancel_and_await_task(active.cancel_task)
+            await cancel_and_await_task(active.submit_task)
 
 
 async def _drive_interactive_tty_repl(
@@ -1393,8 +1519,6 @@ async def _drive_interactive_tty_repl(
                                 if runtime_display is not None:
                                     await runtime_display.render_local_exit_after_cancel()
                     elif event.kind is InteractiveComposerEventKind.TOGGLE_ACTIVITY:
-                        exit_intent = _InteractiveExitIntent.CONTINUE
-                        idle_interrupt_revision = None
                         if current is not None and runtime_display is not None:
                             await runtime_display.toggle_activity_display()
                     elif event.kind is InteractiveComposerEventKind.IDLE_INTERRUPT:
@@ -1687,7 +1811,7 @@ async def _request_interactive_cancel(
     invocation: CliInvocation,
     active: _InteractiveActiveTurn,
     reason: str,
-    composer: InteractiveComposer,
+    composer: InteractiveComposer | None,
     runtime_display: RuntimeDisplayController | None,
 ) -> None:
     """按 current generation 合并并启动 single graceful cancel intent。
@@ -1696,7 +1820,7 @@ async def _request_interactive_cancel(
     :param invocation: 当前 CLI invocation 身份。
     :param active: 当前 active turn。
     :param reason: Host cancel reason。
-    :param composer: invocation 唯一 composer。
+    :param composer: TTY invocation 唯一 composer；non-TTY 时为 ``None``。
     :param runtime_display: 可选 display controller。
     :returns: ``None``。
     :raises Exception: display 或 cancel task 创建失败时向上透传。
@@ -1705,7 +1829,8 @@ async def _request_interactive_cancel(
     if active.cancel_reason is not None:
         return
     active.cancel_reason = reason
-    composer.set_phase(InteractiveComposerPhase.CANCELLING)
+    if composer is not None:
+        composer.set_phase(InteractiveComposerPhase.CANCELLING)
     if runtime_display is not None:
         await runtime_display.finish_thinking_display()
     run_id = active.accepted_run.run_id

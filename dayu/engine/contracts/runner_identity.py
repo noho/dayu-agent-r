@@ -21,6 +21,10 @@ _INTEGER_PART_PREFIX: str = "i"
 _NONE_PART_TOKEN: str = "n"
 _PART_SEPARATOR: str = "|"
 _PART_FIELD_SEPARATOR: str = ":"
+_RUNNER_REQUEST_IDENTITY_OWNER: str = "RunnerRequestIdentity"
+_SUCCESSFUL_RUNNER_RESPONSE_IDENTITY_OWNER: str = (
+    "SuccessfulRunnerResponseIdentity"
+)
 
 _CanonicalIdentityParts = tuple[str, str | None, str | None, str, int, int]
 
@@ -116,8 +120,16 @@ class SuccessfulRunnerResponseIdentity:
             request id 未严格成对时抛出。
         """
 
-        _validate_non_empty_text("effective_provider", self.effective_provider)
-        _validate_non_empty_text("effective_model", self.effective_model)
+        _validate_non_empty_text(
+            _SUCCESSFUL_RUNNER_RESPONSE_IDENTITY_OWNER,
+            "effective_provider",
+            self.effective_provider,
+        )
+        _validate_non_empty_text(
+            _SUCCESSFUL_RUNNER_RESPONSE_IDENTITY_OWNER,
+            "effective_model",
+            self.effective_model,
+        )
         if not isinstance(self.runner_request_identity, RunnerRequestIdentity):
             raise TypeError(
                 "SuccessfulRunnerResponseIdentity.runner_request_identity "
@@ -142,6 +154,7 @@ class SuccessfulRunnerResponseIdentity:
                     "must be present when availability is present"
                 )
             _validate_non_empty_text(
+                _SUCCESSFUL_RUNNER_RESPONSE_IDENTITY_OWNER,
                 "provider_request_id",
                 self.provider_request_id,
             )
@@ -222,10 +235,26 @@ def _validate_identity_inputs(
     :raises ValueError: 任一输入违反请求身份不变量时抛出。
     """
 
-    _validate_non_empty_text("run_id", run_id)
-    _validate_optional_non_empty_text("attempt_id", attempt_id)
-    _validate_optional_non_empty_text("execution_id", execution_id)
-    _validate_non_empty_text("iteration_id", iteration_id)
+    _validate_non_empty_text(
+        _RUNNER_REQUEST_IDENTITY_OWNER,
+        "run_id",
+        run_id,
+    )
+    _validate_optional_non_empty_text(
+        _RUNNER_REQUEST_IDENTITY_OWNER,
+        "attempt_id",
+        attempt_id,
+    )
+    _validate_optional_non_empty_text(
+        _RUNNER_REQUEST_IDENTITY_OWNER,
+        "execution_id",
+        execution_id,
+    )
+    _validate_non_empty_text(
+        _RUNNER_REQUEST_IDENTITY_OWNER,
+        "iteration_id",
+        iteration_id,
+    )
     if iteration_index < 0:
         raise ValueError("RunnerRequestIdentity.iteration_index must be >= 0")
     if runner_call_index < 1:
@@ -237,9 +266,14 @@ def _validate_identity_inputs(
         )
 
 
-def _validate_non_empty_text(field_name: str, value: str) -> None:
+def _validate_non_empty_text(
+    owner_name: str,
+    field_name: str,
+    value: str,
+) -> None:
     """校验必填文本字段非空。
 
+    :param owner_name: 字段所属 contract 名称。
     :param field_name: 字段名，用于错误消息。
     :param value: 需要校验的文本值。
     :returns: 无返回值。
@@ -247,14 +281,17 @@ def _validate_non_empty_text(field_name: str, value: str) -> None:
     """
 
     if value.strip() == "":
-        raise ValueError(f"RunnerRequestIdentity.{field_name} must be non-empty")
+        raise ValueError(f"{owner_name}.{field_name} must be non-empty")
 
 
 def _validate_optional_non_empty_text(
-    field_name: str, value: str | None
+    owner_name: str,
+    field_name: str,
+    value: str | None,
 ) -> None:
     """校验可选文本字段在出现时非空。
 
+    :param owner_name: 字段所属 contract 名称。
     :param field_name: 字段名，用于错误消息。
     :param value: 需要校验的文本值或 ``None``。
     :returns: 无返回值。
@@ -263,7 +300,7 @@ def _validate_optional_non_empty_text(
 
     if value is None:
         return
-    _validate_non_empty_text(field_name, value)
+    _validate_non_empty_text(owner_name, field_name, value)
 
 
 def _canonical_identity_parts(

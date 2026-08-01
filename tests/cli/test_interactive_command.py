@@ -1109,6 +1109,42 @@ class _ManualSigintMonitor(CliSigintMonitor):
         return new_count
 
 
+class _InvocationManualSigintMonitor(_ManualSigintMonitor):
+    """不安装真实 signal handler 的 invocation 级手动 monitor。"""
+
+    install_count: int
+    close_count: int
+
+    def __init__(self) -> None:
+        """初始化手动通知与 lifecycle 调用计数。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.install_count = 0
+        self.close_count = 0
+
+    def install(self) -> None:
+        """记录 invocation 安装而不接管测试进程 signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.install_count += 1
+
+    def close(self) -> None:
+        """记录 invocation 关闭而不修改测试进程 signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+
 def test_interactive_label_targets_shared_agent_slot_and_default_context(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1309,6 +1345,111 @@ def test_interactive_non_tty_exits_after_first_terminal(
     assert len(fake_host.submit_requests) == 1
     assert "dayu> " not in captured.out
     assert "dayu> " not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_interactive_non_tty_single_sigint_crosses_acceptance_barrier_without_orphan(
+    tmp_path: Path,
+) -> None:
+    """non-TTY pre-accept SIGINT 必须保留 submit 并在接受后只取消一次。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: acceptance、canonical waiter 或 cleanup 契约漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _DelayedAcceptanceControlledHost()
+    monitor = _InvocationManualSigintMonitor()
+    execution = asyncio.create_task(
+        session_execution.execute_interactive_on_session(
+            host=cast(Host, host),
+            prepared=_prepared_interactive_execution(
+                tmp_path=tmp_path,
+                runtime=runtime,
+            ),
+            session_id="session-1",
+            stdin=io.StringIO(),
+            binary_stdin=io.BytesIO(b"whole batch"),
+            sigint_monitor_factory=lambda: monitor,
+            run_startup_reconnect=False,
+            detail=False,
+            thinking=False,
+        )
+    )
+
+    await asyncio.wait_for(host.committed.wait(), timeout=2.0)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    assert host.cancel_requests == []
+    assert not execution.done()
+
+    host.release_response.set()
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    host.release_cancel_terminal.set()
+    exit_code = await asyncio.wait_for(execution, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(host.cancel_requests) == 1
+    assert host.cancel_requests[0].mode is CancelMode.GRACEFUL
+    assert host.cancel_requests[0].reason == "cli_sigint"
+    assert not host.cancel_waiter_cancelled
+    assert monitor.install_count == 1
+    assert monitor.close_count == 1
+    assert [attachment.close_count for attachment in host.attachments] == [1]
+
+
+@pytest.mark.asyncio
+async def test_interactive_non_tty_second_sigint_waits_terminal_then_returns_130_and_third_is_noop(
+    tmp_path: Path,
+) -> None:
+    """non-TTY 第二次 SIGINT 只登记退出，第三次不得重复取消。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: signal 计数、terminal 等待或 cleanup 契约漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    monitor = _InvocationManualSigintMonitor()
+    execution = asyncio.create_task(
+        session_execution.execute_interactive_on_session(
+            host=cast(Host, host),
+            prepared=_prepared_interactive_execution(
+                tmp_path=tmp_path,
+                runtime=runtime,
+            ),
+            session_id="session-1",
+            stdin=io.StringIO(),
+            binary_stdin=io.BytesIO(b"whole batch"),
+            sigint_monitor_factory=lambda: monitor,
+            run_startup_reconnect=False,
+            detail=False,
+            thinking=False,
+        )
+    )
+
+    await _wait_for_submit_count(host, 1)
+    monitor.notify()
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    await _wait_for_sigint_observation(monitor, 1)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 2)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 3)
+
+    assert not execution.done()
+    assert len(host.cancel_requests) == 1
+    host.release_cancel_terminal.set()
+    exit_code = await asyncio.wait_for(execution, timeout=2.0)
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert len(host.cancel_requests) == 1
+    assert not host.cancel_waiter_cancelled
+    assert monitor.install_count == 1
+    assert monitor.close_count == 1
+    assert [attachment.close_count for attachment in host.attachments] == [1]
 
 
 @pytest.mark.asyncio
@@ -2731,6 +2872,52 @@ async def test_interactive_exit_after_cancel_waits_accepted_sole_queue_terminal(
 
 
 @pytest.mark.asyncio
+async def test_interactive_ctrl_t_preserves_existing_idle_interrupt_intent(
+    tmp_path: Path,
+) -> None:
+    """Ctrl+T 只能切换显示，不得清除既有 idle exit pending 状态。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: toggle 改写 idle/cancel owner 状态时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _ScriptedComposer(
+        (
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
+                input_revision=7,
+            ),
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.TOGGLE_ACTIVITY,
+                input_revision=7,
+            ),
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
+                input_revision=7,
+            ),
+        )
+    )
+
+    exit_code = await asyncio.wait_for(
+        _start_tty_driver(
+            host=host,
+            runtime=runtime,
+            workspace_root=tmp_path,
+            composer=composer,
+        ),
+        timeout=2.0,
+    )
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert composer.prompt_calls == ["dayu> "] * 3
+    assert host.submit_requests == []
+    assert host.cancel_requests == []
+
+
+@pytest.mark.asyncio
 async def test_interactive_ctrl_t_toggles_without_cancel(
     tmp_path: Path,
 ) -> None:
@@ -3109,6 +3296,33 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
             assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env=_runtime_assembly_env(),
         )
+    )
+
+
+def _prepared_interactive_execution(
+    *,
+    tmp_path: Path,
+    runtime: EntrypointRuntimeResult,
+) -> session_execution.PreparedInteractiveSessionExecution:
+    """构造 existing-session interactive invocation 准备结果。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param runtime: 已装配的 interactive runtime。
+    :returns: 使用默认 run override 的 invocation 准备结果。
+    :raises Exception: invocation contract 构造失败时向上透传。
+    """
+
+    return session_execution.PreparedInteractiveSessionExecution(
+        runtime=runtime,
+        workspace_root=tmp_path,
+        invocation=session_execution.new_cli_invocation(
+            command_name="interactive",
+            scenario="interactive",
+            display_user="本地 CLI 用户",
+            ticker=None,
+        ),
+        run_overrides=ServiceRunOverrides(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
 
 

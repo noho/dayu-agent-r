@@ -90,7 +90,7 @@ def test_runner_request_identity_rejects_empty_text_fields(
     :raises AssertionError: 校验未按预期失败时由 pytest 抛出。
     """
 
-    with pytest.raises(ValueError, match=field_name):
+    with pytest.raises(ValueError) as error_info:
         if field_name == "run_id":
             _identity(run_id=invalid_value)
         elif field_name == "attempt_id":
@@ -101,6 +101,9 @@ def test_runner_request_identity_rejects_empty_text_fields(
             _identity(iteration_id=invalid_value)
         else:
             raise AssertionError(f"unexpected field name: {field_name}")
+    assert str(error_info.value) == (
+        f"RunnerRequestIdentity.{field_name} must be non-empty"
+    )
 
 
 @pytest.mark.parametrize("iteration_index", (-1, -2))
@@ -210,22 +213,27 @@ def test_successful_response_identity_rejects_invalid_request_id_pair(
 
 
 @pytest.mark.parametrize(
-    ("provider", "model"),
-    (("", "model-contract"), ("provider-contract", " ")),
+    ("field_name", "provider", "model"),
+    (
+        ("effective_provider", "", "model-contract"),
+        ("effective_model", "provider-contract", " "),
+    ),
 )
 def test_successful_response_identity_rejects_empty_provider_or_model(
+    field_name: str,
     provider: str,
     model: str,
 ) -> None:
     """成功响应身份必须拒绝空 provider/model。
 
+    :param field_name: 预期由 response owner 报告的字段名。
     :param provider: 待测 provider。
     :param model: 待测 model。
     :returns: 无返回值。
     :raises AssertionError: 非法文本未被拒绝时由 pytest 抛出。
     """
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as error_info:
         SuccessfulRunnerResponseIdentity(
             effective_provider=provider,
             effective_model=model,
@@ -235,6 +243,9 @@ def test_successful_response_identity_rejects_empty_provider_or_model(
             ),
             provider_request_id=None,
         )
+    assert str(error_info.value) == (
+        f"SuccessfulRunnerResponseIdentity.{field_name} must be non-empty"
+    )
 
 
 def _identity(

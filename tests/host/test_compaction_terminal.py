@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -49,10 +52,12 @@ from dayu.host.durable.options import (
     HostDurableStoreOptions,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_COMPETITION_TIMEOUT_SECONDS = 5.0
+_BEGIN_IMMEDIATE_STATEMENT = "BEGIN IMMEDIATE"
 
 
 def _successful_response_identity(
@@ -155,6 +160,113 @@ class _NonCanonicalTerminalEventLogStore(EventLogStore):
         return (self._row,)
 
 
+@dataclass(frozen=True, slots=True)
+class _CompetingTerminalWriter:
+    """在独立真实 connection 上竞争同一 operation terminal 的 writer。
+
+    :param options: 两个 writer 共用的 durable store options。
+    :param operation_id: 两个 writer 竞争的 operation id。
+    :param terminal_type: 本 writer 获得 permit 时计划提交的 terminal type。
+    :param ordinal: 本 writer terminal fixture ordinal。
+    :param ready: connection 与 runner 已准备完成的 barrier。
+    :param start: 允许本 writer 调用 ``run_write`` 的 barrier。
+    :param permit_acquired: 本 writer 获得 permit 后发布的可选 barrier。
+    :param release_permit: 本 writer 获得 permit 后等待的可选 barrier。
+    :param begin_attempted: trace 观察到 ``BEGIN IMMEDIATE`` 的可选 barrier。
+    """
+
+    options: HostDurableStoreOptions
+    operation_id: str
+    terminal_type: str
+    ordinal: int
+    ready: Event
+    start: Event
+    permit_acquired: Event | None
+    release_permit: Event | None
+    begin_attempted: Event | None
+
+    def __call__(
+        self,
+    ) -> CompactionTerminalCommitPermit | CompactionTerminalClosed:
+        """打开 thread-owned connection 并执行一次 terminal competition。
+
+        :returns: production owner 返回的 permit 或 closed disposition。
+        :raises TimeoutError: start/release barrier 未在有界时间内触发时抛出。
+        :raises Exception: durable connection、transaction 或 append 失败时透传。
+        """
+
+        store = open_host_durable_store(self.options)
+        connection = store.connect()
+        try:
+            connection.set_trace_callback(self._record_statement)
+            runner = HostTransactionRunner(
+                connection,
+                self.options.sqlite_policy,
+                artifact_root=self.options.payload_policy.artifact_root,
+                payload_inline_threshold_bytes=(
+                    self.options.payload_policy.payload_inline_threshold_bytes
+                ),
+                create_artifact_root=(
+                    self.options.payload_policy.create_artifact_root
+                ),
+            )
+            self.ready.set()
+            if not self.start.wait(_COMPETITION_TIMEOUT_SECONDS):
+                raise TimeoutError("compaction writer start barrier timed out")
+            return runner.run_write(self._commit_terminal)
+        finally:
+            connection.close()
+            store.close()
+
+    def _record_statement(self, statement: str) -> None:
+        """记录本 writer 已实际尝试执行 ``BEGIN IMMEDIATE``。
+
+        :param statement: SQLite trace callback 产生的 SQL statement。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            self.begin_attempted is not None
+            and statement.strip().upper() == _BEGIN_IMMEDIATE_STATEMENT
+        ):
+            self.begin_attempted.set()
+
+    def _commit_terminal(
+        self,
+        transaction: HostTransaction,
+    ) -> CompactionTerminalCommitPermit | CompactionTerminalClosed:
+        """在 transaction 内取得 permit，并仅由 winner 追加 terminal。
+
+        :param transaction: production runner 提供的真实 write transaction。
+        :returns: production owner 返回的 permit 或 closed disposition。
+        :raises TimeoutError: winner release barrier 未在有界时间内触发时抛出。
+        :raises Exception: owner 判定或 terminal append 失败时透传。
+        """
+
+        result = begin_compaction_terminal_commit_in_transaction(
+            transaction,
+            EventLogStore(),
+            operation_id=self.operation_id,
+            expected_trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        )
+        if not isinstance(result, CompactionTerminalCommitPermit):
+            return result
+        if self.permit_acquired is not None:
+            self.permit_acquired.set()
+        if self.release_permit is not None and not self.release_permit.wait(
+            _COMPETITION_TIMEOUT_SECONDS
+        ):
+            raise TimeoutError("compaction writer permit release timed out")
+        _append_terminal(
+            transaction,
+            operation_id=self.operation_id,
+            terminal_type=self.terminal_type,
+            ordinal=self.ordinal,
+        )
+        return result
+
+
 @pytest.mark.parametrize(
     "trigger_source",
     (
@@ -203,6 +315,98 @@ def test_open_operation_returns_trigger_aware_transaction_local_permit(
         permit = store.transaction_runner.run_write(_operation)
         assert permit.operation_id == operation_id
         assert permit.trigger_source is trigger_source
+
+
+def test_two_competing_terminal_writers_commit_exactly_one_canonical_terminal(
+    tmp_path: Path,
+) -> None:
+    """同一 operation 的两个真实 writer 必须只有一个取得 permit 并提交。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: competition 未真实发生或出现第二 terminal 时抛出。
+    :raises Exception: durable setup、transaction 或 worker 失败时透传。
+    """
+
+    options = _durable_options(tmp_path)
+    operation_id = "operation-two-competing-writers"
+    with open_host_durable_store(options) as store:
+        store.transaction_runner.run_write(
+            partial(
+                _append_request,
+                operation_id=operation_id,
+                trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+            )
+        )
+
+    winner_ready = Event()
+    loser_ready = Event()
+    winner_start = Event()
+    loser_start = Event()
+    winner_has_permit = Event()
+    release_winner = Event()
+    loser_begin_attempted = Event()
+    winner = _CompetingTerminalWriter(
+        options=options,
+        operation_id=operation_id,
+        terminal_type=CONTEXT_COMPACTED,
+        ordinal=1,
+        ready=winner_ready,
+        start=winner_start,
+        permit_acquired=winner_has_permit,
+        release_permit=release_winner,
+        begin_attempted=None,
+    )
+    loser = _CompetingTerminalWriter(
+        options=options,
+        operation_id=operation_id,
+        terminal_type=CONTEXT_COMPACTION_FAILED,
+        ordinal=2,
+        ready=loser_ready,
+        start=loser_start,
+        permit_acquired=None,
+        release_permit=None,
+        begin_attempted=loser_begin_attempted,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner_future = executor.submit(winner)
+        loser_future = executor.submit(loser)
+        assert winner_ready.wait(_COMPETITION_TIMEOUT_SECONDS)
+        assert loser_ready.wait(_COMPETITION_TIMEOUT_SECONDS)
+        winner_start.set()
+        assert winner_has_permit.wait(_COMPETITION_TIMEOUT_SECONDS)
+        loser_start.set()
+        try:
+            assert loser_begin_attempted.wait(_COMPETITION_TIMEOUT_SECONDS)
+            assert not loser_future.done()
+        finally:
+            release_winner.set()
+        winner_result = winner_future.result(_COMPETITION_TIMEOUT_SECONDS)
+        loser_result = loser_future.result(_COMPETITION_TIMEOUT_SECONDS)
+
+    assert isinstance(winner_result, CompactionTerminalCommitPermit)
+    assert isinstance(loser_result, CompactionTerminalClosed)
+    assert (
+        loser_result.disposition
+        is CompactionOperationTerminalDisposition.COMPACTED
+    )
+    assert loser_result.first_terminal_event_type == CONTEXT_COMPACTED
+
+    store = open_host_durable_store(options)
+    try:
+        closed, terminal_rows = store.transaction_runner.run_write(
+            partial(
+                _read_terminal_competition_state,
+                operation_id=operation_id,
+            )
+        )
+    finally:
+        store.close()
+    assert closed.disposition is CompactionOperationTerminalDisposition.COMPACTED
+    assert closed.first_terminal_event_type == CONTEXT_COMPACTED
+    assert len(terminal_rows) == 1
+    assert terminal_rows[0].event_type == CONTEXT_COMPACTED
 
 
 def test_trigger_mismatch_fails_closed(tmp_path: Path) -> None:
@@ -757,6 +961,38 @@ def _append_terminal(
             payload_json=payload,
         ),
     ).row
+
+
+def _read_terminal_competition_state(
+    transaction: HostTransaction,
+    *,
+    operation_id: str,
+) -> tuple[CompactionTerminalClosed, tuple[EventLogRow, ...]]:
+    """读取竞争结束后的 owner disposition 与全部 terminal rows。
+
+    :param transaction: 用于 fresh owner read 的真实 write transaction。
+    :param operation_id: 已完成竞争的 compaction operation id。
+    :returns: closed owner disposition 与测试 Run 的全部 canonical terminal rows。
+    :raises AssertionError: operation 竞争后仍开放时抛出。
+    :raises Exception: durable owner 或 EventLog read 失败时透传。
+    """
+
+    result = begin_compaction_terminal_commit_in_transaction(
+        transaction,
+        EventLogStore(),
+        operation_id=operation_id,
+        expected_trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+    if not isinstance(result, CompactionTerminalClosed):
+        raise AssertionError("compaction competition operation must be closed")
+    terminal_rows = EventLogStore().read_run_events_by_types_page(
+        transaction,
+        run_id="run-test",
+        event_types=(CONTEXT_COMPACTED, CONTEXT_COMPACTION_FAILED),
+        after_event_sequence=0,
+        limit=64,
+    )
+    return result, terminal_rows
 
 
 def _event_request(
