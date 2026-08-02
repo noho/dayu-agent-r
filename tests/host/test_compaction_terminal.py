@@ -20,9 +20,9 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    CompactQualityCheckResultVNext,
-    ConversationCompactOutputVNext,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactCandidateV2,
+    CompactSessionSummaryV2,
 )
 from dayu.host.compaction_terminal import (
     CompactionOperationTerminalDisposition,
@@ -53,6 +53,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from tests.host.fake_compaction import accepted_truth_for_candidate
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -203,12 +204,8 @@ class _CompetingTerminalWriter:
                 connection,
                 self.options.sqlite_policy,
                 artifact_root=self.options.payload_policy.artifact_root,
-                payload_inline_threshold_bytes=(
-                    self.options.payload_policy.payload_inline_threshold_bytes
-                ),
-                create_artifact_root=(
-                    self.options.payload_policy.create_artifact_root
-                ),
+                payload_inline_threshold_bytes=(self.options.payload_policy.payload_inline_threshold_bytes),
+                create_artifact_root=(self.options.payload_policy.create_artifact_root),
             )
             self.ready.set()
             if not self.start.wait(_COMPETITION_TIMEOUT_SECONDS):
@@ -226,10 +223,7 @@ class _CompetingTerminalWriter:
         :raises Exception: 不主动抛出异常。
         """
 
-        if (
-            self.begin_attempted is not None
-            and statement.strip().upper() == _BEGIN_IMMEDIATE_STATEMENT
-        ):
+        if self.begin_attempted is not None and statement.strip().upper() == _BEGIN_IMMEDIATE_STATEMENT:
             self.begin_attempted.set()
 
     def _commit_terminal(
@@ -254,9 +248,7 @@ class _CompetingTerminalWriter:
             return result
         if self.permit_acquired is not None:
             self.permit_acquired.set()
-        if self.release_permit is not None and not self.release_permit.wait(
-            _COMPETITION_TIMEOUT_SECONDS
-        ):
+        if self.release_permit is not None and not self.release_permit.wait(_COMPETITION_TIMEOUT_SECONDS):
             raise TimeoutError("compaction writer permit release timed out")
         _append_terminal(
             transaction,
@@ -387,10 +379,7 @@ def test_two_competing_terminal_writers_commit_exactly_one_canonical_terminal(
 
     assert isinstance(winner_result, CompactionTerminalCommitPermit)
     assert isinstance(loser_result, CompactionTerminalClosed)
-    assert (
-        loser_result.disposition
-        is CompactionOperationTerminalDisposition.COMPACTED
-    )
+    assert loser_result.disposition is CompactionOperationTerminalDisposition.COMPACTED
     assert loser_result.first_terminal_event_type == CONTEXT_COMPACTED
 
     store = open_host_durable_store(options)
@@ -437,9 +426,7 @@ def test_trigger_mismatch_fails_closed(tmp_path: Path) -> None:
                     transaction,
                     EventLogStore(),
                     operation_id="operation-trigger-mismatch",
-                    expected_trigger_source=(
-                        ContextCompactionTriggerSource.REACTIVE
-                    ),
+                    expected_trigger_source=(ContextCompactionTriggerSource.REACTIVE),
                 )
 
         store.transaction_runner.run_write(_operation)
@@ -558,10 +545,7 @@ def test_multiple_terminals_fail_closed_without_inventing_third_truth(
             return result
 
         closed = store.transaction_runner.run_write(_operation)
-        assert (
-            closed.disposition
-            is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
-        )
+        assert closed.disposition is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
         assert closed.first_terminal_event_type == CONTEXT_COMPACTION_FAILED
 
 
@@ -596,9 +580,7 @@ def test_arbitrary_event_cannot_act_as_compaction_request(tmp_path: Path) -> Non
                     transaction,
                     EventLogStore(),
                     operation_id="operation-arbitrary",
-                    expected_trigger_source=(
-                        ContextCompactionTriggerSource.PROACTIVE
-                    ),
+                    expected_trigger_source=(ContextCompactionTriggerSource.PROACTIVE),
                 )
 
         store.transaction_runner.run_write(_operation)
@@ -645,9 +627,7 @@ def test_non_canonical_terminal_row_fails_before_operation_filter(
                     transaction,
                     _NonCanonicalTerminalEventLogStore(injected),
                     operation_id=operation_id,
-                    expected_trigger_source=(
-                        ContextCompactionTriggerSource.PROACTIVE
-                    ),
+                    expected_trigger_source=(ContextCompactionTriggerSource.PROACTIVE),
                 )
 
         store.transaction_runner.run_write(_operation)
@@ -666,37 +646,40 @@ def test_compaction_terminal_writer_inventory_uses_only_shared_owner() -> None:
     """
 
     repository_root = Path(__file__).resolve().parents[2]
-    dispatch_source = (repository_root / "dayu/host/dispatch.py").read_text(
-        encoding="utf-8"
-    )
-    engine_source = (repository_root / "dayu/host/engine_ingest.py").read_text(
-        encoding="utf-8"
-    )
-    proactive_source = (
-        repository_root / "dayu/host/proactive_compaction.py"
-    ).read_text(encoding="utf-8")
+    dispatch_source = (repository_root / "dayu/host/dispatch.py").read_text(encoding="utf-8")
+    engine_source = (repository_root / "dayu/host/engine_ingest.py").read_text(encoding="utf-8")
+    proactive_source = (repository_root / "dayu/host/proactive_compaction.py").read_text(encoding="utf-8")
     dispatch_module = ast.parse(dispatch_source)
     engine_module = ast.parse(engine_source)
     proactive_module = ast.parse(proactive_source)
 
-    assert len(
-        _call_lines(
-            dispatch_module,
-            "begin_compaction_terminal_commit_in_transaction",
+    assert (
+        len(
+            _call_lines(
+                dispatch_module,
+                "begin_compaction_terminal_commit_in_transaction",
+            )
         )
-    ) == 4
-    assert len(
-        _call_lines(
-            engine_module,
-            "begin_compaction_terminal_commit_in_transaction",
+        == 4
+    )
+    assert (
+        len(
+            _call_lines(
+                engine_module,
+                "begin_compaction_terminal_commit_in_transaction",
+            )
         )
-    ) == 1
-    assert len(
-        _call_lines(
-            proactive_module,
-            "begin_compaction_terminal_commit_in_transaction",
+        == 1
+    )
+    assert (
+        len(
+            _call_lines(
+                proactive_module,
+                "begin_compaction_terminal_commit_in_transaction",
+            )
         )
-    ) == 1
+        == 1
+    )
     assert "terminal_count" not in proactive_source
     assert "terminal_count" not in dispatch_source
     assert "terminal_count" not in engine_source
@@ -771,10 +754,7 @@ def test_compaction_terminal_writer_inventory_uses_only_shared_owner() -> None:
     assert len(governance_operation_writers) == 1
     assert governance_operation_writers[0] > governance_guards[0]
     assert len(governance_precondition_writers) == 2
-    assert all(
-        line < governance_guards[0]
-        for line in governance_precondition_writers
-    )
+    assert all(line < governance_guards[0] for line in governance_precondition_writers)
     assert dispatch_source.count("_precondition_compaction_operation_id(") == 3
 
     reactive_execute = _function_node(
@@ -802,9 +782,7 @@ def test_compaction_terminal_writer_inventory_uses_only_shared_owner() -> None:
     assert len(reactive_guards) == 1
     assert len(reactive_writers) == 3
     assert all(line > reactive_guards[0] for line in reactive_writers)
-    assert engine_source.count(
-        "_reactive_precondition_compaction_operation_id("
-    ) == 2
+    assert engine_source.count("_reactive_precondition_compaction_operation_id(") == 2
 
 
 def _function_node(
@@ -822,8 +800,7 @@ def _function_node(
     matches = tuple(
         node
         for node in ast.walk(module)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == function_name
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
     )
     assert len(matches) == 1
     return matches[0]
@@ -843,12 +820,8 @@ def _call_lines(node: ast.AST, callable_name: str) -> tuple[int, ...]:
         if not isinstance(candidate, ast.Call):
             continue
         function = candidate.func
-        if (
-            isinstance(function, ast.Name)
-            and function.id == callable_name
-        ) or (
-            isinstance(function, ast.Attribute)
-            and function.attr == callable_name
+        if (isinstance(function, ast.Name) and function.id == callable_name) or (
+            isinstance(function, ast.Attribute) and function.attr == callable_name
         ):
             lines.append(candidate.lineno)
     return tuple(sorted(lines))
@@ -870,30 +843,34 @@ def _append_request(
     """
 
     reactive = trigger_source is ContextCompactionTriggerSource.REACTIVE
-    return EventLogStore().append_event(
-        transaction,
-        _event_request(
-            event_id=operation_id,
-            event_type=CONTEXT_COMPACTION_REQUESTED,
-            payload_json=build_context_compaction_requested_payload(
-                operation_id=operation_id,
-                max_compaction_attempts_per_operation=5,
-                trigger_source=trigger_source,
-                budget_reason="test",
-                budget_snapshot_ref="budget:test",
-                input_snapshot_cursor=1,
-                estimator_digest=_DIGEST_A,
-                policy_ref="policy:test",
-                provider_request_id=None,
-                provider_error_ref=None,
-                attempt_id="attempt-test" if reactive else None,
-                execution_id="execution-test" if reactive else None,
-                client_correlation_id=None,
-                frozen_material_list_digest=_DIGEST_B,
-                frozen_material_refs=("event-input-test",),
+    return (
+        EventLogStore()
+        .append_event(
+            transaction,
+            _event_request(
+                event_id=operation_id,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload_json=build_context_compaction_requested_payload(
+                    operation_id=operation_id,
+                    max_compaction_attempts_per_operation=5,
+                    trigger_source=trigger_source,
+                    budget_reason="test",
+                    budget_snapshot_ref="budget:test",
+                    input_snapshot_cursor=1,
+                    estimator_digest=_DIGEST_A,
+                    policy_ref="policy:test",
+                    provider_request_id=None,
+                    provider_error_ref=None,
+                    attempt_id="attempt-test" if reactive else None,
+                    execution_id="execution-test" if reactive else None,
+                    client_correlation_id=None,
+                    frozen_material_list_digest=_DIGEST_B,
+                    frozen_material_refs=("event-input-test",),
+                ),
             ),
-        ),
-    ).row
+        )
+        .row
+    )
 
 
 def _append_terminal(
@@ -920,14 +897,13 @@ def _append_terminal(
             accepted_attempt_number=1,
             compact_artifact_ref=f"artifact:{ordinal}",
             compact_artifact_digest=_DIGEST_A,
-            accepted_candidate=_empty_candidate(),
-            quality_check_result=CompactQualityCheckResultVNext(
-                accepted=True,
-                rejection_reasons=(),
+            accepted_truth=accepted_truth_for_candidate(
+                _candidate(),
+                current_input_ref="event-current-protected",
+                source_refs_by_label={"T1": ("event-input-test",)},
             ),
             budget_after_compact=1,
             prompt_local_label_mapping_refs=("label:test",),
-            source_boundary_refs=("event-input-test",),
             accepted_evidence_mapping_refs=(),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(
@@ -953,14 +929,18 @@ def _append_terminal(
             diagnostic_refs=("diagnostic:test",),
             budget_after_attempted_compact=None,
         )
-    return EventLogStore().append_event(
-        transaction,
-        _event_request(
-            event_id=f"terminal-{ordinal}-{terminal_type.lower()}",
-            event_type=terminal_type,
-            payload_json=payload,
-        ),
-    ).row
+    return (
+        EventLogStore()
+        .append_event(
+            transaction,
+            _event_request(
+                event_id=f"terminal-{ordinal}-{terminal_type.lower()}",
+                event_type=terminal_type,
+                payload_json=payload,
+            ),
+        )
+        .row
+    )
 
 
 def _read_terminal_competition_state(
@@ -1031,21 +1011,25 @@ def _event_request(
     )
 
 
-def _empty_candidate() -> ConversationCompactOutputVNext:
-    """构造无高阶语义的合法 compact candidate。
+def _candidate() -> CompactCandidateV2:
+    """构造最小非空合法 compact candidate。
 
     :returns: 合法 vNext compact candidate。
     :raises Exception: candidate contract 构造失败时透传。
     """
 
-    return ConversationCompactOutputVNext(
-        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-        session_summary=None,
-        evidence_backed_facts=(),
+    return CompactCandidateV2(
+        schema=COMPACT_OUTPUT_SCHEMA_V2,
+        session_summary=CompactSessionSummaryV2(
+            text="保留 terminal 测试状态",
+            source_labels=("T1",),
+        ),
+        evidence_facts=(),
         answer_anchors=(),
         forward_intents=(),
-        reference_continuity_items=(),
+        reference_continuity=(),
         diagnostics=(),
+        explicitly_dropped_sources=(),
     )
 
 

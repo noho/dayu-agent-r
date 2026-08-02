@@ -20,8 +20,7 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    CompactQualityCheckResultVNext,
-    ConversationCompactOutputVNext,
+    CompactAcceptedTruthV2,
 )
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_budget import (
@@ -43,6 +42,7 @@ from dayu.host.durable.errors import (
     HostDurableError,
     HostEventIdentityConflictError,
 )
+
 if TYPE_CHECKING:
     from dayu.host.durable.event_log import EventLogRow, EventLogStore
     from dayu.host.durable.transaction import HostTransaction
@@ -252,9 +252,7 @@ def build_context_budget_evaluated_payload(
         "decision_id": context_budget_evaluated_decision_id(identity),
         "run_id": run_id,
         "candidate_input_cursor": result.candidate_input_cursor,
-        "candidate_input_projection_ref": (
-            result.candidate_input_projection_ref
-        ),
+        "candidate_input_projection_ref": (result.candidate_input_projection_ref),
         "candidate_input_digest": result.candidate_input_digest,
         "sizing_stage": result.stage.value,
         "policy_ref": result.policy_ref,
@@ -271,14 +269,8 @@ def build_context_budget_evaluated_payload(
         "hard_threshold_tokens": result.hard_threshold_tokens,
         "pressure_level": result.pressure_level.value,
         "budget_decision": result.budget_decision.value,
-        "fallback_reason": (
-            result.fallback_reason.value
-            if result.fallback_reason is not None
-            else None
-        ),
-        "anchor_diagnostic": _anchor_diagnostic_payload(
-            result.anchor_diagnostic
-        ),
+        "fallback_reason": (result.fallback_reason.value if result.fallback_reason is not None else None),
+        "anchor_diagnostic": _anchor_diagnostic_payload(result.anchor_diagnostic),
     }
     parse_context_budget_evaluated_payload(payload)
     return payload
@@ -298,9 +290,7 @@ def parse_context_budget_evaluated_payload(
     if not isinstance(payload, Mapping):
         raise TypeError("payload must be mapping")
     _require_exact_fields(payload, _BUDGET_EVALUATED_FIELDS)
-    if _required_text(payload, "schema_version") != (
-        CONTEXT_BUDGET_EVALUATED_SCHEMA_VERSION
-    ):
+    if _required_text(payload, "schema_version") != (CONTEXT_BUDGET_EVALUATED_SCHEMA_VERSION):
         raise ValueError("unsupported context budget evaluated schema")
     decision_id = _required_digest(payload, "decision_id")
     run_id = _required_text(payload, "run_id")
@@ -373,9 +363,7 @@ def parse_context_budget_evaluated_payload(
         "fallback_reason",
         ContextSizingFallbackReason,
     )
-    anchor_diagnostic = _parse_anchor_diagnostic(
-        payload.get("anchor_diagnostic")
-    )
+    anchor_diagnostic = _parse_anchor_diagnostic(payload.get("anchor_diagnostic"))
     identity = ContextBudgetEvaluationIdentity(
         run_id=run_id,
         candidate_input_cursor=candidate_input_cursor,
@@ -387,10 +375,7 @@ def parse_context_budget_evaluated_payload(
     )
     if decision_id != context_budget_evaluated_decision_id(identity):
         raise ValueError("context budget decision identity mismatch")
-    if (
-        conservative_input_tokens > MAX_CONTEXT_TOKEN_COUNT
-        or predicted_input_tokens > MAX_CONTEXT_TOKEN_COUNT
-    ):
+    if conservative_input_tokens > MAX_CONTEXT_TOKEN_COUNT or predicted_input_tokens > MAX_CONTEXT_TOKEN_COUNT:
         raise ValueError("context budget token count exceeds supported range")
     validate_context_threshold_ordering(
         soft_threshold_tokens=soft_threshold_tokens,
@@ -422,10 +407,8 @@ def parse_context_budget_evaluated_payload(
         if fallback_reason is not None or anchor_diagnostic is None:
             raise ValueError("anchored context budget diagnostic mismatch")
         if (
-            anchor_diagnostic.conservative_current_tokens
-            != conservative_input_tokens
-            or anchor_diagnostic.predicted_input_tokens
-            != predicted_input_tokens
+            anchor_diagnostic.conservative_current_tokens != conservative_input_tokens
+            or anchor_diagnostic.predicted_input_tokens != predicted_input_tokens
         ):
             raise ValueError("anchored context budget result mismatch")
     else:
@@ -587,16 +570,13 @@ def load_matching_context_budget_evaluation_in_transaction(
     )
     if (
         _identity_from_payload(parsed) != identity
-        or parsed.candidate_input_projection_ref
-        != candidate_input_projection_ref
+        or parsed.candidate_input_projection_ref != candidate_input_projection_ref
         or parsed.estimator_digest != estimator_digest
         or parsed.conservative_input_tokens != conservative_input_tokens
         or parsed.context_window_size != context_window_size
         or parsed.policy_ref != policy_ref
     ):
-        raise HostDurableError(
-            "source context budget fact does not match frozen manifest"
-        )
+        raise HostDurableError("source context budget fact does not match frozen manifest")
     return parsed
 
 
@@ -711,9 +691,7 @@ def _require_matching_context_budget_row(
         )
         if row.idempotency_key != parsed.decision_id:
             raise ValueError("context budget EventLog idempotency mismatch")
-        if row.event_id != context_budget_evaluated_event_id(
-            _identity_from_payload(parsed)
-        ):
+        if row.event_id != context_budget_evaluated_event_id(_identity_from_payload(parsed)):
             raise ValueError("context budget EventLog event id mismatch")
         if expected is not None and parsed != expected:
             raise ValueError("context budget canonical result mismatch")
@@ -808,19 +786,14 @@ def _anchor_diagnostic_payload(
         "iteration_link_event_id": diagnostic.iteration_link_event_id,
         "usage_event_id": diagnostic.usage_event_id,
         "usage_observation_digest": diagnostic.usage_observation_digest,
-        "iteration_completed_event_id": (
-            diagnostic.iteration_completed_event_id
-        ),
+        "iteration_completed_event_id": (diagnostic.iteration_completed_event_id),
         "usage_anchor_tokens": diagnostic.usage_anchor_tokens,
-        "conservative_anchor_tokens": (
-            diagnostic.conservative_anchor_tokens
-        ),
-        "conservative_current_tokens": (
-            diagnostic.conservative_current_tokens
-        ),
+        "conservative_anchor_tokens": (diagnostic.conservative_anchor_tokens),
+        "conservative_current_tokens": (diagnostic.conservative_current_tokens),
         "signed_delta_tokens": diagnostic.signed_delta_tokens,
         "predicted_input_tokens": diagnostic.predicted_input_tokens,
     }
+
 
 CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 """Context compaction requested canonical event type。"""
@@ -872,6 +845,7 @@ class CompactorProposalManifestReference:
         if self.compactor_engine_run_id.strip() == "":
             raise ValueError("compactor_engine_run_id must be non-empty")
 
+
 _FIELD_TRIGGER_SOURCE = "trigger_source"
 _FIELD_BUDGET_REASON = "budget_reason"
 _FIELD_BUDGET_SNAPSHOT_REF = "budget_snapshot_ref"
@@ -891,26 +865,17 @@ _FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
 _FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS = "prompt_local_label_mapping_refs"
 _FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
+_FIELD_SOURCE_BOUNDARY = "source_boundary"
+_FIELD_REPRESENTED_COVERAGE = "represented_coverage"
+_FIELD_EXPLICITLY_DROPPED_COVERAGE = "explicitly_dropped_coverage"
 _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _FIELD_PROJECTION_SIGNAL = "projection_signal"
 _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF = "accepted_proposal_manifest_ref"
 _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST = "accepted_proposal_manifest_digest"
-_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
-_FIELD_PINNED_STATE_PATCH_CANDIDATE = "pinned_state_patch_candidate"
-_FIELD_PRESERVATION_EVIDENCE = "preservation_evidence"
-_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES = "evidence_backed_fact_candidates"
-_FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES = "minimum_preserve_item_candidates"
-_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_FIELD_DROPPED_RANGES = "dropped_ranges"
-_FIELD_SUMMARIZED_RANGES = "summarized_ranges"
-_FIELD_EVIDENCE_ANCHORS_RETAINED = "evidence_anchors_retained"
-_FIELD_QUALITY_CHECK_RESULT = "quality_check_result"
 _FIELD_BUDGET_AFTER_COMPACT = "budget_after_compact"
 _FIELD_FAILURE_REASON = "failure_reason"
 _FIELD_OPERATION_ID = "operation_id"
-_FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = (
-    "max_compaction_attempts_per_operation"
-)
+_FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = "max_compaction_attempts_per_operation"
 _FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _FIELD_ATTEMPT_NUMBER = "attempt_number"
 _FIELD_FAILURE_CATEGORY = "failure_category"
@@ -944,8 +909,6 @@ _FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
 _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
 _FIELD_FALLBACK_BUDGET_RESULT = "fallback_budget_result"
 _FIELD_FALLBACK_ACTION = "fallback_action"
-_FIELD_ACCEPTED = "accepted"
-_FIELD_REJECTION_REASONS = "rejection_reasons"
 _FIELD_SUCCESSFUL_RESPONSE_IDENTITY = "successful_response_identity"
 _FIELD_EFFECTIVE_PROVIDER = "effective_provider"
 _FIELD_EFFECTIVE_MODEL = "effective_model"
@@ -1007,25 +970,14 @@ _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS,
     _FIELD_SOURCE_BOUNDARY_REFS,
     _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
-    _FIELD_QUALITY_CHECK_RESULT,
+    _FIELD_SOURCE_BOUNDARY,
+    _FIELD_REPRESENTED_COVERAGE,
+    _FIELD_EXPLICITLY_DROPPED_COVERAGE,
     _FIELD_BUDGET_AFTER_COMPACT,
     _FIELD_PROJECTION_SIGNAL,
     _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF,
     _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST,
     _FIELD_SUCCESSFUL_RESPONSE_IDENTITY,
-)
-_COMPACTED_OLD_FIELDS = frozenset(
-    (
-        _FIELD_EPISODE_SUMMARY_CANDIDATE,
-        _FIELD_PINNED_STATE_PATCH_CANDIDATE,
-        _FIELD_PRESERVATION_EVIDENCE,
-        _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES,
-        _FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES,
-        _FIELD_PRESERVED_FACT_REFS,
-        _FIELD_DROPPED_RANGES,
-        _FIELD_SUMMARIZED_RANGES,
-        _FIELD_EVIDENCE_ANCHORS_RETAINED,
-    )
 )
 _FAILED_REQUIRED_FIELDS = (
     _FIELD_OPERATION_ID,
@@ -1126,9 +1078,7 @@ def build_context_compaction_requested_payload(
         raise TypeError("trigger_source must be ContextCompactionTriggerSource")
     payload: Mapping[str, JsonValue] = {
         _FIELD_OPERATION_ID: operation_id,
-        _FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION: (
-            max_compaction_attempts_per_operation
-        ),
+        _FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION: (max_compaction_attempts_per_operation),
         _FIELD_TRIGGER_SOURCE: trigger_source.value,
         _FIELD_BUDGET_REASON: budget_reason,
         _FIELD_BUDGET_SNAPSHOT_REF: budget_snapshot_ref,
@@ -1163,9 +1113,7 @@ def validate_context_compaction_requested_payload(
         payload,
         _FIELD_MAX_COMPACTION_ATTEMPTS_PER_OPERATION,
     )
-    trigger_source = ContextCompactionTriggerSource(
-        _required_text(payload, _FIELD_TRIGGER_SOURCE)
-    )
+    trigger_source = ContextCompactionTriggerSource(_required_text(payload, _FIELD_TRIGGER_SOURCE))
     _required_text(payload, _FIELD_BUDGET_REASON)
     _required_text(payload, _FIELD_BUDGET_SNAPSHOT_REF)
     _required_non_negative_int(payload, _FIELD_INPUT_SNAPSHOT_CURSOR)
@@ -1191,11 +1139,9 @@ def build_context_compacted_payload(
     accepted_attempt_number: int,
     compact_artifact_ref: str,
     compact_artifact_digest: str,
-    accepted_candidate: ConversationCompactOutputVNext,
-    quality_check_result: CompactQualityCheckResultVNext,
+    accepted_truth: CompactAcceptedTruthV2,
     budget_after_compact: int,
     prompt_local_label_mapping_refs: tuple[str, ...],
-    source_boundary_refs: tuple[str, ...],
     accepted_evidence_mapping_refs: tuple[str, ...],
     projection_signal: str,
     successful_response_identity: SuccessfulRunnerResponseIdentity,
@@ -1207,11 +1153,9 @@ def build_context_compacted_payload(
     :param accepted_attempt_number: 被接受的 operation attempt number。
     :param compact_artifact_ref: compact artifact payload / artifact ref。
     :param compact_artifact_digest: compact artifact digest。
-    :param accepted_candidate: 通过 quality check 的 vNext compact output。
-    :param quality_check_result: accepted vNext quality check 结果。
+    :param accepted_truth: Context Governance 唯一验收成功 truth。
     :param budget_after_compact: Host 估算的 compact 后预算。
     :param prompt_local_label_mapping_refs: prompt-local label mapping refs。
-    :param source_boundary_refs: source boundary refs。
     :param accepted_evidence_mapping_refs: accepted evidence mapping refs。
     :param projection_signal: memory projection signal。
     :param successful_response_identity: accepted candidate 对应的实际成功
@@ -1223,10 +1167,9 @@ def build_context_compacted_payload(
     :raises ValueError: payload 结构非法时抛出。
     """
 
-    if not isinstance(accepted_candidate, ConversationCompactOutputVNext):
-        raise TypeError("accepted_candidate must be ConversationCompactOutputVNext")
-    if not isinstance(quality_check_result, CompactQualityCheckResultVNext):
-        raise TypeError("quality_check_result must be CompactQualityCheckResultVNext")
+    if not isinstance(accepted_truth, CompactAcceptedTruthV2):
+        raise TypeError("accepted_truth must be CompactAcceptedTruthV2")
+    accepted_candidate = accepted_truth.candidate
     _validate_successful_response_manifest_binding(
         operation_id=operation_id,
         attempt_number=accepted_attempt_number,
@@ -1240,25 +1183,27 @@ def build_context_compacted_payload(
         _FIELD_COMPACT_ARTIFACT_REF: compact_artifact_ref,
         _FIELD_COMPACT_ARTIFACT_DIGEST: compact_artifact_digest,
         _FIELD_ACCEPTED_CANDIDATE: accepted_candidate.to_json(),
-        _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS: _string_list_json(
-            prompt_local_label_mapping_refs
+        _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS: _string_list_json(prompt_local_label_mapping_refs),
+        _FIELD_SOURCE_BOUNDARY_REFS: _string_list_json(
+            (accepted_truth.current_input_ref, *accepted_truth.covered_source_refs)
         ),
-        _FIELD_SOURCE_BOUNDARY_REFS: _string_list_json(source_boundary_refs),
-        _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS: _string_list_json(
-            accepted_evidence_mapping_refs
-        ),
-        _FIELD_QUALITY_CHECK_RESULT: quality_check_result.to_json(),
+        _FIELD_SOURCE_BOUNDARY: [
+            {
+                "source_label": entry.source_label,
+                "source_kind": entry.source_kind.value,
+                "source_refs": list(entry.source_refs),
+                "readable_text": entry.readable_text,
+            }
+            for entry in accepted_truth.source_boundary
+        ],
+        _FIELD_REPRESENTED_COVERAGE: accepted_truth.represented_coverage.to_json(),
+        _FIELD_EXPLICITLY_DROPPED_COVERAGE: (accepted_truth.explicitly_dropped_coverage.to_json()),
+        _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS: _string_list_json(accepted_evidence_mapping_refs),
         _FIELD_BUDGET_AFTER_COMPACT: budget_after_compact,
         _FIELD_PROJECTION_SIGNAL: projection_signal,
-        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF: (
-            accepted_proposal_manifest_reference.manifest_payload_ref
-        ),
-        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST: (
-            accepted_proposal_manifest_reference.manifest_digest
-        ),
-        _FIELD_SUCCESSFUL_RESPONSE_IDENTITY: _successful_response_identity_json(
-            successful_response_identity
-        ),
+        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF: (accepted_proposal_manifest_reference.manifest_payload_ref),
+        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST: (accepted_proposal_manifest_reference.manifest_digest),
+        _FIELD_SUCCESSFUL_RESPONSE_IDENTITY: _successful_response_identity_json(successful_response_identity),
     }
     validate_context_compacted_payload(payload)
     return payload
@@ -1273,7 +1218,6 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
         summary / patch 缺少 preservation evidence 时抛出。
     """
 
-    _reject_old_compacted_fields(payload)
     _require_exact_fields(payload, _COMPACTED_REQUIRED_FIELDS)
     _required_text(payload, _FIELD_OPERATION_ID)
     _required_positive_int(payload, _FIELD_ACCEPTED_ATTEMPT_NUMBER)
@@ -1284,14 +1228,14 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _required_text_list(payload, _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS)
     _required_text_list(payload, _FIELD_SOURCE_BOUNDARY_REFS)
     _required_text_list(payload, _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
-    _validate_quality_check_result_vnext(payload)
+    _required_mapping_list(payload, _FIELD_SOURCE_BOUNDARY)
+    _required_mapping(payload, _FIELD_REPRESENTED_COVERAGE)
+    _required_mapping(payload, _FIELD_EXPLICITLY_DROPPED_COVERAGE)
     _required_non_negative_int(payload, _FIELD_BUDGET_AFTER_COMPACT)
     _required_text(payload, _FIELD_PROJECTION_SIGNAL)
     _required_text(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF)
     _required_digest(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST)
-    _parse_successful_response_identity(
-        _required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY)
-    )
+    _parse_successful_response_identity(_required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY))
 
 
 def build_context_compaction_failed_payload(
@@ -1381,9 +1325,7 @@ def validate_context_compaction_failed_payload(payload: Mapping[str, JsonValue])
     _validate_failed_fallback_fields(payload, fallback_action=fallback_action)
 
 
-def _validate_failed_fallback_fields(
-    payload: Mapping[str, JsonValue], *, fallback_action: str
-) -> None:
+def _validate_failed_fallback_fields(payload: Mapping[str, JsonValue], *, fallback_action: str) -> None:
     """校验 failed payload 的 fallback 诊断字段一致性。
 
     :param payload: 待校验 JSON payload。
@@ -1429,35 +1371,6 @@ def _validate_optional_ref_digest_pair(
         raise ValueError(f"{ref_field} and {digest_field} must both be set or null")
     if digest is not None and not is_sha256_digest(digest):
         raise ValueError(f"{digest_field} must be sha256 digest")
-
-
-def _reject_old_compacted_fields(payload: Mapping[str, JsonValue]) -> None:
-    """拒绝旧 ``CONTEXT_COMPACTED`` 字段。
-
-    :param payload: compacted payload。
-    :returns: ``None``。
-    :raises ValueError: payload 包含旧字段时抛出。
-    """
-
-    for field_name in _COMPACTED_OLD_FIELDS:
-        if field_name in payload:
-            raise ValueError(f"{field_name} is not supported in vNext compacted payload")
-
-
-def _validate_quality_check_result_vnext(payload: Mapping[str, JsonValue]) -> None:
-    """校验 vNext quality check result。
-
-    :param payload: compacted payload。
-    :returns: ``None``。
-    :raises ValueError: quality result 不是 accepted vNext result 时抛出。
-    """
-
-    result = _required_mapping(payload, _FIELD_QUALITY_CHECK_RESULT)
-    if not _required_bool(result, _FIELD_ACCEPTED):
-        raise ValueError("compacted payload requires accepted quality result")
-    reasons = _required_text_list(result, _FIELD_REJECTION_REASONS)
-    if len(reasons) > 0:
-        raise ValueError("accepted quality result must not include rejection reasons")
 
 
 def build_context_compaction_attempt_rejected_payload(
@@ -1528,29 +1441,21 @@ def build_context_compaction_attempt_rejected_payload(
             proposal_manifest_reference=proposal_manifest_reference,
         )
     elif successful_response_identity is not None:
-        raise ValueError(
-            "successful response identity requires proposal manifest reference"
-        )
+        raise ValueError("successful response identity requires proposal manifest reference")
     payload: Mapping[str, JsonValue] = {
         _FIELD_OPERATION_ID: operation_id,
         _FIELD_ATTEMPT_NUMBER: attempt_number,
         _FIELD_FAILURE_CATEGORY: failure_category,
         _FIELD_REPAIRABLE: repairable,
-        _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS: _string_list_json(
-            runner_attempt_summary_refs
-        ),
+        _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS: _string_list_json(runner_attempt_summary_refs),
         _FIELD_DIAGNOSTIC_REFS: _string_list_json(diagnostic_refs),
         _FIELD_NEXT_POLICY_DECISION: next_policy_decision,
         _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: budget_after_attempted_compact,
         _FIELD_PROPOSAL_MANIFEST_REF: (
-            None
-            if proposal_manifest_reference is None
-            else proposal_manifest_reference.manifest_payload_ref
+            None if proposal_manifest_reference is None else proposal_manifest_reference.manifest_payload_ref
         ),
         _FIELD_PROPOSAL_MANIFEST_DIGEST: (
-            None
-            if proposal_manifest_reference is None
-            else proposal_manifest_reference.manifest_digest
+            None if proposal_manifest_reference is None else proposal_manifest_reference.manifest_digest
         ),
         _FIELD_DIAGNOSTIC_ARTIFACT_REF: diagnostic_artifact_ref,
         _FIELD_DIAGNOSTIC_ARTIFACT_DIGEST: diagnostic_artifact_digest,
@@ -1569,9 +1474,7 @@ def build_context_compaction_attempt_rejected_payload(
         _FIELD_SUCCESSFUL_RESPONSE_IDENTITY: (
             None
             if successful_response_identity is None
-            else _successful_response_identity_json(
-                successful_response_identity
-            )
+            else _successful_response_identity_json(successful_response_identity)
         ),
     }
     validate_context_compaction_attempt_rejected_payload(payload)
@@ -1623,32 +1526,18 @@ def validate_context_compaction_attempt_rejected_payload(
     _validate_optional_digest(payload, _FIELD_OFFENDING_BLOCK_TEXT_DIGEST)
     _optional_non_negative_int(payload, _FIELD_OFFENDING_BLOCK_TEXT_LENGTH)
     _validate_optional_digest(payload, _FIELD_MATERIAL_PACK_DIGEST)
-    successful_response_identity = payload.get(
-        _FIELD_SUCCESSFUL_RESPONSE_IDENTITY
-    )
+    successful_response_identity = payload.get(_FIELD_SUCCESSFUL_RESPONSE_IDENTITY)
     proposal_manifest_ref = _optional_text(payload, _FIELD_PROPOSAL_MANIFEST_REF)
     if successful_response_identity is not None:
         if not isinstance(successful_response_identity, Mapping):
             raise ValueError("successful_response_identity must be mapping or null")
         _parse_successful_response_identity(successful_response_identity)
         if proposal_manifest_ref is None:
-            raise ValueError(
-                "successful response identity requires proposal manifest reference"
-            )
-    if (
-        failure_category in _POST_SUCCESS_REJECTION_CATEGORIES
-        and successful_response_identity is None
-    ):
-        raise ValueError(
-            f"{failure_category} requires successful response identity"
-        )
-    if (
-        failure_category in _NO_SUCCESS_REJECTION_CATEGORIES
-        and successful_response_identity is not None
-    ):
-        raise ValueError(
-            f"{failure_category} forbids successful response identity"
-        )
+            raise ValueError("successful response identity requires proposal manifest reference")
+    if failure_category in _POST_SUCCESS_REJECTION_CATEGORIES and successful_response_identity is None:
+        raise ValueError(f"{failure_category} requires successful response identity")
+    if failure_category in _NO_SUCCESS_REJECTION_CATEGORIES and successful_response_identity is not None:
+        raise ValueError(f"{failure_category} forbids successful response identity")
 
 
 def _validate_successful_response_manifest_binding(
@@ -1676,10 +1565,7 @@ def _validate_successful_response_manifest_binding(
         proposal_manifest_reference,
         CompactorProposalManifestReference,
     ):
-        raise TypeError(
-            "proposal_manifest_reference must be "
-            "CompactorProposalManifestReference"
-        )
+        raise TypeError("proposal_manifest_reference must be CompactorProposalManifestReference")
     if proposal_manifest_reference.compaction_operation_id != operation_id:
         raise ValueError("proposal manifest operation id mismatch")
     if proposal_manifest_reference.compaction_attempt_number != attempt_number:
@@ -1704,10 +1590,7 @@ def _successful_response_identity_json(
     """
 
     if not isinstance(identity, SuccessfulRunnerResponseIdentity):
-        raise TypeError(
-            "successful_response_identity must be "
-            "SuccessfulRunnerResponseIdentity"
-        )
+        raise TypeError("successful_response_identity must be SuccessfulRunnerResponseIdentity")
     request_identity = identity.runner_request_identity
     return {
         _FIELD_EFFECTIVE_PROVIDER: identity.effective_provider,
@@ -1719,13 +1602,9 @@ def _successful_response_identity_json(
             _FIELD_ITERATION_ID: request_identity.iteration_id,
             _FIELD_ITERATION_INDEX: request_identity.iteration_index,
             _FIELD_RUNNER_CALL_INDEX: request_identity.runner_call_index,
-            _FIELD_CLIENT_CORRELATION_ID: (
-                request_identity.client_correlation_id
-            ),
+            _FIELD_CLIENT_CORRELATION_ID: (request_identity.client_correlation_id),
         },
-        _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY: (
-            identity.provider_request_id_availability.value
-        ),
+        _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY: (identity.provider_request_id_availability.value),
         _FIELD_PROVIDER_REQUEST_ID: identity.provider_request_id,
     }
 
@@ -1750,9 +1629,7 @@ def _parse_successful_response_identity(
     attempt_id = _optional_text(runner_payload, _FIELD_ATTEMPT_ID)
     execution_id = _optional_text(runner_payload, _FIELD_EXECUTION_ID)
     if attempt_id is not None or execution_id is not None:
-        raise ValueError(
-            "compactor successful response attempt_id and execution_id must be null"
-        )
+        raise ValueError("compactor successful response attempt_id and execution_id must be null")
     request_identity = build_runner_request_identity(
         run_id=_required_text(runner_payload, _FIELD_RUN_ID),
         attempt_id=attempt_id,
@@ -1772,12 +1649,8 @@ def _parse_successful_response_identity(
         _FIELD_CLIENT_CORRELATION_ID,
     )
     if client_correlation_id != request_identity.client_correlation_id:
-        raise ValueError(
-            "runner_request_identity.client_correlation_id is not canonical"
-        )
-    availability = ProviderRequestIdAvailability(
-        _required_text(payload, _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY)
-    )
+        raise ValueError("runner_request_identity.client_correlation_id is not canonical")
+    availability = ProviderRequestIdAvailability(_required_text(payload, _FIELD_PROVIDER_REQUEST_ID_AVAILABILITY))
     return SuccessfulRunnerResponseIdentity(
         effective_provider=_required_text(payload, _FIELD_EFFECTIVE_PROVIDER),
         effective_model=_required_text(payload, _FIELD_EFFECTIVE_MODEL),
@@ -1834,9 +1707,7 @@ def _require_exact_fields(
     _require_fields(payload, fields)
     unexpected = frozenset(payload) - frozenset(fields)
     if unexpected:
-        raise ValueError(
-            "unexpected payload fields: " + ", ".join(sorted(unexpected))
-        )
+        raise ValueError("unexpected payload fields: " + ", ".join(sorted(unexpected)))
 
 
 def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
@@ -1882,9 +1753,7 @@ def _required_digest(payload: Mapping[str, JsonValue], field_name: str) -> str:
     return value
 
 
-def _validate_optional_digest(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> None:
+def _validate_optional_digest(payload: Mapping[str, JsonValue], field_name: str) -> None:
     """校验可选 sha256 digest 字段。
 
     :param payload: JSON payload。
@@ -1898,9 +1767,7 @@ def _validate_optional_digest(
         raise ValueError(f"{field_name} must be sha256 digest")
 
 
-def _required_non_negative_int(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> int:
+def _required_non_negative_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
     """读取必填非负整数字段。
 
     :param payload: JSON payload。
@@ -1917,9 +1784,7 @@ def _required_non_negative_int(
     return value
 
 
-def _required_positive_int(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> int:
+def _required_positive_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
     """读取必填正整数字段。
 
     :param payload: JSON payload。
@@ -1936,9 +1801,7 @@ def _required_positive_int(
     return value
 
 
-def _required_int(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> int:
+def _required_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
     """读取必填严格整数字段。
 
     :param payload: JSON payload。
@@ -1997,9 +1860,7 @@ def _optional_enum(
         raise ValueError(f"{field_name} has unsupported value") from exc
 
 
-def _optional_non_negative_int(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> int | None:
+def _optional_non_negative_int(payload: Mapping[str, JsonValue], field_name: str) -> int | None:
     """读取可选非负整数字段。
 
     :param payload: JSON payload。
@@ -2033,9 +1894,7 @@ def _required_bool(payload: Mapping[str, JsonValue], field_name: str) -> bool:
     return value
 
 
-def _required_mapping(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> Mapping[str, JsonValue]:
+def _required_mapping(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
     """读取必填 JSON object 字段。
 
     :param payload: JSON payload。
@@ -2050,9 +1909,7 @@ def _required_mapping(
     return value
 
 
-def _required_list(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> list[JsonValue]:
+def _required_list(payload: Mapping[str, JsonValue], field_name: str) -> list[JsonValue]:
     """读取必填 JSON array 字段。
 
     :param payload: JSON payload。
@@ -2067,9 +1924,7 @@ def _required_list(
     return value
 
 
-def _required_mapping_list(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[Mapping[str, JsonValue], ...]:
+def _required_mapping_list(payload: Mapping[str, JsonValue], field_name: str) -> tuple[Mapping[str, JsonValue], ...]:
     """读取必填 JSON object array 字段。
 
     :param payload: JSON payload。
@@ -2087,9 +1942,7 @@ def _required_mapping_list(
     return tuple(mappings)
 
 
-def _required_text_list(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
+def _required_text_list(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
     """读取必填非空文本 array 字段。
 
     :param payload: JSON payload。
@@ -2105,9 +1958,7 @@ def _required_text_list(
     return tuple(values)
 
 
-def _optional_text_list(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
+def _optional_text_list(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
     """读取可选非空文本 array 字段。
 
     :param payload: JSON payload。

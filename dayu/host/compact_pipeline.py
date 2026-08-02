@@ -9,7 +9,7 @@ Run / Attempt lifecycle。
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from dayu.contracts.json_value import JsonValue
@@ -26,6 +26,7 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     build_compact_material_pack,
+    conversation_compact_input_vnext_from_material_pack,
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
     retained_previous_compacted_view_labels_for_recovery,
@@ -38,18 +39,17 @@ from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.compact_payload import (
     accepted_evidence_mapping_refs_for_candidate,
     prompt_local_label_mapping_refs,
-    source_boundary_refs,
 )
 from dayu.host.compaction import (
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CompactReadableViewVNext,
-    CompactQualityCheckResultVNext,
+    PreviousCompactReadableView,
+    CompactAcceptedTruthV2,
     CompactSegmentSelection,
     CompactSegmentTrigger,
     CompactionRequest,
-    ConversationCompactOutputVNext,
+    CompactInputV2,
     validate_previous_compacted_view_pair,
 )
 from dayu.host.context_budget import BudgetEstimate
@@ -166,6 +166,7 @@ class CompactPipelineCompactArtifactView(Protocol):
 
         ...
 
+
 class CompactPipelineAttemptDispatchSnapshot(Protocol):
     """pipeline-owned second-read provider hook 的 attempt snapshot 协议。"""
 
@@ -199,7 +200,7 @@ class CompactPipelineSourceSnapshot:
     source_boundary: CompactMaterialSourceBoundary
     material_view_digest: str
     material_source_refs: tuple[str, ...]
-    previous_compacted_readable_view: CompactReadableViewVNext | None = None
+    previous_compacted_readable_view: PreviousCompactReadableView | None = None
 
     def __post_init__(self) -> None:
         """校验 source snapshot 中 previous blocks 与 typed view 的同源 pair。
@@ -263,8 +264,7 @@ class CompactPipelineAcceptedPayloadInput:
     """构造 ``CONTEXT_COMPACTED`` payload 所需的 semantic input。
 
     :param request: accepted compaction request。
-    :param candidate: accepted candidate。
-    :param quality: quality check result。
+    :param accepted_truth: Context Governance final accepted truth。
     :param budget_after_compact: compact 后预算估算。
     :param accepted_attempt_number: accepted proposal attempt number。
     :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
@@ -272,21 +272,30 @@ class CompactPipelineAcceptedPayloadInput:
     :param successful_response_identity: accepted candidate 对应的实际成功
         Runner call 身份。
     :param prompt_local_label_mapping_refs: prompt-local label mapping refs。
-    :param source_boundary_refs: source boundary refs。
     :param accepted_evidence_mapping_refs: candidate 绑定的 accepted evidence refs。
     """
 
     request: CompactionRequest
-    candidate: ConversationCompactOutputVNext
-    quality: CompactQualityCheckResultVNext
+    accepted_truth: CompactAcceptedTruthV2
     budget_after_compact: int
     accepted_attempt_number: int
     accepted_proposal_manifest_ref: str | None
     accepted_proposal_manifest_digest: str | None
     successful_response_identity: SuccessfulRunnerResponseIdentity
     prompt_local_label_mapping_refs: tuple[str, ...]
-    source_boundary_refs: tuple[str, ...]
     accepted_evidence_mapping_refs: tuple[str, ...]
+
+    @property
+    def source_boundary_refs(self) -> tuple[str, ...]:
+        """从 accepted truth 派生 current+covered canonical refs。
+
+        :returns: 与 artifact/event 相同的 source boundary refs。
+        """
+
+        return (
+            self.accepted_truth.current_input_ref,
+            *self.accepted_truth.covered_source_refs,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,10 +428,7 @@ def compact_pipeline_source_snapshot_from_pre_dispatch_view(
         raise TypeError("run must be RunRow")
     if not isinstance(material_view, PreDispatchCompactMaterialView):
         raise TypeError("material_view must be PreDispatchCompactMaterialView")
-    if (
-        run.input_event_sequence
-        != material_view.source_boundary.current_input_event_sequence
-    ):
+    if run.input_event_sequence != material_view.source_boundary.current_input_event_sequence:
         raise ValueError("run input event sequence does not match material boundary")
     block_ids = tuple(block.block_id for block in material_view.material_blocks)
     return CompactPipelineSourceSnapshot(
@@ -506,9 +512,7 @@ def build_tier_recovery_request_plans(
         memory_snapshot_cursor=None,
         policy_digest=root_request_plan.selected_segment.policy_digest,
         material_blocks=source_snapshot.material_blocks,
-        selected_recent_window_turn_floor=(
-            memory_policy.selected_recent_window_turn_floor
-        ),
+        selected_recent_window_turn_floor=(memory_policy.selected_recent_window_turn_floor),
         max_selected_size_units=memory_policy.fallback_selected_recent_window_char_cap,
         max_selected_item_count=memory_policy.fallback_selected_recent_window_item_cap,
     )
@@ -526,15 +530,11 @@ def build_tier_recovery_request_plans(
             ),
         )
     ]
-    retained_labels = retained_previous_compacted_view_labels_for_recovery(
-        source_snapshot.previous_compacted_view
-    )
-    degraded_blocks, degraded_readable_view = (
-        transform_previous_compacted_view_pair_for_recovery(
-            blocks=source_snapshot.previous_compacted_view,
-            readable_view=source_snapshot.previous_compacted_readable_view,
-            retained_block_labels=retained_labels,
-        )
+    retained_labels = retained_previous_compacted_view_labels_for_recovery(source_snapshot.previous_compacted_view)
+    degraded_blocks, degraded_readable_view = transform_previous_compacted_view_pair_for_recovery(
+        blocks=source_snapshot.previous_compacted_view,
+        readable_view=source_snapshot.previous_compacted_readable_view,
+        retained_block_labels=retained_labels,
     )
     if len(degraded_blocks) > 0 and degraded_blocks != source_snapshot.previous_compacted_view:
         plans.append(
@@ -545,20 +545,16 @@ def build_tier_recovery_request_plans(
                     selected_segment=bounded_selection,
                     previous_compacted_view=degraded_blocks,
                     previous_compacted_readable_view=degraded_readable_view,
-                    budget_before_compact=(
-                        root_request_plan.request.budget_before_compact
-                    ),
+                    budget_before_compact=(root_request_plan.request.budget_before_compact),
                     attempt_id=root_request_plan.request.attempt_id,
                     execution_id=root_request_plan.request.execution_id,
                 ),
             )
         )
-    empty_previous_blocks, empty_previous_readable_view = (
-        transform_previous_compacted_view_pair_for_recovery(
-            blocks=source_snapshot.previous_compacted_view,
-            readable_view=source_snapshot.previous_compacted_readable_view,
-            retained_block_labels=frozenset(),
-        )
+    empty_previous_blocks, empty_previous_readable_view = transform_previous_compacted_view_pair_for_recovery(
+        blocks=source_snapshot.previous_compacted_view,
+        readable_view=source_snapshot.previous_compacted_readable_view,
+        retained_block_labels=frozenset(),
     )
     plans.append(
         CompactPipelineRecoveryRequestPlan(
@@ -595,25 +591,34 @@ def build_reactive_pass_queue_plan(
             root_request_plan=root_request_plan,
             pass_requests=(),
         )
+    empty_previous_blocks, empty_previous_readable_view = transform_previous_compacted_view_pair_for_recovery(
+        blocks=source_snapshot.previous_compacted_view,
+        readable_view=source_snapshot.previous_compacted_readable_view,
+        retained_block_labels=frozenset(),
+    )
     requests: list[CompactionRequest] = []
-    for block_id in selected:
+    for index, block_id in enumerate(selected):
         segment = _single_block_segment_selection(
             root_request=root_request_plan.request,
             block_id=block_id,
             material_blocks=source_snapshot.material_blocks,
         )
+        pass_request = _request_plan_from_segment(
+            source_snapshot=source_snapshot,
+            selected_segment=segment,
+            previous_compacted_view=(source_snapshot.previous_compacted_view if index == 0 else empty_previous_blocks),
+            previous_compacted_readable_view=(
+                source_snapshot.previous_compacted_readable_view if index == 0 else empty_previous_readable_view
+            ),
+            budget_before_compact=(root_request_plan.request.budget_before_compact),
+            attempt_id=root_request_plan.request.attempt_id,
+            execution_id=root_request_plan.request.execution_id,
+        ).request
         requests.append(
-            _request_plan_from_segment(
-                source_snapshot=source_snapshot,
-                selected_segment=segment,
-                previous_compacted_view=source_snapshot.previous_compacted_view,
-                previous_compacted_readable_view=source_snapshot.previous_compacted_readable_view,
-                budget_before_compact=(
-                    root_request_plan.request.budget_before_compact
-                ),
-                attempt_id=root_request_plan.request.attempt_id,
-                execution_id=root_request_plan.request.execution_id,
-            ).request
+            _bind_reactive_pass_to_root_labels(
+                request=pass_request,
+                root_input=conversation_compact_input_vnext_from_material_pack(root_request_plan.request.material_pack),
+            )
         )
     return CompactPipelinePassQueuePlan(
         root_request_plan=root_request_plan,
@@ -621,11 +626,83 @@ def build_reactive_pass_queue_plan(
     )
 
 
+def _bind_reactive_pass_to_root_labels(
+    *,
+    request: CompactionRequest,
+    root_input: CompactInputV2,
+) -> CompactionRequest:
+    """把单 pass 的局部编号重绑定到 immutable root labels。
+
+    :param request: 单 block pass request。
+    :param root_input: operation root strict input。
+    :returns: source identity 不变、labels 与 root 一致的 pass request。
+    :raises ValueError: pass source 无法唯一绑定到 root 时抛出。
+    """
+
+    pass_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    root_by_identity = {
+        (entry.source_kind, entry.source_refs, entry.readable_text): entry for entry in root_input.source_boundary
+    }
+    label_mapping: dict[str, str] = {}
+    for entry in pass_input.source_boundary:
+        root_entry = root_by_identity.get((entry.source_kind, entry.source_refs, entry.readable_text))
+        if root_entry is None:
+            raise ValueError("reactive pass source is not present in root boundary")
+        label_mapping[entry.source_label] = root_entry.source_label
+    material_pack = request.material_pack
+    rebound_pack = replace(
+        material_pack,
+        previous_compacted_view=tuple(
+            replace(
+                block,
+                block_label=label_mapping[block.block_label],
+            )
+            for block in material_pack.previous_compacted_view
+        ),
+        trace_material=tuple(
+            replace(
+                block,
+                block_label=label_mapping[block.block_label],
+            )
+            for block in material_pack.trace_material
+        ),
+        evidence_material=tuple(
+            replace(
+                block,
+                evidence_label=label_mapping[block.evidence_label],
+            )
+            for block in material_pack.evidence_material
+        ),
+        answer_material=tuple(
+            replace(
+                block,
+                block_label=label_mapping[block.block_label],
+            )
+            for block in material_pack.answer_material
+        ),
+        provenance_map={
+            label_mapping.get(label, label): replace(
+                provenance,
+                label=label_mapping.get(label, label),
+            )
+            for label, provenance in material_pack.provenance_map.items()
+        },
+    )
+    rebound_request = replace(request, material_pack=rebound_pack)
+    rebound_input = conversation_compact_input_vnext_from_material_pack(rebound_request.material_pack)
+    expected_entries = tuple(
+        root_by_identity[(entry.source_kind, entry.source_refs, entry.readable_text)]
+        for entry in pass_input.source_boundary
+    )
+    if rebound_input.source_boundary != expected_entries:
+        raise ValueError("reactive pass root label binding is inconsistent")
+    return rebound_request
+
+
 def build_compacted_payload_input(
     *,
     request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
-    quality: CompactQualityCheckResultVNext,
+    accepted_truth: CompactAcceptedTruthV2,
     budget_after_compact: int,
     accepted_attempt_number: int,
     accepted_proposal_manifest_ref: str | None,
@@ -635,8 +712,7 @@ def build_compacted_payload_input(
     """构造 accepted compact payload semantic input。
 
     :param request: accepted compaction request。
-    :param candidate: accepted vNext candidate。
-    :param quality: quality check result。
+    :param accepted_truth: Context Governance final accepted truth。
     :param budget_after_compact: compact 后预算估算。
     :param accepted_attempt_number: accepted proposal attempt number。
     :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
@@ -646,20 +722,19 @@ def build_compacted_payload_input(
     :returns: accepted payload input。
     """
 
+    accepted_truth.validate_input_binding(conversation_compact_input_vnext_from_material_pack(request.material_pack))
     return CompactPipelineAcceptedPayloadInput(
         request=request,
-        candidate=candidate,
-        quality=quality,
+        accepted_truth=accepted_truth,
         budget_after_compact=budget_after_compact,
         accepted_attempt_number=accepted_attempt_number,
         accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
         accepted_proposal_manifest_digest=accepted_proposal_manifest_digest,
         successful_response_identity=successful_response_identity,
         prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
-        source_boundary_refs=source_boundary_refs(request),
         accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(
             request,
-            candidate,
+            accepted_truth.candidate,
         ),
     )
 
@@ -697,9 +772,7 @@ def build_fallback_decision_input(
             material_blocks=_fallback_material_blocks(source_snapshot),
             current_input_ref=source_snapshot.current_input_ref,
             input_cursor=source_snapshot.input_event_sequence,
-            selected_recent_window_turn_floor=(
-                memory_policy.selected_recent_window_turn_floor
-            ),
+            selected_recent_window_turn_floor=(memory_policy.selected_recent_window_turn_floor),
             trigger_source=source_snapshot.trigger_source,
         )
         budget = estimate_recent_window_fallback_budget(
@@ -729,9 +802,7 @@ def build_fallback_decision_input(
             fallback_policy_decision=FALLBACK_POLICY_DECISION_SELECTION_FAILED,
             fallback_input_window=window,
             fallback_input_digest=fallback_window_digest(window),
-            fallback_budget_result=build_selection_failure_budget_payload(
-                policy_ref=context_policy.policy_ref
-            ),
+            fallback_budget_result=build_selection_failure_budget_payload(policy_ref=context_policy.policy_ref),
             fallback_action=FALLBACK_ACTION_FAIL_CLOSED,
         )
         return CompactPipelineFallbackDecisionInput(
@@ -741,11 +812,7 @@ def build_fallback_decision_input(
             fallback_handoff=None,
             action_hint=FALLBACK_ACTION_FAIL_CLOSED,
         )
-    action = (
-        FALLBACK_ACTION_DISPATCH
-        if budget.hard_budget_passed
-        else FALLBACK_ACTION_FAIL_CLOSED
-    )
+    action = FALLBACK_ACTION_DISPATCH if budget.hard_budget_passed else FALLBACK_ACTION_FAIL_CLOSED
     window = selection.to_window_payload()
     failed = CompactPipelineFailedPayloadInput(
         operation_id=operation_id,
@@ -768,12 +835,8 @@ def build_fallback_decision_input(
             material_blocks=selection.selected_blocks,
             source_refs=selection.source_refs,
             fallback_input_digest=selection.digest,
-            selected_material_view_digest=selected_material_view_digest(
-                selection.selected_blocks
-            ),
-            selected_recent_window_turn_floor=(
-                selection.selected_recent_window_turn_floor
-            ),
+            selected_material_view_digest=selected_material_view_digest(selection.selected_blocks),
+            selected_recent_window_turn_floor=(selection.selected_recent_window_turn_floor),
             selected_raw_turn_count=_raw_turn_count(selection.selected_blocks),
         ),
         action_hint=action,
@@ -831,7 +894,7 @@ def _request_plan_from_segment(
     source_snapshot: CompactPipelineSourceSnapshot,
     selected_segment: CompactSegmentSelection,
     previous_compacted_view: tuple[CompactMaterialBlock, ...],
-    previous_compacted_readable_view: CompactReadableViewVNext | None,
+    previous_compacted_readable_view: PreviousCompactReadableView | None,
     budget_before_compact: BudgetEstimate,
     attempt_id: str | None,
     execution_id: str | None,
@@ -880,9 +943,7 @@ def _request_plan_from_segment(
         material_pack=material_pack,
         segment_selection=selected_segment,
         evidence_backed_fact_refs=selected_evidence_refs,
-        recent_raw_turn_refs=_dedupe_texts(
-            (source_snapshot.current_input_ref, *selected_raw_turn_refs)
-        ),
+        recent_raw_turn_refs=_dedupe_texts((source_snapshot.current_input_ref, *selected_raw_turn_refs)),
         older_raw_turn_refs=selected_source_refs,
         existing_episode_summary_refs=(),
         budget_before_compact=budget_before_compact,
@@ -929,11 +990,7 @@ def _single_block_segment_selection(
     known = {block.block_id for block in material_blocks}
     if block_id not in known:
         raise ValueError("reactive pass block_id is not in material list")
-    excluded = {
-        block.block_id: _REACTIVE_NOT_IN_PASS_REASON
-        for block in material_blocks
-        if block.block_id != block_id
-    }
+    excluded = {block.block_id: _REACTIVE_NOT_IN_PASS_REASON for block in material_blocks if block.block_id != block_id}
     return CompactSegmentSelection(
         selected_block_ids=(block_id,),
         excluded_protected_ids=(),
@@ -1054,9 +1111,7 @@ def _dedupe_texts(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _fallback_selection_failure_reason(
-    error: Exception, *, compact_failure_reason: str
-) -> str:
+def _fallback_selection_failure_reason(error: Exception, *, compact_failure_reason: str) -> str:
     """构造 fallback selection failure reason。
 
     :param error: 捕获的 selection / budget 异常。
@@ -1064,15 +1119,10 @@ def _fallback_selection_failure_reason(
     :returns: 结构化 reason 文本。
     """
 
-    return (
-        "compact_pipeline_fallback_selection_failed:"
-        f"{compact_failure_reason}:{type(error).__name__}"
-    )
+    return f"compact_pipeline_fallback_selection_failed:{compact_failure_reason}:{type(error).__name__}"
 
 
-def _raw_tail_block_represented_by_memory(
-    block: RunInputMaterialBlock, memory: MemorySnapshotView
-) -> bool:
+def _raw_tail_block_represented_by_memory(block: RunInputMaterialBlock, memory: MemorySnapshotView) -> bool:
     """判断 raw-tail block 是否已由 memory selected recent window 表示。
 
     :param block: raw-tail material block。
@@ -1114,9 +1164,7 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
         )
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
         if block.accepted_tool_evidence is None:
-            raise HostDurableError(
-                "accepted tool evidence LLM material is missing"
-            )
+            raise HostDurableError("accepted tool evidence LLM material is missing")
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
             content=(

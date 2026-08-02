@@ -15,10 +15,8 @@ from typing import Protocol, TypeAlias, TypeVar
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compact_payload import ContextCompactedSemanticPayload
 from dayu.host.compaction import (
-    ConversationCompactOutputVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityReasonVNext,
+    CompactCandidateV2,
+    CompactForwardIntentStatusV2,
 )
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
@@ -157,9 +155,7 @@ class MemoryEvidenceBackedFactKind(StrEnum):
 class MemoryDiagnosticReason(StrEnum):
     """Memory diagnostic 的结构化原因。"""
 
-    ACCEPTED_EVIDENCE_WITHOUT_FACT_CANDIDATE = (
-        "accepted_evidence_without_fact_candidate"
-    )
+    ACCEPTED_EVIDENCE_WITHOUT_FACT_CANDIDATE = "accepted_evidence_without_fact_candidate"
     INLINE_DELTA_REPAIR_INCLUDED = "inline_delta_repair_included"
     SNAPSHOT_MISSING = "snapshot_missing"
     SNAPSHOT_DAMAGED = "snapshot_damaged"
@@ -407,7 +403,7 @@ class ReferenceContinuityItem:
 
     item_id: str
     text: str
-    reason: ReferenceContinuityReasonVNext
+    reason: str
     source_refs: tuple[str, ...]
     event_id: str
     event_sequence: int
@@ -422,8 +418,7 @@ class ReferenceContinuityItem:
 
         _require_non_empty(self.item_id, "item_id")
         _require_non_empty(self.text, "text")
-        if not isinstance(self.reason, ReferenceContinuityReasonVNext):
-            raise ValueError("reason must be ReferenceContinuityReasonVNext")
+        _require_non_empty(self.reason, "reason")
         _require_non_empty_items(self.source_refs, "source_refs")
         _require_non_empty(self.event_id, "event_id")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -597,9 +592,9 @@ class ForwardIntent:
     """
 
     item_id: str
-    intent_type: ForwardIntentTypeVNext
+    intent_type: str
     text: str
-    status: ForwardIntentStatusVNext
+    status: CompactForwardIntentStatusV2
     source_refs: tuple[str, ...]
     event_id: str
     event_sequence: int
@@ -613,11 +608,10 @@ class ForwardIntent:
         """
 
         _require_non_empty(self.item_id, "item_id")
-        if not isinstance(self.intent_type, ForwardIntentTypeVNext):
-            raise ValueError("intent_type must be ForwardIntentTypeVNext")
+        _require_non_empty(self.intent_type, "intent_type")
         _require_non_empty(self.text, "text")
-        if not isinstance(self.status, ForwardIntentStatusVNext):
-            raise ValueError("status must be ForwardIntentStatusVNext")
+        if not isinstance(self.status, CompactForwardIntentStatusV2):
+            raise ValueError("status must be CompactForwardIntentStatusV2")
         _require_non_empty_items(self.source_refs, "source_refs")
         _require_non_empty(self.event_id, "event_id")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -846,32 +840,16 @@ class MemoryProjectionPolicy:
             "max_delta_repair_events",
         )
         _require_non_empty(self.policy_ref, "policy_ref")
-        if self.fallback_selected_recent_window_item_cap < (
-            self.selected_recent_window_turn_floor
-        ):
-            raise ValueError(
-                "fallback_selected_recent_window_item_cap must cover selected_recent_window_turn_floor"
-            )
-        if (
-            self.fallback_selected_recent_window_item_cap
-            > self.selected_recent_window_item_cap
-        ):
-            raise ValueError(
-                "fallback_selected_recent_window_item_cap must not exceed selected_recent_window_item_cap"
-            )
-        if (
-            self.fallback_selected_recent_window_char_cap
-            > self.selected_recent_window_char_cap
-        ):
-            raise ValueError(
-                "fallback_selected_recent_window_char_cap must not exceed selected_recent_window_char_cap"
-            )
+        if self.fallback_selected_recent_window_item_cap < (self.selected_recent_window_turn_floor):
+            raise ValueError("fallback_selected_recent_window_item_cap must cover selected_recent_window_turn_floor")
+        if self.fallback_selected_recent_window_item_cap > self.selected_recent_window_item_cap:
+            raise ValueError("fallback_selected_recent_window_item_cap must not exceed selected_recent_window_item_cap")
+        if self.fallback_selected_recent_window_char_cap > self.selected_recent_window_char_cap:
+            raise ValueError("fallback_selected_recent_window_char_cap must not exceed selected_recent_window_char_cap")
         if self.evidence_fact_floor > self.evidence_fact_item_cap:
             raise ValueError("evidence_fact_floor must not exceed evidence_fact_item_cap")
         if self.reference_continuity_item_floor > self.reference_continuity_item_cap:
-            raise ValueError(
-                "reference_continuity_item_floor must not exceed reference_continuity_item_cap"
-            )
+            raise ValueError("reference_continuity_item_floor must not exceed reference_continuity_item_cap")
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,16 +973,11 @@ class MemoryProjectionEvent:
                 raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
         elif self.compacted_semantics is not None:
             raise ValueError("non-compact event must not carry compacted_semantics")
-        if (
-            self.accepted_tool_evidence is not None
-            and not isinstance(
-                self.accepted_tool_evidence,
-                AcceptedToolEvidenceLLMMaterial,
-            )
+        if self.accepted_tool_evidence is not None and not isinstance(
+            self.accepted_tool_evidence,
+            AcceptedToolEvidenceLLMMaterial,
         ):
-            raise ValueError(
-                "accepted_tool_evidence must be AcceptedToolEvidenceLLMMaterial"
-            )
+            raise ValueError("accepted_tool_evidence must be AcceptedToolEvidenceLLMMaterial")
         _require_optional_non_empty(
             self.assistant_final_answer_text,
             "assistant_final_answer_text",
@@ -1026,12 +999,8 @@ def default_memory_projection_policy(
         selected_recent_window_item_cap=DEFAULT_SELECTED_RECENT_WINDOW_ITEM_CAP,
         selected_recent_window_char_cap=DEFAULT_SELECTED_RECENT_WINDOW_CHAR_CAP,
         selected_recent_window_turn_floor=DEFAULT_SELECTED_RECENT_WINDOW_TURN_FLOOR,
-        fallback_selected_recent_window_item_cap=(
-            DEFAULT_FALLBACK_SELECTED_RECENT_WINDOW_ITEM_CAP
-        ),
-        fallback_selected_recent_window_char_cap=(
-            DEFAULT_FALLBACK_SELECTED_RECENT_WINDOW_CHAR_CAP
-        ),
+        fallback_selected_recent_window_item_cap=(DEFAULT_FALLBACK_SELECTED_RECENT_WINDOW_ITEM_CAP),
+        fallback_selected_recent_window_char_cap=(DEFAULT_FALLBACK_SELECTED_RECENT_WINDOW_CHAR_CAP),
         evidence_fact_item_cap=DEFAULT_EVIDENCE_FACT_ITEM_CAP,
         evidence_fact_char_cap=DEFAULT_EVIDENCE_FACT_CHAR_CAP,
         evidence_fact_floor=DEFAULT_EVIDENCE_FACT_FLOOR,
@@ -1043,9 +1012,7 @@ def default_memory_projection_policy(
         reference_continuity_item_cap=DEFAULT_REFERENCE_CONTINUITY_ITEM_CAP,
         reference_continuity_char_cap=DEFAULT_REFERENCE_CONTINUITY_CHAR_CAP,
         reference_continuity_item_floor=DEFAULT_REFERENCE_CONTINUITY_ITEM_FLOOR,
-        max_lag_events_for_inline_delta=(
-            DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA
-        ),
+        max_lag_events_for_inline_delta=(DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA),
         max_delta_repair_events=DEFAULT_MEMORY_MAX_DELTA_REPAIR_EVENTS,
         policy_ref=DEFAULT_MEMORY_POLICY_REF,
     )
@@ -1247,6 +1214,7 @@ def project_conversation_memory_event(
     intents = base.forward_intent_memory.intents
     diagnostics = base.diagnostics
     latest_compaction_event_ref = base.latest_compaction_event_ref
+    committed_compact_applied = False
 
     if event.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
         selected = _replace_item_by_id(selected, _selected_user_item(event))
@@ -1263,69 +1231,58 @@ def project_conversation_memory_event(
         if compacted_semantics is None:
             raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
         accepted_candidate = compacted_semantics.accepted_candidate
+        _validate_committed_candidate_policy(accepted_candidate, policy)
+        committed_compact_applied = True
         selected = _selected_recent_after_compaction(
             selected,
             current_input_ref=compacted_semantics.current_input_ref,
             compacted_source_refs=compacted_semantics.compacted_source_refs,
         )
         latest_compaction_event_ref = event.event_id
-        session_summary, summary_diagnostics = _session_summary_from_accepted_event(
+        session_summary = _session_summary_from_accepted_event(
             event,
             accepted_candidate,
-            policy,
-            previous_summary=session_summary,
         )
-        diagnostics = diagnostics + summary_diagnostics
-        new_facts, fact_diagnostics = _facts_from_accepted_event(
+        facts = _facts_from_accepted_event(
             event,
             compacted_semantics,
-            policy,
         )
-        diagnostics = diagnostics + fact_diagnostics
-        facts = _merge_facts(facts, new_facts)
-        anchors = _merge_by_id(
-            anchors,
-            _answer_anchors_from_accepted_event(event, accepted_candidate),
-        )
-        intents = _merge_by_id(
-            intents,
-            _forward_intents_from_accepted_event(event, accepted_candidate),
-        )
-        reference_items = _merge_by_id(
-            reference_items,
-            _reference_continuity_from_accepted_event(event, accepted_candidate),
+        anchors = _answer_anchors_from_accepted_event(event, accepted_candidate)
+        intents = _forward_intents_from_accepted_event(event, accepted_candidate)
+        reference_items = _reference_continuity_from_accepted_event(
+            event,
+            accepted_candidate,
         )
     else:
-        diagnostics = diagnostics + (
-            _unsupported_event_type_diagnostic(event, policy_digest=policy_digest),
-        )
+        diagnostics = diagnostics + (_unsupported_event_type_diagnostic(event, policy_digest=policy_digest),)
 
     selected = _limit_selected_recent_window(selected, policy=policy)
-    recent_evidence = tuple(
-        item
-        for item in selected
-        if item.role is SelectedRecentWindowRole.EVIDENCE
-    )
-    facts, fact_budget_diagnostics = _limit_facts(
-        facts,
-        policy=policy,
-        policy_digest=policy_digest,
-    )
-    reference_items, reference_budget_diagnostics = _limit_reference_items(
-        reference_items,
-        policy=policy,
-        policy_digest=policy_digest,
-    )
-    anchors, anchor_budget_diagnostics = _limit_anchors(
-        anchors,
-        policy=policy,
-        policy_digest=policy_digest,
-    )
-    intents, intent_budget_diagnostics = _limit_intents(
-        intents,
-        policy=policy,
-        policy_digest=policy_digest,
-    )
+    recent_evidence = tuple(item for item in selected if item.role is SelectedRecentWindowRole.EVIDENCE)
+    fact_budget_diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    reference_budget_diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    anchor_budget_diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    intent_budget_diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    if not committed_compact_applied:
+        facts, fact_budget_diagnostics = _limit_facts(
+            facts,
+            policy=policy,
+            policy_digest=policy_digest,
+        )
+        reference_items, reference_budget_diagnostics = _limit_reference_items(
+            reference_items,
+            policy=policy,
+            policy_digest=policy_digest,
+        )
+        anchors, anchor_budget_diagnostics = _limit_anchors(
+            anchors,
+            policy=policy,
+            policy_digest=policy_digest,
+        )
+        intents, intent_budget_diagnostics = _limit_intents(
+            intents,
+            policy=policy,
+            policy_digest=policy_digest,
+        )
     cursor = MemorySnapshotCursor(
         consumer_id=consumer_id,
         checkpoint_event_sequence=event.event_sequence,
@@ -1403,9 +1360,7 @@ def memory_snapshot_with_cursor_and_diagnostics(
     )
 
 
-def build_inline_delta_repair_diagnostic(
-    *, event_sequence: int, policy_digest: MemoryPolicyDigest
-) -> MemoryDiagnostic:
+def build_inline_delta_repair_diagnostic(*, event_sequence: int, policy_digest: MemoryPolicyDigest) -> MemoryDiagnostic:
     """构造 inline delta repair diagnostic。
 
     :param event_sequence: inline repair 覆盖到的 EventLog sequence。
@@ -1467,12 +1422,8 @@ def memory_projection_policy_to_json_value(policy: MemoryProjectionPolicy) -> Js
         "evidence_fact_char_cap": policy.evidence_fact_char_cap,
         "evidence_fact_floor": policy.evidence_fact_floor,
         "evidence_fact_item_cap": policy.evidence_fact_item_cap,
-        "fallback_selected_recent_window_char_cap": (
-            policy.fallback_selected_recent_window_char_cap
-        ),
-        "fallback_selected_recent_window_item_cap": (
-            policy.fallback_selected_recent_window_item_cap
-        ),
+        "fallback_selected_recent_window_char_cap": (policy.fallback_selected_recent_window_char_cap),
+        "fallback_selected_recent_window_item_cap": (policy.fallback_selected_recent_window_item_cap),
         "forward_intent_char_cap": policy.forward_intent_char_cap,
         "forward_intent_item_cap": policy.forward_intent_item_cap,
         "max_delta_repair_events": policy.max_delta_repair_events,
@@ -1480,9 +1431,7 @@ def memory_projection_policy_to_json_value(policy: MemoryProjectionPolicy) -> Js
         "policy_ref": policy.policy_ref,
         "reference_continuity_char_cap": policy.reference_continuity_char_cap,
         "reference_continuity_item_cap": policy.reference_continuity_item_cap,
-        "reference_continuity_item_floor": (
-            policy.reference_continuity_item_floor
-        ),
+        "reference_continuity_item_floor": (policy.reference_continuity_item_floor),
         "selected_recent_window_char_cap": policy.selected_recent_window_char_cap,
         "selected_recent_window_item_cap": policy.selected_recent_window_item_cap,
         "selected_recent_window_turn_floor": policy.selected_recent_window_turn_floor,
@@ -1524,25 +1473,14 @@ def conversation_memory_snapshot_from_json_value(
             mapping,
             "latest_compaction_event_ref",
         ),
-        trace_memory=_trace_memory_from_json_value(
-            _required_value(mapping, "trace_memory")
-        ),
-        evidence_fact_memory=_evidence_memory_from_json_value(
-            _required_value(mapping, "evidence_fact_memory")
-        ),
+        trace_memory=_trace_memory_from_json_value(_required_value(mapping, "trace_memory")),
+        evidence_fact_memory=_evidence_memory_from_json_value(_required_value(mapping, "evidence_fact_memory")),
         session_summary_memory=_session_summary_memory_from_json_value(
             _required_value(mapping, "session_summary_memory")
         ),
-        answer_anchor_memory=_answer_anchor_memory_from_json_value(
-            _required_value(mapping, "answer_anchor_memory")
-        ),
-        forward_intent_memory=_forward_intent_memory_from_json_value(
-            _required_value(mapping, "forward_intent_memory")
-        ),
-        diagnostics=tuple(
-            memory_diagnostic_from_json_value(item)
-            for item in _required_list(mapping, "diagnostics")
-        ),
+        answer_anchor_memory=_answer_anchor_memory_from_json_value(_required_value(mapping, "answer_anchor_memory")),
+        forward_intent_memory=_forward_intent_memory_from_json_value(_required_value(mapping, "forward_intent_memory")),
+        diagnostics=tuple(memory_diagnostic_from_json_value(item) for item in _required_list(mapping, "diagnostics")),
         built_at=_required_str(mapping, "built_at"),
         snapshot_digest=_required_str(mapping, "snapshot_digest"),
     )
@@ -1707,92 +1645,119 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
 
     material = event.accepted_tool_evidence
     if material is None:
-        raise HostDurableError(
-            "TOOL_RESULT_ACCEPTED memory LLM material is missing"
-        )
+        raise HostDurableError("TOOL_RESULT_ACCEPTED memory LLM material is missing")
     return render_accepted_tool_evidence_for_llm(material)
+
+
+def _validate_committed_candidate_policy(
+    candidate: CompactCandidateV2,
+    policy: MemoryProjectionPolicy,
+) -> None:
+    """重验 committed v2 candidate 未违反同一 Memory policy。
+
+    该检查是 projection invariant，不做 truncate、merge 或默认补偿。
+
+    :param candidate: canonical event strict parser 恢复的 candidate。
+    :param policy: 与 Context Governance 共用的 policy instance。
+    :returns: ``None``。
+    :raises ValueError: committed projection 违反任一 count/size cap 时抛出。
+    """
+
+    if candidate.session_summary is not None and (
+        estimate_memory_size_units(candidate.session_summary.text).units > policy.session_summary_char_cap
+    ):
+        raise ValueError("committed session summary exceeds Memory policy")
+    _validate_committed_section_policy(
+        section="evidence_facts",
+        texts=tuple(item.claim for item in candidate.evidence_facts),
+        item_cap=policy.evidence_fact_item_cap,
+        size_cap=policy.evidence_fact_char_cap,
+    )
+    _validate_committed_section_policy(
+        section="answer_anchors",
+        texts=tuple(f"{item.title}\n{item.detail}" for item in candidate.answer_anchors),
+        item_cap=policy.answer_anchor_item_cap,
+        size_cap=policy.answer_anchor_char_cap,
+    )
+    _validate_committed_section_policy(
+        section="forward_intents",
+        texts=tuple(item.text for item in candidate.forward_intents),
+        item_cap=policy.forward_intent_item_cap,
+        size_cap=policy.forward_intent_char_cap,
+    )
+    _validate_committed_section_policy(
+        section="reference_continuity",
+        texts=tuple(item.text for item in candidate.reference_continuity),
+        item_cap=policy.reference_continuity_item_cap,
+        size_cap=policy.reference_continuity_char_cap,
+    )
+
+
+def _validate_committed_section_policy(
+    *,
+    section: str,
+    texts: tuple[str, ...],
+    item_cap: int,
+    size_cap: int,
+) -> None:
+    """重验单一 committed semantic section policy。
+
+    :param section: 自解释 section 名。
+    :param texts: section 业务文本。
+    :param item_cap: item count cap。
+    :param size_cap: aggregate size cap。
+    :returns: ``None``。
+    :raises ValueError: count 或 size 超出 policy 时抛出。
+    """
+
+    if len(texts) > item_cap:
+        raise ValueError(f"committed {section} exceeds Memory item cap")
+    total = sum(estimate_memory_size_units(text).units for text in texts)
+    if total > size_cap:
+        raise ValueError(f"committed {section} exceeds Memory size cap")
 
 
 def _session_summary_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: ConversationCompactOutputVNext,
-    policy: MemoryProjectionPolicy,
-    *,
-    previous_summary: SessionSummaryMemoryView,
-) -> tuple[SessionSummaryMemoryView, tuple[MemoryDiagnostic, ...]]:
+    candidate: CompactCandidateV2,
+) -> SessionSummaryMemoryView:
     """从 accepted compact event 物化 Session Summary Memory。
 
     :param event: CONTEXT_COMPACTED event。
     :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
-    :param policy: memory policy。
-    :param previous_summary: compact owner 未提供 replacement 时保留的既有 summary。
-    :returns: session summary view 与 diagnostics。
-    :raises ValueError: candidate 与 memory contract 不一致时抛出。
+    :returns: replacement session summary view。
     """
 
     summary = candidate.session_summary
     if summary is None:
-        return previous_summary, ()
-    text = summary.summary_text
-    if len(text) > policy.session_summary_char_cap:
-        item_id = _item_id(event, "session_summary")
-        return _empty_session_summary_memory(), (
-            _budget_diagnostic(
-                event_sequence=event.event_sequence,
-                item_id=item_id,
-                policy_digest=digest_memory_projection_policy(policy),
-                message="session summary dropped by memory policy",
-            ),
-        )
+        return _empty_session_summary_memory()
+    text = summary.text
     return SessionSummaryMemoryView(
         summary_text=text,
         source_refs=summary.source_labels,
         event_id=event.event_id,
         event_sequence=event.event_sequence,
         size_units=estimate_memory_size_units(text),
-    ), ()
+    )
 
 
 def _facts_from_accepted_event(
     event: MemoryProjectionEvent,
     compacted_semantics: ContextCompactedSemanticPayload,
-    policy: MemoryProjectionPolicy,
-) -> tuple[tuple[EvidenceBackedFactView, ...], tuple[MemoryDiagnostic, ...]]:
+) -> tuple[EvidenceBackedFactView, ...]:
     """从 accepted compact event 物化 evidence-backed facts。
 
     :param event: CONTEXT_COMPACTED event。
     :param compacted_semantics: persisted semantic owner 产生的 typed view。
-    :param policy: memory policy。
-    :returns: facts 与 diagnostics。
+    :returns: replacement facts。
     :raises ValueError: typed semantics 与 memory contract 不一致时抛出。
     """
 
     candidate = compacted_semantics.accepted_candidate
     evidence_refs = compacted_semantics.accepted_evidence_mapping_refs
-    fact_values = candidate.evidence_backed_facts
+    fact_values = candidate.evidence_facts
     if len(evidence_refs) > 0 and len(fact_values) == 0:
-        return (
-            (),
-            (
-                MemoryDiagnostic(
-                    diagnostic_id=_diagnostic_id(
-                        MemoryDiagnosticReason.ACCEPTED_EVIDENCE_WITHOUT_FACT_CANDIDATE,
-                        event_sequence=event.event_sequence,
-                        item_id=_item_id(event, "accepted_evidence_without_fact"),
-                    ),
-                    reason=(
-                        MemoryDiagnosticReason.ACCEPTED_EVIDENCE_WITHOUT_FACT_CANDIDATE
-                    ),
-                    message=(
-                        "accepted evidence exists but compact output provided no fact candidate"
-                    ),
-                    event_sequence=event.event_sequence,
-                    item_id=_item_id(event, "accepted_evidence_without_fact"),
-                    policy_digest=digest_memory_projection_policy(policy),
-                    recorded_at=None,
-                ),
-            ),
-        )
+        raise ValueError("committed compact evidence refs require evidence fact projection")
     provenance = MemoryProvenanceRef(
         producer_kind=MemoryProducerKind.HOST_PROJECTION,
         producer_name="host_projection",
@@ -1808,21 +1773,9 @@ def _facts_from_accepted_event(
     )
     compact_artifact_ref = compacted_semantics.compact_artifact_ref
     facts: list[EvidenceBackedFactView] = []
-    diagnostics: list[MemoryDiagnostic] = []
-    policy_digest = digest_memory_projection_policy(policy)
     for index, fact in enumerate(fact_values):
-        claim_text = fact.claim_text
+        claim_text = fact.claim
         item_id = _item_id(event, f"evidence_fact:{index + 1}")
-        if len(claim_text) > policy.evidence_fact_char_cap:
-            diagnostics.append(
-                _budget_diagnostic(
-                    event_sequence=event.event_sequence,
-                    item_id=item_id,
-                    policy_digest=policy_digest,
-                    message="evidence fact dropped by memory policy",
-                )
-            )
-            continue
         facts.append(
             EvidenceBackedFactView(
                 item_id=item_id,
@@ -1838,7 +1791,7 @@ def _facts_from_accepted_event(
                 size_units=estimate_memory_size_units(claim_text),
             )
         )
-    return tuple(facts), tuple(diagnostics)
+    return tuple(facts)
 
 
 def _empty_session_summary_memory() -> SessionSummaryMemoryView:
@@ -1858,7 +1811,7 @@ def _empty_session_summary_memory() -> SessionSummaryMemoryView:
 
 def _answer_anchors_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: ConversationCompactOutputVNext,
+    candidate: CompactCandidateV2,
 ) -> tuple[AnswerAnchor, ...]:
     """从 accepted compact event 物化 answer anchors。
 
@@ -1870,22 +1823,14 @@ def _answer_anchors_from_accepted_event(
 
     result: list[AnswerAnchor] = []
     for index, item in enumerate(candidate.answer_anchors):
-        children = tuple(
-            AnswerAnchorChild(
-                display_text=child.display_text,
-                ordinal=child.ordinal,
-            )
-            for child in item.anchor_items
-        )
-        text = "\n".join(
-            ([item.anchor_title] + [child.display_text for child in children])
-        )
+        children = (AnswerAnchorChild(display_text=item.detail, ordinal=None),)
+        text = f"{item.title}\n{item.detail}"
         result.append(
             AnswerAnchor(
                 item_id=_item_id(event, f"answer_anchor:{index + 1}"),
-                anchor_title=item.anchor_title,
+                anchor_title=item.title,
                 anchor_items=children,
-                source_refs=item.answer_source_labels,
+                source_refs=item.source_labels,
                 event_id=event.event_id,
                 event_sequence=event.event_sequence,
                 size_units=estimate_memory_size_units(text),
@@ -1896,7 +1841,7 @@ def _answer_anchors_from_accepted_event(
 
 def _forward_intents_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: ConversationCompactOutputVNext,
+    candidate: CompactCandidateV2,
 ) -> tuple[ForwardIntent, ...]:
     """从 accepted compact event 物化 forward intents。
 
@@ -1926,7 +1871,7 @@ def _forward_intents_from_accepted_event(
 
 def _reference_continuity_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: ConversationCompactOutputVNext,
+    candidate: CompactCandidateV2,
 ) -> tuple[ReferenceContinuityItem, ...]:
     """从 accepted compact event 物化 reference continuity items。
 
@@ -1937,7 +1882,7 @@ def _reference_continuity_from_accepted_event(
     """
 
     result: list[ReferenceContinuityItem] = []
-    for index, item in enumerate(candidate.reference_continuity_items):
+    for index, item in enumerate(candidate.reference_continuity):
         text = item.text
         result.append(
             ReferenceContinuityItem(
@@ -2028,11 +1973,7 @@ def _protected_recent_run_ids(
 
     if selected_recent_window_turn_floor == 0:
         return frozenset()
-    eligible = tuple(
-        item
-        for item in items
-        if _is_selected_recent_turn_item(item) and item.run_id is not None
-    )
+    eligible = tuple(item for item in items if _is_selected_recent_turn_item(item) and item.run_id is not None)
     latest_by_run: dict[str, tuple[int, int]] = {}
     for index, item in enumerate(eligible):
         run_id = item.run_id
@@ -2225,11 +2166,7 @@ def _merge_facts(
     result = list(existing)
     for candidate in candidates:
         key = (_normalized_text(candidate.claim_text), candidate.evidence_refs)
-        result = [
-            item
-            for item in result
-            if (_normalized_text(item.claim_text), item.evidence_refs) != key
-        ]
+        result = [item for item in result if (_normalized_text(item.claim_text), item.evidence_refs) != key]
         result.append(candidate)
     return tuple(result)
 
@@ -2262,9 +2199,7 @@ def _replace_item_by_id(
     :returns: 替换后的 tuple。
     """
 
-    return tuple(existing for existing in items if existing.item_id != item.item_id) + (
-        item,
-    )
+    return tuple(existing for existing in items if existing.item_id != item.item_id) + (item,)
 
 
 def _snapshot_with_digest(
@@ -2295,9 +2230,7 @@ def _snapshot_with_digest(
     )
 
 
-def _snapshot_json_value(
-    snapshot: ConversationMemorySnapshotVNext, *, include_digest: bool
-) -> JsonValue:
+def _snapshot_json_value(snapshot: ConversationMemorySnapshotVNext, *, include_digest: bool) -> JsonValue:
     """转换 snapshot 为 JSON object。
 
     :param snapshot: snapshot。
@@ -2306,27 +2239,17 @@ def _snapshot_json_value(
     """
 
     result: dict[str, JsonValue] = {
-        "answer_anchor_memory": _answer_anchor_memory_to_json_value(
-            snapshot.answer_anchor_memory
-        ),
+        "answer_anchor_memory": _answer_anchor_memory_to_json_value(snapshot.answer_anchor_memory),
         "built_at": snapshot.built_at,
         "cursor": _cursor_to_json_value(snapshot.cursor),
-        "diagnostics": [
-            memory_diagnostic_to_json_value(item) for item in snapshot.diagnostics
-        ],
-        "evidence_fact_memory": _evidence_memory_to_json_value(
-            snapshot.evidence_fact_memory
-        ),
-        "forward_intent_memory": _forward_intent_memory_to_json_value(
-            snapshot.forward_intent_memory
-        ),
+        "diagnostics": [memory_diagnostic_to_json_value(item) for item in snapshot.diagnostics],
+        "evidence_fact_memory": _evidence_memory_to_json_value(snapshot.evidence_fact_memory),
+        "forward_intent_memory": _forward_intent_memory_to_json_value(snapshot.forward_intent_memory),
         "latest_compaction_event_ref": snapshot.latest_compaction_event_ref,
         "policy_digest": snapshot.policy_digest,
         "schema_version": snapshot.schema_version,
         "session_id": snapshot.session_id,
-        "session_summary_memory": _session_summary_memory_to_json_value(
-            snapshot.session_summary_memory
-        ),
+        "session_summary_memory": _session_summary_memory_to_json_value(snapshot.session_summary_memory),
         "snapshot_id": snapshot.snapshot_id,
         "trace_memory": _trace_memory_to_json_value(snapshot.trace_memory),
     }
@@ -2387,14 +2310,8 @@ def _trace_memory_to_json_value(view: TraceMemoryView) -> JsonValue:
     """
 
     return {
-        "reference_continuity_items": [
-            _reference_item_to_json_value(item)
-            for item in view.reference_continuity_items
-        ],
-        "selected_recent_window": [
-            _selected_item_to_json_value(item)
-            for item in view.selected_recent_window
-        ],
+        "reference_continuity_items": [_reference_item_to_json_value(item) for item in view.reference_continuity_items],
+        "selected_recent_window": [_selected_item_to_json_value(item) for item in view.selected_recent_window],
     }
 
 
@@ -2408,12 +2325,10 @@ def _trace_memory_from_json_value(value: JsonValue) -> TraceMemoryView:
     mapping = _as_mapping(value, "trace_memory")
     return TraceMemoryView(
         selected_recent_window=tuple(
-            _selected_item_from_json_value(item)
-            for item in _required_list(mapping, "selected_recent_window")
+            _selected_item_from_json_value(item) for item in _required_list(mapping, "selected_recent_window")
         ),
         reference_continuity_items=tuple(
-            _reference_item_from_json_value(item)
-            for item in _required_list(mapping, "reference_continuity_items")
+            _reference_item_from_json_value(item) for item in _required_list(mapping, "reference_continuity_items")
         ),
     )
 
@@ -2426,12 +2341,8 @@ def _evidence_memory_to_json_value(view: EvidenceFactMemoryView) -> JsonValue:
     """
 
     return {
-        "evidence_backed_facts": [
-            _fact_to_json_value(item) for item in view.evidence_backed_facts
-        ],
-        "recent_evidence_items": [
-            _selected_item_to_json_value(item) for item in view.recent_evidence_items
-        ],
+        "evidence_backed_facts": [_fact_to_json_value(item) for item in view.evidence_backed_facts],
+        "recent_evidence_items": [_selected_item_to_json_value(item) for item in view.recent_evidence_items],
     }
 
 
@@ -2445,12 +2356,10 @@ def _evidence_memory_from_json_value(value: JsonValue) -> EvidenceFactMemoryView
     mapping = _as_mapping(value, "evidence_fact_memory")
     return EvidenceFactMemoryView(
         evidence_backed_facts=tuple(
-            _fact_from_json_value(item)
-            for item in _required_list(mapping, "evidence_backed_facts")
+            _fact_from_json_value(item) for item in _required_list(mapping, "evidence_backed_facts")
         ),
         recent_evidence_items=tuple(
-            _selected_item_from_json_value(item)
-            for item in _required_list(mapping, "recent_evidence_items")
+            _selected_item_from_json_value(item) for item in _required_list(mapping, "recent_evidence_items")
         ),
     )
 
@@ -2511,10 +2420,7 @@ def _answer_anchor_memory_from_json_value(value: JsonValue) -> AnswerAnchorMemor
 
     mapping = _as_mapping(value, "answer_anchor_memory")
     return AnswerAnchorMemoryView(
-        anchors=tuple(
-            _answer_anchor_from_json_value(item)
-            for item in _required_list(mapping, "anchors")
-        )
+        anchors=tuple(_answer_anchor_from_json_value(item) for item in _required_list(mapping, "anchors"))
     )
 
 
@@ -2537,10 +2443,7 @@ def _forward_intent_memory_from_json_value(value: JsonValue) -> ForwardIntentMem
 
     mapping = _as_mapping(value, "forward_intent_memory")
     return ForwardIntentMemoryView(
-        intents=tuple(
-            _forward_intent_from_json_value(item)
-            for item in _required_list(mapping, "intents")
-        )
+        intents=tuple(_forward_intent_from_json_value(item) for item in _required_list(mapping, "intents"))
     )
 
 
@@ -2554,12 +2457,8 @@ def _selected_item_to_json_value(item: SelectedRecentWindowItem) -> JsonValue:
     return {
         "event_id": item.event_id,
         "event_sequence": item.event_sequence,
-        "excluded_reason": (
-            None if item.excluded_reason is None else item.excluded_reason.value
-        ),
-        "included_reason": (
-            None if item.included_reason is None else item.included_reason.value
-        ),
+        "excluded_reason": (None if item.excluded_reason is None else item.excluded_reason.value),
+        "included_reason": (None if item.included_reason is None else item.included_reason.value),
         "item_id": item.item_id,
         "role": item.role.value,
         "run_id": item.run_id,
@@ -2602,7 +2501,7 @@ def _reference_item_to_json_value(item: ReferenceContinuityItem) -> JsonValue:
         "event_id": item.event_id,
         "event_sequence": item.event_sequence,
         "item_id": item.item_id,
-        "reason": item.reason.value,
+        "reason": item.reason,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
         "text": item.text,
@@ -2620,7 +2519,7 @@ def _reference_item_from_json_value(value: JsonValue) -> ReferenceContinuityItem
     return ReferenceContinuityItem(
         item_id=_required_str(mapping, "item_id"),
         text=_required_str(mapping, "text"),
-        reason=ReferenceContinuityReasonVNext(_required_str(mapping, "reason")),
+        reason=_required_str(mapping, "reason"),
         source_refs=_required_text_tuple(mapping, "source_refs"),
         event_id=_required_str(mapping, "event_id"),
         event_sequence=_required_int(mapping, "event_sequence"),
@@ -2641,13 +2540,9 @@ def _fact_to_json_value(item: EvidenceBackedFactView) -> JsonValue:
         "compact_artifact_ref": item.compact_artifact_ref,
         "evidence_kind": item.evidence_kind.value,
         "evidence_refs": list(item.evidence_refs),
-        "excluded_reason": (
-            None if item.excluded_reason is None else item.excluded_reason.value
-        ),
+        "excluded_reason": (None if item.excluded_reason is None else item.excluded_reason.value),
         "extraction_operation_ref": item.extraction_operation_ref,
-        "included_reason": (
-            None if item.included_reason is None else item.included_reason.value
-        ),
+        "included_reason": (None if item.included_reason is None else item.included_reason.value),
         "item_id": item.item_id,
         "provenance": _provenance_to_json_value(item.provenance),
         "size_units": item.size_units.units,
@@ -2665,9 +2560,7 @@ def _fact_from_json_value(value: JsonValue) -> EvidenceBackedFactView:
     return EvidenceBackedFactView(
         item_id=_required_str(mapping, "item_id"),
         claim_text=_required_str(mapping, "claim_text"),
-        evidence_kind=MemoryEvidenceBackedFactKind(
-            _required_str(mapping, "evidence_kind")
-        ),
+        evidence_kind=MemoryEvidenceBackedFactKind(_required_str(mapping, "evidence_kind")),
         evidence_refs=_required_text_tuple(mapping, "evidence_refs"),
         provenance=_provenance_from_json_value(_required_value(mapping, "provenance")),
         extraction_operation_ref=_required_str(mapping, "extraction_operation_ref"),
@@ -2687,10 +2580,7 @@ def _answer_anchor_to_json_value(item: AnswerAnchor) -> JsonValue:
     """
 
     return {
-        "anchor_items": [
-            {"display_text": child.display_text, "ordinal": child.ordinal}
-            for child in item.anchor_items
-        ],
+        "anchor_items": [{"display_text": child.display_text, "ordinal": child.ordinal} for child in item.anchor_items],
         "anchor_title": item.anchor_title,
         "event_id": item.event_id,
         "event_sequence": item.event_sequence,
@@ -2736,7 +2626,7 @@ def _forward_intent_to_json_value(item: ForwardIntent) -> JsonValue:
     return {
         "event_id": item.event_id,
         "event_sequence": item.event_sequence,
-        "intent_type": item.intent_type.value,
+        "intent_type": item.intent_type,
         "item_id": item.item_id,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
@@ -2755,9 +2645,9 @@ def _forward_intent_from_json_value(value: JsonValue) -> ForwardIntent:
     mapping = _as_mapping(value, "forward_intent")
     return ForwardIntent(
         item_id=_required_str(mapping, "item_id"),
-        intent_type=ForwardIntentTypeVNext(_required_str(mapping, "intent_type")),
+        intent_type=_required_str(mapping, "intent_type"),
         text=_required_str(mapping, "text"),
-        status=ForwardIntentStatusVNext(_required_str(mapping, "status")),
+        status=CompactForwardIntentStatusV2(_required_str(mapping, "status")),
         source_refs=_required_text_tuple(mapping, "source_refs"),
         event_id=_required_str(mapping, "event_id"),
         event_sequence=_required_int(mapping, "event_sequence"),
@@ -2824,9 +2714,7 @@ def _provenance_from_json_value(value: JsonValue) -> MemoryProvenanceRef:
     )
 
 
-def _optional_included_reason(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> MemoryIncludedReason | None:
+def _optional_included_reason(mapping: Mapping[str, JsonValue], field_name: str) -> MemoryIncludedReason | None:
     """读取可选 included reason。
 
     :param mapping: JSON mapping。
@@ -2838,9 +2726,7 @@ def _optional_included_reason(
     return None if value is None else MemoryIncludedReason(value)
 
 
-def _optional_excluded_reason(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> MemoryExcludedReason | None:
+def _optional_excluded_reason(mapping: Mapping[str, JsonValue], field_name: str) -> MemoryExcludedReason | None:
     """读取可选 excluded reason。
 
     :param mapping: JSON mapping。
@@ -2947,9 +2833,7 @@ def _item_id(event: MemoryProjectionEvent, local_key: str) -> str:
     return f"{_ITEM_ID_PREFIX}-{digest}"
 
 
-def _diagnostic_id(
-    reason: MemoryDiagnosticReason, *, event_sequence: int, item_id: str
-) -> str:
+def _diagnostic_id(reason: MemoryDiagnosticReason, *, event_sequence: int, item_id: str) -> str:
     """派生 diagnostic id。
 
     :param reason: diagnostic reason。
@@ -3100,9 +2984,7 @@ def _required_value(mapping: Mapping[str, JsonValue], field_name: str) -> JsonVa
     return mapping[field_name]
 
 
-def _required_payload_mapping(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> Mapping[str, JsonValue]:
+def _required_payload_mapping(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
     """读取必填 payload object 字段。
 
     :param payload: JSON object。
@@ -3141,9 +3023,7 @@ def _required_str(mapping: Mapping[str, JsonValue], field_name: str) -> str:
     raise ValueError(f"{field_name} must be string")
 
 
-def _optional_str(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> str | None:
+def _optional_str(mapping: Mapping[str, JsonValue], field_name: str) -> str | None:
     """读取可选字符串字段。
 
     :param mapping: JSON object。
@@ -3160,9 +3040,7 @@ def _optional_str(
     raise ValueError(f"{field_name} must be string")
 
 
-def _optional_payload_str(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> str | None:
+def _optional_payload_str(mapping: Mapping[str, JsonValue], field_name: str) -> str | None:
     """读取 payload 可选字符串字段。
 
     :param mapping: JSON object。
@@ -3213,9 +3091,7 @@ def _optional_int(mapping: Mapping[str, JsonValue], field_name: str) -> int | No
     raise ValueError(f"{field_name} must be integer")
 
 
-def _required_list(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> list[JsonValue]:
+def _required_list(mapping: Mapping[str, JsonValue], field_name: str) -> list[JsonValue]:
     """读取必填 JSON array 字段。
 
     :param mapping: JSON object。
@@ -3229,9 +3105,7 @@ def _required_list(
     raise ValueError(f"{field_name} must be list")
 
 
-def _required_text_tuple(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
+def _required_text_tuple(mapping: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
     """读取必填字符串数组字段。
 
     :param mapping: JSON object。
@@ -3248,9 +3122,7 @@ def _required_text_tuple(
     return tuple(result)
 
 
-def _required_mapping_list(
-    mapping: Mapping[str, JsonValue], field_name: str
-) -> tuple[Mapping[str, JsonValue], ...]:
+def _required_mapping_list(mapping: Mapping[str, JsonValue], field_name: str) -> tuple[Mapping[str, JsonValue], ...]:
     """读取必填 JSON object 数组字段。
 
     :param mapping: JSON object。

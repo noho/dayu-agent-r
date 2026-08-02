@@ -19,9 +19,11 @@ from dayu.host.compact_payload import (
     compact_artifact_payload_ref,
 )
 from dayu.host.compaction import (
-    CompactQualityCheckResultVNext,
+    CompactAcceptedTruthV2,
     CompactionRequest,
-    ConversationCompactOutputVNext,
+)
+from dayu.host.compact_material import (
+    conversation_compact_input_vnext_from_material_pack,
 )
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
@@ -34,8 +36,7 @@ class CompactArtifactWriteRequest:
     """vNext compact artifact 写入请求。
 
     :param compaction_request: 原始 compaction request。
-    :param accepted_candidate: 已接受的 vNext compact output。
-    :param quality_result: vNext quality check 结果，必须为 accepted。
+    :param accepted_truth: Context Governance final accepted truth。
     :param policy_digest: context policy digest。
     :param budget_after_compact: Host 估算的 compact 后预算。
     :param payload_ref: descriptor ref；``None`` 时按 artifact digest 派生。
@@ -43,8 +44,7 @@ class CompactArtifactWriteRequest:
     """
 
     compaction_request: CompactionRequest
-    accepted_candidate: ConversationCompactOutputVNext
-    quality_result: CompactQualityCheckResultVNext
+    accepted_truth: CompactAcceptedTruthV2
     policy_digest: str
     budget_after_compact: int
     payload_ref: str | None = None
@@ -60,14 +60,11 @@ class CompactArtifactWriteRequest:
 
         if not isinstance(self.compaction_request, CompactionRequest):
             raise TypeError("CompactArtifactWriteRequest.compaction_request must be CompactionRequest")
-        if not isinstance(self.accepted_candidate, ConversationCompactOutputVNext):
-            raise TypeError(
-                "CompactArtifactWriteRequest.accepted_candidate must be ConversationCompactOutputVNext"
-            )
-        if not isinstance(self.quality_result, CompactQualityCheckResultVNext):
-            raise TypeError("CompactArtifactWriteRequest.quality_result must be CompactQualityCheckResultVNext")
-        if not self.quality_result.accepted:
-            raise ValueError("Compact artifact requires accepted quality result")
+        if not isinstance(self.accepted_truth, CompactAcceptedTruthV2):
+            raise TypeError("CompactArtifactWriteRequest.accepted_truth must be CompactAcceptedTruthV2")
+        self.accepted_truth.validate_input_binding(
+            conversation_compact_input_vnext_from_material_pack(self.compaction_request.material_pack)
+        )
         if not is_sha256_digest(self.policy_digest):
             raise ValueError("CompactArtifactWriteRequest.policy_digest is invalid")
         if self.budget_after_compact < 0:
@@ -153,7 +150,7 @@ class CompactArtifactStore:
             payload_descriptor=descriptor,
             artifact_ref=artifact_ref,
             compaction_request_digest=request.compaction_request.digest(),
-            accepted_candidate_digest=request.accepted_candidate.digest(),
+            accepted_candidate_digest=request.accepted_truth.candidate.digest(),
         )
 
 
@@ -169,16 +166,13 @@ def compact_artifact_json(request: CompactArtifactWriteRequest) -> JsonValue:
         raise TypeError("request must be CompactArtifactWriteRequest")
     return compact_artifact_json_vnext(
         request=request.compaction_request,
-        candidate=request.accepted_candidate,
-        quality=request.quality_result,
+        accepted_truth=request.accepted_truth,
         policy_digest=request.policy_digest,
         budget_after_compact=request.budget_after_compact,
     )
 
 
-def _payload_ref_for_artifact(
-    request: CompactArtifactWriteRequest, artifact_ref: LocalArtifactRef
-) -> str:
+def _payload_ref_for_artifact(request: CompactArtifactWriteRequest, artifact_ref: LocalArtifactRef) -> str:
     """返回 descriptor payload ref。
 
     :param request: compact artifact 写入请求。
@@ -204,7 +198,7 @@ def _descriptor_metadata(
 
     return compact_artifact_descriptor_metadata_vnext(
         request=request.compaction_request,
-        candidate=request.accepted_candidate,
+        accepted_truth=request.accepted_truth,
         artifact_digest=artifact_ref.artifact_digest,
         policy_digest=request.policy_digest,
     )

@@ -12,6 +12,8 @@ private Host implementation；所有财报事实均来自 deterministic mock too
 artifact 文件数作为验收信号。
 """
 
+# ruff: noqa: E402 -- 直接运行 utils 脚本时先把项目根加入 sys.path。
+
 from __future__ import annotations
 
 import argparse
@@ -96,10 +98,9 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityReasonVNext,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactForwardIntentStatusV2,
+    CompactSourceKindV2,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 from dayu.host.context_events import (
@@ -276,16 +277,10 @@ _COMPACT_FALLBACK_FORBIDDEN_SECTIONS: Final[tuple[str, ...]] = (
 )
 _COMPACTOR_MATERIAL_BEGIN: Final[str] = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
 _COMPACTOR_MATERIAL_END: Final[str] = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
-_COMPACTOR_FIELD_TRACE_MATERIAL: Final[str] = "trace_material"
-_COMPACTOR_FIELD_EVIDENCE_MATERIAL: Final[str] = "evidence_material"
-_COMPACTOR_FIELD_ANSWER_MATERIAL: Final[str] = "answer_material"
-_COMPACTOR_FIELD_PREVIOUS_COMPACTED_VIEW: Final[str] = "previous_compacted_view"
-_COMPACTOR_FIELD_LABEL: Final[str] = "label"
+_COMPACTOR_FIELD_SOURCE_BOUNDARY: Final[str] = "source_boundary"
 _COMPACTOR_FIELD_SOURCE_LABEL: Final[str] = "source_label"
-_COMPACTOR_FIELD_SOURCE_LABELS: Final[str] = "source_labels"
-_COMPACTOR_FIELD_RESPONSE_TEXT: Final[str] = "response_text"
-_COMPACTOR_FIELD_RESULT_TEXT: Final[str] = "result_text"
-_COMPACTOR_FIELD_ANSWER_TEXT: Final[str] = "answer_text"
+_COMPACTOR_FIELD_SOURCE_KIND: Final[str] = "source_kind"
+_COMPACTOR_FIELD_READABLE_TEXT: Final[str] = "readable_text"
 _SMOKE_COMPACTOR_SUMMARY_TEXT: Final[str] = "Deterministic smoke compact summary."
 _SMOKE_COMPACTOR_FACT_PREFIX: Final[str] = "Deterministic smoke evidence material: "
 _SMOKE_COMPACTOR_ANSWER_TITLE: Final[str] = "Previous answer"
@@ -1991,64 +1986,89 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
     :raises TypeError: material JSON 字段类型非法时抛出。
     """
 
-    evidence_items = _proposal_labeled_items(material_json, _COMPACTOR_FIELD_EVIDENCE_MATERIAL)
-    answer_items = _proposal_labeled_items(material_json, _COMPACTOR_FIELD_ANSWER_MATERIAL)
-    trace_labels = _proposal_source_labels(material_json, _COMPACTOR_FIELD_TRACE_MATERIAL)
-    previous_labels = _proposal_previous_labels(material_json)
-    evidence_labels = tuple(item[0] for item in evidence_items)
-    answer_labels = tuple(item[0] for item in answer_items)
-    summary_labels = (*trace_labels, *evidence_labels, *answer_labels)
-    continuity_labels = (*previous_labels, *trace_labels, *answer_labels)
+    boundary = _proposal_boundary_items(material_json)
+    summary_items = tuple(
+        item
+        for item in boundary
+        if item[1]
+        in (
+            CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY.value,
+            CompactSourceKindV2.TRACE_MATERIAL.value,
+        )
+    )
+    fact_items = tuple(
+        item
+        for item in boundary
+        if item[1]
+        in (
+            CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT.value,
+            CompactSourceKindV2.EVIDENCE_MATERIAL.value,
+        )
+    )
+    answer_items = tuple(
+        item
+        for item in boundary
+        if item[1]
+        in (
+            CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR.value,
+            CompactSourceKindV2.ANSWER_MATERIAL.value,
+        )
+    )
+    intent_items = tuple(
+        item
+        for item in boundary
+        if item[1] == CompactSourceKindV2.PREVIOUS_FORWARD_INTENT.value
+    )
+    reference_items = tuple(
+        item
+        for item in boundary
+        if item[1] == CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY.value
+    )
     proposal: dict[str, JsonValue] = {
-        "schema_version": CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        "schema": COMPACT_OUTPUT_SCHEMA_V2,
         "session_summary": (
             {
-                "summary_text": _SMOKE_COMPACTOR_SUMMARY_TEXT,
-                "source_labels": list(summary_labels),
+                "text": _SMOKE_COMPACTOR_SUMMARY_TEXT,
+                "source_labels": [item[0] for item in summary_items],
             }
-            if summary_labels
+            if summary_items
             else None
         ),
-        "evidence_backed_facts": [
+        "evidence_facts": [
             {
-                "claim_text": f"{_SMOKE_COMPACTOR_FACT_PREFIX}{_sanitize_compactor_material_text(text)}",
-                "evidence_labels": [label],
-                "source_labels": [label],
+                "claim": f"{_SMOKE_COMPACTOR_FACT_PREFIX}{_sanitize_compactor_material_text(text)}",
+                "support_labels": [label],
+                "context_labels": [],
             }
-            for label, text in evidence_items
+            for label, _, text in fact_items
         ],
         "answer_anchors": [
             {
-                "anchor_title": _SMOKE_COMPACTOR_ANSWER_TITLE,
-                "anchor_items": [{"display_text": _sanitize_compactor_material_text(text), "ordinal": None}],
-                "answer_source_labels": [label],
+                "title": _SMOKE_COMPACTOR_ANSWER_TITLE,
+                "detail": _sanitize_compactor_material_text(text),
+                "source_labels": [label],
             }
-            for label, text in answer_items
+            for label, _, text in answer_items
         ],
-        "forward_intents": (
-            [
-                {
-                    "intent_type": ForwardIntentTypeVNext.NEXT_STEP_NOTE.value,
-                    "text": _SMOKE_COMPACTOR_FORWARD_TEXT,
-                    "status": ForwardIntentStatusVNext.OPEN.value,
-                    "source_labels": [continuity_labels[0]],
-                }
-            ]
-            if continuity_labels
-            else []
-        ),
-        "reference_continuity_items": (
-            [
-                {
-                    "text": _SMOKE_COMPACTOR_REFERENCE_TEXT,
-                    "reason": ReferenceContinuityReasonVNext.LOCAL_REFERENCE.value,
-                    "source_labels": [continuity_labels[0]],
-                }
-            ]
-            if continuity_labels
-            else []
-        ),
+        "forward_intents": [
+            {
+                "intent_type": "next_step_note",
+                "text": f"{_SMOKE_COMPACTOR_FORWARD_TEXT} {text}",
+                "status": CompactForwardIntentStatusV2.OPEN.value,
+                "source_labels": [label],
+            }
+            for label, _, text in intent_items
+        ],
+        "reference_continuity": [
+            {
+                "text": f"{_SMOKE_COMPACTOR_REFERENCE_TEXT} {text}",
+                "reason": "local_reference",
+                "source_labels": [label],
+            }
+            for label, _, text in reference_items
+        ],
         "diagnostics": [],
+        "explicitly_dropped_sources": [],
     }
     return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
 
@@ -2075,86 +2095,40 @@ def _invalid_current_anchor_citation_proposal() -> str:
     """
 
     proposal: Mapping[str, JsonValue] = {
-        "schema_version": CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        "schema": COMPACT_OUTPUT_SCHEMA_V2,
         "session_summary": {
-            "summary_text": "invalid current-anchor citation",
+            "text": "invalid current-anchor citation",
             "source_labels": [_SMOKE_INVALID_CURRENT_ANCHOR_LABEL],
         },
-        "evidence_backed_facts": [],
+        "evidence_facts": [],
         "answer_anchors": [],
         "forward_intents": [],
-        "reference_continuity_items": [],
+        "reference_continuity": [],
         "diagnostics": [],
+        "explicitly_dropped_sources": [],
     }
     return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
 
 
-def _proposal_labeled_items(
+def _proposal_boundary_items(
     material_json: Mapping[str, JsonValue],
-    field_name: str,
-) -> tuple[tuple[str, str], ...]:
-    """读取 material section 中的 label 与文本。
+) -> tuple[tuple[str, str, str], ...]:
+    """读取 fresh v2 source boundary。
 
-    :param material_json: material JSON。
-    :param field_name: section 字段名。
-    :returns: ``(label, text)`` 元组。
-    :raises TypeError: section item 不是 object 时抛出。
+    :param material_json: Host 投影给 compactor 的 material JSON。
+    :returns: ``(label, kind, readable_text)`` 元组。
+    :raises TypeError: boundary 或其字段不是严格预期类型时抛出。
     """
 
-    values = _json_list_or_empty(material_json, field_name)
-    items: list[tuple[str, str]] = []
+    values = _json_list_or_empty(material_json, _COMPACTOR_FIELD_SOURCE_BOUNDARY)
+    items: list[tuple[str, str, str]] = []
     for index, value in enumerate(values):
-        item = _json_object(value, field_name=f"{field_name}[{index}]")
-        label = _json_label(item)
-        text = _json_string_alias(item, _COMPACTOR_FIELD_RESPONSE_TEXT, _COMPACTOR_FIELD_RESULT_TEXT)
-        if text == "":
-            text = _json_string_alias(item, _COMPACTOR_FIELD_ANSWER_TEXT, _COMPACTOR_FIELD_RESULT_TEXT)
-        items.append((label, text))
+        item = _json_object(value, field_name=f"source_boundary[{index}]")
+        label = _json_required_string(item, _COMPACTOR_FIELD_SOURCE_LABEL)
+        kind = _json_required_string(item, _COMPACTOR_FIELD_SOURCE_KIND)
+        readable_text = _json_required_string(item, _COMPACTOR_FIELD_READABLE_TEXT)
+        items.append((label, kind, readable_text))
     return tuple(items)
-
-
-def _proposal_source_labels(material_json: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
-    """读取 material section 中的 source labels。
-
-    :param material_json: material JSON。
-    :param field_name: section 字段名。
-    :returns: label 元组。
-    :raises TypeError: section item 不是 object 时抛出。
-    """
-
-    labels: list[str] = []
-    values = _json_list_or_empty(material_json, field_name)
-    for index, value in enumerate(values):
-        item = _json_object(value, field_name=f"{field_name}[{index}]")
-        labels.append(_json_label(item))
-    return tuple(labels)
-
-
-def _proposal_previous_labels(material_json: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    """读取 previous compacted view 中可用于 continuity 的 labels。
-
-    :param material_json: material JSON。
-    :returns: previous labels。
-    :raises TypeError: previous compacted view 字段类型非法时抛出。
-    """
-
-    previous = material_json.get(_COMPACTOR_FIELD_PREVIOUS_COMPACTED_VIEW)
-    if previous is None:
-        return ()
-    if not isinstance(previous, Mapping):
-        raise TypeError("previous_compacted_view must be object or null")
-    labels: list[str] = []
-    previous_mapping = cast(Mapping[str, JsonValue], previous)
-    for key in (
-        "evidence_backed_facts",
-        "answer_anchors",
-        "forward_intents",
-        "reference_continuity_items",
-    ):
-        for index, value in enumerate(_json_list_or_empty(previous_mapping, key)):
-            item = _json_object(value, field_name=f"{key}[{index}]")
-            labels.extend(_json_source_label_values(item))
-    return tuple(labels)
 
 
 def _json_list_or_empty(data: Mapping[str, JsonValue], field_name: str) -> tuple[JsonValue, ...]:
@@ -2188,54 +2162,19 @@ def _json_object(value: JsonValue, *, field_name: str) -> Mapping[str, JsonValue
     return cast(Mapping[str, JsonValue], value)
 
 
-def _json_label(data: Mapping[str, JsonValue]) -> str:
-    """读取 material item 的 label。
-
-    :param data: material item。
-    :returns: 非空 label。
-    :raises TypeError: label 缺失或为空时抛出。
-    """
-
-    value = data.get(_COMPACTOR_FIELD_LABEL, data.get(_COMPACTOR_FIELD_SOURCE_LABEL))
-    if not isinstance(value, str) or value.strip() == "":
-        raise TypeError("material item label must be non-empty string")
-    return value
-
-
-def _json_string_alias(data: Mapping[str, JsonValue], primary: str, fallback: str) -> str:
-    """读取字符串字段别名。
+def _json_required_string(data: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取严格非空字符串字段。
 
     :param data: JSON object。
-    :param primary: 优先字段名。
-    :param fallback: 备选字段名。
-    :returns: 字符串值；缺失或类型不匹配时返回空字符串。
-    :raises Exception: 不主动抛出异常。
+    :param field_name: 字段名。
+    :returns: 非空字符串。
+    :raises TypeError: 字段缺失、非字符串或为空时抛出。
     """
 
-    primary_value = data.get(primary)
-    if isinstance(primary_value, str):
-        return primary_value
-    fallback_value = data.get(fallback)
-    if isinstance(fallback_value, str):
-        return fallback_value
-    return ""
-
-
-def _json_source_label_values(data: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    """读取 previous view item 中的 source label 序列。
-
-    :param data: previous view item。
-    :returns: source labels。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    labels = _compact_payload_str_tuple(data, _COMPACTOR_FIELD_SOURCE_LABELS)
-    if labels:
-        return labels
-    label = _compact_payload_str(data, _COMPACTOR_FIELD_SOURCE_LABEL)
-    if label is None:
-        return ()
-    return (label,)
+    value = data.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise TypeError(f"{field_name} must be non-empty string")
+    return value
 
 
 def parse_args(argv: Sequence[str]) -> SmokeArgs:

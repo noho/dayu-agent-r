@@ -12,20 +12,25 @@ from dataclasses import dataclass
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
-    CompactCandidateDiagnosticVNext,
-    CompactQualityCheckResultVNext,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactAnswerAnchorV2,
+    CompactCandidateDiagnosticV2,
+    CompactDropReasonV2,
+    CompactExplicitDropV2,
+    CompactExplicitlyDroppedCoverageV2,
+    CompactRepresentedCoverageV2,
+    CompactRepresentedSourceV2,
+    CompactSemanticSectionV2,
+    CompactSourceBoundaryEntryV2,
+    CompactSourceKindV2,
+    CompactAcceptedTruthV2,
     CompactionRequest,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
+    CompactCandidateV2,
+    CompactEvidenceFactV2,
+    CompactForwardIntentV2,
+    CompactForwardIntentStatusV2,
+    CompactReferenceContinuityV2,
+    CompactSessionSummaryV2,
 )
 from dayu.host.durable.codec import is_sha256_digest
 
@@ -39,57 +44,58 @@ _FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
 _FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
-_FIELD_SCHEMA_VERSION = "schema_version"
+_FIELD_SOURCE_BOUNDARY = "source_boundary"
+_FIELD_REPRESENTED_COVERAGE = "represented_coverage"
+_FIELD_EXPLICITLY_DROPPED_COVERAGE = "explicitly_dropped_coverage"
+_FIELD_SCHEMA = "schema"
 _FIELD_SESSION_SUMMARY = "session_summary"
-_FIELD_SUMMARY_TEXT = "summary_text"
+_FIELD_SUMMARY_TEXT = "text"
 _FIELD_SOURCE_LABELS = "source_labels"
-_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_FIELD_CLAIM_TEXT = "claim_text"
-_FIELD_EVIDENCE_LABELS = "evidence_labels"
+_FIELD_EVIDENCE_FACTS = "evidence_facts"
+_FIELD_CLAIM = "claim"
+_FIELD_SUPPORT_LABELS = "support_labels"
+_FIELD_CONTEXT_LABELS = "context_labels"
 _FIELD_ANSWER_ANCHORS = "answer_anchors"
-_FIELD_ANCHOR_TITLE = "anchor_title"
-_FIELD_ANCHOR_ITEMS = "anchor_items"
-_FIELD_DISPLAY_TEXT = "display_text"
-_FIELD_ORDINAL = "ordinal"
-_FIELD_ANSWER_SOURCE_LABELS = "answer_source_labels"
+_FIELD_TITLE = "title"
+_FIELD_DETAIL = "detail"
 _FIELD_FORWARD_INTENTS = "forward_intents"
 _FIELD_INTENT_TYPE = "intent_type"
 _FIELD_TEXT = "text"
 _FIELD_STATUS = "status"
-_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
+_FIELD_REFERENCE_CONTINUITY = "reference_continuity"
 _FIELD_REASON = "reason"
 _FIELD_DIAGNOSTICS = "diagnostics"
 _FIELD_CODE = "code"
+_FIELD_MESSAGE = "message"
+_FIELD_EXPLICITLY_DROPPED_SOURCES = "explicitly_dropped_sources"
+_FIELD_SOURCE_LABEL = "source_label"
 _SHA256_PREFIX = "sha256:"
 
 _CANDIDATE_FIELDS = frozenset(
     (
-        _FIELD_SCHEMA_VERSION,
+        _FIELD_SCHEMA,
         _FIELD_SESSION_SUMMARY,
-        _FIELD_EVIDENCE_BACKED_FACTS,
+        _FIELD_EVIDENCE_FACTS,
         _FIELD_ANSWER_ANCHORS,
         _FIELD_FORWARD_INTENTS,
-        _FIELD_REFERENCE_CONTINUITY_ITEMS,
+        _FIELD_REFERENCE_CONTINUITY,
         _FIELD_DIAGNOSTICS,
+        _FIELD_EXPLICITLY_DROPPED_SOURCES,
     )
 )
 _SUMMARY_FIELDS = frozenset((_FIELD_SUMMARY_TEXT, _FIELD_SOURCE_LABELS))
 _FACT_FIELDS = frozenset(
     (
-        _FIELD_CLAIM_TEXT,
-        _FIELD_EVIDENCE_LABELS,
-        _FIELD_SOURCE_LABELS,
+        _FIELD_CLAIM,
+        _FIELD_SUPPORT_LABELS,
+        _FIELD_CONTEXT_LABELS,
     )
 )
-_ANCHOR_FIELDS = frozenset(
-    (_FIELD_ANCHOR_TITLE, _FIELD_ANCHOR_ITEMS, _FIELD_ANSWER_SOURCE_LABELS)
-)
-_ANCHOR_CHILD_FIELDS = frozenset((_FIELD_DISPLAY_TEXT, _FIELD_ORDINAL))
-_FORWARD_INTENT_FIELDS = frozenset(
-    (_FIELD_INTENT_TYPE, _FIELD_TEXT, _FIELD_STATUS, _FIELD_SOURCE_LABELS)
-)
+_ANCHOR_FIELDS = frozenset((_FIELD_TITLE, _FIELD_DETAIL, _FIELD_SOURCE_LABELS))
+_FORWARD_INTENT_FIELDS = frozenset((_FIELD_INTENT_TYPE, _FIELD_TEXT, _FIELD_STATUS, _FIELD_SOURCE_LABELS))
 _REFERENCE_FIELDS = frozenset((_FIELD_TEXT, _FIELD_REASON, _FIELD_SOURCE_LABELS))
-_DIAGNOSTIC_FIELDS = frozenset((_FIELD_CODE, _FIELD_TEXT, _FIELD_SOURCE_LABELS))
+_DIAGNOSTIC_FIELDS = frozenset((_FIELD_CODE, _FIELD_MESSAGE, _FIELD_SOURCE_LABELS))
+_DROP_FIELDS = frozenset((_FIELD_SOURCE_LABEL, _FIELD_REASON))
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,16 +106,20 @@ class ContextCompactedSemanticPayload:
     :param accepted_candidate_digest: candidate canonical digest。
     :param accepted_evidence_mapping_refs: candidate 绑定的 accepted evidence refs。
     :param compact_artifact_ref: compact artifact ref。
-    :param current_input_ref: 本次 compact 所属 current input boundary ref。
-    :param compacted_source_refs: 本次 accepted compact 覆盖的 canonical source refs。
+    :param current_input_ref: 本次 compact 所属 current input ref。
+    :param source_boundary: committed root typed source boundary。
+    :param represented_coverage: Host 派生的 represented coverage。
+    :param explicitly_dropped_coverage: Host 验证的 drop coverage。
     """
 
-    accepted_candidate: ConversationCompactOutputVNext
+    accepted_candidate: CompactCandidateV2
     accepted_candidate_digest: str
     accepted_evidence_mapping_refs: tuple[str, ...]
     compact_artifact_ref: str
     current_input_ref: str
-    compacted_source_refs: tuple[str, ...]
+    source_boundary: tuple[CompactSourceBoundaryEntryV2, ...]
+    represented_coverage: CompactRepresentedCoverageV2
+    explicitly_dropped_coverage: CompactExplicitlyDroppedCoverageV2
 
     def __post_init__(self) -> None:
         """校验 typed semantic view 的内部一致性。
@@ -119,8 +129,8 @@ class ContextCompactedSemanticPayload:
         :raises ValueError: digest、ref 或 candidate digest 不一致时抛出。
         """
 
-        if not isinstance(self.accepted_candidate, ConversationCompactOutputVNext):
-            raise TypeError("accepted_candidate must be ConversationCompactOutputVNext")
+        if not isinstance(self.accepted_candidate, CompactCandidateV2):
+            raise TypeError("accepted_candidate must be CompactCandidateV2")
         if not is_sha256_digest(self.accepted_candidate_digest):
             raise ValueError("accepted_candidate_digest must be sha256 digest")
         if self.accepted_candidate_digest != self.accepted_candidate.digest():
@@ -137,16 +147,29 @@ class ContextCompactedSemanticPayload:
             self.current_input_ref,
             field_name="current_input_ref",
         )
-        _require_runtime_text_tuple(
-            self.compacted_source_refs,
-            field_name="compacted_source_refs",
+        _validate_committed_coverage(self)
+
+    @property
+    def compacted_source_refs(self) -> tuple[str, ...]:
+        """从 committed typed boundary 与 coverage 派生 canonical refs。
+
+        :returns: 按 root boundary 顺序去重的 covered source refs。
+        """
+
+        covered_labels = frozenset(
+            (
+                *self.represented_coverage.source_labels,
+                *self.explicitly_dropped_coverage.source_labels,
+            )
         )
-        source_boundary_refs = (
-            self.current_input_ref,
-            *self.compacted_source_refs,
+        return tuple(
+            dict.fromkeys(
+                source_ref
+                for entry in self.source_boundary
+                if entry.source_label in covered_labels
+                for source_ref in entry.source_refs
+            )
         )
-        if len(frozenset(source_boundary_refs)) != len(source_boundary_refs):
-            raise ValueError("compact source boundary refs must be unique")
 
 
 def parse_context_compacted_semantic_payload(
@@ -167,7 +190,9 @@ def parse_context_compacted_semantic_payload(
         _FIELD_SOURCE_BOUNDARY_REFS,
         path=_FIELD_SOURCE_BOUNDARY_REFS,
     )
-    return ContextCompactedSemanticPayload(
+    if len(source_refs) == 0:
+        raise ValueError("source_boundary_refs must include current_input_ref")
+    semantics = ContextCompactedSemanticPayload(
         accepted_candidate=candidate,
         accepted_candidate_digest=candidate_digest,
         accepted_evidence_mapping_refs=_required_text_list(
@@ -177,12 +202,17 @@ def parse_context_compacted_semantic_payload(
         ),
         compact_artifact_ref=_required_text(payload, _FIELD_COMPACT_ARTIFACT_REF),
         current_input_ref=source_refs[0],
-        compacted_source_refs=source_refs[1:],
+        source_boundary=_parse_source_boundary(payload),
+        represented_coverage=_parse_represented_coverage(payload),
+        explicitly_dropped_coverage=_parse_dropped_coverage(payload),
     )
+    if source_refs != (semantics.current_input_ref, *semantics.compacted_source_refs):
+        raise ValueError("source_boundary_refs must equal committed derived coverage")
+    return semantics
 
 
 def accepted_compact_business_texts(
-    candidate: ConversationCompactOutputVNext,
+    candidate: CompactCandidateV2,
 ) -> tuple[str, ...]:
     """返回 accepted compact 后普通 dispatch 会消费的业务文本。
 
@@ -191,23 +221,230 @@ def accepted_compact_business_texts(
     :raises TypeError: candidate 类型非法时抛出。
     """
 
-    if not isinstance(candidate, ConversationCompactOutputVNext):
-        raise TypeError("candidate must be ConversationCompactOutputVNext")
+    if not isinstance(candidate, CompactCandidateV2):
+        raise TypeError("candidate must be CompactCandidateV2")
     texts: list[str] = []
     if candidate.session_summary is not None:
-        texts.append(candidate.session_summary.summary_text)
-    texts.extend(fact.claim_text for fact in candidate.evidence_backed_facts)
+        texts.append(candidate.session_summary.text)
+    texts.extend(fact.claim for fact in candidate.evidence_facts)
     for anchor in candidate.answer_anchors:
-        texts.append(anchor.anchor_title)
-        texts.extend(item.display_text for item in anchor.anchor_items)
+        texts.append(anchor.title)
+        texts.append(anchor.detail)
     texts.extend(intent.text for intent in candidate.forward_intents)
-    texts.extend(item.text for item in candidate.reference_continuity_items)
+    texts.extend(item.text for item in candidate.reference_continuity)
     return tuple(texts)
+
+
+def _parse_source_boundary(
+    payload: Mapping[str, JsonValue],
+) -> tuple[CompactSourceBoundaryEntryV2, ...]:
+    """严格恢复 committed root source boundary。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: typed boundary tuple。
+    :raises ValueError: shape、kind、label 或 refs 非法时抛出。
+    """
+
+    items = _required_mapping_list(
+        payload,
+        _FIELD_SOURCE_BOUNDARY,
+        path=_FIELD_SOURCE_BOUNDARY,
+    )
+    result: list[CompactSourceBoundaryEntryV2] = []
+    for index, item in enumerate(items):
+        path = f"{_FIELD_SOURCE_BOUNDARY}[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(("source_label", "source_kind", "source_refs", "readable_text")),
+            path=path,
+        )
+        result.append(
+            CompactSourceBoundaryEntryV2(
+                source_label=_required_text(item, "source_label"),
+                source_kind=CompactSourceKindV2(_required_text(item, "source_kind")),
+                source_refs=_required_unique_text_list(
+                    item,
+                    "source_refs",
+                    path=f"{path}.source_refs",
+                ),
+                readable_text=_required_text(item, "readable_text"),
+            )
+        )
+    labels = tuple(entry.source_label for entry in result)
+    if len(set(labels)) != len(labels):
+        raise ValueError("source_boundary labels must be unique")
+    return tuple(result)
+
+
+def _parse_represented_coverage(
+    payload: Mapping[str, JsonValue],
+) -> CompactRepresentedCoverageV2:
+    """严格恢复 committed represented coverage。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: typed represented coverage。
+    :raises ValueError: shape、section 或 label 非法时抛出。
+    """
+
+    coverage = _required_mapping(payload, _FIELD_REPRESENTED_COVERAGE)
+    _require_exact_fields(
+        coverage,
+        frozenset(("sources",)),
+        path=_FIELD_REPRESENTED_COVERAGE,
+    )
+    sources = _required_mapping_list(
+        coverage,
+        "sources",
+        path=f"{_FIELD_REPRESENTED_COVERAGE}.sources",
+    )
+    result: list[CompactRepresentedSourceV2] = []
+    for index, item in enumerate(sources):
+        path = f"{_FIELD_REPRESENTED_COVERAGE}.sources[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(("source_label", "sections")),
+            path=path,
+        )
+        result.append(
+            CompactRepresentedSourceV2(
+                source_label=_required_text(item, "source_label"),
+                sections=tuple(
+                    CompactSemanticSectionV2(value)
+                    for value in _required_unique_text_list(
+                        item,
+                        "sections",
+                        path=f"{path}.sections",
+                    )
+                ),
+            )
+        )
+    return CompactRepresentedCoverageV2(sources=tuple(result))
+
+
+def _parse_dropped_coverage(
+    payload: Mapping[str, JsonValue],
+) -> CompactExplicitlyDroppedCoverageV2:
+    """严格恢复 committed explicitly dropped coverage。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: typed dropped coverage。
+    :raises ValueError: shape、reason 或 label 非法时抛出。
+    """
+
+    coverage = _required_mapping(payload, _FIELD_EXPLICITLY_DROPPED_COVERAGE)
+    _require_exact_fields(
+        coverage,
+        frozenset(("drops",)),
+        path=_FIELD_EXPLICITLY_DROPPED_COVERAGE,
+    )
+    drops = _required_mapping_list(
+        coverage,
+        "drops",
+        path=f"{_FIELD_EXPLICITLY_DROPPED_COVERAGE}.drops",
+    )
+    return CompactExplicitlyDroppedCoverageV2(
+        drops=tuple(_parse_drop(item, index=index) for index, item in enumerate(drops))
+    )
+
+
+def _validate_committed_coverage(
+    semantics: ContextCompactedSemanticPayload,
+) -> None:
+    """重验 committed candidate/boundary/coverage 单一真源等式。
+
+    :param semantics: 待校验 committed semantic view。
+    :returns: ``None``。
+    :raises ValueError: coverage 顺序、partition 或 candidate 派生值不一致时抛出。
+    """
+
+    boundary_labels = tuple(entry.source_label for entry in semantics.source_boundary)
+    represented = semantics.represented_coverage.source_labels
+    dropped = semantics.explicitly_dropped_coverage.source_labels
+    if represented != tuple(label for label in boundary_labels if label in represented):
+        raise ValueError("represented coverage must follow root boundary order")
+    if dropped != tuple(label for label in boundary_labels if label in dropped):
+        raise ValueError("dropped coverage must follow root boundary order")
+    if set(represented).intersection(dropped):
+        raise ValueError("represented and dropped coverage must be disjoint")
+    if set(represented).union(dropped) != set(boundary_labels):
+        raise ValueError("coverage must exactly partition source_boundary")
+    expected_sections = _candidate_represented_sections(semantics.accepted_candidate)
+    actual_sections = {source.source_label: source.sections for source in semantics.represented_coverage.sources}
+    if actual_sections != expected_sections:
+        raise ValueError("represented coverage must equal candidate-derived sections")
+    if semantics.explicitly_dropped_coverage.drops != semantics.accepted_candidate.explicitly_dropped_sources:
+        raise ValueError("dropped coverage must equal accepted candidate drops")
+    if semantics.current_input_ref in semantics.compacted_source_refs:
+        raise ValueError("current input must not enter compacted source coverage")
+
+
+def _candidate_represented_sections(
+    candidate: CompactCandidateV2,
+) -> dict[str, tuple[CompactSemanticSectionV2, ...]]:
+    """从 committed candidate 派生 label→semantic sections。
+
+    :param candidate: strict v2 candidate。
+    :returns: 每个 represented label 的固定顺序 sections。
+    """
+
+    sections: dict[str, set[CompactSemanticSectionV2]] = {}
+    if candidate.session_summary is not None:
+        _add_candidate_sections(
+            sections,
+            candidate.session_summary.source_labels,
+            CompactSemanticSectionV2.SESSION_SUMMARY,
+        )
+    for fact in candidate.evidence_facts:
+        _add_candidate_sections(
+            sections,
+            (*fact.support_labels, *fact.context_labels),
+            CompactSemanticSectionV2.EVIDENCE_FACTS,
+        )
+    for anchor in candidate.answer_anchors:
+        _add_candidate_sections(
+            sections,
+            anchor.source_labels,
+            CompactSemanticSectionV2.ANSWER_ANCHORS,
+        )
+    for intent in candidate.forward_intents:
+        _add_candidate_sections(
+            sections,
+            intent.source_labels,
+            CompactSemanticSectionV2.FORWARD_INTENTS,
+        )
+    for item in candidate.reference_continuity:
+        _add_candidate_sections(
+            sections,
+            item.source_labels,
+            CompactSemanticSectionV2.REFERENCE_CONTINUITY,
+        )
+    order = tuple(CompactSemanticSectionV2)
+    return {
+        label: tuple(section for section in order if section in label_sections)
+        for label, label_sections in sections.items()
+    }
+
+
+def _add_candidate_sections(
+    sections: dict[str, set[CompactSemanticSectionV2]],
+    labels: tuple[str, ...],
+    section: CompactSemanticSectionV2,
+) -> None:
+    """向 candidate represented section accumulator 写入 labels。
+
+    :param sections: label→section set accumulator。
+    :param labels: candidate source labels。
+    :param section: 当前业务 section。
+    :returns: ``None``。
+    """
+
+    for label in labels:
+        sections.setdefault(label, set()).add(section)
 
 
 def _parse_persisted_candidate(
     candidate: Mapping[str, JsonValue],
-) -> ConversationCompactOutputVNext:
+) -> CompactCandidateV2:
     """从 current persisted shape 恢复 typed candidate。
 
     :param candidate: ``accepted_candidate`` JSON object。
@@ -216,22 +453,19 @@ def _parse_persisted_candidate(
     """
 
     _require_exact_fields(candidate, _CANDIDATE_FIELDS, path=_FIELD_ACCEPTED_CANDIDATE)
-    schema_version = _required_text(candidate, _FIELD_SCHEMA_VERSION)
-    if schema_version != CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT:
-        raise ValueError("accepted_candidate.schema_version is invalid")
-    return ConversationCompactOutputVNext(
-        schema_version=schema_version,
+    schema = _required_text(candidate, _FIELD_SCHEMA)
+    if schema != COMPACT_OUTPUT_SCHEMA_V2:
+        raise ValueError("accepted_candidate.schema is invalid")
+    return CompactCandidateV2(
+        schema=schema,
         session_summary=_parse_session_summary(candidate),
-        evidence_backed_facts=tuple(
+        evidence_facts=tuple(
             _parse_fact(item, index=index)
             for index, item in enumerate(
                 _required_mapping_list(
                     candidate,
-                    _FIELD_EVIDENCE_BACKED_FACTS,
-                    path=(
-                        f"{_FIELD_ACCEPTED_CANDIDATE}."
-                        f"{_FIELD_EVIDENCE_BACKED_FACTS}"
-                    ),
+                    _FIELD_EVIDENCE_FACTS,
+                    path=(f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EVIDENCE_FACTS}"),
                 )
             )
         ),
@@ -255,16 +489,13 @@ def _parse_persisted_candidate(
                 )
             )
         ),
-        reference_continuity_items=tuple(
+        reference_continuity=tuple(
             _parse_reference(item, index=index)
             for index, item in enumerate(
                 _required_mapping_list(
                     candidate,
-                    _FIELD_REFERENCE_CONTINUITY_ITEMS,
-                    path=(
-                        f"{_FIELD_ACCEPTED_CANDIDATE}."
-                        f"{_FIELD_REFERENCE_CONTINUITY_ITEMS}"
-                    ),
+                    _FIELD_REFERENCE_CONTINUITY,
+                    path=(f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_REFERENCE_CONTINUITY}"),
                 )
             )
         ),
@@ -278,12 +509,22 @@ def _parse_persisted_candidate(
                 )
             )
         ),
+        explicitly_dropped_sources=tuple(
+            _parse_drop(item, index=index)
+            for index, item in enumerate(
+                _required_mapping_list(
+                    candidate,
+                    _FIELD_EXPLICITLY_DROPPED_SOURCES,
+                    path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EXPLICITLY_DROPPED_SOURCES}",
+                )
+            )
+        ),
     )
 
 
 def _parse_session_summary(
     candidate: Mapping[str, JsonValue],
-) -> SessionSummaryCandidateVNext | None:
+) -> CompactSessionSummaryV2 | None:
     """恢复 nullable session summary。
 
     :param candidate: accepted candidate JSON object。
@@ -296,13 +537,12 @@ def _parse_session_summary(
         return None
     summary = _mapping_value(value, path=_FIELD_SESSION_SUMMARY)
     _require_exact_fields(summary, _SUMMARY_FIELDS, path=_FIELD_SESSION_SUMMARY)
-    return SessionSummaryCandidateVNext(
-        summary_text=_required_text(summary, _FIELD_SUMMARY_TEXT),
+    return CompactSessionSummaryV2(
+        text=_required_text(summary, _FIELD_SUMMARY_TEXT),
         source_labels=_required_unique_text_list(
             summary,
             _FIELD_SOURCE_LABELS,
-            path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_SESSION_SUMMARY}."
-            f"{_FIELD_SOURCE_LABELS}",
+            path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_SESSION_SUMMARY}.{_FIELD_SOURCE_LABELS}",
         ),
     )
 
@@ -311,7 +551,7 @@ def _parse_fact(
     fact: Mapping[str, JsonValue],
     *,
     index: int,
-) -> EvidenceBackedFactCandidateVNext:
+) -> CompactEvidenceFactV2:
     """恢复单个 persisted evidence-backed fact。
 
     :param fact: fact JSON object。
@@ -320,19 +560,19 @@ def _parse_fact(
     :raises ValueError: fact shape、未知字段、文本或 labels 非法时抛出。
     """
 
-    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EVIDENCE_BACKED_FACTS}[{index}]"
+    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EVIDENCE_FACTS}[{index}]"
     _require_exact_fields(fact, _FACT_FIELDS, path=path)
-    return EvidenceBackedFactCandidateVNext(
-        claim_text=_required_text(fact, _FIELD_CLAIM_TEXT),
-        evidence_labels=_required_unique_text_list(
+    return CompactEvidenceFactV2(
+        claim=_required_text(fact, _FIELD_CLAIM),
+        support_labels=_required_unique_text_list(
             fact,
-            _FIELD_EVIDENCE_LABELS,
-            path=f"{path}.{_FIELD_EVIDENCE_LABELS}",
+            _FIELD_SUPPORT_LABELS,
+            path=f"{path}.{_FIELD_SUPPORT_LABELS}",
         ),
-        source_labels=_required_unique_text_list(
+        context_labels=_required_unique_text_list(
             fact,
-            _FIELD_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_SOURCE_LABELS}",
+            _FIELD_CONTEXT_LABELS,
+            path=f"{path}.{_FIELD_CONTEXT_LABELS}",
             allow_empty=True,
         ),
     )
@@ -342,8 +582,8 @@ def _parse_answer_anchor(
     anchor: Mapping[str, JsonValue],
     *,
     index: int,
-) -> AnswerAnchorCandidateVNext:
-    """恢复单个 persisted answer anchor 及完整 children。
+) -> CompactAnswerAnchorV2:
+    """恢复单个 persisted answer anchor。
 
     :param anchor: answer anchor JSON object。
     :param index: anchor ordinal。
@@ -353,49 +593,14 @@ def _parse_answer_anchor(
 
     path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_ANSWER_ANCHORS}[{index}]"
     _require_exact_fields(anchor, _ANCHOR_FIELDS, path=path)
-    return AnswerAnchorCandidateVNext(
-        anchor_title=_required_text(anchor, _FIELD_ANCHOR_TITLE),
-        anchor_items=tuple(
-            _parse_answer_anchor_child(item, anchor_index=index, child_index=child_index)
-            for child_index, item in enumerate(
-                _required_mapping_list(
-                    anchor,
-                    _FIELD_ANCHOR_ITEMS,
-                    path=f"{path}.{_FIELD_ANCHOR_ITEMS}",
-                )
-            )
-        ),
-        answer_source_labels=_required_unique_text_list(
+    return CompactAnswerAnchorV2(
+        title=_required_text(anchor, _FIELD_TITLE),
+        detail=_required_text(anchor, _FIELD_DETAIL),
+        source_labels=_required_unique_text_list(
             anchor,
-            _FIELD_ANSWER_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_ANSWER_SOURCE_LABELS}",
+            _FIELD_SOURCE_LABELS,
+            path=f"{path}.{_FIELD_SOURCE_LABELS}",
         ),
-    )
-
-
-def _parse_answer_anchor_child(
-    child: Mapping[str, JsonValue],
-    *,
-    anchor_index: int,
-    child_index: int,
-) -> AnswerAnchorChildVNext:
-    """恢复单个 persisted answer anchor child。
-
-    :param child: child JSON object。
-    :param anchor_index: parent anchor ordinal。
-    :param child_index: child ordinal。
-    :returns: typed answer anchor child。
-    :raises ValueError: child shape、文本或 ordinal 非法时抛出。
-    """
-
-    path = (
-        f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_ANSWER_ANCHORS}[{anchor_index}]."
-        f"{_FIELD_ANCHOR_ITEMS}[{child_index}]"
-    )
-    _require_exact_fields(child, _ANCHOR_CHILD_FIELDS, path=path)
-    return AnswerAnchorChildVNext(
-        display_text=_required_text(child, _FIELD_DISPLAY_TEXT),
-        ordinal=_required_optional_non_negative_int(child, _FIELD_ORDINAL),
     )
 
 
@@ -403,7 +608,7 @@ def _parse_forward_intent(
     intent: Mapping[str, JsonValue],
     *,
     index: int,
-) -> ForwardIntentCandidateVNext:
+) -> CompactForwardIntentV2:
     """恢复单个 persisted forward intent。
 
     :param intent: forward intent JSON object。
@@ -414,12 +619,10 @@ def _parse_forward_intent(
 
     path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_FORWARD_INTENTS}[{index}]"
     _require_exact_fields(intent, _FORWARD_INTENT_FIELDS, path=path)
-    return ForwardIntentCandidateVNext(
-        intent_type=ForwardIntentTypeVNext(
-            _required_text(intent, _FIELD_INTENT_TYPE)
-        ),
+    return CompactForwardIntentV2(
+        intent_type=_required_text(intent, _FIELD_INTENT_TYPE),
         text=_required_text(intent, _FIELD_TEXT),
-        status=ForwardIntentStatusVNext(_required_text(intent, _FIELD_STATUS)),
+        status=CompactForwardIntentStatusV2(_required_text(intent, _FIELD_STATUS)),
         source_labels=_required_unique_text_list(
             intent,
             _FIELD_SOURCE_LABELS,
@@ -432,7 +635,7 @@ def _parse_reference(
     reference: Mapping[str, JsonValue],
     *,
     index: int,
-) -> ReferenceContinuityCandidateVNext:
+) -> CompactReferenceContinuityV2:
     """恢复单个 persisted reference continuity item。
 
     :param reference: reference item JSON object。
@@ -441,16 +644,11 @@ def _parse_reference(
     :raises ValueError: shape、reason、文本或 labels 非法时抛出。
     """
 
-    path = (
-        f"{_FIELD_ACCEPTED_CANDIDATE}."
-        f"{_FIELD_REFERENCE_CONTINUITY_ITEMS}[{index}]"
-    )
+    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_REFERENCE_CONTINUITY}[{index}]"
     _require_exact_fields(reference, _REFERENCE_FIELDS, path=path)
-    return ReferenceContinuityCandidateVNext(
+    return CompactReferenceContinuityV2(
         text=_required_text(reference, _FIELD_TEXT),
-        reason=ReferenceContinuityReasonVNext(
-            _required_text(reference, _FIELD_REASON)
-        ),
+        reason=_required_text(reference, _FIELD_REASON),
         source_labels=_required_unique_text_list(
             reference,
             _FIELD_SOURCE_LABELS,
@@ -463,7 +661,7 @@ def _parse_diagnostic(
     diagnostic: Mapping[str, JsonValue],
     *,
     index: int,
-) -> CompactCandidateDiagnosticVNext:
+) -> CompactCandidateDiagnosticV2:
     """恢复单个 persisted compact diagnostic。
 
     :param diagnostic: diagnostic JSON object。
@@ -474,15 +672,36 @@ def _parse_diagnostic(
 
     path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_DIAGNOSTICS}[{index}]"
     _require_exact_fields(diagnostic, _DIAGNOSTIC_FIELDS, path=path)
-    return CompactCandidateDiagnosticVNext(
+    return CompactCandidateDiagnosticV2(
         code=_required_text(diagnostic, _FIELD_CODE),
-        text=_required_text(diagnostic, _FIELD_TEXT),
+        message=_required_text(diagnostic, _FIELD_MESSAGE),
         source_labels=_required_unique_text_list(
             diagnostic,
             _FIELD_SOURCE_LABELS,
             path=f"{path}.{_FIELD_SOURCE_LABELS}",
             allow_empty=True,
         ),
+    )
+
+
+def _parse_drop(
+    drop: Mapping[str, JsonValue],
+    *,
+    index: int,
+) -> CompactExplicitDropV2:
+    """恢复单个 persisted explicit drop。
+
+    :param drop: drop JSON object。
+    :param index: drop ordinal。
+    :returns: typed drop。
+    :raises ValueError: shape、label 或 reason 非法时抛出。
+    """
+
+    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EXPLICITLY_DROPPED_SOURCES}[{index}]"
+    _require_exact_fields(drop, _DROP_FIELDS, path=path)
+    return CompactExplicitDropV2(
+        source_label=_required_text(drop, _FIELD_SOURCE_LABEL),
+        reason=CompactDropReasonV2(_required_text(drop, _FIELD_REASON)),
     )
 
 
@@ -515,46 +734,54 @@ def accepted_candidate_fact_evidence_labels(
 
     candidate = parse_context_compacted_semantic_payload(payload).accepted_candidate
     labels: list[str] = []
-    for fact in candidate.evidence_backed_facts:
-        labels.extend(fact.evidence_labels)
+    for fact in candidate.evidence_facts:
+        labels.extend(fact.support_labels)
     return tuple(dict.fromkeys(labels))
 
 
 def compact_artifact_json_vnext(
     *,
     request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
-    quality: CompactQualityCheckResultVNext,
+    accepted_truth: CompactAcceptedTruthV2,
     policy_digest: str,
     budget_after_compact: int,
 ) -> JsonValue:
     """构造 vNext compact artifact canonical JSON。
 
     :param request: compaction request。
-    :param candidate: accepted vNext candidate。
-    :param quality: accepted vNext quality result。
+    :param accepted_truth: Context Governance final accepted truth。
     :param policy_digest: policy digest。
     :param budget_after_compact: Host 估算的 compact 后预算。
     :returns: artifact JSON object。
     """
 
+    candidate = accepted_truth.candidate
     return {
         "artifact_kind": COMPACT_ARTIFACT_KIND_VNEXT,
         "schema_version": COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
         "compaction_request_digest": request.digest(),
         "accepted_candidate_digest": candidate.digest(),
         "accepted_candidate": candidate.to_json(),
-        "quality_result": quality.to_json(),
+        "source_boundary": [
+            {
+                "source_label": entry.source_label,
+                "source_kind": entry.source_kind.value,
+                "source_refs": list(entry.source_refs),
+                "readable_text": entry.readable_text,
+            }
+            for entry in accepted_truth.source_boundary
+        ],
+        "represented_coverage": accepted_truth.represented_coverage.to_json(),
+        "explicitly_dropped_coverage": (accepted_truth.explicitly_dropped_coverage.to_json()),
         "budget_before_compact": _budget_before_compact_json(request),
         "budget_after_compact": budget_after_compact,
         "input_snapshot_refs": _input_snapshot_refs_json_vnext(request),
-        "prompt_local_label_mapping_refs": list(
-            prompt_local_label_mapping_refs(request)
-        ),
-        "source_boundary_refs": list(source_boundary_refs(request)),
-        "accepted_evidence_mapping_refs": list(
-            accepted_evidence_mapping_refs_for_candidate(request, candidate)
-        ),
+        "prompt_local_label_mapping_refs": list(prompt_local_label_mapping_refs(request)),
+        "source_boundary_refs": [
+            accepted_truth.current_input_ref,
+            *accepted_truth.covered_source_refs,
+        ],
+        "accepted_evidence_mapping_refs": list(accepted_evidence_mapping_refs_for_candidate(request, candidate)),
         "policy_digest": policy_digest,
     }
 
@@ -575,14 +802,14 @@ def compact_artifact_payload_ref(artifact_digest: str) -> str:
 def compact_artifact_descriptor_metadata_vnext(
     *,
     request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
+    accepted_truth: CompactAcceptedTruthV2,
     artifact_digest: str,
     policy_digest: str,
 ) -> Mapping[str, JsonValue]:
     """构造 vNext compact artifact descriptor metadata。
 
     :param request: compaction request。
-    :param candidate: accepted vNext candidate。
+    :param accepted_truth: Context Governance final accepted truth。
     :param artifact_digest: artifact digest。
     :param policy_digest: policy digest。
     :returns: metadata JSON object。
@@ -593,7 +820,7 @@ def compact_artifact_descriptor_metadata_vnext(
         "schema_version": COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
         "artifact_digest": artifact_digest,
         "compaction_request_digest": request.digest(),
-        "accepted_candidate_digest": candidate.digest(),
+        "accepted_candidate_digest": accepted_truth.candidate.digest(),
         "policy_digest": policy_digest,
     }
 
@@ -632,7 +859,7 @@ def source_boundary_refs(request: CompactionRequest) -> tuple[str, ...]:
 
 def accepted_evidence_mapping_refs_for_candidate(
     request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
+    candidate: CompactCandidateV2,
 ) -> tuple[str, ...]:
     """返回 accepted vNext fact candidate 绑定的 canonical evidence refs。
 
@@ -642,8 +869,8 @@ def accepted_evidence_mapping_refs_for_candidate(
     """
 
     evidence_labels: list[str] = []
-    for fact in candidate.evidence_backed_facts:
-        evidence_labels.extend(fact.evidence_labels)
+    for fact in candidate.evidence_facts:
+        evidence_labels.extend(fact.support_labels)
     refs: list[str] = []
     for label in dict.fromkeys(evidence_labels):
         entry = request.material_pack.provenance_map[label]
@@ -667,9 +894,7 @@ def _budget_before_compact_json(request: CompactionRequest) -> JsonValue:
         "hard_threshold_tokens": estimate.hard_threshold_tokens,
         "safety_margin_tokens": estimate.safety_margin_tokens,
         "estimator_digest": estimate.estimator_digest,
-        "overage_reason": (
-            None if estimate.overage_reason is None else estimate.overage_reason.value
-        ),
+        "overage_reason": (None if estimate.overage_reason is None else estimate.overage_reason.value),
     }
 
 
@@ -693,9 +918,7 @@ def _input_snapshot_refs_json_vnext(request: CompactionRequest) -> JsonValue:
     }
 
 
-def _required_mapping(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> Mapping[str, JsonValue]:
+def _required_mapping(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
     """读取必填 JSON object 字段。
 
     :param payload: JSON payload。

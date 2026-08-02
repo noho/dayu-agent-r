@@ -50,30 +50,32 @@ from dayu.host.compact_material import (
     transform_previous_compacted_view_pair_for_recovery,
 )
 from dayu.host.compaction import (
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
+    COMPACT_INPUT_SCHEMA_V2,
+    CompactAcceptedTruthV2,
+    CompactAnswerAnchorV2,
+    CompactCurrentInputV2,
     CompactMaterialBlock,
-    CompactQualityCheckResultVNext,
     CompactMaterialBlockKind,
-    CompactReadableViewVNext,
+    PreviousCompactReadableView,
     CompactMaterialSection,
     CompactSegmentTrigger,
-    ConversationCompactInputVNext,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
+    CompactInputV2,
+    CompactCandidateV2,
+    CompactEvidenceFactV2,
+    CompactForwardIntentV2,
+    CompactForwardIntentStatusV2,
+    CompactReferenceContinuityV2,
     ReadableAnswerAnchorItemVNext,
     ReadableAnswerAnchorVNext,
     ReadableFactItemVNext,
     ReadableForwardIntentVNext,
     ReadableReferenceContinuityItemVNext,
-    SessionSummaryCandidateVNext,
+    CompactSessionSummaryV2,
+    CompactSourceKindV2,
+    CompactSourceBoundaryEntryV2,
 )
 from dayu.host.context_events import build_context_compacted_payload
+from dayu.host.context_governance import accept_compact_candidate_v2
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     sha256_digest_bytes,
@@ -136,6 +138,7 @@ from dayu.host.memory import (
     AnswerAnchorMemoryView,
     SessionSummaryMemoryView,
     TraceMemoryView,
+    default_memory_projection_policy,
 )
 from tests.host.memory_snapshot_factories import (
     empty_memory_snapshot,
@@ -202,16 +205,11 @@ def _proposal_manifest_reference(
         compaction_attempt_number=1,
         compactor_engine_run_id=compactor_engine_run_id,
     )
+
+
 _LONG_EVIDENCE_TEXT_CHAR_COUNT = 5000
-_CURRENT_VNEXT_MATERIAL_KEYS = (
-    "previous_compacted_view",
-    "trace_material",
-    "evidence_material",
-    "answer_material",
-    "current_input_anchor",
-    "instruction",
-)
-_VNEXT_TOP_LEVEL_KEYS = ("schema_version", *_CURRENT_VNEXT_MATERIAL_KEYS)
+_CURRENT_VNEXT_MATERIAL_KEYS = ("current_input", "source_boundary")
+_VNEXT_TOP_LEVEL_KEYS = ("schema", *_CURRENT_VNEXT_MATERIAL_KEYS)
 
 
 class _CompactEvidencePayloadTamperKind(StrEnum):
@@ -246,7 +244,7 @@ class _VNextInputShape(NamedTuple):
     trace_count: int
     evidence_count: int
     answer_count: int
-    current_anchor_label: str
+    current_input_text: str
 
 
 def test_normalized_material_text_preserves_line_boundaries() -> None:
@@ -294,13 +292,13 @@ def _assert_material_pack_shape(pack: CompactMaterialPack, *, expected: _Materia
     """
 
     observed = _material_pack_shape(pack)
-    assert (
-        observed == expected
-    ), f"material pack prompt-local label shape mismatch: expected={expected!r}, observed={observed!r}"
+    assert observed == expected, (
+        f"material pack prompt-local label shape mismatch: expected={expected!r}, observed={observed!r}"
+    )
 
 
 def _vnext_input_shape(
-    vnext_input: ConversationCompactInputVNext,
+    vnext_input: CompactInputV2,
 ) -> _VNextInputShape:
     """返回 vNext compactor input 的顶层 JSON / section count shape。
 
@@ -311,27 +309,30 @@ def _vnext_input_shape(
 
     vnext_json = vnext_input.to_json()
     assert isinstance(vnext_json, dict), "vNext material JSON must be an object"
-    previous_view = vnext_input.previous_compacted_view
-    previous_count = 0
-    if previous_view is not None:
-        previous_count = (
-            (1 if previous_view.session_summary is not None else 0)
-            + len(previous_view.evidence_backed_facts)
-            + len(previous_view.answer_anchors)
-            + len(previous_view.forward_intents)
-            + len(previous_view.reference_continuity_items)
+    previous_kinds = frozenset(
+        (
+            CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY,
+            CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT,
+            CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR,
+            CompactSourceKindV2.PREVIOUS_FORWARD_INTENT,
+            CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY,
         )
+    )
     return _VNextInputShape(
         top_level_keys=tuple(vnext_json),
-        previous_count=previous_count,
-        trace_count=len(vnext_input.trace_material),
-        evidence_count=len(vnext_input.evidence_material),
-        answer_count=len(vnext_input.answer_material),
-        current_anchor_label=vnext_input.current_input_anchor.anchor_label,
+        previous_count=sum(item.source_kind in previous_kinds for item in vnext_input.source_boundary),
+        trace_count=sum(item.source_kind is CompactSourceKindV2.TRACE_MATERIAL for item in vnext_input.source_boundary),
+        evidence_count=sum(
+            item.source_kind is CompactSourceKindV2.EVIDENCE_MATERIAL for item in vnext_input.source_boundary
+        ),
+        answer_count=sum(
+            item.source_kind is CompactSourceKindV2.ANSWER_MATERIAL for item in vnext_input.source_boundary
+        ),
+        current_input_text=vnext_input.current_input.readable_text,
     )
 
 
-def _assert_vnext_input_shape(vnext_input: ConversationCompactInputVNext, *, expected: _VNextInputShape) -> None:
+def _assert_vnext_input_shape(vnext_input: CompactInputV2, *, expected: _VNextInputShape) -> None:
     """断言 vNext compactor input 的 section / top-level key shape。
 
     :param vnext_input: vNext compactor input。
@@ -342,6 +343,20 @@ def _assert_vnext_input_shape(vnext_input: ConversationCompactInputVNext, *, exp
 
     observed = _vnext_input_shape(vnext_input)
     assert observed == expected, f"vNext material section shape mismatch: expected={expected!r}, observed={observed!r}"
+
+
+def _boundary_entries(
+    compact_input: CompactInputV2,
+    source_kind: CompactSourceKindV2,
+) -> tuple[CompactSourceBoundaryEntryV2, ...]:
+    """返回指定 kind 的 source boundary entries。
+
+    :param compact_input: strict v2 input。
+    :param source_kind: source kind。
+    :returns: 匹配 entries。
+    """
+
+    return tuple(entry for entry in compact_input.source_boundary if entry.source_kind is source_kind)
 
 
 def test_segment_selection_is_deterministic_for_same_inputs() -> None:
@@ -574,7 +589,7 @@ def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() 
     retained = retained_previous_compacted_view_labels_for_recovery(previous)
     degraded, degraded_view = transform_previous_compacted_view_pair_for_recovery(
         blocks=previous,
-        readable_view=CompactReadableViewVNext(
+        readable_view=PreviousCompactReadableView(
             session_summary="summary must drop whole",
             evidence_backed_facts=(
                 ReadableFactItemVNext(source_label="P1", claim_text="fact must stay byte exact"),
@@ -586,7 +601,7 @@ def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() 
                 ReadableReferenceContinuityItemVNext(
                     source_label="P2",
                     text="reference must drop whole",
-                    reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                    reason="local_reference",
                 ),
             ),
         ),
@@ -635,7 +650,7 @@ def test_degrade_previous_compacted_view_preserves_verified_pair_order() -> None
     retained = retained_previous_compacted_view_labels_for_recovery(previous)
     degraded, degraded_view = transform_previous_compacted_view_pair_for_recovery(
         blocks=previous,
-        readable_view=CompactReadableViewVNext(
+        readable_view=PreviousCompactReadableView(
             session_summary="lower priority summary drops whole",
             evidence_backed_facts=(
                 ReadableFactItemVNext(source_label="P1", claim_text="older fact remains exact"),
@@ -690,7 +705,7 @@ def test_compact_material_pack_rejects_previous_typed_pair_text_mismatch() -> No
             current_input_ref="event-current",
             current_input_text="current",
             previous_compacted_view=previous,
-            previous_compacted_readable_view=CompactReadableViewVNext(
+            previous_compacted_readable_view=PreviousCompactReadableView(
                 session_summary=None,
                 evidence_backed_facts=(
                     ReadableFactItemVNext(
@@ -827,7 +842,7 @@ def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() 
             current_input_ref="event-current",
             current_input_text="current input",
             previous_compacted_view=previous,
-            previous_compacted_readable_view=CompactReadableViewVNext(
+            previous_compacted_readable_view=PreviousCompactReadableView(
                 session_summary="duplicate readable content",
                 evidence_backed_facts=(),
                 answer_anchors=(),
@@ -925,13 +940,19 @@ def test_conversation_compact_input_vnext_maps_material_without_citable_current_
             trace_count=1,
             evidence_count=1,
             answer_count=1,
-            current_anchor_label="C1",
+            current_input_text="current input",
         ),
     )
-    assert "C1" not in vnext_input.citable_source_labels
-    assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
-    assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
-    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert "C1" not in vnext_input.source_labels
+    assert tuple(item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)) == (
+        "T1",
+    )
+    assert tuple(item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)) == (
+        "A1",
+    )
+    assert tuple(
+        item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
+    ) == ("E1",)
     assert isinstance(vnext_json, dict)
     for key in _CURRENT_VNEXT_MATERIAL_KEYS:
         assert key in vnext_json, f"vNext material JSON missing current key: {key}"
@@ -963,8 +984,9 @@ def test_conversation_compact_input_vnext_maps_user_turn_to_trace() -> None:
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    assert tuple(item.text for item in vnext_input.trace_material) == ("old user input",)
-    assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
+    trace_entries = _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)
+    assert tuple(item.readable_text for item in trace_entries) == ("old user input",)
+    assert tuple(item.source_label for item in trace_entries) == ("T1",)
 
 
 def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> None:
@@ -990,8 +1012,9 @@ def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> Non
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    assert tuple(item.answer_text for item in vnext_input.answer_material) == ("old assistant answer",)
-    assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
+    answer_entries = _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)
+    assert tuple(item.readable_text for item in answer_entries) == ("old assistant answer",)
+    assert tuple(item.source_label for item in answer_entries) == ("A1",)
 
 
 def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer() -> None:
@@ -1030,8 +1053,9 @@ def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    assert tuple(item.answer_text for item in vnext_input.answer_material) == ("assistant final answer",)
-    assert all(item.answer_text != "summary text is navigation only" for item in vnext_input.answer_material)
+    answer_entries = _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)
+    assert tuple(item.readable_text for item in answer_entries) == ("assistant final answer",)
+    assert all(item.readable_text != "summary text is navigation only" for item in answer_entries)
 
 
 def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -> None:
@@ -1059,13 +1083,14 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
+    assert tuple(item.source_label for item in evidence_entries) == ("E1",)
     assert pack.evidence_labels == ("E1",)
     assert tuple(block.raw_result_text for block in pack.evidence_material) == (long_evidence_text,)
-    assert tuple(item.response_text for item in vnext_input.evidence_material) == (long_evidence_text,)
-    assert tuple(item.tool_name for item in vnext_input.evidence_material) == ("fins.search",)
-    assert "E1.1" not in vnext_input.citable_source_labels
-    assert "E1.2" not in vnext_input.citable_source_labels
+    assert long_evidence_text in evidence_entries[0].readable_text
+    assert "fins.search" in evidence_entries[0].readable_text
+    assert "E1.1" not in vnext_input.source_labels
+    assert "E1.2" not in vnext_input.source_labels
 
 
 def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
@@ -1074,9 +1099,7 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
     answer_anchor = ReadableAnswerAnchorVNext(
         source_label="P3",
         anchor_title="answer title",
-        anchor_items=(
-            ReadableAnswerAnchorItemVNext(display_text="answer child", ordinal=None),
-        ),
+        anchor_items=(ReadableAnswerAnchorItemVNext(display_text="answer child", ordinal=None),),
     )
     previous = (
         _previous_compact_block(
@@ -1105,7 +1128,7 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
             text="second factor",
         ),
     )
-    readable_view = CompactReadableViewVNext(
+    readable_view = PreviousCompactReadableView(
         session_summary="summary text",
         evidence_backed_facts=(
             ReadableFactItemVNext(
@@ -1117,16 +1140,16 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
         forward_intents=(
             ReadableForwardIntentVNext(
                 source_label="P4",
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                intent_type="next_step_note",
                 text="follow up",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV2.OPEN,
             ),
         ),
         reference_continuity_items=(
             ReadableReferenceContinuityItemVNext(
                 source_label="P5",
                 text="second factor",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
             ),
         ),
     )
@@ -1150,19 +1173,21 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    previous_view = vnext_input.previous_compacted_view
-    assert previous_view is not None
-    assert previous_view.session_summary == "summary text"
-    assert tuple(item.claim_text for item in previous_view.evidence_backed_facts) == (
-        "Revenue increased year over year",
-    )
-    assert tuple(item.anchor_title for item in previous_view.answer_anchors) == ("answer title",)
-    assert tuple(item.anchor_items[0].display_text for item in previous_view.answer_anchors) == ("answer child",)
-    assert tuple(item.text for item in previous_view.forward_intents) == ("follow up",)
-    assert tuple(item.intent_type.value for item in previous_view.forward_intents) == ("next_step_note",)
-    assert tuple(item.status.value for item in previous_view.forward_intents) == ("open",)
-    assert tuple(item.text for item in previous_view.reference_continuity_items) == ("second factor",)
-    assert tuple(item.reason.value for item in previous_view.reference_continuity_items) == ("local_reference",)
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY)
+    ) == ("summary text",)
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT)
+    ) == ("Revenue increased year over year",)
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR)
+    ) == ("answer title\n- answer child",)
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_FORWARD_INTENT)
+    ) == ("follow up",)
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY)
+    ) == ("second factor",)
 
 
 def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items() -> None:
@@ -1190,34 +1215,34 @@ def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items()
             text="second reference\nwith wrapped source text",
         ),
     )
-    readable_view = CompactReadableViewVNext(
+    readable_view = PreviousCompactReadableView(
         session_summary=None,
         evidence_backed_facts=(),
         answer_anchors=(),
         forward_intents=(
             ReadableForwardIntentVNext(
                 source_label="P1",
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                intent_type="next_step_note",
                 text="follow up one",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV2.OPEN,
             ),
             ReadableForwardIntentVNext(
                 source_label="P2",
-                intent_type=ForwardIntentTypeVNext.PENDING_USER_VISIBLE_TASK,
+                intent_type="pending_user_visible_task",
                 text="follow up two\nwith wrapped source text",
-                status=ForwardIntentStatusVNext.SUPERSEDED,
+                status=CompactForwardIntentStatusV2.SUPERSEDED,
             ),
         ),
         reference_continuity_items=(
             ReadableReferenceContinuityItemVNext(
                 source_label="P3",
                 text="first reference",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
             ),
             ReadableReferenceContinuityItemVNext(
                 source_label="P4",
                 text="second reference\nwith wrapped source text",
-                reason=ReferenceContinuityReasonVNext.RECENT_STATE,
+                reason="recent_state",
             ),
         ),
     )
@@ -1241,27 +1266,17 @@ def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items()
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    previous_view = vnext_input.previous_compacted_view
-    assert previous_view is not None
-    assert tuple(item.text for item in previous_view.forward_intents) == (
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_FORWARD_INTENT)
+    ) == (
         "follow up one",
         "follow up two\nwith wrapped source text",
     )
-    assert tuple(item.intent_type.value for item in previous_view.forward_intents) == (
-        "next_step_note",
-        "pending_user_visible_task",
-    )
-    assert tuple(item.status.value for item in previous_view.forward_intents) == (
-        "open",
-        "superseded",
-    )
-    assert tuple(item.text for item in previous_view.reference_continuity_items) == (
+    assert tuple(
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY)
+    ) == (
         "first reference",
         "second reference\nwith wrapped source text",
-    )
-    assert tuple(item.reason.value for item in previous_view.reference_continuity_items) == (
-        "local_reference",
-        "recent_state",
     )
 
 
@@ -1283,8 +1298,8 @@ def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> 
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    assert tuple(item.text for item in vnext_input.trace_material) == ("run is waiting for user confirmation",)
-    assert tuple(item.trace_kind.value for item in vnext_input.trace_material) == ("user_visible_progress",)
+    trace_entries = _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)
+    assert tuple(item.readable_text for item in trace_entries) == ("run is waiting for user confirmation",)
 
 
 def test_conversation_compact_input_vnext_current_anchor_not_citable() -> None:
@@ -1305,12 +1320,10 @@ def test_conversation_compact_input_vnext_current_anchor_not_citable() -> None:
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
-    assert vnext_input.current_input_anchor.anchor_label == "C1"
-    assert vnext_input.current_input_anchor.text == "current input"
-    assert "C1" not in vnext_input.citable_source_labels
-    current_anchor_section = vnext_input.source_section("C1")
-    assert current_anchor_section is not None
-    assert current_anchor_section.value == "current_input_anchor"
+    assert vnext_input.current_input.readable_text == "current input"
+    assert "C1" not in vnext_input.source_labels
+    current_anchor_section = vnext_input.source_kind("C1")
+    assert current_anchor_section is None
 
 
 def test_snapshot_cursor_lag_requires_catchup_or_inline_delta() -> None:
@@ -1499,10 +1512,11 @@ def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     assert evidence_map["E1"].chunk_parent_label is None
     assert evidence_map["E1"].chunk_ordinal is None
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
-    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
-    assert tuple(item.response_text for item in vnext_input.evidence_material) == (large_text,)
-    assert "E1.1" not in vnext_input.citable_source_labels
-    assert "E1.2" not in vnext_input.citable_source_labels
+    evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
+    assert tuple(item.source_label for item in evidence_entries) == ("E1",)
+    assert large_text in evidence_entries[0].readable_text
+    assert "E1.1" not in vnext_input.source_labels
+    assert "E1.2" not in vnext_input.source_labels
 
 
 def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
@@ -1528,7 +1542,7 @@ def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
     assert pack.current_input_anchor.anchor_text == expected
     assert pack.current_input_anchor.truncated is False
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
-    assert vnext_input.current_input_anchor.text == expected
+    assert vnext_input.current_input.readable_text == expected
 
 
 def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp_path: Path) -> None:
@@ -1759,9 +1773,7 @@ def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) ->
         )
         assert len(evidence_blocks) == 1
         assert evidence_blocks[0].accepted_tool_evidence is not None
-        assert evidence_blocks[0].accepted_tool_evidence.query_text == (
-            "Search FY2025 revenue for MSFT"
-        )
+        assert evidence_blocks[0].accepted_tool_evidence.query_text == ("Search FY2025 revenue for MSFT")
 
 
 def test_pre_dispatch_evidence_preserves_shared_renderer_exact_whitespace(
@@ -1818,9 +1830,7 @@ def test_pre_dispatch_evidence_preserves_shared_renderer_exact_whitespace(
                 event_id="event-tool-result-renderer-whitespace",
                 tool_call_requested_event_ref=request.event_id,
                 tool_call_id="tool-call-renderer-whitespace",
-                normalized_arguments_digest=sha256_digest_json(
-                    {"arguments": {"ticker": "MSFT"}}
-                ),
+                normalized_arguments_digest=sha256_digest_json({"arguments": {"ticker": "MSFT"}}),
                 raw_tool_outcome=raw_tool_outcome,
             )
             current = _append_event(
@@ -1830,11 +1840,7 @@ def test_pre_dispatch_evidence_preserves_shared_renderer_exact_whitespace(
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "current user question"},
             )
-            assert (
-                request.event_sequence
-                < result.event_sequence
-                < current.event_sequence
-            )
+            assert request.event_sequence < result.event_sequence < current.event_sequence
             return _run_row(current)
 
         run = store.transaction_runner.run_write(seed)
@@ -1848,16 +1854,12 @@ def test_pre_dispatch_evidence_preserves_shared_renderer_exact_whitespace(
         )
 
         evidence_blocks = tuple(
-            block
-            for block in view.material_blocks
-            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+            block for block in view.material_blocks if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
         )
         assert len(evidence_blocks) == 1
         block = evidence_blocks[0]
         assert block.accepted_tool_evidence is not None
-        expected_text = render_accepted_tool_evidence_for_llm(
-            block.accepted_tool_evidence
-        )
+        expected_text = render_accepted_tool_evidence_for_llm(block.accepted_tool_evidence)
         assert repeated_whitespace_material in expected_text
         assert normalized_material_text(expected_text) != expected_text
         assert block.text == expected_text
@@ -1945,9 +1947,7 @@ def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> N
             envelope = _accepted_evidence_envelope_for_event(
                 "event-tool-result-descriptor",
                 tool_call_requested_event_ref=request.event_id,
-                normalized_arguments_digest=sha256_digest_json(
-                    {"arguments": {"ticker": "MSFT"}}
-                ),
+                normalized_arguments_digest=sha256_digest_json({"arguments": {"ticker": "MSFT"}}),
                 payload_ref=payload_ref,
             )
             descriptor = PayloadStore().write_sqlite_payload(
@@ -2012,9 +2012,7 @@ def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> N
         assert block.accepted_tool_evidence.result_text == (
             '{"kind":"completed","result":{"content":"descriptor raw content"}}'
         )
-        assert block.text == render_accepted_tool_evidence_for_llm(
-            block.accepted_tool_evidence
-        )
+        assert block.text == render_accepted_tool_evidence_for_llm(block.accepted_tool_evidence)
         assert view.material_blocks[0].payload_refs == ("payload-descriptor-evidence",)
 
 
@@ -2053,9 +2051,7 @@ def test_pre_dispatch_evidence_durable_payload_tamper_fails_closed(
             lambda transaction: _tamper_compact_evidence_payload(
                 transaction,
                 descriptor=descriptor,
-                result_event_id=(
-                    f"event-tool-result-tamper-{tamper_kind.value}"
-                ),
+                result_event_id=(f"event-tool-result-tamper-{tamper_kind.value}"),
                 tamper_kind=tamper_kind,
                 artifact_root=options.payload_policy.artifact_root,
             )
@@ -2139,16 +2135,12 @@ def test_pre_dispatch_evidence_uses_projection_unavailable_source(
 
     assert view is not None
     evidence_blocks = tuple(
-        block
-        for block in view.material_blocks
-        if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        block for block in view.material_blocks if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
     )
     assert len(evidence_blocks) == 1
     evidence_block = evidence_blocks[0]
     assert evidence_block.accepted_tool_evidence is not None
-    assert evidence_block.accepted_tool_evidence.source_text == (
-        ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
-    )
+    assert evidence_block.accepted_tool_evidence.source_text == (ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT)
     visible_text = "\n".join(
         (
             evidence_block.text,
@@ -2402,9 +2394,7 @@ def test_pre_dispatch_evidence_request_identity_mismatch_fails_closed(
                 event_id="event-tool-result-identity-mismatch",
                 tool_call_requested_event_ref=request.event_id,
                 tool_call_id=tool_call_id,
-                normalized_arguments_digest=sha256_digest_json(
-                    {"arguments": {"ticker": "MSFT"}}
-                ),
+                normalized_arguments_digest=sha256_digest_json({"arguments": {"ticker": "MSFT"}}),
             )
             current = _append_event(
                 transaction,
@@ -2487,9 +2477,7 @@ def test_pre_dispatch_evidence_payload_damage_fails_closed(
                         event_id,
                         tool_call_requested_event_ref=request.event_id,
                         tool_call_id=tool_call_id,
-                        normalized_arguments_digest=sha256_digest_json(
-                            {"arguments": {"ticker": "MSFT"}}
-                        ),
+                        normalized_arguments_digest=sha256_digest_json({"arguments": {"ticker": "MSFT"}}),
                     )
                 )
             }
@@ -2696,18 +2684,15 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_pa
         assert tuple(block.text for block in view.previous_compacted_view) == (
             "accepted session summary",
             "accepted fact",
-            "accepted anchor\n- 1. accepted anchor item",
+            "accepted anchor\n- accepted anchor item",
             "accepted next step",
             "accepted reference",
         )
         assert view.previous_compacted_readable_view is not None
-        assert view.previous_compacted_readable_view.session_summary == (
-            "accepted session summary"
+        assert view.previous_compacted_readable_view.session_summary == ("accepted session summary")
+        assert tuple(item.claim_text for item in view.previous_compacted_readable_view.evidence_backed_facts) == (
+            "accepted fact",
         )
-        assert tuple(
-            item.claim_text
-            for item in view.previous_compacted_readable_view.evidence_backed_facts
-        ) == ("accepted fact",)
         assert view.material_blocks[0].text == "new user after compact"
         assert view.material_blocks[1].accepted_tool_evidence is not None
         assert view.material_blocks[1].accepted_tool_evidence.result_text == (
@@ -2783,16 +2768,16 @@ def test_pre_dispatch_previous_view_splits_each_accepted_candidate_item(
             "accepted session summary",
             "accepted fact one",
             "accepted fact two",
-            "accepted anchor one\n- 1. accepted anchor item one",
-            "accepted anchor two\n- 1. accepted anchor item two",
+            "accepted anchor one\n- accepted anchor item one",
+            "accepted anchor two\n- accepted anchor item two",
             "accepted next step",
             "accepted reference",
         )
         assert view.previous_compacted_readable_view is not None
-        assert tuple(
-            item.source_label
-            for item in view.previous_compacted_readable_view.evidence_backed_facts
-        ) == ("P2", "P3")
+        assert tuple(item.source_label for item in view.previous_compacted_readable_view.evidence_backed_facts) == (
+            "P2",
+            "P3",
+        )
 
 
 def test_pre_dispatch_builder_ignores_memory_snapshot_lag_or_missing(tmp_path: Path) -> None:
@@ -2985,7 +2970,7 @@ def test_build_compact_material_pack_uses_explicit_previous_view_without_snapsho
         current_input_ref="event-current",
         current_input_text="current",
         previous_compacted_view=explicit_previous,
-        previous_compacted_readable_view=CompactReadableViewVNext(
+        previous_compacted_readable_view=PreviousCompactReadableView(
             session_summary="explicit summary",
             evidence_backed_facts=(),
             answer_anchors=(),
@@ -3023,7 +3008,7 @@ def test_build_compact_material_pack_uses_explicit_previous_view_without_snapsho
             trace_count=1,
             evidence_count=0,
             answer_count=0,
-            current_anchor_label="C1",
+            current_input_text="current",
         ),
     )
     assert first_pack.previous_compacted_view == ()
@@ -3221,15 +3206,11 @@ def _seed_descriptor_backed_compact_evidence(
         event_id,
         tool_call_requested_event_ref=request.event_id,
         tool_call_id=tool_call_id,
-        normalized_arguments_digest=sha256_digest_json(
-            {"arguments": {"ticker": "MSFT"}}
-        ),
+        normalized_arguments_digest=sha256_digest_json({"arguments": {"ticker": "MSFT"}}),
         payload_ref=payload_ref,
     )
     payload: Mapping[str, JsonValue] = {
-        "accepted_evidence_envelope": (
-            accepted_evidence_envelope_to_json_value(envelope)
-        ),
+        "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
         "raw_tool_outcome": {
             "kind": "completed",
             "result": {"content": "descriptor-backed strict evidence"},
@@ -3341,9 +3322,7 @@ def _tamper_compact_evidence_payload(
             return
         if descriptor.artifact_relative_path is None:
             raise AssertionError("artifact path must exist")
-        (artifact_root / descriptor.artifact_relative_path).write_bytes(
-            b"x" * descriptor.payload_size_bytes
-        )
+        (artifact_root / descriptor.artifact_relative_path).write_bytes(b"x" * descriptor.payload_size_bytes)
         return
     if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
         raise AssertionError("SQLite tamper requires SQLite descriptor")
@@ -3522,9 +3501,7 @@ def _append_tool_result_event(
     :raises HostDurableError: EventLog append 失败时抛出。
     """
 
-    actual_tool_call_id = (
-        f"tool-call-{event_id}" if tool_call_id is None else tool_call_id
-    )
+    actual_tool_call_id = f"tool-call-{event_id}" if tool_call_id is None else tool_call_id
     actual_request_event_ref = tool_call_requested_event_ref
     actual_arguments_digest = normalized_arguments_digest
     if actual_request_event_ref is None and append_request_atom_when_missing:
@@ -3537,9 +3514,7 @@ def _append_tool_result_event(
             run_id=run_id,
         )
         actual_request_event_ref = request.event_id
-        actual_arguments_digest = sha256_digest_json(
-            {"arguments": {"ticker": "MSFT"}}
-        )
+        actual_arguments_digest = sha256_digest_json({"arguments": {"ticker": "MSFT"}})
     envelope = _accepted_evidence_envelope_for_event(
         event_id,
         tool_call_requested_event_ref=actual_request_event_ref,
@@ -3548,9 +3523,7 @@ def _append_tool_result_event(
         source_refs=source_refs,
     )
     result_payload: dict[str, JsonValue] = {
-        "accepted_evidence_envelope": (
-            accepted_evidence_envelope_to_json_value(envelope)
-        ),
+        "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
     }
     if include_raw_outcome:
         result_payload["raw_tool_outcome"] = (
@@ -3625,7 +3598,7 @@ def _append_compacted_event(
     *,
     event_id: str,
     accepted_evidence_refs: tuple[str, ...],
-    accepted_candidate: ConversationCompactOutputVNext | None = None,
+    accepted_candidate: CompactCandidateV2 | None = None,
 ) -> EventLogRow:
     """追加 accepted CONTEXT_COMPACTED canonical fact。
 
@@ -3652,7 +3625,7 @@ def _append_compacted_event(
 def _compacted_payload(
     *,
     accepted_evidence_refs: tuple[str, ...],
-    accepted_candidate: ConversationCompactOutputVNext | None = None,
+    accepted_candidate: CompactCandidateV2 | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 accepted compact payload。
 
@@ -3661,147 +3634,174 @@ def _compacted_payload(
     :returns: compacted payload。
     """
 
+    candidate = _accepted_candidate() if accepted_candidate is None else accepted_candidate
     return dict(
         build_context_compacted_payload(
             operation_id="operation-compact-test",
             accepted_attempt_number=1,
             compact_artifact_ref="artifact:compact-test",
             compact_artifact_digest=_DIGEST,
-            accepted_candidate=(_accepted_candidate() if accepted_candidate is None else accepted_candidate),
-            quality_check_result=CompactQualityCheckResultVNext(
-                accepted=True,
-                rejection_reasons=(),
-            ),
+            accepted_truth=_accepted_truth_for_candidate(candidate),
             budget_after_compact=128,
             prompt_local_label_mapping_refs=("label-map:test",),
-            source_boundary_refs=("source-boundary:test",),
             accepted_evidence_mapping_refs=accepted_evidence_refs,
             projection_signal="project_memory",
             successful_response_identity=_successful_response_identity(
                 operation_id="operation-compact-test",
-                compactor_engine_run_id=(
-                    "compactor-run:operation-compact-test:1"
-                ),
+                compactor_engine_run_id=("compactor-run:operation-compact-test:1"),
             ),
             accepted_proposal_manifest_reference=_proposal_manifest_reference(
                 operation_id="operation-compact-test",
-                compactor_engine_run_id=(
-                    "compactor-run:operation-compact-test:1"
-                ),
+                compactor_engine_run_id=("compactor-run:operation-compact-test:1"),
             ),
         )
     )
 
 
-def _accepted_candidate() -> ConversationCompactOutputVNext:
-    """构造测试用 accepted compact candidate。
+def _accepted_truth_for_candidate(
+    candidate: CompactCandidateV2,
+) -> CompactAcceptedTruthV2:
+    """为测试 candidate 构造并验收同源 root input。
 
-    :returns: ConversationCompactOutputVNext。
+    :param candidate: 待验收 candidate。
+    :returns: accepted truth。
+    :raises AssertionError: candidate 未通过 owner accept 时抛出。
     """
 
-    return ConversationCompactOutputVNext(
-        schema_version="conversation_compact_output_v1",
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text="accepted session summary",
+    label_kinds: dict[str, CompactSourceKindV2] = {}
+    if candidate.session_summary is not None:
+        for label in candidate.session_summary.source_labels:
+            label_kinds[label] = CompactSourceKindV2.TRACE_MATERIAL
+    for fact in candidate.evidence_facts:
+        for label in fact.support_labels:
+            label_kinds[label] = CompactSourceKindV2.EVIDENCE_MATERIAL
+    for anchor in candidate.answer_anchors:
+        for label in anchor.source_labels:
+            label_kinds[label] = CompactSourceKindV2.ANSWER_MATERIAL
+    compact_input = CompactInputV2(
+        schema=COMPACT_INPUT_SCHEMA_V2,
+        current_input=CompactCurrentInputV2(
+            source_ref="source-boundary:test",
+            readable_text="current",
+        ),
+        source_boundary=tuple(
+            CompactSourceBoundaryEntryV2(
+                source_label=label,
+                source_kind=kind,
+                source_refs=(f"source:{label}",),
+                readable_text=f"material {label}",
+            )
+            for label, kind in label_kinds.items()
+        ),
+    )
+    result = accept_compact_candidate_v2(
+        compact_input,
+        candidate,
+        default_memory_projection_policy(),
+    )
+    assert isinstance(result, CompactAcceptedTruthV2)
+    return result
+
+
+def _accepted_candidate() -> CompactCandidateV2:
+    """构造测试用 accepted compact candidate。
+
+    :returns: CompactCandidateV2。
+    """
+
+    return CompactCandidateV2(
+        schema="dayu.context_compaction.output.v2",
+        session_summary=CompactSessionSummaryV2(
+            text="accepted session summary",
             source_labels=("T1",),
         ),
-        evidence_backed_facts=(
-            EvidenceBackedFactCandidateVNext(
-                claim_text="accepted fact",
-                evidence_labels=("E1",),
+        evidence_facts=(
+            CompactEvidenceFactV2(
+                claim="accepted fact",
+                support_labels=("E1",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="accepted anchor",
-                anchor_items=(
-                    AnswerAnchorChildVNext(
-                        display_text="accepted anchor item",
-                        ordinal=1,
-                    ),
-                ),
-                answer_source_labels=("A1",),
+            CompactAnswerAnchorV2(
+                title="accepted anchor",
+                detail="accepted anchor item",
+                source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+            CompactForwardIntentV2(
+                intent_type="next_step_note",
                 text="accepted next step",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV2.OPEN,
                 source_labels=("T1",),
             ),
         ),
-        reference_continuity_items=(
-            ReferenceContinuityCandidateVNext(
+        reference_continuity=(
+            CompactReferenceContinuityV2(
                 text="accepted reference",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
                 source_labels=("T1",),
             ),
         ),
         diagnostics=(),
+        explicitly_dropped_sources=(),
     )
 
 
-def _accepted_candidate_with_multiple_items() -> ConversationCompactOutputVNext:
+def _accepted_candidate_with_multiple_items() -> CompactCandidateV2:
     """构造含多 fact / anchor 的 accepted compact candidate。
 
-    :returns: ConversationCompactOutputVNext。
+    :returns: CompactCandidateV2。
     """
 
-    return ConversationCompactOutputVNext(
-        schema_version="conversation_compact_output_v1",
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text="accepted session summary",
+    return CompactCandidateV2(
+        schema="dayu.context_compaction.output.v2",
+        session_summary=CompactSessionSummaryV2(
+            text="accepted session summary",
             source_labels=("T1",),
         ),
-        evidence_backed_facts=(
-            EvidenceBackedFactCandidateVNext(
-                claim_text="accepted fact one",
-                evidence_labels=("E1",),
+        evidence_facts=(
+            CompactEvidenceFactV2(
+                claim="accepted fact one",
+                support_labels=("E1",),
+                context_labels=(),
             ),
-            EvidenceBackedFactCandidateVNext(
-                claim_text="accepted fact two",
-                evidence_labels=("E2",),
+            CompactEvidenceFactV2(
+                claim="accepted fact two",
+                support_labels=("E2",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="accepted anchor one",
-                anchor_items=(
-                    AnswerAnchorChildVNext(
-                        display_text="accepted anchor item one",
-                        ordinal=1,
-                    ),
-                ),
-                answer_source_labels=("A1",),
+            CompactAnswerAnchorV2(
+                title="accepted anchor one",
+                detail="accepted anchor item one",
+                source_labels=("A1",),
             ),
-            AnswerAnchorCandidateVNext(
-                anchor_title="accepted anchor two",
-                anchor_items=(
-                    AnswerAnchorChildVNext(
-                        display_text="accepted anchor item two",
-                        ordinal=1,
-                    ),
-                ),
-                answer_source_labels=("A2",),
+            CompactAnswerAnchorV2(
+                title="accepted anchor two",
+                detail="accepted anchor item two",
+                source_labels=("A2",),
             ),
         ),
         forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+            CompactForwardIntentV2(
+                intent_type="next_step_note",
                 text="accepted next step",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV2.OPEN,
                 source_labels=("T1",),
             ),
         ),
-        reference_continuity_items=(
-            ReferenceContinuityCandidateVNext(
+        reference_continuity=(
+            CompactReferenceContinuityV2(
                 text="accepted reference",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
                 source_labels=("T1",),
             ),
         ),
         diagnostics=(),
+        explicitly_dropped_sources=(),
     )
 
 
@@ -4005,9 +4005,9 @@ def _snapshot_with_stable_blocks(
                 intents=(
                     ForwardIntent(
                         item_id="memory-item:forward-intent",
-                        intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                        intent_type="next_step_note",
                         text="follow up",
-                        status=ForwardIntentStatusVNext.OPEN,
+                        status=CompactForwardIntentStatusV2.OPEN,
                         source_refs=("event:intent",),
                         event_id="event-intent",
                         event_sequence=checkpoint_event_sequence,
@@ -4021,7 +4021,7 @@ def _snapshot_with_stable_blocks(
                     ReferenceContinuityItem(
                         item_id="memory-item:reference-continuity",
                         text="second factor",
-                        reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                        reason="local_reference",
                         source_refs=("event:reference",),
                         event_id="event-reference",
                         event_sequence=checkpoint_event_sequence,

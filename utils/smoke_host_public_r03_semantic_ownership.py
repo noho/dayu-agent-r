@@ -56,7 +56,7 @@ from dayu.host.compact_material import (
     conversation_compact_input_vnext_from_material_pack,
     select_compact_segment,
 )
-from dayu.host.compaction import CompactSegmentTrigger
+from dayu.host.compaction import CompactSegmentTrigger, CompactSourceKindV2
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
@@ -1276,9 +1276,11 @@ def _compact_source_notes(
     )
     compact_input = conversation_compact_input_vnext_from_material_pack(pack)
     notes = tuple(
-        item.source_note
-        for item in compact_input.evidence_material
-        if item.source_note is not None
+        source_line.removeprefix("来源：")
+        for item in compact_input.source_boundary
+        if item.source_kind is CompactSourceKindV2.EVIDENCE_MATERIAL
+        for source_line in item.readable_text.splitlines()
+        if source_line.startswith("来源：")
     )
     if len(notes) == 0:
         raise RuntimeError("compactor evidence source notes are missing")

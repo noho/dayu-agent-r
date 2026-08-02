@@ -113,9 +113,7 @@ def _successful_response_identity_for_agent_request(
             iteration_index=0,
             runner_call_index=1,
         ),
-        provider_request_id_availability=(
-            ProviderRequestIdAvailability.UNAVAILABLE
-        ),
+        provider_request_id_availability=(ProviderRequestIdAvailability.UNAVAILABLE),
         provider_request_id=None,
     )
 
@@ -189,9 +187,7 @@ def _prepare_proposal_evidence(
         operation_id=operation_id,
         attempt_number=attempt_number,
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(
-        request.material_pack
-    )
+    compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
     projection: Mapping[str, JsonValue] = {
         "projection_kind": "proactive_owner_fixture",
         "compaction_request_digest": request.digest(),
@@ -204,17 +200,12 @@ def _prepare_proposal_evidence(
         compactor_engine_run_id=agent_request.run_id,
         message_count=len(agent_request.messages),
         role_sequence_digest=runner_role_sequence_digest(roles),
-        system_prompt_asset_digest=sha256_digest_json(
-            {"prompt": "Proactive owner fixture system prompt."}
-        ),
-        user_prompt_template_digest=sha256_digest_json(
-            {"prompt": "Proactive owner fixture input."}
-        ),
-        user_prompt_digest=sha256_digest_json(
-            {"compaction_request_digest": request.digest()}
-        ),
+        system_prompt_asset_digest=sha256_digest_json({"prompt": "Proactive owner fixture system prompt."}),
+        user_prompt_template_digest=sha256_digest_json({"prompt": "Proactive owner fixture input."}),
+        user_prompt_digest=sha256_digest_json({"compaction_request_digest": request.digest()}),
         compactor_input_projection=projection,
         compactor_input_projection_digest=sha256_digest_json(projection),
+        repair_feedback=None,
     )
     return request, prepared_input
 
@@ -314,9 +305,7 @@ def _recorded_proposal_evidence(
         compaction_attempt_number=attempt_number,
     )
     return (
-        _successful_response_identity_for_agent_request(
-            prepared_input.agent_request
-        ),
+        _successful_response_identity_for_agent_request(prepared_input.agent_request),
         reference,
     )
 
@@ -339,23 +328,13 @@ def _unrecorded_proposal_evidence(
         attempt_number=attempt_number,
     )
     return (
-        _successful_response_identity_for_agent_request(
-            prepared_input.agent_request
-        ),
+        _successful_response_identity_for_agent_request(prepared_input.agent_request),
         CompactorProposalManifestReference(
-            manifest_event_id=(
-                f"unrecorded-manifest:{operation_id}:{attempt_number}"
-            ),
-            manifest_payload_ref=(
-                f"unrecorded-manifest-payload:{operation_id}:{attempt_number}"
-            ),
+            manifest_event_id=(f"unrecorded-manifest:{operation_id}:{attempt_number}"),
+            manifest_payload_ref=(f"unrecorded-manifest-payload:{operation_id}:{attempt_number}"),
             manifest_digest=prepared_input.role_sequence_digest,
-            compactor_input_projection_ref=(
-                f"unrecorded-projection:{operation_id}:{attempt_number}"
-            ),
-            compactor_input_projection_digest=(
-                prepared_input.compactor_input_projection_digest
-            ),
+            compactor_input_projection_ref=(f"unrecorded-projection:{operation_id}:{attempt_number}"),
+            compactor_input_projection_digest=(prepared_input.compactor_input_projection_digest),
             compaction_operation_id=operation_id,
             compaction_attempt_number=attempt_number,
             compactor_engine_run_id=prepared_input.compactor_engine_run_id,
@@ -466,9 +445,7 @@ def _requested_payload(
     operation_id: str,
     *,
     max_attempt_number: int,
-    trigger_source: ContextCompactionTriggerSource = (
-        ContextCompactionTriggerSource.PROACTIVE
-    ),
+    trigger_source: ContextCompactionTriggerSource = (ContextCompactionTriggerSource.PROACTIVE),
     ordinal: int = 0,
 ) -> Mapping[str, JsonValue]:
     """构造 strict requested payload。
@@ -654,9 +631,7 @@ def test_typed_schedule_reserves_available_tiers_after_root_repairs(
         max_attempt_number=max_attempt_number,
     )
 
-    assert tuple(plan.attempt_number for plan in schedule) == tuple(
-        range(1, max_attempt_number + 1)
-    )
+    assert tuple(plan.attempt_number for plan in schedule) == tuple(range(1, max_attempt_number + 1))
     assert tuple(plan.stage for plan in schedule) == expected_stages
     for plan in schedule:
         if plan.stage in (
@@ -665,9 +640,7 @@ def test_typed_schedule_reserves_available_tiers_after_root_repairs(
         ):
             assert plan.request is root_request
             continue
-        matching_tier = next(
-            tier for tier in tier_requests if tier.stage is plan.stage
-        )
+        matching_tier = next(tier for tier in tier_requests if tier.stage is plan.stage)
         assert plan.request is matching_tier.request
 
 
@@ -690,16 +663,12 @@ def test_schedule_validator_accepts_stage_specific_request_digests() -> None:
         max_attempt_number=5,
         frozen_material_list_digest=_DIGEST,
         frozen_material_refs=("input-root",),
-        prepared_attempt_numbers=tuple(
-            plan.attempt_number for plan in schedule
-        ),
+        prepared_attempt_numbers=tuple(plan.attempt_number for plan in schedule),
         rejected_attempt_numbers=(),
         next_attempt_number=6,
         compacted_event_sequence=None,
         failed_event_sequence=None,
-        prepared_request_digests=tuple(
-            (plan.attempt_number, plan.request.digest()) for plan in schedule
-        ),
+        prepared_request_digests=tuple((plan.attempt_number, plan.request.digest()) for plan in schedule),
         invalid_reason=None,
     )
 
@@ -819,9 +788,7 @@ def test_orphan_non_request_row_without_request_is_invalid(
     assert projection.state.phase is ProactiveCompactionPhase.INVALID
     assert projection.state.operation_id is None
     assert projection.state.invalid_reason == "HostDurableError"
-    assert projection.decision is (
-        ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-    )
+    assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def test_valid_reactive_only_history_remains_absent(tmp_path: Path) -> None:
@@ -902,9 +869,7 @@ def test_reactive_request_with_unknown_operation_row_is_invalid(
     assert projection.state.phase is ProactiveCompactionPhase.INVALID
     assert projection.state.operation_id is None
     assert projection.state.invalid_reason == "HostDurableError"
-    assert projection.decision is (
-        ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-    )
+    assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def test_incomplete_projection_preserves_frozen_budget_and_rejection(
@@ -997,9 +962,7 @@ def test_exhausted_incomplete_projection_fails_existing_operation(
     assert projection is not None
     assert projection.state.next_attempt_number == 2
     assert projection.state.max_attempt_number == 1
-    assert projection.decision is (
-        ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-    )
+    assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def test_failed_terminal_projection_uses_existing_fallback(tmp_path: Path) -> None:
@@ -1063,9 +1026,7 @@ def test_completed_proactive_ignores_later_valid_reactive_operations(
             payload=_failed_payload(proactive_operation_id),
         )
         proactive_projection = _projection(store)
-        proactive_terminal_sequence = (
-            proactive_projection.state.failed_event_sequence
-        )
+        proactive_terminal_sequence = proactive_projection.state.failed_event_sequence
         for ordinal in (1, 2):
             reactive_operation_id = f"event-reactive-later-{ordinal}"
             _append_event(
@@ -1139,9 +1100,7 @@ def test_malformed_request_does_not_reuse_earlier_reactive_identity(
     assert projection.state.phase is ProactiveCompactionPhase.INVALID
     assert projection.state.operation_id is None
     assert projection.state.invalid_reason == "ValueError"
-    assert projection.decision is (
-        ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-    )
+    assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def test_terminal_operation_mismatch_is_invalid(tmp_path: Path) -> None:
@@ -1173,9 +1132,7 @@ def test_terminal_operation_mismatch_is_invalid(tmp_path: Path) -> None:
     assert projection.state.phase is ProactiveCompactionPhase.INVALID
     assert projection.state.operation_id == operation_id
     assert projection.state.failed_event_sequence is not None
-    assert projection.decision is (
-        ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-    )
+    assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def test_multiple_terminals_are_invalid(tmp_path: Path) -> None:
@@ -1208,9 +1165,7 @@ def test_multiple_terminals_are_invalid(tmp_path: Path) -> None:
     assert projection.state.phase is ProactiveCompactionPhase.INVALID
     assert projection.state.operation_id == operation_id
     assert projection.state.failed_event_sequence is not None
-    assert projection.decision is (
-        ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-    )
+    assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def test_bounded_reader_reaches_proactive_request_after_full_page(

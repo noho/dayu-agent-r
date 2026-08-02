@@ -2,7 +2,7 @@
 
 本模块把 Host ``CompactionRequest`` 映射为一次禁用工具的 Engine public
 runner 调用，并把 LLM final answer 的 strict JSON proposal 转换为
-``ConversationCompactOutputVNext``。它不写 EventLog、不写 artifact、不做
+``CompactCandidateV2``。它不写 EventLog、不写 artifact、不做
 semantic repair loop，也不向 Service 暴露 prompt、candidate builder 或
 policy seam。
 """
@@ -14,7 +14,6 @@ import json
 import re
 from collections.abc import Mapping
 from json import JSONDecodeError
-from math import ceil
 from typing import Protocol, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
@@ -42,36 +41,26 @@ from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
-    CONVERSATION_COMPACT_ANSWER_SOURCE_SECTIONS_VNEXT,
-    CONVERSATION_COMPACT_DIAGNOSTIC_SOURCE_SECTIONS_VNEXT,
-    CONVERSATION_COMPACT_FACT_SOURCE_SECTIONS_VNEXT,
-    CONVERSATION_COMPACT_FORWARD_SOURCE_SECTIONS_VNEXT,
-    CompactCandidateDiagnosticVNext,
-    CONVERSATION_COMPACT_REFERENCE_SOURCE_SECTIONS_VNEXT,
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    CONVERSATION_COMPACT_SUMMARY_SOURCE_SECTIONS_VNEXT,
+    CompactAnswerAnchorV2,
+    CompactCandidateDiagnosticV2,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactDropReasonV2,
+    CompactExplicitDropV2,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
-    ConversationCompactInputVNext,
-    ConversationCompactLabelSectionVNext,
-    ConversationCompactOutputVNext,
+    CompactInputV2,
+    CompactCandidateV2,
     ContextCompactor,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
-    conversation_compact_label_looks_stale_vnext,
-)
-from dayu.host.context_budget import (
-    DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
-    DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
-    estimate_budget_text_tokens,
+    CompactEvidenceFactV2,
+    CompactForwardIntentV2,
+    CompactForwardIntentStatusV2,
+    CompactRepairFeedbackV2,
+    CompactReferenceContinuityV2,
+    CompactSessionSummaryV2,
+    CompactValidationIssueCodeV2,
+    CompactValidationIssueV2,
+    CompactValidationReportV2,
 )
 from dayu.host.compaction_operation import CompactorProposalRunInput
 from dayu.host.durable.codec import sha256_digest_json
@@ -92,30 +81,48 @@ _UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
 _COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
 _COMPACTOR_PROJECTION_SCHEMA_VERSION = "compactor_input_projection.v1"
-_SCHEMA_VERSION_FIELD = "schema_version"
+_SCHEMA_VERSION_FIELD = "schema"
 _SESSION_SUMMARY_FIELD = "session_summary"
-_EVIDENCE_BACKED_FACTS_FIELD = "evidence_backed_facts"
+_EVIDENCE_BACKED_FACTS_FIELD = "evidence_facts"
 _ANSWER_ANCHORS_FIELD = "answer_anchors"
 _FORWARD_INTENTS_FIELD = "forward_intents"
-_REFERENCE_CONTINUITY_ITEMS_FIELD = "reference_continuity_items"
+_REFERENCE_CONTINUITY_ITEMS_FIELD = "reference_continuity"
 _DIAGNOSTICS_FIELD = "diagnostics"
-_SUMMARY_TEXT_FIELD = "summary_text"
+_EXPLICITLY_DROPPED_SOURCES_FIELD = "explicitly_dropped_sources"
+_SUMMARY_TEXT_FIELD = "text"
 _SOURCE_LABELS_FIELD = "source_labels"
-_CLAIM_TEXT_FIELD = "claim_text"
-_EVIDENCE_LABELS_FIELD = "evidence_labels"
-_ANCHOR_TITLE_FIELD = "anchor_title"
-_ANCHOR_ITEMS_FIELD = "anchor_items"
-_ANSWER_SOURCE_LABELS_FIELD = "answer_source_labels"
-_DISPLAY_TEXT_FIELD = "display_text"
-_ORDINAL_FIELD = "ordinal"
+_CLAIM_TEXT_FIELD = "claim"
+_EVIDENCE_LABELS_FIELD = "support_labels"
+_CONTEXT_LABELS_FIELD = "context_labels"
+_ANCHOR_TITLE_FIELD = "title"
+_ANCHOR_DETAIL_FIELD = "detail"
 _INTENT_TYPE_FIELD = "intent_type"
 _TEXT_FIELD = "text"
 _STATUS_FIELD = "status"
 _REASON_FIELD = "reason"
 _CODE_FIELD = "code"
-_FORWARD_INTENT_TYPE_VALUES = frozenset(item.value for item in ForwardIntentTypeVNext)
-_FORWARD_INTENT_STATUS_VALUES = frozenset(item.value for item in ForwardIntentStatusVNext)
-_REFERENCE_CONTINUITY_REASON_VALUES = frozenset(item.value for item in ReferenceContinuityReasonVNext)
+_MESSAGE_FIELD = "message"
+_SOURCE_LABEL_FIELD = "source_label"
+_FORWARD_INTENT_STATUS_VALUES = frozenset(item.value for item in CompactForwardIntentStatusV2)
+_TOP_LEVEL_FIELDS = frozenset(
+    (
+        _SCHEMA_VERSION_FIELD,
+        _SESSION_SUMMARY_FIELD,
+        _EVIDENCE_BACKED_FACTS_FIELD,
+        _ANSWER_ANCHORS_FIELD,
+        _FORWARD_INTENTS_FIELD,
+        _REFERENCE_CONTINUITY_ITEMS_FIELD,
+        _DIAGNOSTICS_FIELD,
+        _EXPLICITLY_DROPPED_SOURCES_FIELD,
+    )
+)
+_SUMMARY_FIELDS = frozenset((_SUMMARY_TEXT_FIELD, _SOURCE_LABELS_FIELD))
+_FACT_FIELDS = frozenset((_CLAIM_TEXT_FIELD, _EVIDENCE_LABELS_FIELD, _CONTEXT_LABELS_FIELD))
+_ANCHOR_FIELDS = frozenset((_ANCHOR_TITLE_FIELD, _ANCHOR_DETAIL_FIELD, _SOURCE_LABELS_FIELD))
+_INTENT_FIELDS = frozenset((_INTENT_TYPE_FIELD, _TEXT_FIELD, _STATUS_FIELD, _SOURCE_LABELS_FIELD))
+_REFERENCE_FIELDS = frozenset((_TEXT_FIELD, _REASON_FIELD, _SOURCE_LABELS_FIELD))
+_DIAGNOSTIC_FIELDS = frozenset((_CODE_FIELD, _MESSAGE_FIELD, _SOURCE_LABELS_FIELD))
+_DROP_FIELDS = frozenset((_SOURCE_LABEL_FIELD, _REASON_FIELD))
 
 
 @runtime_checkable
@@ -139,6 +146,39 @@ class LLMCompactionProposalError(CompactorProposalError):
     :param successful_response_identity: 本次失败发生在成功 Engine final 之后
         时对应的响应身份；尚未取得成功 final 时为 ``None``。
     """
+
+
+class LLMCompactionValidationError(LLMCompactionProposalError):
+    """raw LLM JSON 未通过 strict v2 contract。
+
+    :param report: 可直接进入 semantic repair 的脱敏 validation report。
+    :param successful_response_identity: 已取得成功 Engine final 时的响应身份；
+        直接调用 parser 时为 ``None``。
+    """
+
+    def __init__(
+        self,
+        report: CompactValidationReportV2,
+        *,
+        successful_response_identity: SuccessfulRunnerResponseIdentity | None,
+    ) -> None:
+        """初始化 strict parser validation error。
+
+        :param report: strict parser 产生的 validation report。
+        :param successful_response_identity: 成功 Engine final 的响应身份。
+        :returns: ``None``。
+        :raises TypeError: report 类型非法时抛出。
+        """
+
+        if not isinstance(report, CompactValidationReportV2):
+            raise TypeError("report must be CompactValidationReportV2")
+        self.report = report
+        super().__init__(
+            report.issues[0].message,
+            successful_response_identity=successful_response_identity,
+            validation_report=report,
+        )
+
 
 class _RejectingToolExecutor(ToolExecutor):
     """禁用工具 compactor 的 rejecting executor。
@@ -207,7 +247,7 @@ class LLMContextCompactor(ContextCompactor):
         if user_prompt_template.strip() == "":
             raise ValueError("user_prompt_template must be non-empty")
         if user_prompt_template.count(_COMPACTION_REQUEST_PLACEHOLDER) != 1:
-            raise ValueError("user_prompt_template must contain exactly one " "<<compaction_request>> placeholder")
+            raise ValueError("user_prompt_template must contain exactly one <<compaction_request>> placeholder")
         self._runner_spec = runner_spec
         self._runner_options = runner_options
         self._agent_policy = agent_policy
@@ -215,12 +255,17 @@ class LLMContextCompactor(ContextCompactor):
         self._user_prompt_template = user_prompt_template
 
     async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposal:
         """执行一次 vNext LLM compaction proposal。
 
         :param request: Host 构造的 immutable compaction request。
         :param cancellation_token: Host run lifecycle 注入的真实取消 token。
+        :param repair_feedback: 前次 semantic validation feedback。
         :returns: 与实际成功 Runner call 身份配对的 vNext proposal。
         :raises TypeError: request 类型非法时抛出。
         :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
@@ -232,6 +277,7 @@ class LLMContextCompactor(ContextCompactor):
             cancellation_token,
             compaction_operation_id=None,
             compaction_attempt_number=1,
+            repair_feedback=repair_feedback,
         )
         return await self.run_prepared_compactor_proposal(prepared_input)
 
@@ -242,6 +288,7 @@ class LLMContextCompactor(ContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposalRunInput:
         """构造一次 compactor proposal 的真实 Engine runner call 输入。
 
@@ -250,6 +297,7 @@ class LLMContextCompactor(ContextCompactor):
         :param compaction_operation_id: Host compaction operation id；直接
             ``compact`` 调用时为 ``None``。
         :param compaction_attempt_number: operation 内 proposal attempt 序号。
+        :param repair_feedback: 前次 semantic validation feedback。
         :returns: 可执行且可写 manifest 的同源 proposal 输入。
         :raises TypeError: request 类型非法时抛出。
         :raises ValueError: attempt 序号非法时抛出。
@@ -259,9 +307,7 @@ class LLMContextCompactor(ContextCompactor):
             raise TypeError("request must be CompactionRequest")
         if compaction_attempt_number <= 0:
             raise ValueError("compaction_attempt_number must be positive")
-        compact_input = conversation_compact_input_vnext_from_material_pack(
-            request.material_pack
-        )
+        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
         compactor_engine_run_id = _compactor_engine_run_id(
             request=request,
             compaction_operation_id=compaction_operation_id,
@@ -276,11 +322,13 @@ class LLMContextCompactor(ContextCompactor):
             self._user_prompt_template,
             cancellation_token,
             compactor_engine_run_id=compactor_engine_run_id,
+            repair_feedback=repair_feedback,
         )
         roles = tuple(message.role.value for message in agent_request.messages)
         projection = _compactor_input_projection_json(
             request=request,
             compact_input=compact_input,
+            repair_feedback=repair_feedback,
         )
         return CompactorProposalRunInput(
             compact_input=compact_input,
@@ -289,17 +337,14 @@ class LLMContextCompactor(ContextCompactor):
             compactor_engine_run_id=compactor_engine_run_id,
             message_count=len(agent_request.messages),
             role_sequence_digest=runner_role_sequence_digest(roles),
-            system_prompt_asset_digest=sha256_digest_json(
-                {"compactor_system_prompt": self._system_prompt}
-            ),
+            system_prompt_asset_digest=sha256_digest_json({"compactor_system_prompt": self._system_prompt}),
             user_prompt_template_digest=sha256_digest_json(
                 {"compactor_user_prompt_template": self._user_prompt_template}
             ),
-            user_prompt_digest=sha256_digest_json(
-                {"compactor_user_prompt": agent_request.messages[1].content}
-            ),
+            user_prompt_digest=sha256_digest_json({"compactor_user_prompt": agent_request.messages[1].content}),
             compactor_input_projection=projection,
             compactor_input_projection_digest=sha256_digest_json(projection),
+            repair_feedback=repair_feedback,
         )
 
     async def run_prepared_compactor_proposal(
@@ -324,9 +369,7 @@ class LLMContextCompactor(ContextCompactor):
                 timeout_seconds=self._runner_spec.default_timeout_seconds,
             )
         except TimeoutError as exc:
-            _signal_timeout_cancellation(
-                prepared_input.agent_request.cancellation_token
-            )
+            _signal_timeout_cancellation(prepared_input.agent_request.cancellation_token)
             raise LLMCompactionProposalError(
                 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE,
                 successful_response_identity=None,
@@ -350,6 +393,11 @@ class LLMContextCompactor(ContextCompactor):
                 prepared_input.compact_input,
                 outcome.content,
             )
+        except LLMCompactionValidationError as exc:
+            raise LLMCompactionValidationError(
+                exc.report,
+                successful_response_identity=response_identity,
+            ) from exc
         except LLMCompactionProposalError as exc:
             raise LLMCompactionProposalError(
                 str(exc),
@@ -399,7 +447,6 @@ def _validated_prepared_response_identity(
             successful_response_identity=response_identity,
         )
     return response_identity
-
 
 
 async def _run_agent_request(request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
@@ -477,7 +524,7 @@ def _safe_outcome_text(text: str) -> str:
 
 
 def _agent_request_vnext(
-    request: ConversationCompactInputVNext,
+    request: CompactInputV2,
     runner_spec: RunnerSpec,
     runner_options: RunnerCallOptions,
     agent_policy: AgentPolicy,
@@ -486,6 +533,7 @@ def _agent_request_vnext(
     cancellation_token: CancellationToken,
     *,
     compactor_engine_run_id: str,
+    repair_feedback: CompactRepairFeedbackV2 | None,
 ) -> AgentRunRequest:
     """构造 vNext 禁用工具的 Engine public run request。
 
@@ -497,6 +545,7 @@ def _agent_request_vnext(
     :param user_prompt_template: compactor user prompt template。
     :param cancellation_token: Host cancellation token。
     :param compactor_engine_run_id: Host 派生的 compactor Engine run id。
+    :param repair_feedback: 前次 semantic validation feedback。
     :returns: Engine run request。
     """
 
@@ -509,7 +558,11 @@ def _agent_request_vnext(
             SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),
             UserMessage(
                 role=AgentMessageRole.USER,
-                content=_user_prompt_vnext(request, user_prompt_template),
+                content=_user_prompt_vnext(
+                    request,
+                    user_prompt_template,
+                    repair_feedback=repair_feedback,
+                ),
             ),
         ),
         disable_tools=True,
@@ -550,12 +603,14 @@ def _compactor_engine_run_id(
 def _compactor_input_projection_json(
     *,
     request: CompactionRequest,
-    compact_input: ConversationCompactInputVNext,
+    compact_input: CompactInputV2,
+    repair_feedback: CompactRepairFeedbackV2 | None,
 ) -> Mapping[str, JsonValue]:
     """构造 compactor input projection artifact body。
 
     :param request: Host compaction request。
     :param compact_input: 已冻结的 vNext compactor input。
+    :param repair_feedback: 本次 attempt 的 semantic repair feedback。
     :returns: 可作为 artifact 写入的 projection JSON。
     """
 
@@ -565,6 +620,7 @@ def _compactor_input_projection_json(
         "compaction_request_digest": request.digest(),
         "source_boundary_refs": list(_compactor_source_boundary_refs(request)),
         "compact_input": compact_input.to_json(),
+        "repair_feedback": (None if repair_feedback is None else repair_feedback.to_json()),
     }
 
 
@@ -588,23 +644,38 @@ def _compactor_source_boundary_refs(request: CompactionRequest) -> tuple[str, ..
 
 
 def _user_prompt_vnext(
-    request: ConversationCompactInputVNext, user_prompt_template: str
+    request: CompactInputV2,
+    user_prompt_template: str,
+    *,
+    repair_feedback: CompactRepairFeedbackV2 | None,
 ) -> str:
     """渲染 vNext compactor user prompt。
 
     :param request: vNext compactor input。
     :param user_prompt_template: 包含唯一 compaction request 占位符的模板。
+    :param repair_feedback: 前次 semantic validation feedback。
     :returns: 已嵌入 vNext compaction request 数据块的 user prompt。
     """
 
-    return user_prompt_template.replace(
+    rendered = user_prompt_template.replace(
         _COMPACTION_REQUEST_PLACEHOLDER,
         _compaction_request_prompt_block_vnext(request),
     )
+    if repair_feedback is None:
+        return rendered
+    return (
+        rendered
+        + "\n\nPREVIOUS_VALIDATION_REPORT_JSON\n"
+        + json.dumps(
+            repair_feedback.to_json(),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
-
-def _compaction_request_prompt_block_vnext(request: ConversationCompactInputVNext) -> str:
+def _compaction_request_prompt_block_vnext(request: CompactInputV2) -> str:
     """构造 vNext compactor request 数据块。
 
     :param request: vNext compactor input。
@@ -617,17 +688,13 @@ def _compaction_request_prompt_block_vnext(request: ConversationCompactInputVNex
         indent=2,
         sort_keys=True,
     )
-    return (
-        f"{_UNTRUSTED_COMPACTION_MATERIAL_BEGIN}\n"
-        f"{material_json}\n"
-        f"{_UNTRUSTED_COMPACTION_MATERIAL_END}"
-    )
+    return f"{_UNTRUSTED_COMPACTION_MATERIAL_BEGIN}\n{material_json}\n{_UNTRUSTED_COMPACTION_MATERIAL_END}"
 
 
 def parse_conversation_compact_output_vnext(
-    request: ConversationCompactInputVNext,
+    request: CompactInputV2,
     final_answer: str,
-) -> ConversationCompactOutputVNext:
+) -> CompactCandidateV2:
     """解析并校验 vNext strict JSON compact output。
 
     :param request: vNext compactor input。
@@ -637,20 +704,21 @@ def parse_conversation_compact_output_vnext(
     :raises LLMCompactionProposalError: JSON 解析、schema 或 label contract 非法时抛出。
     """
 
-    if not isinstance(request, ConversationCompactInputVNext):
-        raise TypeError("request must be ConversationCompactInputVNext")
+    if not isinstance(request, CompactInputV2):
+        raise TypeError("request must be CompactInputV2")
     try:
         candidate = _parse_vnext_proposal(final_answer)
-        _validate_vnext_candidate_source_labels(request, candidate)
+    except LLMCompactionValidationError:
+        raise
     except (KeyError, TypeError, ValueError) as exc:
-        raise LLMCompactionProposalError(
-            f"compactor vNext proposal schema invalid: {exc}",
+        raise LLMCompactionValidationError(
+            _parser_validation_report(exc),
             successful_response_identity=None,
         ) from exc
     return candidate
 
 
-def _parse_vnext_proposal(final_answer: str) -> ConversationCompactOutputVNext:
+def _parse_vnext_proposal(final_answer: str) -> CompactCandidateV2:
     """解析 vNext LLM strict JSON proposal。
 
     :param final_answer: LLM final answer 原文。
@@ -660,39 +728,49 @@ def _parse_vnext_proposal(final_answer: str) -> ConversationCompactOutputVNext:
 
     raw = final_answer.strip()
     if len(raw) < _MIN_PROPOSAL_LENGTH:
-        raise LLMCompactionProposalError(
-            "compactor vNext proposal is empty",
+        raise LLMCompactionValidationError(
+            _single_parser_issue_report(
+                code=CompactValidationIssueCodeV2.BLANK_REQUIRED_TEXT,
+                json_path="$",
+                message="candidate 必须是非空 strict JSON object。",
+            ),
             successful_response_identity=None,
         )
     try:
-        parsed: JsonValue = json.loads(raw)
+        parsed: JsonValue = json.loads(raw, object_pairs_hook=_strict_object_pairs)
     except JSONDecodeError as exc:
-        raise LLMCompactionProposalError(
-            f"compactor vNext proposal is not valid JSON: {exc.msg}",
+        raise LLMCompactionValidationError(
+            _single_parser_issue_report(
+                code=CompactValidationIssueCodeV2.INVALID_JSON,
+                json_path="$",
+                message=f"candidate 不是有效 JSON：{exc.msg}。",
+            ),
             successful_response_identity=None,
         ) from exc
     proposal = _json_object(parsed, "proposal")
+    _require_exact_keys(proposal, _TOP_LEVEL_FIELDS, path="$")
     schema_version = _required_string(
         proposal,
         _SCHEMA_VERSION_FIELD,
         parent_path="",
     )
-    if schema_version != CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT:
+    if schema_version != COMPACT_OUTPUT_SCHEMA_V2:
         raise ValueError(f"{_SCHEMA_VERSION_FIELD} is invalid")
-    return ConversationCompactOutputVNext(
-        schema_version=schema_version,
+    return CompactCandidateV2(
+        schema=schema_version,
         session_summary=_session_summary_candidate_vnext(proposal),
-        evidence_backed_facts=_fact_candidates_vnext(proposal),
+        evidence_facts=_fact_candidates_vnext(proposal),
         answer_anchors=_answer_anchor_candidates_vnext(proposal),
         forward_intents=_forward_intent_candidates_vnext(proposal),
-        reference_continuity_items=_reference_candidates_vnext(proposal),
+        reference_continuity=_reference_candidates_vnext(proposal),
         diagnostics=_diagnostics_vnext(proposal),
+        explicitly_dropped_sources=_explicit_drops_v2(proposal),
     )
 
 
 def _session_summary_candidate_vnext(
     proposal: Mapping[str, JsonValue],
-) -> SessionSummaryCandidateVNext | None:
+) -> CompactSessionSummaryV2 | None:
     """解析 vNext session summary candidate。
 
     :param proposal: 已解析 proposal。
@@ -703,13 +781,14 @@ def _session_summary_candidate_vnext(
     if value is None:
         return None
     data = _json_object(value, _SESSION_SUMMARY_FIELD)
-    return SessionSummaryCandidateVNext(
-        summary_text=_required_string(data, _SUMMARY_TEXT_FIELD, parent_path=_SESSION_SUMMARY_FIELD),
+    _require_exact_keys(data, _SUMMARY_FIELDS, path=f"$.{_SESSION_SUMMARY_FIELD}")
+    return CompactSessionSummaryV2(
+        text=_required_string(data, _SUMMARY_TEXT_FIELD, parent_path=_SESSION_SUMMARY_FIELD),
         source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=_SESSION_SUMMARY_FIELD),
     )
 
 
-def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceBackedFactCandidateVNext, ...]:
+def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactEvidenceFactV2, ...]:
     """解析 vNext evidence-backed fact candidates。
 
     :param proposal: 已解析 proposal。
@@ -721,21 +800,22 @@ def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceB
         _EVIDENCE_BACKED_FACTS_FIELD,
         parent_path="",
     )
-    candidates: list[EvidenceBackedFactCandidateVNext] = []
+    candidates: list[CompactEvidenceFactV2] = []
     for index, item in enumerate(values):
         item_path = _item_path(_EVIDENCE_BACKED_FACTS_FIELD, index)
         data = _json_object(item, item_path)
+        _require_exact_keys(data, _FACT_FIELDS, path=f"$.{item_path}")
         candidates.append(
-            EvidenceBackedFactCandidateVNext(
-                claim_text=_required_string(data, _CLAIM_TEXT_FIELD, parent_path=item_path),
-                evidence_labels=_required_string_tuple(data, _EVIDENCE_LABELS_FIELD, parent_path=item_path),
-                source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
+            CompactEvidenceFactV2(
+                claim=_required_string(data, _CLAIM_TEXT_FIELD, parent_path=item_path),
+                support_labels=_required_string_tuple(data, _EVIDENCE_LABELS_FIELD, parent_path=item_path),
+                context_labels=_required_string_tuple(data, _CONTEXT_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
 
 
-def _answer_anchor_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[AnswerAnchorCandidateVNext, ...]:
+def _answer_anchor_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactAnswerAnchorV2, ...]:
     """解析 vNext answer anchor candidates。
 
     :param proposal: 已解析 proposal。
@@ -747,51 +827,22 @@ def _answer_anchor_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[
         _ANSWER_ANCHORS_FIELD,
         parent_path="",
     )
-    candidates: list[AnswerAnchorCandidateVNext] = []
+    candidates: list[CompactAnswerAnchorV2] = []
     for index, item in enumerate(values):
         item_path = _item_path(_ANSWER_ANCHORS_FIELD, index)
         data = _json_object(item, item_path)
+        _require_exact_keys(data, _ANCHOR_FIELDS, path=f"$.{item_path}")
         candidates.append(
-            AnswerAnchorCandidateVNext(
-                anchor_title=_required_string(data, _ANCHOR_TITLE_FIELD, parent_path=item_path),
-                anchor_items=_answer_anchor_children_vnext(data, item_path),
-                answer_source_labels=_required_string_tuple(data, _ANSWER_SOURCE_LABELS_FIELD, parent_path=item_path),
+            CompactAnswerAnchorV2(
+                title=_required_string(data, _ANCHOR_TITLE_FIELD, parent_path=item_path),
+                detail=_required_string(data, _ANCHOR_DETAIL_FIELD, parent_path=item_path),
+                source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
 
 
-def _answer_anchor_children_vnext(
-    source: Mapping[str, JsonValue],
-    parent_path: str,
-) -> tuple[AnswerAnchorChildVNext, ...]:
-    """解析 vNext answer anchor children。
-
-    :param source: answer anchor JSON object。
-    :param parent_path: answer anchor 的完整字段路径。
-    :returns: answer anchor child tuple。
-    """
-
-    values = _required_array(
-        source,
-        _ANCHOR_ITEMS_FIELD,
-        parent_path=parent_path,
-    )
-    field_path = _field_path(parent_path, _ANCHOR_ITEMS_FIELD)
-    children: list[AnswerAnchorChildVNext] = []
-    for index, item in enumerate(values):
-        item_path = _item_path(field_path, index)
-        data = _json_object(item, item_path)
-        children.append(
-            AnswerAnchorChildVNext(
-                display_text=_required_string(data, _DISPLAY_TEXT_FIELD, parent_path=item_path),
-                ordinal=_optional_non_negative_int(data, _ORDINAL_FIELD, parent_path=item_path),
-            )
-        )
-    return tuple(children)
-
-
-def _forward_intent_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[ForwardIntentCandidateVNext, ...]:
+def _forward_intent_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactForwardIntentV2, ...]:
     """解析 vNext forward intent candidates。
 
     :param proposal: 已解析 proposal。
@@ -803,22 +854,16 @@ def _forward_intent_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple
         _FORWARD_INTENTS_FIELD,
         parent_path="",
     )
-    candidates: list[ForwardIntentCandidateVNext] = []
+    candidates: list[CompactForwardIntentV2] = []
     for index, item in enumerate(values):
         item_path = _item_path(_FORWARD_INTENTS_FIELD, index)
         data = _json_object(item, item_path)
+        _require_exact_keys(data, _INTENT_FIELDS, path=f"$.{item_path}")
         candidates.append(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext(
-                    _required_enum(
-                        data,
-                        _INTENT_TYPE_FIELD,
-                        parent_path=item_path,
-                        allowed_values=_FORWARD_INTENT_TYPE_VALUES,
-                    )
-                ),
+            CompactForwardIntentV2(
+                intent_type=_required_string(data, _INTENT_TYPE_FIELD, parent_path=item_path),
                 text=_required_string(data, _TEXT_FIELD, parent_path=item_path),
-                status=ForwardIntentStatusVNext(
+                status=CompactForwardIntentStatusV2(
                     _required_enum(
                         data,
                         _STATUS_FIELD,
@@ -832,7 +877,7 @@ def _forward_intent_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple
     return tuple(candidates)
 
 
-def _reference_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[ReferenceContinuityCandidateVNext, ...]:
+def _reference_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactReferenceContinuityV2, ...]:
     """解析 vNext reference continuity candidates。
 
     :param proposal: 已解析 proposal。
@@ -844,28 +889,22 @@ def _reference_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[Refe
         _REFERENCE_CONTINUITY_ITEMS_FIELD,
         parent_path="",
     )
-    candidates: list[ReferenceContinuityCandidateVNext] = []
+    candidates: list[CompactReferenceContinuityV2] = []
     for index, item in enumerate(values):
         item_path = _item_path(_REFERENCE_CONTINUITY_ITEMS_FIELD, index)
         data = _json_object(item, item_path)
+        _require_exact_keys(data, _REFERENCE_FIELDS, path=f"$.{item_path}")
         candidates.append(
-            ReferenceContinuityCandidateVNext(
+            CompactReferenceContinuityV2(
                 text=_required_string(data, _TEXT_FIELD, parent_path=item_path),
-                reason=ReferenceContinuityReasonVNext(
-                    _required_enum(
-                        data,
-                        _REASON_FIELD,
-                        parent_path=item_path,
-                        allowed_values=_REFERENCE_CONTINUITY_REASON_VALUES,
-                    )
-                ),
+                reason=_required_string(data, _REASON_FIELD, parent_path=item_path),
                 source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
 
 
-def _diagnostics_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactCandidateDiagnosticVNext, ...]:
+def _diagnostics_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactCandidateDiagnosticV2, ...]:
     """解析 vNext compact diagnostics。
 
     :param proposal: 已解析 proposal。
@@ -877,116 +916,172 @@ def _diagnostics_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactCandid
         _DIAGNOSTICS_FIELD,
         parent_path="",
     )
-    diagnostics: list[CompactCandidateDiagnosticVNext] = []
+    diagnostics: list[CompactCandidateDiagnosticV2] = []
     for index, item in enumerate(values):
         item_path = _item_path(_DIAGNOSTICS_FIELD, index)
         data = _json_object(item, item_path)
+        _require_exact_keys(data, _DIAGNOSTIC_FIELDS, path=f"$.{item_path}")
         diagnostics.append(
-            CompactCandidateDiagnosticVNext(
+            CompactCandidateDiagnosticV2(
                 code=_required_string(data, _CODE_FIELD, parent_path=item_path),
-                text=_required_string(data, _TEXT_FIELD, parent_path=item_path),
-                source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
+                message=_required_string(data, _MESSAGE_FIELD, parent_path=item_path),
+                source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(diagnostics)
 
 
-def _validate_vnext_candidate_source_labels(
-    request: ConversationCompactInputVNext,
-    candidate: ConversationCompactOutputVNext,
-) -> None:
-    """校验 vNext candidate source labels 的 section allowlist。
+def _explicit_drops_v2(
+    proposal: Mapping[str, JsonValue],
+) -> tuple[CompactExplicitDropV2, ...]:
+    """解析 explicit drop declarations。
 
-    :param request: vNext compactor input。
-    :param candidate: vNext compact output。
-    :returns: ``None``。
-    :raises ValueError: label 未知、stale、跨 section 或 current anchor 被引用时抛出。
+    :param proposal: 已解析 proposal。
+    :returns: typed drop tuple。
     """
 
-    if candidate.session_summary is not None:
-        _validate_vnext_labels(
-            request,
-            candidate.session_summary.source_labels,
-            field_name="session_summary.source_labels",
-            allowed_sections=CONVERSATION_COMPACT_SUMMARY_SOURCE_SECTIONS_VNEXT,
+    values = _required_array(proposal, _EXPLICITLY_DROPPED_SOURCES_FIELD, parent_path="")
+    drops: list[CompactExplicitDropV2] = []
+    for index, item in enumerate(values):
+        item_path = _item_path(_EXPLICITLY_DROPPED_SOURCES_FIELD, index)
+        data = _json_object(item, item_path)
+        _require_exact_keys(data, _DROP_FIELDS, path=f"$.{item_path}")
+        drops.append(
+            CompactExplicitDropV2(
+                source_label=_required_string(data, _SOURCE_LABEL_FIELD, parent_path=item_path),
+                reason=CompactDropReasonV2(
+                    _required_enum(
+                        data,
+                        _REASON_FIELD,
+                        parent_path=item_path,
+                        allowed_values=frozenset(item.value for item in CompactDropReasonV2),
+                    )
+                ),
+            )
         )
-    for index, fact in enumerate(candidate.evidence_backed_facts):
-        _validate_vnext_labels(
-            request,
-            fact.evidence_labels,
-            field_name=f"evidence_backed_facts[{index}].evidence_labels",
-            allowed_sections=CONVERSATION_COMPACT_FACT_SOURCE_SECTIONS_VNEXT,
-        )
-        _validate_vnext_labels(
-            request,
-            fact.source_labels,
-            field_name=f"evidence_backed_facts[{index}].source_labels",
-            allowed_sections=CONVERSATION_COMPACT_FACT_SOURCE_SECTIONS_VNEXT,
-            allow_empty=True,
-        )
-    for index, anchor in enumerate(candidate.answer_anchors):
-        _validate_vnext_labels(
-            request,
-            anchor.answer_source_labels,
-            field_name=f"answer_anchors[{index}].answer_source_labels",
-            allowed_sections=CONVERSATION_COMPACT_ANSWER_SOURCE_SECTIONS_VNEXT,
-        )
-    for index, intent in enumerate(candidate.forward_intents):
-        _validate_vnext_labels(
-            request,
-            intent.source_labels,
-            field_name=f"forward_intents[{index}].source_labels",
-            allowed_sections=CONVERSATION_COMPACT_FORWARD_SOURCE_SECTIONS_VNEXT,
-        )
-    for index, item in enumerate(candidate.reference_continuity_items):
-        _validate_vnext_labels(
-            request,
-            item.source_labels,
-            field_name=f"reference_continuity_items[{index}].source_labels",
-            allowed_sections=CONVERSATION_COMPACT_REFERENCE_SOURCE_SECTIONS_VNEXT,
-        )
-    for index, diagnostic in enumerate(candidate.diagnostics):
-        _validate_vnext_labels(
-            request,
-            diagnostic.source_labels,
-            field_name=f"diagnostics[{index}].source_labels",
-            allowed_sections=CONVERSATION_COMPACT_DIAGNOSTIC_SOURCE_SECTIONS_VNEXT,
-            allow_empty=True,
-        )
+    return tuple(drops)
 
 
-def _validate_vnext_labels(
-    request: ConversationCompactInputVNext,
-    labels: tuple[str, ...],
+def _strict_object_pairs(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    """把 JSON object pairs 转为 dict，并在覆盖前拒绝 duplicate key。
+
+    :param pairs: json decoder 提供的原始 key/value pairs。
+    :returns: 无重复 key 的 JSON object。
+    :raises ValueError: 任一 key 重复时抛出。
+    """
+
+    result: dict[str, JsonValue] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate_json_key: {key}")
+        result[key] = value
+    return result
+
+
+def _single_parser_issue_report(
     *,
-    field_name: str,
-    allowed_sections: tuple[ConversationCompactLabelSectionVNext, ...],
-    allow_empty: bool = False,
-) -> None:
-    """校验 vNext prompt-local labels。
+    code: CompactValidationIssueCodeV2,
+    json_path: str,
+    message: str,
+) -> CompactValidationReportV2:
+    """构造单问题 strict parser report。
 
-    :param request: vNext compactor input。
-    :param labels: 待校验 labels。
-    :param field_name: 错误字段名。
-    :param allowed_sections: 允许引用的 section。
-    :param allow_empty: 是否允许空 labels。
-    :returns: ``None``。
-    :raises ValueError: label 缺失、未知、stale、跨 section 或 current anchor 被引用时抛出。
+    :param code: 稳定 parser 问题码。
+    :param json_path: 出错 JSON path。
+    :param message: 脱敏、自解释消息。
+    :returns: 单问题 validation report。
     """
 
-    if not allow_empty and len(labels) == 0:
-        raise ValueError(f"{field_name} missing source label")
-    for label in labels:
-        section = request.source_section(label)
-        if section is ConversationCompactLabelSectionVNext.CURRENT_INPUT_ANCHOR:
-            raise ValueError(f"{field_name} cites current input anchor: {label}")
-        if section is None:
-            if conversation_compact_label_looks_stale_vnext(label):
-                raise ValueError(f"{field_name} contains stale source label: {label}")
-            raise ValueError(f"{field_name} contains unknown source label: {label}")
-        if section not in allowed_sections:
-            raise ValueError(f"{field_name} contains cross-section label: {label}")
+    safe_path = truncate_diagnostic_text(
+        redact_sensitive_diagnostic_values(
+            json_path,
+            redaction_marker=_REDACTED_SECRET,
+        ),
+        max_chars=_MAX_SAFE_OUTCOME_MESSAGE_CHARS,
+        truncated_suffix=_TRUNCATED_SUFFIX,
+    )
+    safe_message = truncate_diagnostic_text(
+        redact_sensitive_diagnostic_values(
+            message,
+            redaction_marker=_REDACTED_SECRET,
+        ),
+        max_chars=_MAX_SAFE_OUTCOME_MESSAGE_CHARS,
+        truncated_suffix=_TRUNCATED_SUFFIX,
+    )
+    return CompactValidationReportV2(
+        issues=(
+            CompactValidationIssueV2(
+                code=code,
+                json_path=safe_path,
+                message=safe_message,
+            ),
+        )
+    )
 
+
+def _parser_validation_report(
+    error: KeyError | TypeError | ValueError,
+) -> CompactValidationReportV2:
+    """把 strict parser 内部异常归一为稳定 validation report。
+
+    :param error: parser helper 抛出的边界错误。
+    :returns: 可供 whole-candidate repair 使用的 validation report。
+    """
+
+    raw_message = str(error).strip("'")
+    code = CompactValidationIssueCodeV2.INVALID_ENUM_VALUE
+    json_path = "$"
+    if raw_message.startswith("duplicate_json_key:"):
+        code = CompactValidationIssueCodeV2.DUPLICATE_JSON_KEY
+        # object_pairs_hook 尚不知道 nested object 的父路径；raw key 可能携带
+        # secret，不能把它伪装成可回显的 JSON path。
+        json_path = "$"
+    elif raw_message.startswith("unknown_json_key at "):
+        code = CompactValidationIssueCodeV2.UNKNOWN_JSON_KEY
+        json_path = raw_message.removeprefix("unknown_json_key at ").partition(":")[0]
+    elif raw_message.startswith("missing_required_key at "):
+        code = CompactValidationIssueCodeV2.MISSING_REQUIRED_KEY
+        json_path = raw_message.removeprefix("missing_required_key at ").partition(":")[0]
+    elif raw_message.startswith("missing required key:"):
+        code = CompactValidationIssueCodeV2.MISSING_REQUIRED_KEY
+        json_path = f"$.{raw_message.partition(':')[2].strip()}"
+    elif isinstance(error, TypeError):
+        code = CompactValidationIssueCodeV2.INVALID_FIELD_TYPE
+        json_path = f"$.{raw_message.partition(' ')[0]}"
+    elif "must not be empty" in raw_message or "must be non-empty" in raw_message:
+        code = CompactValidationIssueCodeV2.BLANK_REQUIRED_TEXT
+    elif "invalid enum value" in raw_message or "schema is invalid" in raw_message:
+        code = CompactValidationIssueCodeV2.INVALID_ENUM_VALUE
+        json_path = f"$.{raw_message.partition(' ')[0]}"
+    return _single_parser_issue_report(
+        code=code,
+        json_path=json_path,
+        message=f"strict candidate contract rejected：{raw_message}",
+    )
+
+
+def _require_exact_keys(
+    source: Mapping[str, JsonValue],
+    expected: frozenset[str],
+    *,
+    path: str,
+) -> None:
+    """拒绝 unknown 与 missing JSON keys。
+
+    :param source: 当前 JSON object。
+    :param expected: exact required key set。
+    :param path: 当前 object path。
+    :returns: ``None``。
+    :raises ValueError: key set 不精确时抛出。
+    """
+
+    actual = frozenset(source)
+    unknown = tuple(sorted(actual - expected))
+    missing = tuple(sorted(expected - actual))
+    if unknown:
+        raise ValueError(f"unknown_json_key at {path}: {','.join(unknown)}")
+    if missing:
+        raise ValueError(f"missing_required_key at {path}: {','.join(missing)}")
 
 
 def _field_path(parent: str, key: str) -> str:
@@ -1222,4 +1317,8 @@ def _string_tuple(value: JsonValue, field_path: str) -> tuple[str, ...]:
     return tuple(strings)
 
 
-__all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]
+__all__ = [
+    "LLMCompactionProposalError",
+    "LLMCompactionValidationError",
+    "LLMContextCompactor",
+]

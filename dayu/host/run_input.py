@@ -197,6 +197,7 @@ from dayu.host.memory import (
     memory_snapshot_with_cursor_and_diagnostics,
     project_conversation_memory_event,
 )
+
 if TYPE_CHECKING:
     from dayu.host.tool_runtime import ToolRuntimeHandle
 
@@ -221,9 +222,7 @@ _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
 _PAYLOAD_FIELD_TRIGGER_SOURCE = "trigger_source"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _PREPARED_CANDIDATE_SCHEMA_VERSION = "runner_call_prepared_candidate.v1"
-_PREPARED_CANDIDATE_MEDIA_TYPE = (
-    "application/vnd.dayu.runner-call-prepared-candidate+json"
-)
+_PREPARED_CANDIDATE_MEDIA_TYPE = "application/vnd.dayu.runner-call-prepared-candidate+json"
 _PREPARED_CANDIDATE_FIELDS = frozenset(
     {
         "schema_version",
@@ -309,7 +308,7 @@ _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS = (
     "runner_call_index=",
     "checkpoint_event_id",
     "checkpoint_event_sequence",
-    "ConversationCompactOutputVNext",
+    "CompactCandidateV2",
 )
 _RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
 _RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-runner-call-input-manifest"
@@ -684,30 +683,17 @@ class PreparedRunnerCallCandidate:
             or not isinstance(self.candidate_input_cursor, int)
             or self.candidate_input_cursor < 0
         ):
-            raise ValueError(
-                "PreparedRunnerCallCandidate.candidate_input_cursor must be "
-                "non-negative int"
-            )
+            raise ValueError("PreparedRunnerCallCandidate.candidate_input_cursor must be non-negative int")
         if not isinstance(self.messages, tuple):
             raise TypeError("PreparedRunnerCallCandidate.messages must be tuple")
         if not isinstance(self.tool_schemas, tuple):
-            raise TypeError(
-                "PreparedRunnerCallCandidate.tool_schemas must be tuple"
-            )
+            raise TypeError("PreparedRunnerCallCandidate.tool_schemas must be tuple")
         if not isinstance(self.disable_tools, bool):
-            raise TypeError(
-                "PreparedRunnerCallCandidate.disable_tools must be bool"
-            )
+            raise TypeError("PreparedRunnerCallCandidate.disable_tools must be bool")
         if not isinstance(self.tool_execution_mode, ToolExecutionMode):
-            raise TypeError(
-                "PreparedRunnerCallCandidate.tool_execution_mode must be "
-                "ToolExecutionMode"
-            )
+            raise TypeError("PreparedRunnerCallCandidate.tool_execution_mode must be ToolExecutionMode")
         if not isinstance(self.policy_snapshot, PolicySnapshot):
-            raise TypeError(
-                "PreparedRunnerCallCandidate.policy_snapshot must be "
-                "PolicySnapshot"
-            )
+            raise TypeError("PreparedRunnerCallCandidate.policy_snapshot must be PolicySnapshot")
         for field_name, values in (
             (
                 "PreparedRunnerCallCandidate.source_cursor_refs",
@@ -2280,9 +2266,7 @@ def prepare_runner_call_candidate_in_transaction(
         or user_input_event.attempt_id is not None
         or user_input_event.execution_id is not None
     ):
-        raise HostDurableError(
-            "candidate current USER_INPUT_ACCEPTED identity mismatch"
-        )
+        raise HostDurableError("candidate current USER_INPUT_ACCEPTED identity mismatch")
     run_accepted_event = _require_event(
         event_log_store.read_event_by_id(transaction, run.accepted_event_id),
         expected_type=_EVENT_TYPE_RUN_ACCEPTED,
@@ -2388,9 +2372,7 @@ def prepare_runner_call_candidate_in_transaction(
         source_cursor_refs=source_refs,
         memory_snapshot_cursor_ref=memory.memory_snapshot_cursor,
         compact_artifact_refs=_compact_artifact_refs(compact),
-        context_fallback_decision_ref=_context_fallback_decision_ref(
-            fallback
-        ),
+        context_fallback_decision_ref=_context_fallback_decision_ref(fallback),
     )
 
 
@@ -2526,11 +2508,7 @@ def resolve_prepared_runner_call_context_anchor_in_transaction(
 
     if not isinstance(candidate, PreparedRunnerCallCandidate):
         raise TypeError("candidate must be PreparedRunnerCallCandidate")
-    scan_cursor = (
-        candidate.candidate_input_cursor
-        if candidate_input_cursor is None
-        else candidate_input_cursor
-    )
+    scan_cursor = candidate.candidate_input_cursor if candidate_input_cursor is None else candidate_input_cursor
     return resolve_context_anchor(
         transaction,
         event_log_store,
@@ -2566,17 +2544,13 @@ def continuation_runner_call_sizing_snapshot(
 
     if source_sizing.status is RunnerCallSizingStatus.UNAVAILABLE:
         if source_sizing.reason is None:
-            raise HostDurableError(
-                "continuation source unavailable reason is missing"
-            )
+            raise HostDurableError("continuation source unavailable reason is missing")
         return unavailable_runner_call_sizing_snapshot(
             source_sizing.reason,
             sizing_stage=ContextSizingStage.CONTINUATION,
         )
     if source_sizing.status is not RunnerCallSizingStatus.COMPLETE:
-        raise HostDurableError(
-            "continuation source sizing is not complete"
-        )
+        raise HostDurableError("continuation source sizing is not complete")
     estimator_id = source_sizing.estimator_id
     estimator_version = source_sizing.estimator_version
     provider = source_sizing.provider
@@ -2591,17 +2565,12 @@ def continuation_runner_call_sizing_snapshot(
         or provider != candidate.policy_snapshot.runner_spec.provider
         or model is None
         or model != candidate.policy_snapshot.runner_spec.model
-        or source_sizing.request_semantics_digest
-        != candidate.request_semantics_digest
+        or source_sizing.request_semantics_digest != candidate.request_semantics_digest
         or source_sizing.policy_ref is None
         or source_sizing.policy_snapshot_digest is None
     ):
-        raise HostDurableError(
-            "continuation source sizing compatibility mismatch"
-        )
-    tokens, estimator_digest = estimate_context_input(
-        _budget_estimate_input_from_prepared_candidate(candidate)
-    )
+        raise HostDurableError("continuation source sizing compatibility mismatch")
+    tokens, estimator_digest = estimate_context_input(_budget_estimate_input_from_prepared_candidate(candidate))
     return complete_runner_call_sizing_snapshot(
         sizing_stage=ContextSizingStage.CONTINUATION,
         estimator_id=estimator_id,
@@ -2638,9 +2607,7 @@ def _budget_estimate_input_from_prepared_candidate(
     for index, message in enumerate(candidate.messages):
         message_fragments.append(
             BudgetTextFragment(
-                fragment_ref=(
-                    f"candidate-message:{index}:{message.role.value}"
-                ),
+                fragment_ref=(f"candidate-message:{index}:{message.role.value}"),
                 text=_candidate_budget_message_text(message),
             )
         )
@@ -2648,9 +2615,7 @@ def _budget_estimate_input_from_prepared_candidate(
         if structured_atom is not None:
             json_fragments.append(
                 BudgetJsonFragment(
-                    fragment_ref=(
-                        f"candidate-message-structured:{index}"
-                    ),
+                    fragment_ref=(f"candidate-message-structured:{index}"),
                     value=structured_atom,
                 )
             )
@@ -2669,11 +2634,7 @@ def _budget_estimate_input_from_prepared_candidate(
         tool_schema_fragments=tool_fragments,
         compact_artifact_refs=candidate.compact_artifact_refs,
         memory_snapshot_cursor=None,
-        current_prompt_ref=(
-            candidate.source_cursor_refs[-1]
-            if candidate.source_cursor_refs
-            else None
-        ),
+        current_prompt_ref=(candidate.source_cursor_refs[-1] if candidate.source_cursor_refs else None),
         input_snapshot_digest=candidate.input_snapshot_digest,
     )
 
@@ -2744,15 +2705,9 @@ def runner_request_semantics_digest(policy_snapshot: PolicySnapshot) -> str:
     spec = policy_snapshot.runner_spec
     return sha256_digest_json(
         {
-            "runner_input_serializer_schema_version": (
-                RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-            ),
-            "runner_call_input_projection_schema_version": (
-                RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION
-            ),
-            "runner_options": runner_options_json(
-                policy_snapshot.runner_options
-            ),
+            "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
+            "runner_call_input_projection_schema_version": (RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION),
+            "runner_options": runner_options_json(policy_snapshot.runner_options),
             "provider_request": provider_request_json(spec.provider_request),
             "supports_tool_calling": spec.supports_tool_calling,
             "supports_streaming": spec.supports_streaming,
@@ -2785,15 +2740,9 @@ def agent_run_request_from_prepared_candidate(
         raise HostDurableError("frozen candidate session identity mismatch")
     if candidate.run_id != attempt_snapshot.run_id:
         raise HostDurableError("frozen candidate Run identity mismatch")
-    if (
-        candidate.policy_snapshot.policy_snapshot_ref
-        != attempt_snapshot.policy_snapshot_ref
-    ):
+    if candidate.policy_snapshot.policy_snapshot_ref != attempt_snapshot.policy_snapshot_ref:
         raise HostDurableError("frozen candidate policy identity mismatch")
-    if (
-        runner_request_semantics_digest(candidate.policy_snapshot)
-        != candidate.request_semantics_digest
-    ):
+    if runner_request_semantics_digest(candidate.policy_snapshot) != candidate.request_semantics_digest:
         raise HostDurableError("frozen candidate request semantics mismatch")
     rebuilt = prepare_runner_call_candidate(
         session_id=candidate.session_id,
@@ -2807,9 +2756,7 @@ def agent_run_request_from_prepared_candidate(
         source_cursor_refs=candidate.source_cursor_refs,
         memory_snapshot_cursor_ref=candidate.memory_snapshot_cursor_ref,
         compact_artifact_refs=candidate.compact_artifact_refs,
-        context_fallback_decision_ref=(
-            candidate.context_fallback_decision_ref
-        ),
+        context_fallback_decision_ref=(candidate.context_fallback_decision_ref),
     )
     if rebuilt.input_snapshot_digest != candidate.input_snapshot_digest:
         raise HostDurableError("frozen candidate input snapshot digest mismatch")
@@ -2858,9 +2805,7 @@ def load_run_input_policy_snapshot_in_transaction(
         or event.attempt_id is not None
         or event.execution_id is not None
     ):
-        raise HostDurableError(
-            "source Run exact USER_INPUT_ACCEPTED fact is invalid"
-        )
+        raise HostDurableError("source Run exact USER_INPUT_ACCEPTED fact is invalid")
     payload = event_payload_object(
         transaction,
         event,
@@ -2868,9 +2813,7 @@ def load_run_input_policy_snapshot_in_transaction(
     )
     execution_config = payload.get("effective_execution_config")
     if execution_config is None:
-        raise HostDurableError(
-            "source Run effective execution config is missing"
-        )
+        raise HostDurableError("source Run effective execution config is missing")
     snapshot = effective_execution_snapshot_from_json(execution_config)
     return PolicySnapshot(
         runner_spec=snapshot.runner_spec,
@@ -2925,11 +2868,7 @@ def load_prepared_runner_call_source_in_transaction(
         )
     try:
         hot = parse_runner_call_hot_payload(_payload_object(event))
-        if (
-            hot.host_run_id != run_id
-            or hot.attempt_id != attempt_id
-            or hot.execution_id != execution_id
-        ):
+        if hot.host_run_id != run_id or hot.attempt_id != attempt_id or hot.execution_id != execution_id:
             raise HostDurableError("prepared manifest hot identity mismatch")
         manifest_json = sqlite_payload_object(
             transaction,
@@ -2946,17 +2885,13 @@ def load_prepared_runner_call_source_in_transaction(
             or manifest.identity.iteration_index is not None
             or manifest.compactor_identity is not None
         ):
-            raise HostDurableError(
-                "prepared runner-call source is not a pre-start manifest"
-            )
+            raise HostDurableError("prepared runner-call source is not a pre-start manifest")
     except (HostDurableError, TypeError, ValueError) as exc:
         raise PreparedRunnerCallSourceError(
             PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
             "prepared runner-call manifest is invalid",
         ) from exc
-    candidate_ref = _prepared_candidate_payload_ref(
-        manifest.input_projection_digest
-    )
+    candidate_ref = _prepared_candidate_payload_ref(manifest.input_projection_digest)
     try:
         candidate_json = sqlite_payload_object(
             transaction,
@@ -3013,12 +2948,9 @@ def load_prepared_runner_call_source_in_transaction(
             raise HostDurableError("prepared candidate Run identity mismatch")
         if (
             candidate.candidate_input_projection_ref != candidate_ref
-            or candidate.candidate_input_projection_digest
-            != manifest.input_projection_digest
+            or candidate.candidate_input_projection_digest != manifest.input_projection_digest
         ):
-            raise HostDurableError(
-                "prepared candidate manifest projection mismatch"
-            )
+            raise HostDurableError("prepared candidate manifest projection mismatch")
     except (HostDurableError, TypeError, ValueError) as exc:
         raise PreparedRunnerCallSourceError(
             PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA,
@@ -3031,24 +2963,13 @@ def load_prepared_runner_call_source_in_transaction(
             "prepared runner-call source sizing is not applicable",
         )
     if (
-        (
-            sizing.input_snapshot_digest is not None
-            and sizing.input_snapshot_digest != candidate.input_snapshot_digest
-        )
+        (sizing.input_snapshot_digest is not None and sizing.input_snapshot_digest != candidate.input_snapshot_digest)
         or (
             sizing.request_semantics_digest is not None
-            and sizing.request_semantics_digest
-            != candidate.request_semantics_digest
+            and sizing.request_semantics_digest != candidate.request_semantics_digest
         )
-        or (
-            sizing.provider is not None
-            and sizing.provider
-            != candidate.policy_snapshot.runner_spec.provider
-        )
-        or (
-            sizing.model is not None
-            and sizing.model != candidate.policy_snapshot.runner_spec.model
-        )
+        or (sizing.provider is not None and sizing.provider != candidate.policy_snapshot.runner_spec.provider)
+        or (sizing.model is not None and sizing.model != candidate.policy_snapshot.runner_spec.model)
     ):
         raise PreparedRunnerCallSourceError(
             PreparedRunnerCallSourceFailureCategory.REQUEST_SEMANTICS,
@@ -3080,38 +3001,24 @@ def _prepared_source_tool_facts(
     """
 
     fields = frozenset(candidate_json)
-    if (
-        not fields.issubset(_PREPARED_CANDIDATE_FIELDS)
-        or not _PREPARED_CANDIDATE_POLICY_INDEPENDENT_FIELDS.issubset(fields)
+    if not fields.issubset(_PREPARED_CANDIDATE_FIELDS) or not _PREPARED_CANDIDATE_POLICY_INDEPENDENT_FIELDS.issubset(
+        fields
     ):
-        raise HostDurableError(
-            "prepared candidate policy-independent fields are invalid"
-        )
+        raise HostDurableError("prepared candidate policy-independent fields are invalid")
     if (
-        _candidate_required_text(candidate_json, "schema_version")
-        != _PREPARED_CANDIDATE_SCHEMA_VERSION
-        or _candidate_required_text(candidate_json, "session_id")
-        != run.session_id
-        or _candidate_required_text(candidate_json, "host_run_id")
-        != run.run_id
+        _candidate_required_text(candidate_json, "schema_version") != _PREPARED_CANDIDATE_SCHEMA_VERSION
+        or _candidate_required_text(candidate_json, "session_id") != run.session_id
+        or _candidate_required_text(candidate_json, "host_run_id") != run.run_id
     ):
-        raise HostDurableError(
-            "prepared candidate policy-independent identity is invalid"
-        )
+        raise HostDurableError("prepared candidate policy-independent identity is invalid")
     cursor = candidate_json.get("candidate_input_cursor")
     if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
-        raise HostDurableError(
-            "prepared candidate input cursor is invalid"
-        )
+        raise HostDurableError("prepared candidate input cursor is invalid")
     _candidate_messages(candidate_json.get("messages"))
-    tool_schemas = _candidate_tool_schemas(
-        candidate_json.get("tool_schemas")
-    )
+    tool_schemas = _candidate_tool_schemas(candidate_json.get("tool_schemas"))
     disable_tools = candidate_json.get("disable_tools")
     if not isinstance(disable_tools, bool):
-        raise HostDurableError(
-            "prepared candidate disable_tools is invalid"
-        )
+        raise HostDurableError("prepared candidate disable_tools is invalid")
     try:
         tool_execution_mode = ToolExecutionMode(
             _candidate_required_text(
@@ -3120,18 +3027,12 @@ def _prepared_source_tool_facts(
             )
         )
     except ValueError as exc:
-        raise HostDurableError(
-            "prepared candidate tool_execution_mode is invalid"
-        ) from exc
+        raise HostDurableError("prepared candidate tool_execution_mode is invalid") from exc
     if tool_execution_mode is ToolExecutionMode.TOOL_ENABLED:
         if disable_tools:
-            raise HostDurableError(
-                "tool-enabled candidate must not disable tools"
-            )
+            raise HostDurableError("tool-enabled candidate must not disable tools")
     elif not disable_tools or tool_schemas:
-        raise HostDurableError(
-            "no-tool candidate must disable tools and omit schemas"
-        )
+        raise HostDurableError("no-tool candidate must disable tools and omit schemas")
     _candidate_text_tuple(
         candidate_json.get("source_cursor_refs"),
         field_name="source_cursor_refs",
@@ -3169,15 +3070,12 @@ def _validate_prepared_source_policy_fields(
     """
 
     try:
-        valid = (
-            _candidate_required_text(candidate_json, "policy_snapshot_ref")
-            == policy_snapshot.policy_snapshot_ref
-            and _candidate_required_text(
-                candidate_json,
-                "policy_snapshot_digest",
-            )
-            == _engine_policy_snapshot_digest(policy_snapshot)
-        )
+        valid = _candidate_required_text(
+            candidate_json, "policy_snapshot_ref"
+        ) == policy_snapshot.policy_snapshot_ref and _candidate_required_text(
+            candidate_json,
+            "policy_snapshot_digest",
+        ) == _engine_policy_snapshot_digest(policy_snapshot)
     except HostDurableError as exc:
         raise PreparedRunnerCallSourceError(
             PreparedRunnerCallSourceFailureCategory.POLICY,
@@ -3211,8 +3109,7 @@ def _validate_prepared_source_request_fields(
                 "request_semantics_digest",
             )
             == runner_request_semantics_digest(policy_snapshot)
-            and _candidate_required_text(candidate_json, "estimator_id")
-            == CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+            and _candidate_required_text(candidate_json, "estimator_id") == CONTEXT_ESTIMATOR_CONTRACT.estimator_id
             and _candidate_required_text(candidate_json, "estimator_version")
             == CONTEXT_ESTIMATOR_CONTRACT.estimator_version
         )
@@ -3259,16 +3156,11 @@ def load_prepared_runner_call_candidate_in_transaction(
     candidate = source.candidate
     if (
         candidate.policy_snapshot != policy_snapshot
-        or candidate.policy_snapshot.policy_snapshot_ref
-        != policy_snapshot.policy_snapshot_ref
-        or _engine_policy_snapshot_digest(candidate.policy_snapshot)
-        != _engine_policy_snapshot_digest(policy_snapshot)
-        or candidate.request_semantics_digest
-        != runner_request_semantics_digest(policy_snapshot)
+        or candidate.policy_snapshot.policy_snapshot_ref != policy_snapshot.policy_snapshot_ref
+        or _engine_policy_snapshot_digest(candidate.policy_snapshot) != _engine_policy_snapshot_digest(policy_snapshot)
+        or candidate.request_semantics_digest != runner_request_semantics_digest(policy_snapshot)
     ):
-        raise HostDurableError(
-            "prepared candidate caller policy identity mismatch"
-        )
+        raise HostDurableError("prepared candidate caller policy identity mismatch")
     return candidate
 
 
@@ -3313,56 +3205,33 @@ def _prepared_candidate_from_json(
     """
 
     if frozenset(value) != _PREPARED_CANDIDATE_FIELDS:
-        raise HostDurableError(
-            "prepared candidate payload fields are invalid"
-        )
-    if (
-        _candidate_required_text(value, "schema_version")
-        != _PREPARED_CANDIDATE_SCHEMA_VERSION
-    ):
-        raise HostDurableError(
-            "prepared candidate schema version is unsupported"
-        )
-    if (
-        _candidate_required_text(value, "policy_snapshot_ref")
-        != policy_snapshot.policy_snapshot_ref
-        or _candidate_required_text(value, "policy_snapshot_digest")
-        != _engine_policy_snapshot_digest(policy_snapshot)
-    ):
+        raise HostDurableError("prepared candidate payload fields are invalid")
+    if _candidate_required_text(value, "schema_version") != _PREPARED_CANDIDATE_SCHEMA_VERSION:
+        raise HostDurableError("prepared candidate schema version is unsupported")
+    if _candidate_required_text(
+        value, "policy_snapshot_ref"
+    ) != policy_snapshot.policy_snapshot_ref or _candidate_required_text(
+        value, "policy_snapshot_digest"
+    ) != _engine_policy_snapshot_digest(policy_snapshot):
         raise HostDurableError("prepared candidate policy snapshot mismatch")
+    if _candidate_required_text(value, "request_semantics_digest") != runner_request_semantics_digest(policy_snapshot):
+        raise HostDurableError("prepared candidate request semantics mismatch")
     if (
-        _candidate_required_text(value, "request_semantics_digest")
-        != runner_request_semantics_digest(policy_snapshot)
+        _candidate_required_text(value, "estimator_id") != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+        or _candidate_required_text(value, "estimator_version") != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
     ):
-        raise HostDurableError(
-            "prepared candidate request semantics mismatch"
-        )
-    if (
-        _candidate_required_text(value, "estimator_id")
-        != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
-        or _candidate_required_text(value, "estimator_version")
-        != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
-    ):
-        raise HostDurableError(
-            "prepared candidate estimator contract mismatch"
-        )
+        raise HostDurableError("prepared candidate estimator contract mismatch")
     cursor = value.get("candidate_input_cursor")
     if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
-        raise HostDurableError(
-            "prepared candidate input cursor is invalid"
-        )
+        raise HostDurableError("prepared candidate input cursor is invalid")
     disable_tools = value.get("disable_tools")
     if not isinstance(disable_tools, bool):
-        raise HostDurableError(
-            "prepared candidate disable_tools is invalid"
-        )
+        raise HostDurableError("prepared candidate disable_tools is invalid")
     mode_value = _candidate_required_text(value, "tool_execution_mode")
     try:
         tool_execution_mode = ToolExecutionMode(mode_value)
     except ValueError as exc:
-        raise HostDurableError(
-            "prepared candidate tool_execution_mode is invalid"
-        ) from exc
+        raise HostDurableError("prepared candidate tool_execution_mode is invalid") from exc
     candidate = prepare_runner_call_candidate(
         session_id=_candidate_required_text(value, "session_id"),
         run_id=_candidate_required_text(value, "host_run_id"),
@@ -3408,14 +3277,8 @@ def _candidate_messages(value: JsonValue | None) -> tuple[AgentMessage, ...]:
     for expected_index, item in enumerate(value):
         mapping = _candidate_mapping(item, field_name="message")
         index = mapping.get("index")
-        if (
-            isinstance(index, bool)
-            or not isinstance(index, int)
-            or index != expected_index
-        ):
-            raise HostDurableError(
-                "prepared candidate message index is invalid"
-            )
+        if isinstance(index, bool) or not isinstance(index, int) or index != expected_index:
+            raise HostDurableError("prepared candidate message index is invalid")
         role = _candidate_required_text(mapping, "role")
         if role == AgentMessageRole.SYSTEM.value:
             messages.append(
@@ -3445,9 +3308,7 @@ def _candidate_messages(value: JsonValue | None) -> tuple[AgentMessage, ...]:
         elif role == AgentMessageRole.ASSISTANT.value:
             messages.append(_candidate_assistant_message(mapping))
         else:
-            raise HostDurableError(
-                "prepared candidate message role is unsupported"
-            )
+            raise HostDurableError("prepared candidate message role is unsupported")
     return tuple(messages)
 
 
@@ -3473,9 +3334,7 @@ def _candidate_assistant_message(
     )
     calls_value = value.get("tool_calls")
     if not isinstance(calls_value, list):
-        raise HostDurableError(
-            "prepared candidate assistant tool_calls must be array"
-        )
+        raise HostDurableError("prepared candidate assistant tool_calls must be array")
     calls: list[AssistantToolCall] = []
     for item in calls_value:
         call = _candidate_mapping(item, field_name="assistant.tool_call")
@@ -3488,9 +3347,7 @@ def _candidate_assistant_message(
                 id=_candidate_required_text(call, "id"),
                 name=_candidate_required_text(call, "name"),
                 arguments=arguments,
-                provider_state=_candidate_provider_state(
-                    call.get("provider_state")
-                ),
+                provider_state=_candidate_provider_state(call.get("provider_state")),
             )
         )
     return AssistantMessage(
@@ -3515,13 +3372,9 @@ def _candidate_provider_state(
         return None
     mapping = _candidate_mapping(value, field_name="provider_state")
     if set(mapping) != {"provider", "thought_signature"}:
-        raise HostDurableError(
-            "prepared candidate provider state fields are invalid"
-        )
+        raise HostDurableError("prepared candidate provider state fields are invalid")
     if _candidate_required_text(mapping, "provider") != "gemini":
-        raise HostDurableError(
-            "prepared candidate provider state is unsupported"
-        )
+        raise HostDurableError("prepared candidate provider state is unsupported")
     return GeminiToolCallState(
         thought_signature=_candidate_required_text(
             mapping,
@@ -3541,20 +3394,14 @@ def _candidate_tool_schemas(
     """
 
     if not isinstance(value, list):
-        raise HostDurableError(
-            "prepared candidate tool_schemas must be array"
-        )
+        raise HostDurableError("prepared candidate tool_schemas must be array")
     schemas: list[ToolSchema] = []
     for item in value:
         schema = _candidate_mapping(item, field_name="tool_schema")
         if set(schema) != {"type", "function"}:
-            raise HostDurableError(
-                "prepared candidate tool schema fields are invalid"
-            )
+            raise HostDurableError("prepared candidate tool schema fields are invalid")
         if _candidate_required_text(schema, "type") != "function":
-            raise HostDurableError(
-                "prepared candidate tool schema type is unsupported"
-            )
+            raise HostDurableError("prepared candidate tool schema type is unsupported")
         function = _candidate_mapping(
             schema.get("function"),
             field_name="tool_schema.function",
@@ -3573,9 +3420,7 @@ def _candidate_tool_schemas(
         )
         additional = parameters.get("additionalProperties")
         if additional is not None and not isinstance(additional, bool):
-            raise HostDurableError(
-                "prepared candidate additionalProperties is invalid"
-            )
+            raise HostDurableError("prepared candidate additionalProperties is invalid")
         schemas.append(
             ToolSchema(
                 type="function",
@@ -3617,9 +3462,7 @@ def _validate_prepared_tool_snapshot(
 
     if not tool_schemas:
         if refs:
-            raise HostDurableError(
-                "no-tool candidate must not reference tool schema snapshot"
-            )
+            raise HostDurableError("no-tool candidate must not reference tool schema snapshot")
         return
     ref = _candidate_prefixed_ref(
         refs,
@@ -3637,13 +3480,8 @@ def _validate_prepared_tool_snapshot(
     )
     schemas = _candidate_tool_schemas(snapshot.get("tool_schemas"))
     snapshot_disable_tools = snapshot.get("disable_tools")
-    if (
-        schemas != tool_schemas
-        or snapshot_disable_tools is not disable_tools
-    ):
-        raise HostDurableError(
-            "prepared selected tool schema snapshot mismatch"
-        )
+    if schemas != tool_schemas or snapshot_disable_tools is not disable_tools:
+        raise HostDurableError("prepared selected tool schema snapshot mismatch")
 
 
 def _candidate_prefixed_ref(
@@ -3661,9 +3499,7 @@ def _candidate_prefixed_ref(
 
     values = tuple(ref.removeprefix(prefix) for ref in refs if ref.startswith(prefix))
     if len(values) != 1 or values[0].strip() == "":
-        raise HostDurableError(
-            "prepared tool schema snapshot ref is incomplete"
-        )
+        raise HostDurableError("prepared tool schema snapshot ref is incomplete")
     return values[0]
 
 
@@ -3701,12 +3537,8 @@ def _candidate_required_text(
     """
 
     item = value.get(field_name)
-    if not isinstance(item, str) or (
-        not allow_empty and item.strip() == ""
-    ):
-        raise HostDurableError(
-            f"prepared candidate {field_name} must be text"
-        )
+    if not isinstance(item, str) or (not allow_empty and item.strip() == ""):
+        raise HostDurableError(f"prepared candidate {field_name} must be text")
     return item
 
 
@@ -3727,12 +3559,8 @@ def _candidate_optional_text(
 
     if value is None:
         return None
-    if not isinstance(value, str) or (
-        not allow_empty and value.strip() == ""
-    ):
-        raise HostDurableError(
-            f"prepared candidate {field_name} must be optional text"
-        )
+    if not isinstance(value, str) or (not allow_empty and value.strip() == ""):
+        raise HostDurableError(f"prepared candidate {field_name} must be optional text")
     return value
 
 
@@ -3750,15 +3578,11 @@ def _candidate_text_tuple(
     """
 
     if not isinstance(value, list):
-        raise HostDurableError(
-            f"prepared candidate {field_name} must be array"
-        )
+        raise HostDurableError(f"prepared candidate {field_name} must be array")
     items: list[str] = []
     for item in value:
         if not isinstance(item, str) or item.strip() == "":
-            raise HostDurableError(
-                f"prepared candidate {field_name} items must be text"
-            )
+            raise HostDurableError(f"prepared candidate {field_name} items must be text")
         items.append(item)
     return tuple(items)
 
@@ -4223,9 +4047,7 @@ def _load_pre_start_memory_snapshot(
         max_checkpoint_event_sequence=required_event_sequence,
     )
     if row is None:
-        event_filter = event_log_read_filter_from_projection_filter(
-            conversation_memory_projection_event_filter()
-        )
+        event_filter = event_log_read_filter_from_projection_filter(conversation_memory_projection_event_filter())
         page = event_log_store.read_events_after_matching(
             transaction,
             0,
@@ -4277,9 +4099,7 @@ def _load_pre_start_memory_snapshot(
     cursor = snapshot.cursor
     if cursor.checkpoint_event_sequence > 0:
         cursor_event = (
-            None
-            if cursor.checkpoint_event_id is None
-            else read_event_by_id(transaction, cursor.checkpoint_event_id)
+            None if cursor.checkpoint_event_id is None else read_event_by_id(transaction, cursor.checkpoint_event_id)
         )
         if (
             cursor_event is None
@@ -4312,9 +4132,7 @@ def _load_pre_start_memory_snapshot(
             policy.max_lag_events_for_inline_delta,
             policy.max_delta_repair_events,
         )
-        event_filter = event_log_read_filter_from_projection_filter(
-            conversation_memory_projection_event_filter()
-        )
+        event_filter = event_log_read_filter_from_projection_filter(conversation_memory_projection_event_filter())
         page = event_log_store.read_events_after_matching(
             transaction,
             cursor.checkpoint_event_sequence,
@@ -4353,9 +4171,7 @@ def _load_pre_start_memory_snapshot(
             )
         covered_event_id = page.covered_event_id
         if covered_event_id is None:
-            raise HostDurableError(
-                "candidate memory delta covered event id is missing"
-            )
+            raise HostDurableError("candidate memory delta covered event id is missing")
         repaired = memory_snapshot_with_cursor_and_diagnostics(
             snapshot=repaired,
             cursor=MemorySnapshotCursor(
@@ -4440,9 +4256,7 @@ def _load_pre_start_compact_artifact(
                 payload,
                 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST,
             ),
-            represented_evidence_refs=(
-                semantic_payload.accepted_evidence_mapping_refs
-            ),
+            represented_evidence_refs=(semantic_payload.accepted_evidence_mapping_refs),
         ),
         compacted_event,
     )
@@ -4545,9 +4359,7 @@ def _pre_start_protected_recent_raw_tail(
     )
     return select_ordinary_protected_raw_tail(
         source_snapshot=source_snapshot,
-        selected_recent_window_turn_floor=(
-            memory_projection_policy.selected_recent_window_turn_floor
-        ),
+        selected_recent_window_turn_floor=(memory_projection_policy.selected_recent_window_turn_floor),
         memory=memory,
     )
 
@@ -4698,10 +4510,7 @@ def _pre_start_current_user_tail(
     """
 
     for message in continuity.messages:
-        if (
-            isinstance(message, UserMessage)
-            and message.content == facts.user_prompt
-        ):
+        if isinstance(message, UserMessage) and message.content == facts.user_prompt:
             return ()
     return (
         UserMessage(
@@ -4819,7 +4628,7 @@ def _memory_evidence_fact_message(
         return None
     lines = [_MEMORY_EVIDENCE_FACT_HEADER]
     for index, fact in enumerate(facts, start=1):
-        lines.append(f"Source F{index}: " f"claim_text={fact.claim_text}")
+        lines.append(f"Source F{index}: claim_text={fact.claim_text}")
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
         content="\n".join(lines),
@@ -4862,11 +4671,7 @@ def _memory_forward_intent_message(
         return None
     lines = [_MEMORY_FORWARD_INTENT_HEADER]
     for intent in intents:
-        lines.append(
-            "forward_intent="
-            f"type={intent.intent_type.value}; "
-            f"status={intent.status.value}; text={intent.text}"
-        )
+        lines.append(f"forward_intent=type={intent.intent_type}; status={intent.status.value}; text={intent.text}")
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -4883,9 +4688,7 @@ def _memory_reference_continuity_message(
         return None
     lines = [_MEMORY_REFERENCE_CONTINUITY_HEADER]
     for item in items:
-        lines.append(
-            f"reference_continuity=reason={item.reason.value}; text={item.text}"
-        )
+        lines.append(f"reference_continuity=reason={item.reason}; text={item.text}")
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -5427,9 +5230,7 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
         )
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
         if block.accepted_tool_evidence is None:
-            raise HostDurableError(
-                "accepted tool evidence LLM material is missing"
-            )
+            raise HostDurableError("accepted tool evidence LLM material is missing")
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
             content=(
@@ -5645,13 +5446,8 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
         if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED
         else None
     )
-    if (
-        accepted_tool_projection is not None
-        and accepted_tool_projection.llm_material is None
-    ):
-        raise HostDurableError(
-            "TOOL_RESULT_ACCEPTED typed LLM material is missing"
-        )
+    if accepted_tool_projection is not None and accepted_tool_projection.llm_material is None:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED typed LLM material is missing")
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
@@ -5666,20 +5462,14 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
         payload_digest=row.payload_digest,
         payload=payload,
         compacted_semantics=(
-            parse_context_compacted_semantic_payload(payload)
-            if row.event_type == CONTEXT_COMPACTED
-            else None
+            parse_context_compacted_semantic_payload(payload) if row.event_type == CONTEXT_COMPACTED else None
         ),
         assistant_final_answer_text=_assistant_final_answer_text(
             transaction,
             row,
             payload,
         ),
-        accepted_tool_evidence=(
-            None
-            if accepted_tool_projection is None
-            else accepted_tool_projection.llm_material
-        ),
+        accepted_tool_evidence=(None if accepted_tool_projection is None else accepted_tool_projection.llm_material),
     )
 
 
@@ -5985,9 +5775,7 @@ def _resume_wait_continuity_from_current_start(
     projection = project_accepted_tool_result(transaction, tool_result_event)
     request_event_ref = projection.tool_call_requested_event_ref
     if request_event_ref is None:
-        raise HostDurableError(
-            "resume wait tool-call requested event ref is missing"
-        )
+        raise HostDurableError("resume wait tool-call requested event ref is missing")
     return project_wait_resume_continuity(
         user_prompt=current_facts.user_prompt,
         accepted_result=projection,
@@ -6057,9 +5845,7 @@ def project_wait_resume_continuity(
             ToolMessage(
                 role=AgentMessageRole.TOOL,
                 tool_call_id=tool_call_id,
-                content=_resume_wait_tool_message_content(
-                    {"raw_tool_outcome": accepted_result.raw_outcome}
-                ),
+                content=_resume_wait_tool_message_content({"raw_tool_outcome": accepted_result.raw_outcome}),
             ),
         ),
         source_refs=source_refs,
@@ -6317,36 +6103,26 @@ def _find_existing_runner_call_manifest_event(
         try:
             hot = parse_runner_call_hot_payload(_payload_object(event))
         except (HostDurableError, TypeError, ValueError) as exc:
-            raise HostDurableError(
-                "runner-call manifest hot payload is invalid"
-            ) from exc
+            raise HostDurableError("runner-call manifest hot payload is invalid") from exc
         if (
             hot.session_id != run.session_id
             or hot.host_run_id != run.run_id
             or hot.attempt_id != event.attempt_id
             or hot.execution_id != event.execution_id
         ):
-            raise HostDurableError(
-                "runner-call manifest EventLog and hot identity mismatch"
-            )
+            raise HostDurableError("runner-call manifest EventLog and hot identity mismatch")
         if hot.runner_call_kind == _RUNNER_CALL_KIND_COMPACTOR_PROPOSAL:
             continue
         if event.attempt_id is None or event.execution_id is None:
-            raise HostDurableError(
-                "runner-call dispatch manifest EventLog identity is incomplete"
-            )
+            raise HostDurableError("runner-call dispatch manifest EventLog identity is incomplete")
         if hot.attempt_id != attempt_id or hot.execution_id != execution_id:
             continue
         if hot.iteration_id is not None or hot.iteration_index is not None:
             continue
         if hot.runner_call_kind not in _PRE_START_RUNNER_CALL_KINDS:
-            raise HostDurableError(
-                "runner-call manifest pre-start kind is unsupported"
-            )
+            raise HostDurableError("runner-call manifest pre-start kind is unsupported")
         if matched is not None:
-            raise HostDurableError(
-                "runner-call manifest identity has duplicate canonical events"
-            )
+            raise HostDurableError("runner-call manifest identity has duplicate canonical events")
         matched = event
     return matched
 
@@ -6421,10 +6197,7 @@ def _prepared_candidate_payload_ref(candidate_digest: str) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    return (
-        f"{_PREPARED_CANDIDATE_PROJECTION_REF_PREFIX}:"
-        f"{candidate_digest.removeprefix('sha256:')}"
-    )
+    return f"{_PREPARED_CANDIDATE_PROJECTION_REF_PREFIX}:{candidate_digest.removeprefix('sha256:')}"
 
 
 def _prepared_candidate_sqlite_payload_id(candidate_digest: str) -> str:
@@ -6435,10 +6208,7 @@ def _prepared_candidate_sqlite_payload_id(candidate_digest: str) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    return (
-        "sqlite-runner-call-prepared-candidate:"
-        f"{candidate_digest.removeprefix('sha256:')}"
-    )
+    return f"sqlite-runner-call-prepared-candidate:{candidate_digest.removeprefix('sha256:')}"
 
 
 def _runner_call_projection_id(event_id: str) -> str:
@@ -6490,17 +6260,12 @@ def _prepared_candidate_projection_body(
         "session_id": session_id,
         "host_run_id": run_id,
         "candidate_input_cursor": candidate_input_cursor,
-        "messages": [
-            _prepared_candidate_message_body(index, message)
-            for index, message in enumerate(messages)
-        ],
+        "messages": [_prepared_candidate_message_body(index, message) for index, message in enumerate(messages)],
         "tool_schemas": [_tool_schema_json(schema) for schema in tool_schemas],
         "disable_tools": disable_tools,
         "tool_execution_mode": tool_execution_mode.value,
         "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
-        "policy_snapshot_digest": _engine_policy_snapshot_digest(
-            policy_snapshot
-        ),
+        "policy_snapshot_digest": _engine_policy_snapshot_digest(policy_snapshot),
         "source_cursor_refs": list(source_cursor_refs),
         "memory_snapshot_cursor_ref": memory_snapshot_cursor_ref,
         "compact_artifact_refs": list(compact_artifact_refs),
@@ -6536,20 +6301,13 @@ def _prepared_candidate_input_snapshot_body(
     """
 
     return {
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
-        "messages": [
-            _prepared_candidate_message_body(index, message)
-            for index, message in enumerate(messages)
-        ],
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
+        "messages": [_prepared_candidate_message_body(index, message) for index, message in enumerate(messages)],
         "tool_schemas": [_tool_schema_json(schema) for schema in tool_schemas],
         "disable_tools": disable_tools,
         "tool_execution_mode": tool_execution_mode.value,
         "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
-        "policy_snapshot_digest": _engine_policy_snapshot_digest(
-            policy_snapshot
-        ),
+        "policy_snapshot_digest": _engine_policy_snapshot_digest(policy_snapshot),
         "request_semantics_digest": request_semantics_digest,
     }
 
@@ -6582,9 +6340,7 @@ def _prepared_candidate_message_body(
                 "id": call.id,
                 "name": call.name,
                 "arguments": dict(call.arguments),
-                "provider_state": _prepared_candidate_provider_state(
-                    call.provider_state
-                ),
+                "provider_state": _prepared_candidate_provider_state(call.provider_state),
             }
             for call in message.tool_calls
         ]
@@ -6626,22 +6382,16 @@ def _engine_policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:
     return sha256_digest_json(
         {
             "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
-            "request_semantics_digest": runner_request_semantics_digest(
-                policy_snapshot
-            ),
+            "request_semantics_digest": runner_request_semantics_digest(policy_snapshot),
             "agent_policy": {
                 "max_iterations": policy.max_iterations,
                 "continuation_max_attempts": policy.continuation_max_attempts,
                 "allow_tool_calls": policy.allow_tool_calls,
-                "tool_execution_timeout_seconds": (
-                    policy.tool_execution_timeout_seconds
-                ),
+                "tool_execution_timeout_seconds": (policy.tool_execution_timeout_seconds),
                 "fallback_mode": policy.fallback_mode.value,
                 "fallback_prompt": policy.fallback_prompt,
                 "continuation_prompt": policy.continuation_prompt,
-                "max_consecutive_failed_tool_batches": (
-                    policy.max_consecutive_failed_tool_batches
-                ),
+                "max_consecutive_failed_tool_batches": (policy.max_consecutive_failed_tool_batches),
             },
         }
     )
@@ -6665,10 +6415,7 @@ def _prepared_candidate_kind_and_trigger(
             _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
             _RUNNER_CALL_TRIGGER_HOST_RESUME,
         )
-    if (
-        candidate.context_fallback_decision_ref is not None
-        or candidate.compact_artifact_refs
-    ):
+    if candidate.context_fallback_decision_ref is not None or candidate.compact_artifact_refs:
         return (
             _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
             _RUNNER_CALL_TRIGGER_CONTEXT_GOVERNANCE_RESOLVED,
@@ -6714,13 +6461,9 @@ def _prepared_runner_call_projection_body(
         "runner_call_trigger_reason": trigger_reason,
         "iteration_id": None,
         "iteration_index": None,
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
         "message_count": len(candidate.messages),
-        "role_sequence_digest": runner_role_sequence_digest(
-            _message_role_values(candidate.messages)
-        ),
+        "role_sequence_digest": runner_role_sequence_digest(_message_role_values(candidate.messages)),
         "messages": [
             _prepared_runner_call_projection_message(
                 candidate,
@@ -6789,18 +6532,14 @@ def _write_prepared_tool_schema_snapshot_payload(
         "execution_id": execution_id,
         "disable_tools": candidate.disable_tools,
         "tool_schema_count": len(candidate.tool_schemas),
-        "tool_schemas": [
-            _tool_schema_json(schema) for schema in candidate.tool_schemas
-        ],
+        "tool_schemas": [_tool_schema_json(schema) for schema in candidate.tool_schemas],
     }
     snapshot_digest = sha256_digest_json(snapshot)
     payload_ref = _selected_tool_schema_payload_ref(event_id)
     existing = payload_store.read_payload_descriptor(transaction, payload_ref)
     if existing is not None:
         if existing.payload_digest != snapshot_digest:
-            raise HostDurableError(
-                "selected tool schema snapshot digest mismatch"
-            )
+            raise HostDurableError("selected tool schema snapshot digest mismatch")
         return existing
     return payload_store.write_sqlite_payload(
         transaction,
@@ -6813,9 +6552,7 @@ def _write_prepared_tool_schema_snapshot_payload(
             metadata=payload_descriptor_metadata(
                 PayloadDescriptorKind.SELECTED_TOOL_SCHEMA_SNAPSHOT,
                 {
-                    "schema_version": (
-                        SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION
-                    ),
+                    "schema_version": (SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION),
                     "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
                     "event_id": event_id,
                 },
@@ -6852,18 +6589,13 @@ def _write_prepared_candidate_payload(
         source_cursor_refs=candidate.source_cursor_refs,
         memory_snapshot_cursor_ref=candidate.memory_snapshot_cursor_ref,
         compact_artifact_refs=candidate.compact_artifact_refs,
-        context_fallback_decision_ref=(
-            candidate.context_fallback_decision_ref
-        ),
+        context_fallback_decision_ref=(candidate.context_fallback_decision_ref),
         request_semantics_digest=candidate.request_semantics_digest,
     )
     digest = sha256_digest_json(body)
     if digest != candidate.candidate_input_projection_digest:
         raise HostDurableError("prepared candidate payload digest mismatch")
-    if (
-        _prepared_candidate_payload_ref(digest)
-        != candidate.candidate_input_projection_ref
-    ):
+    if _prepared_candidate_payload_ref(digest) != candidate.candidate_input_projection_ref:
         raise HostDurableError("prepared candidate payload ref mismatch")
     existing = payload_store.read_payload_descriptor(
         transaction,
@@ -6871,9 +6603,7 @@ def _write_prepared_candidate_payload(
     )
     if existing is not None:
         if existing.payload_digest != digest:
-            raise HostDurableError(
-                "prepared candidate descriptor digest mismatch"
-            )
+            raise HostDurableError("prepared candidate descriptor digest mismatch")
         return existing
     return payload_store.write_sqlite_payload(
         transaction,
@@ -6947,34 +6677,18 @@ def _prepared_runner_call_manifest_body(
         "iteration_id": None,
         "iteration_index": None,
         "message_count": len(candidate.messages),
-        "role_sequence_digest": runner_role_sequence_digest(
-            _message_role_values(candidate.messages)
-        ),
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
-        "input_projection_digest": (
-            candidate.candidate_input_projection_digest
-        ),
-        "runner_call_projection_artifact_ref": (
-            projection_descriptor.payload_ref
-        ),
-        "runner_call_projection_artifact_digest": (
-            projection_descriptor.payload_digest
-        ),
-        "runner_call_projection_artifact_size_bytes": (
-            projection_descriptor.payload_size_bytes
-        ),
+        "role_sequence_digest": runner_role_sequence_digest(_message_role_values(candidate.messages)),
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
+        "input_projection_digest": (candidate.candidate_input_projection_digest),
+        "runner_call_projection_artifact_ref": (projection_descriptor.payload_ref),
+        "runner_call_projection_artifact_digest": (projection_descriptor.payload_digest),
+        "runner_call_projection_artifact_size_bytes": (projection_descriptor.payload_size_bytes),
         "message_entries": list(message_entries),
         "source_cursor_refs": list(candidate.source_cursor_refs),
-        "tool_schema_snapshot_refs": list(
-            _tool_schema_snapshot_refs(tool_schema_descriptor)
-        ),
+        "tool_schema_snapshot_refs": list(_tool_schema_snapshot_refs(tool_schema_descriptor)),
         "memory_snapshot_cursor_ref": candidate.memory_snapshot_cursor_ref,
         "compact_artifact_refs": list(candidate.compact_artifact_refs),
-        "context_fallback_decision_ref": (
-            candidate.context_fallback_decision_ref
-        ),
+        "context_fallback_decision_ref": (candidate.context_fallback_decision_ref),
         "projector_metadata": list(projector_metadata),
         "compactor_identity": None,
         "sizing_snapshot": runner_call_sizing_snapshot_json(sizing_snapshot),
@@ -7012,9 +6726,7 @@ def _prepared_manifest_message_entry(
             message,
         ),
         "provider_tool_calls_digest": _assistant_tool_calls_digest(message),
-        "reasoning_content_digest": _assistant_reasoning_content_digest(
-            message
-        ),
+        "reasoning_content_digest": _assistant_reasoning_content_digest(message),
     }
 
 
@@ -7030,8 +6742,7 @@ def _prepared_projector_metadata(
 
     purpose = (
         _PROJECTOR_PURPOSE_POST_COMPACTION
-        if candidate.compact_artifact_refs
-        or candidate.context_fallback_decision_ref is not None
+        if candidate.compact_artifact_refs or candidate.context_fallback_decision_ref is not None
         else _PROJECTOR_PURPOSE_ORDINARY
     )
     return tuple(
@@ -7451,9 +7162,7 @@ def _runner_call_manifest_hot_payload(
             execution_id=_manifest_optional_text(manifest, "execution_id"),
             runner_call_index=_manifest_int(manifest, "runner_call_index"),
             runner_call_kind=_manifest_text(manifest, "runner_call_kind"),
-            runner_call_trigger_reason=_manifest_text(
-                manifest, "runner_call_trigger_reason"
-            ),
+            runner_call_trigger_reason=_manifest_text(manifest, "runner_call_trigger_reason"),
             iteration_id=_manifest_optional_text(manifest, "iteration_id"),
             iteration_index=None,
             manifest_payload_ref=manifest_payload_ref,
@@ -7462,15 +7171,9 @@ def _runner_call_manifest_hot_payload(
             validation_status=_RUNNER_CALL_VALIDATION_COMPLETE,
             message_count=message_count,
             role_sequence_digest=role_sequence_digest,
-            input_projection_digest=_manifest_text(
-                manifest, "input_projection_digest"
-            ),
-            runner_call_projection_artifact_ref=_manifest_text(
-                manifest, "runner_call_projection_artifact_ref"
-            ),
-            runner_call_projection_artifact_digest=_manifest_text(
-                manifest, "runner_call_projection_artifact_digest"
-            ),
+            input_projection_digest=_manifest_text(manifest, "input_projection_digest"),
+            runner_call_projection_artifact_ref=_manifest_text(manifest, "runner_call_projection_artifact_ref"),
+            runner_call_projection_artifact_digest=_manifest_text(manifest, "runner_call_projection_artifact_digest"),
             runner_call_projection_artifact_size_bytes=_manifest_int(
                 manifest, "runner_call_projection_artifact_size_bytes"
             ),
@@ -7970,10 +7673,7 @@ def _runner_call_kind_and_trigger(
 
     start_payload = _payload_object(record_input.current_facts.run_started_event)
     started_payload = decode_run_started_payload(start_payload)
-    if (
-        started_payload.start_reason is RunStartReason.RECOVERY
-        or record_input.fallback is not None
-    ):
+    if started_payload.start_reason is RunStartReason.RECOVERY or record_input.fallback is not None:
         return (
             _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
             _RUNNER_CALL_TRIGGER_CONTEXT_GOVERNANCE_RESOLVED,

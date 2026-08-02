@@ -21,18 +21,14 @@ from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host._event_payload import tool_awaiting_payload
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
-    CompactQualityCheckResultVNext,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactAnswerAnchorV2,
+    CompactCandidateV2,
+    CompactEvidenceFactV2,
+    CompactForwardIntentV2,
+    CompactForwardIntentStatusV2,
+    CompactReferenceContinuityV2,
+    CompactSessionSummaryV2,
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
@@ -40,6 +36,7 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_FAILED,
     build_context_compacted_payload,
 )
+from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.durable import memory as durable_memory_module
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.connection import HostDurableStore
@@ -123,9 +120,7 @@ _OCCURRED_AT = datetime(2026, 5, 16, tzinfo=UTC)
 _REQUEST_PAYLOAD_KIND_VALID = "valid"
 _REQUEST_PAYLOAD_KIND_INVALID = "invalid"
 _FAIL_SAFE_QUERY_TEXT = "这个 request query 不应进入 memory"
-_COMPACT_ARTIFACT_DIGEST = (
-    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-)
+_COMPACT_ARTIFACT_DIGEST = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 
 def _successful_response_identity(
@@ -184,6 +179,8 @@ def _proposal_manifest_reference(
         compaction_attempt_number=attempt_number,
         compactor_engine_run_id=compactor_engine_run_id,
     )
+
+
 _TOOL_AWAITING_GOVERNANCE_KEYS = frozenset(
     (
         "session_id",
@@ -207,46 +204,46 @@ _TOOL_AWAITING_GOVERNANCE_KEYS = frozenset(
 
 _REQUIRED_MEMORY_POLICY_FIELD_NAMES = frozenset(
     (
-    "context_window_size",
-    "selected_recent_window_item_cap",
-    "selected_recent_window_char_cap",
-    "selected_recent_window_turn_floor",
-    "fallback_selected_recent_window_item_cap",
-    "fallback_selected_recent_window_char_cap",
-    "evidence_fact_item_cap",
-    "evidence_fact_char_cap",
-    "evidence_fact_floor",
-    "session_summary_char_cap",
-    "answer_anchor_item_cap",
-    "answer_anchor_char_cap",
-    "forward_intent_item_cap",
-    "forward_intent_char_cap",
-    "reference_continuity_item_cap",
-    "reference_continuity_char_cap",
-    "reference_continuity_item_floor",
-    "max_lag_events_for_inline_delta",
-    "max_delta_repair_events",
-    "policy_ref",
-)
+        "context_window_size",
+        "selected_recent_window_item_cap",
+        "selected_recent_window_char_cap",
+        "selected_recent_window_turn_floor",
+        "fallback_selected_recent_window_item_cap",
+        "fallback_selected_recent_window_char_cap",
+        "evidence_fact_item_cap",
+        "evidence_fact_char_cap",
+        "evidence_fact_floor",
+        "session_summary_char_cap",
+        "answer_anchor_item_cap",
+        "answer_anchor_char_cap",
+        "forward_intent_item_cap",
+        "forward_intent_char_cap",
+        "reference_continuity_item_cap",
+        "reference_continuity_char_cap",
+        "reference_continuity_item_floor",
+        "max_lag_events_for_inline_delta",
+        "max_delta_repair_events",
+        "policy_ref",
+    )
 )
 
 _REQUIRED_MEMORY_SNAPSHOT_FIELD_NAMES = frozenset(
     (
-    "schema_version",
-    "snapshot_id",
-    "session_id",
-    "cursor",
-    "policy_digest",
-    "latest_compaction_event_ref",
-    "trace_memory",
-    "evidence_fact_memory",
-    "session_summary_memory",
-    "answer_anchor_memory",
-    "forward_intent_memory",
-    "diagnostics",
-    "built_at",
-    "snapshot_digest",
-)
+        "schema_version",
+        "snapshot_id",
+        "session_id",
+        "cursor",
+        "policy_digest",
+        "latest_compaction_event_ref",
+        "trace_memory",
+        "evidence_fact_memory",
+        "session_summary_memory",
+        "answer_anchor_memory",
+        "forward_intent_memory",
+        "diagnostics",
+        "built_at",
+        "snapshot_digest",
+    )
 )
 
 
@@ -358,9 +355,7 @@ def _event(
         payload_digest=None,
         payload=payload,
         compacted_semantics=(
-            parse_context_compacted_semantic_payload(payload)
-            if event_type == CONTEXT_COMPACTED
-            else None
+            parse_context_compacted_semantic_payload(payload) if event_type == CONTEXT_COMPACTED else None
         ),
         assistant_final_answer_text=assistant_final_answer_text,
         accepted_tool_evidence=accepted_tool_evidence,
@@ -419,9 +414,7 @@ def _tool_awaiting_governance_payload(
         snapshot_ref=None,
         external_job_ref=None,
         accept_idempotency_key="accept-awaiting-memory",
-        semantic_input_digest=sha256_digest_json(
-            {"semantic_input": "awaiting-memory"}
-        ),
+        semantic_input_digest=sha256_digest_json({"semantic_input": "awaiting-memory"}),
     )
     assert isinstance(payload, Mapping)
     assert set(payload) == _TOOL_AWAITING_GOVERNANCE_KEYS
@@ -440,20 +433,14 @@ def _llm_facing_memory_text_view(
     :returns: selected recent window 与 recent evidence 的 role/text 视图。
     """
 
-    selected = tuple(
-        (item.role, item.text)
-        for item in snapshot.trace_memory.selected_recent_window
-    )
-    recent_evidence = tuple(
-        (item.role, item.text)
-        for item in snapshot.evidence_fact_memory.recent_evidence_items
-    )
+    selected = tuple((item.role, item.text) for item in snapshot.trace_memory.selected_recent_window)
+    recent_evidence = tuple((item.role, item.text) for item in snapshot.evidence_fact_memory.recent_evidence_items)
     return selected, recent_evidence
 
 
 def _accepted_compact_payload(
     *,
-    facts: list[EvidenceBackedFactCandidateVNext] | None = None,
+    facts: list[CompactEvidenceFactV2] | None = None,
     summary_text: str | None = "用户关注收入增速和毛利率变化。",
     source_boundary_refs: tuple[str, ...] = ("event:user-1",),
 ) -> dict[str, JsonValue]:
@@ -465,49 +452,51 @@ def _accepted_compact_payload(
     :returns: CONTEXT_COMPACTED payload。
     """
 
-    candidate = ConversationCompactOutputVNext(
-        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    candidate = CompactCandidateV2(
+        schema=COMPACT_OUTPUT_SCHEMA_V2,
         session_summary=(
             None
             if summary_text is None
-            else SessionSummaryCandidateVNext(
-                summary_text=summary_text,
+            else CompactSessionSummaryV2(
+                text=summary_text,
                 source_labels=("u1",),
             )
         ),
-        evidence_backed_facts=() if facts is None else tuple(facts),
+        evidence_facts=() if facts is None else tuple(facts),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="收入口径",
-                anchor_items=(
-                    AnswerAnchorChildVNext(
-                        display_text="同比收入增速来自已接受证据。",
-                        ordinal=1,
-                    ),
-                    AnswerAnchorChildVNext(
-                        display_text="毛利率口径保持一致。",
-                        ordinal=2,
-                    ),
-                ),
-                answer_source_labels=("e1",),
+            CompactAnswerAnchorV2(
+                title="收入口径",
+                detail="同比收入增速来自已接受证据。\n毛利率口径保持一致。",
+                source_labels=("a1",),
             ),
         ),
         forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+            CompactForwardIntentV2(
+                intent_type="next_step_note",
                 text="下一轮继续核对费用率。",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV2.OPEN,
                 source_labels=("u1",),
             ),
         ),
-        reference_continuity_items=(
-            ReferenceContinuityCandidateVNext(
+        reference_continuity=(
+            CompactReferenceContinuityV2(
                 text="“该公司”继续指向当前分析主体。",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
                 source_labels=("u1",),
             ),
         ),
         diagnostics=(),
+        explicitly_dropped_sources=(),
+    )
+    additional_refs = source_boundary_refs[1:]
+    accepted_truth = accepted_truth_for_candidate(
+        candidate,
+        current_input_ref=source_boundary_refs[0],
+        source_refs_by_label={
+            "u1": additional_refs or ("source:u1",),
+            "e1": ("event:tool-1",),
+            "a1": ("source:a1",),
+        },
     )
     return dict(
         build_context_compacted_payload(
@@ -515,15 +504,10 @@ def _accepted_compact_payload(
             accepted_attempt_number=1,
             compact_artifact_ref="artifact:compact-1",
             compact_artifact_digest=_COMPACT_ARTIFACT_DIGEST,
-            accepted_candidate=candidate,
-            quality_check_result=CompactQualityCheckResultVNext(
-                accepted=True,
-                rejection_reasons=(),
-            ),
+            accepted_truth=accepted_truth,
             budget_after_compact=512,
             prompt_local_label_mapping_refs=("prompt-label:u1", "prompt-label:e1"),
-            source_boundary_refs=source_boundary_refs,
-            accepted_evidence_mapping_refs=("event:tool-1",),
+            accepted_evidence_mapping_refs=(() if facts is None else ("event:tool-1",)),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(
                 operation_id="event-context-compaction-requested-1",
@@ -566,17 +550,13 @@ def _tool_call_requested_payload(
         "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
         "arguments_inline_json": arguments_json,
         "arguments_payload_ref": None,
-        "arguments_json_size_bytes": len(
-            canonical_json_dumps(arguments_json).encode("utf-8")
-        ),
+        "arguments_json_size_bytes": len(canonical_json_dumps(arguments_json).encode("utf-8")),
         "semantic_input_digest": semantic_input_digest,
     }
     if semantic_query_text is None:
         payload.update(
             {
-                "semantic_query_storage_kind": (
-                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT
-                ),
+                "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT),
                 "semantic_query_text": None,
                 "semantic_query_payload_ref": None,
                 "semantic_query_digest": None,
@@ -588,9 +568,7 @@ def _tool_call_requested_payload(
             "semantic_query_storage_kind": TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
             "semantic_query_text": semantic_query_text,
             "semantic_query_payload_ref": None,
-            "semantic_query_digest": sha256_digest_json(
-                {"semantic_query_text": semantic_query_text}
-            ),
+            "semantic_query_digest": sha256_digest_json({"semantic_query_text": semantic_query_text}),
         }
     )
     return payload
@@ -639,9 +617,7 @@ def _accepted_tool_result_payload(
         locator_refs=(),
     )
     return {
-        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-            envelope
-        ),
+        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(envelope),
         "raw_tool_outcome": raw_tool_outcome,
     }
 
@@ -831,9 +807,7 @@ def _assert_tool_query_projection_fails_closed(
     arguments_digest = sha256_digest_json(arguments_json)
     semantic_input_digest = sha256_digest_json({"semantic_input": "COIN"})
     envelope_arguments_digest = (
-        arguments_digest
-        if case.envelope_arguments_digest is None
-        else case.envelope_arguments_digest
+        arguments_digest if case.envelope_arguments_digest is None else case.envelope_arguments_digest
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
@@ -868,17 +842,16 @@ def _assert_tool_query_projection_fails_closed(
         )
 
 
-def _fact(claim_text: str) -> EvidenceBackedFactCandidateVNext:
+def _fact(claim_text: str) -> CompactEvidenceFactV2:
     """构造 fact candidate。
 
     :param claim_text: fact claim 文本。
     :returns: typed fact candidate。
     """
 
-    return EvidenceBackedFactCandidateVNext(
-        claim_text=claim_text,
-        evidence_labels=("e1",),
-        source_labels=("e1",),
+    return CompactEvidenceFactV2(
+        claim=claim_text,
+        support_labels=("e1",),
     )
 
 
@@ -889,9 +862,7 @@ def _memory_item_count(transaction: HostTransaction) -> int:
     :returns: memory item row 数。
     """
 
-    row = transaction.fetchone(
-        f"SELECT COUNT(*) AS count FROM {TABLE_HOST_MEMORY_ITEMS}"
-    )
+    row = transaction.fetchone(f"SELECT COUNT(*) AS count FROM {TABLE_HOST_MEMORY_ITEMS}")
     assert row is not None
     count = row.get("count")
     assert isinstance(count, int)
@@ -911,12 +882,8 @@ def test_memory_projection_policy_contract_uses_owner_level_fields() -> None:
 
     changed_window_policy = replace(policy, context_window_size=16384)
     changed_ref_policy = replace(policy, policy_ref=f"{policy.policy_ref}:changed")
-    assert digest_memory_projection_policy(policy) != digest_memory_projection_policy(
-        changed_window_policy
-    )
-    assert digest_memory_projection_policy(policy) != digest_memory_projection_policy(
-        changed_ref_policy
-    )
+    assert digest_memory_projection_policy(policy) != digest_memory_projection_policy(changed_window_policy)
+    assert digest_memory_projection_policy(policy) != digest_memory_projection_policy(changed_ref_policy)
 
 
 def test_conversation_memory_snapshot_vnext_contract_uses_owner_level_sections() -> None:
@@ -974,9 +941,7 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
                 "tool-1",
                 "TOOL_RESULT_ACCEPTED",
                 {"display_text": "10-K revenue table"},
-                accepted_tool_evidence=_memory_tool_material(
-                    canonical_json_dumps({"table": "10-K revenue"})
-                ),
+                accepted_tool_evidence=_memory_tool_material(canonical_json_dumps({"table": "10-K revenue"})),
             ),
         ),
         session_id=_SESSION_ID,
@@ -985,9 +950,7 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
         built_at=_NOW,
     )
 
-    assert tuple(
-        item.role for item in snapshot.trace_memory.selected_recent_window
-    ) == (
+    assert tuple(item.role for item in snapshot.trace_memory.selected_recent_window) == (
         SelectedRecentWindowRole.USER,
         SelectedRecentWindowRole.ASSISTANT,
         SelectedRecentWindowRole.EVIDENCE,
@@ -1027,9 +990,7 @@ def test_tool_awaiting_does_not_project_llm_facing_memory() -> None:
     evidence = snapshot.evidence_fact_memory.recent_evidence_items
     assert tuple(item.role for item in selected) == (SelectedRecentWindowRole.USER,)
     assert evidence == ()
-    memory_text = "\n".join(
-        item.text for item in snapshot.trace_memory.selected_recent_window
-    )
+    memory_text = "\n".join(item.text for item in snapshot.trace_memory.selected_recent_window)
     forbidden_fragments = (
         "等待",
         "awaiting",
@@ -1058,9 +1019,7 @@ def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() ->
             "tool-result-1",
             "TOOL_RESULT_ACCEPTED",
             {"display_text": "下载工具返回：已保存 Circle 2024 10-K。"},
-            accepted_tool_evidence=_memory_tool_material(
-                canonical_json_dumps({"saved": "Circle 2024 10-K"})
-            ),
+            accepted_tool_evidence=_memory_tool_material(canonical_json_dumps({"saved": "Circle 2024 10-K"})),
         ),
         _event(
             5,
@@ -1100,10 +1059,7 @@ def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() ->
         built_at=_NOW,
     )
 
-    assert (
-        _llm_facing_memory_text_view(with_awaiting_snapshot)
-        == _llm_facing_memory_text_view(ordinary_snapshot)
-    )
+    assert _llm_facing_memory_text_view(with_awaiting_snapshot) == _llm_facing_memory_text_view(ordinary_snapshot)
     selected_view, evidence_view = _llm_facing_memory_text_view(with_awaiting_snapshot)
     memory_text = "\n".join(text for _, text in selected_view + evidence_view)
     assert "TOOL_AWAITING" not in memory_text
@@ -1174,9 +1130,7 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "TOOL_RESULT_ACCEPTED",
                 {"display_text": "mid evidence"},
                 run_id="run-mid",
-                accepted_tool_evidence=_memory_tool_material(
-                    canonical_json_dumps({"evidence": "mid"})
-                ),
+                accepted_tool_evidence=_memory_tool_material(canonical_json_dumps({"evidence": "mid"})),
             ),
             _event(
                 6,
@@ -1199,9 +1153,7 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "TOOL_RESULT_ACCEPTED",
                 {"display_text": "new evidence"},
                 run_id="run-new",
-                accepted_tool_evidence=_memory_tool_material(
-                    canonical_json_dumps({"evidence": "new"})
-                ),
+                accepted_tool_evidence=_memory_tool_material(canonical_json_dumps({"evidence": "new"})),
             ),
         ),
         session_id=_SESSION_ID,
@@ -1267,9 +1219,7 @@ def test_selected_recent_window_floor_skips_missing_run_id_group() -> None:
         built_at=_NOW,
     )
 
-    assert tuple(item.text for item in snapshot.trace_memory.selected_recent_window) == (
-        "with run",
-    )
+    assert tuple(item.text for item in snapshot.trace_memory.selected_recent_window) == ("with run",)
 
 
 def test_accepted_compact_materializes_vnext_memory_sections() -> None:
@@ -1294,29 +1244,15 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
 
     assert snapshot.latest_compaction_event_ref == "compact-1"
     assert snapshot.session_summary_memory.summary_text == "用户关注收入增速和毛利率变化。"
-    assert snapshot.evidence_fact_memory.evidence_backed_facts[0].claim_text == (
-        "收入同比增长 12%。"
-    )
+    assert snapshot.evidence_fact_memory.evidence_backed_facts[0].claim_text == ("收入同比增长 12%。")
     assert snapshot.answer_anchor_memory.anchors[0].anchor_title == "收入口径"
     assert tuple(
-        (child.display_text, child.ordinal)
-        for child in snapshot.answer_anchor_memory.anchors[0].anchor_items
-    ) == (
-        ("同比收入增速来自已接受证据。", 1),
-        ("毛利率口径保持一致。", 2),
-    )
-    assert (
-        snapshot.forward_intent_memory.intents[0].intent_type
-        is ForwardIntentTypeVNext.NEXT_STEP_NOTE
-    )
-    assert (
-        snapshot.forward_intent_memory.intents[0].status
-        is ForwardIntentStatusVNext.OPEN
-    )
+        (child.display_text, child.ordinal) for child in snapshot.answer_anchor_memory.anchors[0].anchor_items
+    ) == (("同比收入增速来自已接受证据。\n毛利率口径保持一致。", None),)
+    assert snapshot.forward_intent_memory.intents[0].intent_type == "next_step_note"
+    assert snapshot.forward_intent_memory.intents[0].status is CompactForwardIntentStatusV2.OPEN
     assert snapshot.forward_intent_memory.intents[0].text == "下一轮继续核对费用率。"
-    assert snapshot.trace_memory.reference_continuity_items[0].reason is (
-        ReferenceContinuityReasonVNext.LOCAL_REFERENCE
-    )
+    assert snapshot.trace_memory.reference_continuity_items[0].reason == "local_reference"
 
 
 def test_accepted_compact_prunes_covered_tool_raw_and_keeps_uncovered_and_new_delta() -> None:
@@ -1359,9 +1295,7 @@ def test_accepted_compact_prunes_covered_tool_raw_and_keeps_uncovered_and_new_de
             "TOOL_RESULT_ACCEPTED",
             {},
             run_id="run-protected",
-            accepted_tool_evidence=_memory_tool_material(
-                "uncovered protected evidence"
-            ),
+            accepted_tool_evidence=_memory_tool_material("uncovered protected evidence"),
         ),
         _event(
             6,
@@ -1412,9 +1346,7 @@ def test_accepted_compact_prunes_covered_tool_raw_and_keeps_uncovered_and_new_de
 
     assert incremental is not None
     assert incremental == rebuilt
-    assert conversation_memory_snapshot_from_json_value(
-        conversation_memory_snapshot_to_json_value(rebuilt)
-    ) == rebuilt
+    assert conversation_memory_snapshot_from_json_value(conversation_memory_snapshot_to_json_value(rebuilt)) == rebuilt
     selected = rebuilt.trace_memory.selected_recent_window
     selected_ids = tuple(item.event_id for item in selected)
     assert selected_ids == (
@@ -1426,14 +1358,10 @@ def test_accepted_compact_prunes_covered_tool_raw_and_keeps_uncovered_and_new_de
     assert "event-old-evidence" not in selected_ids
     assert "event-protected-evidence" in selected_ids
     assert "event-new-delta" in selected_ids
-    assert sum(
-        item.event_id == "event-current-input"
-        for item in selected
-    ) == 1
-    assert tuple(
-        item.event_id
-        for item in rebuilt.evidence_fact_memory.recent_evidence_items
-    ) == ("event-protected-evidence",)
+    assert sum(item.event_id == "event-current-input" for item in selected) == 1
+    assert tuple(item.event_id for item in rebuilt.evidence_fact_memory.recent_evidence_items) == (
+        "event-protected-evidence",
+    )
 
 
 def test_accepted_compact_without_covered_refs_preserves_recent_window() -> None:
@@ -1458,9 +1386,7 @@ def test_accepted_compact_without_covered_refs_preserves_recent_window() -> None
             3,
             "event-compact-current-only",
             CONTEXT_COMPACTED,
-            _accepted_compact_payload(
-                source_boundary_refs=("event-current",)
-            ),
+            _accepted_compact_payload(source_boundary_refs=("event-current",)),
             run_id="run-current",
         ),
     )
@@ -1473,16 +1399,17 @@ def test_accepted_compact_without_covered_refs_preserves_recent_window() -> None
         built_at=_NOW,
     )
 
-    assert tuple(
-        item.event_id for item in snapshot.trace_memory.selected_recent_window
-    ) == ("event-protected", "event-current")
+    assert tuple(item.event_id for item in snapshot.trace_memory.selected_recent_window) == (
+        "event-protected",
+        "event-current",
+    )
 
 
-def test_accepted_compact_without_summary_preserves_prior_session_summary() -> None:
-    """compact owner 未提供 summary replacement 时保留既有 session summary。
+def test_accepted_compact_without_summary_clears_prior_session_summary() -> None:
+    """accepted candidate 是完整替换，缺席 summary 必须清除旧值。
 
     :returns: ``None``。
-    :raises AssertionError: facts-only compact 清空既有 session summary 时抛出。
+    :raises AssertionError: facts-only compact 残留旧 summary 时抛出。
     """
 
     policy = _policy()
@@ -1511,8 +1438,8 @@ def test_accepted_compact_without_summary_preserves_prior_session_summary() -> N
     )
 
     assert snapshot.latest_compaction_event_ref == "compact-facts-only"
-    assert snapshot.session_summary_memory.summary_text == "上一轮已接受 summary。"
-    assert snapshot.session_summary_memory.event_id == "compact-prior-summary"
+    assert snapshot.session_summary_memory.summary_text is None
+    assert snapshot.session_summary_memory.event_id is None
     assert snapshot.evidence_fact_memory.evidence_backed_facts[-1].claim_text == (
         "facts-only compact 仍保留旧 summary。"
     )
@@ -1806,12 +1733,8 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
         ),
         result_ref=AcceptedEvidenceResultRef(
             payload_ref="payload-tool-result-raw-memory",
-            payload_digest=sha256_digest_json(
-                {"status": "ok", "text": "tool fact accepted"}
-            ),
-            outcome_digest=sha256_digest_json(
-                {"status": "ok", "text": "tool fact accepted"}
-            ),
+            payload_digest=sha256_digest_json({"status": "ok", "text": "tool fact accepted"}),
+            outcome_digest=sha256_digest_json({"status": "ok", "text": "tool fact accepted"}),
             truncation_applied=False,
         ),
         locator_refs=(),
@@ -1824,9 +1747,7 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
                 event_id,
                 "TOOL_RESULT_ACCEPTED",
                 {
-                    "accepted_evidence_envelope": (
-                        accepted_evidence_envelope_to_json_value(envelope)
-                    ),
+                    "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                     "display_text": "preview display must not enter memory",
                     "content": "preview content must not enter memory",
                     "raw_tool_outcome": {
@@ -1838,9 +1759,7 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
                     tool_name="lookup_mock_fact",
                     query_text="查询 DAYU 的业务事实",
                     source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
-                    result_text=canonical_json_dumps(
-                        {"status": "ok", "text": "tool fact accepted"}
-                    ),
+                    result_text=canonical_json_dumps({"status": "ok", "text": "tool fact accepted"}),
                 ),
             ),
         ),
@@ -1897,18 +1816,14 @@ def test_accepted_tool_evidence_disambiguates_raw_result_with_request_query() ->
                 event_id,
                 "TOOL_RESULT_ACCEPTED",
                 {
-                    "accepted_evidence_envelope": (
-                        accepted_evidence_envelope_to_json_value(envelope)
-                    ),
+                    "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                     "raw_tool_outcome": {"total": 0, "documents": []},
                 },
                 accepted_tool_evidence=AcceptedToolEvidenceLLMMaterial(
                     tool_name="list_documents",
                     query_text="读取 ticker=COIN 的财报列表",
                     source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
-                    result_text=canonical_json_dumps(
-                        {"total": 0, "documents": []}
-                    ),
+                    result_text=canonical_json_dumps({"total": 0, "documents": []}),
                 ),
             ),
         ),
@@ -1962,9 +1877,7 @@ def test_accepted_tool_evidence_missing_projection_fields_fail_closed() -> None:
         result_ref=AcceptedEvidenceResultRef(
             payload_ref=None,
             payload_digest=None,
-            outcome_digest=sha256_digest_json(
-                {"status": "ok", "text": "tool fact accepted"}
-            ),
+            outcome_digest=sha256_digest_json({"status": "ok", "text": "tool fact accepted"}),
             truncation_applied=False,
         ),
         locator_refs=(),
@@ -1982,9 +1895,7 @@ def test_accepted_tool_evidence_missing_projection_fields_fail_closed() -> None:
                     event_id,
                     "TOOL_RESULT_ACCEPTED",
                     {
-                        "accepted_evidence_envelope": (
-                            accepted_evidence_envelope_to_json_value(envelope)
-                        ),
+                        "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                         "raw_tool_outcome": {
                             "status": "ok",
                             "text": "tool fact accepted",
@@ -2058,97 +1969,79 @@ def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild()
         assert forbidden not in projected_text
 
 
-def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:
-    """Evidence facts 超过 section item cap 时整体丢弃并记录 budget diagnostic。"""
+def test_committed_compact_over_item_cap_fails_projection_invariant() -> None:
+    """committed truth 超过共享 item cap 时 fail closed，不下游截断。"""
 
     policy = replace(_policy(), evidence_fact_item_cap=1, evidence_fact_floor=0)
-    snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                "compact-1",
-                CONTEXT_COMPACTED,
-                _accepted_compact_payload(
-                    facts=[
-                        _fact("旧 fact 应被截断。"),
-                        _fact("新 fact 应被保留。"),
-                    ],
+    with pytest.raises(ValueError, match="committed evidence_facts exceeds"):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    "compact-1",
+                    CONTEXT_COMPACTED,
+                    _accepted_compact_payload(
+                        facts=[
+                            _fact("旧 fact 不得被截断。"),
+                            _fact("新 fact 不得被偏爱。"),
+                        ],
+                    ),
                 ),
             ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=policy,
-        built_at=_NOW,
-    )
-
-    assert tuple(
-        fact.claim_text
-        for fact in snapshot.evidence_fact_memory.evidence_backed_facts
-    ) == ("新 fact 应被保留。",)
-    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
-        diagnostic.reason for diagnostic in snapshot.diagnostics
-    )
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at=_NOW,
+        )
 
 
-def test_accepted_compact_drops_oversized_fact_without_prefix_text() -> None:
-    """超出 fact char cap 的 compact fact 整体丢弃，不返回前缀文本。"""
+def test_committed_compact_oversized_fact_fails_projection_invariant() -> None:
+    """超出 fact size cap 的 committed truth fail closed，不丢弃或截断。"""
 
     policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
     long_claim = "这是一条超过上限且不能被前缀截断的完整事实。"
-    snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                "compact-oversized-fact",
-                CONTEXT_COMPACTED,
-                _accepted_compact_payload(facts=[_fact(long_claim)]),
+    with pytest.raises(ValueError, match="committed evidence_facts exceeds"):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    "compact-oversized-fact",
+                    CONTEXT_COMPACTED,
+                    _accepted_compact_payload(facts=[_fact(long_claim)]),
+                ),
             ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=policy,
-        built_at=_NOW,
-    )
-
-    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
-    assert long_claim[: policy.evidence_fact_char_cap] not in tuple(
-        fact.claim_text for fact in snapshot.evidence_fact_memory.evidence_backed_facts
-    )
-    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
-        diagnostic.reason for diagnostic in snapshot.diagnostics
-    )
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at=_NOW,
+        )
 
 
-def test_accepted_compact_drops_oversized_summary_without_prefix_text() -> None:
-    """超出 summary char cap 的 compact summary 整体丢弃，不返回前缀文本。"""
+def test_committed_compact_oversized_summary_fails_projection_invariant() -> None:
+    """超出 summary size cap 的 committed truth fail closed，不下游截断。"""
 
     policy = replace(_policy(), session_summary_char_cap=8)
     long_summary = "用户需要完整保留的长 summary，不能静默截断。"
     payload = _accepted_compact_payload(summary_text=long_summary)
-    snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                "compact-oversized-summary",
-                CONTEXT_COMPACTED,
-                payload,
+    with pytest.raises(ValueError, match="committed session summary exceeds"):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    "compact-oversized-summary",
+                    CONTEXT_COMPACTED,
+                    payload,
+                ),
             ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=policy,
-        built_at=_NOW,
-    )
-
-    assert snapshot.session_summary_memory.summary_text is None
-    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
-        diagnostic.reason for diagnostic in snapshot.diagnostics
-    )
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at=_NOW,
+        )
 
 
-def test_accepted_evidence_without_fact_candidate_records_diagnostic_only() -> None:
-    """accepted evidence 存在但无 fact candidate 时不合成 fallback fact。"""
+def test_accepted_candidate_without_fact_keeps_fact_projection_empty() -> None:
+    """accepted candidate 无 fact 时保持空投影，不合成 fallback 或诊断。"""
 
     policy = _policy()
     snapshot = project_conversation_memory_event(
@@ -2160,9 +2053,7 @@ def test_accepted_evidence_without_fact_candidate_records_diagnostic_only() -> N
     )
 
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
-    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
-        MemoryDiagnosticReason.ACCEPTED_EVIDENCE_WITHOUT_FACT_CANDIDATE,
-    )
+    assert snapshot.diagnostics == ()
 
 
 def test_failed_compaction_event_does_not_materialize_memory_sections() -> None:
@@ -2214,30 +2105,13 @@ def test_snapshot_json_roundtrip_preserves_vnext_sections() -> None:
     trace_memory = cast(dict[str, JsonValue], mapping["trace_memory"])
     references = cast(list[JsonValue], trace_memory["reference_continuity_items"])
     reference = cast(dict[str, JsonValue], references[0])
-    assert intent["intent_type"] == ForwardIntentTypeVNext.NEXT_STEP_NOTE.value
-    assert intent["status"] == ForwardIntentStatusVNext.OPEN.value
-    assert reference["reason"] == ReferenceContinuityReasonVNext.LOCAL_REFERENCE.value
+    assert intent["intent_type"] == "next_step_note"
+    assert intent["status"] == CompactForwardIntentStatusV2.OPEN.value
+    assert reference["reason"] == "local_reference"
 
 
-@pytest.mark.parametrize(
-    ("section", "field_name", "invalid_value"),
-    (
-        ("forward_intent_memory", "intent_type", "unknown_intent"),
-        ("forward_intent_memory", "status", "unknown_status"),
-        ("trace_memory", "reason", "unknown_reason"),
-    ),
-)
-def test_snapshot_json_rejects_invalid_compact_enum(
-    section: str,
-    field_name: str,
-    invalid_value: str,
-) -> None:
-    """snapshot codec 严格恢复 compact enum，不写 unknown fallback。
-
-    :param section: 被破坏的 snapshot section。
-    :param field_name: 被破坏的 enum 字段。
-    :param invalid_value: 非法 enum value。
-    """
+def test_snapshot_json_rejects_invalid_forward_intent_status() -> None:
+    """snapshot codec 严格恢复 status 闭集，不写 unknown fallback。"""
 
     snapshot = project_conversation_memory_event(
         previous_snapshot=None,
@@ -2255,13 +2129,10 @@ def test_snapshot_json_rejects_invalid_compact_enum(
         dict[str, JsonValue],
         conversation_memory_snapshot_to_json_value(snapshot),
     )
-    section_mapping = cast(dict[str, JsonValue], mapping[section])
-    items_field = (
-        "reference_continuity_items" if section == "trace_memory" else "intents"
-    )
-    items = cast(list[JsonValue], section_mapping[items_field])
+    section_mapping = cast(dict[str, JsonValue], mapping["forward_intent_memory"])
+    items = cast(list[JsonValue], section_mapping["intents"])
     item = cast(dict[str, JsonValue], items[0])
-    item[field_name] = invalid_value
+    item["status"] = "unknown_status"
 
     with pytest.raises(ValueError):
         conversation_memory_snapshot_from_json_value(mapping)
@@ -2310,28 +2181,30 @@ def test_write_snapshot_with_checkpoint_commits_snapshot_before_checkpoint(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
-            lambda transaction: append_event(
-                transaction,
-                EventLogAppendRequest(
-                    event_id="compact-1",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=_SESSION_ID,
-                    run_id=_RUN_ID,
-                    attempt_id=_ATTEMPT_ID,
-                    execution_id=_EXECUTION_ID,
-                    event_type=CONTEXT_COMPACTED,
-                    occurred_at=_OCCURRED_AT,
-                    actor="pytest",
-                    source="pytest",
-                    client_request_id=None,
-                    idempotency_key=None,
-                    policy_decision=None,
-                    reason=None,
-                    payload_json=_accepted_compact_payload(facts=[_fact("收入增长。")]),
-                    payload_ref=None,
-                    payload_digest=None,
-                ),
-            ).row
+            lambda transaction: (
+                append_event(
+                    transaction,
+                    EventLogAppendRequest(
+                        event_id="compact-1",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=_SESSION_ID,
+                        run_id=_RUN_ID,
+                        attempt_id=_ATTEMPT_ID,
+                        execution_id=_EXECUTION_ID,
+                        event_type=CONTEXT_COMPACTED,
+                        occurred_at=_OCCURRED_AT,
+                        actor="pytest",
+                        source="pytest",
+                        client_request_id=None,
+                        idempotency_key=None,
+                        policy_decision=None,
+                        reason=None,
+                        payload_json=_accepted_compact_payload(facts=[_fact("收入增长。")]),
+                        payload_ref=None,
+                        payload_digest=None,
+                    ),
+                ).row
+            )
         )
         written = store.transaction_runner.run_write(
             lambda transaction: write_memory_snapshot_with_checkpoint(
@@ -2353,10 +2226,7 @@ def test_write_snapshot_with_checkpoint_commits_snapshot_before_checkpoint(
         assert read_back is not None
         assert written.snapshot.snapshot_id == read_back.snapshot.snapshot_id
         assert checkpoint is not None
-        assert (
-            checkpoint.checkpoint_event_sequence
-            == snapshot.cursor.checkpoint_event_sequence
-        )
+        assert checkpoint.checkpoint_event_sequence == snapshot.cursor.checkpoint_event_sequence
         assert checkpoint.checkpoint_event_id == snapshot.cursor.checkpoint_event_id
 
 
@@ -2368,28 +2238,30 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
-            lambda transaction: append_event(
-                transaction,
-                EventLogAppendRequest(
-                    event_id="compact-1",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=_SESSION_ID,
-                    run_id=_RUN_ID,
-                    attempt_id=_ATTEMPT_ID,
-                    execution_id=_EXECUTION_ID,
-                    event_type=CONTEXT_COMPACTED,
-                    occurred_at=_OCCURRED_AT,
-                    actor="pytest",
-                    source="pytest",
-                    client_request_id=None,
-                    idempotency_key=None,
-                    policy_decision=None,
-                    reason=None,
-                    payload_json=_accepted_compact_payload(facts=[_fact("收入增长。")]),
-                    payload_ref=None,
-                    payload_digest=None,
-                ),
-            ).row
+            lambda transaction: (
+                append_event(
+                    transaction,
+                    EventLogAppendRequest(
+                        event_id="compact-1",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=_SESSION_ID,
+                        run_id=_RUN_ID,
+                        attempt_id=_ATTEMPT_ID,
+                        execution_id=_EXECUTION_ID,
+                        event_type=CONTEXT_COMPACTED,
+                        occurred_at=_OCCURRED_AT,
+                        actor="pytest",
+                        source="pytest",
+                        client_request_id=None,
+                        idempotency_key=None,
+                        policy_decision=None,
+                        reason=None,
+                        payload_json=_accepted_compact_payload(facts=[_fact("收入增长。")]),
+                        payload_ref=None,
+                        payload_digest=None,
+                    ),
+                ).row
+            )
         )
         consumer = ConversationMemoryProjectionConsumer(policy)
         ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -2429,29 +2301,15 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
 
         assert latest is not None
         assert latest.snapshot.latest_compaction_event_ref == "compact-1"
-        assert latest.snapshot.session_summary_memory.summary_text == (
-            "用户关注收入增速和毛利率变化。"
-        )
-        assert (
-            latest.snapshot.evidence_fact_memory.evidence_backed_facts[0].claim_text
-            == "收入增长。"
-        )
-        assert latest.snapshot.answer_anchor_memory.anchors[0].anchor_title == (
-            "收入口径"
-        )
-        assert latest.snapshot.forward_intent_memory.intents[0].text == (
-            "下一轮继续核对费用率。"
-        )
-        assert latest.snapshot.trace_memory.reference_continuity_items[0].text == (
-            "“该公司”继续指向当前分析主体。"
-        )
+        assert latest.snapshot.session_summary_memory.summary_text == ("用户关注收入增速和毛利率变化。")
+        assert latest.snapshot.evidence_fact_memory.evidence_backed_facts[0].claim_text == "收入增长。"
+        assert latest.snapshot.answer_anchor_memory.anchors[0].anchor_title == ("收入口径")
+        assert latest.snapshot.forward_intent_memory.intents[0].text == ("下一轮继续核对费用率。")
+        assert latest.snapshot.trace_memory.reference_continuity_items[0].text == ("“该公司”继续指向当前分析主体。")
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 1
         assert checkpoint.checkpoint_event_id == "compact-1"
-        assert (
-            latest.snapshot.cursor.checkpoint_event_sequence
-            == checkpoint.checkpoint_event_sequence
-        )
+        assert latest.snapshot.cursor.checkpoint_event_sequence == checkpoint.checkpoint_event_sequence
         assert latest.snapshot.cursor.checkpoint_event_id == checkpoint.checkpoint_event_id
         assert set(item_kinds) == {
             "answer_anchor",
@@ -2475,32 +2333,34 @@ def test_projection_consumer_invalid_persisted_enum_does_not_advance_checkpoint(
     candidate = cast(dict[str, JsonValue], payload["accepted_candidate"])
     intents = cast(list[JsonValue], candidate["forward_intents"])
     intent = cast(dict[str, JsonValue], intents[0])
-    intent["intent_type"] = "unknown_intent"
+    intent["status"] = "unknown_status"
     payload["accepted_candidate_digest"] = sha256_digest_json(candidate)
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
-            lambda transaction: append_event(
-                transaction,
-                EventLogAppendRequest(
-                    event_id="compact-invalid-enum",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=_SESSION_ID,
-                    run_id=_RUN_ID,
-                    attempt_id=_ATTEMPT_ID,
-                    execution_id=_EXECUTION_ID,
-                    event_type=CONTEXT_COMPACTED,
-                    occurred_at=_OCCURRED_AT,
-                    actor="pytest",
-                    source="pytest",
-                    client_request_id=None,
-                    idempotency_key=None,
-                    policy_decision=None,
-                    reason=None,
-                    payload_json=payload,
-                    payload_ref=None,
-                    payload_digest=None,
-                ),
-            ).row
+            lambda transaction: (
+                append_event(
+                    transaction,
+                    EventLogAppendRequest(
+                        event_id="compact-invalid-enum",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=_SESSION_ID,
+                        run_id=_RUN_ID,
+                        attempt_id=_ATTEMPT_ID,
+                        execution_id=_EXECUTION_ID,
+                        event_type=CONTEXT_COMPACTED,
+                        occurred_at=_OCCURRED_AT,
+                        actor="pytest",
+                        source="pytest",
+                        client_request_id=None,
+                        idempotency_key=None,
+                        policy_decision=None,
+                        reason=None,
+                        payload_json=payload,
+                        payload_ref=None,
+                        payload_digest=None,
+                    ),
+                ).row
+            )
         )
         consumer = ConversationMemoryProjectionConsumer(policy)
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -2815,9 +2675,7 @@ def test_projection_consumer_fails_closed_when_requested_event_ref_missing(
         ),
         pytest.param(
             _BrokenToolQueryCase(
-                envelope_arguments_digest=sha256_digest_json(
-                    {"arguments": {"ticker": "MSFT"}}
-                ),
+                envelope_arguments_digest=sha256_digest_json({"arguments": {"ticker": "MSFT"}}),
             ),
             id="arguments-digest-mismatch",
         ),
@@ -2933,28 +2791,30 @@ def test_projection_consumer_skips_failed_compact_without_memory_snapshot(
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
-            lambda transaction: append_event(
-                transaction,
-                EventLogAppendRequest(
-                    event_id="compact-failed-1",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=_SESSION_ID,
-                    run_id=_RUN_ID,
-                    attempt_id=_ATTEMPT_ID,
-                    execution_id=_EXECUTION_ID,
-                    event_type=CONTEXT_COMPACTION_FAILED,
-                    occurred_at=_OCCURRED_AT,
-                    actor="pytest",
-                    source="pytest",
-                    client_request_id=None,
-                    idempotency_key=None,
-                    policy_decision=None,
-                    reason=None,
-                    payload_json={"failure_reason": "compactor_unavailable"},
-                    payload_ref=None,
-                    payload_digest=None,
-                ),
-            ).row
+            lambda transaction: (
+                append_event(
+                    transaction,
+                    EventLogAppendRequest(
+                        event_id="compact-failed-1",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=_SESSION_ID,
+                        run_id=_RUN_ID,
+                        attempt_id=_ATTEMPT_ID,
+                        execution_id=_EXECUTION_ID,
+                        event_type=CONTEXT_COMPACTION_FAILED,
+                        occurred_at=_OCCURRED_AT,
+                        actor="pytest",
+                        source="pytest",
+                        client_request_id=None,
+                        idempotency_key=None,
+                        policy_decision=None,
+                        reason=None,
+                        payload_json={"failure_reason": "compactor_unavailable"},
+                        payload_ref=None,
+                        payload_digest=None,
+                    ),
+                ).row
+            )
         )
         consumer = ConversationMemoryProjectionConsumer(policy)
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -2996,28 +2856,30 @@ def test_projection_consumer_skips_compaction_attempt_rejected(
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
-            lambda transaction: append_event(
-                transaction,
-                EventLogAppendRequest(
-                    event_id="compact-attempt-rejected-1",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=_SESSION_ID,
-                    run_id=_RUN_ID,
-                    attempt_id=_ATTEMPT_ID,
-                    execution_id=_EXECUTION_ID,
-                    event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-                    occurred_at=_OCCURRED_AT,
-                    actor="pytest",
-                    source="pytest",
-                    client_request_id=None,
-                    idempotency_key=None,
-                    policy_decision=None,
-                    reason=None,
-                    payload_json={"failure_category": "proposal_failed"},
-                    payload_ref=None,
-                    payload_digest=None,
-                ),
-            ).row
+            lambda transaction: (
+                append_event(
+                    transaction,
+                    EventLogAppendRequest(
+                        event_id="compact-attempt-rejected-1",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=_SESSION_ID,
+                        run_id=_RUN_ID,
+                        attempt_id=_ATTEMPT_ID,
+                        execution_id=_EXECUTION_ID,
+                        event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                        occurred_at=_OCCURRED_AT,
+                        actor="pytest",
+                        source="pytest",
+                        client_request_id=None,
+                        idempotency_key=None,
+                        policy_decision=None,
+                        reason=None,
+                        payload_json={"failure_category": "proposal_failed"},
+                        payload_ref=None,
+                        payload_digest=None,
+                    ),
+                ).row
+            )
         )
         consumer = ConversationMemoryProjectionConsumer(policy)
         result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
@@ -3080,13 +2942,9 @@ def test_memory_snapshot_integrity_empty_and_valid_rows_return_no_issues(
     """Memory snapshot integrity classifier 对空库和有效 row 返回空诊断。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        empty_issues = store.transaction_runner.run_read(
-            inspect_memory_snapshot_integrity
-        )
+        empty_issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
         snapshot = _write_integrity_compact_snapshot(store)
-        valid_issues = store.transaction_runner.run_read(
-            inspect_memory_snapshot_integrity
-        )
+        valid_issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
         read_back = store.transaction_runner.run_read(
             lambda transaction: read_memory_snapshot(
                 transaction,
@@ -3127,10 +2985,7 @@ def test_memory_snapshot_integrity_classifies_schema_mismatch(tmp_path: Path) ->
         issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.SCHEMA_MISMATCH
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.SCHEMA_MISMATCH
         assert issues[0].snapshot_id == snapshot.snapshot_id
 
 
@@ -3147,10 +3002,7 @@ def test_memory_snapshot_integrity_classifies_manual_digest_mismatch(
         issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH
         assert issues[0].snapshot_id == snapshot.snapshot_id
 
 
@@ -3166,10 +3018,7 @@ def test_memory_snapshot_integrity_classifies_row_digest_column_mismatch(
         issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH
         assert issues[0].snapshot_id == snapshot.snapshot_id
 
 
@@ -3193,10 +3042,7 @@ def test_memory_snapshot_integrity_classifies_unsupported_old_item_kind(
             )
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
         assert issues[0].snapshot_id == snapshot.snapshot_id
 
 
@@ -3210,10 +3056,7 @@ def test_memory_snapshot_integrity_classifies_unknown_item_kind(tmp_path: Path) 
         issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
         assert issues[0].snapshot_id == snapshot.snapshot_id
 
 
@@ -3278,10 +3121,7 @@ def test_memory_snapshot_integrity_classifies_storage_read_failure(
         issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
         assert issues[0].snapshot_id is None
 
 
@@ -3331,13 +3171,8 @@ def test_memory_snapshot_integrity_classifies_row_identity_read_failure(
         issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
 
         assert len(issues) == 1
-        assert (
-            issues[0].failure_kind
-            is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
-        )
-        assert issues[0].message.startswith(
-            "memory snapshot row identity read failed:"
-        )
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
+        assert issues[0].message.startswith("memory snapshot row identity read failed:")
         assert issues[0].snapshot_id is None
 
 
@@ -3361,28 +3196,30 @@ def _write_integrity_compact_snapshot(
 
     payload = _accepted_compact_payload(facts=[_fact(claim_text)])
     store.transaction_runner.run_write(
-        lambda transaction: append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id=event_id,
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=session_id,
-                run_id=_RUN_ID,
-                attempt_id=_ATTEMPT_ID,
-                execution_id=_EXECUTION_ID,
-                event_type=CONTEXT_COMPACTED,
-                occurred_at=_OCCURRED_AT,
-                actor="pytest",
-                source="pytest",
-                client_request_id=None,
-                idempotency_key=None,
-                policy_decision=None,
-                reason=None,
-                payload_json=payload,
-                payload_ref=None,
-                payload_digest=None,
-            ),
-        ).row
+        lambda transaction: (
+            append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=event_id,
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    event_type=CONTEXT_COMPACTED,
+                    occurred_at=_OCCURRED_AT,
+                    actor="pytest",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=payload,
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+        )
     )
     projection_event = MemoryProjectionEvent(
         event_sequence=event_sequence,

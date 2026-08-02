@@ -150,12 +150,13 @@ from dayu.host.compact_material import (
     conversation_compact_input_vnext_from_material_pack,
 )
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    CompactQualityCheckResultVNext,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactRepairFeedbackV2,
     CompactionRequest,
     CompactorProposal,
     ContextCompactor,
 )
+from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.compaction_operation import (
     CompactionOperationResult,
     CompactorProposalManifestRecorder,
@@ -172,7 +173,6 @@ from dayu.host.context_budget import (
     ContextBudgetDecision,
     ContextEstimateMethod,
     ContextEstimatorContract,
-    ContextPressureLevel,
     ContextSizingFallbackReason,
     ContextSizingStage,
     build_conservative_context_sizing_result_from_atoms,
@@ -386,10 +386,10 @@ def _proposal_manifest_reference(
         compaction_attempt_number=attempt_number,
         compactor_engine_run_id=compactor_engine_run_id,
     )
+
+
 _REACTIVE_POLICY_REF = "test-reactive-policy"
-_ORIGINAL_INGEST_VALIDATED_OPERATION_CALL = (
-    engine_ingest_module._IngestValidatedOperation.__call__
-)
+_ORIGINAL_INGEST_VALIDATED_OPERATION_CALL = engine_ingest_module._IngestValidatedOperation.__call__
 
 
 class _ExpectedTransientRollback(RuntimeError):
@@ -498,9 +498,7 @@ def _cas_lost_terminal_closeout(
     del event_log_store
     run = read_run_by_id(transaction, request.run_id)
     attempt = read_attempt_by_id(transaction, request.attempt_id)
-    dispatch_record = read_dispatch_record_by_attempt_id(
-        transaction, request.attempt_id
-    )
+    dispatch_record = read_dispatch_record_by_attempt_id(transaction, request.attempt_id)
     assert run is not None
     assert attempt is not None
     assert dispatch_record is not None
@@ -528,7 +526,11 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         self.calls = 0
 
     async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposal:
         """执行 vNext compact 并验证当前不在外层 write transaction 内。
 
@@ -538,11 +540,13 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        row = self._transaction_runner.run_read(
-            lambda transaction: read_run_by_id(transaction, request.run_id)
-        )
+        row = self._transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, request.run_id))
         assert row is not None
-        return await super().compact(request, cancellation_token)
+        return await super().compact(
+            request,
+            cancellation_token,
+            repair_feedback=repair_feedback,
+        )
 
 
 class _InputSequenceAdvancingCompactor(FakeContextCompactor):
@@ -560,7 +564,11 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
         self.calls = 0
 
     async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposal:
         """推进 durable input sequence 后返回旧 snapshot 的 vNext candidate。
 
@@ -571,7 +579,11 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
 
         self.calls += 1
         _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
-        return await super().compact(request, cancellation_token)
+        return await super().compact(
+            request,
+            cancellation_token,
+            repair_feedback=repair_feedback,
+        )
 
 
 class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
@@ -592,6 +604,8 @@ class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposal:
         """提交两个同 operation failed terminal 后返回 accepted candidate。
 
@@ -649,14 +663,22 @@ class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
                 )
 
         self._transaction_runner.run_write(_operation)
-        return await super().compact(request, cancellation_token)
+        return await super().compact(
+            request,
+            cancellation_token,
+            repair_feedback=repair_feedback,
+        )
 
 
 class _RaisingCompactor(FakeContextCompactor):
     """测试用失败 compactor。"""
 
     async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposal:
         """抛出 vNext proposal 失败。
 
@@ -667,15 +689,14 @@ class _RaisingCompactor(FakeContextCompactor):
         """
 
         del cancellation_token
+        del repair_feedback
         raise RuntimeError(f"proposal failed for {request.run_id}")
 
 
 class _RejectingToolExecutor(ToolExecutor):
     """测试用工具执行器，prepared compactor 路径不会实际调用。"""
 
-    async def execute(
-        self, request: BatchToolExecutionRequest
-    ) -> BatchToolExecutionOutcome:
+    async def execute(self, request: BatchToolExecutionRequest) -> BatchToolExecutionOutcome:
         """拒绝意外工具执行。
 
         :param request: 批式工具执行请求。
@@ -709,6 +730,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposalRunInput:
         """构造测试用 prepared compactor proposal input。
 
@@ -721,9 +743,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
 
         del cancellation_token
         self._prepared_request = request
-        compact_input = conversation_compact_input_vnext_from_material_pack(
-            request.material_pack
-        )
+        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
         agent_request = _proposal_agent_request(
             request,
             compaction_operation_id=compaction_operation_id,
@@ -732,6 +752,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         projection = {
             "projection_kind": "reactive_compactor_input_projection",
             "compaction_request_digest": request.digest(),
+            "repair_feedback": (None if repair_feedback is None else repair_feedback.to_json()),
         }
         roles = tuple(message.role.value for message in agent_request.messages)
         return CompactorProposalRunInput(
@@ -746,6 +767,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
             user_prompt_digest=sha256_digest_json({"user_prompt": "reactive"}),
             compactor_input_projection=projection,
             compactor_input_projection_digest=sha256_digest_json(projection),
+            repair_feedback=repair_feedback,
         )
 
     async def run_prepared_compactor_proposal(
@@ -768,13 +790,12 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         proposal = await super().compact(
             request,
             prepared_input.agent_request.cancellation_token,
+            repair_feedback=prepared_input.repair_feedback,
         )
         return CompactorProposal(
             candidate=proposal.candidate,
             successful_response_identity=(
-                _successful_response_identity_for_agent_request(
-                    prepared_input.agent_request
-                )
+                _successful_response_identity_for_agent_request(prepared_input.agent_request)
             ),
         )
 
@@ -973,6 +994,7 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         candidate = _candidate(
             seeded,
@@ -1100,21 +1122,15 @@ def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
     assert succeeded.terminal.attempt_event_type == (
         closeout_attempt_terminal_event_type_for_status(AttemptStatus.SUCCEEDED).value
     )
-    assert succeeded.terminal.run_event_type == (
-        run_terminal_event_type_for_status(RunStatus.SUCCEEDED).value
-    )
+    assert succeeded.terminal.run_event_type == (run_terminal_event_type_for_status(RunStatus.SUCCEEDED).value)
     assert failed.terminal.attempt_event_type == (
         closeout_attempt_terminal_event_type_for_status(AttemptStatus.FAILED).value
     )
-    assert failed.terminal.run_event_type == (
-        run_terminal_event_type_for_status(RunStatus.FAILED).value
-    )
+    assert failed.terminal.run_event_type == (run_terminal_event_type_for_status(RunStatus.FAILED).value)
     assert lost.terminal.attempt_event_type == (
         closeout_attempt_terminal_event_type_for_status(AttemptStatus.LOST).value
     )
-    assert lost.terminal.run_event_type == (
-        run_terminal_event_type_for_status(RunStatus.LOST).value
-    )
+    assert lost.terminal.run_event_type == (run_terminal_event_type_for_status(RunStatus.LOST).value)
 
 
 def test_engine_owned_empty_final_failure_closes_failed(
@@ -1247,9 +1263,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
 ) -> None:
     """provider overflow budget_state=None 使用 Host estimator 并进入 recovery。"""
 
-    original_run_compaction_operation = (
-        engine_ingest_module.run_compaction_operation
-    )
+    original_run_compaction_operation = engine_ingest_module.run_compaction_operation
     observed_attempt_ranges: list[tuple[int, int, str | None]] = []
 
     async def observe_run_compaction_operation(
@@ -1262,6 +1276,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         pass_queue: tuple[CompactionRequest, ...] = (),
         compaction_operation_id: str | None = None,
         proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+        memory_policy: MemoryProjectionPolicy,
     ) -> CompactionOperationResult:
         """记录 Engine ingest 传给 operation owner 的冻结 attempt range。
 
@@ -1273,6 +1288,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         :param pass_queue: reactive pass queue。
         :param compaction_operation_id: request event 同源 operation id。
         :param proposal_manifest_recorder: durable manifest recorder。
+        :param memory_policy: Context Governance 与 Memory 共用 policy。
         :returns: 原 operation owner 的执行结果。
         :raises Exception: 原 operation owner 异常时透传。
         """
@@ -1293,6 +1309,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             pass_queue=pass_queue,
             compaction_operation_id=compaction_operation_id,
             proposal_manifest_recorder=proposal_manifest_recorder,
+            memory_policy=memory_policy,
         )
 
     monkeypatch.setattr(
@@ -1305,6 +1322,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         policy = replace(
@@ -1324,7 +1342,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
         )
 
-        result = await EngineEventIngestor(
+        ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
@@ -1332,7 +1350,12 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             context_budget_policy=policy,
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest_async(candidate)
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        )
+        result = await ingestor.ingest_async(candidate)
 
         assert result.terminal_closeout is False
         assert result.stop_worker_stream is True
@@ -1367,27 +1390,24 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert requested_payload["client_correlation_id"] == "client-overflow"
         assert requested_payload["attempt_id"] == seeded.attempt_id
         assert requested_payload["execution_id"] == seeded.execution_id
-        assert requested_payload["frozen_material_refs"] == ["event-input-ingest"]
+        assert requested_payload["frozen_material_refs"] == [
+            "event-input-ingest-history",
+            "event-input-ingest",
+        ]
         assert isinstance(requested_payload["frozen_material_list_digest"], str)
         assert isinstance(requested_payload["estimator_digest"], str)
         compacted_payload = _payload(result.events[3])
         assert compacted_payload["operation_id"] == result.events[0].event_id
         assert compacted_payload["accepted_attempt_number"] == 1
-        assert compacted_payload["projection_signal"] == (
-            COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP
-        )
+        assert compacted_payload["projection_signal"] == (COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP)
         accepted_candidate = compacted_payload["accepted_candidate"]
         assert isinstance(accepted_candidate, Mapping)
-        assert accepted_candidate["schema_version"] == (
-            CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
-        )
+        assert accepted_candidate["schema"] == (COMPACT_OUTPUT_SCHEMA_V2)
         assert "preserved_fact_refs" not in compacted_payload
         artifact_ref = compacted_payload["compact_artifact_ref"]
         assert isinstance(artifact_ref, str)
         descriptor = store.transaction_runner.run_read(
-            lambda transaction: PayloadStore().read_payload_descriptor(
-                transaction, artifact_ref
-            )
+            lambda transaction: PayloadStore().read_payload_descriptor(transaction, artifact_ref)
         )
         assert descriptor is not None
         assert descriptor.media_type == COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT
@@ -1397,12 +1417,8 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         artifact_raw = json.loads(artifact_path.read_text(encoding="utf-8"))
         assert isinstance(artifact_raw, Mapping)
         artifact_json = cast(Mapping[str, JsonValue], artifact_raw)
-        assert artifact_json["schema_version"] == (
-            COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT
-        )
-        assert artifact_json["accepted_candidate_digest"] == (
-            compacted_payload["accepted_candidate_digest"]
-        )
+        assert artifact_json["schema_version"] == (COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT)
+        assert artifact_json["accepted_candidate_digest"] == (compacted_payload["accepted_candidate_digest"])
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.FAILED
@@ -1410,9 +1426,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
         recovery_manifest_event = result.events[-4]
-        hot = parse_runner_call_hot_payload(
-            _payload(recovery_manifest_event)
-        )
+        hot = parse_runner_call_hot_payload(_payload(recovery_manifest_event))
         assert hot.runner_call_trigger_reason == "context_governance_resolved"
         manifest_json = store.transaction_runner.run_read(
             lambda transaction: sqlite_payload_object(
@@ -1426,35 +1440,25 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
             manifest_json,
             hot_payload=hot,
         )
-        assert manifest.identity.runner_call_trigger_reason == (
-            "context_governance_resolved"
-        )
+        assert manifest.identity.runner_call_trigger_reason == ("context_governance_resolved")
         recovery_attempt_id = hot.attempt_id
         recovery_execution_id = hot.execution_id
         assert recovery_attempt_id is not None
         assert recovery_execution_id is not None
         policy_snapshot, _config = _source_policy_snapshot_and_config()
         loaded = store.transaction_runner.run_read(
-            lambda transaction: (
-                    load_prepared_runner_call_candidate_in_transaction(
-                        transaction,
-                        EventLogStore(),
-                    run_id=seeded.run_id,
-                    attempt_id=recovery_attempt_id,
-                    execution_id=recovery_execution_id,
-                    policy_snapshot=policy_snapshot,
-                )
+            lambda transaction: load_prepared_runner_call_candidate_in_transaction(
+                transaction,
+                EventLogStore(),
+                run_id=seeded.run_id,
+                attempt_id=recovery_attempt_id,
+                execution_id=recovery_execution_id,
+                policy_snapshot=policy_snapshot,
             )
         )
-        assert manifest.sizing_snapshot.sizing_stage is (
-            ContextSizingStage.REACTIVE_POST_COMPACT
-        )
-        assert manifest.sizing_snapshot.input_snapshot_digest == (
-            loaded.input_snapshot_digest
-        )
-        assert loaded.tool_execution_mode is (
-            ToolExecutionMode.NO_TOOL_DISABLED
-        )
+        assert manifest.sizing_snapshot.sizing_stage is (ContextSizingStage.REACTIVE_POST_COMPACT)
+        assert manifest.sizing_snapshot.input_snapshot_digest == (loaded.input_snapshot_digest)
+        assert loaded.tool_execution_mode is (ToolExecutionMode.NO_TOOL_DISABLED)
         assert wakeup.dispatches[0].attempt_id == hot.attempt_id
         assert wakeup.dispatches[0].execution_id == hot.execution_id
 
@@ -1474,6 +1478,7 @@ async def test_reactive_reuses_source_frozen_tool_snapshot_and_mode(
             store.transaction_runner,
             record_source_candidate=True,
             source_tool_schema=source_schema,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         result = await EngineEventIngestor(
@@ -1484,6 +1489,10 @@ async def test_reactive_reuses_source_frozen_tool_snapshot_and_mode(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(
             _context_compaction_candidate(
                 seeded,
@@ -1500,15 +1509,13 @@ async def test_reactive_reuses_source_frozen_tool_snapshot_and_mode(
             allow_tool_calls=True,
         )
         loaded = store.transaction_runner.run_read(
-            lambda transaction: (
-                    load_prepared_runner_call_candidate_in_transaction(
-                        transaction,
-                        EventLogStore(),
-                    run_id=seeded.run_id,
-                    attempt_id=recovery_attempt_id,
-                    execution_id=recovery_execution_id,
-                    policy_snapshot=policy_snapshot,
-                )
+            lambda transaction: load_prepared_runner_call_candidate_in_transaction(
+                transaction,
+                EventLogStore(),
+                run_id=seeded.run_id,
+                attempt_id=recovery_attempt_id,
+                execution_id=recovery_execution_id,
+                policy_snapshot=policy_snapshot,
             )
         )
 
@@ -1554,6 +1561,7 @@ async def test_reactive_memory_catch_up_failure_blocks_recovery_start(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
 
@@ -1565,6 +1573,10 @@ async def test_reactive_memory_catch_up_failure_blocks_recovery_start(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=52))
 
         assert result.status is EngineIngestStatus.ACCEPTED
@@ -1623,6 +1635,7 @@ async def test_reactive_memory_catch_up_not_reached_blocks_recovery_start(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         result = await EngineEventIngestor(
@@ -1633,6 +1646,10 @@ async def test_reactive_memory_catch_up_not_reached_blocks_recovery_start(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(
             _context_compaction_candidate(
                 seeded,
@@ -1718,6 +1735,7 @@ async def test_reactive_recovery_requires_terminal_source_attempt(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         result = await EngineEventIngestor(
@@ -1728,6 +1746,10 @@ async def test_reactive_recovery_requires_terminal_source_attempt(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(
             _context_compaction_candidate(
                 seeded,
@@ -1781,6 +1803,7 @@ async def test_reactive_recovery_requires_matching_committed_outcome(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         ingestor = EngineEventIngestor(
@@ -1791,6 +1814,10 @@ async def test_reactive_recovery_requires_matching_committed_outcome(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         )
 
         with pytest.raises(
@@ -1821,12 +1848,8 @@ async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
     """
 
     policy = _reactive_policy()
-    hard_pressure_tokens = int(
-        policy.context_window_size * policy.hard_threshold_context_ratio
-    )
-    original_estimator = (
-        engine_ingest_module.estimate_prepared_runner_call_candidate
-    )
+    hard_pressure_tokens = int(policy.context_window_size * policy.hard_threshold_context_ratio)
+    original_estimator = engine_ingest_module.estimate_prepared_runner_call_candidate
 
     def estimate_post_compact_hard(
         candidate: PreparedRunnerCallCandidate,
@@ -1854,6 +1877,7 @@ async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
 
@@ -1865,9 +1889,11 @@ async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
             context_budget_policy=policy,
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=152)
-        )
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=152))
 
         assert tuple(event.event_type for event in result.events)[-4:] == (
             "RUNNER_CALL_INPUT_ASSEMBLED",
@@ -1888,27 +1914,19 @@ async def test_reactive_post_compact_hard_pressure_still_starts_recovery(
             manifest_json,
             hot_payload=hot,
         )
-        assert manifest.sizing_snapshot.sizing_stage is (
-            ContextSizingStage.REACTIVE_POST_COMPACT
-        )
+        assert manifest.sizing_snapshot.sizing_stage is (ContextSizingStage.REACTIVE_POST_COMPACT)
         assert manifest.sizing_snapshot.conservative_input_tokens is not None
+        assert manifest.sizing_snapshot.conservative_input_tokens >= hard_pressure_tokens
+        budget_payload = parse_context_budget_evaluated_payload(_payload(result.events[-3]))
+        assert budget_payload.estimate_method is (ContextEstimateMethod.CONSERVATIVE_FALLBACK)
+        assert budget_payload.fallback_reason is (ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED)
         assert (
-            manifest.sizing_snapshot.conservative_input_tokens
-            >= hard_pressure_tokens
+            _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            == 0
         )
-        budget_payload = parse_context_budget_evaluated_payload(
-            _payload(result.events[-3])
-        )
-        assert budget_payload.estimate_method is (
-            ContextEstimateMethod.CONSERVATIVE_FALLBACK
-        )
-        assert budget_payload.fallback_reason is (
-            ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
-        )
-        assert _event_count(
-            store.transaction_runner,
-            CONTEXT_COMPACTION_FAILED,
-        ) == 0
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
         assert _event_count(store.transaction_runner, "RUN_LOST") == 0
         assert len(wakeup.dispatches) == 1
@@ -1933,10 +1951,10 @@ async def test_reactive_source_strict_load_failure_has_zero_start_and_wake(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
             source_tool_schema=(
                 _reactive_source_tool_schema()
-                if tamper_kind
-                is _ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING
+                if tamper_kind is _ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING
                 else None
             ),
         )
@@ -1954,6 +1972,10 @@ async def test_reactive_source_strict_load_failure_has_zero_start_and_wake(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         )
 
         with pytest.raises(HostDurableError):
@@ -1984,6 +2006,7 @@ async def test_reactive_duplicate_after_recovery_winner_does_not_repeat_wake(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         ingestor = EngineEventIngestor(
@@ -1994,6 +2017,10 @@ async def test_reactive_duplicate_after_recovery_winner_does_not_repeat_wake(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         )
         candidate = _context_compaction_candidate(
             seeded,
@@ -2049,6 +2076,7 @@ async def test_reactive_start_precondition_miss_rolls_back_candidate_and_manifes
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         descriptor_count_before = store.transaction_runner.run_read(
             lambda transaction: _table_row_count(
@@ -2066,33 +2094,37 @@ async def test_reactive_start_precondition_miss_rolls_back_candidate_and_manifes
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=162)
-        )
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=162))
 
         assert result.status is EngineIngestStatus.ACCEPTED
         assert result.events[-1].event_type == CONTEXT_COMPACTED
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
         assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
-        assert _event_count(
-            store.transaction_runner,
-            "RUNNER_CALL_INPUT_ASSEMBLED",
-        ) == 2
-        assert _event_count(
-            store.transaction_runner,
-            CONTEXT_BUDGET_EVALUATED,
-        ) == 0
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+            == 2
+        )
+        assert (
+            _event_count(
+                store.transaction_runner,
+                CONTEXT_BUDGET_EVALUATED,
+            )
+            == 0
+        )
         descriptor_count_after = store.transaction_runner.run_read(
             lambda transaction: _table_row_count(
                 transaction,
                 TABLE_PAYLOAD_DESCRIPTORS,
             )
         )
-        assert descriptor_count_after == (
-            descriptor_count_before
-            + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT
-            + 1
-        )
+        assert descriptor_count_after == (descriptor_count_before + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT + 1)
         assert wakeup.dispatches == []
 
 
@@ -2106,6 +2138,7 @@ async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
@@ -2114,22 +2147,18 @@ async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
             context_budget_policy=_reactive_policy(),
             context_compactor=_PreparedManifestReactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=40))
 
-        compacted_rows = tuple(
-            event for event in result.events if event.event_type == CONTEXT_COMPACTED
-        )
+        compacted_rows = tuple(event for event in result.events if event.event_type == CONTEXT_COMPACTED)
         assert len(compacted_rows) == 1
         compacted_payload = _payload(compacted_rows[0])
-        assert isinstance(
-            compacted_payload["accepted_proposal_manifest_ref"], str
-        )
-        assert compacted_payload["accepted_proposal_manifest_ref"].startswith(
-            "runner-call-manifest:"
-        )
-        assert isinstance(
-            compacted_payload["accepted_proposal_manifest_digest"], str
-        )
+        assert isinstance(compacted_payload["accepted_proposal_manifest_ref"], str)
+        assert compacted_payload["accepted_proposal_manifest_ref"].startswith("runner-call-manifest:")
+        assert isinstance(compacted_payload["accepted_proposal_manifest_digest"], str)
         assert (
             _event_count(
                 store.transaction_runner,
@@ -2176,6 +2205,7 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         compactor = _TransactionReadableCompactor(store.transaction_runner)
         candidate = _context_compaction_candidate(seeded, worker_event_index=41)
@@ -2187,6 +2217,10 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(candidate)
 
         assert result.status is EngineIngestStatus.ACCEPTED
@@ -2210,6 +2244,7 @@ async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         descriptor_count_before = store.transaction_runner.run_read(
@@ -2224,10 +2259,12 @@ async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
-            context_compactor=_InvalidMultipleReactiveCompactor(
-                store.transaction_runner
-            ),
+            context_compactor=_InvalidMultipleReactiveCompactor(store.transaction_runner),
             compact_artifact_root=artifact_root,
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         )
 
         with pytest.raises(
@@ -2243,14 +2280,20 @@ async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_
 
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 2
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
-        assert _event_count(
-            store.transaction_runner,
-            CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-        ) == 0
-        assert _event_count(
-            store.transaction_runner,
-            "RUNNER_CALL_INPUT_ASSEMBLED",
-        ) == 2
+        assert (
+            _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            )
+            == 0
+        )
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+            == 2
+        )
         assert _event_count(store.transaction_runner, "RUN_STARTED") == 1
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
@@ -2262,10 +2305,7 @@ async def test_reactive_invalid_multiple_terminals_fail_closed_without_third_or_
                 TABLE_PAYLOAD_DESCRIPTORS,
             )
         )
-        assert descriptor_count_after == (
-            descriptor_count_before
-            + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT
-        )
+        assert descriptor_count_after == (descriptor_count_before + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT)
 
 
 @pytest.mark.parametrize("winner_compacted", (True, False))
@@ -2289,6 +2329,7 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         wakeup = _WakeupSpy()
         ingestor = EngineEventIngestor(
@@ -2299,6 +2340,10 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=artifact_root,
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         )
         candidate = _context_compaction_candidate(
             seeded,
@@ -2320,6 +2365,7 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
             pass_queue: tuple[CompactionRequest, ...] = (),
             compaction_operation_id: str | None = None,
             proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+            memory_policy: MemoryProjectionPolicy | None = None,
         ) -> CompactionOperationResult:
             """以 barrier 控制同 pending 两个相反 provider result 的返回顺序。
 
@@ -2331,12 +2377,13 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
             :param pass_queue: frozen reactive pass queue。
             :param compaction_operation_id: request event 同源 operation id。
             :param proposal_manifest_recorder: durable manifest recorder。
+            :param memory_policy: Context Governance 使用的 Memory policy。
             :returns: 当前 contender 对应 accepted 或 failed result。
             :raises AssertionError: operation frozen identity 漂移时抛出。
             """
 
             nonlocal entered_count
-            del pass_queue, proposal_manifest_recorder
+            del pass_queue, proposal_manifest_recorder, memory_policy
             assert compactor is not None
             assert first_attempt_number == 1
             assert max_attempt_number == pending.policy.max_compaction_attempts_per_operation
@@ -2348,35 +2395,24 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
             if entered_count == 2:
                 both_entered.set()
             await releases[contender_index].wait()
-            contender_compacted = (
-                winner_compacted
-                if contender_index == 0
-                else not winner_compacted
-            )
+            contender_compacted = winner_compacted if contender_index == 0 else not winner_compacted
             if contender_compacted:
                 proposal = await FakeContextCompactor().compact(
                     request,
                     cancellation_token,
+                    repair_feedback=None,
                 )
-                compactor_engine_run_id = (
-                    proposal.successful_response_identity
-                    .runner_request_identity.run_id
-                )
+                compactor_engine_run_id = proposal.successful_response_identity.runner_request_identity.run_id
                 return CompactionOperationResult(
-                    accepted_candidate=proposal.candidate,
-                    quality_result=CompactQualityCheckResultVNext(
-                        accepted=True,
-                        rejection_reasons=(),
+                    accepted_truth=accepted_truth_for_candidate(
+                        proposal.candidate,
+                        current_input_ref=request.current_input_ref,
                     ),
                     rejected_attempts=(),
                     failure_reason=None,
-                    budget_after_attempted_compact=(
-                        pending.estimate.estimated_input_tokens
-                    ),
+                    budget_after_attempted_compact=(pending.estimate.estimated_input_tokens),
                     accepted_attempt_number=1,
-                    accepted_successful_response_identity=(
-                        proposal.successful_response_identity
-                    ),
+                    accepted_successful_response_identity=(proposal.successful_response_identity),
                     accepted_proposal_manifest_reference=(
                         _proposal_manifest_reference(
                             operation_id=compaction_operation_id,
@@ -2386,8 +2422,7 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
                     ),
                 )
             return CompactionOperationResult(
-                accepted_candidate=None,
-                quality_result=None,
+                accepted_truth=None,
                 rejected_attempts=(),
                 failure_reason="contending_provider_failure",
                 budget_after_attempted_compact=None,
@@ -2408,12 +2443,9 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
         releases[0].set()
         winner = await first
         assert isinstance(winner, engine_ingest_module._ReactiveRecoveryAccepted)
-        ingestor._complete_reactive_recovery(winner)
-        first_terminal_type = (
-            CONTEXT_COMPACTED
-            if winner_compacted
-            else CONTEXT_COMPACTION_FAILED
-        )
+        if winner_compacted:
+            ingestor._complete_reactive_recovery(winner)
+        first_terminal_type = CONTEXT_COMPACTED if winner_compacted else CONTEXT_COMPACTION_FAILED
         first_terminal = _latest_event(
             store.transaction_runner,
             first_terminal_type,
@@ -2439,43 +2471,60 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
         loser = await late
 
         assert isinstance(loser, EngineIngestResult)
-        assert _events_after_cursor(
-            store.transaction_runner,
-            cursor_after_winner,
-        ) == ()
-        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == (
-            1 if winner_compacted else 0
+        assert (
+            _events_after_cursor(
+                store.transaction_runner,
+                cursor_after_winner,
+            )
+            == ()
         )
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == (1 if winner_compacted else 0)
         assert _event_count(
             store.transaction_runner,
             CONTEXT_COMPACTION_FAILED,
         ) == (0 if winner_compacted else 1)
-        assert _event_count(
-            store.transaction_runner,
-            CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-        ) == 0
-        assert _latest_event(
-            store.transaction_runner,
-            first_terminal_type,
-        ).event_id == first_terminal.event_id
-        assert _compact_artifact_files(artifact_root) == artifact_files_after_winner
-        assert store.transaction_runner.run_read(
-            lambda transaction: _table_row_count(
-                transaction,
-                TABLE_PAYLOAD_DESCRIPTORS,
+        assert (
+            _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
             )
-        ) == descriptor_count_after_winner
-        assert _event_count(
-            store.transaction_runner,
-            "RUN_STARTED",
-        ) == run_started_after_winner
-        assert _attempt_count(
-            store.transaction_runner,
-            seeded.run_id,
-        ) == attempt_count_after_winner
-        assert run_started_after_winner == 2
-        assert attempt_count_after_winner == 2
-        assert len(wakeup.dispatches) == 1
+            == 0
+        )
+        assert (
+            _latest_event(
+                store.transaction_runner,
+                first_terminal_type,
+            ).event_id
+            == first_terminal.event_id
+        )
+        assert _compact_artifact_files(artifact_root) == artifact_files_after_winner
+        assert (
+            store.transaction_runner.run_read(
+                lambda transaction: _table_row_count(
+                    transaction,
+                    TABLE_PAYLOAD_DESCRIPTORS,
+                )
+            )
+            == descriptor_count_after_winner
+        )
+        assert (
+            _event_count(
+                store.transaction_runner,
+                "RUN_STARTED",
+            )
+            == run_started_after_winner
+        )
+        assert (
+            _attempt_count(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            == attempt_count_after_winner
+        )
+        expected_start_count = 2 if winner_compacted else 1
+        assert run_started_after_winner == expected_start_count
+        assert attempt_count_after_winner == expected_start_count
+        assert len(wakeup.dispatches) == (1 if winner_compacted else 0)
 
 
 @pytest.mark.asyncio
@@ -2516,6 +2565,7 @@ async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         compactor = _TransactionReadableCompactor(store.transaction_runner)
 
@@ -2526,9 +2576,11 @@ async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=141)
-        )
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=141))
 
         assert result.status is EngineIngestStatus.ACCEPTED
         assert compactor.calls == 1
@@ -2551,6 +2603,7 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         compactor = _InputSequenceAdvancingCompactor(store.transaction_runner)
         candidate = _context_compaction_candidate(seeded, worker_event_index=43)
@@ -2562,6 +2615,10 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(candidate)
 
         assert result.status is EngineIngestStatus.ACCEPTED
@@ -2573,9 +2630,7 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status is RunStatus.RECOVERING
         assert attempt_status is AttemptStatus.FAILED
-        stale_failed = _latest_event(
-            store.transaction_runner, CONTEXT_COMPACTION_FAILED
-        )
+        stale_failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
         payload = _payload(stale_failed)
         assert payload["failure_reason"] == "stale_compaction_result"
         assert_failed_payload_no_fallback(
@@ -2596,10 +2651,11 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         candidate = _context_compaction_candidate(seeded, worker_event_index=42)
 
-        result = await EngineEventIngestor(
+        ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
@@ -2612,12 +2668,18 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
             ),
             context_compactor=_RaisingCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest_async(candidate)
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        )
+        pending = ingestor._ingest_before_reactive_compaction(candidate)
+        assert isinstance(pending, engine_ingest_module._ReactiveCompactPending)
+        outcome = await ingestor._execute_reactive_compaction(pending)
+        result = outcome.result if isinstance(outcome, engine_ingest_module._ReactiveRecoveryAccepted) else outcome
 
         rejected_rows = tuple(
-            event
-            for event in result.events
-            if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
+            event for event in result.events if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
         )
         assert len(rejected_rows) == 1
         rejected_payload = _payload(rejected_rows[0])
@@ -2637,8 +2699,9 @@ async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
-        result = await EngineEventIngestor(
+        ingestor = EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
@@ -2651,26 +2714,32 @@ async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
             ),
             context_compactor=_PreparedManifestReactiveCompactor(fail_run=True),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=39))
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        )
+        pending = ingestor._ingest_before_reactive_compaction(
+            _context_compaction_candidate(seeded, worker_event_index=39)
+        )
+        assert isinstance(pending, engine_ingest_module._ReactiveCompactPending)
+        outcome = await ingestor._execute_reactive_compaction(pending)
+        result = outcome.result if isinstance(outcome, engine_ingest_module._ReactiveRecoveryAccepted) else outcome
 
         rejected_rows = tuple(
-            event
-            for event in result.events
-            if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
+            event for event in result.events if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
         )
         assert len(rejected_rows) == 1
         rejected_payload = _payload(rejected_rows[0])
         assert isinstance(rejected_payload["proposal_manifest_ref"], str)
-        assert rejected_payload["proposal_manifest_ref"].startswith(
-            "runner-call-manifest:"
-        )
+        assert rejected_payload["proposal_manifest_ref"].startswith("runner-call-manifest:")
         assert isinstance(rejected_payload["proposal_manifest_digest"], str)
         assert (
             _event_count(
                 store.transaction_runner,
                 "RUNNER_CALL_INPUT_ASSEMBLED",
             )
-            == 3
+            == 2
         )
 
 
@@ -2737,20 +2806,18 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
             terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
-        ).ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=42)
-        )
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=42))
 
         assert tuple(event.event_type for event in result.events) == (
             CONTEXT_COMPACTION_REQUESTED,
             "ATTEMPT_FAILED",
-                "RUN_RECOVERING",
-                CONTEXT_COMPACTION_FAILED,
-                "RUNNER_CALL_INPUT_ASSEMBLED",
-                "CONTEXT_BUDGET_EVALUATED",
-                "RUN_STARTED",
-                "ATTEMPT_STARTED",
-            )
+            "RUN_RECOVERING",
+            CONTEXT_COMPACTION_FAILED,
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            "CONTEXT_BUDGET_EVALUATED",
+            "RUN_STARTED",
+            "ATTEMPT_STARTED",
+        )
         assert result.terminal_closeout is False
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -2759,23 +2826,15 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
-        assert _current_attempt_id(store.transaction_runner, seeded.run_id) != (
-            seeded.attempt_id
-        )
+        assert _current_attempt_id(store.transaction_runner, seeded.run_id) != (seeded.attempt_id)
         failed_payload = _payload(result.events[3])
         assert failed_payload["operation_id"] == result.events[0].event_id
         assert failed_payload["fallback_action"] == "dispatch"
-        assert failed_payload["fallback_policy_decision"] == (
-            "deterministic_recent_window"
-        )
+        assert failed_payload["fallback_policy_decision"] == ("deterministic_recent_window")
         assert isinstance(failed_payload["fallback_input_window"], Mapping)
-        assert failed_payload["fallback_input_window"]["current_input_ref"] == (
-            "event-input-ingest"
-        )
+        assert failed_payload["fallback_input_window"]["current_input_ref"] == ("event-input-ingest")
         assert isinstance(failed_payload["fallback_budget_result"], Mapping)
-        assert failed_payload["fallback_budget_result"]["status"] == (
-            "within_hard_budget"
-        )
+        assert failed_payload["fallback_budget_result"]["status"] == ("within_hard_budget")
         fallback_manifest_event = result.events[4]
         hot = parse_runner_call_hot_payload(_payload(fallback_manifest_event))
         manifest_json = store.transaction_runner.run_read(
@@ -2791,9 +2850,7 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
             hot_payload=hot,
         )
         assert hot.runner_call_trigger_reason == "context_governance_resolved"
-        assert manifest.identity.runner_call_trigger_reason == (
-            "context_governance_resolved"
-        )
+        assert manifest.identity.runner_call_trigger_reason == ("context_governance_resolved")
 
 
 @pytest.mark.asyncio
@@ -2820,9 +2877,7 @@ async def test_reactive_fallback_over_budget_fails_closed_without_lost(
             terminal_post_commit_port=terminal_port,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
-        ).ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=42)
-        )
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=42))
 
         assert tuple(event.event_type for event in result.events) == (
             CONTEXT_COMPACTION_REQUESTED,
@@ -2840,9 +2895,7 @@ async def test_reactive_fallback_over_budget_fails_closed_without_lost(
         failed_payload = _payload(result.events[3])
         assert failed_payload["operation_id"] == result.events[0].event_id
         assert failed_payload["fallback_action"] == "fail_closed"
-        assert failed_payload["fallback_policy_decision"] == (
-            "deterministic_recent_window"
-        )
+        assert failed_payload["fallback_policy_decision"] == ("deterministic_recent_window")
         assert isinstance(failed_payload["fallback_budget_result"], Mapping)
         assert failed_payload["fallback_budget_result"]["status"] == "over_hard_budget"
         assert len(terminal_port.observations) == 1
@@ -2913,9 +2966,7 @@ async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
             terminal_post_commit_port=terminal_port,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             context_budget_policy=_reactive_policy(),
-        ).ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=53)
-        )
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=53))
 
         assert result.status is EngineIngestStatus.REJECTED
         assert result.terminal_closeout is False
@@ -2950,9 +3001,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
-        first = await ingestor.ingest_async(
-            _context_compaction_candidate(seeded, worker_event_index=43)
-        )
+        first = await ingestor.ingest_async(_context_compaction_candidate(seeded, worker_event_index=43))
         assert first.status == EngineIngestStatus.ACCEPTED
 
         stale = ingestor.ingest(
@@ -2974,9 +3023,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
         current_attempt = _current_attempt_id(store.transaction_runner, seeded.run_id)
         assert current_attempt != seeded.attempt_id
-        assert _attempt_status(store.transaction_runner, current_attempt) == (
-            AttemptStatus.STARTING
-        )
+        assert _attempt_status(store.transaction_runner, current_attempt) == (AttemptStatus.STARTING)
 
 
 def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
@@ -3083,9 +3130,7 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
             compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
 
-        assert CONTEXT_COMPACTION_REQUESTED not in (
-            event.event_type for event in result.events
-        )
+        assert CONTEXT_COMPACTION_REQUESTED not in (event.event_type for event in result.events)
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.FAILED
@@ -3156,6 +3201,7 @@ async def test_reactive_compact_count_allows_second_operation(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
+            compactable_history=True,
         )
         _append_reactive_requested_fact(
             store.transaction_runner,
@@ -3171,6 +3217,10 @@ async def test_reactive_compact_count_allows_second_operation(
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
 
         assert result.status == EngineIngestStatus.ACCEPTED
@@ -3594,9 +3644,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
                     iteration_index=0,
                     message_count=2,
                     role_sequence_digest=role_digest,
-                    runner_input_serializer_schema_version=(
-                        RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                    ),
+                    runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
                 ),
                 event_type=EngineEventType.ITERATION_STARTED,
             )
@@ -3639,9 +3687,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
         assert isinstance(pairing, Mapping)
         assert pairing["status"] == "complete"
         assert pairing["reason"] is None
-        assert pairing["manifest_event_id"] == (
-            "event-prepared-runner-call-usage"
-        )
+        assert pairing["manifest_event_id"] == ("event-prepared-runner-call-usage")
         assert isinstance(pairing["observation_digest"], str)
         context_pressure = payload["context_pressure"]
         assert isinstance(context_pressure, Mapping)
@@ -3909,13 +3955,8 @@ def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
             first.terminal_notice,
             second.terminal_notice,
         ]
-        assert (
-            first.terminal_notice.terminal_event_sequence
-            == second.terminal_notice.terminal_event_sequence
-        )
-        assert [event.event_id for event in first.events] == [
-            event.event_id for event in second.events
-        ]
+        assert first.terminal_notice.terminal_event_sequence == second.terminal_notice.terminal_event_sequence
+        assert [event.event_id for event in first.events] == [event.event_id for event in second.events]
         assert _event_count(store.transaction_runner, "ATTEMPT_SUCCEEDED") == 1
         assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 1
         assert wakeup.promoted_session_ids == []
@@ -4330,10 +4371,7 @@ def test_transient_fence_comes_from_same_validation_transaction_attempt_row(
         assert result.events == ()
         assert attempt_read_spy.call_count == 1
         assert len(publisher.candidates) == 1
-        assert (
-            publisher.candidates[0].durable_causal_fence_event_sequence
-            == sentinel_fence
-        )
+        assert publisher.candidates[0].durable_causal_fence_event_sequence == sentinel_fence
 
 
 def test_transient_publisher_failure_is_sanitized_and_does_not_change_acceptance(
@@ -4500,8 +4538,8 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         late = _candidate(
             seeded,
             worker_event_index=14,
-                data=RunFailedData(
-                    error_code=adapter_error_code("late"),
+            data=RunFailedData(
+                error_code=adapter_error_code("late"),
                 message="late",
                 provider_request_id=None,
                 recoverable=False,
@@ -4591,9 +4629,7 @@ def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == (
-            "run_cancelled_invalid_active_cancel_link"
-        )
+        assert _payload(result.events[0])["reason"] == ("run_cancelled_invalid_active_cancel_link")
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -4607,9 +4643,7 @@ def test_run_cancelled_with_malformed_active_cancel_payload_uses_typed_link(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
-        store.transaction_runner.run_write(
-            _AppendMalformedRunCancellingOperation(seeded)
-        )
+        store.transaction_runner.run_write(_AppendMalformedRunCancellingOperation(seeded))
         candidate = _candidate(
             seeded,
             worker_event_index=16,
@@ -4685,8 +4719,8 @@ def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
         candidate = _candidate(
             seeded,
             worker_event_index=17,
-                data=RunFailedData(
-                    error_code=adapter_error_code("late_after_timeout"),
+            data=RunFailedData(
+                error_code=adapter_error_code("late_after_timeout"),
                 message="late after timeout",
                 provider_request_id=None,
                 recoverable=False,
@@ -4743,9 +4777,7 @@ def test_late_final_answer_after_run_cancelling_is_rejected_with_diagnostic(
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == (
-            "late_terminal_after_active_cancel"
-        )
+        assert _payload(result.events[0])["reason"] == ("late_terminal_after_active_cancel")
         assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 0
         assert _event_count(store.transaction_runner, "ATTEMPT_SUCCEEDED") == 0
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
@@ -4764,8 +4796,8 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         candidate = _candidate(
             seeded,
             worker_event_index=19,
-                data=RunFailedData(
-                    error_code=adapter_error_code("late_failure"),
+            data=RunFailedData(
+                error_code=adapter_error_code("late_failure"),
                 message="late failure",
                 provider_request_id=None,
                 recoverable=False,
@@ -4780,9 +4812,7 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == (
-            "late_terminal_after_active_cancel"
-        )
+        assert _payload(result.events[0])["reason"] == ("late_terminal_after_active_cancel")
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
         assert _event_count(store.transaction_runner, "ATTEMPT_FAILED") == 0
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
@@ -4837,9 +4867,7 @@ def test_host_lifecycle_after_run_cancelling_is_diagnostic_only(
         assert diagnostic.event_id.startswith("event-host-lifecycle-")
         assert diagnostic.source == "host.worker_lifecycle"
         diagnostic_payload = _payload(diagnostic)
-        assert diagnostic_payload["reason"] == (
-            "host_lifecycle_after_active_cancel"
-        )
+        assert diagnostic_payload["reason"] == ("host_lifecycle_after_active_cancel")
         assert diagnostic_payload["lifecycle_source"] == lifecycle_source
         assert "engine_event_type" not in diagnostic_payload
         assert "engine_event_ref" not in diagnostic_payload
@@ -4891,13 +4919,9 @@ def test_late_awaiting_after_cancel_does_not_move_to_waiting(
 
         assert suspended_result.status == EngineIngestStatus.ACCEPTED
         assert awaiting_result.status == EngineIngestStatus.ACCEPTED
-        assert _payload(suspended_result.events[0])["reason"] == (
-            "tool_awaiting"
-        )
+        assert _payload(suspended_result.events[0])["reason"] == ("tool_awaiting")
         assert _payload(suspended_result.events[0])["run_status"] == "cancelling"
-        assert _payload(suspended_result.events[0])[
-            "waiting_confirmation_accepted"
-        ] is False
+        assert _payload(suspended_result.events[0])["waiting_confirmation_accepted"] is False
         assert _payload(awaiting_result.events[0])["run_status"] == "cancelling"
         assert _event_count(store.transaction_runner, "RUN_WAITING") == 0
         assert _event_count(store.transaction_runner, "ATTEMPT_SUSPENDED") == 0
@@ -5005,9 +5029,7 @@ class _CloseActiveCancelWatchdogOperation:
             ActiveCancelWatchdogCloseoutInput(
                 run_id=self.seeded.run_id,
                 attempt_id=self.seeded.attempt_id,
-                attempt_cancelled_event_id=(
-                    "event-active-watchdog-attempt-cancelled-ingest"
-                ),
+                attempt_cancelled_event_id=("event-active-watchdog-attempt-cancelled-ingest"),
                 run_cancelled_event_id="event-active-watchdog-run-cancelled-ingest",
                 occurred_at=_NOW,
                 actor="host.active_cancel_watchdog",
@@ -5050,10 +5072,7 @@ def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
             "ATTEMPT_FAILED",
             "RUN_FAILED",
         ]
-        assert all(
-            event.event_id.startswith("event-host-lifecycle-")
-            for event in result.events
-        )
+        assert all(event.event_id.startswith("event-host-lifecycle-") for event in result.events)
         assert all(event.source == "host.worker_lifecycle" for event in result.events)
         attempt_payload = _payload(result.events[0])
         assert "engine_event_ref" not in attempt_payload
@@ -5062,9 +5081,7 @@ def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
             lambda transaction: sqlite_payload_object(
                 transaction,
                 payload_ref=cast(str, attempt_payload["terminal_summary_ref"]),
-                payload_digest=cast(
-                    str, attempt_payload["terminal_summary_digest"]
-                ),
+                payload_digest=cast(str, attempt_payload["terminal_summary_digest"]),
                 payload_label="host lifecycle terminal payload",
             )
         )
@@ -5089,9 +5106,7 @@ def test_host_lifecycle_ingress_rejects_mismatched_run_identity(
 
     durable_read_run = engine_ingest_module.read_run_by_id
 
-    def mismatched_read_run(
-        transaction: HostTransaction, run_id: str
-    ) -> RunRow | None:
+    def mismatched_read_run(transaction: HostTransaction, run_id: str) -> RunRow | None:
         """返回 key 查询命中但 row identity 漂移的测试 double。
 
         :param transaction: 当前 Host transaction。
@@ -5126,9 +5141,7 @@ def test_host_lifecycle_ingress_rejects_mismatched_run_identity(
         assert result.status is EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert result.terminal_closeout is False
-        assert [event.event_type for event in result.events] == [
-            "HOST_LIFECYCLE_DIAGNOSTIC"
-        ]
+        assert [event.event_type for event in result.events] == ["HOST_LIFECYCLE_DIAGNOSTIC"]
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
         assert _statuses(store.transaction_runner, seeded) == (
             RunStatus.RUNNING,
@@ -5178,10 +5191,7 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
             "ATTEMPT_LOST",
             "RUN_LOST",
         ]
-        assert all(
-            event.event_id.startswith("event-host-lifecycle-")
-            for event in first.events
-        )
+        assert all(event.event_id.startswith("event-host-lifecycle-") for event in first.events)
         assert all(event.source == "host.worker_lifecycle" for event in first.events)
         payload = _payload(first.events[1])
         assert "engine_event_ref" not in payload
@@ -5190,9 +5200,7 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
             lambda transaction: sqlite_payload_object(
                 transaction,
                 payload_ref=cast(str, attempt_payload["terminal_summary_ref"]),
-                payload_digest=cast(
-                    str, attempt_payload["terminal_summary_digest"]
-                ),
+                payload_digest=cast(str, attempt_payload["terminal_summary_digest"]),
                 payload_label="host lifecycle terminal payload",
             )
         )
@@ -5416,9 +5424,7 @@ def test_engine_run_failed_with_worker_lifecycle_reason_remains_engine_failed(
         ]
         assert all(event.event_id.startswith("event-engine-") for event in result.events)
         payload = _payload(result.events[0])
-        assert payload["engine_event_ref"] == (
-            f"engine:{seeded.execution_id}:1:run_failed"
-        )
+        assert payload["engine_event_ref"] == (f"engine:{seeded.execution_id}:1:run_failed")
         assert _statuses(store.transaction_runner, seeded) == (
             RunStatus.FAILED,
             AttemptStatus.FAILED,
@@ -5459,9 +5465,7 @@ def test_late_rejection_uses_status_even_when_terminal_refs_are_missing(
 
             run = read_run_by_id(transaction, seeded.run_id)
             attempt = read_attempt_by_id(transaction, seeded.attempt_id)
-            dispatch = read_dispatch_record_by_attempt_id(
-                transaction, seeded.attempt_id
-            )
+            dispatch = read_dispatch_record_by_attempt_id(transaction, seeded.attempt_id)
             assert run is not None
             assert attempt is not None
             assert dispatch is not None
@@ -5541,9 +5545,7 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
                 iteration_index=0,
                 message_count=1,
                 role_sequence_digest=runner_role_sequence_digest(("user",)),
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             ValueError,
             "type/data mismatch",
@@ -5621,9 +5623,7 @@ def test_iteration_started_links_prepared_runner_call_manifest(
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5653,16 +5653,10 @@ def test_iteration_started_links_prepared_runner_call_manifest(
         assert link_payload["expected_message_count"] == 2
         assert link_payload["engine_role_sequence_digest"] == role_digest
         assert link_payload["expected_role_sequence_digest"] == role_digest
-        assert preview_payload["runner_call_iteration_link_event_id"] == (
-            result.events[0].event_id
-        )
-        assert preview_payload["runner_call_manifest_event_id"] == (
-            manifest_event.event_id
-        )
+        assert preview_payload["runner_call_iteration_link_event_id"] == (result.events[0].event_id)
+        assert preview_payload["runner_call_manifest_event_id"] == (manifest_event.event_id)
         assert validation["status"] == "complete"
-        assert validation["runner_call_iteration_link_event_id"] == (
-            result.events[0].event_id
-        )
+        assert validation["runner_call_iteration_link_event_id"] == (result.events[0].event_id)
         assert validation["manifest_event_id"] == manifest_event.event_id
         assert validation["continuation_limited_signal"] is False
 
@@ -5711,9 +5705,7 @@ def test_iteration_started_mismatch_fails_closed_after_link(
                 iteration_index=0,
                 message_count=message_count,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5749,12 +5741,8 @@ def test_iteration_started_mismatch_fails_closed_after_link(
         assert diagnostic["expected_digest"] == expected_digest
         assert rejected_payload["reason"] == "runner_call_manifest_mismatch"
         assert rejected_payload["stop_worker_stream"] is True
-        assert rejected_payload["runner_call_iteration_link_event_id"] == (
-            result.events[0].event_id
-        )
-        assert rejected_payload["runner_call_manifest_event_id"] == (
-            manifest_event.event_id
-        )
+        assert rejected_payload["runner_call_iteration_link_event_id"] == (result.events[0].event_id)
+        assert rejected_payload["runner_call_manifest_event_id"] == (manifest_event.event_id)
         assert replay.status == EngineIngestStatus.REJECTED
         assert replay.stop_worker_stream is True
         assert [event.event_type for event in replay.events] == [
@@ -5790,9 +5778,7 @@ def test_iteration_started_missing_initial_manifest_fails_closed(
                 iteration_index=0,
                 message_count=1,
                 role_sequence_digest=runner_role_sequence_digest(("user",)),
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5839,9 +5825,7 @@ def test_iteration_started_mismatch_link_does_not_seed_continuation(
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=observed_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5852,12 +5836,8 @@ def test_iteration_started_mismatch_link_does_not_seed_continuation(
                 iteration_id="iter-after-mismatch-prior",
                 iteration_index=1,
                 message_count=4,
-                role_sequence_digest=runner_role_sequence_digest(
-                    ("system", "user", "assistant", "tool")
-                ),
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                role_sequence_digest=runner_role_sequence_digest(("system", "user", "assistant", "tool")),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5879,9 +5859,7 @@ def test_iteration_started_mismatch_link_does_not_seed_continuation(
         assert [event.event_type for event in next_result.events] == [
             "ENGINE_EVENT_REJECTED",
         ]
-        assert _payload(next_result.events[0])["reason"] == (
-            "missing_runner_call_manifest"
-        )
+        assert _payload(next_result.events[0])["reason"] == ("missing_runner_call_manifest")
         assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
         assert (
             _event_count(
@@ -5908,9 +5886,7 @@ def test_iteration_started_rejected_event_does_not_seed_continuation(
                 iteration_index=0,
                 message_count=1,
                 role_sequence_digest=runner_role_sequence_digest(("user",)),
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5922,9 +5898,7 @@ def test_iteration_started_rejected_event_does_not_seed_continuation(
                 iteration_index=0,
                 message_count=1,
                 role_sequence_digest=runner_role_sequence_digest(("user",)),
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -5942,9 +5916,7 @@ def test_iteration_started_rejected_event_does_not_seed_continuation(
 
         assert first_result.status == EngineIngestStatus.REJECTED
         assert second_result.status == EngineIngestStatus.REJECTED
-        assert _payload(second_result.events[0])["reason"] == (
-            "missing_runner_call_manifest"
-        )
+        assert _payload(second_result.events[0])["reason"] == ("missing_runner_call_manifest")
         assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 0
 
 
@@ -5984,9 +5956,7 @@ def test_iteration_started_ambiguous_prepared_manifest_fails_closed(
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6029,9 +5999,7 @@ def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6043,9 +6011,7 @@ def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
                 iteration_index=0,
                 message_count=3,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6064,9 +6030,7 @@ def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
         assert accepted.status == EngineIngestStatus.ACCEPTED
         assert rejected.status == EngineIngestStatus.REJECTED
         assert rejected.stop_worker_stream is True
-        assert _payload(rejected.events[0])["reason"] == (
-            "runner_call_iteration_link_conflict"
-        )
+        assert _payload(rejected.events[0])["reason"] == ("runner_call_iteration_link_conflict")
         assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ITERATION_LINKED") == 1
 
 
@@ -6105,9 +6069,7 @@ def test_iteration_started_links_all_ordinary_dispatch_kinds(
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6120,9 +6082,7 @@ def test_iteration_started_links_all_ordinary_dispatch_kinds(
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert result.events[0].event_type == "RUNNER_CALL_INPUT_ITERATION_LINKED"
-        assert _payload(result.events[0])["manifest_event_id"] == (
-            manifest_event.event_id
-        )
+        assert _payload(result.events[0])["manifest_event_id"] == (manifest_event.event_id)
         assert _payload(result.events[0])["runner_call_kind"] == runner_call_kind
 
 
@@ -6174,9 +6134,7 @@ def test_runner_call_manifest_rejects_stale_and_unknown_governance_trigger(
         )
 
         assert hot.runner_call_trigger_reason == "context_governance_resolved"
-        assert manifest.identity.runner_call_trigger_reason == (
-            "context_governance_resolved"
-        )
+        assert manifest.identity.runner_call_trigger_reason == ("context_governance_resolved")
 
         invalid_hot_payload = dict(hot_payload)
         invalid_hot_payload["runner_call_trigger_reason"] = invalid_trigger_reason
@@ -6184,9 +6142,7 @@ def test_runner_call_manifest_rejects_stale_and_unknown_governance_trigger(
             parse_runner_call_hot_payload(invalid_hot_payload)
 
         invalid_manifest_json = dict(manifest_json)
-        invalid_manifest_json["runner_call_trigger_reason"] = (
-            invalid_trigger_reason
-        )
+        invalid_manifest_json["runner_call_trigger_reason"] = invalid_trigger_reason
         with pytest.raises(HostDurableError, match="runner_call_trigger_reason"):
             parse_runner_call_manifest(
                 invalid_manifest_json,
@@ -6219,9 +6175,7 @@ def test_iteration_started_does_not_link_compactor_manifest(tmp_path: Path) -> N
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6243,9 +6197,7 @@ def test_iteration_started_continuation_reset_uses_limited_signal_after_link(
     """iteration_index reset 为 0 时不能误匹配已 linked ordinary manifest。"""
 
     initial_digest = runner_role_sequence_digest(("system", "user"))
-    continuation_digest = runner_role_sequence_digest(
-        ("system", "user", "assistant", "tool")
-    )
+    continuation_digest = runner_role_sequence_digest(("system", "user", "assistant", "tool"))
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         _append_prepared_runner_call_manifest(
@@ -6266,9 +6218,7 @@ def test_iteration_started_continuation_reset_uses_limited_signal_after_link(
                 iteration_index=0,
                 message_count=2,
                 role_sequence_digest=initial_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6280,9 +6230,7 @@ def test_iteration_started_continuation_reset_uses_limited_signal_after_link(
                 iteration_index=0,
                 message_count=4,
                 role_sequence_digest=continuation_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6321,9 +6269,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
 ) -> None:
     """tool-loop continuation iteration 会写 canonical limited manifest signal。"""
 
-    role_digest = runner_role_sequence_digest(
-        ("system", "user", "assistant", "tool")
-    )
+    role_digest = runner_role_sequence_digest(("system", "user", "assistant", "tool"))
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         _append_prior_iteration_started_preview(
@@ -6341,9 +6287,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
                 iteration_index=1,
                 message_count=4,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6359,10 +6303,13 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "RUNNER_CALL_INPUT_ASSEMBLED",
             "ITERATION_STARTED",
         ]
-        assert _event_count(
-            store.transaction_runner,
-            CONTEXT_BUDGET_EVALUATED,
-        ) == 0
+        assert (
+            _event_count(
+                store.transaction_runner,
+                CONTEXT_BUDGET_EVALUATED,
+            )
+            == 0
+        )
         manifest_event = result.events[0]
         preview_event = result.events[1]
         manifest_hot = _payload(manifest_event)
@@ -6397,9 +6344,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "expected_digest": None,
             "consumer_boundary": "host.engine_ingest",
         }
-        assert manifest_body["manifest_id"] == (
-            f"runner-call-manifest:{manifest_event.event_id}"
-        )
+        assert manifest_body["manifest_id"] == (f"runner-call-manifest:{manifest_event.event_id}")
         assert manifest_body["message_entries"] == []
         assert manifest_body["message_count"] == 4
         assert manifest_event.payload_ref == manifest_hot["manifest_payload_ref"]
@@ -6444,9 +6389,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
                 manifest_digest=sha256_digest_json({"anchor": "manifest"}),
                 iteration_link_event_id="event-anchor-link",
                 usage_event_id="event-anchor-usage",
-                usage_observation_digest=sha256_digest_json(
-                    {"anchor": "usage"}
-                ),
+                usage_observation_digest=sha256_digest_json({"anchor": "usage"}),
                 iteration_completed_event_id="event-anchor-completed",
                 usage_anchor_tokens=100,
                 conservative_anchor_tokens=100,
@@ -6460,9 +6403,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
         resolve_anchor,
     )
 
-    role_digest = runner_role_sequence_digest(
-        ("system", "user", "assistant", "tool")
-    )
+    role_digest = runner_role_sequence_digest(("system", "user", "assistant", "tool"))
     input_projection = (
         RunnerInputMessageProjection(
             index=0,
@@ -6494,16 +6435,12 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
         RunnerInputMessageProjection(
             index=3,
             role="tool",
-            content='{"current_time":"2026-07-07 19:18:11","payload":"'
-            + ("y" * 5000)
-            + '"}',
+            content='{"current_time":"2026-07-07 19:18:11","payload":"' + ("y" * 5000) + '"}',
             tool_call_id="call-time",
             tool_calls=(),
         ),
     )
-    with open_host_durable_store(
-        _options(tmp_path, payload_inline_threshold_bytes=4096)
-    ) as store:
+    with open_host_durable_store(_options(tmp_path, payload_inline_threshold_bytes=4096)) as store:
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
@@ -6523,9 +6460,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
                 iteration_index=1,
                 message_count=4,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
                 input_projection=input_projection,
             ),
             event_type=EngineEventType.ITERATION_STARTED,
@@ -6544,29 +6479,17 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             "ITERATION_STARTED",
         )
         manifest_hot = _payload(result.events[0])
-        budget_payload = parse_context_budget_evaluated_payload(
-            _payload(result.events[1])
-        )
+        budget_payload = parse_context_budget_evaluated_payload(_payload(result.events[1]))
         preview_payload = _payload(result.events[2])
         validation = preview_payload["runner_call_manifest_validation"]
         assert isinstance(validation, Mapping)
         assert manifest_hot["validation_status"] == "complete"
-        assert (
-            budget_payload.sizing_stage
-            is ContextSizingStage.CONTINUATION
-        )
-        assert (
-            budget_payload.budget_decision
-            is ContextBudgetDecision.ALLOW_DISPATCH
-        )
-        assert budget_payload.estimate_method is (
-            ContextEstimateMethod.USAGE_ANCHORED
-        )
+        assert budget_payload.sizing_stage is ContextSizingStage.CONTINUATION
+        assert budget_payload.budget_decision is ContextBudgetDecision.ALLOW_DISPATCH
+        assert budget_payload.estimate_method is (ContextEstimateMethod.USAGE_ANCHORED)
         assert budget_payload.anchor_diagnostic is not None
         assert len(observed_queries) == 1
-        assert observed_queries[0].candidate_input_cursor == (
-            result.events[0].event_sequence - 1
-        )
+        assert observed_queries[0].candidate_input_cursor == (result.events[0].event_sequence - 1)
         hot_diagnostic = _json_object(manifest_hot["diagnostic"])
         assert hot_diagnostic["status"] == "complete"
         assert hot_diagnostic["reason"] is None
@@ -6581,9 +6504,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             )
         )
         message_entries = _json_object_sequence(manifest_body["message_entries"])
-        projector_metadata = _json_object_sequence(
-            manifest_body["projector_metadata"]
-        )
+        projector_metadata = _json_object_sequence(manifest_body["projector_metadata"])
         assert len(message_entries) == 4
         assert len(projector_metadata) == 1
         projector_metadata_ids: set[str] = set()
@@ -6591,10 +6512,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             metadata_id = item["projector_metadata_id"]
             assert isinstance(metadata_id, str)
             projector_metadata_ids.add(metadata_id)
-        assert all(
-            entry["projector_metadata_id"] in projector_metadata_ids
-            for entry in message_entries
-        )
+        assert all(entry["projector_metadata_id"] in projector_metadata_ids for entry in message_entries)
         assert frozenset(projector_metadata[0]) == frozenset(
             {
                 "projector_metadata_id",
@@ -6625,9 +6543,7 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
                 expected_digest=projection_digest,
             )
         )
-        projection_messages = _json_object_sequence(
-            projection_payload.payload["messages"]
-        )
+        projection_messages = _json_object_sequence(projection_payload.payload["messages"])
         assert len(projection_messages) == len(message_entries)
         for message, entry in zip(projection_messages, message_entries, strict=True):
             assert message["index"] == entry["index"]
@@ -6691,16 +6607,10 @@ def test_continuation_source_failure_projects_typed_closed_reason(
         seeded = _seed_active_run(
             store.transaction_runner,
             record_source_candidate=True,
-            source_tool_schema=(
-                _reactive_source_tool_schema()
-                if failure_kind == "tool"
-                else None
-            ),
+            source_tool_schema=(_reactive_source_tool_schema() if failure_kind == "tool" else None),
             source_complete_sizing=True,
             source_request_semantics_digest_override=(
-                sha256_digest_json({"request": "corrupt"})
-                if failure_kind == "request"
-                else None
+                sha256_digest_json({"request": "corrupt"}) if failure_kind == "request" else None
             ),
         )
         _link_pre_start_runner_call_manifest(
@@ -6729,12 +6639,8 @@ def test_continuation_source_failure_projects_typed_closed_reason(
                 iteration_index=1,
                 message_count=2,
                 role_sequence_digest=role_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
-                input_projection=(
-                    () if failure_kind == "projection" else input_projection
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
+                input_projection=(() if failure_kind == "projection" else input_projection),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -6809,9 +6715,7 @@ def test_source_loader_ignores_valid_continuation_manifest(
                     iteration_index=1,
                     message_count=2,
                     role_sequence_digest=role_digest,
-                    runner_input_serializer_schema_version=(
-                        RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                    ),
+                    runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
                     input_projection=projection,
                 ),
                 event_type=EngineEventType.ITERATION_STARTED,
@@ -6866,10 +6770,7 @@ def test_source_loader_rejects_two_pre_start_manifests(
                 )
             )
 
-        assert (
-            exc_info.value.category
-            is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
-        )
+        assert exc_info.value.category is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
 
 
 def test_source_loader_rejects_eventlog_hot_identity_mismatch(
@@ -6920,10 +6821,7 @@ def test_source_loader_rejects_eventlog_hot_identity_mismatch(
                 )
             )
 
-        assert (
-            exc_info.value.category
-            is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
-        )
+        assert exc_info.value.category is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
 
 
 def test_source_loader_prioritizes_tool_failure_over_policy_failure(
@@ -6960,10 +6858,7 @@ def test_source_loader_prioritizes_tool_failure_over_policy_failure(
                 )
             )
 
-        assert (
-            exc_info.value.category
-            is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
-        )
+        assert exc_info.value.category is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA
 
 
 def test_source_loader_reports_policy_after_valid_tool_source(
@@ -6995,10 +6890,7 @@ def test_source_loader_reports_policy_after_valid_tool_source(
                 )
             )
 
-        assert (
-            exc_info.value.category
-            is PreparedRunnerCallSourceFailureCategory.POLICY
-        )
+        assert exc_info.value.category is PreparedRunnerCallSourceFailureCategory.POLICY
 
 
 @pytest.mark.parametrize("tamper_kind", tuple(_EngineHotTamperKind))
@@ -7045,9 +6937,7 @@ def test_engine_ingest_rejects_invalid_runner_call_hot_payload(
             diagnostic["observed_count"] = 3
             payload["diagnostic"] = diagnostic
         else:
-            diagnostic["expected_digest"] = sha256_digest_json(
-                {"roles": ["tampered"]}
-            )
+            diagnostic["expected_digest"] = sha256_digest_json({"roles": ["tampered"]})
             payload["diagnostic"] = diagnostic
 
         with pytest.raises(HostDurableError):
@@ -7089,9 +6979,7 @@ def test_iteration_completed_preview_includes_client_correlation_id(
         assert payload["client_correlation_id"] == "client-iteration"
 
 
-def _options(
-    tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536
-) -> HostDurableStoreOptions:
+def _options(tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536) -> HostDurableStoreOptions:
     """构造测试 durable store options。
 
     :param tmp_path: pytest 临时目录。
@@ -7123,6 +7011,7 @@ def _seed_active_run(
     source_tool_schema: ToolSchema | None = None,
     source_complete_sizing: bool = False,
     source_request_semantics_digest_override: str | None = None,
+    compactable_history: bool = False,
 ) -> _SeededRun:
     """创建已 worker accepted 的 active Run。
 
@@ -7134,6 +7023,7 @@ def _seed_active_run(
     :param source_complete_sizing: 是否记录 continuation 可消费的完整 sizing。
     :param source_request_semantics_digest_override: 可选 source sizing request
         semantics 摘要覆盖值，用于反例。
+    :param compactable_history: 是否在 current input 前写入可引用历史。
     :returns: seeded run。
     """
 
@@ -7148,10 +7038,8 @@ def _seed_active_run(
         execution_id="execution-ingest",
         dispatch_record_id="dispatch-ingest",
     )
-    policy_snapshot, effective_execution_config = (
-        _source_policy_snapshot_and_config(
-            allow_tool_calls=source_tool_schema is not None,
-        )
+    policy_snapshot, effective_execution_config = _source_policy_snapshot_and_config(
+        allow_tool_calls=source_tool_schema is not None,
     )
 
     def _operation(transaction: HostTransaction) -> None:
@@ -7164,6 +7052,33 @@ def _seed_active_run(
                 boot_id=None,
             ),
         )
+        if compactable_history:
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-input-ingest-history",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id="run-ingest-history",
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="USER_INPUT_ACCEPTED",
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id="client-ingest-history",
+                    idempotency_key="idem-ingest-history",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "display_text": "older compactable material",
+                        "operation_kind": "analysis",
+                        "effective_execution_config": (effective_execution_config),
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
         input_event = (
             EventLogStore()
             .append_event(
@@ -7186,9 +7101,7 @@ def _seed_active_run(
                     payload_json={
                         "display_text": display_text,
                         "operation_kind": "analysis",
-                        "effective_execution_config": (
-                            effective_execution_config
-                        ),
+                        "effective_execution_config": (effective_execution_config),
                     },
                     payload_ref=None,
                     payload_digest=None,
@@ -7258,9 +7171,7 @@ def _seed_active_run(
     if not record_source_candidate:
         return seeded
     required_cursor = transaction_runner.run_read(
-        lambda transaction: EventLogStore()
-        .read_events_after(transaction, 0, limit=100)[-1]
-        .event_sequence
+        lambda transaction: EventLogStore().read_events_after(transaction, 0, limit=100)[-1].event_sequence
     )
     catch_up = catch_up_conversation_memory_projection(
         transaction_runner,
@@ -7297,16 +7208,10 @@ def _seed_active_run(
                 source_refs=(),
             ),
             policy_snapshot=policy_snapshot,
-            tool_schemas=(
-                ()
-                if source_tool_schema is None
-                else (source_tool_schema,)
-            ),
+            tool_schemas=(() if source_tool_schema is None else (source_tool_schema,)),
             disable_tools=source_tool_schema is None,
             tool_execution_mode=(
-                ToolExecutionMode.NO_TOOL_DISABLED
-                if source_tool_schema is None
-                else ToolExecutionMode.TOOL_ENABLED
+                ToolExecutionMode.NO_TOOL_DISABLED if source_tool_schema is None else ToolExecutionMode.TOOL_ENABLED
             ),
             memory_projection_policy=default_memory_projection_policy(),
         )
@@ -7326,12 +7231,8 @@ def _seed_active_run(
             owner_host_instance_id=None,
         )
         sizing_snapshot: RunnerCallSizingSnapshot
-        source_estimator_digest = sha256_digest_json(
-            {"estimate": "source"}
-        )
-        source_policy_digest = sha256_digest_json(
-            {"context_policy": "source"}
-        )
+        source_estimator_digest = sha256_digest_json({"estimate": "source"})
+        source_policy_digest = sha256_digest_json({"context_policy": "source"})
         if source_complete_sizing:
             sizing_snapshot = complete_runner_call_sizing_snapshot(
                 sizing_stage=ContextSizingStage.ORDINARY,
@@ -7379,17 +7280,11 @@ def _seed_active_run(
                 result=build_conservative_context_sizing_result_from_atoms(
                     stage=ContextSizingStage.ORDINARY,
                     candidate_input_cursor=candidate.candidate_input_cursor,
-                    candidate_input_projection_ref=(
-                        candidate.candidate_input_projection_ref
-                    ),
+                    candidate_input_projection_ref=(candidate.candidate_input_projection_ref),
                     candidate_input_digest=candidate.input_snapshot_digest,
                     estimator_contract=ContextEstimatorContract(
-                        estimator_id=(
-                            CONTEXT_ESTIMATOR_CONTRACT.estimator_id
-                        ),
-                        estimator_version=(
-                            CONTEXT_ESTIMATOR_CONTRACT.estimator_version
-                        ),
+                        estimator_id=(CONTEXT_ESTIMATOR_CONTRACT.estimator_id),
+                        estimator_version=(CONTEXT_ESTIMATOR_CONTRACT.estimator_version),
                     ),
                     estimator_digest=source_estimator_digest,
                     conservative_input_tokens=128,
@@ -7400,9 +7295,7 @@ def _seed_active_run(
                     policy_snapshot_digest=source_policy_digest,
                 ),
             )
-            assert manifest_event.event_sequence > (
-                candidate.candidate_input_cursor
-            )
+            assert manifest_event.event_sequence > (candidate.candidate_input_cursor)
 
     transaction_runner.run_write(_record_source_candidate)
     return seeded
@@ -7478,9 +7371,7 @@ def _reactive_source_tool_schema() -> ToolSchema:
     )
 
 
-def _steer_to_new_running_attempt(
-    transaction_runner: HostTransactionRunner, seeded: _SeededRun
-) -> _SeededRun:
+def _steer_to_new_running_attempt(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> _SeededRun:
     """把 seeded active Run 切换为 steer 后的新 running Attempt。
 
     :param transaction_runner: Host transaction runner。
@@ -7700,9 +7591,7 @@ def _candidate(
     )
 
 
-def _context_compaction_candidate(
-    seeded: _SeededRun, *, worker_event_index: int
-) -> EngineEventCandidate:
+def _context_compaction_candidate(seeded: _SeededRun, *, worker_event_index: int) -> EngineEventCandidate:
     """构造 reactive context compaction EngineEvent candidate。
 
     :param seeded: seeded run。
@@ -7810,9 +7699,7 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
     )
 
 
-def _reactive_policy(
-    *, max_reactive_compactions_per_run: int = 2
-) -> ContextBudgetPolicy:
+def _reactive_policy(*, max_reactive_compactions_per_run: int = 2) -> ContextBudgetPolicy:
     """构造测试 reactive context budget policy。
 
     :param max_reactive_compactions_per_run: 单个 Run reactive compact 上限。
@@ -7848,9 +7735,7 @@ def _accepted_tool_record() -> AcceptedToolExecutionRecord:
     )
 
 
-def _awaiting_tool_record(
-    *, await_spec: ToolAwaitSpec | None = None
-) -> AwaitingToolExecutionRecord:
+def _awaiting_tool_record(*, await_spec: ToolAwaitSpec | None = None) -> AwaitingToolExecutionRecord:
     """构造测试用 awaiting tool execution record。
 
     :param await_spec: 可选等待规约；无则使用默认规约。
@@ -7904,9 +7789,7 @@ def _awaiting_accept_candidate(seeded: _SeededRun) -> ToolAwaitingAcceptCandidat
         tool_name="lookup",
         tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
         tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json(
-            {"arguments": {"query": "lookup"}}
-        ),
+        normalized_arguments_digest=sha256_digest_json({"arguments": {"query": "lookup"}}),
         accepted_arguments={"query": "lookup"},
         await_spec=await_spec,
         snapshot_ref=None,
@@ -7994,9 +7877,7 @@ def _tool_call() -> ToolCallRequest:
     )
 
 
-def _statuses(
-    transaction_runner: HostTransactionRunner, seeded: _SeededRun
-) -> tuple[RunStatus, AttemptStatus]:
+def _statuses(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> tuple[RunStatus, AttemptStatus]:
     """读取 Run / Attempt 状态。
 
     :param transaction_runner: Host transaction runner。
@@ -8112,9 +7993,7 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
 
     def _operation(transaction: HostTransaction) -> int:
         return sum(
-            1
-            for row in EventLogStore().read_events_after(transaction, 0, limit=100)
-            if row.event_type == event_type
+            1 for row in EventLogStore().read_events_after(transaction, 0, limit=100) if row.event_type == event_type
         )
 
     return transaction_runner.run_read(_operation)
@@ -8219,20 +8098,12 @@ def _append_prepared_runner_call_manifest(
         projector_id = (
             f"compactor_{role}_prompt"
             if is_compactor
-            else (
-                "run_input_system_context"
-                if role == "system"
-                else "user_input_message"
-            )
+            else ("run_input_system_context" if role == "system" else "user_input_message")
         )
         purpose = (
             "compactor_proposal_input"
             if is_compactor
-            else (
-                "post_compaction_input"
-                if runner_call_kind == "post_compaction_dispatch"
-                else "ordinary_run_input"
-            )
+            else ("post_compaction_input" if runner_call_kind == "post_compaction_dispatch" else "ordinary_run_input")
         )
         source_contract_refs = (f"event:source:{event_id}:{index}",)
         projector_schema_version = "compactor_projector.v1" if is_compactor else "run_input_projector.v1"
@@ -8260,17 +8131,11 @@ def _append_prepared_runner_call_manifest(
             {
                 "index": index,
                 "role": role,
-                "content_digest": sha256_digest_json(
-                    {"event_id": event_id, "message_index": index}
-                ),
+                "content_digest": sha256_digest_json({"event_id": event_id, "message_index": index}),
                 "content_size_bytes": index + 1,
                 "source_refs": list(source_contract_refs),
-                "projection_artifact_ref": (
-                    None if is_compactor and index == 0 else projection_ref
-                ),
-                "projection_artifact_digest": (
-                    None if is_compactor and index == 0 else projection_digest
-                ),
+                "projection_artifact_ref": (None if is_compactor and index == 0 else projection_ref),
+                "projection_artifact_digest": (None if is_compactor and index == 0 else projection_digest),
                 "projector_metadata_id": metadata_id,
                 "provider_tool_calls_digest": None,
                 "reasoning_content_digest": None,
@@ -8287,9 +8152,7 @@ def _append_prepared_runner_call_manifest(
             "compaction_operation_id": operation_id,
             "compactor_engine_run_id": "compactor-engine-run-test",
             "compaction_attempt_number": runner_call_index + 1,
-            "compaction_request_digest": sha256_digest_json(
-                {"compaction_operation_id": operation_id}
-            ),
+            "compaction_request_digest": sha256_digest_json({"compaction_operation_id": operation_id}),
             "compactor_input_projection_ref": projection_ref,
         }
     manifest: dict[str, JsonValue] = {
@@ -8306,12 +8169,8 @@ def _append_prepared_runner_call_manifest(
         "iteration_index": None,
         "message_count": message_count,
         "role_sequence_digest": role_sequence_digest,
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
-        "input_projection_digest": sha256_digest_json(
-            {"projection": event_id}
-        ),
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
+        "input_projection_digest": sha256_digest_json({"projection": event_id}),
         "message_entries": message_entries,
         "source_cursor_refs": [f"event:{event_id}"],
         "tool_schema_snapshot_refs": [],
@@ -8345,23 +8204,15 @@ def _append_prepared_runner_call_manifest(
                 "sizing_stage": "ordinary",
                 "estimator_id": "dayu.host.conservative_context_budget",
                 "estimator_version": "1",
-                "estimator_digest": sha256_digest_json(
-                    {"estimate": event_id}
-                ),
+                "estimator_digest": sha256_digest_json({"estimate": event_id}),
                 "conservative_input_tokens": 128,
                 "context_window_size": 32768,
                 "provider": "openai",
                 "model": "test-model",
-                "request_semantics_digest": sha256_digest_json(
-                    {"request": event_id}
-                ),
-                "input_snapshot_digest": sha256_digest_json(
-                    {"input": event_id}
-                ),
+                "request_semantics_digest": sha256_digest_json({"request": event_id}),
+                "input_snapshot_digest": sha256_digest_json({"input": event_id}),
                 "policy_ref": "policy-test",
-                "policy_snapshot_digest": sha256_digest_json(
-                    {"policy": event_id}
-                ),
+                "policy_snapshot_digest": sha256_digest_json({"policy": event_id}),
             }
         ),
     }
@@ -8392,18 +8243,10 @@ def _append_prepared_runner_call_manifest(
             validation_status="complete",
             message_count=message_count,
             role_sequence_digest=role_sequence_digest,
-            input_projection_digest=sha256_digest_json(
-                {"projection": event_id}
-            ),
-            runner_call_projection_artifact_ref=(
-                None if is_compactor else projection_ref
-            ),
-            runner_call_projection_artifact_digest=(
-                None if is_compactor else projection_digest
-            ),
-            runner_call_projection_artifact_size_bytes=(
-                None if is_compactor else 128
-            ),
+            input_projection_digest=sha256_digest_json({"projection": event_id}),
+            runner_call_projection_artifact_ref=(None if is_compactor else projection_ref),
+            runner_call_projection_artifact_digest=(None if is_compactor else projection_digest),
+            runner_call_projection_artifact_size_bytes=(None if is_compactor else 128),
             diagnostic=complete_runner_call_hot_diagnostic(
                 status="complete",
                 message_count=message_count,
@@ -8488,9 +8331,7 @@ def _link_pre_start_runner_call_manifest(
         )
     )
     pre_start_events = tuple(
-        event
-        for event in events
-        if parse_runner_call_hot_payload(_payload(event)).iteration_id is None
+        event for event in events if parse_runner_call_hot_payload(_payload(event)).iteration_id is None
     )
     assert len(pre_start_events) == 1
     hot = parse_runner_call_hot_payload(_payload(pre_start_events[0]))
@@ -8507,9 +8348,7 @@ def _link_pre_start_runner_call_manifest(
                 iteration_index=0,
                 message_count=hot.message_count,
                 role_sequence_digest=hot.role_sequence_digest,
-                runner_input_serializer_schema_version=(
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                runner_input_serializer_schema_version=(RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
             ),
             event_type=EngineEventType.ITERATION_STARTED,
         )
@@ -8611,9 +8450,7 @@ def _attempt_count(transaction_runner: HostTransactionRunner, run_id: str) -> in
     return transaction_runner.run_read(_operation)
 
 
-def _current_attempt_id(
-    transaction_runner: HostTransactionRunner, run_id: str
-) -> str:
+def _current_attempt_id(transaction_runner: HostTransactionRunner, run_id: str) -> str:
     """读取 Run 当前 Attempt id。
 
     :param transaction_runner: Host transaction runner。
@@ -8630,9 +8467,7 @@ def _current_attempt_id(
     return transaction_runner.run_read(_operation)
 
 
-def _attempt_status(
-    transaction_runner: HostTransactionRunner, attempt_id: str
-) -> AttemptStatus:
+def _attempt_status(transaction_runner: HostTransactionRunner, attempt_id: str) -> AttemptStatus:
     """读取 Attempt 状态。
 
     :param transaction_runner: Host transaction runner。
@@ -8648,9 +8483,7 @@ def _attempt_status(
     return transaction_runner.run_read(_operation)
 
 
-def _latest_event(
-    transaction_runner: HostTransactionRunner, event_type: str
-) -> EventLogRow:
+def _latest_event(transaction_runner: HostTransactionRunner, event_type: str) -> EventLogRow:
     """读取最近一条指定类型事件。
 
     :param transaction_runner: Host transaction runner。
@@ -8839,10 +8672,7 @@ def _tamper_reactive_source(
             manifest_json,
             hot_payload=hot,
         )
-        if (
-            tamper_kind
-            is _ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING
-        ):
+        if tamper_kind is _ReactiveSourceTamperKind.TOOL_SNAPSHOT_MISSING:
             tool_refs = tuple(
                 ref.removeprefix("tool_schema_snapshot_ref:")
                 for ref in manifest.source_refs.tool_schema_snapshot_refs
@@ -8858,9 +8688,7 @@ def _tamper_reactive_source(
             )
             assert result.rowcount == 1
             return
-        candidate_ref = _prepared_candidate_payload_ref(
-            manifest.input_projection_digest
-        )
+        candidate_ref = _prepared_candidate_payload_ref(manifest.input_projection_digest)
         result = transaction.execute(
             f"""
             UPDATE {TABLE_PAYLOAD_DESCRIPTORS}
@@ -8874,9 +8702,7 @@ def _tamper_reactive_source(
     transaction_runner.run_write(_operation)
 
 
-def _advance_run_input_sequence(
-    transaction_runner: HostTransactionRunner, *, run_id: str
-) -> None:
+def _advance_run_input_sequence(transaction_runner: HostTransactionRunner, *, run_id: str) -> None:
     """追加新输入事件并推进 Run input sequence。
 
     :param transaction_runner: Host transaction runner。
@@ -8951,8 +8777,7 @@ def _canonical_tool_event_count(transaction_runner: HostTransactionRunner) -> in
         return sum(
             1
             for row in EventLogStore().read_events_after(transaction, 0, limit=100)
-            if row.event_class is EventClass.CANONICAL_FACT
-            and row.event_type.startswith("TOOL_")
+            if row.event_class is EventClass.CANONICAL_FACT and row.event_type.startswith("TOOL_")
         )
 
     return transaction_runner.run_read(_operation)

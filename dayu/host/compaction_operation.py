@@ -35,18 +35,28 @@ from dayu.host._runner_call_manifest import (
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compact_payload import accepted_compact_business_texts
 from dayu.host.compaction import (
+    CompactAcceptedTruthV2,
     CompactMaterialBlock,
-    CompactQualityCheckResultVNext,
+    CompactRepairFeedbackV2,
+    CompactSessionSummaryV2,
+    CompactSourceBoundaryEntryV2,
+    CompactValidationReportV2,
+    CompactValidationIssueCodeV2,
+    CompactValidationIssueV2,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
     ContextCompactor,
-    ConversationCompactInputVNext,
-    ConversationCompactOutputVNext,
+    CompactInputV2,
+    CompactCandidateV2,
 )
 from dayu.host.context_budget import estimate_post_compact_budget
 from dayu.host.context_events import CompactorProposalManifestReference
-from dayu.host.context_governance import check_conversation_compact_output_vnext
+from dayu.host.context_governance import (
+    accept_compact_candidate_v2,
+    build_compact_repair_feedback_v2,
+)
+from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
@@ -83,9 +93,7 @@ _RUNNER_CALL_TRIGGER_COMPACTION_INITIAL = "context_compaction_initial_proposal"
 _RUNNER_CALL_TRIGGER_COMPACTION_REPAIR = "context_compaction_repair_attempt"
 _RUNNER_CALL_TRIGGER_COMPACTION_RETRY = "context_compaction_retry_attempt"
 _RUNNER_CALL_VALIDATION_COMPLETE = "complete"
-_COMPACTOR_INPUT_PROJECTION_MEDIA_TYPE = (
-    "application/vnd.dayu.compactor-input-projection+json"
-)
+_COMPACTOR_INPUT_PROJECTION_MEDIA_TYPE = "application/vnd.dayu.compactor-input-projection+json"
 _COMPACTOR_PROJECTOR_SCHEMA_VERSION = "compactor_projector.v1"
 _COMPACTOR_PROJECTOR_PURPOSE = "compactor_proposal_input"
 _COMPACTOR_SYSTEM_PROJECTOR_ID = "compactor_system_prompt"
@@ -93,26 +101,14 @@ _COMPACTOR_USER_PROJECTOR_ID = "compactor_user_prompt"
 _COMPACTOR_INPUT_PROJECTION_PAYLOAD_PREFIX = "compactor-input-projection"
 _RUNNER_CALL_MANIFEST_PAYLOAD_PREFIX = "runner-call-manifest"
 _GOVERNANCE_ACTOR = "host.context_governance"
-_COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION = (
-    "compaction_rejected_attempt_diagnostic.v1"
-)
-_COMPACTION_REJECTED_DIAGNOSTIC_MEDIA_TYPE = (
-    "application/vnd.dayu.compaction-rejected-attempt-diagnostic+json"
-)
+_COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION = "compaction_rejected_attempt_diagnostic.v1"
+_COMPACTION_REJECTED_DIAGNOSTIC_MEDIA_TYPE = "application/vnd.dayu.compaction-rejected-attempt-diagnostic+json"
 _COMPACTION_REJECTED_DIAGNOSTIC_PAYLOAD_PREFIX = "compaction-diagnostic"
-_EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX = (
-    "event-compaction-rejected-diagnostic"
-)
-_EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
-    "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
-)
-_DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = (
-    "material_pack_to_compact_input"
-)
+_EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX = "event-compaction-rejected-diagnostic"
+_EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+_DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = "material_pack_to_compact_input"
 _DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION = "proposal_execution"
-_DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = (
-    "conversation_compact_input_vnext_from_material_pack"
-)
+_DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = "conversation_compact_input_vnext_from_material_pack"
 _DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION = "compactor_proposal_execution"
 
 
@@ -133,7 +129,7 @@ class CompactorProposalRunInput:
     :param compactor_input_projection_digest: projection body digest。
     """
 
-    compact_input: ConversationCompactInputVNext
+    compact_input: CompactInputV2
     agent_request: AgentRunRequest
     compaction_request_digest: str
     compactor_engine_run_id: str
@@ -144,6 +140,7 @@ class CompactorProposalRunInput:
     user_prompt_digest: str
     compactor_input_projection: Mapping[str, JsonValue]
     compactor_input_projection_digest: str
+    repair_feedback: CompactRepairFeedbackV2 | None
 
 
 @runtime_checkable
@@ -157,6 +154,7 @@ class CompactorProposalPreparedCompactor(Protocol):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposalRunInput:
         """构造但不执行 compactor proposal runner call 输入。
 
@@ -165,6 +163,7 @@ class CompactorProposalPreparedCompactor(Protocol):
         :param compaction_operation_id: Host compaction operation id；未知时为
             ``None``。
         :param compaction_attempt_number: operation 内 proposal attempt 序号。
+        :param repair_feedback: 前次 semantic validation feedback。
         :returns: 真实 Engine runner call 输入与轻量观测。
         """
 
@@ -259,9 +258,7 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 transaction,
                 BoundedJsonPayloadWriteRequest(
                     payload_ref=projection_ref,
-                    sqlite_payload_id=_compactor_input_projection_payload_id(
-                        event_id
-                    ),
+                    sqlite_payload_id=_compactor_input_projection_payload_id(event_id),
                     payload_json=prepared_input.compactor_input_projection,
                     media_type=_COMPACTOR_INPUT_PROJECTION_MEDIA_TYPE,
                     metadata=payload_descriptor_metadata(
@@ -271,14 +268,10 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                             "event_id": event_id,
                             "compaction_operation_id": compaction_operation_id,
                             "compaction_attempt_number": compaction_attempt_number,
-                            "compaction_request_digest": (
-                                prepared_input.compaction_request_digest
-                            ),
+                            "compaction_request_digest": (prepared_input.compaction_request_digest),
                         },
                     ),
-                    expected_digest=(
-                        prepared_input.compactor_input_projection_digest
-                    ),
+                    expected_digest=(prepared_input.compactor_input_projection_digest),
                 ),
             )
             manifest = _compactor_runner_call_manifest_body(
@@ -303,9 +296,7 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                         {
                             "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
                             "event_id": event_id,
-                            "schema_version": (
-                                RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
-                            ),
+                            "schema_version": (RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION),
                             "compaction_operation_id": compaction_operation_id,
                             "compaction_attempt_number": compaction_attempt_number,
                         },
@@ -344,9 +335,7 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 manifest_payload_ref=manifest_descriptor.payload_ref,
                 manifest_digest=manifest_digest,
                 compactor_input_projection_ref=projection_descriptor.payload_ref,
-                compactor_input_projection_digest=(
-                    prepared_input.compactor_input_projection_digest
-                ),
+                compactor_input_projection_digest=(prepared_input.compactor_input_projection_digest),
                 compaction_operation_id=compaction_operation_id,
                 compaction_attempt_number=compaction_attempt_number,
                 compactor_engine_run_id=prepared_input.compactor_engine_run_id,
@@ -374,9 +363,7 @@ class CompactionNextPolicyDecision(StrEnum):
 
 _FAILURE_PROPOSAL_FAILED = CompactionFailureCategory.PROPOSAL_FAILED
 _FAILURE_QUALITY_CHECK_REJECTED = CompactionFailureCategory.QUALITY_CHECK_REJECTED
-_FAILURE_HARD_THRESHOLD_AFTER_COMPACT = (
-    CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
-)
+_FAILURE_HARD_THRESHOLD_AFTER_COMPACT = CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
 _FAILURE_MAX_ATTEMPTS_EXHAUSTED = CompactionFailureCategory.MAX_ATTEMPTS_EXHAUSTED
 _FAILURE_CANCELLATION_REQUESTED = CompactionFailureCategory.CANCELLATION_REQUESTED
 _NEXT_DECISION_RETRY_REPAIR = CompactionNextPolicyDecision.RETRY_SEMANTIC_REPAIR
@@ -490,8 +477,8 @@ class CompactionAttemptRejected:
 class CompactionOperationResult:
     """事务外 compaction operation 结果。
 
-    :param accepted_candidate: 被 Host 接受的 candidate；失败时为 ``None``。
-    :param quality_result: accepted candidate 对应 quality result。
+    :param accepted_truth: Context Governance 验收并绑定输入边界的唯一 truth；
+        失败时为 ``None``。
     :param rejected_attempts: semantic attempt reject 诊断列表。
     :param failure_reason: 最终失败原因；成功时为 ``None``。
     :param budget_after_attempted_compact: 最后一次 attempt 后预算；未知时为
@@ -504,14 +491,14 @@ class CompactionOperationResult:
         成功 Engine final 身份；operation 失败时为 ``None``。
     """
 
-    accepted_candidate: ConversationCompactOutputVNext | None
-    quality_result: CompactQualityCheckResultVNext | None
+    accepted_truth: CompactAcceptedTruthV2 | None
     rejected_attempts: tuple[CompactionAttemptRejected, ...]
     failure_reason: str | None
     budget_after_attempted_compact: int | None
     accepted_attempt_number: int | None
     accepted_successful_response_identity: SuccessfulRunnerResponseIdentity | None
     accepted_proposal_manifest_reference: CompactorProposalManifestReference | None
+    next_repair_feedback: CompactRepairFeedbackV2 | None = None
 
     def required_successful_response_identity(
         self,
@@ -524,9 +511,7 @@ class CompactionOperationResult:
 
         value = self.accepted_successful_response_identity
         if value is None:
-            raise RuntimeError(
-                "accepted compaction is missing successful response identity"
-            )
+            raise RuntimeError("accepted compaction is missing successful response identity")
         return value
 
     def required_proposal_manifest_reference(
@@ -540,9 +525,7 @@ class CompactionOperationResult:
 
         value = self.accepted_proposal_manifest_reference
         if value is None:
-            raise RuntimeError(
-                "accepted compaction is missing proposal manifest reference"
-            )
+            raise RuntimeError("accepted compaction is missing proposal manifest reference")
         return value
 
 
@@ -557,8 +540,8 @@ class _CompactorProposalAttempt:
     :param successful_response_identity: 产生 candidate 的成功 Runner call 身份。
     """
 
-    compact_input: ConversationCompactInputVNext
-    candidate: ConversationCompactOutputVNext
+    compact_input: CompactInputV2
+    candidate: CompactCandidateV2
     proposal_manifest_reference: CompactorProposalManifestReference | None
     successful_response_identity: SuccessfulRunnerResponseIdentity
 
@@ -571,11 +554,14 @@ class _CompactorProposalExecutionError(Exception):
     :param proposal_manifest_reference: 已写 manifest ref。
     :param successful_response_identity: 失败发生在成功 Engine final 之后时的
         同源响应身份；否则为 ``None``。
+    :param validation_report: raw LLM strict contract reject report；ordinary
+        execution failure 时为 ``None``。
     """
 
     original_exception: Exception
     proposal_manifest_reference: CompactorProposalManifestReference | None
     successful_response_identity: SuccessfulRunnerResponseIdentity | None
+    validation_report: CompactValidationReportV2 | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -676,6 +662,7 @@ async def run_compaction_operation(
     pass_queue: tuple[CompactionRequest, ...] = (),
     compaction_operation_id: str | None = None,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+    memory_policy: MemoryProjectionPolicy,
 ) -> CompactionOperationResult:
     """在事务外执行 Host semantic compaction operation。
 
@@ -688,6 +675,7 @@ async def run_compaction_operation(
         ``request`` 作为单 pass。
     :param compaction_operation_id: Host compaction operation id；生产路径必须传入。
     :param proposal_manifest_recorder: compactor proposal manifest 记录器。
+    :param memory_policy: 与 Memory projector 同源的 typed policy；生产调用必填。
     :returns: compaction operation 结果。
     """
 
@@ -701,6 +689,8 @@ async def run_compaction_operation(
         pass_queue=pass_queue,
         compaction_operation_id=compaction_operation_id,
         proposal_manifest_recorder=proposal_manifest_recorder,
+        memory_policy=memory_policy,
+        initial_repair_feedback=None,
     )
 
 
@@ -713,6 +703,8 @@ async def run_compaction_attempt(
     cancellation_token: CancellationToken,
     compaction_operation_id: str | None = None,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
+    memory_policy: MemoryProjectionPolicy,
+    repair_feedback: CompactRepairFeedbackV2 | None,
 ) -> CompactionOperationResult:
     """执行 single-operation 全局预算内的精确一次 semantic attempt。
 
@@ -727,6 +719,9 @@ async def run_compaction_attempt(
     :param cancellation_token: Host 注入 compactor 的真实取消 token。
     :param compaction_operation_id: Host compaction operation id；生产路径必须传入。
     :param proposal_manifest_recorder: compactor proposal manifest 记录器。
+    :param memory_policy: 与 Memory projector 同源的 typed policy；生产调用必填。
+    :param repair_feedback: 前一 semantic attempt 的脱敏 typed report；首次为
+        ``None``。
     :returns: 只执行当前 attempt 的 operation result。
     :raises ValueError: attempt range 非法时抛出。
     """
@@ -741,6 +736,8 @@ async def run_compaction_attempt(
         pass_queue=(),
         compaction_operation_id=compaction_operation_id,
         proposal_manifest_recorder=proposal_manifest_recorder,
+        memory_policy=memory_policy,
+        initial_repair_feedback=repair_feedback,
     )
 
 
@@ -755,6 +752,8 @@ async def _run_compaction_operation(
     pass_queue: tuple[CompactionRequest, ...],
     compaction_operation_id: str | None,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None,
+    memory_policy: MemoryProjectionPolicy | None,
+    initial_repair_feedback: CompactRepairFeedbackV2 | None,
 ) -> CompactionOperationResult:
     """执行共享的 semantic attempt loop。
 
@@ -767,37 +766,42 @@ async def _run_compaction_operation(
     :param pass_queue: reactive multi-pass request 队列。
     :param compaction_operation_id: durable operation id。
     :param proposal_manifest_recorder: proposal manifest owner。
+    :param memory_policy: 与 Memory projector 同源的 typed policy。
+    :param initial_repair_feedback: 跨 scheduler 调用延续的 semantic feedback。
     :returns: compaction operation 结果。
     :raises ValueError: attempt range 非法时抛出。
     """
 
     if first_attempt_number <= 0:
         raise ValueError("first_attempt_number must be positive")
+    if memory_policy is None:
+        raise TypeError("memory_policy is required")
     if max_attempt_number <= 0:
         raise ValueError("max_attempt_number must be positive")
     if first_attempt_number > max_attempt_number:
         raise ValueError("first_attempt_number must not exceed max_attempt_number")
     if last_execution_attempt_number < first_attempt_number:
-        raise ValueError(
-            "last_execution_attempt_number must not precede first_attempt_number"
-        )
+        raise ValueError("last_execution_attempt_number must not precede first_attempt_number")
     if last_execution_attempt_number > max_attempt_number:
-        raise ValueError(
-            "last_execution_attempt_number must not exceed max_attempt_number"
-        )
+        raise ValueError("last_execution_attempt_number must not exceed max_attempt_number")
     requests = _operation_pass_requests(request=request, pass_queue=pass_queue)
     rejected: list[CompactionAttemptRejected] = []
     last_budget: int | None = None
-    accepted_candidate: ConversationCompactOutputVNext | None = None
-    accepted_quality: CompactQualityCheckResultVNext | None = None
+    accepted_pass_truths: list[CompactAcceptedTruthV2 | None] = [None for _ in requests]
+    repair_feedback_by_pass: list[CompactRepairFeedbackV2 | None] = [None for _ in requests]
+    repair_feedback_by_pass[0] = initial_repair_feedback
+    pass_attempt_numbers: list[int | None] = [None for _ in requests]
+    pass_manifest_references: list[CompactorProposalManifestReference | None] = [None for _ in requests]
+    pass_response_identities: list[SuccessfulRunnerResponseIdentity | None] = [None for _ in requests]
     accepted_manifest_reference: CompactorProposalManifestReference | None = None
     accepted_attempt_number: int | None = None
-    accepted_successful_response_identity: (
-        SuccessfulRunnerResponseIdentity | None
-    ) = None
+    accepted_successful_response_identity: SuccessfulRunnerResponseIdentity | None = None
     attempt_number = first_attempt_number
-    for pass_request in requests:
-        pass_accepted = False
+    pass_index = 0
+    while pass_index < len(requests):
+        pass_request = requests[pass_index]
+        pass_accepted = accepted_pass_truths[pass_index] is not None
+        repair_feedback = repair_feedback_by_pass[pass_index]
         while attempt_number <= last_execution_attempt_number and not pass_accepted:
             proposal_manifest_reference: CompactorProposalManifestReference | None = None
             if cancellation_token.is_cancelled():
@@ -819,8 +823,7 @@ async def _run_compaction_operation(
                     exception=None,
                 )
                 return CompactionOperationResult(
-                    accepted_candidate=None,
-                    quality_result=None,
+                    accepted_truth=None,
                     rejected_attempts=tuple(rejected),
                     failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
@@ -830,9 +833,7 @@ async def _run_compaction_operation(
                 )
             repairable = attempt_number < max_attempt_number
             next_decision = _NEXT_DECISION_RETRY_REPAIR if repairable else _NEXT_DECISION_FAIL_COMPACTION
-            attempt_cancellation_token = _CompactionAttemptCancellationToken(
-                cancellation_token
-            )
+            attempt_cancellation_token = _CompactionAttemptCancellationToken(cancellation_token)
             try:
                 proposal = await _prepare_compactor_proposal(
                     compactor,
@@ -841,12 +842,44 @@ async def _run_compaction_operation(
                     compaction_operation_id=compaction_operation_id,
                     compaction_attempt_number=attempt_number,
                     proposal_manifest_recorder=proposal_manifest_recorder,
+                    repair_feedback=repair_feedback,
                 )
                 compact_input = proposal.compact_input
                 proposal_manifest_reference = proposal.proposal_manifest_reference
                 candidate = proposal.candidate
             except _CompactorProposalExecutionError as exc:
                 proposal_manifest_reference = exc.proposal_manifest_reference
+                if exc.validation_report is not None:
+                    rejected_attempt = _attempt_rejected(
+                        request=pass_request,
+                        attempt_number=attempt_number,
+                        failure_category=_FAILURE_QUALITY_CHECK_REJECTED,
+                        repairable=repairable,
+                        next_policy_decision=next_decision,
+                        budget_after_attempted_compact=None,
+                        diagnostic_suffix=_quality_suffix_vnext(exc.validation_report),
+                        proposal_manifest_reference=proposal_manifest_reference,
+                        successful_response_identity=(exc.successful_response_identity),
+                    )
+                    rejected.append(rejected_attempt)
+                    _log_rejected_attempt(
+                        request=pass_request,
+                        rejected=rejected_attempt,
+                        exception=None,
+                    )
+                    if not repairable:
+                        return _failed_operation_result(
+                            rejected=rejected,
+                            failure_reason=_FAILURE_QUALITY_CHECK_REJECTED,
+                            last_budget=last_budget,
+                        )
+                    repair_feedback = build_compact_repair_feedback_v2(
+                        exc.validation_report,
+                        previous_attempt_number=attempt_number,
+                    )
+                    repair_feedback_by_pass[pass_index] = repair_feedback
+                    attempt_number += 1
+                    continue
                 diagnostic_suffix = _exception_diagnostic_suffix(exc.original_exception)
                 diagnostic = _proposal_failure_diagnostic(
                     request=pass_request,
@@ -866,9 +899,7 @@ async def _run_compaction_operation(
                     budget_after_attempted_compact=None,
                     diagnostic_suffix=diagnostic_suffix,
                     proposal_manifest_reference=proposal_manifest_reference,
-                    successful_response_identity=(
-                        exc.successful_response_identity
-                    ),
+                    successful_response_identity=(exc.successful_response_identity),
                     diagnostic=diagnostic,
                 )
                 rejected.append(rejected_attempt)
@@ -879,8 +910,7 @@ async def _run_compaction_operation(
                 )
                 if not repairable:
                     return CompactionOperationResult(
-                        accepted_candidate=None,
-                        quality_result=None,
+                        accepted_truth=None,
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
@@ -910,8 +940,7 @@ async def _run_compaction_operation(
                     exception=None,
                 )
                 return CompactionOperationResult(
-                    accepted_candidate=None,
-                    quality_result=None,
+                    accepted_truth=None,
                     rejected_attempts=tuple(rejected),
                     failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
@@ -950,8 +979,7 @@ async def _run_compaction_operation(
                 )
                 if not repairable:
                     return CompactionOperationResult(
-                        accepted_candidate=None,
-                        quality_result=None,
+                        accepted_truth=None,
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
@@ -961,12 +989,16 @@ async def _run_compaction_operation(
                     )
                 attempt_number += 1
                 continue
-            quality = check_conversation_compact_output_vnext(compact_input, candidate)
+            acceptance = accept_compact_candidate_v2(
+                compact_input,
+                candidate,
+                memory_policy,
+            )
             last_budget = estimate_post_compact_budget(
                 compacted_business_texts=accepted_compact_business_texts(candidate),
-                current_input_text=compact_input.current_input_anchor.text,
+                current_input_text=compact_input.current_input.readable_text,
             )
-            if not quality.accepted:
+            if isinstance(acceptance, CompactValidationReportV2):
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
                     attempt_number=attempt_number,
@@ -974,11 +1006,9 @@ async def _run_compaction_operation(
                     repairable=repairable,
                     next_policy_decision=next_decision,
                     budget_after_attempted_compact=last_budget,
-                    diagnostic_suffix=_quality_suffix_vnext(quality),
+                    diagnostic_suffix=_quality_suffix_vnext(acceptance),
                     proposal_manifest_reference=proposal_manifest_reference,
-                    successful_response_identity=(
-                        proposal.successful_response_identity
-                    ),
+                    successful_response_identity=(proposal.successful_response_identity),
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -988,8 +1018,7 @@ async def _run_compaction_operation(
                 )
                 if not repairable:
                     return CompactionOperationResult(
-                        accepted_candidate=None,
-                        quality_result=None,
+                        accepted_truth=None,
                         rejected_attempts=tuple(rejected),
                         failure_reason=_FAILURE_QUALITY_CHECK_REJECTED.value,
                         budget_after_attempted_compact=last_budget,
@@ -997,53 +1026,24 @@ async def _run_compaction_operation(
                         accepted_successful_response_identity=None,
                         accepted_proposal_manifest_reference=None,
                     )
-                attempt_number += 1
-                continue
-            if _requires_budget_acceptance(pass_request) and (
-                last_budget >= pass_request.budget_before_compact.hard_threshold_tokens
-            ):
-                rejected_attempt = _attempt_rejected(
-                    request=pass_request,
-                    attempt_number=attempt_number,
-                    failure_category=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
-                    repairable=repairable,
-                    next_policy_decision=next_decision,
-                    budget_after_attempted_compact=last_budget,
-                    diagnostic_suffix=_DIAGNOSTIC_SUFFIX_HARD_THRESHOLD,
-                    proposal_manifest_reference=proposal_manifest_reference,
-                    successful_response_identity=(
-                        proposal.successful_response_identity
-                    ),
+                repair_feedback = build_compact_repair_feedback_v2(
+                    acceptance,
+                    previous_attempt_number=attempt_number,
                 )
-                rejected.append(rejected_attempt)
-                _log_rejected_attempt(
-                    request=pass_request,
-                    rejected=rejected_attempt,
-                    exception=None,
-                )
-                if not repairable:
-                    return CompactionOperationResult(
-                        accepted_candidate=None,
-                        quality_result=None,
-                        rejected_attempts=tuple(rejected),
-                        failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT.value,
-                        budget_after_attempted_compact=last_budget,
-                        accepted_attempt_number=None,
-                        accepted_successful_response_identity=None,
-                        accepted_proposal_manifest_reference=None,
-                    )
+                repair_feedback_by_pass[pass_index] = repair_feedback
                 attempt_number += 1
                 continue
             pass_accepted = True
+            accepted_pass_truths[pass_index] = acceptance
+            repair_feedback_by_pass[pass_index] = None
+            pass_attempt_numbers[pass_index] = attempt_number
+            pass_manifest_references[pass_index] = proposal_manifest_reference
+            pass_response_identities[pass_index] = proposal.successful_response_identity
             (
-                accepted_candidate,
-                accepted_quality,
                 accepted_manifest_reference,
                 accepted_attempt_number,
                 accepted_successful_response_identity,
             ) = (
-                candidate,
-                quality,
                 proposal_manifest_reference,
                 attempt_number,
                 proposal.successful_response_identity,
@@ -1051,37 +1051,339 @@ async def _run_compaction_operation(
             attempt_number += 1
         if not pass_accepted:
             return CompactionOperationResult(
-                accepted_candidate=None,
-                quality_result=None,
+                accepted_truth=None,
                 rejected_attempts=tuple(rejected),
                 failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
                 budget_after_attempted_compact=last_budget,
                 accepted_attempt_number=None,
                 accepted_successful_response_identity=None,
                 accepted_proposal_manifest_reference=None,
+                next_repair_feedback=repair_feedback_by_pass[pass_index],
             )
-    if accepted_candidate is None or accepted_quality is None:
-        return CompactionOperationResult(
-            accepted_candidate=None,
-            quality_result=None,
-            rejected_attempts=tuple(rejected),
-            failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
-            budget_after_attempted_compact=last_budget,
-            accepted_attempt_number=None,
-            accepted_successful_response_identity=None,
-            accepted_proposal_manifest_reference=None,
+        pass_index += 1
+        if pass_index < len(requests):
+            continue
+        root_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        root_candidate = _aggregate_pass_candidates(
+            root_input=root_input,
+            pass_truths=_required_pass_truths(accepted_pass_truths),
         )
-    return CompactionOperationResult(
-        accepted_candidate=accepted_candidate,
-        quality_result=accepted_quality,
-        rejected_attempts=tuple(rejected),
-        failure_reason=None,
-        budget_after_attempted_compact=last_budget,
-        accepted_attempt_number=accepted_attempt_number,
-        accepted_successful_response_identity=(
-            accepted_successful_response_identity
+        root_acceptance = accept_compact_candidate_v2(
+            root_input,
+            root_candidate,
+            memory_policy,
+        )
+        if isinstance(root_acceptance, CompactValidationReportV2):
+            routed = _route_root_validation_report(
+                report=root_acceptance,
+                pass_truths=_required_pass_truths(accepted_pass_truths),
+            )
+            if routed is None:
+                return _failed_operation_result(
+                    rejected=rejected,
+                    failure_reason=_FAILURE_QUALITY_CHECK_REJECTED,
+                    last_budget=last_budget,
+                )
+            routed_index, routed_report = routed
+            _record_root_rejection(
+                request=requests[routed_index],
+                report=routed_report,
+                attempt_number=_required_attempt_number(pass_attempt_numbers[routed_index]),
+                max_attempt_number=max_attempt_number,
+                budget_after_attempted_compact=last_budget,
+                proposal_manifest_reference=pass_manifest_references[routed_index],
+                successful_response_identity=pass_response_identities[routed_index],
+                rejected=rejected,
+            )
+            routed_feedback = build_compact_repair_feedback_v2(
+                routed_report,
+                previous_attempt_number=_required_attempt_number(pass_attempt_numbers[routed_index]),
+            )
+            if attempt_number > last_execution_attempt_number:
+                return _failed_operation_result(
+                    rejected=rejected,
+                    failure_reason=_FAILURE_QUALITY_CHECK_REJECTED,
+                    last_budget=last_budget,
+                    next_repair_feedback=routed_feedback,
+                )
+            repair_feedback_by_pass[routed_index] = routed_feedback
+            accepted_pass_truths[routed_index] = None
+            pass_index = routed_index
+            continue
+        last_budget = estimate_post_compact_budget(
+            compacted_business_texts=accepted_compact_business_texts(root_candidate),
+            current_input_text=root_input.current_input.readable_text,
+        )
+        if _requires_budget_acceptance(request) and (
+            last_budget >= request.budget_before_compact.hard_threshold_tokens
+        ):
+            budget_report = _root_budget_validation_report()
+            routed = _route_root_validation_report(
+                report=budget_report,
+                pass_truths=_required_pass_truths(accepted_pass_truths),
+            )
+            if routed is None:
+                return _failed_operation_result(
+                    rejected=rejected,
+                    failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
+                    last_budget=last_budget,
+                )
+            routed_index, routed_report = routed
+            _record_root_rejection(
+                request=requests[routed_index],
+                report=routed_report,
+                attempt_number=_required_attempt_number(pass_attempt_numbers[routed_index]),
+                max_attempt_number=max_attempt_number,
+                budget_after_attempted_compact=last_budget,
+                proposal_manifest_reference=pass_manifest_references[routed_index],
+                successful_response_identity=pass_response_identities[routed_index],
+                rejected=rejected,
+                failure_category=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
+            )
+            routed_feedback = build_compact_repair_feedback_v2(
+                routed_report,
+                previous_attempt_number=_required_attempt_number(pass_attempt_numbers[routed_index]),
+            )
+            if attempt_number > last_execution_attempt_number:
+                return _failed_operation_result(
+                    rejected=rejected,
+                    failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
+                    last_budget=last_budget,
+                    next_repair_feedback=routed_feedback,
+                )
+            repair_feedback_by_pass[routed_index] = routed_feedback
+            accepted_pass_truths[routed_index] = None
+            pass_index = routed_index
+            continue
+        return CompactionOperationResult(
+            accepted_truth=root_acceptance,
+            rejected_attempts=tuple(rejected),
+            failure_reason=None,
+            budget_after_attempted_compact=last_budget,
+            accepted_attempt_number=accepted_attempt_number,
+            accepted_successful_response_identity=(accepted_successful_response_identity),
+            accepted_proposal_manifest_reference=accepted_manifest_reference,
+        )
+    return _failed_operation_result(
+        rejected=rejected,
+        failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED,
+        last_budget=last_budget,
+    )
+
+
+def _aggregate_pass_candidates(
+    *,
+    root_input: CompactInputV2,
+    pass_truths: tuple[CompactAcceptedTruthV2, ...],
+) -> CompactCandidateV2:
+    """按 frozen pass 顺序机械合并 operation-private truths。
+
+    :param root_input: immutable operation root input。
+    :param pass_truths: 按 queue 顺序排列的 pass accepted truths。
+    :returns: 等待 root revalidation 的 aggregate candidate。
+    :raises ValueError: pass truths 为空时抛出。
+    """
+
+    if len(pass_truths) == 0:
+        raise ValueError("pass_truths must not be empty")
+    summaries = tuple(
+        truth.candidate.session_summary for truth in pass_truths if truth.candidate.session_summary is not None
+    )
+    summary: CompactSessionSummaryV2 | None = None
+    if summaries:
+        summary_labels = set(label for item in summaries for label in item.source_labels)
+        summary = CompactSessionSummaryV2(
+            text="\n".join(item.text for item in summaries),
+            source_labels=tuple(label for label in root_input.source_labels if label in summary_labels),
+        )
+    return CompactCandidateV2(
+        schema=pass_truths[0].candidate.schema,
+        session_summary=summary,
+        evidence_facts=tuple(item for truth in pass_truths for item in truth.candidate.evidence_facts),
+        answer_anchors=tuple(item for truth in pass_truths for item in truth.candidate.answer_anchors),
+        forward_intents=tuple(item for truth in pass_truths for item in truth.candidate.forward_intents),
+        reference_continuity=tuple(item for truth in pass_truths for item in truth.candidate.reference_continuity),
+        diagnostics=tuple(item for truth in pass_truths for item in truth.candidate.diagnostics),
+        explicitly_dropped_sources=tuple(
+            item for truth in pass_truths for item in truth.candidate.explicitly_dropped_sources
         ),
-        accepted_proposal_manifest_reference=accepted_manifest_reference,
+    )
+
+
+def _required_pass_truths(
+    values: list[CompactAcceptedTruthV2 | None],
+) -> tuple[CompactAcceptedTruthV2, ...]:
+    """把已完整接受的 pass truth list 收敛为非空 tuple。
+
+    :param values: 与 frozen pass queue 同序的 optional truths。
+    :returns: 全部非空的 accepted truth tuple。
+    :raises RuntimeError: 任一 pass 尚未接受时抛出。
+    """
+
+    if any(value is None for value in values):
+        raise RuntimeError("all pass truths must be accepted before root validation")
+    return tuple(value for value in values if value is not None)
+
+
+def _required_attempt_number(value: int | None) -> int:
+    """返回已接受 pass 的 attempt number。
+
+    :param value: optional attempt number。
+    :returns: positive attempt number。
+    :raises RuntimeError: pass 尚无 accepted attempt 时抛出。
+    """
+
+    if value is None:
+        raise RuntimeError("accepted pass is missing attempt number")
+    return value
+
+
+def _route_root_validation_report(
+    *,
+    report: CompactValidationReportV2,
+    pass_truths: tuple[CompactAcceptedTruthV2, ...],
+) -> tuple[int, CompactValidationReportV2] | None:
+    """把首个 root issue 路由到最后一个稳定贡献 pass。
+
+    :param report: aggregate root validation report。
+    :param pass_truths: frozen queue 顺序的 operation-private truths。
+    :returns: pass index 与仅含该 issue 的 report；不可归属时为 ``None``。
+    """
+
+    issue = report.issues[0]
+    for index in range(len(pass_truths) - 1, -1, -1):
+        if _pass_truth_contributes_to_issue(pass_truths[index], issue):
+            return index, CompactValidationReportV2(issues=(issue,))
+    return None
+
+
+def _pass_truth_contributes_to_issue(
+    truth: CompactAcceptedTruthV2,
+    issue: CompactValidationIssueV2,
+) -> bool:
+    """判断 pass 是否是 root issue 的稳定贡献者。
+
+    :param truth: operation-private pass truth。
+    :param issue: root validation issue。
+    :returns: source label 或 section 能归属当前 pass 时返回 ``True``。
+    """
+
+    boundary_labels = {entry.source_label for entry in truth.source_boundary}
+    if issue.source_labels:
+        return any(label in boundary_labels for label in issue.source_labels)
+    candidate = truth.candidate
+    section_presence = (
+        ("session_summary", candidate.session_summary is not None),
+        ("evidence_facts", bool(candidate.evidence_facts)),
+        ("answer_anchors", bool(candidate.answer_anchors)),
+        ("forward_intents", bool(candidate.forward_intents)),
+        ("reference_continuity", bool(candidate.reference_continuity)),
+        ("diagnostics", bool(candidate.diagnostics)),
+        (
+            "explicitly_dropped_sources",
+            bool(candidate.explicitly_dropped_sources),
+        ),
+    )
+    for section, present in section_presence:
+        if section in issue.json_path:
+            return present
+    if issue.code is CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED:
+        return any(present for _, present in section_presence)
+    return False
+
+
+def _root_budget_validation_report() -> CompactValidationReportV2:
+    """构造 operation-root hard budget 的 whole-candidate repair report。
+
+    :returns: 单问题 typed validation report。
+    """
+
+    return CompactValidationReportV2(
+        issues=(
+            CompactValidationIssueV2(
+                code=CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED,
+                json_path="$",
+                message="aggregate candidate 超过 operation hard budget；请压缩业务文本。",
+            ),
+        )
+    )
+
+
+def _record_root_rejection(
+    *,
+    request: CompactionRequest,
+    report: CompactValidationReportV2,
+    attempt_number: int,
+    max_attempt_number: int,
+    budget_after_attempted_compact: int | None,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None,
+    rejected: list[CompactionAttemptRejected],
+    failure_category: CompactionFailureCategory = _FAILURE_QUALITY_CHECK_REJECTED,
+) -> None:
+    """记录 aggregate root 对既有 pass attempt 的拒绝。
+
+    :param request: 被路由 pass request。
+    :param report: 路由后的单问题 report。
+    :param attempt_number: 产生该 pass truth 的全局 attempt number。
+    :param max_attempt_number: operation 全局 attempt 上限。
+    :param budget_after_attempted_compact: aggregate budget estimate。
+    :param proposal_manifest_reference: 同源 proposal manifest ref。
+    :param successful_response_identity: 同源成功 response identity。
+    :param rejected: operation reject accumulator。
+    :param failure_category: root reject 类别。
+    :returns: ``None``。
+    """
+
+    repairable = attempt_number < max_attempt_number
+    rejected_attempt = _attempt_rejected(
+        request=request,
+        attempt_number=attempt_number,
+        failure_category=failure_category,
+        repairable=repairable,
+        next_policy_decision=(_NEXT_DECISION_RETRY_REPAIR if repairable else _NEXT_DECISION_FAIL_COMPACTION),
+        budget_after_attempted_compact=budget_after_attempted_compact,
+        diagnostic_suffix=(
+            _DIAGNOSTIC_SUFFIX_HARD_THRESHOLD
+            if failure_category is _FAILURE_HARD_THRESHOLD_AFTER_COMPACT
+            else _quality_suffix_vnext(report)
+        ),
+        proposal_manifest_reference=proposal_manifest_reference,
+        successful_response_identity=successful_response_identity,
+    )
+    rejected.append(rejected_attempt)
+    _log_rejected_attempt(
+        request=request,
+        rejected=rejected_attempt,
+        exception=None,
+    )
+
+
+def _failed_operation_result(
+    *,
+    rejected: list[CompactionAttemptRejected],
+    failure_reason: CompactionFailureCategory,
+    last_budget: int | None,
+    next_repair_feedback: CompactRepairFeedbackV2 | None = None,
+) -> CompactionOperationResult:
+    """构造不泄漏 partial pass truth 的 operation failure arm。
+
+    :param rejected: 已记录 rejected attempts。
+    :param failure_reason: terminal failure category。
+    :param last_budget: 最后一次 aggregate 或 candidate budget。
+    :param next_repair_feedback: 后续 semantic attempt 应消费的脱敏 feedback。
+    :returns: strict failure result。
+    """
+
+    return CompactionOperationResult(
+        accepted_truth=None,
+        rejected_attempts=tuple(rejected),
+        failure_reason=failure_reason.value,
+        budget_after_attempted_compact=last_budget,
+        accepted_attempt_number=None,
+        accepted_successful_response_identity=None,
+        accepted_proposal_manifest_reference=None,
+        next_repair_feedback=next_repair_feedback,
     )
 
 
@@ -1099,6 +1401,8 @@ def _operation_pass_requests(
 
     if len(pass_queue) == 0:
         return (request,)
+    root_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    pass_boundary_entries: list[CompactSourceBoundaryEntryV2] = []
     for pass_request in pass_queue:
         if not isinstance(pass_request, CompactionRequest):
             raise TypeError("pass_queue items must be CompactionRequest")
@@ -1110,6 +1414,14 @@ def _operation_pass_requests(
             or pass_request.execution_id != request.execution_id
         ):
             raise ValueError("pass_queue request identity must match root request")
+        pass_input = conversation_compact_input_vnext_from_material_pack(pass_request.material_pack)
+        if pass_input.current_input != root_input.current_input:
+            raise ValueError("pass_queue current input must match root request")
+        pass_boundary_entries.extend(pass_input.source_boundary)
+    root_entries_by_label = {entry.source_label: entry for entry in root_input.source_boundary}
+    pass_entries_by_label = {entry.source_label: entry for entry in pass_boundary_entries}
+    if len(pass_boundary_entries) != len(pass_entries_by_label) or pass_entries_by_label != root_entries_by_label:
+        raise ValueError("pass_queue boundaries must be disjoint exact partitions of root")
     return pass_queue
 
 
@@ -1136,6 +1448,7 @@ async def _prepare_compactor_proposal(
     compaction_operation_id: str | None,
     compaction_attempt_number: int,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None,
+    repair_feedback: CompactRepairFeedbackV2 | None,
 ) -> _CompactorProposalAttempt:
     """准备、记录并执行一次 compactor proposal。
 
@@ -1145,6 +1458,7 @@ async def _prepare_compactor_proposal(
     :param compaction_operation_id: Host compaction operation id。
     :param compaction_attempt_number: operation 内 proposal attempt 序号。
     :param proposal_manifest_recorder: proposal manifest 记录器。
+    :param repair_feedback: 前次 semantic validation feedback。
     :returns: proposal attempt 结果。
     :raises TypeError: compactor 不支持 vNext capability 时抛出。
     """
@@ -1155,6 +1469,7 @@ async def _prepare_compactor_proposal(
             cancellation_token,
             compaction_operation_id=compaction_operation_id,
             compaction_attempt_number=compaction_attempt_number,
+            repair_feedback=repair_feedback,
         )
         manifest_reference = _record_compactor_proposal_manifest(
             recorder=proposal_manifest_recorder,
@@ -1168,9 +1483,7 @@ async def _prepare_compactor_proposal(
             proposal_manifest_reference=manifest_reference,
         )
         try:
-            proposal = await compactor.run_prepared_compactor_proposal(
-                prepared_input
-            )
+            proposal = await compactor.run_prepared_compactor_proposal(prepared_input)
         except asyncio.CancelledError as exc:
             if not cancellation_token.is_cancelled():
                 raise
@@ -1181,15 +1494,15 @@ async def _prepare_compactor_proposal(
             raise _CompactorProposalExecutionError(
                 original_exception=exc,
                 proposal_manifest_reference=manifest_reference,
-                successful_response_identity=(
-                    exc.successful_response_identity
-                ),
+                successful_response_identity=(exc.successful_response_identity),
+                validation_report=exc.validation_report,
             ) from exc
         except Exception as exc:
             raise _CompactorProposalExecutionError(
                 original_exception=exc,
                 proposal_manifest_reference=manifest_reference,
                 successful_response_identity=None,
+                validation_report=None,
             ) from exc
         try:
             _validate_prepared_proposal_identity(
@@ -1200,27 +1513,26 @@ async def _prepare_compactor_proposal(
             raise _CompactorProposalExecutionError(
                 original_exception=exc,
                 proposal_manifest_reference=manifest_reference,
-                successful_response_identity=(
-                    exc.successful_response_identity
-                ),
+                successful_response_identity=(exc.successful_response_identity),
+                validation_report=exc.validation_report,
             ) from exc
         return _CompactorProposalAttempt(
             compact_input=prepared_input.compact_input,
             candidate=proposal.candidate,
             proposal_manifest_reference=manifest_reference,
-            successful_response_identity=(
-                proposal.successful_response_identity
-            ),
+            successful_response_identity=(proposal.successful_response_identity),
         )
-    compact_input = conversation_compact_input_vnext_from_material_pack(
-        request.material_pack
-    )
+    compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
     _ensure_compactor_proposal_active(
         cancellation_token,
         proposal_manifest_reference=None,
     )
     try:
-        proposal = await compactor.compact(request, cancellation_token)
+        proposal = await compactor.compact(
+            request,
+            cancellation_token,
+            repair_feedback=repair_feedback,
+        )
     except asyncio.CancelledError as exc:
         if not cancellation_token.is_cancelled():
             raise
@@ -1232,6 +1544,7 @@ async def _prepare_compactor_proposal(
             original_exception=exc,
             proposal_manifest_reference=None,
             successful_response_identity=exc.successful_response_identity,
+            validation_report=exc.validation_report,
         ) from exc
     return _CompactorProposalAttempt(
         compact_input=compact_input,
@@ -1367,9 +1680,7 @@ def write_compaction_rejected_attempt_diagnostic_artifact(
     :raises HostDurableError: descriptor 或 artifact 写入失败时抛出。
     """
 
-    diagnostic_event_id = _new_event_id(
-        _EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX
-    )
+    diagnostic_event_id = _new_event_id(_EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX)
     artifact_digest = sha256_digest_json(diagnostic.artifact_body)
     artifact_ref = artifact_store.write_artifact_bytes(
         canonical_json_dumps(diagnostic.artifact_body).encode("utf-8"),
@@ -1463,9 +1774,7 @@ def _compactor_runner_call_manifest_body(
             "projector_metadata": list(projector_metadata),
             "source_cursor_refs": list(source_cursor_refs),
             "compactor_input_projection_ref": compactor_input_projection_ref,
-            "compactor_input_projection_digest": (
-                prepared_input.compactor_input_projection_digest
-            ),
+            "compactor_input_projection_digest": (prepared_input.compactor_input_projection_digest),
         }
     )
     return {
@@ -1477,24 +1786,18 @@ def _compactor_runner_call_manifest_body(
         "execution_id": request.execution_id,
         "runner_call_index": compaction_attempt_number - 1,
         "runner_call_kind": _RUNNER_CALL_KIND_COMPACTOR_PROPOSAL,
-        "runner_call_trigger_reason": _compactor_trigger_reason(
-            compaction_attempt_number
-        ),
+        "runner_call_trigger_reason": _compactor_trigger_reason(compaction_attempt_number),
         "iteration_id": None,
         "iteration_index": None,
         "message_count": prepared_input.message_count,
         "role_sequence_digest": prepared_input.role_sequence_digest,
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
         "input_projection_digest": input_projection_digest,
         "message_entries": list(message_entries),
         "source_cursor_refs": list(source_cursor_refs),
         "tool_schema_snapshot_refs": [],
         "memory_snapshot_cursor_ref": (
-            None
-            if request.memory_snapshot_cursor is None
-            else f"memory:{request.memory_snapshot_cursor}"
+            None if request.memory_snapshot_cursor is None else f"memory:{request.memory_snapshot_cursor}"
         ),
         "compact_artifact_refs": [],
         "context_fallback_decision_ref": None,
@@ -1508,9 +1811,7 @@ def _compactor_runner_call_manifest_body(
             "compaction_request_digest": prepared_input.compaction_request_digest,
             "compactor_input_projection_ref": compactor_input_projection_ref,
         },
-        "sizing_snapshot": runner_call_sizing_snapshot_json(
-            not_applicable_runner_call_sizing_snapshot()
-        ),
+        "sizing_snapshot": runner_call_sizing_snapshot_json(not_applicable_runner_call_sizing_snapshot()),
         "diagnostic": None,
     }
 
@@ -1540,12 +1841,8 @@ def _compactor_runner_call_hot_payload(
             host_run_id=_required_manifest_text(manifest, "host_run_id"),
             attempt_id=_optional_manifest_text(manifest, "attempt_id"),
             execution_id=_optional_manifest_text(manifest, "execution_id"),
-            runner_call_index=_required_manifest_int(
-                manifest, "runner_call_index"
-            ),
-            runner_call_kind=_required_manifest_text(
-                manifest, "runner_call_kind"
-            ),
+            runner_call_index=_required_manifest_int(manifest, "runner_call_index"),
+            runner_call_kind=_required_manifest_text(manifest, "runner_call_kind"),
             runner_call_trigger_reason=_required_manifest_text(
                 manifest,
                 "runner_call_trigger_reason",
@@ -1554,9 +1851,7 @@ def _compactor_runner_call_hot_payload(
             iteration_index=None,
             manifest_payload_ref=manifest_payload_ref,
             manifest_digest=manifest_digest,
-            manifest_schema_version=_required_manifest_text(
-                manifest, "schema_version"
-            ),
+            manifest_schema_version=_required_manifest_text(manifest, "schema_version"),
             validation_status=_RUNNER_CALL_VALIDATION_COMPLETE,
             message_count=message_count,
             role_sequence_digest=role_sequence_digest,
@@ -1597,26 +1892,18 @@ def _compactor_message_entries(
             {
                 "index": index,
                 "role": message.role.value,
-                "content_digest": sha256_digest_json(
-                    {"message_content": message_content}
-                ),
+                "content_digest": sha256_digest_json({"message_content": message_content}),
                 "content_size_bytes": len(message_content.encode("utf-8")),
                 "source_refs": list(
                     _compactor_message_source_refs(
                         index=index,
                         prepared_input=prepared_input,
-                        compactor_input_projection_ref=(
-                            compactor_input_projection_ref
-                        ),
+                        compactor_input_projection_ref=(compactor_input_projection_ref),
                     )
                 ),
-                "projection_artifact_ref": (
-                    None if index == 0 else compactor_input_projection_ref
-                ),
+                "projection_artifact_ref": (None if index == 0 else compactor_input_projection_ref),
                 "projection_artifact_digest": (
-                    None
-                    if index == 0
-                    else prepared_input.compactor_input_projection_digest
+                    None if index == 0 else prepared_input.compactor_input_projection_digest
                 ),
                 "projector_metadata_id": _compactor_projector_metadata_id(index),
                 "provider_tool_calls_digest": None,
@@ -1648,9 +1935,7 @@ def _compactor_projector_metadata(
                 projector_schema_version=_COMPACTOR_PROJECTOR_SCHEMA_VERSION,
                 projector_digest=prepared_input.system_prompt_asset_digest,
                 purpose=_COMPACTOR_PROJECTOR_PURPOSE,
-                source_contract_refs=(
-                    f"prompt-digest:{prepared_input.system_prompt_asset_digest}",
-                ),
+                source_contract_refs=(f"prompt-digest:{prepared_input.system_prompt_asset_digest}",),
             )
         ),
         runner_call_projector_metadata_descriptor(
@@ -1916,9 +2201,7 @@ def _proposal_failure_diagnostic_unchecked(
         exception_message=exception_message,
         proposal_manifest_reference=proposal_manifest_reference,
     )
-    material_pack_digest = sha256_digest_json(
-        {"material_pack": request.material_pack.to_json()}
-    )
+    material_pack_digest = sha256_digest_json({"material_pack": request.material_pack.to_json()})
     compaction_request_digest = request.digest()
     artifact_body = _proposal_failure_diagnostic_artifact_body(
         request=request,
@@ -2026,14 +2309,10 @@ def _proposal_failure_diagnostic_artifact_body(
         "exception_message": exception_message,
         "diagnostic_suffix": diagnostic_suffix,
         "proposal_manifest_ref": (
-            None
-            if proposal_manifest_reference is None
-            else proposal_manifest_reference.manifest_payload_ref
+            None if proposal_manifest_reference is None else proposal_manifest_reference.manifest_payload_ref
         ),
         "proposal_manifest_digest": (
-            None
-            if proposal_manifest_reference is None
-            else proposal_manifest_reference.manifest_digest
+            None if proposal_manifest_reference is None else proposal_manifest_reference.manifest_digest
         ),
         "material_pack_digest": material_pack_digest,
         "compaction_request_digest": compaction_request_digest,
@@ -2046,8 +2325,7 @@ def _proposal_failure_diagnostic_artifact_body(
             offending_block=offending_block,
         ),
         "all_previous_compacted_view_blocks": [
-            _previous_block_locator_json(block=block, ordinal=ordinal)
-            for ordinal, block in enumerate(previous_blocks)
+            _previous_block_locator_json(block=block, ordinal=ordinal) for ordinal, block in enumerate(previous_blocks)
         ],
     }
 
@@ -2064,9 +2342,7 @@ def _material_pack_summary(request: CompactionRequest) -> Mapping[str, JsonValue
         "trace_material_count": len(request.material_pack.trace_material),
         "evidence_material_count": len(request.material_pack.evidence_material),
         "answer_material_count": len(request.material_pack.answer_material),
-        "current_input_anchor_digest": (
-            request.material_pack.current_input_anchor.content_digest
-        ),
+        "current_input_anchor_digest": (request.material_pack.current_input_anchor.content_digest),
         "current_input_anchor_length": len(anchor_text),
     }
 
@@ -2085,10 +2361,7 @@ def _offending_block_artifact_json(
 
     if offending_block is None:
         return None
-    if (
-        offending_block.block_ordinal < 0
-        or offending_block.block_ordinal >= len(previous_blocks)
-    ):
+    if offending_block.block_ordinal < 0 or offending_block.block_ordinal >= len(previous_blocks):
         return None
     block = previous_blocks[offending_block.block_ordinal]
     return {
@@ -2106,9 +2379,7 @@ def _offending_block_artifact_json(
     }
 
 
-def _previous_block_locator_json(
-    *, block: CompactMaterialBlock, ordinal: int
-) -> Mapping[str, JsonValue]:
+def _previous_block_locator_json(*, block: CompactMaterialBlock, ordinal: int) -> Mapping[str, JsonValue]:
     """构造 previous view block locator 摘要。
 
     :param block: previous view block。
@@ -2175,9 +2446,7 @@ def _attempt_rejected(
         failure_category=failure_category,
         repairable=repairable,
         runner_attempt_summary_refs=(f"runner-attempt:{request.run_id}:{attempt_number}",),
-        diagnostic_refs=(
-            f"diagnostic:{failure_category.value}:{operation_ref}:{diagnostic_suffix}",
-        ),
+        diagnostic_refs=(f"diagnostic:{failure_category.value}:{operation_ref}:{diagnostic_suffix}",),
         next_policy_decision=next_policy_decision,
         budget_after_attempted_compact=budget_after_attempted_compact,
         proposal_manifest_reference=proposal_manifest_reference,
@@ -2186,16 +2455,14 @@ def _attempt_rejected(
     )
 
 
-def _quality_suffix_vnext(quality: CompactQualityCheckResultVNext) -> str:
+def _quality_suffix_vnext(quality: CompactValidationReportV2) -> str:
     """构造 quality reject 诊断后缀。
 
     :param quality: quality check 结果。
     :returns: 中性诊断后缀。
     """
 
-    if len(quality.rejection_reasons) == 0:
-        return _DIAGNOSTIC_SUFFIX_UNKNOWN
-    return "-".join(reason.value for reason in quality.rejection_reasons)
+    return "-".join(issue.code.value for issue in quality.issues)
 
 
 def _exception_diagnostic_suffix(exc: Exception) -> str:

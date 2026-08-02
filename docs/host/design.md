@@ -3029,7 +3029,7 @@ ordinary RunInput 的 LLM-facing material 不得暴露内部治理标识。下�
 | projector metadata、projector id、schema version、source contract refs、projection artifact ref | 删除；只保留 section title 和业务文本 | 不写替代字段；manifest 保留 provenance。 |
 | Attempt ledger、execution ledger、attempt id、execution id、iteration id、runner call index | 删除；如影响当前继续目标，用用户可读恢复说明 | “Continue from the previous interrupted step.” |
 | scheduler、lane、worker、dispatch、recovery 内部状态 | 删除；如用户需要知道状态，只写业务可见状态 | “The previous step was interrupted before a final answer.” |
-| Python 类型名、Host / Engine 内部类名、内部 enum 名 | 删除；用当前 prompt 自足说明字段含义 | 使用业务 schema 名或普通自然语言；不得写 `ConversationCompactOutputVNext` 这类实现类型名。 |
+| Python 类型名、Host / Engine 内部类名、内部 enum 名 | 删除；用当前 prompt 自足说明字段含义 | 使用业务 schema 名或普通自然语言；不得写 `CompactCandidateV2` 这类实现类型名。 |
 
 system envelope merge 只能合并已经由各 input provider / projection policy 治理后的 bounded content，不得新增、展开或重新召回内容。实现必须保留各 section 原有 item cap、char cap、selected recent window cap、floor 和 compact / fallback budget 约束；merge 后的总 envelope 大小必须有可测断言：`len(merged_system_content) <= sum(len(candidate_system_content)) + deterministic_header_separator_overhead`，其中 `candidate_system_content` 是所有准备进入 system envelope 的 bounded rendered content，`deterministic_header_separator_overhead` 只包含非空 section 的固定 Markdown header、header 与内容之间的固定换行，以及 section 间固定 separator。若某 section 在 merge 前已超出其 provider cap，必须在 provider 边界 fail closed 或截断；merge helper 不得用新的全局截断掩盖上游 cap 失效。focused tests 必须覆盖 section cap preservation 或上述总字符数 sanity，并断言 merge 没有引入候选 system content 之外的新业务文本。
 
@@ -3294,145 +3294,89 @@ F02 的稳定问题陈述固定为：`EvidenceReadableItem.tool_name` 已有业�
 
 LLM-facing memory / compact / RunInput material 不允许字段级 silent truncation、preview 化或 summary 化。任何给模型阅读的 `display_text`、`text`、`claim_text`、`answer_text`、`response_text`、`summary_text` 或等价业务字段，要么是完整选中 material / item / section 的可读内容，要么带明确 provenance 做 chunking，要么整体 keep / drop，要么 fail closed。上下文缩小只能通过 deterministic selection、whole-item 或 whole-section keep-drop、chunking with provenance、section-aware degrade 或 fail closed 表达；不得把超长字段静默切到固定字符数后继续让模型当作完整事实、完整证据或完整回答理解。
 
-### 24.3 vNext Compact I/O Contract
+### 24.3 Compact v2 I/O Contract
 
 Compact input 与 ordinary RunInput、fallback RunInput 共享同一套 material selection / rendering 语义：都从 `latest_accepted_compacted_view`、`post_compact_delta_material`、`current_input_anchor`、`selected_recent_window_policy` 与 `protected_recent_floor_policy` 推导 `rendered_context = assemble(...)`。三者差异只在 renderer、source label、accept barrier 与 tier output：compact input 使用 compactor renderer 和 prompt-local labels，并经过 compact output accept barrier；ordinary RunInput 使用普通 runner renderer；fallback RunInput 使用对应 fallback tier 的 bounded renderer。设计层不得为 compact input 另起一套 selector，也不得让 fallback selected recent window 变成独立 memory 系统。
 
-`ConversationCompactInputVNext` 是 Host 渲染给 compactor 的唯一 user material data block，结构固定为：
+`CompactInputV2` 是 Host 渲染给 compactor 的唯一 user material data block，结构固定为：
 
 ```text
-ConversationCompactInputVNext
-  schema_version: "conversation_compact_input_v1"
-  previous_compacted_view?: CompactReadableView
-  trace_material: list[TraceReadableItem]
-  evidence_material: list[EvidenceReadableItem]
-  answer_material: list[AnswerReadableItem]
-  current_input_anchor: CurrentInputAnchor
-  instruction: CompactInstruction
+CompactInputV2
+  schema: "dayu.context_compaction.input.v2"
+  current_input:
+    readable_text: str
+  source_boundary: list[CompactSourceBoundaryEntryV2]
+
+CompactSourceBoundaryEntryV2
+  source_label: str
+  source_kind: "previous_session_summary" | "previous_evidence_fact" |
+               "previous_answer_anchor" | "previous_forward_intent" |
+               "previous_reference_continuity" | "trace_material" |
+               "evidence_material" | "answer_material"
+  readable_text: str
 ```
 
-compact input 子类型固定为 LLM-readable schema，不携带 Host internal refs：
+每个 `source_label` 都是只在本次调用有效的 opaque handle；Host 在 typed input 中同时保存但绝不投影 `source_refs`。`source_boundary` 是模型可以 represented 或显式 drop 的完整闭集，material builder 把上一轮 accepted projection、post-compact delta trace、accepted evidence 与 answer material 统一投影到该边界。`current_input` 只有业务可读文本，不分配 label、不可引用、不可 compact，必须原样保留到 ordinary/fallback RunInput。空 `source_boundary` 不调用 compactor。
+
+`CompactCandidateV2` 是 compactor 必须返回的 strict JSON object：
 
 ```text
-PromptLocalLabel = str
-
-CompactReadableView
-  session_summary?: str
-  evidence_backed_facts: list[ReadableFactItem]
-  answer_anchors: list[ReadableAnswerAnchor]
-  forward_intents: list[ReadableForwardIntent]
-  reference_continuity_items: list[ReadableReferenceContinuityItem]
-
-ReadableFactItem
-  source_label: PromptLocalLabel
-  claim_text: str
-  source_note?: str
-
-ReadableAnswerAnchor
-  source_label: PromptLocalLabel
-  anchor_title: str
-  anchor_items: list[ReadableAnswerAnchorItem]
-
-ReadableAnswerAnchorItem
-  display_text: str
-  ordinal?: int
-
-ReadableForwardIntent
-  source_label: PromptLocalLabel
-  intent_type: "open_question" | "pending_clarification" | "pending_user_visible_task" | "next_step_note"
-  text: str
-  status: "open" | "blocked" | "superseded"
-
-ReadableReferenceContinuityItem
-  source_label: PromptLocalLabel
-  text: str
-  reason: "local_reference" | "ordinal_reference" | "ellipsis_recovery" | "recent_state"
-
-TraceReadableItem
-  source_label: PromptLocalLabel
-  trace_kind: "user_input" | "assistant_final_answer" | "user_visible_progress"
-  text: str
-
-EvidenceReadableItem
-  source_label: PromptLocalLabel
-  tool_name: str
-  query_text?: str
-  response_text: str
-  source_note?: str
-
-AnswerReadableItem
-  source_label: PromptLocalLabel
-  answer_text: str
-
-CurrentInputAnchor
-  anchor_label: PromptLocalLabel
-  text: str
-
-CompactInstruction
-  output_schema_name: "conversation_compact_output_v1"
-  compact_goal: "roll_forward_session_memory"
+CompactCandidateV2
+  schema: "dayu.context_compaction.output.v2"
+  session_summary: CompactSessionSummaryV2 | null
+  evidence_facts: list[CompactEvidenceFactV2]
+  answer_anchors: list[CompactAnswerAnchorV2]
+  forward_intents: list[CompactForwardIntentV2]
+  reference_continuity: list[CompactReferenceContinuityV2]
+  diagnostics: list[CompactCandidateDiagnosticV2]
+  explicitly_dropped_sources: list[CompactExplicitDropV2]
 ```
 
-所有 readable item 的 `source_label` 都是 prompt-local opaque label，只在本次 compact 调用内有效。`display_text`、`text`、`claim_text` 与 `answer_text` 是模型可读业务内容；这些字段不得承载 durable refs、digest、event sequence、policy name 或 compact boundary。`CompactInstruction` 只表达业务任务和目标输出 schema，不承载 Host budget policy、fallback decision、repair state 或内部 provenance map。
-
-`previous_compacted_view` 只包含上一轮 accepted compacted view 的业务可读 projection，包括 session summary、accepted evidence-backed facts、answer anchors、forward intents 与 reference continuity items；不得包含 raw compact artifact JSON。`trace_material` 只包含用户输入、助手最终回答和用户可见进展 / 结果摘要，不暴露 Host run-state 字段名。`evidence_material` 只包含可读 tool、query、response / source text 与 prompt-local evidence label。`answer_material` 只包含可读 assistant final answer / conclusion 与 prompt-local answer label。`current_input_anchor` 只包含当前用户输入文本和 prompt-local anchor label；同一 current user payload 不得再作为 trace material 重复渲染。`instruction` 只表达本次 compact 的业务任务和输出 contract 要求，`output_schema_name` 是业务可读输出 contract 标识，不是 Python 类型名；`instruction` 不承载 Host policy internals。
-
-`current_input_anchor` 是 readable but not citable：LLM 可以读取它来理解本次 compact 的边界，Host 也用它确保当前用户输入不会被 compact / fallback 吞掉；但 `current_input_anchor.anchor_label` 不属于任何 compact candidate 的 allowed source label set。Host accept barrier 必须拒绝任何在 `source_labels`、`evidence_labels`、`answer_source_labels`、diagnostic `source_labels` 或其它 candidate source 字段中引用 `current_input_anchor.anchor_label` 的输出。当前输入只有到下一轮成为历史时，才可能作为 trace material 进入后续 compact。
-
-`ConversationCompactOutputVNext` 是 compactor 必须返回的 strict JSON object：
+子项 schema 固定为：
 
 ```text
-ConversationCompactOutputVNext
-  schema_version: "conversation_compact_output_v1"
-  session_summary: SessionSummaryCandidate | null
-  evidence_backed_facts: list[EvidenceBackedFactCandidate]
-  answer_anchors: list[AnswerAnchorCandidate]
-  forward_intents: list[ForwardIntentCandidate]
-  reference_continuity_items: list[ReferenceContinuityCandidate]
-  diagnostics: list[CompactCandidateDiagnostic]
-```
-
-`session_summary` 为 nullable；compact 后如果没有足够材料形成 summary，Host 可以接受空 summary，但不能让空 summary 掩盖其它必需 quality gate。`evidence_backed_facts`、`answer_anchors`、`forward_intents`、`reference_continuity_items` 必须是 list，允许为空。所有 candidate 均必须引用本次 input 中存在且允许被引用的 prompt-local source labels；未知 label、跨 section label、stale label、缺 source label 或引用 `current_input_anchor.anchor_label` 都是 candidate invalid。candidate 文本必须非空且受 policy char cap 限制；枚举字段只能使用 schema 定义值；空字符串不表达删除或清空语义。
-
-candidate schema：
-
-```text
-SessionSummaryCandidate
-  summary_text: str
+CompactSessionSummaryV2
+  text: str
   source_labels: list[str]
 
-EvidenceBackedFactCandidate
-  claim_text: str
-  evidence_labels: list[str]
-  source_labels?: list[str]
+CompactEvidenceFactV2
+  claim: str
+  support_labels: list[str]
+  context_labels: list[str]
 
-AnswerAnchorCandidate
-  anchor_title: str
-  anchor_items: list[AnswerAnchorChild]
-  answer_source_labels: list[str]
+CompactAnswerAnchorV2
+  title: str
+  detail: str
+  source_labels: list[str]
 
-AnswerAnchorChild
-  display_text: str
-  ordinal?: int
-
-ForwardIntentCandidate
-  intent_type: "open_question" | "pending_clarification" | "pending_user_visible_task" | "next_step_note"
+CompactForwardIntentV2
+  intent_type: str
   text: str
   status: "open" | "blocked" | "superseded"
   source_labels: list[str]
 
-ReferenceContinuityCandidate
+CompactReferenceContinuityV2
   text: str
-  reason: "local_reference" | "ordinal_reference" | "ellipsis_recovery" | "recent_state"
+  reason: str
   source_labels: list[str]
 
-CompactCandidateDiagnostic
+CompactCandidateDiagnosticV2
   code: str
-  text: str
-  source_labels?: list[str]
+  message: str
+  source_labels: list[str]
+
+CompactExplicitDropV2
+  source_label: str
+  reason: "superseded" | "redundant" | "out_of_scope" | "policy_limit"
 ```
 
-`EvidenceBackedFactCandidate` 只能引用 evidence material labels，不能引用 user input、assistant final answer、session summary、answer anchor 或 forward intent 后冒充工具事实。LLM-facing candidate 不输出 `evidence_kind`；Host 根据 evidence labels 所属 material section 派生内部 evidence kind，并在 accepted typed candidate / memory projection 中保留 Host-owned typed value。`AnswerAnchorCandidate` 只能引用 assistant final answer / conclusion labels。`ForwardIntentCandidate` 不能被当作工具执行计划或事实证明，也不能自动触发工具。`ReferenceContinuityCandidate` 只能保存理解局部指代所需的最小文本，不能保留整段长输入。
+raw LLM response 必须在边界使用拒绝 duplicate key 的 JSON decoder，并对每一层执行 exact-key、exact-type parsing；unknown key、缺字段、别名、旧字段和多余包装一律拒绝，不存在旧 reader 或兼容分支。`session_summary` 可为 `null`，其它 collection 字段必须显式存在。diagnostics 只解释候选，不计 represented coverage；删除只能进入 `explicitly_dropped_sources`，不得用空文本、遗漏或 diagnostic 冒充删除。
+
+Context Governance 是唯一 accept owner。它从业务语义区引用关系派生 represented coverage，并要求每个 boundary label 恰好落入 represented 或 explicitly dropped，两集合必须完整、互斥且无重复。它还按 source kind 检查 section 合法性，拒绝 empty/diagnostics-only/low-information、unknown label、duplicate、同一 source 的矛盾事实与矛盾 intent，并使用 `MemoryProjectionPolicy` 与 Memory 相同的 `estimate_memory_size_units` 执行 session summary 字符上限，以及 evidence facts、answer anchors、forward intents、reference continuity 各自的 section item-count 与 aggregate-size 上限。diagnostics 不属于 Memory semantic projection，因此不受 `MemoryProjectionPolicy` cap；它仍受 strict shape 与 deterministic duplicate 规则约束。只有该 owner 能构造绑定 immutable input boundary 的 `CompactAcceptedTruthV2`。
+
+可修复 reject 生成 bounded、脱敏、自解释的前次 validation report；下一次 semantic attempt 必须基于同一 immutable input 完整重产 whole candidate，不能合并 partial candidate，也不能把 provider/timeout 等 execution retry 记为 semantic repair。reactive 模式保留 ordered pass queue，所有 pass 共享 operation 级 attempt budget；中间 pass 只在内存中累积 accepted truth，全部 pass 后必须回到 root input 做 coverage、重复、矛盾与 caps 重验。任一 pass 或 root 验证失败时，中间 truth 不得提交。
+
+无效 attempt 和中间 pass 不得写 accepted artifact、`CONTEXT_COMPACTED`、Memory、ordinary RunInput 或 public trace。只有 terminal permit 可以把 final accepted truth 写为单一 aggregate artifact 与单一 `CONTEXT_COMPACTED`；exhaust 只写单一 `CONTEXT_COMPACTION_FAILED`，然后沿既有 fallback/fail-closed 路径。late/stale completion 在 terminal 已确定后不得产生第二 terminal。Memory 只能读取已提交 canonical event 的 strict v2 projection，并以 accepted represented 与 dropped coverage 的并集删除/替换旧投影；current input 继续保留。artifact、EventLog、Memory、RunInput 与 trace 必须由同一个 final accepted truth 派生。
 
 ### 24.4 Snapshot Typed Schema
 
@@ -3572,8 +3516,8 @@ Host 负责：
 - provider-aware context budget policy。
 - RunInputBuilder 输入层预算观测。
 - proactive / reactive compact 触发。
-- `ConversationCompactInputVNext` 构造。
-- `ConversationCompactOutputVNext` accept barrier。
+- `CompactInputV2` 构造。
+- `CompactCandidateV2` accept barrier。
 - compaction whole-candidate repair / retry 编排。
 - failure closeout、tier 1-3 compact recovery fallback 与 tier 4-5 dispatch fallback。
 - context overflow recovery dispatch。
@@ -3667,7 +3611,7 @@ Context Governance 与 Conversation Memory 的关系必须保持单向。Convers
 
 Proactive compact 的 material view 必须由 EventLog-backed compact material builder 生成，而不是由 Context Governance 临时拼接。该 builder 的职责是从 latest accepted `CONTEXT_COMPACTED` 构造 `previous_compacted_view`，从 latest compact cursor 之后到当前 input 之前的 committed canonical facts 构造 post-compact delta material，并把当前 `USER_INPUT_ACCEPTED` 作为 current input anchor。Context Governance 只消费 builder 输出做预算估算、segment selection 与 compact operation 编排。
 
-第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `ConversationCompactOutputVNext` 结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 vNext compact I/O contract 为准。
+第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `CompactCandidateV2` 结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 vNext compact I/O contract 为准。
 
 Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、accepted attempt number、accepted candidate digest、prompt-local label mapping refs、source boundary refs、quality check result、budget after compact 与 projection signal。是否将 session summary、evidence-backed fact candidates、answer anchors、forward intents 或 reference continuity items materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
 
@@ -3793,7 +3737,7 @@ compaction request/trigger/terminal，不扩展为通用 terminal framework。
 
 HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
 
-Compaction request 的输入边界固定为 `ConversationCompactInputVNext`，而不是从 Session 起点重放 EventLog ledger。一次 compactor run 的 messages 只能由 compactor system prompt 和一个 user material data block 组成；data block 是 Host 对 latest accepted compacted view、post-compact delta material 与 current input anchor 的去重、分段、可读投影，不承载 Host 内部账本 dump。
+Compaction request 的输入边界固定为 `CompactInputV2`，而不是从 Session 起点重放 EventLog ledger。一次 compactor run 的 messages 只能由 compactor system prompt 和一个 user material data block 组成；data block 是 Host 对 latest accepted compacted view、post-compact delta material 与 current input anchor 的去重、分段、可读投影，不承载 Host 内部账本 dump。
 
 compact material selection 必须满足：
 

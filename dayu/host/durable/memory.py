@@ -164,10 +164,7 @@ class MemorySnapshotIntegrityIssue:
         """
 
         if not isinstance(self.failure_kind, MemorySnapshotIntegrityFailureKind):
-            raise TypeError(
-                "MemorySnapshotIntegrityIssue.failure_kind must be "
-                "MemorySnapshotIntegrityFailureKind"
-            )
+            raise TypeError("MemorySnapshotIntegrityIssue.failure_kind must be MemorySnapshotIntegrityFailureKind")
         _require_non_empty_text(
             self.message,
             field_name="MemorySnapshotIntegrityIssue.message",
@@ -188,14 +185,8 @@ class MemorySnapshotIntegrityIssue:
             self.policy_digest,
             field_name="MemorySnapshotIntegrityIssue.policy_digest",
         )
-        if (
-            self.checkpoint_event_sequence is not None
-            and self.checkpoint_event_sequence < _ZERO_CURSOR_SEQUENCE
-        ):
-            raise ValueError(
-                "MemorySnapshotIntegrityIssue.checkpoint_event_sequence "
-                "must be non-negative"
-            )
+        if self.checkpoint_event_sequence is not None and self.checkpoint_event_sequence < _ZERO_CURSOR_SEQUENCE:
+            raise ValueError("MemorySnapshotIntegrityIssue.checkpoint_event_sequence must be non-negative")
 
     def json_value(self) -> JsonValue:
         """返回 operator-facing 自解释 JSON object。
@@ -296,9 +287,7 @@ class ConversationMemoryProjectionConsumer:
 
         return self._event_filter
 
-    def apply_event(
-        self, transaction: HostTransaction, event: ProjectionEventView
-    ) -> ProjectionApplyResult:
+    def apply_event(self, transaction: HostTransaction, event: ProjectionEventView) -> ProjectionApplyResult:
         """在当前 transaction 内投影单个 EventLog event。
 
         :param transaction: Host durable transaction。
@@ -314,11 +303,7 @@ class ConversationMemoryProjectionConsumer:
             policy_digest=self._policy_digest,
         )
         previous_snapshot = None if latest is None else latest.snapshot
-        if (
-            previous_snapshot is not None
-            and previous_snapshot.cursor.checkpoint_event_sequence
-            >= event.event_sequence
-        ):
+        if previous_snapshot is not None and previous_snapshot.cursor.checkpoint_event_sequence >= event.event_sequence:
             return ProjectionApplyResult(ProjectionApplyStatus.DUPLICATE)
         snapshot = project_conversation_memory_event(
             previous_snapshot=previous_snapshot,
@@ -381,9 +366,7 @@ def _memory_projection_payload_view(
             payload=event.payload,
             assistant_final_answer_text=None,
             accepted_tool_evidence=None,
-            compacted_semantics=parse_context_compacted_semantic_payload(
-                event.payload
-            ),
+            compacted_semantics=parse_context_compacted_semantic_payload(event.payload),
         )
     if event.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return _MemoryProjectionPayloadView(
@@ -424,9 +407,7 @@ def _tool_result_memory_payload_view(
         resolved_payload=event.payload,
     )
     if projection.llm_material is None:
-        raise HostDurableError(
-            "TOOL_RESULT_ACCEPTED memory LLM material is missing"
-        )
+        raise HostDurableError("TOOL_RESULT_ACCEPTED memory LLM material is missing")
     return _MemoryProjectionPayloadView(
         payload=event.payload,
         assistant_final_answer_text=None,
@@ -494,9 +475,7 @@ class MemoryDiagnosticRow:
     recorded_at: str
 
 
-def read_memory_snapshot(
-    transaction: HostTransaction, snapshot_id: str
-) -> MemorySnapshotRow | None:
+def read_memory_snapshot(transaction: HostTransaction, snapshot_id: str) -> MemorySnapshotRow | None:
     """按 snapshot id 读取 memory snapshot。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -653,9 +632,7 @@ def write_memory_snapshot(
 
     _require_non_empty_text(updated_at, field_name="updated_at")
     _validate_snapshot_digest(snapshot)
-    snapshot_json = canonical_json_dumps(
-        conversation_memory_snapshot_to_json_value(snapshot)
-    )
+    snapshot_json = canonical_json_dumps(conversation_memory_snapshot_to_json_value(snapshot))
     transaction.execute(
         f"""
         INSERT INTO {TABLE_HOST_MEMORY_SNAPSHOTS} (
@@ -773,9 +750,7 @@ def write_memory_diagnostic(
     return written
 
 
-def reset_conversation_memory_projection(
-    transaction: HostTransaction, *, consumer_id: str
-) -> None:
+def reset_conversation_memory_projection(transaction: HostTransaction, *, consumer_id: str) -> None:
     """清空目标 conversation memory projection rows 及其 cursor / failure。
 
     projection checkpoint / failure 当前是 ``consumer_id`` 粒度，因此 reset
@@ -791,10 +766,7 @@ def reset_conversation_memory_projection(
     """
 
     _require_non_empty_text(consumer_id, field_name="consumer_id")
-    snapshot_filter = (
-        f"SELECT snapshot_id FROM {TABLE_HOST_MEMORY_SNAPSHOTS} "
-        "WHERE consumer_id = ?"
-    )
+    snapshot_filter = f"SELECT snapshot_id FROM {TABLE_HOST_MEMORY_SNAPSHOTS} WHERE consumer_id = ?"
     transaction.execute(
         f"""
         DELETE FROM {TABLE_HOST_MEMORY_DIAGNOSTICS}
@@ -826,9 +798,7 @@ def reset_conversation_memory_projection(
     )
 
 
-def read_memory_diagnostic(
-    transaction: HostTransaction, diagnostic_id: str
-) -> MemoryDiagnosticRow | None:
+def read_memory_diagnostic(transaction: HostTransaction, diagnostic_id: str) -> MemoryDiagnosticRow | None:
     """读取 memory diagnostic row。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -855,9 +825,7 @@ def read_memory_diagnostic(
     return _diagnostic_row_from_host_row(row)
 
 
-def _replace_memory_items(
-    transaction: HostTransaction, snapshot: ConversationMemorySnapshotVNext
-) -> None:
+def _replace_memory_items(transaction: HostTransaction, snapshot: ConversationMemorySnapshotVNext) -> None:
     """替换 snapshot 对应的 item rows。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -1002,11 +970,7 @@ def _insert_session_summary_item(
     """
 
     summary = snapshot.session_summary_memory
-    if (
-        summary.summary_text is None
-        or summary.event_id is None
-        or summary.event_sequence is None
-    ):
+    if summary.summary_text is None or summary.event_id is None or summary.event_sequence is None:
         raise HostDurableError("session summary memory item is incomplete")
     item_id = f"{snapshot.snapshot_id}:session_summary"
     _insert_item(
@@ -1219,9 +1183,7 @@ def _insert_memory_diagnostic(
     :returns: ``None``。
     """
 
-    diagnostic_json = canonical_json_dumps(
-        memory_diagnostic_to_json_value(diagnostic)
-    )
+    diagnostic_json = canonical_json_dumps(memory_diagnostic_to_json_value(diagnostic))
     transaction.execute(
         f"""
         INSERT INTO {TABLE_HOST_MEMORY_DIAGNOSTICS} (
@@ -1256,9 +1218,7 @@ def _insert_memory_diagnostic(
     )
 
 
-def _snapshot_row_from_host_row(
-    transaction: HostTransaction, row: HostRow
-) -> MemorySnapshotRow:
+def _snapshot_row_from_host_row(transaction: HostTransaction, row: HostRow) -> MemorySnapshotRow:
     """把 durable row 转换为 typed snapshot row。
 
     :param transaction: Host durable transaction。
@@ -1465,9 +1425,7 @@ def _memory_snapshot_item_kind_integrity_issues(
         if item_kind == _ITEM_KIND_OLD_VERIFIED_FACT:
             issues.append(
                 _memory_snapshot_integrity_issue(
-                    failure_kind=(
-                        MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
-                    ),
+                    failure_kind=(MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND),
                     message="old durable memory item kind verified_fact is not supported",
                     identity=identity,
                 )
@@ -1476,9 +1434,7 @@ def _memory_snapshot_item_kind_integrity_issues(
         if item_kind not in allowed_kinds:
             issues.append(
                 _memory_snapshot_integrity_issue(
-                    failure_kind=(
-                        MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
-                    ),
+                    failure_kind=(MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND),
                     message=f"unsupported durable memory item kind: {item_kind}",
                     identity=identity,
                 )
@@ -1521,9 +1477,7 @@ def _memory_snapshot_integrity_issue(
     )
 
 
-def _validate_snapshot_item_kinds(
-    transaction: HostTransaction, snapshot_id: str
-) -> None:
+def _validate_snapshot_item_kinds(transaction: HostTransaction, snapshot_id: str) -> None:
     """校验 snapshot item rows 没有旧 kind 或未知 kind。
 
     :param transaction: Host durable transaction。
@@ -1551,9 +1505,7 @@ def _validate_snapshot_item_kinds(
     for row in rows:
         item_kind = _require_text(row.get("item_kind"), field_name="item_kind")
         if item_kind == _ITEM_KIND_OLD_VERIFIED_FACT:
-            raise HostDurableError(
-                "old durable memory item kind verified_fact is not supported"
-            )
+            raise HostDurableError("old durable memory item kind verified_fact is not supported")
         if item_kind not in allowed_kinds:
             raise HostDurableError(f"unsupported durable memory item kind: {item_kind}")
 
@@ -1568,9 +1520,7 @@ def _diagnostic_row_from_host_row(row: HostRow) -> MemoryDiagnosticRow:
 
     session_id = _require_text(row.get("session_id"), field_name="session_id")
     snapshot_id = _optional_text(row.get("snapshot_id"), field_name="snapshot_id")
-    diagnostic_json = _require_text(
-        row.get("diagnostic_json"), field_name="diagnostic_json"
-    )
+    diagnostic_json = _require_text(row.get("diagnostic_json"), field_name="diagnostic_json")
     recorded_at = _require_text(row.get("recorded_at"), field_name="recorded_at")
     diagnostic = _diagnostic_from_json_text(diagnostic_json)
     return MemoryDiagnosticRow(
@@ -1679,7 +1629,7 @@ def _forward_intent_item_json_value(item: ForwardIntent) -> JsonValue:
     """
 
     return {
-        "intent_type": item.intent_type.value,
+        "intent_type": item.intent_type,
         "item_id": item.item_id,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
@@ -1699,7 +1649,7 @@ def _reference_continuity_item_json_value(
 
     return {
         "item_id": item.item_id,
-        "reason": item.reason.value,
+        "reason": item.reason,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
         "text": item.text,

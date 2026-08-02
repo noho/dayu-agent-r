@@ -93,7 +93,6 @@ from dayu.host.compact_payload import (
     compact_artifact_json_vnext,
     compact_artifact_payload_ref,
     prompt_local_label_mapping_refs,
-    source_boundary_refs,
 )
 from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
@@ -108,13 +107,15 @@ from dayu.host.compact_pipeline import (
     build_reactive_pass_queue_plan,
     compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
+from dayu.host.compact_material import (
+    conversation_compact_input_vnext_from_material_pack,
+)
 from dayu.host.compaction import (
-    CompactQualityCheckResultVNext,
+    CompactAcceptedTruthV2,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactionRequest,
     ContextCompactor,
-    ConversationCompactOutputVNext,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
@@ -273,7 +274,6 @@ from dayu.host.run_input import (
     SessionContinuityView,
     estimate_prepared_runner_call_candidate,
     load_prepared_runner_call_source_in_transaction,
-    load_prepared_runner_call_candidate_in_transaction,
     prepare_runner_call_candidate_in_transaction,
     record_prepared_runner_call_candidate_in_transaction,
     resolve_prepared_runner_call_context_anchor_in_transaction,
@@ -744,9 +744,7 @@ class _CompleteContinuationFrozenSources:
     source_budget: ContextBudgetEvaluatedPayload
 
 
-_ContinuationFrozenSources = (
-    _UnavailableContinuationFrozenSources | _CompleteContinuationFrozenSources
-)
+_ContinuationFrozenSources = _UnavailableContinuationFrozenSources | _CompleteContinuationFrozenSources
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,9 +929,7 @@ def _prepare_reactive_recovery_candidate(
         source.run.input_event_id,
     )
     if current_input_event is None:
-        raise HostDurableError(
-            "reactive recovery current input event is missing"
-        )
+        raise HostDurableError("reactive recovery current input event is missing")
     source_candidate = source.candidate
     return prepare_runner_call_candidate_in_transaction(
         transaction,
@@ -986,30 +982,22 @@ def _build_reactive_recovery_sizing(
         return build_conservative_context_sizing_result(
             stage=stage,
             candidate_input_cursor=candidate.candidate_input_cursor,
-            candidate_input_projection_ref=(
-                candidate.candidate_input_projection_ref
-            ),
+            candidate_input_projection_ref=(candidate.candidate_input_projection_ref),
             candidate_input_digest=candidate.input_snapshot_digest,
             policy=context_budget_policy,
             estimate=estimate,
-            fallback_reason=(
-                ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
-            ),
+            fallback_reason=(ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED),
         )
-    anchor_resolution = (
-        resolve_prepared_runner_call_context_anchor_in_transaction(
-            transaction,
-            event_log_store,
-            candidate=candidate,
-            context_window_size=context_budget_policy.context_window_size,
-        )
+    anchor_resolution = resolve_prepared_runner_call_context_anchor_in_transaction(
+        transaction,
+        event_log_store,
+        candidate=candidate,
+        context_window_size=context_budget_policy.context_window_size,
     )
     return build_context_sizing_result(
         stage=stage,
         candidate_input_cursor=candidate.candidate_input_cursor,
-        candidate_input_projection_ref=(
-            candidate.candidate_input_projection_ref
-        ),
+        candidate_input_projection_ref=(candidate.candidate_input_projection_ref),
         candidate_input_digest=candidate.input_snapshot_digest,
         policy=context_budget_policy,
         estimate=estimate,
@@ -1039,8 +1027,7 @@ def _close_reactive_fallback_hard_if_required(
 
     if (
         sizing.stage is not ContextSizingStage.DISPATCH_FALLBACK
-        or sizing.budget_decision
-        is not ContextBudgetDecision.BLOCK_HARD_THRESHOLD
+        or sizing.budget_decision is not ContextBudgetDecision.BLOCK_HARD_THRESHOLD
     ):
         return None
     append_context_budget_evaluated_in_transaction(
@@ -1151,8 +1138,7 @@ def _commit_reactive_recovery_start_truths(
         or result.dispatch_record is None
         or result.attempt.attempt_id != start_input.attempt_id
         or result.attempt.execution_id != start_input.execution_id
-        or result.dispatch_record.dispatch_record_id
-        != start_input.dispatch_record_id
+        or result.dispatch_record.dispatch_record_id != start_input.dispatch_record_id
     ):
         raise _ReactiveRecoveryStartCasMissRollback()
     rows = _existing_rows(
@@ -1225,11 +1211,7 @@ def _reactive_recovery_started(
     return _ReactiveRecoveryStarted(
         result=EngineIngestResult(
             status=EngineIngestStatus.ACCEPTED,
-            events=(
-                accepted.result.events
-                + (truth.manifest, truth.budget_fact)
-                + truth.start_rows
-            ),
+            events=(accepted.result.events + (truth.manifest, truth.budget_fact) + truth.start_rows),
             terminal_closeout=False,
             terminal_notice=None,
             reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
@@ -1259,9 +1241,7 @@ def _validate_reactive_recovery_outcome_event(
 
     if accepted.compacted_event_id is None:
         if accepted.compacted_event_sequence is not None:
-            raise HostDurableError(
-                "reactive fallback cannot carry compacted event sequence"
-            )
+            raise HostDurableError("reactive fallback cannot carry compacted event sequence")
         _reactive_failed_event_from_accepted(
             transaction,
             event_log_store,
@@ -1270,9 +1250,7 @@ def _validate_reactive_recovery_outcome_event(
         )
         return
     if accepted.compacted_event_sequence is None:
-        raise HostDurableError(
-            "reactive compacted event sequence is missing"
-        )
+        raise HostDurableError("reactive compacted event sequence is missing")
     event = event_log_store.read_event_by_id(
         transaction,
         accepted.compacted_event_id,
@@ -1285,9 +1263,7 @@ def _validate_reactive_recovery_outcome_event(
         or event.attempt_id != source_attempt.attempt_id
         or event.execution_id != source_attempt.execution_id
     ):
-        raise HostDurableError(
-            "reactive compacted outcome identity is invalid"
-        )
+        raise HostDurableError("reactive compacted outcome identity is invalid")
 
 
 def _reactive_failed_event_from_accepted(
@@ -1307,15 +1283,9 @@ def _reactive_failed_event_from_accepted(
     :raises HostDurableError: failed event 缺失、歧义或 identity 不匹配时抛出。
     """
 
-    event_ids = tuple(
-        row.event_id
-        for row in accepted.result.events
-        if row.event_type == CONTEXT_COMPACTION_FAILED
-    )
+    event_ids = tuple(row.event_id for row in accepted.result.events if row.event_type == CONTEXT_COMPACTION_FAILED)
     if len(event_ids) != 1:
-        raise HostDurableError(
-            "reactive fallback requires one compaction failed event"
-        )
+        raise HostDurableError("reactive fallback requires one compaction failed event")
     event = event_log_store.read_event_by_id(transaction, event_ids[0])
     if (
         event is None
@@ -1324,9 +1294,7 @@ def _reactive_failed_event_from_accepted(
         or event.attempt_id != source_attempt.attempt_id
         or event.execution_id != source_attempt.execution_id
     ):
-        raise HostDurableError(
-            "reactive compaction failed outcome identity is invalid"
-        )
+        raise HostDurableError("reactive compaction failed outcome identity is invalid")
     return event
 
 
@@ -1356,9 +1324,7 @@ def _close_reactive_fallback_hard_in_transaction(
         accepted=accepted,
         source_attempt=source_attempt,
     )
-    run_failed_event_id = (
-        f"{failed_event.event_id}:dispatch-fallback-hard"
-    )
+    run_failed_event_id = f"{failed_event.event_id}:dispatch-fallback-hard"
     result = fail_recovering_run_in_transaction(
         transaction,
         event_log_store,
@@ -1375,11 +1341,7 @@ def _close_reactive_fallback_hard_in_transaction(
             context_compaction_failed_event_id=failed_event.event_id,
         ),
     )
-    if (
-        result.status is not StateMutationStatus.UPDATED
-        or result.run is None
-        or result.run_event is None
-    ):
+    if result.status is not StateMutationStatus.UPDATED or result.run is None or result.run_event is None:
         raise _ReactiveRecoveryStartCasMissRollback()
     return _ReactiveRecoveryTerminal(
         result=EngineIngestResult(
@@ -1424,11 +1386,9 @@ class _IngestValidatedOperation:
             self.candidate,
         )
         if context is None:
-            winner_duplicate = (
-                self.ingestor._reactive_recovery_winner_duplicate_result(
-                    transaction,
-                    self.candidate,
-                )
+            winner_duplicate = self.ingestor._reactive_recovery_winner_duplicate_result(
+                transaction,
+                self.candidate,
             )
             if winner_duplicate is not None:
                 return winner_duplicate
@@ -1470,9 +1430,7 @@ class EngineEventIngestor:
         compact_artifact_root: Path | None = None,
         compact_artifact_create_parent_dirs: bool = True,
         memory_projection_policy: MemoryProjectionPolicy | None = None,
-        memory_projection_catchup_batch_size: int = (
-            _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE
-        ),
+        memory_projection_catchup_batch_size: int = (_DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE),
     ) -> None:
         """初始化 EngineEvent ingestor。
 
@@ -1526,9 +1484,7 @@ class EngineEventIngestor:
             candidate=candidate,
         )
 
-    async def ingest_async(
-        self, candidate: EngineEventCandidate
-    ) -> EngineIngestResult:
+    async def ingest_async(self, candidate: EngineEventCandidate) -> EngineIngestResult:
         """接收一个可执行 reactive compaction 的 EngineEvent candidate。
 
         :param candidate: 待 ingest 的 EngineEvent candidate。
@@ -1591,9 +1547,7 @@ class EngineEventIngestor:
         """
 
         if result.terminal_notice is not None:
-            self._terminal_post_commit_port.notify_terminal_post_commit(
-                result.terminal_notice
-            )
+            self._terminal_post_commit_port.notify_terminal_post_commit(result.terminal_notice)
         if result.transient_delta is not None:
             _publish_transient_delta(
                 self._transient_delta_publisher,
@@ -1643,9 +1597,7 @@ class EngineEventIngestor:
                 existing,
                 context.candidate,
             ):
-                raise HostDurableError(
-                    "reactive compaction prefix identity is invalid"
-                )
+                raise HostDurableError("reactive compaction prefix identity is invalid")
             outcome = self._matching_reactive_outcome_event(
                 transaction,
                 candidate=context.candidate,
@@ -1665,15 +1617,9 @@ class EngineEventIngestor:
                     run_id=context.run.run_id,
                     session_id=context.run.session_id,
                     source_attempt_id=context.attempt.attempt_id,
-                    compacted_event_id=(
-                        outcome.event_id
-                        if outcome.event_type == CONTEXT_COMPACTED
-                        else None
-                    ),
+                    compacted_event_id=(outcome.event_id if outcome.event_type == CONTEXT_COMPACTED else None),
                     compacted_event_sequence=(
-                        outcome.event_sequence
-                        if outcome.event_type == CONTEXT_COMPACTED
-                        else None
+                        outcome.event_sequence if outcome.event_type == CONTEXT_COMPACTED else None
                     ),
                 )
             return EngineIngestResult(
@@ -1722,11 +1668,7 @@ class EngineEventIngestor:
         """
 
         event_ids = _duplicate_terminal_event_ids(candidate)
-        if (
-            candidate.engine_event.type
-            is not EngineEventType.CONTEXT_COMPACTION_REQUESTED
-            or len(event_ids) != 3
-        ):
+        if candidate.engine_event.type is not EngineEventType.CONTEXT_COMPACTION_REQUESTED or len(event_ids) != 3:
             return None
         existing = _existing_rows(
             self._event_log_store,
@@ -1736,9 +1678,7 @@ class EngineEventIngestor:
         if len(existing) != len(event_ids):
             return None
         if not _reactive_prefix_matches_candidate(existing, candidate):
-            raise HostDurableError(
-                "reactive compaction prefix identity is invalid"
-            )
+            raise HostDurableError("reactive compaction prefix identity is invalid")
         outcome = self._matching_reactive_outcome_event(
             transaction,
             candidate=candidate,
@@ -1765,8 +1705,7 @@ class EngineEventIngestor:
             or source_attempt.run_id != envelope.run_id
             or source_attempt.execution_id != envelope.execution_id
             or not is_terminal_attempt_status(source_attempt.status)
-            or source_dispatch.dispatch_record_id
-            != envelope.dispatch_record_id
+            or source_dispatch.dispatch_record_id != envelope.dispatch_record_id
             or source_dispatch.execution_id != envelope.execution_id
             or run.current_attempt_id is None
         ):
@@ -1811,17 +1750,14 @@ class EngineEventIngestor:
 
         envelope = candidate.envelope
         if (
-            candidate.engine_event.type
-            is not EngineEventType.CONTEXT_COMPACTION_REQUESTED
+            candidate.engine_event.type is not EngineEventType.CONTEXT_COMPACTION_REQUESTED
             or request_event.event_type != CONTEXT_COMPACTION_REQUESTED
             or request_event.session_id != envelope.session_id
             or request_event.run_id != envelope.run_id
             or request_event.attempt_id != envelope.attempt_id
             or request_event.execution_id != envelope.execution_id
         ):
-            raise HostDurableError(
-                "reactive compaction request identity is invalid"
-            )
+            raise HostDurableError("reactive compaction request identity is invalid")
         outcome_ids = (
             _event_id(
                 candidate,
@@ -1842,9 +1778,7 @@ class EngineEventIngestor:
             outcome_ids,
         )
         if len(outcomes) > 1:
-            raise HostDurableError(
-                "reactive compaction outcome is ambiguous"
-            )
+            raise HostDurableError("reactive compaction outcome is ambiguous")
         if len(outcomes) == 0:
             return None
         outcome = next(iter(outcomes))
@@ -1854,21 +1788,14 @@ class EngineEventIngestor:
             or outcome.attempt_id != envelope.attempt_id
             or outcome.execution_id != envelope.execution_id
         ):
-            raise HostDurableError(
-                "reactive compaction outcome identity is invalid"
-            )
+            raise HostDurableError("reactive compaction outcome identity is invalid")
         payload = event_payload_object(
             transaction,
             outcome,
             payload_label=outcome.event_type,
         )
-        if (
-            payload.get(_PAYLOAD_FIELD_OPERATION_ID)
-            != request_event.event_id
-        ):
-            raise HostDurableError(
-                "reactive compaction outcome operation pairing is invalid"
-            )
+        if payload.get(_PAYLOAD_FIELD_OPERATION_ID) != request_event.event_id:
+            raise HostDurableError("reactive compaction outcome operation pairing is invalid")
         return outcome
 
     def _duplicate_host_lifecycle_terminal_result(
@@ -1995,9 +1922,7 @@ class EngineEventIngestor:
                 context,
                 _final_answer_plan(event.data),
             )
-        if event.type == EngineEventType.RUN_FAILED and isinstance(
-            event.data, RunFailedData
-        ):
+        if event.type == EngineEventType.RUN_FAILED and isinstance(event.data, RunFailedData):
             error_code = serialize_engine_error_code(event.data.error_code)
             if event.data.recoverable:
                 diagnostic = self._append_diagnostic_event(
@@ -2029,58 +1954,38 @@ class EngineEventIngestor:
                 context,
                 _run_failed_plan(event.data),
             )
-        if event.type == EngineEventType.RUN_CANCELLED and isinstance(
-            event.data, RunCancelledData
-        ):
+        if event.type == EngineEventType.RUN_CANCELLED and isinstance(event.data, RunCancelledData):
             return self._close_active_cancel(transaction, context, event.data)
         if event.type == EngineEventType.CONTEXT_COMPACTION_REQUESTED and isinstance(
             event.data, ContextCompactionRequestedData
         ):
-            return self._start_reactive_context_recovery(
-                transaction, context, event.data
-            )
-        if event.type == EngineEventType.RUN_SUSPENDED and isinstance(
-            event.data, RunSuspendedData
-        ):
+            return self._start_reactive_context_recovery(transaction, context, event.data)
+        if event.type == EngineEventType.RUN_SUSPENDED and isinstance(event.data, RunSuspendedData):
             return self._confirm_waiting_engine_event(
                 transaction,
                 context,
                 event.data,
                 _run_suspended_payload(context, event.data),
             )
-        if event.type == EngineEventType.TOOL_AWAITING and isinstance(
-            event.data, ToolAwaitingData
-        ):
+        if event.type == EngineEventType.TOOL_AWAITING and isinstance(event.data, ToolAwaitingData):
             return self._confirm_waiting_engine_event(
                 transaction,
                 context,
                 event.data,
                 _tool_awaiting_payload(context, event.data),
             )
-        if event.type == EngineEventType.USAGE_REPORTED and isinstance(
-            event.data, UsageReportedData
-        ):
+        if event.type == EngineEventType.USAGE_REPORTED and isinstance(event.data, UsageReportedData):
             row = self._append_projection_signal(transaction, context, event.data)
             return _single_event_result(row)
-        if event.type == EngineEventType.ITERATION_STARTED and isinstance(
-            event.data, IterationStartedData
-        ):
-            return self._append_iteration_started_events(
-                transaction, context, event.data
-            )
+        if event.type == EngineEventType.ITERATION_STARTED and isinstance(event.data, IterationStartedData):
+            return self._append_iteration_started_events(transaction, context, event.data)
         if _is_preview_event(event):
             row = self._append_preview_event(transaction, context)
             return _single_event_result(row)
-        if event.type == EngineEventType.PROVIDER_DIAGNOSTIC and isinstance(
-            event.data, ProviderDiagnosticData
-        ):
-            row = self._append_provider_diagnostic(
-                transaction, context, event.data
-            )
+        if event.type == EngineEventType.PROVIDER_DIAGNOSTIC and isinstance(event.data, ProviderDiagnosticData):
+            row = self._append_provider_diagnostic(transaction, context, event.data)
             return _single_event_result(row)
-        if event.type == EngineEventType.PROVIDER_PROTOCOL_ERROR and isinstance(
-            event.data, ProviderProtocolErrorData
-        ):
+        if event.type == EngineEventType.PROVIDER_PROTOCOL_ERROR and isinstance(event.data, ProviderProtocolErrorData):
             row = self._append_provider_protocol_error(transaction, context, event.data)
             return _single_event_result(row)
         return self._append_rejected_diagnostic(
@@ -2103,9 +2008,7 @@ class EngineEventIngestor:
         envelope = candidate.envelope
         run = read_run_by_id(transaction, envelope.run_id)
         attempt = read_attempt_by_id(transaction, envelope.attempt_id)
-        dispatch_record = read_dispatch_record_by_attempt_id(
-            transaction, envelope.attempt_id
-        )
+        dispatch_record = read_dispatch_record_by_attempt_id(transaction, envelope.attempt_id)
         if run is None or attempt is None or dispatch_record is None:
             return None
         if (
@@ -2141,9 +2044,7 @@ class EngineEventIngestor:
         envelope = candidate.envelope
         run = read_run_by_id(transaction, envelope.run_id)
         attempt = read_attempt_by_id(transaction, envelope.attempt_id)
-        dispatch_record = read_dispatch_record_by_attempt_id(
-            transaction, envelope.attempt_id
-        )
+        dispatch_record = read_dispatch_record_by_attempt_id(transaction, envelope.attempt_id)
         if run is None or attempt is None or dispatch_record is None:
             return None
         if (
@@ -2258,9 +2159,7 @@ class EngineEventIngestor:
             ),
         )
         if result.status != StateMutationStatus.UPDATED:
-            raise _TerminalCloseoutRollback(
-                f"Engine terminal closeout returned {result.status.value}"
-            )
+            raise _TerminalCloseoutRollback(f"Engine terminal closeout returned {result.status.value}")
         rows = _existing_rows(
             self._event_log_store,
             transaction,
@@ -2296,9 +2195,7 @@ class EngineEventIngestor:
         candidate = context.candidate
         plan = candidate.plan
         terminal = plan.terminal
-        attempt_event_id, run_event_id = _host_lifecycle_terminal_event_ids(
-            candidate
-        )
+        attempt_event_id, run_event_id = _host_lifecycle_terminal_event_ids(candidate)
         existing = _existing_rows(
             self._event_log_store,
             transaction,
@@ -2355,16 +2252,12 @@ class EngineEventIngestor:
                 unsupported_later_owner=None,
                 worker_lifecycle_signal=plan.worker_lifecycle_signal,
                 stream_error_code=plan.stream_error_code,
-                last_observed_worker_event_index=(
-                    plan.last_observed_worker_event_index
-                ),
+                last_observed_worker_event_index=(plan.last_observed_worker_event_index),
                 last_accepted_event_id=plan.last_accepted_event_id,
             ),
         )
         if result.status != StateMutationStatus.UPDATED:
-            raise _TerminalCloseoutRollback(
-                f"Host lifecycle terminal closeout returned {result.status.value}"
-            )
+            raise _TerminalCloseoutRollback(f"Host lifecycle terminal closeout returned {result.status.value}")
         rows = _existing_rows(
             self._event_log_store,
             transaction,
@@ -2513,9 +2406,7 @@ class EngineEventIngestor:
                 failure_reason="context_budget_policy_missing",
                 message="Context budget policy is not configured",
             )
-        input_event = self._event_log_store.read_event_by_id(
-            transaction, context.run.input_event_id
-        )
+        input_event = self._event_log_store.read_event_by_id(transaction, context.run.input_event_id)
         if input_event is None:
             return self._fail_reactive_recovery_without_request(
                 transaction,
@@ -2541,9 +2432,7 @@ class EngineEventIngestor:
         )
         decision = decide_context_budget(estimate)
         try:
-            compact_count = self._committed_reactive_compact_count(
-                transaction, context.run
-            )
+            compact_count = self._committed_reactive_compact_count(transaction, context.run)
         except Exception:
             return self._fail_reactive_recovery_without_request(
                 transaction,
@@ -2605,9 +2494,7 @@ class EngineEventIngestor:
         requested = self._append_reactive_compaction_requested_event(
             transaction,
             operation_id=operation_id,
-            max_compaction_attempts_per_operation=(
-                policy.max_compaction_attempts_per_operation
-            ),
+            max_compaction_attempts_per_operation=(policy.max_compaction_attempts_per_operation),
             context=context,
             data=data,
             estimate=estimate,
@@ -2786,9 +2673,7 @@ class EngineEventIngestor:
             transient_delta=None,
         )
 
-    def _committed_reactive_compact_count(
-        self, transaction: HostTransaction, run: RunRow
-    ) -> int:
+    def _committed_reactive_compact_count(self, transaction: HostTransaction, run: RunRow) -> int:
         """读取本 Run 已提交 reactive compact request 数。
 
         :param transaction: 当前 Host transaction。
@@ -2858,9 +2743,7 @@ class EngineEventIngestor:
                 reason={"decision": decision.value, "engine_reason": data.reason},
                 payload_json=build_context_compaction_requested_payload(
                     operation_id=operation_id,
-                    max_compaction_attempts_per_operation=(
-                        max_compaction_attempts_per_operation
-                    ),
+                    max_compaction_attempts_per_operation=(max_compaction_attempts_per_operation),
                     trigger_source=ContextCompactionTriggerSource.REACTIVE,
                     budget_reason=data.reason,
                     budget_snapshot_ref=estimate.estimator_digest,
@@ -2897,9 +2780,7 @@ class EngineEventIngestor:
             source_snapshot=pending.source_snapshot,
             selection_policy_digest=digest_memory_projection_policy(memory_policy),
             budget_before_compact=pending.estimate,
-            selected_recent_window_turn_floor=(
-                memory_policy.selected_recent_window_turn_floor
-            ),
+            selected_recent_window_turn_floor=(memory_policy.selected_recent_window_turn_floor),
             attempt_id=pending.context.attempt.attempt_id,
             execution_id=pending.context.attempt.execution_id,
         )
@@ -2910,10 +2791,20 @@ class EngineEventIngestor:
         ).pass_requests
         compactor = self._context_compactor
         artifact_root = self._compact_artifact_root
-        if compactor is None or artifact_root is None:
+        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        if len(compact_input.source_boundary) == 0:
             operation_result = CompactionOperationResult(
-                accepted_candidate=None,
-                quality_result=None,
+                accepted_truth=None,
+                rejected_attempts=(),
+                failure_reason="empty_source_boundary",
+                budget_after_attempted_compact=None,
+                accepted_attempt_number=None,
+                accepted_successful_response_identity=None,
+                accepted_proposal_manifest_reference=None,
+            )
+        elif compactor is None or artifact_root is None:
+            operation_result = CompactionOperationResult(
+                accepted_truth=None,
                 rejected_attempts=(),
                 failure_reason="compactor_or_artifact_store_missing",
                 budget_after_attempted_compact=None,
@@ -2926,17 +2817,12 @@ class EngineEventIngestor:
                 request=request,
                 compactor=compactor,
                 first_attempt_number=1,
-                max_attempt_number=(
-                    pending.policy.max_compaction_attempts_per_operation
-                ),
-                cancellation_token=(
-                    pending.context.candidate.envelope.cancellation_token
-                ),
+                max_attempt_number=(pending.policy.max_compaction_attempts_per_operation),
+                cancellation_token=(pending.context.candidate.envelope.cancellation_token),
                 pass_queue=pass_queue,
                 compaction_operation_id=pending.operation_id,
-                proposal_manifest_recorder=(
-                    self._compactor_proposal_manifest_recorder()
-                ),
+                proposal_manifest_recorder=(self._compactor_proposal_manifest_recorder()),
+                memory_policy=memory_policy,
             )
 
         def _operation(
@@ -2949,13 +2835,8 @@ class EngineEventIngestor:
                 expected_trigger_source=ContextCompactionTriggerSource.REACTIVE,
             )
             if isinstance(terminal_commit, CompactionTerminalClosed):
-                if (
-                    terminal_commit.disposition
-                    is CompactionOperationTerminalDisposition.INVALID_MULTIPLE
-                ):
-                    raise HostDurableError(
-                        COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR
-                    )
+                if terminal_commit.disposition is CompactionOperationTerminalDisposition.INVALID_MULTIPLE:
+                    raise HostDurableError(COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR)
                 _LOGGER.warning(
                     "engine_ingest.reactive_compact.late_terminal_noop "
                     "operation_id=%s disposition=%s "
@@ -2966,9 +2847,7 @@ class EngineEventIngestor:
                     terminal_commit.first_terminal_event_type,
                 )
                 return pending.result_prefix
-            latest = self._validate_durable_context(
-                transaction, pending.context.candidate
-            )
+            latest = self._validate_durable_context(transaction, pending.context.candidate)
             if latest is None:
                 return pending.result_prefix
             sequence_stale = latest.run.input_event_sequence != pending.expected_input_event_sequence
@@ -2981,9 +2860,7 @@ class EngineEventIngestor:
                     failure_reason="stale_compaction_result",
                     attempt_count=len(operation_result.rejected_attempts),
                     retry_repair_budget_exhausted=False,
-                    budget_after_attempted_compact=(
-                        operation_result.budget_after_attempted_compact
-                    ),
+                    budget_after_attempted_compact=(operation_result.budget_after_attempted_compact),
                 )
                 return EngineIngestResult(
                     status=EngineIngestStatus.ACCEPTED,
@@ -3006,11 +2883,7 @@ class EngineEventIngestor:
                         rejected=rejected,
                     )
                 )
-            if (
-                operation_result.accepted_candidate is None
-                or operation_result.quality_result is None
-                or operation_result.failure_reason is not None
-            ):
+            if operation_result.accepted_truth is None or operation_result.failure_reason is not None:
                 failure_reason = operation_result.failure_reason or "compaction_failed"
                 attempt_count = len(operation_result.rejected_attempts)
                 retry_repair_budget_exhausted = attempt_count > 0
@@ -3022,9 +2895,7 @@ class EngineEventIngestor:
                     failure_reason=failure_reason,
                     attempt_count=attempt_count,
                     retry_repair_budget_exhausted=retry_repair_budget_exhausted,
-                    budget_after_attempted_compact=(
-                        operation_result.budget_after_attempted_compact
-                    ),
+                    budget_after_attempted_compact=(operation_result.budget_after_attempted_compact),
                 )
                 failed_input = fallback_decision.failed_payload_input
                 failed = self._append_reactive_compaction_failed_event(
@@ -3034,12 +2905,8 @@ class EngineEventIngestor:
                     operation_id=failed_input.operation_id,
                     failure_reason=failed_input.failure_reason,
                     attempt_count=failed_input.attempt_count,
-                    retry_repair_budget_exhausted=(
-                        failed_input.retry_repair_budget_exhausted
-                    ),
-                    budget_after_attempted_compact=(
-                        failed_input.budget_after_attempted_compact
-                    ),
+                    retry_repair_budget_exhausted=(failed_input.retry_repair_budget_exhausted),
+                    budget_after_attempted_compact=(failed_input.budget_after_attempted_compact),
                     fallback_policy_decision=failed_input.fallback_policy_decision,
                     fallback_input_window=failed_input.fallback_input_window,
                     fallback_input_digest=failed_input.fallback_input_digest,
@@ -3107,22 +2974,15 @@ class EngineEventIngestor:
                 request=request,
                 decision=pending.decision,
                 operation_id=pending.operation_id,
-                accepted_attempt_number=_required_accepted_attempt_number(
-                    operation_result
-                ),
-                candidate=operation_result.accepted_candidate,
-                quality=operation_result.quality_result,
+                accepted_attempt_number=_required_accepted_attempt_number(operation_result),
+                accepted_truth=operation_result.accepted_truth,
                 budget_after_compact=(
                     operation_result.budget_after_attempted_compact
                     if operation_result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
-                accepted_proposal_manifest_reference=(
-                    operation_result.required_proposal_manifest_reference()
-                ),
-                successful_response_identity=(
-                    operation_result.required_successful_response_identity()
-                ),
+                accepted_proposal_manifest_reference=(operation_result.required_proposal_manifest_reference()),
+                successful_response_identity=(operation_result.required_successful_response_identity()),
             )
             return _ReactiveRecoveryAccepted(
                 result=EngineIngestResult(
@@ -3171,8 +3031,7 @@ class EngineEventIngestor:
         decision: ContextBudgetDecision,
         operation_id: str,
         accepted_attempt_number: int,
-        candidate: ConversationCompactOutputVNext,
-        quality: CompactQualityCheckResultVNext,
+        accepted_truth: CompactAcceptedTruthV2,
         budget_after_compact: int,
         accepted_proposal_manifest_reference: CompactorProposalManifestReference,
         successful_response_identity: SuccessfulRunnerResponseIdentity,
@@ -3185,8 +3044,7 @@ class EngineEventIngestor:
         :param decision: compact 前预算决策。
         :param operation_id: reactive compaction request event id。
         :param accepted_attempt_number: accepted operation attempt number。
-        :param candidate: accepted vNext compaction candidate。
-        :param quality: accepted vNext quality result。
+        :param accepted_truth: Context Governance final accepted truth。
         :param budget_after_compact: Host 估算的 compact 后预算。
         :param accepted_proposal_manifest_reference: accepted proposal 对应的
             typed manifest reference。
@@ -3211,8 +3069,7 @@ class EngineEventIngestor:
             canonical_json_dumps(
                 compact_artifact_json_vnext(
                     request=request,
-                    candidate=candidate,
-                    quality=quality,
+                    accepted_truth=accepted_truth,
                     policy_digest=policy_digest,
                     budget_after_compact=budget_after_compact,
                 )
@@ -3226,7 +3083,7 @@ class EngineEventIngestor:
             COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
             compact_artifact_descriptor_metadata_vnext(
                 request=request,
-                candidate=candidate,
+                accepted_truth=accepted_truth,
                 artifact_digest=artifact_ref.artifact_digest,
                 policy_digest=policy_digest,
             ),
@@ -3258,16 +3115,15 @@ class EngineEventIngestor:
                     accepted_attempt_number=accepted_attempt_number,
                     compact_artifact_ref=descriptor.payload_ref,
                     compact_artifact_digest=artifact_ref.artifact_digest,
-                    accepted_candidate=candidate,
-                    quality_check_result=quality,
+                    accepted_truth=accepted_truth,
                     budget_after_compact=budget_after_compact,
                     prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
-                    source_boundary_refs=source_boundary_refs(request),
-                    accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
-                    projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
-                    accepted_proposal_manifest_reference=(
-                        accepted_proposal_manifest_reference
+                    accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(
+                        request,
+                        accepted_truth.candidate,
                     ),
+                    projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+                    accepted_proposal_manifest_reference=(accepted_proposal_manifest_reference),
                     successful_response_identity=successful_response_identity,
                 ),
                 payload_ref=None,
@@ -3343,9 +3199,7 @@ class EngineEventIngestor:
                     policy_decision=_RECOVERY_FAILURE_POLICY_DECISION,
                     retryable=False,
                     attempt_count=attempt_count,
-                    retry_repair_budget_exhausted=(
-                        retry_repair_budget_exhausted
-                    ),
+                    retry_repair_budget_exhausted=(retry_repair_budget_exhausted),
                     diagnostic_refs=diagnostic_refs,
                     budget_after_attempted_compact=budget_after_attempted_compact,
                     fallback_policy_decision=fallback_policy_decision,
@@ -3408,49 +3262,29 @@ class EngineEventIngestor:
                     attempt_number=rejected.attempt_number,
                     failure_category=rejected.failure_category.value,
                     repairable=rejected.repairable,
-                    runner_attempt_summary_refs=(
-                        rejected.runner_attempt_summary_refs
-                    ),
+                    runner_attempt_summary_refs=(rejected.runner_attempt_summary_refs),
                     diagnostic_refs=rejected.diagnostic_refs,
                     next_policy_decision=rejected.next_policy_decision.value,
-                    budget_after_attempted_compact=(
-                        rejected.budget_after_attempted_compact
-                    ),
-                    proposal_manifest_reference=(
-                        rejected.proposal_manifest_reference
-                    ),
-                    successful_response_identity=(
-                        rejected.successful_response_identity
-                    ),
+                    budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
+                    proposal_manifest_reference=(rejected.proposal_manifest_reference),
+                    successful_response_identity=(rejected.successful_response_identity),
                     diagnostic_artifact_ref=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.payload_ref
+                        None if diagnostic_reference is None else diagnostic_reference.payload_ref
                     ),
                     diagnostic_artifact_digest=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.payload_digest
+                        None if diagnostic_reference is None else diagnostic_reference.payload_digest
                     ),
                     failure_stage=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.diagnostic.failure_stage
+                        None if diagnostic_reference is None else diagnostic_reference.diagnostic.failure_stage
                     ),
                     diagnostic_suffix=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.diagnostic.diagnostic_suffix
+                        None if diagnostic_reference is None else diagnostic_reference.diagnostic.diagnostic_suffix
                     ),
                     parser_or_validator=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.diagnostic.parser_or_validator
+                        None if diagnostic_reference is None else diagnostic_reference.diagnostic.parser_or_validator
                     ),
                     exception_class=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.diagnostic.exception_class
+                        None if diagnostic_reference is None else diagnostic_reference.diagnostic.exception_class
                     ),
                     exception_message=(
                         None if diagnostic_reference is None else diagnostic_reference.diagnostic.exception_message
@@ -3462,9 +3296,7 @@ class EngineEventIngestor:
                     offending_block_text_digest=_diagnostic_offending_text_digest(diagnostic_reference),
                     offending_block_text_length=_diagnostic_offending_text_length(diagnostic_reference),
                     material_pack_digest=(
-                        None
-                        if diagnostic_reference is None
-                        else diagnostic_reference.diagnostic.material_pack_digest
+                        None if diagnostic_reference is None else diagnostic_reference.diagnostic.material_pack_digest
                     ),
                 ),
                 payload_ref=None,
@@ -3595,9 +3427,7 @@ class EngineEventIngestor:
             transient_delta=None,
         )
 
-    def _complete_reactive_recovery(
-        self, accepted: _ReactiveRecoveryAccepted
-    ) -> EngineIngestResult:
+    def _complete_reactive_recovery(self, accepted: _ReactiveRecoveryAccepted) -> EngineIngestResult:
         """reactive recovery accepted 后启动新 Attempt。
 
         compact accepted recovery 先追平 memory projection；fallback recovery
@@ -3643,9 +3473,7 @@ class EngineEventIngestor:
                 return accepted.result
         context_budget_policy = self._context_budget_policy
         if context_budget_policy is None:
-            raise HostDurableError(
-                "reactive recovery context budget policy is missing"
-            )
+            raise HostDurableError("reactive recovery context budget policy is missing")
         try:
             outcome = self._transaction_runner.run_write(
                 _StartReactiveRecoveryOperation(
@@ -3687,9 +3515,7 @@ class EngineEventIngestor:
             data=data,
         )
         reason = (
-            _REASON_WAITING_EVENT_CONFIRMATION
-            if check.accepted
-            else _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS
+            _REASON_WAITING_EVENT_CONFIRMATION if check.accepted else _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS
         )
         event_id = _event_id(
             context.candidate,
@@ -3783,9 +3609,7 @@ class EngineEventIngestor:
                     candidate=candidate,
                     reason=_REASON_STALE_EXECUTION_ID,
                 )
-            duplicate = self._duplicate_host_lifecycle_terminal_result(
-                transaction, context
-            )
+            duplicate = self._duplicate_host_lifecycle_terminal_result(transaction, context)
             if duplicate is not None:
                 return duplicate
             late = _late_host_lifecycle_rejection_reason(context)
@@ -3802,9 +3626,7 @@ class EngineEventIngestor:
         except _TerminalCloseoutRollback:
             result = _terminal_closeout_precondition_failed_result()
         if result.terminal_notice is not None:
-            self._terminal_post_commit_port.notify_terminal_post_commit(
-                result.terminal_notice
-            )
+            self._terminal_post_commit_port.notify_terminal_post_commit(result.terminal_notice)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "host.engine_ingest.lifecycle_closeout.committed session_id=%s "
@@ -3848,11 +3670,7 @@ class EngineEventIngestor:
                 event_id=_event_id(candidate, EventClass.PREVIEW, event_type, 0),
                 event_class=EventClass.PREVIEW,
                 event_type=event_type,
-                payload=(
-                    _preview_payload(transaction, context)
-                    if payload is None
-                    else payload
-                ),
+                payload=(_preview_payload(transaction, context) if payload is None else payload),
                 reason=None,
             ),
         ).row
@@ -3906,9 +3724,7 @@ class EngineEventIngestor:
             preview = self._append_preview_event(
                 transaction,
                 context,
-                payload=_iteration_started_preview_payload(
-                    context, data, resolution
-                ),
+                payload=_iteration_started_preview_payload(context, data, resolution),
             )
             return _event_rows_result((preview,))
 
@@ -3938,16 +3754,12 @@ class EngineEventIngestor:
                     reason=_RUNNER_CALL_MANIFEST_REASON_MISSING,
                     stop_worker_stream=True,
                 )
-            manifest_event, budget_fact = (
-                self._append_limited_runner_call_manifest_event(
-                    transaction,
-                    context,
-                    data,
-                    runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
-                    runner_call_trigger_reason=(
-                        _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE
-                    ),
-                )
+            manifest_event, budget_fact = self._append_limited_runner_call_manifest_event(
+                transaction,
+                context,
+                data,
+                runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
+                runner_call_trigger_reason=(_RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE),
             )
             rows.append(manifest_event)
             if budget_fact is not None:
@@ -3959,9 +3771,7 @@ class EngineEventIngestor:
             preview = self._append_preview_event(
                 transaction,
                 context,
-                payload=_iteration_started_preview_payload(
-                    context, data, resolution
-                ),
+                payload=_iteration_started_preview_payload(context, data, resolution),
             )
             rows.append(preview)
             return _event_rows_result(tuple(rows))
@@ -3991,9 +3801,7 @@ class EngineEventIngestor:
             self._append_preview_event(
                 transaction,
                 context,
-                payload=_iteration_started_preview_payload(
-                    context, data, resolution
-                ),
+                payload=_iteration_started_preview_payload(context, data, resolution),
             )
         )
         return _event_rows_result(tuple(rows))
@@ -4026,9 +3834,7 @@ class EngineEventIngestor:
             _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
             0,
         )
-        runner_call_index = _next_runner_call_index(
-            transaction, context.run.run_id
-        )
+        runner_call_index = _next_runner_call_index(transaction, context.run.run_id)
         projection_descriptor: PayloadDescriptor | None = None
         if _has_complete_observed_input_projection(data):
             projection = _observed_runner_call_projection_body(
@@ -4082,9 +3888,7 @@ class EngineEventIngestor:
         ).row
         typed_manifest = parse_runner_call_manifest(
             manifest,
-            hot_payload=parse_runner_call_hot_payload(
-                _payload_object(manifest_event)
-            ),
+            hot_payload=parse_runner_call_hot_payload(_payload_object(manifest_event)),
         )
         sizing = typed_manifest.sizing_snapshot
         if sizing.status is not RunnerCallSizingStatus.COMPLETE:
@@ -4093,9 +3897,7 @@ class EngineEventIngestor:
             frozen_sources,
             _CompleteContinuationFrozenSources,
         ):
-            raise AssertionError(
-                "complete continuation sizing requires complete frozen sources"
-            )
+            raise AssertionError("complete continuation sizing requires complete frozen sources")
         source_budget = frozen_sources.source_budget
         projection = typed_manifest.projection_descriptor
         if (
@@ -4112,9 +3914,7 @@ class EngineEventIngestor:
             or sizing.policy_ref is None
             or sizing.policy_snapshot_digest is None
         ):
-            raise HostDurableError(
-                "complete continuation manifest is missing budget atoms"
-            )
+            raise HostDurableError("complete continuation manifest is missing budget atoms")
         anchor_resolution = resolve_context_anchor(
             transaction,
             self._event_log_store,
@@ -4130,9 +3930,7 @@ class EngineEventIngestor:
                     estimator_id=sizing.estimator_id,
                     estimator_version=sizing.estimator_version,
                 ),
-                request_semantics_digest=(
-                    sizing.request_semantics_digest
-                ),
+                request_semantics_digest=(sizing.request_semantics_digest),
             ),
         )
         result = build_context_sizing_result_from_atoms(
@@ -4268,9 +4066,7 @@ class EngineEventIngestor:
                     ),
                     "runner_call_pairing": _usage_pairing_payload(
                         pairing,
-                        observation_digest=(
-                            diagnostic.observation_digest
-                        ),
+                        observation_digest=(diagnostic.observation_digest),
                     ),
                 },
                 reason=None,
@@ -4748,9 +4544,7 @@ class EngineEventIngestor:
         :raises HostDurableError: durable payload 写入失败时抛出。
         """
 
-        payload_json: dict[str, JsonValue] = dict(
-            candidate.plan.terminal.terminal_payload
-        )
+        payload_json: dict[str, JsonValue] = dict(candidate.plan.terminal.terminal_payload)
         payload_json.update(
             {
                 "attempt_id": candidate.envelope.attempt_id,
@@ -4763,9 +4557,7 @@ class EngineEventIngestor:
         return self._payload_store.write_sqlite_payload(
             transaction,
             SQLitePayloadWriteRequest(
-                payload_ref=(
-                    f"{_HOST_LIFECYCLE_PAYLOAD_REF_PREFIX}-{event_id}"
-                ),
+                payload_ref=(f"{_HOST_LIFECYCLE_PAYLOAD_REF_PREFIX}-{event_id}"),
                 payload_id=f"{_HOST_LIFECYCLE_PAYLOAD_ID_PREFIX}-{event_id}",
                 payload_format=SQLitePayloadFormat.CANONICAL_JSON,
                 payload_json=payload_json,
@@ -4896,15 +4688,12 @@ def _late_engine_event_rejection_reason(
     """
 
     if (
-        context.candidate.engine_event.type
-        in (EngineEventType.RUN_SUSPENDED, EngineEventType.TOOL_AWAITING)
+        context.candidate.engine_event.type in (EngineEventType.RUN_SUSPENDED, EngineEventType.TOOL_AWAITING)
         and context.run.status is RunStatus.WAITING
         and context.attempt.status is AttemptStatus.SUSPENDED
     ):
         return None
-    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(
-        context.attempt.status
-    ):
+    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(context.attempt.status):
         return _REASON_TERMINAL_ALREADY_CLOSED
     if context.run.status is RunStatus.CANCELLING and context.candidate.engine_event.type in (
         EngineEventType.FINAL_ANSWER,
@@ -4924,9 +4713,7 @@ def _late_host_lifecycle_rejection_reason(
     :raises: 无主动抛出。
     """
 
-    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(
-        context.attempt.status
-    ):
+    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(context.attempt.status):
         return _REASON_TERMINAL_ALREADY_CLOSED
     if context.run.status is RunStatus.CANCELLING:
         return _REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL
@@ -4974,9 +4761,7 @@ def _validate_waiting_confirmation(
         return _waiting_confirmation_rejected("run_attempt_not_waiting")
     active_waits = tuple(
         wait_record
-        for wait_record in read_active_wait_records_for_run(
-            transaction, context.run.run_id
-        )
+        for wait_record in read_active_wait_records_for_run(transaction, context.run.run_id)
         if wait_record.attempt_id == context.attempt.attempt_id
         and wait_record.execution_id == context.attempt.execution_id
     )
@@ -4984,9 +4769,7 @@ def _validate_waiting_confirmation(
         return _waiting_confirmation_rejected("active_wait_record_not_unique")
     wait_record = active_waits[0]
     if wait_record.status is not WaitRecordStatus.WAITING:
-        return _waiting_confirmation_rejected(
-            "active_wait_record_not_waiting", wait_record=wait_record
-        )
+        return _waiting_confirmation_rejected("active_wait_record_not_waiting", wait_record=wait_record)
     refs = _accepted_waiting_refs_or_none(
         transaction=transaction,
         event_log_store=event_log_store,
@@ -4994,9 +4777,7 @@ def _validate_waiting_confirmation(
         wait_record=wait_record,
     )
     if refs is None:
-        return _waiting_confirmation_rejected(
-            "accepted_wait_refs_mismatch", wait_record=wait_record
-        )
+        return _waiting_confirmation_rejected("accepted_wait_refs_mismatch", wait_record=wait_record)
     mismatch = _engine_awaiting_record_mismatch(
         data=data,
         wait_record=wait_record,
@@ -5082,20 +4863,14 @@ def _accepted_waiting_refs_or_none(
         return None
     if not (
         _tool_awaiting_payload_matches_wait(tool_payload, wait_record)
-        and _run_waiting_payload_matches_wait(
-            run_payload, wait_record, tool_awaiting
-        )
-        and _attempt_suspended_payload_matches_wait(
-            attempt_payload, wait_record, run_waiting
-        )
+        and _run_waiting_payload_matches_wait(run_payload, wait_record, tool_awaiting)
+        and _attempt_suspended_payload_matches_wait(attempt_payload, wait_record, run_waiting)
     ):
         return None
     return _AcceptedWaitingRefs(tool_awaiting_payload=tool_payload)
 
 
-def _waiting_event_row_matches_context(
-    row: EventLogRow, context: _ValidatedCandidate
-) -> bool:
+def _waiting_event_row_matches_context(row: EventLogRow, context: _ValidatedCandidate) -> bool:
     """判断 waiting canonical row 是否与 envelope identity 同源。
 
     :param row: EventLog row。
@@ -5112,9 +4887,7 @@ def _waiting_event_row_matches_context(
     )
 
 
-def _tool_awaiting_payload_matches_wait(
-    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
-) -> bool:
+def _tool_awaiting_payload_matches_wait(payload: Mapping[str, JsonValue], wait_record: WaitRecordRow) -> bool:
     """校验 ``TOOL_AWAITING`` payload 与 wait record 同源。
 
     :param payload: canonical payload。
@@ -5124,26 +4897,17 @@ def _tool_awaiting_payload_matches_wait(
 
     try:
         return (
-            _required_payload_text(payload, field_name="session_id")
-            == wait_record.session_id
-            and _required_payload_text(payload, field_name="run_id")
-            == wait_record.run_id
-            and _required_payload_text(payload, field_name="attempt_id")
-            == wait_record.attempt_id
-            and _required_payload_text(payload, field_name="execution_id")
-            == wait_record.execution_id
-            and _required_payload_text(payload, field_name="wait_id")
-            == wait_record.wait_id
-            and _required_payload_text(payload, field_name="tool_call_id")
-            == wait_record.tool_call_id
-            and _required_payload_text(payload, field_name="tool_name")
-            == wait_record.tool_name
+            _required_payload_text(payload, field_name="session_id") == wait_record.session_id
+            and _required_payload_text(payload, field_name="run_id") == wait_record.run_id
+            and _required_payload_text(payload, field_name="attempt_id") == wait_record.attempt_id
+            and _required_payload_text(payload, field_name="execution_id") == wait_record.execution_id
+            and _required_payload_text(payload, field_name="wait_id") == wait_record.wait_id
+            and _required_payload_text(payload, field_name="tool_call_id") == wait_record.tool_call_id
+            and _required_payload_text(payload, field_name="tool_name") == wait_record.tool_name
             and _required_payload_text(payload, field_name="accept_idempotency_key")
             == wait_record.accept_idempotency_key
-            and _required_payload_text(payload, field_name="adapter_key")
-            == wait_record.adapter_key.value
-            and _required_payload_text(payload, field_name="resume_policy")
-            == wait_record.resume_policy.value
+            and _required_payload_text(payload, field_name="adapter_key") == wait_record.adapter_key.value
+            and _required_payload_text(payload, field_name="resume_policy") == wait_record.resume_policy.value
             and _payload_await_spec_matches_wait(payload, wait_record)
             and _payload_snapshot_matches_wait(payload, wait_record)
             and _payload_external_job_matches_wait(payload, wait_record)
@@ -5167,17 +4931,11 @@ def _run_waiting_payload_matches_wait(
 
     try:
         return (
-            _required_payload_text(payload, field_name="session_id")
-            == wait_record.session_id
-            and _required_payload_text(payload, field_name="run_id")
-            == wait_record.run_id
-            and _required_payload_text(payload, field_name="attempt_id")
-            == wait_record.attempt_id
-            and _required_payload_text(payload, field_name="wait_id")
-            == wait_record.wait_id
-            and _payload_event_ref_matches(
-                payload, field_name="tool_awaiting_event_ref", row=tool_awaiting
-            )
+            _required_payload_text(payload, field_name="session_id") == wait_record.session_id
+            and _required_payload_text(payload, field_name="run_id") == wait_record.run_id
+            and _required_payload_text(payload, field_name="attempt_id") == wait_record.attempt_id
+            and _required_payload_text(payload, field_name="wait_id") == wait_record.wait_id
+            and _payload_event_ref_matches(payload, field_name="tool_awaiting_event_ref", row=tool_awaiting)
         )
     except HostDurableError:
         return False
@@ -5198,29 +4956,19 @@ def _attempt_suspended_payload_matches_wait(
 
     try:
         return (
-            _required_payload_text(payload, field_name="session_id")
-            == wait_record.session_id
-            and _required_payload_text(payload, field_name="run_id")
-            == wait_record.run_id
-            and _required_payload_text(payload, field_name="attempt_id")
-            == wait_record.attempt_id
-            and _required_payload_text(payload, field_name="execution_id")
-            == wait_record.execution_id
-            and _required_payload_text(payload, field_name="wait_id")
-            == wait_record.wait_id
-            and _required_payload_text(payload, field_name="tool_call_id")
-            == wait_record.tool_call_id
-            and _payload_event_ref_matches(
-                payload, field_name="run_waiting_event_ref", row=run_waiting
-            )
+            _required_payload_text(payload, field_name="session_id") == wait_record.session_id
+            and _required_payload_text(payload, field_name="run_id") == wait_record.run_id
+            and _required_payload_text(payload, field_name="attempt_id") == wait_record.attempt_id
+            and _required_payload_text(payload, field_name="execution_id") == wait_record.execution_id
+            and _required_payload_text(payload, field_name="wait_id") == wait_record.wait_id
+            and _required_payload_text(payload, field_name="tool_call_id") == wait_record.tool_call_id
+            and _payload_event_ref_matches(payload, field_name="run_waiting_event_ref", row=run_waiting)
         )
     except HostDurableError:
         return False
 
 
-def _payload_await_spec_matches_wait(
-    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
-) -> bool:
+def _payload_await_spec_matches_wait(payload: Mapping[str, JsonValue], wait_record: WaitRecordRow) -> bool:
     """校验 payload 中的 await spec 与 wait record 一致。
 
     :param payload: ``TOOL_AWAITING`` payload。
@@ -5234,9 +4982,7 @@ def _payload_await_spec_matches_wait(
     deadline = value.get("deadline")
     try:
         expected_deadline = (
-            parse_utc_timestamp(wait_record.deadline_at).isoformat()
-            if wait_record.deadline_at is not None
-            else None
+            parse_utc_timestamp(wait_record.deadline_at).isoformat() if wait_record.deadline_at is not None else None
         )
     except ValueError:
         return False
@@ -5247,9 +4993,7 @@ def _payload_await_spec_matches_wait(
     )
 
 
-def _payload_snapshot_matches_wait(
-    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
-) -> bool:
+def _payload_snapshot_matches_wait(payload: Mapping[str, JsonValue], wait_record: WaitRecordRow) -> bool:
     """校验 payload 中的 snapshot ref 与 wait record 一致。
 
     :param payload: ``TOOL_AWAITING`` payload。
@@ -5269,9 +5013,7 @@ def _payload_snapshot_matches_wait(
     )
 
 
-def _payload_external_job_matches_wait(
-    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
-) -> bool:
+def _payload_external_job_matches_wait(payload: Mapping[str, JsonValue], wait_record: WaitRecordRow) -> bool:
     """校验 payload 中的 external job ref 与 wait record 一致。
 
     :param payload: ``TOOL_AWAITING`` payload。
@@ -5286,14 +5028,11 @@ def _payload_external_job_matches_wait(
         return False
     return (
         value.get("adapter_key") == wait_record.external_job_ref.adapter_key.value
-        and value.get("external_job_id")
-        == wait_record.external_job_ref.external_job_id
+        and value.get("external_job_id") == wait_record.external_job_ref.external_job_id
     )
 
 
-def _payload_event_ref_matches(
-    payload: Mapping[str, JsonValue], *, field_name: str, row: EventLogRow
-) -> bool:
+def _payload_event_ref_matches(payload: Mapping[str, JsonValue], *, field_name: str, row: EventLogRow) -> bool:
     """校验 payload 中的 EventLog ref 是否指向指定 row。
 
     :param payload: canonical payload。
@@ -5345,9 +5084,7 @@ def _engine_awaiting_record_mismatch(
         return "awaiting_spec_mismatch"
     try:
         deadline_at = (
-            format_utc_timestamp(record.await_spec.deadline)
-            if record.await_spec.deadline is not None
-            else None
+            format_utc_timestamp(record.await_spec.deadline) if record.await_spec.deadline is not None else None
         )
     except ValueError:
         return "awaiting_deadline_mismatch"
@@ -5358,9 +5095,7 @@ def _engine_awaiting_record_mismatch(
     return None
 
 
-def _engine_snapshot_matches_wait(
-    snapshot: ToolAwaitSnapshot | None, wait_record: WaitRecordRow
-) -> bool:
+def _engine_snapshot_matches_wait(snapshot: ToolAwaitSnapshot | None, wait_record: WaitRecordRow) -> bool:
     """校验 Engine awaiting snapshot 与 wait record snapshot ref 一致。
 
     :param snapshot: Engine ``ToolAwaitSnapshot`` 或 ``None``。
@@ -5558,9 +5293,7 @@ def _require_event_row(
     return row
 
 
-def _material_list_digest(
-    material_blocks: tuple[RunInputMaterialBlock, ...]
-) -> str:
+def _material_list_digest(material_blocks: tuple[RunInputMaterialBlock, ...]) -> str:
     """计算冻结 material list digest。
 
     :param material_blocks: 冻结 material blocks。
@@ -5583,9 +5316,7 @@ def _material_list_digest(
     )
 
 
-def _material_source_refs(
-    material_blocks: tuple[RunInputMaterialBlock, ...]
-) -> tuple[str, ...]:
+def _material_source_refs(material_blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[str, ...]:
     """返回 material list 覆盖的 canonical source refs。
 
     :param material_blocks: material blocks。
@@ -5729,9 +5460,7 @@ def _latest_rows_for_types(
     return tuple(rows)
 
 
-def _display_text_from_input_event(
-    transaction: HostTransaction, event: EventLogRow
-) -> str:
+def _display_text_from_input_event(transaction: HostTransaction, event: EventLogRow) -> str:
     """从 ``USER_INPUT_ACCEPTED`` payload 读取展示文本。
 
     :param transaction: 当前 Host transaction。
@@ -5740,9 +5469,7 @@ def _display_text_from_input_event(
     :raises HostDurableError: payload 缺少展示文本或无法解析时抛出。
     """
 
-    payload = event_payload_object(
-        transaction, event, payload_label="USER_INPUT_ACCEPTED"
-    )
+    payload = event_payload_object(transaction, event, payload_label="USER_INPUT_ACCEPTED")
     return _required_payload_text(payload, field_name="display_text")
 
 
@@ -5885,9 +5612,7 @@ def _duplicate_terminal_event_ids(
                 1,
             ),
         )
-    if event.type == EngineEventType.RUN_FAILED and isinstance(
-        event.data, RunFailedData
-    ):
+    if event.type == EngineEventType.RUN_FAILED and isinstance(event.data, RunFailedData):
         if event.data.recoverable:
             return (
                 _event_id(
@@ -6003,9 +5728,7 @@ def _engine_event_ref(candidate: EngineEventCandidate) -> str:
     )
 
 
-def _reactive_precondition_compaction_operation_id(
-    *, context: _ValidatedCandidate, failure_reason: str
-) -> str:
+def _reactive_precondition_compaction_operation_id(*, context: _ValidatedCandidate, failure_reason: str) -> str:
     """构造未写 request fact 的 reactive precondition failure operation id。
 
     :param context: 已校验 candidate 上下文。
@@ -6036,9 +5759,7 @@ def _final_answer_plan(data: FinalAnswerData) -> _EngineTerminalPlan:
 
     return _EngineTerminalPlan(
         terminal=_TerminalFactPlan(
-            attempt_event_type=_closeout_attempt_event_type(
-                AttemptStatus.SUCCEEDED
-            ),
+            attempt_event_type=_closeout_attempt_event_type(AttemptStatus.SUCCEEDED),
             run_event_type=_run_terminal_event_type(RunStatus.SUCCEEDED),
             attempt_status=AttemptStatus.SUCCEEDED,
             run_status=RunStatus.SUCCEEDED,
@@ -6134,9 +5855,7 @@ def _unsupported_waiting_plan() -> _EngineTerminalPlan:
     )
 
 
-def _failed_lifecycle_plan(
-    *, reason: str, last_observed_worker_event_index: int
-) -> _HostLifecycleTerminalPlan:
+def _failed_lifecycle_plan(*, reason: str, last_observed_worker_event_index: int) -> _HostLifecycleTerminalPlan:
     """构造 worker lifecycle failed closeout plan。
 
     :param reason: closeout reason。
@@ -6362,9 +6081,7 @@ def _validated_transient_delta_candidate(
         attempt_id=candidate.envelope.attempt_id,
         execution_id=candidate.envelope.execution_id,
         worker_event_index=candidate.worker_event_index,
-        durable_causal_fence_event_sequence=(
-            context.attempt.started_event_sequence
-        ),
+        durable_causal_fence_event_sequence=(context.attempt.started_event_sequence),
         observed_at=candidate.observed_at,
         type=transient_type,
         data=public_data,
@@ -6417,9 +6134,7 @@ def _preview_payload(transaction: HostTransaction, context: _ValidatedCandidate)
     }
     data = event.data
     if isinstance(data, IterationStartedData):
-        raise HostDurableError(
-            "iteration started preview requires runner-call link resolution"
-        )
+        raise HostDurableError("iteration started preview requires runner-call link resolution")
     elif isinstance(data, ContentCompleteData):
         common["iteration_id"] = data.iteration_id
         common["has_content"] = data.content is not None
@@ -6433,9 +6148,7 @@ def _preview_payload(transaction: HostTransaction, context: _ValidatedCandidate)
         common["tool_name"] = data.name
         common["index_in_iteration"] = data.index_in_iteration
         common["argument_key_count"] = len(data.arguments)
-        common["normalized_arguments_digest"] = sha256_digest_json(
-            {"arguments": data.arguments}
-        )
+        common["normalized_arguments_digest"] = sha256_digest_json({"arguments": data.arguments})
         common["provider_state_present"] = data.provider_state is not None
     elif isinstance(data, ToolResultAcceptedData):
         common["iteration_id"] = data.iteration_id
@@ -6497,9 +6210,7 @@ def _observed_runner_call_projection_body(
         "execution_id": context.attempt.execution_id,
         "runner_call_index": runner_call_index,
         "runner_call_kind": (
-            runner_call_kind
-            if runner_call_kind is not None
-            else _runner_call_kind_for_iteration(data)
+            runner_call_kind if runner_call_kind is not None else _runner_call_kind_for_iteration(data)
         ),
         "runner_call_trigger_reason": (
             runner_call_trigger_reason
@@ -6508,15 +6219,10 @@ def _observed_runner_call_projection_body(
         ),
         "iteration_id": data.iteration_id,
         "iteration_index": data.iteration_index,
-        "runner_input_serializer_schema_version": (
-            data.runner_input_serializer_schema_version
-        ),
+        "runner_input_serializer_schema_version": (data.runner_input_serializer_schema_version),
         "message_count": data.message_count,
         "role_sequence_digest": data.role_sequence_digest,
-        "messages": [
-            _observed_projection_message(context, message)
-            for message in data.input_projection
-        ],
+        "messages": [_observed_projection_message(context, message) for message in data.input_projection],
     }
 
 
@@ -6566,9 +6272,7 @@ def _observed_message_content_digest(
     if len(message.tool_calls) > 0:
         return sha256_digest_json(
             {
-                "serializer_schema_version": (
-                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-                ),
+                "serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
                 "role": message.role,
                 "content": message.content,
                 "reasoning_content_digest": None,
@@ -6645,9 +6349,7 @@ def _continuation_frozen_sources(
             execution_id=context.attempt.execution_id,
         )
     except PreparedRunnerCallSourceError as exc:
-        return _unavailable_continuation_sources(
-            _continuation_reason_from_source_failure(exc.category)
-        )
+        return _unavailable_continuation_sources(_continuation_reason_from_source_failure(exc.category))
     first_manifest = source.manifest
     tool_refs = first_manifest.source_refs.tool_schema_snapshot_refs
     try:
@@ -6682,10 +6384,8 @@ def _continuation_frozen_sources(
         or sizing.conservative_input_tokens is None
         or sizing.input_snapshot_digest is None
         or sizing.sizing_stage is None
-        or sizing.estimator_id
-        != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
-        or sizing.estimator_version
-        != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
+        or sizing.estimator_id != CONTEXT_ESTIMATOR_CONTRACT.estimator_id
+        or sizing.estimator_version != CONTEXT_ESTIMATOR_CONTRACT.estimator_version
     ):
         return _unavailable_continuation_sources(
             RunnerCallSizingUnavailableReason.CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE,
@@ -6712,9 +6412,7 @@ def _continuation_frozen_sources(
                 estimator_id=sizing.estimator_id,
                 estimator_version=sizing.estimator_version,
             ),
-            candidate_input_projection_ref=(
-                source.candidate.candidate_input_projection_ref
-            ),
+            candidate_input_projection_ref=(source.candidate.candidate_input_projection_ref),
             estimator_digest=sizing.estimator_digest,
             conservative_input_tokens=sizing.conservative_input_tokens,
             context_window_size=sizing.context_window_size,
@@ -6752,15 +6450,11 @@ def _continuation_reason_from_source_failure(
     """
 
     if category is PreparedRunnerCallSourceFailureCategory.TOOL_SCHEMA:
-        return (
-            RunnerCallSizingUnavailableReason.CONTINUATION_TOOL_SCHEMA_UNAVAILABLE
-        )
+        return RunnerCallSizingUnavailableReason.CONTINUATION_TOOL_SCHEMA_UNAVAILABLE
     if category is PreparedRunnerCallSourceFailureCategory.POLICY:
         return RunnerCallSizingUnavailableReason.CONTINUATION_POLICY_UNAVAILABLE
     if category is PreparedRunnerCallSourceFailureCategory.REQUEST_SEMANTICS:
-        return (
-            RunnerCallSizingUnavailableReason.CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE
-        )
+        return RunnerCallSizingUnavailableReason.CONTINUATION_REQUEST_SEMANTICS_UNAVAILABLE
     raise AssertionError("unsupported prepared runner-call source failure category")
 
 
@@ -6816,15 +6510,11 @@ def _continuation_tool_schema_fragments(
     )
     schemas = payload.get("tool_schemas")
     if not isinstance(schemas, list):
-        raise HostDurableError(
-            "continuation selected tool schemas must be array"
-        )
+        raise HostDurableError("continuation selected tool schemas must be array")
     fragments: list[BudgetJsonFragment] = []
     for index, item in enumerate(schemas):
         if not isinstance(item, Mapping):
-            raise HostDurableError(
-                "continuation selected tool schema must be object"
-            )
+            raise HostDurableError("continuation selected tool schema must be object")
         fragments.append(
             BudgetJsonFragment(
                 fragment_ref=f"continuation-tool-schema:{index}",
@@ -6900,15 +6590,9 @@ def _continuation_sizing_snapshot(
     input_snapshot_digest = sha256_digest_json(
         {
             "projection_digest": input_projection_digest,
-            "tool_schema_snapshot_refs": list(
-                frozen_sources.tool_schema_snapshot_refs
-            ),
-            "policy_snapshot_digest": (
-                frozen_sources.policy_snapshot_digest
-            ),
-            "request_semantics_digest": (
-                frozen_sources.request_semantics_digest
-            ),
+            "tool_schema_snapshot_refs": list(frozen_sources.tool_schema_snapshot_refs),
+            "policy_snapshot_digest": (frozen_sources.policy_snapshot_digest),
+            "request_semantics_digest": (frozen_sources.request_semantics_digest),
         }
     )
     tokens, estimator_digest = estimate_context_input(
@@ -7006,9 +6690,7 @@ def _limited_runner_call_manifest_body(
             status=_RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL,
             reason=_RUNNER_CALL_MANIFEST_REASON_MISSING_PROJECTION,
             missing_atom_kind=None,
-            missing_ref_kind=(
-                _RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT
-            ),
+            missing_ref_kind=(_RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT),
             missing_ref=None,
             observed_count=data.message_count,
             expected_count=None,
@@ -7068,9 +6750,7 @@ def _limited_runner_call_manifest_body(
         "execution_id": context.attempt.execution_id,
         "runner_call_index": runner_call_index,
         "runner_call_kind": (
-            runner_call_kind
-            if runner_call_kind is not None
-            else _runner_call_kind_for_iteration(data)
+            runner_call_kind if runner_call_kind is not None else _runner_call_kind_for_iteration(data)
         ),
         "runner_call_trigger_reason": (
             runner_call_trigger_reason
@@ -7081,40 +6761,26 @@ def _limited_runner_call_manifest_body(
         "iteration_index": data.iteration_index,
         "message_count": data.message_count,
         "role_sequence_digest": data.role_sequence_digest,
-        "runner_input_serializer_schema_version": (
-            data.runner_input_serializer_schema_version
-        ),
+        "runner_input_serializer_schema_version": (data.runner_input_serializer_schema_version),
         "input_projection_digest": input_projection_digest,
         "runner_call_projection_artifact_ref": (
-            projection_descriptor.payload_ref
-            if projection_descriptor is not None
-            else None
+            projection_descriptor.payload_ref if projection_descriptor is not None else None
         ),
         "runner_call_projection_artifact_digest": (
-            projection_descriptor.payload_digest
-            if projection_descriptor is not None
-            else None
+            projection_descriptor.payload_digest if projection_descriptor is not None else None
         ),
         "runner_call_projection_artifact_size_bytes": (
-            projection_descriptor.payload_size_bytes
-            if projection_descriptor is not None
-            else None
+            projection_descriptor.payload_size_bytes if projection_descriptor is not None else None
         ),
         "message_entries": list(message_entries),
         "source_cursor_refs": list(_limited_runner_call_source_refs(context)),
-        "tool_schema_snapshot_refs": list(
-            frozen_sources.tool_schema_snapshot_refs
-        ),
+        "tool_schema_snapshot_refs": list(frozen_sources.tool_schema_snapshot_refs),
         "memory_snapshot_cursor_ref": None,
         "compact_artifact_refs": [],
         "context_fallback_decision_ref": None,
-        "projector_metadata": [
-            _limited_runner_call_projector_metadata(context, data)
-        ],
+        "projector_metadata": [_limited_runner_call_projector_metadata(context, data)],
         "compactor_identity": None,
-        "sizing_snapshot": runner_call_sizing_snapshot_json(
-            sizing_snapshot
-        ),
+        "sizing_snapshot": runner_call_sizing_snapshot_json(sizing_snapshot),
         "diagnostic": diagnostic,
     }
 
@@ -7447,9 +7113,7 @@ def _runner_call_manifest_hot_payload(
             execution_id=_manifest_optional_text(manifest, "execution_id"),
             runner_call_index=_manifest_int(manifest, "runner_call_index"),
             runner_call_kind=_manifest_text(manifest, "runner_call_kind"),
-            runner_call_trigger_reason=_manifest_text(
-                manifest, "runner_call_trigger_reason"
-            ),
+            runner_call_trigger_reason=_manifest_text(manifest, "runner_call_trigger_reason"),
             iteration_id=_manifest_optional_text(manifest, "iteration_id"),
             iteration_index=_manifest_optional_int(manifest, "iteration_index"),
             manifest_payload_ref=manifest_payload_ref,
@@ -7457,12 +7121,8 @@ def _runner_call_manifest_hot_payload(
             manifest_schema_version=_manifest_text(manifest, "schema_version"),
             validation_status=validation_status,
             message_count=_manifest_int(manifest, "message_count"),
-            role_sequence_digest=_manifest_text(
-                manifest, "role_sequence_digest"
-            ),
-            input_projection_digest=_manifest_text(
-                manifest, "input_projection_digest"
-            ),
+            role_sequence_digest=_manifest_text(manifest, "role_sequence_digest"),
+            input_projection_digest=_manifest_text(manifest, "input_projection_digest"),
             runner_call_projection_artifact_ref=_manifest_optional_text(
                 manifest, "runner_call_projection_artifact_ref"
             ),
@@ -7478,9 +7138,7 @@ def _runner_call_manifest_hot_payload(
     )
 
 
-def _manifest_hot_diagnostic(
-    manifest: Mapping[str, JsonValue]
-) -> RunnerCallHotDiagnostic:
+def _manifest_hot_diagnostic(manifest: Mapping[str, JsonValue]) -> RunnerCallHotDiagnostic:
     """构造 runner-call manifest hot payload diagnostic。
 
     :param manifest: manifest body。
@@ -7675,34 +7333,20 @@ def _usage_manifest_pairing(
     for row in rows:
         event_id = row.get("event_id")
         if not isinstance(event_id, str):
-            raise HostDurableError(
-                "runner-call usage link event id is invalid"
-            )
+            raise HostDurableError("runner-call usage link event id is invalid")
         event = event_log_store.read_event_by_id(transaction, event_id)
         if event is None:
-            raise HostDurableError(
-                "runner-call usage link event row is missing"
-            )
+            raise HostDurableError("runner-call usage link event row is missing")
         payload = _payload_object(event)
-        if (
-            _optional_payload_text(payload, field_name="iteration_id")
-            == iteration_id
-        ):
+        if _optional_payload_text(payload, field_name="iteration_id") == iteration_id:
             matching.append(event)
     if not matching:
-        return _unavailable_usage_manifest_pairing(
-            _UsagePairingReason.ITERATION_LINK_MISSING
-        )
+        return _unavailable_usage_manifest_pairing(_UsagePairingReason.ITERATION_LINK_MISSING)
     if len(matching) != 1:
-        return _unavailable_usage_manifest_pairing(
-            _UsagePairingReason.ITERATION_LINK_INVALID
-        )
+        return _unavailable_usage_manifest_pairing(_UsagePairingReason.ITERATION_LINK_INVALID)
     link_event = matching[0]
     link = _payload_object(link_event)
-    if (
-        _manifest_text(link, "validation_status")
-        != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
-    ):
+    if _manifest_text(link, "validation_status") != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
         return _unavailable_usage_manifest_pairing(
             _UsagePairingReason.ITERATION_LINK_INVALID,
             iteration_link_event_id=link_event.event_id,
@@ -7727,10 +7371,7 @@ def _usage_manifest_pairing(
             iteration_link_event_id=link_event.event_id,
         )
     hot = parse_runner_call_hot_payload(_payload_object(manifest_event))
-    if (
-        hot.manifest_payload_ref != manifest_ref
-        or hot.manifest_digest != manifest_digest
-    ):
+    if hot.manifest_payload_ref != manifest_ref or hot.manifest_digest != manifest_digest:
         return _unavailable_usage_manifest_pairing(
             _UsagePairingReason.MANIFEST_INCOMPLETE,
             manifest_event_id=manifest_event_id,
@@ -7750,8 +7391,7 @@ def _usage_manifest_pairing(
     )
     sizing = manifest.sizing_snapshot
     if (
-        manifest.identity.runner_call_kind
-        not in _USAGE_PAIRING_ELIGIBLE_RUNNER_CALL_KINDS
+        manifest.identity.runner_call_kind not in _USAGE_PAIRING_ELIGIBLE_RUNNER_CALL_KINDS
         or manifest.compactor_identity is not None
         or sizing.status is not RunnerCallSizingStatus.COMPLETE
         or sizing.input_snapshot_digest is None
@@ -8016,9 +7656,7 @@ def _has_prior_iteration_observation(
         if event is None:
             raise HostDurableError("runner-call link event row is missing")
         payload = _payload_object(event)
-        if _manifest_text(payload, "validation_status") == (
-            _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
-        ):
+        if _manifest_text(payload, "validation_status") == (_RUNNER_CALL_MANIFEST_STATUS_COMPLETE):
             return True
 
     preview_row = transaction.fetchone(
@@ -8055,9 +7693,7 @@ def _runner_call_iteration_link_payload(
     :raises HostDurableError: manifest hot payload 字段非法时抛出。
     """
 
-    manifest_payload = parse_runner_call_hot_payload(
-        _payload_object(manifest_event)
-    )
+    manifest_payload = parse_runner_call_hot_payload(_payload_object(manifest_event))
     expected_count = manifest_payload.message_count
     expected_digest = manifest_payload.role_sequence_digest
     status = _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
@@ -8093,16 +7729,12 @@ def _runner_call_iteration_link_payload(
         "manifest_schema_version": manifest_payload.manifest_schema_version,
         "runner_call_index": manifest_payload.runner_call_index,
         "runner_call_kind": manifest_payload.runner_call_kind,
-        "runner_call_trigger_reason": (
-            manifest_payload.runner_call_trigger_reason
-        ),
+        "runner_call_trigger_reason": (manifest_payload.runner_call_trigger_reason),
         "iteration_id": data.iteration_id,
         "iteration_index": data.iteration_index,
         "engine_message_count": data.message_count,
         "engine_role_sequence_digest": data.role_sequence_digest,
-        "runner_input_serializer_schema_version": (
-            data.runner_input_serializer_schema_version
-        ),
+        "runner_input_serializer_schema_version": (data.runner_input_serializer_schema_version),
         "expected_message_count": expected_count,
         "expected_role_sequence_digest": expected_digest,
         "validation_status": status,
@@ -8124,19 +7756,11 @@ def _runner_call_iteration_link_matches(
 
     payload = _payload_object(event)
     return (
-        _optional_payload_text(payload, field_name="iteration_id")
-        == data.iteration_id
-        and _optional_payload_int(payload, field_name="iteration_index")
-        == data.iteration_index
-        and _optional_payload_int(payload, field_name="engine_message_count")
-        == data.message_count
-        and _optional_payload_text(
-            payload, field_name="engine_role_sequence_digest"
-        )
-        == data.role_sequence_digest
-        and _optional_payload_text(
-            payload, field_name="runner_input_serializer_schema_version"
-        )
+        _optional_payload_text(payload, field_name="iteration_id") == data.iteration_id
+        and _optional_payload_int(payload, field_name="iteration_index") == data.iteration_index
+        and _optional_payload_int(payload, field_name="engine_message_count") == data.message_count
+        and _optional_payload_text(payload, field_name="engine_role_sequence_digest") == data.role_sequence_digest
+        and _optional_payload_text(payload, field_name="runner_input_serializer_schema_version")
         == data.runner_input_serializer_schema_version
     )
 
@@ -8162,9 +7786,7 @@ def _resolution_from_link_event(
         manifest_payload_ref=_manifest_text(payload, "manifest_payload_ref"),
         manifest_digest=_manifest_text(payload, "manifest_digest"),
         expected_count=_manifest_optional_int(payload, "expected_message_count"),
-        expected_digest=_manifest_optional_text(
-            payload, "expected_role_sequence_digest"
-        ),
+        expected_digest=_manifest_optional_text(payload, "expected_role_sequence_digest"),
         observed_count=data.message_count,
         observed_digest=data.role_sequence_digest,
         continuation_limited_signal=False,
@@ -8200,9 +7822,7 @@ def _resolution_from_limited_manifest_event(
         expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
         observed_count=data.message_count,
         observed_digest=data.role_sequence_digest,
-        continuation_limited_signal=(
-            status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
-        ),
+        continuation_limited_signal=(status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE),
     )
 
 
@@ -8214,9 +7834,7 @@ def _link_diagnostic(payload: Mapping[str, JsonValue]) -> Mapping[str, JsonValue
     :raises HostDurableError: diagnostic 字段非法时抛出。
     """
 
-    if _manifest_text(payload, "validation_status") == (
-        _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
-    ):
+    if _manifest_text(payload, "validation_status") == (_RUNNER_CALL_MANIFEST_STATUS_COMPLETE):
         return {"reason": None}
     value = payload.get("diagnostic")
     if not isinstance(value, Mapping):
@@ -8246,12 +7864,8 @@ def _iteration_started_preview_payload(
         "iteration_index": data.iteration_index,
         "message_count": data.message_count,
         "role_sequence_digest": data.role_sequence_digest,
-        "runner_input_serializer_schema_version": (
-            data.runner_input_serializer_schema_version
-        ),
-        "runner_call_manifest_validation": _runner_call_link_validation_summary(
-            resolution
-        ),
+        "runner_input_serializer_schema_version": (data.runner_input_serializer_schema_version),
+        "runner_call_manifest_validation": _runner_call_link_validation_summary(resolution),
     }
     if resolution.link_event_id is not None:
         payload["runner_call_iteration_link_event_id"] = resolution.link_event_id
@@ -8333,9 +7947,7 @@ def _runner_call_diagnostic_projection(
     )
 
 
-def _optional_payload_int(
-    payload: Mapping[str, JsonValue], *, field_name: str
-) -> int | None:
+def _optional_payload_int(payload: Mapping[str, JsonValue], *, field_name: str) -> int | None:
     """读取 payload 中的可选非负整数字段。
 
     :param payload: payload 映射。
@@ -8352,9 +7964,7 @@ def _optional_payload_int(
     return value
 
 
-def _optional_payload_text(
-    payload: Mapping[str, JsonValue], *, field_name: str
-) -> str | None:
+def _optional_payload_text(payload: Mapping[str, JsonValue], *, field_name: str) -> str | None:
     """读取 payload 中的可选非空文本字段。
 
     :param payload: payload 映射。
@@ -8371,9 +7981,7 @@ def _optional_payload_text(
     raise HostDurableError(f"payload field {field_name} must be non-empty text")
 
 
-def _manifest_diagnostic(
-    manifest: Mapping[str, JsonValue]
-) -> Mapping[str, JsonValue]:
+def _manifest_diagnostic(manifest: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
     """读取 manifest 中的 diagnostic object。
 
     :param manifest: manifest body。
@@ -8387,9 +7995,7 @@ def _manifest_diagnostic(
     return value
 
 
-def _manifest_optional_diagnostic(
-    manifest: Mapping[str, JsonValue]
-) -> Mapping[str, JsonValue] | None:
+def _manifest_optional_diagnostic(manifest: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
     """读取 manifest 中的可选 diagnostic object。
 
     :param manifest: manifest body。
@@ -8435,9 +8041,7 @@ def _manifest_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
     return value
 
 
-def _manifest_optional_text(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> str | None:
+def _manifest_optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
     """读取 manifest / diagnostic 中的可选文本字段。
 
     :param payload: manifest 或 diagnostic JSON object。
@@ -8469,9 +8073,7 @@ def _manifest_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
     return value
 
 
-def _manifest_optional_int(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> int | None:
+def _manifest_optional_int(payload: Mapping[str, JsonValue], field_name: str) -> int | None:
     """读取 manifest / diagnostic 中的可选非负整数字段。
 
     :param payload: manifest 或 diagnostic JSON object。
@@ -8528,9 +8130,7 @@ def _context_compaction_payload(
     }
 
 
-def _run_suspended_payload(
-    context: _ValidatedCandidate, data: RunSuspendedData
-) -> Mapping[str, JsonValue]:
+def _run_suspended_payload(context: _ValidatedCandidate, data: RunSuspendedData) -> Mapping[str, JsonValue]:
     """构造 run_suspended diagnostic payload。
 
     :param context: 已校验上下文。
@@ -8548,9 +8148,7 @@ def _run_suspended_payload(
     }
 
 
-def _tool_awaiting_payload(
-    context: _ValidatedCandidate, data: ToolAwaitingData
-) -> Mapping[str, JsonValue]:
+def _tool_awaiting_payload(context: _ValidatedCandidate, data: ToolAwaitingData) -> Mapping[str, JsonValue]:
     """构造 tool_awaiting diagnostic payload。
 
     :param context: 已校验上下文。
@@ -8580,11 +8178,7 @@ def _provider_protocol_failure_metadata(
     :raises Exception: 不主动抛出异常。
     """
 
-    diagnostic_refs = tuple(
-        ref
-        for ref in (raw_payload_ref, data.provider_request_id)
-        if ref is not None
-    )
+    diagnostic_refs = tuple(ref for ref in (raw_payload_ref, data.provider_request_id) if ref is not None)
     return {
         "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
         "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
@@ -8609,9 +8203,7 @@ def _provider_protocol_partial_tool_call_signal(
 
     partial_count = len(partial_tool_calls)
     summary_status = (
-        _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT
-        if partial_count > 0
-        else _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE
+        _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT if partial_count > 0 else _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE
     )
     return {
         "schema_version": _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION,
@@ -8619,10 +8211,7 @@ def _provider_protocol_partial_tool_call_signal(
         "partial_tool_call_count": partial_count,
         "summary_status": summary_status,
         "raw_payload_present": raw_payload_present,
-        "partial_tool_calls": [
-            _partial_tool_call_summary_payload(summary)
-            for summary in partial_tool_calls
-        ],
+        "partial_tool_calls": [_partial_tool_call_summary_payload(summary) for summary in partial_tool_calls],
     }
 
 
@@ -8702,9 +8291,7 @@ def _accepted_no_event_result(
     )
 
 
-def _merge_diagnostic_and_closeout(
-    diagnostic: EventLogRow, closeout: EngineIngestResult
-) -> EngineIngestResult:
+def _merge_diagnostic_and_closeout(diagnostic: EventLogRow, closeout: EngineIngestResult) -> EngineIngestResult:
     """合并 diagnostic 与 terminal closeout 结果。
 
     :param diagnostic: diagnostic EventLog row。

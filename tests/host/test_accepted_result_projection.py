@@ -31,7 +31,11 @@ from dayu.host.compact_material import (
     conversation_compact_input_vnext_from_material_pack,
     select_compact_segment,
 )
-from dayu.host.compaction import CompactMaterialBlockKind, CompactSegmentTrigger
+from dayu.host.compaction import (
+    CompactMaterialBlockKind,
+    CompactSegmentTrigger,
+    CompactSourceKindV2,
+)
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
@@ -131,12 +135,18 @@ def test_planned_and_committed_projection_share_one_owner_contract(
     """
 
     event_log = EventLogStore()
-    projections: tuple[
-        AcceptedToolResultProjection | None,
-        AcceptedToolResultProjection,
-    ] | None = None
+    projections: (
+        tuple[
+            AcceptedToolResultProjection | None,
+            AcceptedToolResultProjection,
+        ]
+        | None
+    ) = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
-        def operation(transaction: HostTransaction) -> tuple[
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[
             AcceptedToolResultProjection | None,
             AcceptedToolResultProjection,
         ]:
@@ -153,9 +163,7 @@ def test_planned_and_committed_projection_share_one_owner_contract(
                 event_id="event-planned-committed-equivalence",
                 tool_call_id="tool-call-planned-committed-equivalence",
                 tool_fact_kind="completed",
-                raw_tool_outcome=_completed_outcome_json(
-                    {"summary": "Equivalent projection"}
-                ),
+                raw_tool_outcome=_completed_outcome_json({"summary": "Equivalent projection"}),
                 source_refs=_OPAQUE_SENTINEL_REFS,
             )
             payload = event_payload_object(
@@ -202,11 +210,7 @@ def _completed_outcome_json(value: JsonValue) -> JsonValue:
     :raises ValueError: value 不是合法 JSON 时由 typed contract 抛出。
     """
 
-    return accepted_tool_outcome_json(
-        ToolCompletedOutcome(
-            result=ToolResultSuccess(ok=True, value=value, meta=None)
-        )
-    )
+    return accepted_tool_outcome_json(ToolCompletedOutcome(result=ToolResultSuccess(ok=True, value=value, meta=None)))
 
 
 def test_projection_uses_semantic_query_status_result_and_business_source(
@@ -217,6 +221,7 @@ def test_projection_uses_semantic_query_status_result_and_business_source(
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入一组 request / accepted result facts。
 
@@ -274,6 +279,7 @@ def test_projection_falls_back_to_arguments_when_semantic_query_is_absent(
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入无 semantic query 的 request / accepted result facts。
 
@@ -313,9 +319,7 @@ def test_projection_falls_back_to_arguments_when_semantic_query_is_absent(
 
     assert projection is not None
     assert projection.query.state is AcceptedToolResultQueryState.ARGUMENTS_SUMMARY
-    assert projection.query.text == (
-        f"参数：{canonical_json_dumps({'arguments': {'ticker': 'AAPL'}})}"
-    )
+    assert projection.query.text == (f"参数：{canonical_json_dumps({'arguments': {'ticker': 'AAPL'}})}")
     assert projection.status is AcceptedToolResultStatus.FAILED
     assert projection is not None
     assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
@@ -382,9 +386,7 @@ def test_opaque_provenance_round_trips_but_stays_out_of_projection(
                 event_id="event-result-opaque-round-trip",
                 tool_call_id="tool-call-opaque-round-trip",
                 tool_fact_kind="completed",
-                raw_tool_outcome=_completed_outcome_json(
-                    {"citation": _CITATION_OBJECT}
-                ),
+                raw_tool_outcome=_completed_outcome_json({"citation": _CITATION_OBJECT}),
                 source_refs=_OPAQUE_SENTINEL_REFS,
                 locator_refs=tuple(reversed(_OPAQUE_SENTINEL_REFS)),
             )
@@ -396,9 +398,7 @@ def test_opaque_provenance_round_trips_but_stays_out_of_projection(
                 payload_label="opaque round-trip accepted result",
             )
         )
-        envelope = accepted_evidence_envelope_from_payload(
-            payload, producer_event_ref=row.event_id
-        )
+        envelope = accepted_evidence_envelope_from_payload(payload, producer_event_ref=row.event_id)
         projection = store.transaction_runner.run_read(
             lambda transaction: project_accepted_tool_result(transaction, row)
         )
@@ -462,9 +462,7 @@ def test_projection_missing_request_atom_fails_closed(
             )
         )
         with pytest.raises(HostDurableError, match="request atom is missing"):
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(transaction, row)
-            )
+            store.transaction_runner.run_read(lambda transaction: project_accepted_tool_result(transaction, row))
 
 
 def test_projection_missing_envelope_fails_closed(
@@ -492,18 +490,14 @@ def test_projection_missing_envelope_fails_closed(
             )
         )
         with pytest.raises(HostDurableError, match="evidence envelope is missing"):
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(transaction, row)
-            )
+            store.transaction_runner.run_read(lambda transaction: project_accepted_tool_result(transaction, row))
 
 
 def test_renderer_rejects_missing_typed_material() -> None:
     """renderer 不接受缺失 material，禁止整体 fallback。"""
 
     with pytest.raises(TypeError, match="AcceptedToolEvidenceLLMMaterial"):
-        render_accepted_tool_evidence_for_llm(
-            cast(AcceptedToolEvidenceLLMMaterial, None)
-        )
+        render_accepted_tool_evidence_for_llm(cast(AcceptedToolEvidenceLLMMaterial, None))
 
 
 def test_memory_consumer_rejects_canonical_result_without_llm_material(
@@ -591,10 +585,7 @@ def test_projection_missing_envelope_and_blank_status_handling(
 
     assert blank_status_projection is not None
     assert blank_status_projection.status is AcceptedToolResultStatus.UNKNOWN
-    assert (
-        "accepted_status_unavailable"
-        in blank_status_projection.diagnostic_reasons
-    )
+    assert "accepted_status_unavailable" in blank_status_projection.diagnostic_reasons
 
 
 def test_accepted_evidence_producer_mismatch_is_typed_exception(
@@ -612,9 +603,7 @@ def test_accepted_evidence_producer_mismatch_is_typed_exception(
         source_refs=(),
     )
     payload: dict[str, JsonValue] = {
-        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-            envelope
-        ),
+        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(envelope),
         "raw_tool_outcome": {"kind": "completed"},
     }
     wrapped_cause: BaseException | None = None
@@ -637,9 +626,7 @@ def test_accepted_evidence_producer_mismatch_is_typed_exception(
             )
         )
         with pytest.raises(HostDurableError) as wrapped:
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(transaction, row)
-            )
+            store.transaction_runner.run_read(lambda transaction: project_accepted_tool_result(transaction, row))
         wrapped_cause = wrapped.value.__cause__
 
     assert isinstance(wrapped_cause, AcceptedEvidenceProducerEventRefMismatchError)
@@ -693,6 +680,7 @@ def test_projection_identity_mismatch_fails_closed(tmp_path: Path) -> None:
 
     event_log = EventLogStore()
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入 tool_call_id 不一致的 request / accepted result。
 
@@ -724,9 +712,7 @@ def test_projection_identity_mismatch_fails_closed(tmp_path: Path) -> None:
 
         row = store.transaction_runner.run_write(seed)
         with pytest.raises(HostDurableError, match="envelope mismatch"):
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(transaction, row)
-            )
+            store.transaction_runner.run_read(lambda transaction: project_accepted_tool_result(transaction, row))
 
 
 @pytest.mark.parametrize(
@@ -748,6 +734,7 @@ def test_projection_result_execution_identity_mismatch_fails_closed(
 
     event_log = EventLogStore()
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入 execution 不同源的 request / accepted result。
 
@@ -784,9 +771,7 @@ def test_projection_result_execution_identity_mismatch_fails_closed(
             HostDurableError,
             match="accepted result request atom identity mismatch",
         ):
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(transaction, row)
-            )
+            store.transaction_runner.run_read(lambda transaction: project_accepted_tool_result(transaction, row))
 
 
 def test_projection_wait_resolution_status_takes_priority(tmp_path: Path) -> None:
@@ -841,9 +826,7 @@ def test_projection_never_guesses_business_source_from_opaque_refs(
     assert projection is not None
     assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
     assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
-    assert "source_locator_refs" not in {
-        field.name for field in fields(AcceptedToolResultProjection)
-    }
+    assert "source_locator_refs" not in {field.name for field in fields(AcceptedToolResultProjection)}
     assert "OpaqueEvidenceRef" not in repr(projection)
     for ref in _OPAQUE_SENTINEL_REFS:
         assert ref.ref_kind not in projection.source.text
@@ -904,6 +887,7 @@ def test_projection_resolves_hot_payload_cold_result_and_keeps_inline_direct(
         "result": {"ok": True, "summary": "descriptor result"},
     }
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(
             transaction: HostTransaction,
         ) -> tuple[
@@ -929,17 +913,15 @@ def test_projection_resolves_hot_payload_cold_result_and_keeps_inline_direct(
                 arguments_json=arguments_json,
                 semantic_query_text=None,
             )
-            descriptor_row, descriptor_hot_payload, _ = (
-                _append_hot_cold_tool_result(
-                    transaction,
-                    event_log,
-                    event_id="event-result-descriptor",
-                    tool_call_id="tool-call-descriptor",
-                    request_event_ref=descriptor_request.event_id,
-                    normalized_arguments_digest=arguments_digest,
-                    raw_tool_outcome=descriptor_payload,
-                    source_refs=(),
-                )
+            descriptor_row, descriptor_hot_payload, _ = _append_hot_cold_tool_result(
+                transaction,
+                event_log,
+                event_id="event-result-descriptor",
+                tool_call_id="tool-call-descriptor",
+                request_event_ref=descriptor_request.event_id,
+                normalized_arguments_digest=arguments_digest,
+                raw_tool_outcome=descriptor_payload,
+                source_refs=(),
             )
             inline_request = _append_tool_call_requested(
                 transaction,
@@ -995,9 +977,7 @@ def test_projection_resolves_hot_payload_cold_result_and_keeps_inline_direct(
         assert descriptor_projection.result_details_text == "descriptor result"
         assert descriptor_projection.status is AcceptedToolResultStatus.COMPLETED
         assert descriptor_projection.llm_material is not None
-        assert descriptor_projection.llm_material.result_text == (
-            canonical_json_dumps(descriptor_payload)
-        )
+        assert descriptor_projection.llm_material.result_text == (canonical_json_dumps(descriptor_payload))
         assert inline_projection.result_details_text == "inline result"
         assert inline_projection.status is AcceptedToolResultStatus.COMPLETED
         assert inline_projection.llm_material is not None
@@ -1018,6 +998,7 @@ def test_projection_hot_payload_cold_descriptor_corruption_fails_closed(
 
     event_log = EventLogStore()
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(
             transaction: HostTransaction,
         ) -> tuple[EventLogRow, Mapping[str, JsonValue], PayloadDescriptor]:
@@ -1045,9 +1026,7 @@ def test_projection_hot_payload_cold_descriptor_corruption_fails_closed(
                 tool_call_id=f"tool-call-cold-{failure.value}",
                 request_event_ref=request.event_id,
                 normalized_arguments_digest=arguments_digest,
-                raw_tool_outcome=_completed_outcome_json(
-                    {"summary": "strict cold result"}
-                ),
+                raw_tool_outcome=_completed_outcome_json({"summary": "strict cold result"}),
                 source_refs=(),
             )
 
@@ -1085,6 +1064,7 @@ def test_projection_missing_event_payload_fails_closed(
 
     event_log = EventLogStore()
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入 payload JSON 非 object 的 accepted result event。
 
@@ -1119,9 +1099,7 @@ def test_projection_missing_event_payload_fails_closed(
 
         row = store.transaction_runner.run_write(seed)
         with pytest.raises(HostDurableError, match="evidence envelope is missing"):
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(transaction, row)
-            )
+            store.transaction_runner.run_read(lambda transaction: project_accepted_tool_result(transaction, row))
 
 
 def test_projection_mechanically_displays_legal_business_argument_names(
@@ -1132,6 +1110,7 @@ def test_projection_mechanically_displays_legal_business_argument_names(
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入含合法路径、引用标签与 password-like 业务名的结果。
 
@@ -1227,6 +1206,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     compact_view: PreDispatchCompactMaterialView | None = None
     current_row: EventLogRow | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
+
         def seed(
             transaction: HostTransaction,
         ) -> tuple[EventLogRow, Mapping[str, JsonValue], EventLogRow]:
@@ -1279,9 +1259,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
                 resolved_payload=hot_payload,
             )
         )
-        consumer = ToolTraceProjectionConsumer(
-            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
-        )
+        consumer = ToolTraceProjectionConsumer(ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl"))
         store.transaction_runner.run_write(
             lambda transaction: consumer.apply_event(
                 transaction,
@@ -1324,9 +1302,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     assert compact_view is not None
     assert current_row is not None
     evidence_blocks = tuple(
-        block
-        for block in compact_view.material_blocks
-        if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        block for block in compact_view.material_blocks if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
     )
     assert len(evidence_blocks) == 1
     evidence_block = evidence_blocks[0]
@@ -1345,11 +1321,14 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
         current_input_ref=current_row.event_id,
         current_input_text="current question",
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(
-        compact_pack
+    compact_input = conversation_compact_input_vnext_from_material_pack(compact_pack)
+    evidence_sources = tuple(
+        source
+        for source in compact_input.source_boundary
+        if source.source_kind is CompactSourceKindV2.EVIDENCE_MATERIAL
     )
-    assert len(compact_input.evidence_material) == 1
-    compact_evidence = compact_input.evidence_material[0]
+    assert len(evidence_sources) == 1
+    compact_evidence = evidence_sources[0]
     assert projection.llm_material is not None
     material = projection.llm_material
     run_input_text = render_accepted_tool_evidence_for_llm(material)
@@ -1371,12 +1350,10 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     assert block_material.query_text == projection.query.text
     assert block_material.source_text == projection.source.text
     assert block_material.result_text == projection.result_text
-    assert compact_evidence.query_text == projection.query.text
-    assert compact_evidence.response_text == projection.result_text
-    assert compact_evidence.source_note == projection.source.text
-    assert evidence_block.text == render_accepted_tool_evidence_for_llm(
-        material
-    )
+    assert f"查询：{projection.query.text}" in compact_evidence.readable_text
+    assert f"结果：{projection.result_text}" in compact_evidence.readable_text
+    assert f"来源：{projection.source.text}" in compact_evidence.readable_text
+    assert evidence_block.text == render_accepted_tool_evidence_for_llm(material)
     assert f"查询语义：{projection.query.text}" in run_input_text
     assert f"业务来源：{projection.source.text}" in run_input_text
     assert f"工具结果：{projection.result_text}" in run_input_text
@@ -1477,9 +1454,7 @@ def _append_tool_call_requested(
 
     arguments_digest = sha256_digest_json(arguments_json)
     semantic_query_digest = (
-        sha256_digest_json({"semantic_query_text": semantic_query_text})
-        if semantic_query_text is not None
-        else None
+        sha256_digest_json({"semantic_query_text": semantic_query_text}) if semantic_query_text is not None else None
     )
     return _append_event(
         transaction,
@@ -1494,9 +1469,7 @@ def _append_tool_call_requested(
             "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
             "arguments_payload_ref": None,
             "arguments_inline_json": arguments_json,
-            "arguments_json_size_bytes": len(
-                canonical_json_dumps(arguments_json).encode("utf-8")
-            ),
+            "arguments_json_size_bytes": len(canonical_json_dumps(arguments_json).encode("utf-8")),
             "semantic_input_digest": _DIGEST,
             "semantic_query_storage_kind": (
                 TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
@@ -1648,9 +1621,7 @@ def _append_tool_result(
         "tool_call_id": tool_call_id,
         "tool_name": _TOOL_NAME,
         "normalized_arguments_digest": normalized_arguments_digest,
-        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-            envelope
-        ),
+        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(envelope),
     }
     if include_raw_outcome:
         payload["raw_tool_outcome"] = raw_tool_outcome

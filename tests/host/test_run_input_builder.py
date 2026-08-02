@@ -121,21 +121,18 @@ from dayu.host.durable.state import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
+    COMPACT_OUTPUT_SCHEMA_V2,
+    CompactAnswerAnchorV2,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CompactQualityCheckResultVNext,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
+    CompactCandidateV2,
+    CompactEvidenceFactV2,
+    CompactForwardIntentV2,
+    CompactForwardIntentStatusV2,
+    CompactReferenceContinuityV2,
+    CompactSessionSummaryV2,
 )
+from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     build_pre_dispatch_compact_material_view,
@@ -289,6 +286,8 @@ def _proposal_manifest_reference(
         compaction_attempt_number=1,
         compactor_engine_run_id=compactor_engine_run_id,
     )
+
+
 _R03_CITATION_OBJECT: dict[str, JsonValue] = {
     "document_id": "MSFT-10K-2025",
     "source_type": "sec_filing",
@@ -313,8 +312,7 @@ _R03_OPAQUE_SENTINEL_REFS = (
 )
 _RESUME_GUIDANCE_COMPLETED_INTRO = "上一轮被等待中断的外部工具步骤已经完成。"
 _RESUME_GUIDANCE_NO_REPEAT = (
-    "这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了"
-    "同一次请求再次启动相同下载、上传或处理。"
+    "这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了同一次请求再次启动相同下载、上传或处理。"
 )
 _RESUME_GUIDANCE_FORBIDDEN_INTERNAL_FRAGMENTS = (
     "Resume guidance",
@@ -483,12 +481,8 @@ def _build_with_compact_memory_refs(
         )
         compact_view = CompactArtifactView(
             compaction_event_ref=compact_event_ref,
-            compact_artifact_ref=(
-                None if compact_event_ref is None else "compact-artifact:test"
-            ),
-            compact_artifact_digest=(
-                None if compact_event_ref is None else "sha256:" + "1" * 64
-            ),
+            compact_artifact_ref=(None if compact_event_ref is None else "compact-artifact:test"),
+            compact_artifact_digest=(None if compact_event_ref is None else "sha256:" + "1" * 64),
         )
         builder = create_no_tool_run_input_builder(
             transaction_runner=store.transaction_runner,
@@ -637,9 +631,9 @@ def test_resume_wait_messages_fail_closed_for_invalid_start_reason(
             payload=_user_input_payload("resume prompt"),
         )
         _append_resume_wait_projection_events(store.transaction_runner, seeded)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
         resume_started = replace(
             _read_event_by_id(store.transaction_runner, "event-run-started-resume"),
             payload_json=canonical_json_dumps(payload_json),
@@ -673,18 +667,12 @@ def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
             session_id=session_id,
             payload=_user_input_payload("resume prompt"),
         )
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
         resume_started = replace(
             current_facts.run_started_event,
-            payload_json=canonical_json_dumps(
-                {
-                    "start_reason": serialize_run_start_reason(
-                        RunStartReason.RESUME
-                    )
-                }
-            ),
+            payload_json=canonical_json_dumps({"start_reason": serialize_run_start_reason(RunStartReason.RESUME)}),
         )
         record_input = RunnerCallManifestRecordInput(
             attempt_snapshot=_attempt_snapshot(seeded),
@@ -701,10 +689,10 @@ def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             ),
-                continuity=SessionContinuityView(
-                    messages=(),
-                    source_refs=(),
-                ),
+            continuity=SessionContinuityView(
+                messages=(),
+                source_refs=(),
+            ),
             tool_snapshot=ToolSchemaSnapshot(
                 tool_schemas=(),
                 disable_tools=True,
@@ -1056,9 +1044,7 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
         )
         messages = _json_object_sequence(projection.payload["messages"])
         manifest_entries = _json_object_sequence(manifest["message_entries"])
-        projector_metadata = _json_object_sequence(
-            manifest["projector_metadata"]
-        )
+        projector_metadata = _json_object_sequence(manifest["projector_metadata"])
         projection_descriptor = store.transaction_runner.run_read(
             lambda transaction: PayloadStore().read_payload_descriptor(
                 transaction,
@@ -1133,9 +1119,7 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             payload=input_payload,
         )
         attempt_snapshot = _attempt_snapshot(seeded)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(attempt_snapshot)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(attempt_snapshot)
         durable_input_payload = store.transaction_runner.run_read(
             lambda transaction: event_payload_object(
                 transaction,
@@ -1147,14 +1131,10 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             durable_input_payload,
         )
 
-        assert dispatch_decision.policy_snapshot.runner_spec.headers == {
-            header_name: _CONFIGURED_SECRET_SENTINEL
-        }
+        assert dispatch_decision.policy_snapshot.runner_spec.headers == {header_name: _CONFIGURED_SECRET_SENTINEL}
         effective_attempt_snapshot = replace(
             attempt_snapshot,
-            policy_snapshot_ref=(
-                dispatch_decision.policy_snapshot.policy_snapshot_ref
-            ),
+            policy_snapshot_ref=(dispatch_decision.policy_snapshot.policy_snapshot_ref),
         )
 
         request = create_no_tool_run_input_builder(
@@ -1162,9 +1142,7 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             policy_snapshot=dispatch_decision.policy_snapshot,
         ).build(effective_attempt_snapshot)
 
-        assert request.runner_spec.headers == {
-            header_name: _CONFIGURED_SECRET_SENTINEL
-        }
+        assert request.runner_spec.headers == {header_name: _CONFIGURED_SECRET_SENTINEL}
         for message in request.messages:
             assert _CONFIGURED_SECRET_SENTINEL not in _message_content(message)
 
@@ -1183,14 +1161,10 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             )
         )
         assert memory_snapshot is not None
-        memory_json = canonical_json_dumps(
-            conversation_memory_snapshot_to_json_value(memory_snapshot.snapshot)
-        )
+        memory_json = canonical_json_dumps(conversation_memory_snapshot_to_json_value(memory_snapshot.snapshot))
         assert _CONFIGURED_SECRET_SENTINEL not in memory_json
 
-        run = store.transaction_runner.run_read(
-            lambda transaction: read_run_by_id(transaction, seeded.run_id)
-        )
+        run = store.transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, seeded.run_id))
         assert run is not None
         compact_material = store.transaction_runner.run_read(
             lambda transaction: build_pre_dispatch_compact_material_view(
@@ -1230,9 +1204,7 @@ def test_internal_execution_value_round_trips_without_llm_projection(
         )
         assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(hot_payload)
         assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(manifest)
-        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(
-            runner_call_projection.payload
-        )
+        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(runner_call_projection.payload)
 
 
 def test_session_continuity_does_not_emit_unbudgeted_historical_raw_turns(
@@ -1527,9 +1499,7 @@ def test_prepared_candidate_tool_execution_mode_is_strict_and_digest_owned() -> 
         tool_execution_mode=ToolExecutionMode.NO_TOOL_REPLAY,
     )
 
-    assert disabled.candidate_input_projection_digest != (
-        replay.candidate_input_projection_digest
-    )
+    assert disabled.candidate_input_projection_digest != (replay.candidate_input_projection_digest)
     assert disabled.input_snapshot_digest != replay.input_snapshot_digest
     body = dict(
         _prepared_candidate_projection_body(
@@ -1540,8 +1510,7 @@ def test_prepared_candidate_tool_execution_mode_is_strict_and_digest_owned() -> 
     )
     assert body["tool_execution_mode"] == "no_tool_disabled"
     assert (
-        _prepared_candidate_from_json(body, policy_snapshot=policy)
-        .tool_execution_mode
+        _prepared_candidate_from_json(body, policy_snapshot=policy).tool_execution_mode
         is ToolExecutionMode.NO_TOOL_DISABLED
     )
     body["tool_execution_mode"] = "unknown_mode"
@@ -1873,19 +1842,13 @@ def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
         evidence_block = _accepted_tool_evidence_blocks(blocks)[0]
 
         assert evidence_block.accepted_tool_evidence is not None
-        assert evidence_block.accepted_tool_evidence.result_text == (
-            canonical_json_dumps(raw_outcome)
-        )
-        assert evidence_block.text == render_accepted_tool_evidence_for_llm(
-            evidence_block.accepted_tool_evidence
-        )
+        assert evidence_block.accepted_tool_evidence.result_text == (canonical_json_dumps(raw_outcome))
+        assert evidence_block.text == render_accepted_tool_evidence_for_llm(evidence_block.accepted_tool_evidence)
         assert "full raw outcome for LLM material" in evidence_block.text
         assert _DIGEST_A not in evidence_block.text
         assert seeded_evidence.tool_result_event_id not in evidence_block.text
         assert evidence_block.accepted_tool_evidence.tool_name == "fins.search"
-        assert evidence_block.accepted_tool_evidence.query_text == (
-            "Read MSFT FY2025 revenue from filing"
-        )
+        assert evidence_block.accepted_tool_evidence.query_text == ("Read MSFT FY2025 revenue from filing")
         assert evidence_block.accepted_evidence_id == (seeded_evidence.accepted_evidence_id)
         assert evidence_block.canonical_source_refs == (seeded_evidence.accepted_evidence_id,)
         assert evidence_block.payload_refs == (f"payload:{seeded_evidence.tool_result_event_id}",)
@@ -1947,9 +1910,7 @@ def test_run_input_messages_use_explicit_citation_and_hide_opaque_refs(
             material_blocks=blocks,
         )
 
-    visible_text = "\n".join(
-        _message_content(message) for message in messages
-    )
+    visible_text = "\n".join(_message_content(message) for message in messages)
     assert canonical_json_dumps(_R03_CITATION_OBJECT) in visible_text
     for ref in _R03_OPAQUE_SENTINEL_REFS:
         assert ref.ref_kind not in visible_text
@@ -3022,7 +2983,7 @@ def test_inline_delta_includes_vnext_memory_sections(tmp_path: Path) -> None:
 
     policy = _memory_policy(
         max_lag_events_for_inline_delta=16,
-        evidence_fact_char_cap=24,
+        evidence_fact_char_cap=2048,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -3430,9 +3391,7 @@ def test_terminal_answer_text_matches_durable_projection_and_run_input(
 
         request = _build_request_with_memory(store, seeded, policy)
         run_input_answers = tuple(
-            _message_content(message)
-            for message in request.messages
-            if isinstance(message, AssistantMessage)
+            _message_content(message) for message in request.messages if isinstance(message, AssistantMessage)
         )
 
         consumer = ConversationMemoryProjectionConsumer(policy)
@@ -3763,17 +3722,11 @@ def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
         request = _build_post_compaction_request(store, recovery, policy)
         contents = tuple(_message_content(message) for message in request.messages)
         system_content = _single_system_content(request.messages)
-        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(
-            store
-        )
+        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(store)
 
         assert hot_manifest["runner_call_kind"] == "post_compaction_dispatch"
-        assert hot_manifest["runner_call_trigger_reason"] == (
-            "context_governance_resolved"
-        )
-        assert durable_manifest["runner_call_trigger_reason"] == (
-            "context_governance_resolved"
-        )
+        assert hot_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
+        assert durable_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
         assert "请列出四条关键风险" in contents
         assert answer_text in contents
         assert "3. 第三条是客户集中度升高，需要拆解前五大客户变化。" in ("\n".join(contents))
@@ -3880,10 +3833,7 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             policy,
         )
 
-        assert all(
-            answer_text not in _message_content(message)
-            for message in without_compacted_event.messages
-        )
+        assert all(answer_text not in _message_content(message) for message in without_compacted_event.messages)
 
     with open_host_durable_store(_options(tmp_path / "fallback")) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -3934,17 +3884,11 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
 
         request = builder.build(_attempt_snapshot(recovery))
         contents = tuple(_message_content(message) for message in request.messages)
-        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(
-            store
-        )
+        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(store)
 
         assert hot_manifest["runner_call_kind"] == "post_compaction_dispatch"
-        assert hot_manifest["runner_call_trigger_reason"] == (
-            "context_governance_resolved"
-        )
-        assert durable_manifest["runner_call_trigger_reason"] == (
-            "context_governance_resolved"
-        )
+        assert hot_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
+        assert durable_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
         assert all(answer_text not in content for content in contents)
         assert _message_occurrences(contents, current_prompt) == 1
         assert contents[-1] == current_prompt
@@ -4413,9 +4357,7 @@ def _latest_current_run_compact_event_ref(
 
     event_id = f"event-{seeded.run_id}-compacted"
     return store.transaction_runner.run_read(
-        lambda transaction: (
-            event_id if EventLogStore().read_event_by_id(transaction, event_id) is not None else None
-        )
+        lambda transaction: event_id if EventLogStore().read_event_by_id(transaction, event_id) is not None else None
     )
 
 
@@ -5074,9 +5016,7 @@ def _append_prior_accepted_tool_evidence_tx(
         ),
     )
     result_payload: dict[str, JsonValue] = {
-        "accepted_evidence_envelope": (
-            accepted_evidence_envelope_to_json_value(envelope)
-        ),
+        "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
     }
     if include_raw_outcome:
         result_payload["raw_tool_outcome"] = actual_raw_outcome
@@ -5125,14 +5065,10 @@ def _append_canonical_tool_result_for_memory(
     :raises HostDurableError: durable append 失败时由 store 抛出。
     """
 
-    arguments_json: dict[str, JsonValue] = {
-        "arguments": {"query": result_summary}
-    }
+    arguments_json: dict[str, JsonValue] = {"arguments": {"query": result_summary}}
     arguments_digest = sha256_digest_json(arguments_json)
     semantic_query = f"查询：{result_summary}"
-    semantic_query_digest = sha256_digest_json(
-        {"semantic_query_text": semantic_query}
-    )
+    semantic_query_digest = sha256_digest_json({"semantic_query_text": semantic_query})
     event_log = EventLogStore()
     event_log.append_event(
         transaction,
@@ -5150,13 +5086,9 @@ def _append_canonical_tool_result_for_memory(
                 "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,
-                "arguments_json_size_bytes": len(
-                    canonical_json_dumps(arguments_json).encode("utf-8")
-                ),
+                "arguments_json_size_bytes": len(canonical_json_dumps(arguments_json).encode("utf-8")),
                 "semantic_input_digest": semantic_query_digest,
-                "semantic_query_storage_kind": (
-                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
-                ),
+                "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT),
                 "semantic_query_text": semantic_query,
                 "semantic_query_payload_ref": None,
                 "semantic_query_digest": semantic_query_digest,
@@ -5199,9 +5131,7 @@ def _append_canonical_tool_result_for_memory(
                 "tool_call_id": tool_call_id,
                 "tool_fact_kind": "completed",
                 "normalized_arguments_digest": arguments_digest,
-                "accepted_evidence_envelope": (
-                    accepted_evidence_envelope_to_json_value(envelope)
-                ),
+                "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                 "raw_tool_outcome": raw_outcome,
             },
         ),
@@ -6143,9 +6073,7 @@ def _append_resume_wait_projection_events(
         request_arguments = accepted_arguments or {"ticker": "V"}
         request_arguments_json: dict[str, JsonValue] = {"arguments": dict(request_arguments)}
         request_arguments_digest = sha256_digest_json(request_arguments_json)
-        normalized_arguments_digest = (
-            request_normalized_arguments_digest or request_arguments_digest
-        )
+        normalized_arguments_digest = request_normalized_arguments_digest or request_arguments_digest
         request_event_id = "event-tool-call-requested-resume"
         request_row: EventLogRow | None = None
         if include_request_atom:
@@ -6331,16 +6259,10 @@ def _append_resume_wait_projection_events(
                 client_request_id=None,
                 idempotency_key="resolve-resume",
                 policy_decision=None,
-                reason={
-                    "start_reason": serialize_run_start_reason(
-                        RunStartReason.RESUME
-                    )
-                },
+                reason={"start_reason": serialize_run_start_reason(RunStartReason.RESUME)},
                 payload_json={
                     "run_id": seeded.run_id,
-                    "start_reason": serialize_run_start_reason(
-                        RunStartReason.RESUME
-                    ),
+                    "start_reason": serialize_run_start_reason(RunStartReason.RESUME),
                     "wait_id": "wait-resume-private",
                     "source_attempt_id": seeded.attempt_id,
                     "attempt_id": "attempt-resume-private",
@@ -7159,39 +7081,37 @@ def _compact_payload(
     :returns: compacted payload。
     """
 
-    resolved_fact_candidates: list[EvidenceBackedFactCandidateVNext]
+    resolved_fact_candidates: list[CompactEvidenceFactV2]
     if fact_candidates is None:
         resolved_fact_candidates = [
-            EvidenceBackedFactCandidateVNext(
-                claim_text="Revenue increased year over year",
-                evidence_labels=("evidence:memory-tool",),
-                source_labels=("evidence:memory-tool",),
+            CompactEvidenceFactV2(
+                claim="Revenue increased year over year",
+                support_labels=("evidence:memory-tool",),
             )
         ]
     else:
         resolved_fact_candidates = [
-            EvidenceBackedFactCandidateVNext(
-                claim_text=str(candidate["claim_text"]),
-                evidence_labels=("evidence:memory-tool",),
-                source_labels=("evidence:memory-tool",),
+            CompactEvidenceFactV2(
+                claim=str(candidate["claim_text"]),
+                support_labels=("evidence:memory-tool",),
             )
             for candidate in fact_candidates
             if isinstance(candidate, dict) and "claim_text" in candidate
         ]
-    resolved_reference_continuity_items: list[ReferenceContinuityCandidateVNext]
+    resolved_reference_continuity_items: list[CompactReferenceContinuityV2]
     if reference_continuity_items is None:
         resolved_reference_continuity_items = [
-            ReferenceContinuityCandidateVNext(
+            CompactReferenceContinuityV2(
                 text="second factor: margin mix",
-                reason=ReferenceContinuityReasonVNext.RECENT_STATE,
+                reason="recent_state",
                 source_labels=("event-memory-raw-user",),
             )
         ]
     else:
         resolved_reference_continuity_items = [
-            ReferenceContinuityCandidateVNext(
+            CompactReferenceContinuityV2(
                 text=str(candidate["text"]),
-                reason=ReferenceContinuityReasonVNext.ORDINAL_REFERENCE,
+                reason="ordinal_reference",
                 source_labels=("event-long-input",),
             )
             for candidate in reference_continuity_items
@@ -7211,32 +7131,41 @@ def _compact_payload(
             values = open_questions.get("value")
             if isinstance(values, list) and values and isinstance(values[0], str):
                 forward_text = values[0]
-    candidate = ConversationCompactOutputVNext(
-        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text=summary_text,
+    candidate = CompactCandidateV2(
+        schema=COMPACT_OUTPUT_SCHEMA_V2,
+        session_summary=CompactSessionSummaryV2(
+            text=summary_text,
             source_labels=("event-memory-raw-user",),
         ),
-        evidence_backed_facts=tuple(resolved_fact_candidates),
+        evidence_facts=tuple(resolved_fact_candidates),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="Compacted answer anchor",
-                anchor_items=(
-                    AnswerAnchorChildVNext(display_text=anchor_text, ordinal=1),
-                ),
-                answer_source_labels=("event-memory-episode",),
-            ),
-        ),
-        forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.OPEN_QUESTION,
-                text=forward_text,
-                status=ForwardIntentStatusVNext.OPEN,
+            CompactAnswerAnchorV2(
+                title="Compacted answer anchor",
+                detail=anchor_text,
                 source_labels=("event-memory-episode",),
             ),
         ),
-        reference_continuity_items=tuple(resolved_reference_continuity_items),
+        forward_intents=(
+            CompactForwardIntentV2(
+                intent_type="open_question",
+                text=forward_text,
+                status=CompactForwardIntentStatusV2.OPEN,
+                source_labels=("event-memory-episode",),
+            ),
+        ),
+        reference_continuity=tuple(resolved_reference_continuity_items),
         diagnostics=(),
+        explicitly_dropped_sources=(),
+    )
+    accepted_truth = accepted_truth_for_candidate(
+        candidate,
+        current_input_ref="event-current-protected",
+        source_refs_by_label={
+            "event-memory-raw-user": ("event-memory-raw-user",),
+            "event-memory-episode": ("event-memory-episode",),
+            "evidence:memory-tool": ("evidence:memory-tool",),
+            "event-long-input": ("event-long-input",),
+        },
     )
     return dict(
         build_context_compacted_payload(
@@ -7244,18 +7173,13 @@ def _compact_payload(
             accepted_attempt_number=1,
             compact_artifact_ref="compact-artifact:test",
             compact_artifact_digest=_DIGEST_A,
-            accepted_candidate=candidate,
-            quality_check_result=CompactQualityCheckResultVNext(
-                accepted=True,
-                rejection_reasons=(),
-            ),
+            accepted_truth=accepted_truth,
             budget_after_compact=512,
             prompt_local_label_mapping_refs=(
                 "prompt-label:event-memory-raw-user",
                 "prompt-label:event-memory-episode",
                 "prompt-label:evidence:memory-tool",
             ),
-            source_boundary_refs=("event-memory-raw-user",),
             accepted_evidence_mapping_refs=("evidence:memory-tool",),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(

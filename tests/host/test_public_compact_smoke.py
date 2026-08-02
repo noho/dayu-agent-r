@@ -92,9 +92,9 @@ _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT = 7
 _SOFT_THRESHOLD_PROMPT_SENTENCE = "请保留标记 DAYU_COMPACT_OK，并继续等待下一步。"
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
-_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
-_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
-_INTERNAL_COMPACT_INPUT_TYPE_NAME = "ConversationCompactInputVNext"
+_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "dayu.context_compaction.output.v2"
+_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "CompactCandidateV2"
+_INTERNAL_COMPACT_INPUT_TYPE_NAME = "CompactInputV2"
 _COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
 _SCHEMA_VERSION_FIELD = "schema_version"
@@ -133,9 +133,7 @@ _R03_PUBLIC_CITATION: dict[str, JsonValue] = {
 _SECOND_FACTOR_MARKER = "第二个因素=库存周转率"
 _DUPLICATE_PROMPT_SENTENCE = "DAYU_DUPLICATE_PROMPT_COMPACT_SEGMENT。"
 _RUN_REAL_COMPACTOR_SMOKE_ENV = "DAYU_RUN_REAL_COMPACTOR_SMOKE"
-_PACKAGE_CONFIG_ROOT = (
-    pathlib.Path(__file__).resolve().parents[2] / "dayu" / "config"
-)
+_PACKAGE_CONFIG_ROOT = pathlib.Path(__file__).resolve().parents[2] / "dayu" / "config"
 _COMPACTOR_PROFILE_ID = "standard-256k"
 _FORBIDDEN_COMPACTOR_PROMPT_TERMS = (
     "Host-owned context compaction",
@@ -157,7 +155,6 @@ _FORBIDDEN_COMPACTOR_PROMPT_TERMS = (
     "payload_refs",
     "digest",
     "cursor",
-    "policy",
 )
 _FORBIDDEN_COMPACTOR_MATERIAL_TERMS = (
     _INTERNAL_COMPACT_OUTPUT_TYPE_NAME,
@@ -171,19 +168,11 @@ _FORBIDDEN_COMPACTOR_MATERIAL_TERMS = (
     "vNext",
 )
 _COMPACTOR_MATERIAL_TOP_LEVEL_KEYS = (
-    "schema_version",
-    "previous_compacted_view",
-    "trace_material",
-    "evidence_material",
-    "answer_material",
-    "current_input_anchor",
-    "instruction",
+    "schema",
+    "current_input",
+    "source_boundary",
 )
-_COMPACTOR_MATERIAL_LIST_SECTION_KEYS = (
-    "trace_material",
-    "evidence_material",
-    "answer_material",
-)
+_COMPACTOR_MATERIAL_LIST_SECTION_KEYS = ("source_boundary",)
 _STALE_COMPACTOR_MATERIAL_SECTION_KEYS = (
     "stable_input",
     "history_input",
@@ -205,38 +194,26 @@ def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
         assert forbidden_term not in prompt_text
 
     assert "<<compaction_request>>" in user_prompt_template
-    assert "输入 JSON 说明" in user_prompt_template
-    assert "输出 JSON 字段" in user_prompt_template
-    assert "输出 JSON 最小示例" in user_prompt_template
-    assert "label 是本次请求内的引用标签" in user_prompt_template
-    assert "label 本身不是业务事实、财报事实或结论" in system_prompt
-    assert (
-        "本次 `session_summary.source_labels` 只标注本次新材料来源"
-        in user_prompt_template
-    )
-    assert (
-        "不要引用 `previous_compacted_view` 或 `current_input_anchor` 中的 label"
-        in user_prompt_template
-    )
-    assert '"source_labels": ["P1", "T1", "E1", "A1"]' not in (
-        user_prompt_template
-    )
-    assert '"source_labels": ["T1", "E1", "A1"]' in user_prompt_template
-    assert "唯一允许值为 `conversation_compact_output_v1`" in user_prompt_template
-    assert (
-        "必须为每个确实需要保留的 evidence label 产出至少一个 "
-        "evidence_backed_facts 条目；不得合成无证据事实。"
-        in user_prompt_template
-    )
-    assert "应为每个确实需要保留的 evidence label" not in user_prompt_template
+    assert "输入 schema：" in user_prompt_template
+    assert "输出必须完整且只含以下字段" in user_prompt_template
+    assert "最小形状示例" in user_prompt_template
+    assert "仅是本次请求内的引用标签，不是业务事实" in user_prompt_template
+    assert "source label 只是本次请求内的引用标签" in system_prompt
+    assert "current_input" in user_prompt_template
+    assert "它没有 source label，不能被输出引用" in user_prompt_template
+    assert '"source_labels": ["T1"]' in user_prompt_template
+    assert "必须为 `dayu.context_compaction.output.v2`" in user_prompt_template
+    assert "不得发明输入中没有的事实" in user_prompt_template
+    assert "只能引用 kind 为 `evidence_material`" in user_prompt_template
     for required_field in (
-        "schema_version",
+        "schema",
         "session_summary",
-        "evidence_backed_facts",
+        "evidence_facts",
         "answer_anchors",
         "forward_intents",
-        "reference_continuity_items",
+        "reference_continuity",
         "diagnostics",
+        "explicitly_dropped_sources",
     ):
         assert required_field in user_prompt_template
 
@@ -250,9 +227,7 @@ def test_compactor_material_assertion_helpers_accept_valid_material() -> None:
 
     material_json = _valid_compactor_material_json()
     _assert_compactor_material_instruction_contract(material_json)
-    _assert_material_evidence_contains_marker(
-        material_json, marker=_LONG_CHAPTER_MARKER
-    )
+    _assert_material_evidence_contains_marker(material_json, marker=_LONG_CHAPTER_MARKER)
     proposal = _required_mapping(
         cast(
             JsonValue,
@@ -286,13 +261,14 @@ def test_compactor_material_forbidden_terms_rejects_internal_text() -> None:
     """
 
     material_json = _valid_compactor_material_json()
-    anchor = dict(
+    current_input = dict(
         _required_mapping(
-            material_json["current_input_anchor"], field_name="current_input_anchor"
+            material_json["current_input"],
+            field_name="current_input",
         )
     )
-    anchor["text"] = "EventLog should never be LLM-facing material."
-    material_json["current_input_anchor"] = anchor
+    current_input["readable_text"] = "EventLog should never be LLM-facing material."
+    material_json["current_input"] = current_input
 
     with pytest.raises(AssertionError, match="LLM-facing material boundary"):
         _assert_no_forbidden_compactor_material_terms(material_json)
@@ -308,9 +284,7 @@ def test_compactor_material_evidence_marker_rejects_missing_marker() -> None:
     material_json = _valid_compactor_material_json(include_marker=False)
 
     with pytest.raises(AssertionError, match="evidence material marker boundary"):
-        _assert_material_evidence_contains_marker(
-            material_json, marker=_LONG_CHAPTER_MARKER
-        )
+        _assert_material_evidence_contains_marker(material_json, marker=_LONG_CHAPTER_MARKER)
 
 
 def test_label_only_fake_proposal_rejects_canonical_ref_leakage() -> None:
@@ -321,12 +295,11 @@ def test_label_only_fake_proposal_rejects_canonical_ref_leakage() -> None:
     """
 
     proposal: dict[str, JsonValue] = {
-        "evidence_backed_facts": [
+        "evidence_facts": [
             {
-                "evidence_labels": ["E1"],
-                "claim_text": (
-                    f"{_LONG_CHAPTER_MARKER} payload:event-tool-result-accepted"
-                ),
+                "support_labels": ["E1"],
+                "context_labels": [],
+                "claim": (f"{_LONG_CHAPTER_MARKER} payload:event-tool-result-accepted"),
             }
         ]
     }
@@ -541,9 +514,7 @@ async def test_no_compaction_recent_raw_turns_continuity(
     ):
         session = await host.ensure_session(ensure_request("p12-6-no-compact"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -562,16 +533,12 @@ async def test_no_compaction_recent_raw_turns_continuity(
                 "第二轮追问：刚才说的增长来源是什么？",
             ),
         )
-        second_terminal = await next_terminal_for_run(
-            watcher, second.accepted_run_id
-        )
+        second_terminal = await next_terminal_for_run(watcher, second.accepted_run_id)
 
     assert second_terminal.kind is HostEventKind.SUCCEEDED
     second_request = factory.requests[1]
     for index, request in enumerate(factory.requests):
-        assert_at_most_one_system_message(
-            request.messages, label=f"no compact request {index}"
-        )
+        assert_at_most_one_system_message(request.messages, label=f"no compact request {index}")
     joined = _joined_message_content(second_request.messages)
     assert "第一轮原始问题：请记住营收增长来自价格因素。" in joined
     assert "Session Summary Memory:" not in joined
@@ -610,9 +577,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     ):
         session = await host.ensure_session(ensure_request("p12-6-tool-evidence"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -648,26 +613,25 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
     _assert_compactor_material_instruction_contract(material_json)
-    _assert_material_evidence_contains_marker(
-        material_json, marker=_LONG_CHAPTER_MARKER
-    )
+    _assert_material_evidence_contains_marker(material_json, marker=_LONG_CHAPTER_MARKER)
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
-    evidence_material = material_json["evidence_material"]
-    assert isinstance(evidence_material, list)
+    source_boundary = material_json["source_boundary"]
+    assert isinstance(source_boundary, list)
+    evidence_material = [
+        item for item in source_boundary if isinstance(item, Mapping) and item.get("source_kind") == "evidence_material"
+    ]
     assert len(evidence_material) >= 1
     first_evidence = evidence_material[0]
     assert isinstance(first_evidence, Mapping)
-    assert first_evidence["source_note"] == canonical_json_dumps(
-        _R03_PUBLIC_CITATION
-    )
+    readable_text = first_evidence["readable_text"]
+    assert isinstance(readable_text, str)
+    assert canonical_json_dumps(_R03_PUBLIC_CITATION) in readable_text
     assert "result_preview" not in material_text
     assert "payload:" not in material_text
     assert "event-tool-result" not in material_text
     assert len(factory.requests) >= 3
     for index, request in enumerate(factory.requests):
-        assert_at_most_one_system_message(
-            request.messages, label=f"tool evidence request {index}"
-        )
+        assert_at_most_one_system_message(request.messages, label=f"tool evidence request {index}")
     joined = _joined_message_content(factory.requests[-1].messages)
     assert "## Verified Evidence and Facts" in joined
     assert _LONG_CHAPTER_MARKER in joined
@@ -676,11 +640,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     proposal = _required_mapping(
         cast(
             JsonValue,
-            json.loads(
-                fake_compaction_proposal_from_material_json(
-                    _llm_material_with_long_tool_evidence()
-                )
-            ),
+            json.loads(fake_compaction_proposal_from_material_json(_llm_material_with_long_tool_evidence())),
         ),
         field_name="fake proposal",
     )
@@ -688,10 +648,10 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
 
 
 @pytest.mark.asyncio
-async def test_long_user_input_second_factor_survives_reference_continuity(
+async def test_long_current_input_second_factor_survives_empty_boundary_noop(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """长输入 compact 后，下一轮仍可通过 vNext continuity 看到第二个因素。
+    """空 source boundary 不调 compactor，长 current input 仍进入下一轮。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -719,9 +679,7 @@ async def test_long_user_input_second_factor_survives_reference_continuity(
     ):
         session = await host.ensure_session(ensure_request("p12-6-min-preserve"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         first = await host.submit_followup(
             session.session_id,
@@ -743,11 +701,9 @@ async def test_long_user_input_second_factor_survives_reference_continuity(
         terminal = await next_terminal_for_run(watcher, second.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
-    assert len(fake_compactor.prompt_lengths) >= 1
+    assert fake_compactor.prompt_lengths == []
     for index, request in enumerate(factory.requests):
-        assert_at_most_one_system_message(
-            request.messages, label=f"minimum preserve request {index}"
-        )
+        assert_at_most_one_system_message(request.messages, label=f"minimum preserve request {index}")
     joined = _joined_message_content(factory.requests[1].messages)
     assert _SECOND_FACTOR_MARKER in joined
 
@@ -784,9 +740,7 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
     ):
         session = await host.ensure_session(ensure_request("p12-6-multi-compact"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         for index in range(4):
             followup = await host.submit_followup(
@@ -811,20 +765,16 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.prompt_lengths) >= 2
     for index, request in enumerate(factory.requests):
-        assert_at_most_one_system_message(
-            request.messages, label=f"multi compact request {index}"
-        )
+        assert_at_most_one_system_message(request.messages, label=f"multi compact request {index}")
     assert max(fake_compactor.prompt_lengths) <= _FAKE_COMPACTOR_MAX_PROMPT_CHARS
-    assert len(_joined_message_content(factory.requests[-1].messages)) <= (
-        _FAKE_PUBLIC_MEMORY_MAX_CHARS
-    )
+    assert len(_joined_message_content(factory.requests[-1].messages)) <= (_FAKE_PUBLIC_MEMORY_MAX_CHARS)
 
 
 @pytest.mark.asyncio
-async def test_proactive_compact_long_current_input_reaches_compactor_without_lossy_anchor(
+async def test_proactive_empty_boundary_keeps_long_current_input_without_compactor(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """超长 current input 完整进入 compactor current_input_anchor。
+    """超长 current input 在空 boundary no-op 后完整进入 ordinary request。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -853,9 +803,7 @@ async def test_proactive_compact_long_current_input_reaches_compactor_without_lo
     ):
         session = await host.ensure_session(ensure_request("p12-6-duplicate"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -868,31 +816,18 @@ async def test_proactive_compact_long_current_input_reaches_compactor_without_lo
         terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
-    assert len(fake_compactor.prompt_lengths) == 1
-    assert len(fake_compactor.material_jsons) == 1
-    material_json = fake_compactor.material_jsons[0]
-    current_anchor = _required_mapping(
-        material_json["current_input_anchor"],
-        field_name="current_input_anchor",
-    )
-    assert current_anchor["anchor_label"] == "C1"
-    assert current_anchor["text"] == long_prompt
-    assert material_json["previous_compacted_view"] is None
-    assert material_json["trace_material"] == []
-    assert material_json["evidence_material"] == []
-    assert material_json["answer_material"] == []
-    material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
-    assert "truncated" not in material_text
-    assert "preview" not in material_text
-    assert "summary" not in material_text
-    assert len(_compact_artifact_files(tmp_path / "compact-artifacts")) >= 1
+    assert fake_compactor.prompt_lengths == []
+    assert len(factory.requests) == 1
+    joined = _joined_message_content(factory.requests[0].messages)
+    assert joined.count(long_prompt) == 1
+    assert _compact_artifact_files(tmp_path / "compact-artifacts") == ()
 
 
 @pytest.mark.asyncio
-async def test_public_reactive_compact_recovers_with_followup_attempt(
+async def test_public_reactive_empty_boundary_recovers_via_typed_fallback(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """public Host reactive compact 成功后创建 recovery attempt 并终态成功。
+    """public Host reactive 空边界不调 compactor并由 typed fallback恢复。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -920,9 +855,7 @@ async def test_public_reactive_compact_recovers_with_followup_attempt(
     ):
         session = await host.ensure_session(ensure_request("p12-6-reactive"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -935,23 +868,21 @@ async def test_public_reactive_compact_recovers_with_followup_attempt(
         terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
-    assert len(fake_compactor.prompt_lengths) == 1
+    assert fake_compactor.prompt_lengths == []
     assert len(factory.requests) == 2
     assert len(factory.snapshots) == 2
     assert factory.snapshots[0].attempt_id != factory.snapshots[1].attempt_id
     assert factory.snapshots[0].execution_id != factory.snapshots[1].execution_id
     assert factory.requests[1].run_id == factory.requests[0].run_id
     for index, request in enumerate(factory.requests):
-        assert_at_most_one_system_message(
-            request.messages, label=f"reactive compact request {index}"
-        )
+        assert_at_most_one_system_message(request.messages, label=f"reactive compact request {index}")
 
 
 @pytest.mark.asyncio
-async def test_public_compact_failure_dispatches_deterministic_recent_window(
+async def test_public_proactive_empty_boundary_dispatches_without_compactor(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """public Host compact proposal 全部被拒后 fallback dispatch 仍保留当前输入。
+    """public Host proactive 空边界 no-op 并完整 dispatch current input。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -974,18 +905,14 @@ async def test_public_compact_failure_dispatches_deterministic_recent_window(
                 allow_tool_calls=False,
                 tooling_options=None,
                 policy_ref="p12-6-public-fallback-compact",
-                max_compaction_attempts_per_operation=(
-                    _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
-                ),
+                max_compaction_attempts_per_operation=(_COMPACTOR_MAX_ATTEMPTS_PER_OPERATION),
             )
         ) as host,
         AsyncExitStack() as attachment_stack,
     ):
         session = await host.ensure_session(ensure_request("p12-6-fallback"))
         attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            close_attachment_shielded, attachment
-        )
+        attachment_stack.push_async_callback(close_attachment_shielded, attachment)
         watcher = await host.watch_session_events(session.session_id)
         followup = await host.submit_followup(
             session.session_id,
@@ -998,10 +925,10 @@ async def test_public_compact_failure_dispatches_deterministic_recent_window(
         terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
-    assert len(bad_compactor.prompt_lengths) >= _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+    assert bad_compactor.prompt_lengths == []
     assert len(factory.requests) == 1
     assert prompt in _joined_message_content(factory.requests[0].messages)
-    assert len(_compact_artifact_files(tmp_path / "compact-artifacts")) >= 1
+    assert _compact_artifact_files(tmp_path / "compact-artifacts") == ()
 
 
 @pytest.mark.asyncio
@@ -1016,9 +943,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     """
 
     if os.environ.get(_RUN_REAL_COMPACTOR_SMOKE_ENV) != "1":
-        pytest.skip(
-            f"set {_RUN_REAL_COMPACTOR_SMOKE_ENV}=1 to run optional real compactor smoke"
-        )
+        pytest.skip(f"set {_RUN_REAL_COMPACTOR_SMOKE_ENV}=1 to run optional real compactor smoke")
     case = PROVIDER_CASES[1]
     api_key = api_key_or_skip(case)
     runner_spec = runner_spec_for_case(case, api_key)
@@ -1062,9 +987,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
             context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
             soft_threshold_tokens=_SOFT_THRESHOLD_TOKENS,
             hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
-            max_compaction_attempts_per_operation=(
-                _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
-            ),
+            max_compaction_attempts_per_operation=(_COMPACTOR_MAX_ATTEMPTS_PER_OPERATION),
             policy_ref="slice5-real-compact-policy",
         ),
         compactor_runner_baseline=CompactorRunnerBaseline(
@@ -1085,9 +1008,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         ):
             session = await host.ensure_session(ensure_request("real-compact"))
             attachment = await host.attach_session(session.session_id)
-            attachment_stack.push_async_callback(
-                close_attachment_shielded, attachment
-            )
+            attachment_stack.push_async_callback(close_attachment_shielded, attachment)
             watcher = await host.watch_session_events(session.session_id)
             compacted = await host.submit_followup(
                 session.session_id,
@@ -1097,9 +1018,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
                     _soft_threshold_prompt(),
                 ),
             )
-            first_terminal = await next_terminal_for_run(
-                watcher, compacted.accepted_run_id
-            )
+            first_terminal = await next_terminal_for_run(watcher, compacted.accepted_run_id)
             skip_if_provider_terminal_failed(case, first_terminal)
             followup = await host.submit_followup(
                 session.session_id,
@@ -1109,9 +1028,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
                     "基于已经压缩的上下文，只输出 DAYU_COMPACT_OK。",
                 ),
             )
-            second_terminal = await next_terminal_for_run(
-                watcher, followup.accepted_run_id
-            )
+            second_terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
     except RuntimeError as exc:
         skip_if_provider_exception(case, exc)
         raise
@@ -1126,9 +1043,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     assert second_terminal.final_answer is not None
     assert second_terminal.final_answer.content.strip() != ""
     artifact_files_after = _compact_artifact_files(compact_artifact_root)
-    new_artifacts = tuple(
-        path for path in artifact_files_after if path not in artifact_files_before
-    )
+    new_artifacts = tuple(path for path in artifact_files_after if path not in artifact_files_before)
     assert len(new_artifacts) > 0
     compaction_request_digest = _runner_call_manifest_for_run(
         new_artifacts,
@@ -1160,9 +1075,7 @@ class FakeCompactorRunAgent:
     prompts: list[str] = field(default_factory=list)
     material_jsons: list[Mapping[str, JsonValue]] = field(default_factory=list)
 
-    async def __call__(
-        self, request: AgentRunRequest, *, timeout_seconds: float
-    ) -> AgentRunResult:
+    async def __call__(self, request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
         """模拟 ``LLMContextCompactor`` 的 Engine runner 返回。
 
         :param request: compactor 构造的 Engine request。
@@ -1172,9 +1085,7 @@ class FakeCompactorRunAgent:
         """
 
         del timeout_seconds
-        assert_at_most_one_system_message(
-            request.messages, label="fake compactor request"
-        )
+        assert_at_most_one_system_message(request.messages, label="fake compactor request")
         material_json = _material_json_from_compactor_request(request)
         _assert_compactor_material_instruction_contract(material_json)
         user_prompt = _compactor_user_prompt(request)
@@ -1208,9 +1119,7 @@ class RejectingCompactorRunAgent:
     prompts: list[str] = field(default_factory=list)
     material_jsons: list[Mapping[str, JsonValue]] = field(default_factory=list)
 
-    async def __call__(
-        self, request: AgentRunRequest, *, timeout_seconds: float
-    ) -> AgentRunResult:
+    async def __call__(self, request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
         """模拟反复产出非法引用标签的 compactor runner。
 
         :param request: compactor 构造的 Engine request。
@@ -1220,9 +1129,7 @@ class RejectingCompactorRunAgent:
         """
 
         del timeout_seconds
-        assert_at_most_one_system_message(
-            request.messages, label="rejecting compactor request"
-        )
+        assert_at_most_one_system_message(request.messages, label="rejecting compactor request")
         material_json = _material_json_from_compactor_request(request)
         _assert_compactor_material_instruction_contract(material_json)
         user_prompt = _compactor_user_prompt(request)
@@ -1319,9 +1226,7 @@ class _ReactivePublicWorker:
 
         self._factory = factory
 
-    async def accept(
-        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
-    ) -> LocalWorkerHandle:
+    async def accept(self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest) -> LocalWorkerHandle:
         """接受 dispatch 并按序返回 reactive 或 final handle。
 
         :param snapshot: dispatch snapshot。
@@ -1380,9 +1285,7 @@ def _fake_compact_open_options(
     tooling_options: HostToolingOptions | None,
     policy_ref: str,
     soft_threshold_tokens: int = _FAKE_COMPACT_SOFT_THRESHOLD_TOKENS,
-    max_compaction_attempts_per_operation: int = (
-        _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
-    ),
+    max_compaction_attempts_per_operation: int = (_COMPACTOR_MAX_ATTEMPTS_PER_OPERATION),
     selected_recent_window_turn_floor: int | None = None,
 ) -> OpenHostOptions:
     """构造带 deterministic compactor baseline 的 public ``OpenHostOptions``。
@@ -1415,9 +1318,7 @@ def _fake_compact_open_options(
             soft_threshold_tokens=soft_threshold_tokens,
             hard_threshold_tokens=_FAKE_COMPACT_HARD_THRESHOLD_TOKENS,
             policy_ref=policy_ref,
-            max_compaction_attempts_per_operation=(
-                max_compaction_attempts_per_operation
-            ),
+            max_compaction_attempts_per_operation=(max_compaction_attempts_per_operation),
         ),
         compactor_runner_baseline=_fake_compactor_baseline(tmp_path),
         memory_projection_policy=(
@@ -1546,9 +1447,7 @@ def _successful_response_identity(
             iteration_index=0,
             runner_call_index=1,
         ),
-        provider_request_id_availability=(
-            ProviderRequestIdAvailability.UNAVAILABLE
-        ),
+        provider_request_id_availability=(ProviderRequestIdAvailability.UNAVAILABLE),
         provider_request_id=None,
     )
 
@@ -1604,13 +1503,7 @@ def _assert_compactor_material_instruction_contract(
 
     _assert_compactor_material_section_shape(material_json)
     _assert_no_forbidden_compactor_material_terms(material_json)
-    instruction_value = material_json["instruction"]
-    assert isinstance(instruction_value, Mapping)
-    instruction = cast(Mapping[str, JsonValue], instruction_value)
-    assert (
-        instruction["output_schema_name"]
-        == _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER
-    )
+    assert material_json["schema"] == "dayu.context_compaction.input.v2"
 
 
 def _assert_compactor_material_section_shape(
@@ -1624,24 +1517,15 @@ def _assert_compactor_material_section_shape(
     """
 
     for key in _COMPACTOR_MATERIAL_TOP_LEVEL_KEYS:
-        assert (
-            key in material_json
-        ), f"material pack / labels boundary missing top-level key: {key}"
+        assert key in material_json, f"material pack / labels boundary missing top-level key: {key}"
     for key in _STALE_COMPACTOR_MATERIAL_SECTION_KEYS:
-        assert (
-            key not in material_json
-        ), f"material pack / labels boundary leaked stale section key: {key}"
+        assert key not in material_json, f"material pack / labels boundary leaked stale section key: {key}"
     for key in _COMPACTOR_MATERIAL_LIST_SECTION_KEYS:
         section_value = material_json[key]
-        assert isinstance(
-            section_value, list
-        ), f"material pack / labels boundary expected list section: {key}"
-    assert isinstance(
-        material_json["current_input_anchor"], Mapping
-    ), "material pack / labels boundary expected current_input_anchor object"
-    assert isinstance(
-        material_json["instruction"], Mapping
-    ), "material pack / labels boundary expected instruction object"
+        assert isinstance(section_value, list), f"material pack / labels boundary expected list section: {key}"
+    assert isinstance(material_json["current_input"], Mapping), (
+        "material pack / labels boundary expected current_input object"
+    )
 
 
 def _assert_no_forbidden_compactor_material_terms(
@@ -1656,14 +1540,12 @@ def _assert_no_forbidden_compactor_material_terms(
 
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
     for forbidden_term in _FORBIDDEN_COMPACTOR_MATERIAL_TERMS:
-        assert (
-            forbidden_term not in material_text
-        ), f"LLM-facing material boundary leaked forbidden term: {forbidden_term}"
+        assert forbidden_term not in material_text, (
+            f"LLM-facing material boundary leaked forbidden term: {forbidden_term}"
+        )
 
 
-def _assert_material_evidence_contains_marker(
-    material_json: Mapping[str, JsonValue], *, marker: str
-) -> None:
+def _assert_material_evidence_contains_marker(material_json: Mapping[str, JsonValue], *, marker: str) -> None:
     """校验 public compactor material 的 evidence section 保留 marker。
 
     :param material_json: compactor request 中投影给 LLM 的 material JSON。
@@ -1672,20 +1554,17 @@ def _assert_material_evidence_contains_marker(
     :raises AssertionError: evidence material 缺失 marker 时抛出。
     """
 
-    evidence_material = material_json["evidence_material"]
-    assert isinstance(
-        evidence_material, list
-    ), "evidence material marker boundary expected evidence_material list"
+    source_boundary = material_json["source_boundary"]
+    assert isinstance(source_boundary, list), "evidence material marker boundary expected source_boundary list"
+    evidence_material = tuple(
+        item for item in source_boundary if isinstance(item, Mapping) and item.get("source_kind") == "evidence_material"
+    )
     assert len(evidence_material) >= 1
     evidence_text = json.dumps(evidence_material, ensure_ascii=False, sort_keys=True)
-    assert (
-        marker in evidence_text
-    ), f"evidence material marker boundary missing marker: {marker}"
+    assert marker in evidence_text, f"evidence material marker boundary missing marker: {marker}"
 
 
-def _assert_label_only_fake_proposal(
-    proposal: Mapping[str, JsonValue], *, marker: str
-) -> None:
+def _assert_label_only_fake_proposal(proposal: Mapping[str, JsonValue], *, marker: str) -> None:
     """校验 fake compactor proposal 只使用 prompt-local label。
 
     :param proposal: fake compactor proposal JSON object。
@@ -1694,26 +1573,18 @@ def _assert_label_only_fake_proposal(
     :raises AssertionError: proposal 缺少 fact、marker 或泄漏 canonical ref 时抛出。
     """
 
-    fact_candidates = proposal["evidence_backed_facts"]
+    fact_candidates = proposal["evidence_facts"]
     assert isinstance(fact_candidates, list)
     assert len(fact_candidates) == 1
     fact = _required_mapping(fact_candidates[0], field_name="fact")
-    assert fact["evidence_labels"] == [
-        "E1"
-    ], "compactor proposal boundary must use prompt-local E label"
-    claim_text = fact["claim_text"]
+    assert fact["support_labels"] == ["E1"], "compactor proposal boundary must use prompt-local E label"
+    claim_text = fact["claim"]
     assert isinstance(claim_text, str)
     assert marker in claim_text, "compactor proposal boundary lost evidence marker"
     proposal_text = json.dumps(proposal, ensure_ascii=False, sort_keys=True)
-    assert (
-        "result_preview" not in proposal_text
-    ), "compactor proposal boundary leaked result_preview"
-    assert (
-        "event-tool-result-accepted" not in proposal_text
-    ), "compactor proposal boundary leaked canonical event ref"
-    assert (
-        "payload:" not in proposal_text
-    ), "compactor proposal boundary leaked payload ref"
+    assert "result_preview" not in proposal_text, "compactor proposal boundary leaked result_preview"
+    assert "event-tool-result-accepted" not in proposal_text, "compactor proposal boundary leaked canonical event ref"
+    assert "payload:" not in proposal_text, "compactor proposal boundary leaked payload ref"
 
 
 def _assert_runner_call_manifest_messages(
@@ -1744,9 +1615,7 @@ def _assert_runner_call_manifest_messages(
         observed_roles.append(role)
     expected_role_values = tuple(role.value for role in expected_roles)
     assert tuple(observed_roles) == expected_role_values
-    assert manifest["role_sequence_digest"] == runner_role_sequence_digest(
-        expected_role_values
-    )
+    assert manifest["role_sequence_digest"] == runner_role_sequence_digest(expected_role_values)
 
 
 def _material_json_text_from_prompt(prompt: str) -> str:
@@ -1776,9 +1645,11 @@ def _first_material_json_with_evidence(
     """
 
     for value in values:
-        evidence_material = value["evidence_material"]
-        assert isinstance(evidence_material, list)
-        if len(evidence_material) > 0:
+        source_boundary = value["source_boundary"]
+        assert isinstance(source_boundary, list)
+        if any(
+            isinstance(item, Mapping) and item.get("source_kind") == "evidence_material" for item in source_boundary
+        ):
             return value
     raise AssertionError("public compactor material evidence_material is empty")
 
@@ -1791,53 +1662,33 @@ def _compactor_user_prompt(request: AgentRunRequest) -> str:
     :raises AssertionError: request 不含单个 user material prompt 时抛出。
     """
 
-    user_messages = tuple(
-        message for message in request.messages if isinstance(message, UserMessage)
-    )
+    user_messages = tuple(message for message in request.messages if isinstance(message, UserMessage))
     assert len(user_messages) == 1
     return user_messages[0].content
 
 
-def _valid_compactor_material_json(
-    *, include_marker: bool = True
-) -> dict[str, JsonValue]:
+def _valid_compactor_material_json(*, include_marker: bool = True) -> dict[str, JsonValue]:
     """构造 helper 自测用有效 public compactor material JSON。
 
     :param include_marker: 是否在 evidence material 中包含长章节 marker。
     :returns: public compactor material JSON。
     """
 
-    result_text = (
-        _long_chapter_tool_result()
-        if include_marker
-        else "accepted raw tool evidence without marker"
-    )
+    result_text = _long_chapter_tool_result() if include_marker else "accepted raw tool evidence without marker"
     evidence_item: dict[str, JsonValue] = {
-        "label": "E1",
-        "kind": "accepted_tool_evidence",
-        "tool_name": "lookup_mock_fact",
-        "query_text": "读取长章节工具证据",
-        "result_text": result_text,
-        "source_text": "accepted raw tool evidence",
+        "source_label": "E1",
+        "source_kind": "evidence_material",
+        "readable_text": (
+            f"工具：lookup_mock_fact\n查询：读取长章节工具证据\n结果：{result_text}\n来源：accepted raw tool evidence"
+        ),
     }
-    current_anchor: dict[str, JsonValue] = {
-        "label": "C1",
-        "kind": "current_input_anchor",
-        "text": "复用 raw evidence fact。",
-        "truncated": False,
-    }
-    instruction: dict[str, JsonValue] = {
-        "output_schema_name": _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER,
-        "compact_goal": "保留可复用证据。",
+    current_input: dict[str, JsonValue] = {
+        "readable_text": "复用 raw evidence fact。",
     }
     return {
-        "schema_version": "conversation_compact_input_v1",
-        "previous_compacted_view": None,
-        "trace_material": [],
-        "evidence_material": [evidence_item],
-        "answer_material": [],
-        "current_input_anchor": current_anchor,
-        "instruction": instruction,
+        "schema": "dayu.context_compaction.input.v2",
+        "current_input": current_input,
+        "source_boundary": [evidence_item],
     }
 
 
@@ -1933,9 +1784,7 @@ def _joined_message_content(messages: tuple[AgentMessage, ...]) -> str:
     :returns: 文本拼接结果。
     """
 
-    return "\n\n".join(
-        message.content if message.content is not None else "" for message in messages
-    )
+    return "\n\n".join(message.content if message.content is not None else "" for message in messages)
 
 
 def _long_compaction_prompt(marker: str) -> str:
@@ -1945,10 +1794,7 @@ def _long_compaction_prompt(marker: str) -> str:
     :returns: 长 prompt。
     """
 
-    return (
-        f"{marker}：请保留这段财报分析上下文。"
-        + "营收、毛利率、现金流和库存周转的讨论。" * 160
-    )
+    return f"{marker}：请保留这段财报分析上下文。" + "营收、毛利率、现金流和库存周转的讨论。" * 160
 
 
 def _long_user_input_with_second_factor() -> str:
@@ -1960,7 +1806,8 @@ def _long_user_input_with_second_factor() -> str:
     return (
         "请分析三个因素：第一个因素=收入增速；"
         f"{_SECOND_FACTOR_MARKER}；第三个因素=经营现金流。"
-        + "补充背景：管理层讨论、分部披露、季节性和费用率变化。" * 180
+        + "补充背景：管理层讨论、分部披露、季节性和费用率变化。"
+        * 180
     )
 
 
@@ -1970,11 +1817,7 @@ def _long_chapter_tool_result() -> str:
     :returns: 工具结果文本。
     """
 
-    return (
-        "财报章节原文："
-        + "管理层讨论显示收入结构变化和费用率改善。" * 35
-        + f" 关键结论：{_LONG_CHAPTER_MARKER}。"
-    )
+    return "财报章节原文：" + "管理层讨论显示收入结构变化和费用率改善。" * 35 + f" 关键结论：{_LONG_CHAPTER_MARKER}。"
 
 
 def _soft_threshold_prompt() -> str:
@@ -1994,12 +1837,8 @@ def _compactor_baseline_inputs() -> tuple[str, str, AgentPolicy]:
     :raises OSError: user prompt template 读取失败时抛出。
     """
 
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=None
-    )
-    compactor_baseline = config.execution_profiles.execution_profiles[
-        _COMPACTOR_PROFILE_ID
-    ].compactor_baseline
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=None)
+    compactor_baseline = config.execution_profiles.execution_profiles[_COMPACTOR_PROFILE_ID].compactor_baseline
     scene = prepare_scene(
         ScenePrepareRequest(
             scene_id=compactor_baseline.scene_id,
@@ -2010,11 +1849,9 @@ def _compactor_baseline_inputs() -> tuple[str, str, AgentPolicy]:
         )
     )
     assert len(scene.system_messages) == 1
-    user_prompt_template = (
-        _PACKAGE_CONFIG_ROOT
-        / "prompts"
-        / compactor_baseline.user_prompt_template_path
-    ).read_text(encoding="utf-8")
+    user_prompt_template = (_PACKAGE_CONFIG_ROOT / "prompts" / compactor_baseline.user_prompt_template_path).read_text(
+        encoding="utf-8"
+    )
     assert "<<compaction_request>>" in user_prompt_template
     override = scene.agent_policy_override
     assert override is not None
@@ -2037,9 +1874,7 @@ def _compactor_baseline_inputs() -> tuple[str, str, AgentPolicy]:
             fallback_mode=AgentFallbackMode(override.fallback_mode.value),
             fallback_prompt=override.fallback_prompt,
             continuation_prompt=override.continuation_prompt,
-            max_consecutive_failed_tool_batches=(
-                override.max_consecutive_failed_tool_batches
-            ),
+            max_consecutive_failed_tool_batches=(override.max_consecutive_failed_tool_batches),
         ),
     )
 
@@ -2053,15 +1888,9 @@ def _compactor_runner_options(model_id: str) -> RunnerCallOptions:
     :raises ValueError: RunnerCallOptions 字段非法时由底层抛出。
     """
 
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=None
-    )
-    compactor_baseline = config.execution_profiles.execution_profiles[
-        _COMPACTOR_PROFILE_ID
-    ].compactor_baseline
-    hint = config.models.models[
-        model_id
-    ].runtime_hints.runner_option_hints[compactor_baseline.runner_option_hint_id]
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=None)
+    compactor_baseline = config.execution_profiles.execution_profiles[_COMPACTOR_PROFILE_ID].compactor_baseline
+    hint = config.models.models[model_id].runtime_hints.runner_option_hints[compactor_baseline.runner_option_hint_id]
     return RunnerCallOptions(
         temperature=hint.temperature,
         max_tokens=None,
@@ -2151,9 +1980,7 @@ def _compact_artifact_for_run(
     :raises AssertionError: digest 非法、schema 非 current 或匹配数不为一时抛出。
     """
 
-    assert is_sha256_digest(compaction_request_digest), (
-        "compaction_request_digest must be SHA-256 digest"
-    )
+    assert is_sha256_digest(compaction_request_digest), "compaction_request_digest must be SHA-256 digest"
     matches: list[Mapping[str, JsonValue]] = []
     for path in paths:
         artifact = _required_mapping(_read_json(path), field_name=str(path))
@@ -2165,17 +1992,13 @@ def _compact_artifact_for_run(
         )
         if artifact_kind != _COMPACT_ARTIFACT_KIND:
             continue
-        assert _SCHEMA_VERSION_FIELD in artifact, (
-            f"{_SCHEMA_VERSION_FIELD} is required"
-        )
+        assert _SCHEMA_VERSION_FIELD in artifact, f"{_SCHEMA_VERSION_FIELD} is required"
         schema_version = artifact[_SCHEMA_VERSION_FIELD]
         assert isinstance(schema_version, int) and not isinstance(
             schema_version,
             bool,
         ), f"{_SCHEMA_VERSION_FIELD} must be integer"
-        assert schema_version == COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT, (
-            "compact artifact schema version is not current"
-        )
+        assert schema_version == COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT, "compact artifact schema version is not current"
         artifact_digest = _required_sha256_digest(
             artifact,
             field_name=_COMPACTION_REQUEST_DIGEST_FIELD,
@@ -2183,15 +2006,12 @@ def _compact_artifact_for_run(
         if artifact_digest == compaction_request_digest:
             matches.append(artifact)
     assert len(matches) == 1, (
-        "expected exactly one compact artifact for compaction_request_digest; "
-        f"found {len(matches)}"
+        f"expected exactly one compact artifact for compaction_request_digest; found {len(matches)}"
     )
     return matches[0]
 
 
-def _runner_call_manifest_for_run(
-    paths: tuple[pathlib.Path, ...], run_id: str
-) -> str:
+def _runner_call_manifest_for_run(paths: tuple[pathlib.Path, ...], run_id: str) -> str:
     """唯一定位 current compactor manifest 并返回 typed request digest。
 
     :param paths: 候选 artifact 文件路径。
@@ -2205,10 +2025,7 @@ def _runner_call_manifest_for_run(
         artifact = _required_mapping(_read_json(path), field_name=str(path))
         if _SCHEMA_VERSION_FIELD not in artifact:
             continue
-        if (
-            artifact[_SCHEMA_VERSION_FIELD]
-            != RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
-        ):
+        if artifact[_SCHEMA_VERSION_FIELD] != RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION:
             continue
         host_run_id = _required_text(artifact, field_name=_HOST_RUN_ID_FIELD)
         runner_call_kind = _required_text(
@@ -2220,14 +2037,9 @@ def _runner_call_manifest_for_run(
         if runner_call_kind != _COMPACTOR_PROPOSAL_RUNNER_CALL_KIND:
             continue
         matches.append(artifact)
-    assert len(matches) == 1, (
-        f"expected exactly one runner-call manifest for run {run_id}; "
-        f"found {len(matches)}"
-    )
+    assert len(matches) == 1, f"expected exactly one runner-call manifest for run {run_id}; found {len(matches)}"
     manifest = matches[0]
-    assert _COMPACTOR_IDENTITY_FIELD in manifest, (
-        f"{_COMPACTOR_IDENTITY_FIELD} is required"
-    )
+    assert _COMPACTOR_IDENTITY_FIELD in manifest, f"{_COMPACTOR_IDENTITY_FIELD} is required"
     compactor_identity = _required_mapping(
         manifest[_COMPACTOR_IDENTITY_FIELD],
         field_name=_COMPACTOR_IDENTITY_FIELD,
@@ -2258,9 +2070,7 @@ def _read_json(path: pathlib.Path) -> JsonValue:
     return cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
 
 
-def _required_mapping(
-    value: JsonValue, *, field_name: str
-) -> Mapping[str, JsonValue]:
+def _required_mapping(value: JsonValue, *, field_name: str) -> Mapping[str, JsonValue]:
     """校验 JSON 值为 object。
 
     :param value: 待校验 JSON 值。

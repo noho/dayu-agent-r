@@ -1,8 +1,7 @@
-"""Host context compaction typed contracts。
+"""Host Context Governance 的严格 v2 类型契约。
 
-本模块定义 Context Governance 使用的 vNext compactor 输入、候选输出、
-material provenance 与 quality check 结果。它只表达 Host-owned typed
-boundary，不调用 LLM、不写 EventLog、不更新 memory projection。
+本模块只拥有 compactor 输入、候选输出、验收真值与 material provenance
+的类型边界；它不调用模型、不写 EventLog，也不更新 Memory projection。
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -26,17 +25,11 @@ from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.evidence import OpaqueEvidenceRef
 
-CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT = "conversation_compact_input_v1"
-"""vNext compact input schema version。"""
+COMPACT_INPUT_SCHEMA_V2 = "dayu.context_compaction.input.v2"
+"""严格 compactor 输入 schema。"""
 
-CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT = "conversation_compact_output_v1"
-"""vNext compact output schema version。"""
-
-CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT = CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
-"""vNext compact instruction 投影给 LLM 的输出 contract 标识。"""
-
-CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY = "roll_forward_session_memory"
-"""vNext compact instruction 固定业务目标。"""
+COMPACT_OUTPUT_SCHEMA_V2 = "dayu.context_compaction.output.v2"
+"""严格 compactor 输出 schema。"""
 
 class CompactMaterialSection(StrEnum):
     """vNext compact material pack 的 LLM-facing section。"""
@@ -63,14 +56,27 @@ class CompactMaterialBlockKind(StrEnum):
     CURRENT_INPUT_ANCHOR = "current_input_anchor"
 
 
-class ConversationCompactLabelSectionVNext(StrEnum):
-    """vNext prompt-local label 所属 material section。"""
+class CompactSourceKindV2(StrEnum):
+    """source boundary 条目的业务来源类型。"""
 
-    PREVIOUS_COMPACTED_VIEW = "previous_compacted_view"
+    PREVIOUS_SESSION_SUMMARY = "previous_session_summary"
+    PREVIOUS_EVIDENCE_FACT = "previous_evidence_fact"
+    PREVIOUS_ANSWER_ANCHOR = "previous_answer_anchor"
+    PREVIOUS_FORWARD_INTENT = "previous_forward_intent"
+    PREVIOUS_REFERENCE_CONTINUITY = "previous_reference_continuity"
     TRACE_MATERIAL = "trace_material"
     EVIDENCE_MATERIAL = "evidence_material"
     ANSWER_MATERIAL = "answer_material"
-    CURRENT_INPUT_ANCHOR = "current_input_anchor"
+
+
+class CompactSemanticSectionV2(StrEnum):
+    """candidate 中可形成 represented coverage 的业务区。"""
+
+    SESSION_SUMMARY = "session_summary"
+    EVIDENCE_FACTS = "evidence_facts"
+    ANSWER_ANCHORS = "answer_anchors"
+    FORWARD_INTENTS = "forward_intents"
+    REFERENCE_CONTINUITY = "reference_continuity"
 
 
 class TraceReadableKindVNext(StrEnum):
@@ -81,16 +87,7 @@ class TraceReadableKindVNext(StrEnum):
     USER_VISIBLE_PROGRESS = "user_visible_progress"
 
 
-class ForwardIntentTypeVNext(StrEnum):
-    """vNext forward intent 类型。"""
-
-    OPEN_QUESTION = "open_question"
-    PENDING_CLARIFICATION = "pending_clarification"
-    PENDING_USER_VISIBLE_TASK = "pending_user_visible_task"
-    NEXT_STEP_NOTE = "next_step_note"
-
-
-class ForwardIntentStatusVNext(StrEnum):
+class CompactForwardIntentStatusV2(StrEnum):
     """vNext forward intent 状态。"""
 
     OPEN = "open"
@@ -98,82 +95,72 @@ class ForwardIntentStatusVNext(StrEnum):
     SUPERSEDED = "superseded"
 
 
-class ReferenceContinuityReasonVNext(StrEnum):
-    """vNext reference continuity 保留原因。"""
-
-    LOCAL_REFERENCE = "local_reference"
-    ORDINAL_REFERENCE = "ordinal_reference"
-    ELLIPSIS_RECOVERY = "ellipsis_recovery"
-    RECENT_STATE = "recent_state"
-
-
-CONVERSATION_COMPACT_SUMMARY_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.TRACE_MATERIAL,
-    ConversationCompactLabelSectionVNext.EVIDENCE_MATERIAL,
-    ConversationCompactLabelSectionVNext.ANSWER_MATERIAL,
+COMPACT_FACT_SOURCE_KINDS_V2 = (
+    CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT,
+    CompactSourceKindV2.EVIDENCE_MATERIAL,
 )
-"""vNext session summary candidate 允许引用的本次新材料 label section。"""
+"""evidence fact 的 support label 允许来源。"""
 
-CONVERSATION_COMPACT_FACT_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.EVIDENCE_MATERIAL,
+COMPACT_FACT_CONTEXT_SOURCE_KINDS_V2 = (
+    CompactSourceKindV2.TRACE_MATERIAL,
+    CompactSourceKindV2.ANSWER_MATERIAL,
 )
-"""vNext evidence-backed fact candidate 允许引用的 label section。"""
+"""evidence fact 的 context label 允许来源。"""
 
-CONVERSATION_COMPACT_ANSWER_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.ANSWER_MATERIAL,
+COMPACT_ANSWER_SOURCE_KINDS_V2 = (
+    CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR,
+    CompactSourceKindV2.ANSWER_MATERIAL,
 )
-"""vNext answer anchor candidate 允许引用的 label section。"""
+"""answer anchor 允许来源。"""
 
-CONVERSATION_COMPACT_FORWARD_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.PREVIOUS_COMPACTED_VIEW,
-    ConversationCompactLabelSectionVNext.TRACE_MATERIAL,
-    ConversationCompactLabelSectionVNext.ANSWER_MATERIAL,
+COMPACT_FORWARD_SOURCE_KINDS_V2 = (
+    CompactSourceKindV2.PREVIOUS_FORWARD_INTENT,
+    CompactSourceKindV2.TRACE_MATERIAL,
+    CompactSourceKindV2.ANSWER_MATERIAL,
 )
-"""vNext forward intent candidate 允许引用的 label section。"""
+"""forward intent 允许来源。"""
 
-CONVERSATION_COMPACT_REFERENCE_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.PREVIOUS_COMPACTED_VIEW,
-    ConversationCompactLabelSectionVNext.TRACE_MATERIAL,
-    ConversationCompactLabelSectionVNext.ANSWER_MATERIAL,
+COMPACT_REFERENCE_SOURCE_KINDS_V2 = (
+    CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY,
+    CompactSourceKindV2.TRACE_MATERIAL,
+    CompactSourceKindV2.EVIDENCE_MATERIAL,
+    CompactSourceKindV2.ANSWER_MATERIAL,
 )
-"""vNext reference continuity candidate 允许引用的 label section。"""
-
-CONVERSATION_COMPACT_DIAGNOSTIC_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.PREVIOUS_COMPACTED_VIEW,
-    ConversationCompactLabelSectionVNext.TRACE_MATERIAL,
-    ConversationCompactLabelSectionVNext.EVIDENCE_MATERIAL,
-    ConversationCompactLabelSectionVNext.ANSWER_MATERIAL,
-)
-"""vNext diagnostic candidate 允许引用的 label section。"""
-
-_CONVERSATION_COMPACT_STALE_LABEL_PREFIXES_VNEXT = ("S", "H", "E", "A", "T", "P")
-"""vNext prompt-local material label 历史前缀集合。"""
+"""reference continuity 允许来源。"""
 
 
-def conversation_compact_label_looks_stale_vnext(label: str) -> bool:
-    """判断 label 是否像已过期 vNext prompt-local material label。
+class CompactValidationIssueCodeV2(StrEnum):
+    """严格 parser 与 Host acceptance 的稳定问题码。"""
 
-    :param label: prompt-local label。
-    :returns: label 形似历史 prompt-local material label 时返回 ``True``。
-    :raises TypeError: label 不是字符串时抛出。
-    """
-
-    if not isinstance(label, str):
-        raise TypeError("label must be str")
-    return any(label.startswith(prefix) for prefix in _CONVERSATION_COMPACT_STALE_LABEL_PREFIXES_VNEXT)
-
-
-class CompactQualityIssueVNext(StrEnum):
-    """vNext compact contract validator 拒绝原因。"""
-
-    SCHEMA_INVALID = "schema_invalid"
+    INVALID_JSON = "invalid_json"
+    DUPLICATE_JSON_KEY = "duplicate_json_key"
+    UNKNOWN_JSON_KEY = "unknown_json_key"
+    MISSING_REQUIRED_KEY = "missing_required_key"
+    INVALID_FIELD_TYPE = "invalid_field_type"
+    INVALID_ENUM_VALUE = "invalid_enum_value"
+    BLANK_REQUIRED_TEXT = "blank_required_text"
     UNKNOWN_SOURCE_LABEL = "unknown_source_label"
-    STALE_SOURCE_LABEL = "stale_source_label"
-    MISSING_SOURCE_LABEL = "missing_source_label"
-    CROSS_SECTION_LABEL = "cross_section_label"
-    CURRENT_INPUT_ANCHOR_CITED = "current_input_anchor_cited"
-    EMPTY_TEXT = "empty_text"
-    ILLEGAL_ENUM = "illegal_enum"
+    DUPLICATE_SOURCE_LABEL = "duplicate_source_label"
+    SOURCE_KIND_MISMATCH = "source_kind_mismatch"
+    DUPLICATE_DROP_LABEL = "duplicate_drop_label"
+    REPRESENTED_AND_DROPPED = "represented_and_dropped"
+    UNCOVERED_SOURCE = "uncovered_source"
+    DUPLICATE_SEMANTIC_ITEM = "duplicate_semantic_item"
+    CONTRADICTORY_SEMANTIC_ITEM = "contradictory_semantic_item"
+    EMPTY_SEMANTIC_OUTPUT = "empty_semantic_output"
+    DIAGNOSTICS_ONLY_OUTPUT = "diagnostics_only_output"
+    LOW_INFORMATION_OUTPUT = "low_information_output"
+    POLICY_ITEM_CAP_EXCEEDED = "policy_item_cap_exceeded"
+    POLICY_SIZE_CAP_EXCEEDED = "policy_size_cap_exceeded"
+
+
+class CompactDropReasonV2(StrEnum):
+    """候选显式丢弃 source 的闭集原因。"""
+
+    SUPERSEDED = "superseded"
+    REDUNDANT = "redundant"
+    OUT_OF_SCOPE = "out_of_scope"
+    POLICY_LIMIT = "policy_limit"
 
 
 class CompactSegmentTrigger(StrEnum):
@@ -598,15 +585,15 @@ class CurrentInputAnchor:
 
 
 @dataclass(frozen=True, slots=True)
-class CurrentInputAnchorVNext:
-    """vNext 当前输入 anchor。
+class CompactCurrentInputV2:
+    """当前用户输入的不可引用保护锚点。
 
-    :param anchor_label: prompt-local current input label。
-    :param text: LLM 可读当前用户输入文本。
+    :param source_ref: 当前输入 canonical ref；只供 Host 使用。
+    :param readable_text: 投影给模型的业务可读文本。
     """
 
-    anchor_label: PromptLocalMaterialLabel
-    text: str
+    source_ref: str
+    readable_text: str
 
     def __post_init__(self) -> None:
         """校验 vNext current input anchor。
@@ -616,8 +603,8 @@ class CurrentInputAnchorVNext:
         :raises ValueError: 字段为空时抛出。
         """
 
-        _require_non_empty(self.anchor_label, field_name="CurrentInputAnchorVNext.anchor_label")
-        _require_non_empty(self.text, field_name="CurrentInputAnchorVNext.text")
+        _require_non_empty(self.source_ref, field_name="CompactCurrentInputV2.source_ref")
+        _require_non_empty(self.readable_text, field_name="CompactCurrentInputV2.readable_text")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -625,41 +612,51 @@ class CurrentInputAnchorVNext:
         :returns: JSON object。
         """
 
-        return {"anchor_label": self.anchor_label, "text": self.text}
+        return {"readable_text": self.readable_text}
 
 
 @dataclass(frozen=True, slots=True)
-class CompactInstructionVNext:
-    """vNext compact instruction。
+class CompactSourceBoundaryEntryV2:
+    """本次 compaction 可引用、可替换的单一 source。
 
-    :param output_schema_name: 投影给 LLM 的输出 contract 标识，不是内部类型名。
-    :param compact_goal: compact 业务目标。
+    :param source_label: prompt-local 不透明引用标签。
+    :param source_kind: source 的业务类型。
+    :param source_refs: 非空且唯一的 canonical refs；不投影给模型。
+    :param readable_text: 自解释的业务可读文本。
     """
 
-    output_schema_name: str = CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT
-    compact_goal: str = CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY
+    source_label: str
+    source_kind: CompactSourceKindV2
+    source_refs: tuple[str, ...]
+    readable_text: str
 
     def __post_init__(self) -> None:
-        """校验 vNext compact instruction。
+        """校验 source boundary entry。
 
         :returns: ``None``。
-        :raises ValueError: instruction literal 非法时抛出。
+        :raises TypeError: source kind 类型非法时抛出。
+        :raises ValueError: 文本或 refs 非法时抛出。
         """
 
-        if self.output_schema_name != CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT:
-            raise ValueError("CompactInstructionVNext.output_schema_name is invalid")
-        if self.compact_goal != CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY:
-            raise ValueError("CompactInstructionVNext.compact_goal is invalid")
+        _require_non_empty(self.source_label, field_name="CompactSourceBoundaryEntryV2.source_label")
+        if not isinstance(self.source_kind, CompactSourceKindV2):
+            raise TypeError("CompactSourceBoundaryEntryV2.source_kind is invalid")
+        _require_non_empty_unique_string_tuple(
+            self.source_refs,
+            field_name="CompactSourceBoundaryEntryV2.source_refs",
+        )
+        _require_non_empty(self.readable_text, field_name="CompactSourceBoundaryEntryV2.readable_text")
 
     def to_json(self) -> JsonValue:
-        """转换为 JSON object。
+        """转换为 LLM-facing JSON。
 
-        :returns: JSON object。
+        :returns: 不含 canonical refs 的 JSON object。
         """
 
         return {
-            "output_schema_name": self.output_schema_name,
-            "compact_goal": self.compact_goal,
+            "source_label": self.source_label,
+            "source_kind": self.source_kind.value,
+            "readable_text": self.readable_text,
         }
 
 
@@ -784,9 +781,9 @@ class ReadableForwardIntentVNext:
     """
 
     source_label: PromptLocalMaterialLabel
-    intent_type: ForwardIntentTypeVNext
+    intent_type: str
     text: str
-    status: ForwardIntentStatusVNext
+    status: CompactForwardIntentStatusV2
 
     def __post_init__(self) -> None:
         """校验可读 forward intent。
@@ -797,9 +794,11 @@ class ReadableForwardIntentVNext:
         """
 
         _require_non_empty(self.source_label, field_name="ReadableForwardIntentVNext.source_label")
-        if not isinstance(self.intent_type, ForwardIntentTypeVNext):
-            raise TypeError("ReadableForwardIntentVNext.intent_type is invalid")
-        if not isinstance(self.status, ForwardIntentStatusVNext):
+        _require_non_empty(
+            self.intent_type,
+            field_name="ReadableForwardIntentVNext.intent_type",
+        )
+        if not isinstance(self.status, CompactForwardIntentStatusV2):
             raise TypeError("ReadableForwardIntentVNext.status is invalid")
         _require_non_empty(self.text, field_name="ReadableForwardIntentVNext.text")
 
@@ -811,7 +810,7 @@ class ReadableForwardIntentVNext:
 
         return {
             "source_label": self.source_label,
-            "intent_type": self.intent_type.value,
+            "intent_type": self.intent_type,
             "text": self.text,
             "status": self.status.value,
         }
@@ -828,7 +827,7 @@ class ReadableReferenceContinuityItemVNext:
 
     source_label: PromptLocalMaterialLabel
     text: str
-    reason: ReferenceContinuityReasonVNext
+    reason: str
 
     def __post_init__(self) -> None:
         """校验可读 reference continuity item。
@@ -839,8 +838,10 @@ class ReadableReferenceContinuityItemVNext:
         """
 
         _require_non_empty(self.source_label, field_name="ReadableReferenceContinuityItemVNext.source_label")
-        if not isinstance(self.reason, ReferenceContinuityReasonVNext):
-            raise TypeError("ReadableReferenceContinuityItemVNext.reason is invalid")
+        _require_non_empty(
+            self.reason,
+            field_name="ReadableReferenceContinuityItemVNext.reason",
+        )
         _require_non_empty(self.text, field_name="ReadableReferenceContinuityItemVNext.text")
 
     def to_json(self) -> JsonValue:
@@ -852,12 +853,12 @@ class ReadableReferenceContinuityItemVNext:
         return {
             "source_label": self.source_label,
             "text": self.text,
-            "reason": self.reason.value,
+            "reason": self.reason,
         }
 
 
 @dataclass(frozen=True, slots=True)
-class CompactReadableViewVNext:
+class PreviousCompactReadableView:
     """vNext previous compacted view。
 
     :param session_summary: 可选 session summary。
@@ -882,13 +883,19 @@ class CompactReadableViewVNext:
         """
 
         if self.session_summary is not None:
-            _require_non_empty(self.session_summary, field_name="CompactReadableViewVNext.session_summary")
-        _require_readable_fact_tuple(self.evidence_backed_facts, field_name="CompactReadableViewVNext.evidence_backed_facts")
-        _require_readable_answer_anchor_tuple(self.answer_anchors, field_name="CompactReadableViewVNext.answer_anchors")
-        _require_readable_forward_intent_tuple(self.forward_intents, field_name="CompactReadableViewVNext.forward_intents")
+            _require_non_empty(self.session_summary, field_name="PreviousCompactReadableView.session_summary")
+        _require_readable_fact_tuple(
+            self.evidence_backed_facts, field_name="PreviousCompactReadableView.evidence_backed_facts"
+        )
+        _require_readable_answer_anchor_tuple(
+            self.answer_anchors, field_name="PreviousCompactReadableView.answer_anchors"
+        )
+        _require_readable_forward_intent_tuple(
+            self.forward_intents, field_name="PreviousCompactReadableView.forward_intents"
+        )
         _require_readable_reference_tuple(
             self.reference_continuity_items,
-            field_name="CompactReadableViewVNext.reference_continuity_items",
+            field_name="PreviousCompactReadableView.reference_continuity_items",
         )
 
     def to_json(self) -> JsonValue:
@@ -1021,25 +1028,17 @@ class AnswerReadableItemVNext:
 
 
 @dataclass(frozen=True, slots=True)
-class ConversationCompactInputVNext:
-    """vNext compactor 输入 contract。
+class CompactInputV2:
+    """严格 v2 compactor 输入。
 
-    :param schema_version: input schema version。
-    :param previous_compacted_view: 上一轮 accepted compacted view。
-    :param trace_material: trace material items。
-    :param evidence_material: evidence material items。
-    :param answer_material: answer material items。
-    :param current_input_anchor: 当前输入 anchor。
-    :param instruction: compact instruction。
+    :param schema: 固定 v2 schema literal。
+    :param current_input: 不可引用且必须保留的当前输入。
+    :param source_boundary: 本次候选必须精确 represented 或 drop 的 sources。
     """
 
-    schema_version: str
-    previous_compacted_view: CompactReadableViewVNext | None
-    trace_material: tuple[TraceReadableItemVNext, ...]
-    evidence_material: tuple[EvidenceReadableItemVNext, ...]
-    answer_material: tuple[AnswerReadableItemVNext, ...]
-    current_input_anchor: CurrentInputAnchorVNext
-    instruction: CompactInstructionVNext
+    schema: Literal["dayu.context_compaction.input.v2"]
+    current_input: CompactCurrentInputV2
+    source_boundary: tuple[CompactSourceBoundaryEntryV2, ...]
 
     def __post_init__(self) -> None:
         """校验 vNext compactor 输入 contract。
@@ -1049,69 +1048,34 @@ class ConversationCompactInputVNext:
         :raises ValueError: schema 或 label 集合非法时抛出。
         """
 
-        if self.schema_version != CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT:
-            raise ValueError("ConversationCompactInputVNext.schema_version is invalid")
-        if self.previous_compacted_view is not None and not isinstance(
-            self.previous_compacted_view,
-            CompactReadableViewVNext,
-        ):
-            raise TypeError("ConversationCompactInputVNext.previous_compacted_view is invalid")
-        _require_trace_readable_tuple(self.trace_material, field_name="ConversationCompactInputVNext.trace_material")
-        _require_evidence_readable_tuple(
-            self.evidence_material,
-            field_name="ConversationCompactInputVNext.evidence_material",
-        )
-        _require_answer_readable_tuple(self.answer_material, field_name="ConversationCompactInputVNext.answer_material")
-        if not isinstance(self.current_input_anchor, CurrentInputAnchorVNext):
-            raise TypeError("ConversationCompactInputVNext.current_input_anchor is invalid")
-        if not isinstance(self.instruction, CompactInstructionVNext):
-            raise TypeError("ConversationCompactInputVNext.instruction is invalid")
-        _require_unique_string_tuple(self.citable_source_labels, field_name="ConversationCompactInputVNext.source_labels")
-        if self.current_input_anchor.anchor_label in self.citable_source_labels:
-            raise ValueError("current input anchor label must not be citable")
+        if self.schema != COMPACT_INPUT_SCHEMA_V2:
+            raise ValueError("CompactInputV2.schema is invalid")
+        if not isinstance(self.current_input, CompactCurrentInputV2):
+            raise TypeError("CompactInputV2.current_input is invalid")
+        for entry in self.source_boundary:
+            if not isinstance(entry, CompactSourceBoundaryEntryV2):
+                raise TypeError("CompactInputV2.source_boundary item is invalid")
+        _require_unique_string_tuple(self.source_labels, field_name="CompactInputV2.source_labels")
 
     @property
-    def citable_source_labels(self) -> tuple[PromptLocalMaterialLabel, ...]:
-        """返回 vNext candidate 可引用 label。
+    def source_labels(self) -> tuple[str, ...]:
+        """返回 boundary label 的固定顺序。
 
-        :returns: 不包含 current input anchor 的 prompt-local label tuple。
+        :returns: prompt-local source labels。
         """
 
-        labels: list[PromptLocalMaterialLabel] = []
-        if self.previous_compacted_view is not None:
-            labels.extend(item.source_label for item in self.previous_compacted_view.evidence_backed_facts)
-            labels.extend(item.source_label for item in self.previous_compacted_view.answer_anchors)
-            labels.extend(item.source_label for item in self.previous_compacted_view.forward_intents)
-            labels.extend(item.source_label for item in self.previous_compacted_view.reference_continuity_items)
-        labels.extend(item.source_label for item in self.trace_material)
-        labels.extend(item.source_label for item in self.evidence_material)
-        labels.extend(item.source_label for item in self.answer_material)
-        return tuple(labels)
+        return tuple(entry.source_label for entry in self.source_boundary)
 
-    def source_section(self, label: PromptLocalMaterialLabel) -> ConversationCompactLabelSectionVNext | None:
-        """返回 label 所属 vNext section。
+    def source_kind(self, label: PromptLocalMaterialLabel) -> CompactSourceKindV2 | None:
+        """返回 label 对应 source kind。
 
         :param label: prompt-local label。
         :returns: label 所属 section；未知时返回 ``None``。
         """
 
-        if self.previous_compacted_view is not None:
-            previous_labels = (
-                tuple(item.source_label for item in self.previous_compacted_view.evidence_backed_facts)
-                + tuple(item.source_label for item in self.previous_compacted_view.answer_anchors)
-                + tuple(item.source_label for item in self.previous_compacted_view.forward_intents)
-                + tuple(item.source_label for item in self.previous_compacted_view.reference_continuity_items)
-            )
-            if label in previous_labels:
-                return ConversationCompactLabelSectionVNext.PREVIOUS_COMPACTED_VIEW
-        if label in tuple(item.source_label for item in self.trace_material):
-            return ConversationCompactLabelSectionVNext.TRACE_MATERIAL
-        if label in tuple(item.source_label for item in self.evidence_material):
-            return ConversationCompactLabelSectionVNext.EVIDENCE_MATERIAL
-        if label in tuple(item.source_label for item in self.answer_material):
-            return ConversationCompactLabelSectionVNext.ANSWER_MATERIAL
-        if label == self.current_input_anchor.anchor_label:
-            return ConversationCompactLabelSectionVNext.CURRENT_INPUT_ANCHOR
+        for entry in self.source_boundary:
+            if entry.source_label == label:
+                return entry.source_kind
         return None
 
     def to_json(self) -> JsonValue:
@@ -1121,27 +1085,21 @@ class ConversationCompactInputVNext:
         """
 
         return {
-            "schema_version": self.schema_version,
-            "previous_compacted_view": (
-                None if self.previous_compacted_view is None else self.previous_compacted_view.to_json()
-            ),
-            "trace_material": _trace_readable_list_json(self.trace_material),
-            "evidence_material": _evidence_readable_list_json(self.evidence_material),
-            "answer_material": _answer_readable_list_json(self.answer_material),
-            "current_input_anchor": self.current_input_anchor.to_json(),
-            "instruction": self.instruction.to_json(),
+            "schema": self.schema,
+            "current_input": self.current_input.to_json(),
+            "source_boundary": [entry.to_json() for entry in self.source_boundary],
         }
 
 
 @dataclass(frozen=True, slots=True)
-class SessionSummaryCandidateVNext:
+class CompactSessionSummaryV2:
     """vNext session summary candidate。
 
     :param summary_text: summary 文本。
     :param source_labels: 支撑 summary 的 prompt-local labels。
     """
 
-    summary_text: str
+    text: str
     source_labels: tuple[PromptLocalMaterialLabel, ...]
 
     def __post_init__(self) -> None:
@@ -1151,10 +1109,10 @@ class SessionSummaryCandidateVNext:
         :raises ValueError: 文本或 source labels 非法时抛出。
         """
 
-        _require_non_empty(self.summary_text, field_name="SessionSummaryCandidateVNext.summary_text")
+        _require_non_empty(self.text, field_name="CompactSessionSummaryV2.text")
         _require_non_empty_unique_string_tuple(
             self.source_labels,
-            field_name="SessionSummaryCandidateVNext.source_labels",
+            field_name="CompactSessionSummaryV2.source_labels",
         )
 
     def to_json(self) -> JsonValue:
@@ -1164,13 +1122,13 @@ class SessionSummaryCandidateVNext:
         """
 
         return {
-            "summary_text": self.summary_text,
+            "text": self.text,
             "source_labels": _string_list_json(self.source_labels),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceBackedFactCandidateVNext:
+class CompactEvidenceFactV2:
     """vNext evidence-backed fact candidate。
 
     :param claim_text: fact claim 文本。
@@ -1178,9 +1136,9 @@ class EvidenceBackedFactCandidateVNext:
     :param source_labels: 可选辅助 source labels。
     """
 
-    claim_text: str
-    evidence_labels: tuple[PromptLocalMaterialLabel, ...]
-    source_labels: tuple[PromptLocalMaterialLabel, ...] = field(default_factory=_empty_string_tuple)
+    claim: str
+    support_labels: tuple[PromptLocalMaterialLabel, ...]
+    context_labels: tuple[PromptLocalMaterialLabel, ...] = field(default_factory=_empty_string_tuple)
 
     def __post_init__(self) -> None:
         """校验 vNext evidence-backed fact candidate。
@@ -1189,14 +1147,14 @@ class EvidenceBackedFactCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_non_empty(self.claim_text, field_name="EvidenceBackedFactCandidateVNext.claim_text")
+        _require_non_empty(self.claim, field_name="CompactEvidenceFactV2.claim")
         _require_non_empty_unique_string_tuple(
-            self.evidence_labels,
-            field_name="EvidenceBackedFactCandidateVNext.evidence_labels",
+            self.support_labels,
+            field_name="CompactEvidenceFactV2.support_labels",
         )
         _require_unique_string_tuple(
-            self.source_labels,
-            field_name="EvidenceBackedFactCandidateVNext.source_labels",
+            self.context_labels,
+            field_name="CompactEvidenceFactV2.context_labels",
         )
 
     def to_json(self) -> JsonValue:
@@ -1206,45 +1164,14 @@ class EvidenceBackedFactCandidateVNext:
         """
 
         return {
-            "claim_text": self.claim_text,
-            "evidence_labels": _string_list_json(self.evidence_labels),
-            "source_labels": _string_list_json(self.source_labels),
+            "claim": self.claim,
+            "support_labels": _string_list_json(self.support_labels),
+            "context_labels": _string_list_json(self.context_labels),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class AnswerAnchorChildVNext:
-    """vNext answer anchor 子项。
-
-    :param display_text: 展示文本。
-    :param ordinal: 可选序号。
-    """
-
-    display_text: str
-    ordinal: int | None = None
-
-    def __post_init__(self) -> None:
-        """校验 vNext answer anchor 子项。
-
-        :returns: ``None``。
-        :raises ValueError: 文本或序号非法时抛出。
-        """
-
-        _require_non_empty(self.display_text, field_name="AnswerAnchorChildVNext.display_text")
-        if self.ordinal is not None:
-            _require_non_negative_int(self.ordinal, field_name="AnswerAnchorChildVNext.ordinal")
-
-    def to_json(self) -> JsonValue:
-        """转换为 JSON object。
-
-        :returns: JSON object。
-        """
-
-        return {"display_text": self.display_text, "ordinal": self.ordinal}
-
-
-@dataclass(frozen=True, slots=True)
-class AnswerAnchorCandidateVNext:
+class CompactAnswerAnchorV2:
     """vNext answer anchor candidate。
 
     :param anchor_title: anchor 标题。
@@ -1252,9 +1179,9 @@ class AnswerAnchorCandidateVNext:
     :param answer_source_labels: answer material labels。
     """
 
-    anchor_title: str
-    anchor_items: tuple[AnswerAnchorChildVNext, ...]
-    answer_source_labels: tuple[PromptLocalMaterialLabel, ...]
+    title: str
+    detail: str
+    source_labels: tuple[PromptLocalMaterialLabel, ...]
 
     def __post_init__(self) -> None:
         """校验 vNext answer anchor candidate。
@@ -1264,15 +1191,11 @@ class AnswerAnchorCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_non_empty(self.anchor_title, field_name="AnswerAnchorCandidateVNext.anchor_title")
-        _require_answer_anchor_child_tuple(
-            self.anchor_items,
-            field_name="AnswerAnchorCandidateVNext.anchor_items",
-            require_non_empty=True,
-        )
+        _require_non_empty(self.title, field_name="CompactAnswerAnchorV2.title")
+        _require_non_empty(self.detail, field_name="CompactAnswerAnchorV2.detail")
         _require_non_empty_unique_string_tuple(
-            self.answer_source_labels,
-            field_name="AnswerAnchorCandidateVNext.answer_source_labels",
+            self.source_labels,
+            field_name="CompactAnswerAnchorV2.source_labels",
         )
 
     def to_json(self) -> JsonValue:
@@ -1282,14 +1205,14 @@ class AnswerAnchorCandidateVNext:
         """
 
         return {
-            "anchor_title": self.anchor_title,
-            "anchor_items": _answer_anchor_child_list_json(self.anchor_items),
-            "answer_source_labels": _string_list_json(self.answer_source_labels),
+            "title": self.title,
+            "detail": self.detail,
+            "source_labels": _string_list_json(self.source_labels),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class ForwardIntentCandidateVNext:
+class CompactForwardIntentV2:
     """vNext forward intent candidate。
 
     :param intent_type: intent 类型。
@@ -1298,9 +1221,9 @@ class ForwardIntentCandidateVNext:
     :param source_labels: 支撑该 intent 的 source labels。
     """
 
-    intent_type: ForwardIntentTypeVNext
+    intent_type: str
     text: str
-    status: ForwardIntentStatusVNext
+    status: CompactForwardIntentStatusV2
     source_labels: tuple[PromptLocalMaterialLabel, ...]
 
     def __post_init__(self) -> None:
@@ -1311,14 +1234,13 @@ class ForwardIntentCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        if not isinstance(self.intent_type, ForwardIntentTypeVNext):
-            raise TypeError("ForwardIntentCandidateVNext.intent_type is invalid")
-        if not isinstance(self.status, ForwardIntentStatusVNext):
-            raise TypeError("ForwardIntentCandidateVNext.status is invalid")
-        _require_non_empty(self.text, field_name="ForwardIntentCandidateVNext.text")
+        _require_non_empty(self.intent_type, field_name="CompactForwardIntentV2.intent_type")
+        if not isinstance(self.status, CompactForwardIntentStatusV2):
+            raise TypeError("CompactForwardIntentV2.status is invalid")
+        _require_non_empty(self.text, field_name="CompactForwardIntentV2.text")
         _require_non_empty_unique_string_tuple(
             self.source_labels,
-            field_name="ForwardIntentCandidateVNext.source_labels",
+            field_name="CompactForwardIntentV2.source_labels",
         )
 
     def to_json(self) -> JsonValue:
@@ -1328,7 +1250,7 @@ class ForwardIntentCandidateVNext:
         """
 
         return {
-            "intent_type": self.intent_type.value,
+            "intent_type": self.intent_type,
             "text": self.text,
             "status": self.status.value,
             "source_labels": _string_list_json(self.source_labels),
@@ -1336,7 +1258,7 @@ class ForwardIntentCandidateVNext:
 
 
 @dataclass(frozen=True, slots=True)
-class ReferenceContinuityCandidateVNext:
+class CompactReferenceContinuityV2:
     """vNext reference continuity candidate。
 
     :param text: 连续性文本。
@@ -1345,7 +1267,7 @@ class ReferenceContinuityCandidateVNext:
     """
 
     text: str
-    reason: ReferenceContinuityReasonVNext
+    reason: str
     source_labels: tuple[PromptLocalMaterialLabel, ...]
 
     def __post_init__(self) -> None:
@@ -1356,12 +1278,11 @@ class ReferenceContinuityCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_non_empty(self.text, field_name="ReferenceContinuityCandidateVNext.text")
-        if not isinstance(self.reason, ReferenceContinuityReasonVNext):
-            raise TypeError("ReferenceContinuityCandidateVNext.reason is invalid")
+        _require_non_empty(self.text, field_name="CompactReferenceContinuityV2.text")
+        _require_non_empty(self.reason, field_name="CompactReferenceContinuityV2.reason")
         _require_non_empty_unique_string_tuple(
             self.source_labels,
-            field_name="ReferenceContinuityCandidateVNext.source_labels",
+            field_name="CompactReferenceContinuityV2.source_labels",
         )
 
     def to_json(self) -> JsonValue:
@@ -1372,13 +1293,13 @@ class ReferenceContinuityCandidateVNext:
 
         return {
             "text": self.text,
-            "reason": self.reason.value,
+            "reason": self.reason,
             "source_labels": _string_list_json(self.source_labels),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class CompactCandidateDiagnosticVNext:
+class CompactCandidateDiagnosticV2:
     """vNext compact candidate diagnostic。
 
     :param code: 诊断 code。
@@ -1387,7 +1308,7 @@ class CompactCandidateDiagnosticVNext:
     """
 
     code: str
-    text: str
+    message: str
     source_labels: tuple[PromptLocalMaterialLabel, ...] = field(default_factory=_empty_string_tuple)
 
     def __post_init__(self) -> None:
@@ -1397,11 +1318,11 @@ class CompactCandidateDiagnosticVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_non_empty(self.code, field_name="CompactCandidateDiagnosticVNext.code")
-        _require_non_empty(self.text, field_name="CompactCandidateDiagnosticVNext.text")
+        _require_non_empty(self.code, field_name="CompactCandidateDiagnosticV2.code")
+        _require_non_empty(self.message, field_name="CompactCandidateDiagnosticV2.message")
         _require_unique_string_tuple(
             self.source_labels,
-            field_name="CompactCandidateDiagnosticVNext.source_labels",
+            field_name="CompactCandidateDiagnosticV2.source_labels",
         )
 
     def to_json(self) -> JsonValue:
@@ -1412,31 +1333,65 @@ class CompactCandidateDiagnosticVNext:
 
         return {
             "code": self.code,
-            "text": self.text,
+            "message": self.message,
             "source_labels": _string_list_json(self.source_labels),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class ConversationCompactOutputVNext:
-    """vNext compactor 输出 contract。
+class CompactExplicitDropV2:
+    """候选对单一 boundary source 的显式丢弃声明。
 
-    :param schema_version: output schema version。
-    :param session_summary: nullable session summary candidate。
-    :param evidence_backed_facts: fact candidates。
-    :param answer_anchors: answer anchor candidates。
-    :param forward_intents: forward intent candidates。
-    :param reference_continuity_items: reference continuity candidates。
-    :param diagnostics: candidate diagnostics。
+    :param source_label: 被丢弃的 prompt-local label。
+    :param reason: 闭集丢弃原因。
     """
 
-    schema_version: str
-    session_summary: SessionSummaryCandidateVNext | None
-    evidence_backed_facts: tuple[EvidenceBackedFactCandidateVNext, ...]
-    answer_anchors: tuple[AnswerAnchorCandidateVNext, ...]
-    forward_intents: tuple[ForwardIntentCandidateVNext, ...]
-    reference_continuity_items: tuple[ReferenceContinuityCandidateVNext, ...]
-    diagnostics: tuple[CompactCandidateDiagnosticVNext, ...]
+    source_label: str
+    reason: CompactDropReasonV2
+
+    def __post_init__(self) -> None:
+        """校验 drop 声明。
+
+        :returns: ``None``。
+        :raises TypeError: reason 类型非法时抛出。
+        :raises ValueError: label 为空时抛出。
+        """
+
+        _require_non_empty(self.source_label, field_name="CompactExplicitDropV2.source_label")
+        if not isinstance(self.reason, CompactDropReasonV2):
+            raise TypeError("CompactExplicitDropV2.reason is invalid")
+
+    def to_json(self) -> JsonValue:
+        """转换为 JSON object。
+
+        :returns: JSON object。
+        """
+
+        return {"source_label": self.source_label, "reason": self.reason.value}
+
+
+@dataclass(frozen=True, slots=True)
+class CompactCandidateV2:
+    """模型可返回的完整 replacement candidate。
+
+    :param schema: 固定 v2 schema literal。
+    :param session_summary: nullable session summary。
+    :param evidence_facts: evidence-backed facts。
+    :param answer_anchors: answer anchors。
+    :param forward_intents: forward intents。
+    :param reference_continuity: reference continuity items。
+    :param diagnostics: 不计 represented coverage 的 diagnostics。
+    :param explicitly_dropped_sources: 明确丢弃的 boundary sources。
+    """
+
+    schema: Literal["dayu.context_compaction.output.v2"]
+    session_summary: CompactSessionSummaryV2 | None
+    evidence_facts: tuple[CompactEvidenceFactV2, ...]
+    answer_anchors: tuple[CompactAnswerAnchorV2, ...]
+    forward_intents: tuple[CompactForwardIntentV2, ...]
+    reference_continuity: tuple[CompactReferenceContinuityV2, ...]
+    diagnostics: tuple[CompactCandidateDiagnosticV2, ...]
+    explicitly_dropped_sources: tuple[CompactExplicitDropV2, ...]
 
     def __post_init__(self) -> None:
         """校验 vNext compactor 输出 contract。
@@ -1446,15 +1401,18 @@ class ConversationCompactOutputVNext:
         :raises ValueError: schema 或数量非法时抛出。
         """
 
-        if self.schema_version != CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT:
-            raise ValueError("ConversationCompactOutputVNext.schema_version is invalid")
-        if self.session_summary is not None and not isinstance(self.session_summary, SessionSummaryCandidateVNext):
-            raise TypeError("ConversationCompactOutputVNext.session_summary is invalid")
-        _require_fact_candidate_vnext_tuple(self.evidence_backed_facts)
+        if self.schema != COMPACT_OUTPUT_SCHEMA_V2:
+            raise ValueError("CompactCandidateV2.schema is invalid")
+        if self.session_summary is not None and not isinstance(self.session_summary, CompactSessionSummaryV2):
+            raise TypeError("CompactCandidateV2.session_summary is invalid")
+        _require_fact_candidate_vnext_tuple(self.evidence_facts)
         _require_answer_anchor_candidate_tuple(self.answer_anchors)
         _require_forward_intent_candidate_tuple(self.forward_intents)
-        _require_reference_candidate_tuple(self.reference_continuity_items)
+        _require_reference_candidate_tuple(self.reference_continuity)
         _require_diagnostic_vnext_tuple(self.diagnostics)
+        for drop in self.explicitly_dropped_sources:
+            if not isinstance(drop, CompactExplicitDropV2):
+                raise TypeError("CompactCandidateV2.explicitly_dropped_sources item is invalid")
 
     def digest(self) -> str:
         """计算 vNext candidate digest。
@@ -1471,44 +1429,45 @@ class ConversationCompactOutputVNext:
         """
 
         return {
-            "schema_version": self.schema_version,
+            "schema": self.schema,
             "session_summary": None if self.session_summary is None else self.session_summary.to_json(),
-            "evidence_backed_facts": _fact_candidate_vnext_list_json(self.evidence_backed_facts),
+            "evidence_facts": _fact_candidate_vnext_list_json(self.evidence_facts),
             "answer_anchors": _answer_anchor_candidate_list_json(self.answer_anchors),
             "forward_intents": _forward_intent_candidate_list_json(self.forward_intents),
-            "reference_continuity_items": _reference_candidate_list_json(self.reference_continuity_items),
+            "reference_continuity": _reference_candidate_list_json(self.reference_continuity),
             "diagnostics": _diagnostic_vnext_list_json(self.diagnostics),
+            "explicitly_dropped_sources": [drop.to_json() for drop in self.explicitly_dropped_sources],
         }
 
 
 @dataclass(frozen=True, slots=True)
-class CompactQualityCheckResultVNext:
-    """vNext compact contract validator 结果。
+class CompactRepresentedSourceV2:
+    """单一 source 在业务语义区中的代表关系。
 
-    :param accepted: candidate 是否通过 vNext contract validator。
-    :param rejection_reasons: vNext 拒绝原因。
+    :param source_label: boundary label。
+    :param sections: 去重且按固定 enum 顺序排列的业务区。
     """
 
-    accepted: bool
-    rejection_reasons: tuple[CompactQualityIssueVNext, ...]
+    source_label: str
+    sections: tuple[CompactSemanticSectionV2, ...]
 
     def __post_init__(self) -> None:
-        """校验 vNext quality result。
+        """校验 represented source。
 
         :returns: ``None``。
-        :raises TypeError: 字段类型非法时抛出。
-        :raises ValueError: accepted 与 reasons 不一致时抛出。
+        :raises TypeError: section 类型非法时抛出。
+        :raises ValueError: label、section 顺序或唯一性非法时抛出。
         """
 
-        _require_bool(self.accepted, field_name="CompactQualityCheckResultVNext.accepted")
-        _require_quality_issue_vnext_tuple(
-            self.rejection_reasons,
-            field_name="CompactQualityCheckResultVNext.rejection_reasons",
-        )
-        if self.accepted and len(self.rejection_reasons) > 0:
-            raise ValueError("Accepted vNext quality result must not include rejection reasons")
-        if not self.accepted and len(self.rejection_reasons) == 0:
-            raise ValueError("Rejected vNext quality result must include rejection reasons")
+        _require_non_empty(self.source_label, field_name="CompactRepresentedSourceV2.source_label")
+        for section in self.sections:
+            if not isinstance(section, CompactSemanticSectionV2):
+                raise TypeError("CompactRepresentedSourceV2.sections item is invalid")
+        if len(self.sections) == 0:
+            raise ValueError("CompactRepresentedSourceV2.sections must not be empty")
+        expected = tuple(sorted(set(self.sections), key=lambda item: list(CompactSemanticSectionV2).index(item)))
+        if self.sections != expected:
+            raise ValueError("CompactRepresentedSourceV2.sections must be unique and ordered")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -1516,10 +1475,290 @@ class CompactQualityCheckResultVNext:
         :returns: JSON object。
         """
 
-        reasons: list[JsonValue] = []
-        for reason in self.rejection_reasons:
-            reasons.append(reason.value)
-        return {"accepted": self.accepted, "rejection_reasons": reasons}
+        return {"source_label": self.source_label, "sections": [section.value for section in self.sections]}
+
+
+@dataclass(frozen=True, slots=True)
+class CompactRepresentedCoverageV2:
+    """Host 从 candidate 派生的 represented coverage。
+
+    :param sources: 按 root boundary 顺序排列的 represented sources。
+    """
+
+    sources: tuple[CompactRepresentedSourceV2, ...]
+
+    @property
+    def source_labels(self) -> tuple[str, ...]:
+        """返回 represented label set 的稳定序列。
+
+        :returns: represented labels。
+        """
+
+        return tuple(source.source_label for source in self.sources)
+
+    def to_json(self) -> JsonValue:
+        """转换为 JSON object。
+
+        :returns: JSON object。
+        """
+
+        return {"sources": [source.to_json() for source in self.sources]}
+
+
+@dataclass(frozen=True, slots=True)
+class CompactExplicitlyDroppedCoverageV2:
+    """经 Host 验证的显式 drop coverage。
+
+    :param drops: 按 root boundary 顺序排列的 drop 声明。
+    """
+
+    drops: tuple[CompactExplicitDropV2, ...]
+
+    @property
+    def source_labels(self) -> tuple[str, ...]:
+        """返回 drop labels 的稳定序列。
+
+        :returns: drop labels。
+        """
+
+        return tuple(drop.source_label for drop in self.drops)
+
+    def to_json(self) -> JsonValue:
+        """转换为 JSON object。
+
+        :returns: JSON object。
+        """
+
+        return {"drops": [drop.to_json() for drop in self.drops]}
+
+
+@dataclass(frozen=True, slots=True)
+class CompactValidationIssueV2:
+    """严格 parser 或 Host acceptance 的单一确定性问题。
+
+    :param code: 稳定问题码。
+    :param json_path: 候选中的自解释 JSON path。
+    :param message: 脱敏、自解释的修复提示。
+    :param source_labels: 只包含 prompt-local labels。
+    """
+
+    code: CompactValidationIssueCodeV2
+    json_path: str
+    message: str
+    source_labels: tuple[str, ...] = field(default_factory=_empty_string_tuple)
+
+    def __post_init__(self) -> None:
+        """校验 validation issue。
+
+        :returns: ``None``。
+        :raises TypeError: code 类型非法时抛出。
+        :raises ValueError: path/message/labels 非法时抛出。
+        """
+
+        if not isinstance(self.code, CompactValidationIssueCodeV2):
+            raise TypeError("CompactValidationIssueV2.code is invalid")
+        _require_non_empty(self.json_path, field_name="CompactValidationIssueV2.json_path")
+        _require_non_empty(self.message, field_name="CompactValidationIssueV2.message")
+        _require_unique_string_tuple(self.source_labels, field_name="CompactValidationIssueV2.source_labels")
+
+    def to_json(self) -> JsonValue:
+        """转换为脱敏 JSON object。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "code": self.code.value,
+            "json_path": self.json_path,
+            "message": self.message,
+            "source_labels": _string_list_json(self.source_labels),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompactValidationReportV2:
+    """候选拒绝报告；success 不使用该 bag。
+
+    :param issues: 稳定排序、精确去重且非空的问题。
+    """
+
+    issues: tuple[CompactValidationIssueV2, ...]
+
+    def __post_init__(self) -> None:
+        """校验 reject report。
+
+        :returns: ``None``。
+        :raises TypeError: issue 类型非法时抛出。
+        :raises ValueError: issues 为空、重复或顺序不稳定时抛出。
+        """
+
+        if len(self.issues) == 0:
+            raise ValueError("CompactValidationReportV2.issues must not be empty")
+        for issue in self.issues:
+            if not isinstance(issue, CompactValidationIssueV2):
+                raise TypeError("CompactValidationReportV2.issues item is invalid")
+        expected = tuple(sorted(set(self.issues), key=_validation_issue_sort_key))
+        if self.issues != expected:
+            raise ValueError("CompactValidationReportV2.issues must be unique and ordered")
+
+    def to_json(self) -> JsonValue:
+        """转换为 JSON object。
+
+        :returns: JSON object。
+        """
+
+        return {"issues": [issue.to_json() for issue in self.issues]}
+
+
+MAX_COMPACT_REPAIR_ISSUES = 32
+"""单次 repair feedback 最多携带的问题数。"""
+
+MAX_COMPACT_REPAIR_ISSUE_MESSAGE_CHARS = 240
+"""单条 repair issue message 的字符上限。"""
+
+MAX_COMPACT_REPAIR_FEEDBACK_CHARS = 8192
+"""完整 repair feedback 的字符上限。"""
+
+COMPACT_REPAIR_REQUIRED_ACTION = (
+    "返回一个符合当前 schema 的完整 replacement candidate；它不是 patch，不得沿用、合并或补写先前 JSON 的任何部分。"
+)
+"""repair 的固定 whole-candidate 动作要求。"""
+
+
+@dataclass(frozen=True, slots=True)
+class CompactRepairFeedbackV2:
+    """下一次 semantic repair 使用的脱敏、bounded feedback。
+
+    :param previous_attempt_number: 产生报告的前次 attempt number。
+    :param issues: bounded issues。
+    :param additional_issue_count: 未携带的剩余问题数。
+    :param required_action: 固定 whole-candidate replacement 要求。
+    """
+
+    previous_attempt_number: int
+    issues: tuple[CompactValidationIssueV2, ...]
+    additional_issue_count: int
+    required_action: str = COMPACT_REPAIR_REQUIRED_ACTION
+
+    def __post_init__(self) -> None:
+        """校验 repair feedback。
+
+        :returns: ``None``。
+        :raises ValueError: attempt/count/action 或 issue 数量非法时抛出。
+        """
+
+        if self.previous_attempt_number <= 0:
+            raise ValueError("CompactRepairFeedbackV2.previous_attempt_number must be positive")
+        if len(self.issues) == 0 or len(self.issues) > MAX_COMPACT_REPAIR_ISSUES:
+            raise ValueError("CompactRepairFeedbackV2.issues count is invalid")
+        _require_non_negative_int(
+            self.additional_issue_count,
+            field_name="CompactRepairFeedbackV2.additional_issue_count",
+        )
+        if self.required_action != COMPACT_REPAIR_REQUIRED_ACTION:
+            raise ValueError("CompactRepairFeedbackV2.required_action is invalid")
+
+    def to_json(self) -> JsonValue:
+        """转换为 LLM-facing 脱敏 JSON。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "previous_attempt_number": self.previous_attempt_number,
+            "issues": [issue.to_json() for issue in self.issues],
+            "additional_issue_count": self.additional_issue_count,
+            "required_action": self.required_action,
+        }
+
+
+class _CompactAcceptancePermit:
+    """限制 accepted truth 只能由 governance owner 构造。"""
+
+    __slots__ = ()
+
+
+_COMPACT_ACCEPTANCE_PERMIT = _CompactAcceptancePermit()
+
+
+@dataclass(frozen=True, slots=True)
+class CompactAcceptedTruthV2:
+    """Host 成功验收后唯一可提交的 compact truth。
+
+    :param candidate: 完整 replacement candidate。
+    :param source_boundary: immutable root source boundary。
+    :param represented_coverage: Host 派生的 represented coverage。
+    :param explicitly_dropped_coverage: Host 验证的 drop coverage。
+    :param current_input_ref: 始终保留的当前输入 ref。
+    :param _permit: governance owner 私有构造许可。
+    """
+
+    candidate: CompactCandidateV2
+    source_boundary: tuple[CompactSourceBoundaryEntryV2, ...]
+    represented_coverage: CompactRepresentedCoverageV2
+    explicitly_dropped_coverage: CompactExplicitlyDroppedCoverageV2
+    current_input_ref: str
+    _permit: _CompactAcceptancePermit = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """校验 accepted truth 构造来源与覆盖等式。
+
+        :returns: ``None``。
+        :raises ValueError: 私有许可、current input 或覆盖等式非法时抛出。
+        """
+
+        if self._permit is not _COMPACT_ACCEPTANCE_PERMIT:
+            raise ValueError("CompactAcceptedTruthV2 must be created by Context Governance")
+        _require_non_empty(self.current_input_ref, field_name="CompactAcceptedTruthV2.current_input_ref")
+        boundary_labels = tuple(entry.source_label for entry in self.source_boundary)
+        represented = self.represented_coverage.source_labels
+        dropped = self.explicitly_dropped_coverage.source_labels
+        if set(represented).intersection(dropped):
+            raise ValueError("represented and dropped coverage must be disjoint")
+        if set(boundary_labels) != set(represented).union(dropped):
+            raise ValueError("accepted coverage must exactly partition source boundary")
+
+    @property
+    def covered_source_refs(self) -> tuple[str, ...]:
+        """按 boundary 顺序派生 accepted coverage 的 canonical refs。
+
+        :returns: represented 与 dropped sources 对应的唯一 refs。
+        """
+
+        refs: list[str] = []
+        covered_labels = set(self.represented_coverage.source_labels).union(
+            self.explicitly_dropped_coverage.source_labels
+        )
+        for entry in self.source_boundary:
+            if entry.source_label in covered_labels:
+                refs.extend(entry.source_refs)
+        return tuple(dict.fromkeys(refs))
+
+    def validate_input_binding(self, compact_input: CompactInputV2) -> None:
+        """验证 accepted truth 仍绑定产生它的 immutable input。
+
+        :param compact_input: 待提交 request 派生的 strict v2 input。
+        :returns: ``None``。
+        :raises TypeError: ``compact_input`` 类型非法时抛出。
+        :raises ValueError: current ref 或 source boundary 不同源时抛出。
+        """
+
+        if not isinstance(compact_input, CompactInputV2):
+            raise TypeError("compact_input must be CompactInputV2")
+        if self.current_input_ref != compact_input.current_input.source_ref:
+            raise ValueError("accepted truth current input binding mismatch")
+        if self.source_boundary != compact_input.source_boundary:
+            raise ValueError("accepted truth source boundary binding mismatch")
+
+
+def _validation_issue_sort_key(issue: CompactValidationIssueV2) -> tuple[str, str, tuple[str, ...], str]:
+    """返回 validation issue 的稳定排序键。
+
+    :param issue: validation issue。
+    :returns: code/path/labels/message 排序键。
+    """
+
+    return (issue.code.value, issue.json_path, issue.source_labels, issue.message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1618,7 +1857,7 @@ class CompactMaterialPack:
     """
 
     previous_compacted_view: tuple[CompactMaterialBlock, ...]
-    previous_compacted_readable_view: CompactReadableViewVNext | None
+    previous_compacted_readable_view: PreviousCompactReadableView | None
     trace_material: tuple[CompactMaterialBlock, ...]
     evidence_material: tuple[CompactEvidenceBlock, ...]
     answer_material: tuple[CompactMaterialBlock, ...]
@@ -1880,12 +2119,65 @@ class CompactionRequest:
         }
 
     def llm_material_json(self) -> JsonValue:
-        """返回只可暴露给 LLM 的 material JSON。
+        """返回严格 v2 LLM-facing 输入。
 
-        :returns: 不含 EventLog / payload / digest / cursor 的 material JSON。
+        :returns: 不含 canonical refs / digest / cursor 的 v2 input JSON。
         """
 
-        return self.material_pack.llm_json()
+        return self.compact_input.to_json()
+
+    @property
+    def compact_input(self) -> CompactInputV2:
+        """从冻结 material pack 机械投影严格 v2 input。
+
+        :returns: current input 与逐项 source boundary。
+        """
+
+        entries: list[CompactSourceBoundaryEntryV2] = []
+        for block in self.material_pack.previous_compacted_view:
+            entries.append(
+                CompactSourceBoundaryEntryV2(
+                    source_label=block.block_label,
+                    source_kind=_previous_source_kind(block.kind),
+                    source_refs=block.canonical_source_refs,
+                    readable_text=block.text,
+                )
+            )
+        for block in self.material_pack.trace_material:
+            entries.append(
+                CompactSourceBoundaryEntryV2(
+                    source_label=block.block_label,
+                    source_kind=CompactSourceKindV2.TRACE_MATERIAL,
+                    source_refs=block.canonical_source_refs,
+                    readable_text=block.text,
+                )
+            )
+        for block in self.material_pack.evidence_material:
+            entries.append(
+                CompactSourceBoundaryEntryV2(
+                    source_label=block.evidence_label,
+                    source_kind=CompactSourceKindV2.EVIDENCE_MATERIAL,
+                    source_refs=block.canonical_source_refs,
+                    readable_text=_evidence_boundary_text(block),
+                )
+            )
+        for block in self.material_pack.answer_material:
+            entries.append(
+                CompactSourceBoundaryEntryV2(
+                    source_label=block.block_label,
+                    source_kind=CompactSourceKindV2.ANSWER_MATERIAL,
+                    source_refs=block.canonical_source_refs,
+                    readable_text=block.text,
+                )
+            )
+        return CompactInputV2(
+            schema=COMPACT_INPUT_SCHEMA_V2,
+            current_input=CompactCurrentInputV2(
+                source_ref=self.current_input_ref,
+                readable_text=self.current_input_text,
+            ),
+            source_boundary=tuple(entries),
+        )
 
     @property
     def canonical_evidence_refs(self) -> tuple[str, ...]:
@@ -1928,6 +2220,42 @@ class CompactionRequest:
         return self.material_pack.current_input_anchor.anchor_text
 
 
+def _previous_source_kind(kind: CompactMaterialBlockKind) -> CompactSourceKindV2:
+    """把 previous compact block kind 映射到唯一 v2 source kind。
+
+    :param kind: previous material block kind。
+    :returns: 对应 previous-* source kind。
+    :raises ValueError: kind 不属于 previous semantic sections 时抛出。
+    """
+
+    mapping = {
+        CompactMaterialBlockKind.SESSION_SUMMARY: CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY,
+        CompactMaterialBlockKind.EVIDENCE_BACKED_FACT: CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT,
+        CompactMaterialBlockKind.ANSWER_ANCHOR: CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR,
+        CompactMaterialBlockKind.FORWARD_INTENT: CompactSourceKindV2.PREVIOUS_FORWARD_INTENT,
+        CompactMaterialBlockKind.REFERENCE_CONTINUITY: CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY,
+    }
+    try:
+        return mapping[kind]
+    except KeyError as exc:
+        raise ValueError("previous compact material block kind is invalid") from exc
+
+
+def _evidence_boundary_text(block: CompactEvidenceBlock) -> str:
+    """构造自解释 evidence boundary 文本。
+
+    :param block: 已校验 evidence material block。
+    :returns: 不含内部 provenance 的业务可读文本。
+    """
+
+    return (
+        f"工具：{block.readable_tool_name}\n"
+        f"查询：{block.readable_query_text}\n"
+        f"结果：{block.raw_result_text}\n"
+        f"来源：{block.readable_source_text}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CompactorProposal:
     """一次成功 compactor Runner call 产生的配对 proposal。
@@ -1937,7 +2265,7 @@ class CompactorProposal:
         call 身份。
     """
 
-    candidate: ConversationCompactOutputVNext
+    candidate: CompactCandidateV2
     successful_response_identity: SuccessfulRunnerResponseIdentity
 
     def __post_init__(self) -> None:
@@ -1947,16 +2275,13 @@ class CompactorProposal:
         :raises TypeError: candidate 或成功响应身份类型非法时抛出。
         """
 
-        if not isinstance(self.candidate, ConversationCompactOutputVNext):
-            raise TypeError("CompactorProposal.candidate must be ConversationCompactOutputVNext")
+        if not isinstance(self.candidate, CompactCandidateV2):
+            raise TypeError("CompactorProposal.candidate must be CompactCandidateV2")
         if not isinstance(
             self.successful_response_identity,
             SuccessfulRunnerResponseIdentity,
         ):
-            raise TypeError(
-                "CompactorProposal.successful_response_identity must be "
-                "SuccessfulRunnerResponseIdentity"
-            )
+            raise TypeError("CompactorProposal.successful_response_identity must be SuccessfulRunnerResponseIdentity")
 
 
 class CompactorProposalError(RuntimeError):
@@ -1965,6 +2290,8 @@ class CompactorProposalError(RuntimeError):
     :param message: 中性且安全的失败描述。
     :param successful_response_identity: 已取得成功 Engine final 时的同源
         response identity；没有成功 final 时为 ``None``。
+    :param validation_report: raw LLM contract reject 的 typed report；ordinary
+        execution/transport failure 时为 ``None``。
     """
 
     def __init__(
@@ -1972,18 +2299,21 @@ class CompactorProposalError(RuntimeError):
         message: str,
         *,
         successful_response_identity: SuccessfulRunnerResponseIdentity | None,
+        validation_report: CompactValidationReportV2 | None = None,
     ) -> None:
         """初始化 proposal error。
 
         :param message: 中性且安全的失败描述。
         :param successful_response_identity: 已取得成功 Engine final 时的同源
             response identity；没有成功 final 时为 ``None``。
+        :param validation_report: strict parser validation report。
         :returns: 无返回值。
         :raises Exception: 不主动抛出异常。
         """
 
         super().__init__(message)
         self.successful_response_identity = successful_response_identity
+        self.validation_report = validation_report
 
 
 class ContextCompactor(Protocol):
@@ -1998,11 +2328,14 @@ class ContextCompactor(Protocol):
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV2 | None,
     ) -> CompactorProposal:
         """生成 vNext compaction output candidate。
 
         :param request: Host 构造的 compaction 请求。
         :param cancellation_token: Host 注入的真实取消 token。
+        :param repair_feedback: 前次 semantic validation 的脱敏反馈；首次为 ``None``。
         :returns: 与实际成功 Runner call 身份配对的 vNext proposal。
         :raises RuntimeError: compactor 后端失败时可抛出运行时错误。
         """
@@ -2169,7 +2502,7 @@ def _require_provenance_mapping(
         if not isinstance(key, str):
             raise TypeError("CompactMaterialPack.provenance_map keys must be str")
         if not isinstance(entry, PromptLocalProvenanceEntry):
-            raise TypeError("CompactMaterialPack.provenance_map values must be " "PromptLocalProvenanceEntry")
+            raise TypeError("CompactMaterialPack.provenance_map values must be PromptLocalProvenanceEntry")
         if key != entry.label:
             raise ValueError("CompactMaterialPack.provenance_map key mismatch")
 
@@ -2218,18 +2551,14 @@ def previous_answer_anchor_block_text(anchor: ReadableAnswerAnchorVNext) -> str:
         raise TypeError("anchor must be ReadableAnswerAnchorVNext")
     lines = [anchor.anchor_title]
     for item in anchor.anchor_items:
-        ordinal_prefix = (
-            ""
-            if item.ordinal is None
-            else f"{item.ordinal}{_ANCHOR_CHILD_ORDINAL_SEPARATOR}"
-        )
+        ordinal_prefix = "" if item.ordinal is None else f"{item.ordinal}{_ANCHOR_CHILD_ORDINAL_SEPARATOR}"
         lines.append(f"{_ANCHOR_CHILD_TEXT_PREFIX}{ordinal_prefix}{item.display_text}")
     return "\n".join(lines)
 
 
 def validate_previous_compacted_view_pair(
     blocks: tuple[CompactMaterialBlock, ...],
-    readable_view: CompactReadableViewVNext | None,
+    readable_view: PreviousCompactReadableView | None,
 ) -> None:
     """校验 previous compacted blocks 与 typed readable view 的 exact pair。
 
@@ -2250,7 +2579,7 @@ def validate_previous_compacted_view_pair(
 
 def _require_previous_compacted_view_pair(
     blocks: tuple[CompactMaterialBlock, ...],
-    readable_view: CompactReadableViewVNext | None,
+    readable_view: PreviousCompactReadableView | None,
 ) -> None:
     """校验 previous compacted blocks 与 typed readable view 的 exact pair。
 
@@ -2267,8 +2596,8 @@ def _require_previous_compacted_view_pair(
         return
     if readable_view is None:
         raise ValueError("previous compacted readable view is required with blocks")
-    if not isinstance(readable_view, CompactReadableViewVNext):
-        raise TypeError("previous compacted readable view must be CompactReadableViewVNext")
+    if not isinstance(readable_view, PreviousCompactReadableView):
+        raise TypeError("previous compacted readable view must be PreviousCompactReadableView")
     _require_previous_block_kind_and_label_set(blocks)
     summary_blocks = _previous_blocks_by_kind(
         blocks,
@@ -2288,10 +2617,7 @@ def _require_previous_compacted_view_pair(
     )
     _require_previous_item_blocks(
         _previous_blocks_by_kind(blocks, CompactMaterialBlockKind.ANSWER_ANCHOR),
-        tuple(
-            (item.source_label, previous_answer_anchor_block_text(item))
-            for item in readable_view.answer_anchors
-        ),
+        tuple((item.source_label, previous_answer_anchor_block_text(item)) for item in readable_view.answer_anchors),
         section_name="answer_anchors",
     )
     _require_previous_item_blocks(
@@ -2396,7 +2722,7 @@ def _require_range_tuple(value: tuple[CompactInputRange, ...], *, field_name: st
             raise TypeError(f"{field_name} items must be CompactInputRange")
 
 
-def _require_quality_issue_vnext_tuple(value: tuple[CompactQualityIssueVNext, ...], *, field_name: str) -> None:
+def _require_quality_issue_vnext_tuple(value: tuple[CompactValidationIssueCodeV2, ...], *, field_name: str) -> None:
     """校验 vNext quality issue tuple。
 
     :param value: 待校验 tuple。
@@ -2408,8 +2734,8 @@ def _require_quality_issue_vnext_tuple(value: tuple[CompactQualityIssueVNext, ..
     if not isinstance(value, tuple):
         raise TypeError(f"{field_name} must be tuple")
     for item in value:
-        if not isinstance(item, CompactQualityIssueVNext):
-            raise TypeError(f"{field_name} items must be CompactQualityIssueVNext")
+        if not isinstance(item, CompactValidationIssueCodeV2):
+            raise TypeError(f"{field_name} items must be CompactValidationIssueCodeV2")
 
 
 def _require_readable_fact_tuple(value: tuple[ReadableFactItemVNext, ...], *, field_name: str) -> None:
@@ -2428,9 +2754,7 @@ def _require_readable_fact_tuple(value: tuple[ReadableFactItemVNext, ...], *, fi
             raise TypeError(f"{field_name} items must be ReadableFactItemVNext")
 
 
-def _require_readable_answer_anchor_tuple(
-    value: tuple[ReadableAnswerAnchorVNext, ...], *, field_name: str
-) -> None:
+def _require_readable_answer_anchor_tuple(value: tuple[ReadableAnswerAnchorVNext, ...], *, field_name: str) -> None:
     """校验 vNext readable answer anchor tuple。
 
     :param value: 待校验 tuple。
@@ -2471,9 +2795,7 @@ def _require_readable_answer_anchor_item_tuple(
             raise TypeError(f"{field_name} items must be ReadableAnswerAnchorItemVNext")
 
 
-def _require_readable_forward_intent_tuple(
-    value: tuple[ReadableForwardIntentVNext, ...], *, field_name: str
-) -> None:
+def _require_readable_forward_intent_tuple(value: tuple[ReadableForwardIntentVNext, ...], *, field_name: str) -> None:
     """校验 vNext readable forward intent tuple。
 
     :param value: 待校验 tuple。
@@ -2555,29 +2877,7 @@ def _require_answer_readable_tuple(value: tuple[AnswerReadableItemVNext, ...], *
             raise TypeError(f"{field_name} items must be AnswerReadableItemVNext")
 
 
-def _require_answer_anchor_child_tuple(
-    value: tuple[AnswerAnchorChildVNext, ...], *, field_name: str, require_non_empty: bool
-) -> None:
-    """校验 vNext answer anchor child tuple。
-
-    :param value: 待校验 tuple。
-    :param field_name: 错误字段名。
-    :param require_non_empty: 是否要求非空。
-    :returns: ``None``。
-    :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 要求非空但为空时抛出。
-    """
-
-    if not isinstance(value, tuple):
-        raise TypeError(f"{field_name} must be tuple")
-    if require_non_empty and len(value) == 0:
-        raise ValueError(f"{field_name} must be non-empty")
-    for item in value:
-        if not isinstance(item, AnswerAnchorChildVNext):
-            raise TypeError(f"{field_name} items must be AnswerAnchorChildVNext")
-
-
-def _require_fact_candidate_vnext_tuple(value: tuple[EvidenceBackedFactCandidateVNext, ...]) -> None:
+def _require_fact_candidate_vnext_tuple(value: tuple[CompactEvidenceFactV2, ...]) -> None:
     """校验 vNext fact candidate tuple。
 
     :param value: 待校验 tuple。
@@ -2586,13 +2886,13 @@ def _require_fact_candidate_vnext_tuple(value: tuple[EvidenceBackedFactCandidate
     """
 
     if not isinstance(value, tuple):
-        raise TypeError("ConversationCompactOutputVNext.evidence_backed_facts must be tuple")
+        raise TypeError("CompactCandidateV2.evidence_facts must be tuple")
     for item in value:
-        if not isinstance(item, EvidenceBackedFactCandidateVNext):
-            raise TypeError("ConversationCompactOutputVNext.evidence_backed_facts items are invalid")
+        if not isinstance(item, CompactEvidenceFactV2):
+            raise TypeError("CompactCandidateV2.evidence_facts items are invalid")
 
 
-def _require_answer_anchor_candidate_tuple(value: tuple[AnswerAnchorCandidateVNext, ...]) -> None:
+def _require_answer_anchor_candidate_tuple(value: tuple[CompactAnswerAnchorV2, ...]) -> None:
     """校验 vNext answer anchor candidate tuple。
 
     :param value: 待校验 tuple。
@@ -2601,13 +2901,13 @@ def _require_answer_anchor_candidate_tuple(value: tuple[AnswerAnchorCandidateVNe
     """
 
     if not isinstance(value, tuple):
-        raise TypeError("ConversationCompactOutputVNext.answer_anchors must be tuple")
+        raise TypeError("CompactCandidateV2.answer_anchors must be tuple")
     for item in value:
-        if not isinstance(item, AnswerAnchorCandidateVNext):
-            raise TypeError("ConversationCompactOutputVNext.answer_anchors items are invalid")
+        if not isinstance(item, CompactAnswerAnchorV2):
+            raise TypeError("CompactCandidateV2.answer_anchors items are invalid")
 
 
-def _require_forward_intent_candidate_tuple(value: tuple[ForwardIntentCandidateVNext, ...]) -> None:
+def _require_forward_intent_candidate_tuple(value: tuple[CompactForwardIntentV2, ...]) -> None:
     """校验 vNext forward intent candidate tuple。
 
     :param value: 待校验 tuple。
@@ -2616,13 +2916,13 @@ def _require_forward_intent_candidate_tuple(value: tuple[ForwardIntentCandidateV
     """
 
     if not isinstance(value, tuple):
-        raise TypeError("ConversationCompactOutputVNext.forward_intents must be tuple")
+        raise TypeError("CompactCandidateV2.forward_intents must be tuple")
     for item in value:
-        if not isinstance(item, ForwardIntentCandidateVNext):
-            raise TypeError("ConversationCompactOutputVNext.forward_intents items are invalid")
+        if not isinstance(item, CompactForwardIntentV2):
+            raise TypeError("CompactCandidateV2.forward_intents items are invalid")
 
 
-def _require_reference_candidate_tuple(value: tuple[ReferenceContinuityCandidateVNext, ...]) -> None:
+def _require_reference_candidate_tuple(value: tuple[CompactReferenceContinuityV2, ...]) -> None:
     """校验 vNext reference continuity candidate tuple。
 
     :param value: 待校验 tuple。
@@ -2631,13 +2931,13 @@ def _require_reference_candidate_tuple(value: tuple[ReferenceContinuityCandidate
     """
 
     if not isinstance(value, tuple):
-        raise TypeError("ConversationCompactOutputVNext.reference_continuity_items must be tuple")
+        raise TypeError("CompactCandidateV2.reference_continuity must be tuple")
     for item in value:
-        if not isinstance(item, ReferenceContinuityCandidateVNext):
-            raise TypeError("ConversationCompactOutputVNext.reference_continuity_items items are invalid")
+        if not isinstance(item, CompactReferenceContinuityV2):
+            raise TypeError("CompactCandidateV2.reference_continuity items are invalid")
 
 
-def _require_diagnostic_vnext_tuple(value: tuple[CompactCandidateDiagnosticVNext, ...]) -> None:
+def _require_diagnostic_vnext_tuple(value: tuple[CompactCandidateDiagnosticV2, ...]) -> None:
     """校验 vNext diagnostic tuple。
 
     :param value: 待校验 tuple。
@@ -2646,10 +2946,10 @@ def _require_diagnostic_vnext_tuple(value: tuple[CompactCandidateDiagnosticVNext
     """
 
     if not isinstance(value, tuple):
-        raise TypeError("ConversationCompactOutputVNext.diagnostics must be tuple")
+        raise TypeError("CompactCandidateV2.diagnostics must be tuple")
     for item in value:
-        if not isinstance(item, CompactCandidateDiagnosticVNext):
-            raise TypeError("ConversationCompactOutputVNext.diagnostics items are invalid")
+        if not isinstance(item, CompactCandidateDiagnosticV2):
+            raise TypeError("CompactCandidateV2.diagnostics items are invalid")
 
 
 def _require_bool(value: bool, *, field_name: str) -> None:
@@ -2894,20 +3194,7 @@ def _answer_readable_list_json(values: tuple[AnswerReadableItemVNext, ...]) -> l
     return result
 
 
-def _answer_anchor_child_list_json(values: tuple[AnswerAnchorChildVNext, ...]) -> list[JsonValue]:
-    """把 vNext answer anchor child tuple 转换为 JSON 数组。
-
-    :param values: answer anchor child tuple。
-    :returns: JSON 数组。
-    """
-
-    result: list[JsonValue] = []
-    for value in values:
-        result.append(value.to_json())
-    return result
-
-
-def _fact_candidate_vnext_list_json(values: tuple[EvidenceBackedFactCandidateVNext, ...]) -> list[JsonValue]:
+def _fact_candidate_vnext_list_json(values: tuple[CompactEvidenceFactV2, ...]) -> list[JsonValue]:
     """把 vNext fact candidate tuple 转换为 JSON 数组。
 
     :param values: fact candidate tuple。
@@ -2920,7 +3207,7 @@ def _fact_candidate_vnext_list_json(values: tuple[EvidenceBackedFactCandidateVNe
     return result
 
 
-def _answer_anchor_candidate_list_json(values: tuple[AnswerAnchorCandidateVNext, ...]) -> list[JsonValue]:
+def _answer_anchor_candidate_list_json(values: tuple[CompactAnswerAnchorV2, ...]) -> list[JsonValue]:
     """把 vNext answer anchor candidate tuple 转换为 JSON 数组。
 
     :param values: answer anchor candidate tuple。
@@ -2933,7 +3220,7 @@ def _answer_anchor_candidate_list_json(values: tuple[AnswerAnchorCandidateVNext,
     return result
 
 
-def _forward_intent_candidate_list_json(values: tuple[ForwardIntentCandidateVNext, ...]) -> list[JsonValue]:
+def _forward_intent_candidate_list_json(values: tuple[CompactForwardIntentV2, ...]) -> list[JsonValue]:
     """把 vNext forward intent candidate tuple 转换为 JSON 数组。
 
     :param values: forward intent candidate tuple。
@@ -2946,7 +3233,7 @@ def _forward_intent_candidate_list_json(values: tuple[ForwardIntentCandidateVNex
     return result
 
 
-def _reference_candidate_list_json(values: tuple[ReferenceContinuityCandidateVNext, ...]) -> list[JsonValue]:
+def _reference_candidate_list_json(values: tuple[CompactReferenceContinuityV2, ...]) -> list[JsonValue]:
     """把 vNext reference candidate tuple 转换为 JSON 数组。
 
     :param values: reference candidate tuple。
@@ -2959,7 +3246,7 @@ def _reference_candidate_list_json(values: tuple[ReferenceContinuityCandidateVNe
     return result
 
 
-def _diagnostic_vnext_list_json(values: tuple[CompactCandidateDiagnosticVNext, ...]) -> list[JsonValue]:
+def _diagnostic_vnext_list_json(values: tuple[CompactCandidateDiagnosticV2, ...]) -> list[JsonValue]:
     """把 vNext diagnostic tuple 转换为 JSON 数组。
 
     :param values: diagnostic tuple。
@@ -2991,46 +3278,51 @@ def _budget_estimate_json(estimate: BudgetEstimate) -> JsonValue:
 
 
 __all__ = [
-    "AnswerAnchorCandidateVNext",
-    "AnswerAnchorChildVNext",
+    "CompactAnswerAnchorV2",
     "AnswerReadableItemVNext",
-    "CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY",
-    "CONVERSATION_COMPACT_ANSWER_SOURCE_SECTIONS_VNEXT",
-    "CONVERSATION_COMPACT_DIAGNOSTIC_SOURCE_SECTIONS_VNEXT",
-    "CONVERSATION_COMPACT_FACT_SOURCE_SECTIONS_VNEXT",
-    "CONVERSATION_COMPACT_FORWARD_SOURCE_SECTIONS_VNEXT",
-    "CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT",
-    "CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT",
-    "CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT",
-    "CONVERSATION_COMPACT_REFERENCE_SOURCE_SECTIONS_VNEXT",
-    "CONVERSATION_COMPACT_SUMMARY_SOURCE_SECTIONS_VNEXT",
-    "CompactCandidateDiagnosticVNext",
+    "COMPACT_ANSWER_SOURCE_KINDS_V2",
+    "COMPACT_FACT_CONTEXT_SOURCE_KINDS_V2",
+    "COMPACT_FACT_SOURCE_KINDS_V2",
+    "COMPACT_FORWARD_SOURCE_KINDS_V2",
+    "COMPACT_INPUT_SCHEMA_V2",
+    "COMPACT_OUTPUT_SCHEMA_V2",
+    "COMPACT_REFERENCE_SOURCE_KINDS_V2",
+    "COMPACT_REPAIR_REQUIRED_ACTION",
+    "CompactCandidateDiagnosticV2",
+    "CompactAcceptedTruthV2",
+    "CompactDropReasonV2",
     "CompactEvidenceBlock",
-    "CompactInstructionVNext",
+    "CompactExplicitDropV2",
+    "CompactExplicitlyDroppedCoverageV2",
     "CompactInputRange",
     "CompactMaterialBlock",
     "CompactMaterialBlockKind",
     "CompactMaterialPack",
     "CompactMaterialSection",
-    "CompactQualityCheckResultVNext",
-    "CompactQualityIssueVNext",
-    "CompactReadableViewVNext",
+    "CompactValidationReportV2",
+    "CompactValidationIssueV2",
+    "CompactValidationIssueCodeV2",
+    "PreviousCompactReadableView",
     "CompactSegmentSelection",
     "CompactSegmentTrigger",
     "CompactionRequest",
     "CompactorProposal",
     "CompactorProposalError",
-    "ConversationCompactInputVNext",
-    "ConversationCompactLabelSectionVNext",
-    "ConversationCompactOutputVNext",
+    "CompactInputV2",
+    "CompactSourceKindV2",
+    "CompactSourceBoundaryEntryV2",
+    "CompactSemanticSectionV2",
+    "CompactRepresentedCoverageV2",
+    "CompactRepresentedSourceV2",
+    "CompactRepairFeedbackV2",
+    "CompactCandidateV2",
     "ContextCompactor",
     "CurrentInputAnchor",
-    "CurrentInputAnchorVNext",
-    "EvidenceBackedFactCandidateVNext",
+    "CompactCurrentInputV2",
+    "CompactEvidenceFactV2",
     "EvidenceReadableItemVNext",
-    "ForwardIntentCandidateVNext",
-    "ForwardIntentStatusVNext",
-    "ForwardIntentTypeVNext",
+    "CompactForwardIntentV2",
+    "CompactForwardIntentStatusV2",
     "PromptLocalEvidenceMap",
     "PromptLocalMaterialLabel",
     "PromptLocalProvenanceEntry",
@@ -3039,12 +3331,13 @@ __all__ = [
     "ReadableFactItemVNext",
     "ReadableForwardIntentVNext",
     "ReadableReferenceContinuityItemVNext",
-    "ReferenceContinuityCandidateVNext",
-    "ReferenceContinuityReasonVNext",
-    "SessionSummaryCandidateVNext",
+    "CompactReferenceContinuityV2",
+    "CompactSessionSummaryV2",
     "TraceReadableItemVNext",
     "TraceReadableKindVNext",
-    "conversation_compact_label_looks_stale_vnext",
+    "MAX_COMPACT_REPAIR_FEEDBACK_CHARS",
+    "MAX_COMPACT_REPAIR_ISSUES",
+    "MAX_COMPACT_REPAIR_ISSUE_MESSAGE_CHARS",
     "previous_answer_anchor_block_text",
     "validate_previous_compacted_view_pair",
 ]
