@@ -73,7 +73,16 @@ from dayu.cli.session_terminal_cursor import (
 )
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.contracts import JsonValue
-from dayu.host.api import CancelMode, FollowupBehavior, Host
+from dayu.host.api import (
+    CancelMode,
+    FollowupBehavior,
+    Host,
+    HostApiError,
+    HostSessionAccessMode,
+    HostSessionAttachment,
+    HostSessionMutationErrorDetail,
+    HostSessionMutationRejectionReason,
+)
 from dayu.service.entrypoint_runtime import (
     DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS,
     DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
@@ -102,9 +111,14 @@ _INTERACTIVE_OPERATION_SUBMIT_FOLLOWUP: Final[str] = "submit_followup"
 _INTERACTIVE_OPERATION_CANCEL_RUN: Final[str] = "cancel_run"
 _INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
 _INTERACTIVE_QUEUED_DRAFT_MESSAGE: Final[str] = "Interactive: one follow-up is already queued; draft kept."
+_INTERACTIVE_READ_ONLY_MESSAGE: Final[str] = (
+    "Interactive: session is read-only; draft kept. Submit again to retry with a fresh attachment."
+)
 _INTERACTIVE_INVALID_UTF8_MESSAGE: Final[str] = "interactive stdin is not valid UTF-8"
 _UsageErrorFactory = Callable[[str], ValueError]
 _CancelRunAndWait = Callable[[str, str], Awaitable[EntrypointRunTerminalResult]]
+_OpenFreshSessionAttachment = Callable[[], Awaitable[HostSessionAttachment]]
+_CloseSessionAttachment = Callable[[HostSessionAttachment], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +383,118 @@ class _InteractiveExitIntent(StrEnum):
 
 
 @dataclass(slots=True)
+class _InteractiveSessionAttachmentController:
+    """编排 interactive invocation 的不可变 attachment 生命周期。
+
+    Host attachment registry 仍是 access mode 的唯一 owner；本 controller 只在
+    typed READ_ONLY 拒绝后登记下一次 mutation 需要 refresh，并保证旧 attachment
+    完整关闭后才调用 fresh attach。它不修改或推断 attachment mode。
+
+    :param current: 当前 invocation 唯一 live attachment。
+    :param open_fresh: 创建 fresh attachment 的 typed callback。
+    :param close_current: 关闭指定 attachment 的 typed callback。
+    :param refresh_required: 下一次 mutation 前是否必须 refresh。
+    """
+
+    current: HostSessionAttachment | None
+    open_fresh: _OpenFreshSessionAttachment
+    close_current: _CloseSessionAttachment
+    refresh_required: bool = False
+    _closed: bool = False
+
+    def require_refresh(self) -> None:
+        """登记下一次 mutation 必须关闭旧 attachment 并 fresh attach。
+
+        :returns: ``None``。
+        :raises RuntimeError: controller 已关闭时抛出。
+        """
+
+        if self._closed:
+            raise RuntimeError("interactive attachment controller is closed")
+        self.refresh_required = True
+
+    async def attachment_for_mutation(self) -> HostSessionAttachment:
+        """返回 mutation 使用的 attachment，必要时按 close-before-open refresh。
+
+        refresh 会在等待旧 attachment 关闭前移除本地引用。关闭或 fresh attach
+        失败时保持 refresh 标记，后续只允许由下一次显式 mutation 再次 fresh attach。
+
+        :returns: 当前或新建的唯一 live attachment。
+        :raises RuntimeError: controller 已关闭或 current 缺失时抛出。
+        :raises asyncio.CancelledError: caller 在 close/open 期间被取消时透传。
+        :raises Exception: attachment close 或 fresh attach 失败时向上透传。
+        """
+
+        if self._closed:
+            raise RuntimeError("interactive attachment controller is closed")
+        if not self.refresh_required:
+            if self.current is None:
+                raise RuntimeError("interactive current attachment is missing")
+            return self.current
+
+        # close 一旦开始，旧对象就不再是 controller 可安全复用或重试的 current。
+        previous = self.current
+        self.current = None
+        if previous is not None:
+            await asyncio.shield(self.close_current(previous))
+        fresh = await self.open_fresh()
+        self.current = fresh
+        self.refresh_required = False
+        return fresh
+
+    async def close(self) -> None:
+        """幂等关闭 controller 当前仍存活的 attachment。
+
+        terminal 状态与 current 引用在等待底层关闭前提交；即使底层关闭失败，
+        后续调用也不会再次关闭同一 attachment。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: caller 取消等待时透传；底层 close 继续。
+        :raises Exception: attachment close 失败时向上透传。
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+        current = self.current
+        self.current = None
+        if current is not None:
+            await asyncio.shield(self.close_current(current))
+
+
+@dataclass(frozen=True, slots=True)
+class _InteractivePendingMutation:
+    """冻结尚未跨越 Host acceptance barrier 的用户 mutation identity。
+
+    exact cursor 仍由 ``InteractiveComposer`` 唯一保存；其 public SUBMIT event 只
+    投影原始 draft 与 input revision，因此 coordinator 不复制或反推 cursor。
+
+    :param normalized_prompt: outer-trim 后提交给 Host 的 prompt。
+    :param draft: composer 投影的 exact 原始草稿。
+    :param draft_revision: composer 投影的用户编辑版本。
+    :param turn_index: invocation 内稳定 turn identity。
+    :param client_request_id: 同语义重试复用的稳定 Host idempotency identity。
+    """
+
+    normalized_prompt: str
+    draft: str
+    draft_revision: int
+    turn_index: int
+    client_request_id: str
+
+    def same_semantic_submission(self, *, draft: str, draft_revision: int) -> bool:
+        """判断新 SUBMIT 是否仍是同一份未接受用户语义。
+
+        :param draft: 新 SUBMIT 的 exact 原始草稿。
+        :param draft_revision: 新 SUBMIT 的用户编辑版本。
+        :returns: draft 与 revision 都未变化时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.draft == draft and self.draft_revision == draft_revision
+
+
+@dataclass(slots=True)
 class _InteractiveActiveTurn:
     """当前 interactive turn 的 submit、acceptance 与 cancel 状态。
 
@@ -617,7 +743,11 @@ async def execute_interactive_on_session(
     )
     primary_error: BaseException | None = None
     exit_code = EXIT_SUCCESS
-    attachment = await host.attach_session(session_id)
+    attachment_controller = _InteractiveSessionAttachmentController(
+        current=await host.attach_session(session_id),
+        open_fresh=partial(host.attach_session, session_id),
+        close_current=_close_interactive_session_attachment,
+    )
     try:
         if runtime_display is not None:
             await runtime_display.install_runtime_line_guard()
@@ -646,6 +776,7 @@ async def execute_interactive_on_session(
                     run_view=effective_run_view if detail else None,
                     thinking_renderer=effective_thinking_renderer,
                     runtime_display=runtime_display,
+                    attachment_controller=attachment_controller,
                 )
             else:
                 if effective_binary_stdin is None:
@@ -679,6 +810,7 @@ async def execute_interactive_on_session(
                 run_view=effective_run_view if detail else None,
                 thinking_renderer=effective_thinking_renderer,
                 runtime_display=runtime_display,
+                attachment_controller=attachment_controller,
             )
         else:
             if effective_binary_stdin is None:
@@ -711,7 +843,7 @@ async def execute_interactive_on_session(
             display_error,
         )
     try:
-        await asyncio.shield(attachment.aclose())
+        await asyncio.shield(attachment_controller.close())
     except BaseException as error:
         cleanup_error = _combine_lifecycle_cleanup_errors(
             cleanup_error,
@@ -1118,9 +1250,7 @@ async def _submit_prompt_turn_handling_sigint(
         key_task = asyncio.create_task(monitor.wait_next())
         while True:
             wait_tasks: set[
-                asyncio.Task[EntrypointRunTerminalResult]
-                | asyncio.Task[int]
-                | asyncio.Task[RunningKeyAction]
+                asyncio.Task[EntrypointRunTerminalResult] | asyncio.Task[int] | asyncio.Task[RunningKeyAction]
             ] = {submit_task, sigint_task, key_task}
             cancel_task = closeout.cancel_task
             if cancel_task is not None and not cancel_task.done():
@@ -1163,9 +1293,7 @@ async def _submit_prompt_turn_handling_sigint(
                             await runtime_display.render_cancel_requested()
                     elif exit_after and runtime_display is not None:
                         await runtime_display.render_local_exit_after_cancel()
-                sigint_task = asyncio.create_task(
-                    sigint_monitor.wait_next(observed_sigint_count)
-                )
+                sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
             if submit_task in done:
                 closeout.observe_terminal(await submit_task)
                 terminal_result = await closeout.wait_closeout()
@@ -1334,6 +1462,10 @@ async def _run_interactive_non_tty_batch(
         invocation=invocation,
         session_id=session_id,
         turn_index=1,
+        client_request_id=interactive_submit_client_request_id(
+            invocation,
+            turn_index=1,
+        ),
         generation=1,
         user_prompt=user_prompt,
         run_overrides=run_overrides,
@@ -1448,6 +1580,72 @@ async def _wait_interactive_batch_terminal_handling_sigint(
                 await cancel_and_await_task(cancel_task)
 
 
+async def _close_interactive_session_attachment(
+    attachment: HostSessionAttachment,
+) -> None:
+    """关闭一个 interactive Session attachment。
+
+    本 helper 只把 public resource method 适配为 controller 的窄 typed callback，
+    不改写 attachment mode，也不增加兼容分支。
+
+    :param attachment: 待关闭的 public Host attachment。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: caller 取消等待时透传。
+    :raises Exception: attachment close 失败时向上透传。
+    """
+
+    await attachment.aclose()
+
+
+def _new_interactive_pending_mutation(
+    *,
+    invocation: CliInvocation,
+    draft: str,
+    draft_revision: int,
+    turn_index: int,
+) -> _InteractivePendingMutation:
+    """从一次新用户语义提交创建稳定 pending mutation identity。
+
+    :param invocation: 当前 CLI invocation identity。
+    :param draft: composer 投影的 exact 原始草稿。
+    :param draft_revision: composer 投影的用户编辑版本。
+    :param turn_index: 新 mutation 的 invocation 内 turn index。
+    :returns: 冻结 prompt、draft、revision 与 request id 的 pending mutation。
+    :raises ValueError: 规范化 prompt 为空时抛出。
+    """
+
+    normalized_prompt = draft.strip()
+    if normalized_prompt == "":
+        raise ValueError("interactive pending mutation prompt must not be empty")
+    return _InteractivePendingMutation(
+        normalized_prompt=normalized_prompt,
+        draft=draft,
+        draft_revision=draft_revision,
+        turn_index=turn_index,
+        client_request_id=interactive_submit_client_request_id(
+            invocation,
+            turn_index=turn_index,
+        ),
+    )
+
+
+def _is_read_only_mutation_rejection(error: HostApiError) -> bool:
+    """按 Host typed detail 判定精确 READ_ONLY mutation rejection。
+
+    :param error: Host public API 结构化错误。
+    :returns: detail 的 kind、reason 与 actual_mode 都匹配时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    detail = error.detail
+    return (
+        isinstance(detail, HostSessionMutationErrorDetail)
+        and detail.kind == "session_mutation_access"
+        and detail.reason is HostSessionMutationRejectionReason.READ_ONLY
+        and detail.actual_mode is HostSessionAccessMode.READ_ONLY
+    )
+
+
 async def _drive_interactive_tty_repl(
     *,
     host: Host,
@@ -1458,6 +1656,7 @@ async def _drive_interactive_tty_repl(
     run_overrides: ServiceRunOverrides,
     composer: InteractiveComposer,
     sigint_monitor: CliSigintMonitor,
+    attachment_controller: _InteractiveSessionAttachmentController,
     run_view: InteractiveRunView | None = None,
     thinking_renderer: CliThinkingRenderer | None = None,
     runtime_display: RuntimeDisplayController | None = None,
@@ -1472,6 +1671,7 @@ async def _drive_interactive_tty_repl(
     :param run_overrides: 所有 turn 复用的执行 override。
     :param composer: invocation 唯一 prompt_toolkit stdin owner。
     :param sigint_monitor: invocation 唯一 OS SIGINT monitor。
+    :param attachment_controller: invocation 唯一 attachment 生命周期 controller。
     :param run_view: 可选 interactive run view。
     :param thinking_renderer: 可选 thinking renderer。
     :param runtime_display: 可选串行 display controller。
@@ -1483,6 +1683,9 @@ async def _drive_interactive_tty_repl(
     next_turn_index = 1
     current: _InteractiveActiveTurn | None = None
     queued: _InteractiveQueuedFollowup | None = None
+    current_acceptance_task: asyncio.Task[str] | None = None
+    queued_acceptance_task: asyncio.Task[str] | None = None
+    pending_mutation: _InteractivePendingMutation | None = None
     exit_intent = _InteractiveExitIntent.CONTINUE
     exit_after_closeout = False
     active_sigint_count = 0
@@ -1509,6 +1712,10 @@ async def _drive_interactive_tty_repl(
                 cancel_task = current.closeout.cancel_task
                 if cancel_task is not None and not cancel_task.done():
                     wait_tasks.add(cancel_task)
+            if current_acceptance_task is not None:
+                wait_tasks.add(current_acceptance_task)
+            if queued_acceptance_task is not None:
+                wait_tasks.add(queued_acceptance_task)
             if not wait_tasks:
                 raise RuntimeError("interactive TTY driver has no waitable owner")
             done, _pending = await asyncio.wait(
@@ -1535,39 +1742,63 @@ async def _drive_interactive_tty_repl(
                             raise RuntimeError("interactive submit event draft is missing")
                         user_prompt = draft.strip()
                         if user_prompt == "":
+                            pending_mutation = None
                             composer.accept_submit(record_history=False)
                         elif current is None:
+                            if pending_mutation is None or not pending_mutation.same_semantic_submission(
+                                draft=draft,
+                                draft_revision=event.input_revision,
+                            ):
+                                pending_mutation = _new_interactive_pending_mutation(
+                                    invocation=invocation,
+                                    draft=draft,
+                                    draft_revision=event.input_revision,
+                                    turn_index=next_turn_index,
+                                )
+                                next_turn_index += 1
+                            await attachment_controller.attachment_for_mutation()
                             current = _start_interactive_turn(
                                 host=host,
                                 runtime=runtime,
                                 invocation=invocation,
                                 session_id=session_id,
-                                turn_index=next_turn_index,
+                                turn_index=pending_mutation.turn_index,
+                                client_request_id=pending_mutation.client_request_id,
                                 generation=generation,
-                                user_prompt=user_prompt,
+                                user_prompt=pending_mutation.normalized_prompt,
                                 run_overrides=run_overrides,
                                 run_view=run_view,
                                 thinking_renderer=thinking_renderer,
                                 runtime_display=runtime_display,
                             )
-                            next_turn_index += 1
-                            composer.accept_submit(record_history=True)
-                            composer.set_phase(InteractiveComposerPhase.RUNNING)
+                            current_acceptance_task = asyncio.create_task(current.closeout.barrier.wait_run_id())
                         elif queued is None:
+                            if pending_mutation is None or not pending_mutation.same_semantic_submission(
+                                draft=draft,
+                                draft_revision=event.input_revision,
+                            ):
+                                pending_mutation = _new_interactive_pending_mutation(
+                                    invocation=invocation,
+                                    draft=draft,
+                                    draft_revision=event.input_revision,
+                                    turn_index=next_turn_index,
+                                )
+                                next_turn_index += 1
+                            await attachment_controller.attachment_for_mutation()
                             queued = _start_interactive_queued_followup(
                                 host=host,
                                 runtime=runtime,
                                 invocation=invocation,
                                 session_id=session_id,
-                                turn_index=next_turn_index,
-                                user_prompt=user_prompt,
+                                turn_index=pending_mutation.turn_index,
+                                client_request_id=pending_mutation.client_request_id,
+                                user_prompt=pending_mutation.normalized_prompt,
                                 run_overrides=run_overrides,
                                 run_view=run_view,
                                 thinking_renderer=thinking_renderer,
                                 runtime_display=runtime_display,
                             )
-                            next_turn_index += 1
-                            composer.accept_submit(record_history=True)
+                            queued_acceptance_task = asyncio.create_task(queued.closeout.barrier.wait_run_id())
                         else:
                             print(_INTERACTIVE_QUEUED_DRAFT_MESSAGE, file=sys.stderr)
                     elif event.kind is InteractiveComposerEventKind.RUNNING_KEY_ACTION:
@@ -1593,6 +1824,23 @@ async def _drive_interactive_tty_repl(
                         if current is None:
                             normal_completion = True
                             return EXIT_SUCCESS
+
+            if current_acceptance_task is not None and (
+                current_acceptance_task in done or (current is not None and current.closeout.barrier.accepted.is_set())
+            ):
+                await current_acceptance_task
+                current_acceptance_task = None
+                pending_mutation = None
+                composer.accept_submit(record_history=True)
+                composer.set_phase(InteractiveComposerPhase.RUNNING)
+
+            if queued_acceptance_task is not None and (
+                queued_acceptance_task in done or (queued is not None and queued.closeout.barrier.accepted.is_set())
+            ):
+                await queued_acceptance_task
+                queued_acceptance_task = None
+                pending_mutation = None
+                composer.accept_submit(record_history=True)
 
             if sigint_task is not None and sigint_task in done:
                 new_sigint_count = await sigint_task
@@ -1629,12 +1877,42 @@ async def _drive_interactive_tty_repl(
 
             current_cancel_task = None if current is None else current.closeout.cancel_task
             if current is not None and (
-                current.submit_task in done
-                or (current_cancel_task is not None and current_cancel_task in done)
+                current.submit_task in done or (current_cancel_task is not None and current_cancel_task in done)
             ):
                 completed = current
                 if completed.submit_task in done:
-                    completed.closeout.observe_terminal(await completed.submit_task)
+                    try:
+                        completed_terminal = await completed.submit_task
+                    except HostApiError as error:
+                        if (
+                            completed.closeout.barrier.accepted_run_id is not None
+                            or not _is_read_only_mutation_rejection(error)
+                        ):
+                            raise
+                        if current_acceptance_task is not None:
+                            await cancel_and_await_task(current_acceptance_task)
+                            current_acceptance_task = None
+                        cancel_task = completed.closeout.cancel_task
+                        if cancel_task is not None:
+                            await cancel_and_await_task(cancel_task)
+                        attachment_controller.require_refresh()
+                        print(_INTERACTIVE_READ_ONLY_MESSAGE, file=sys.stderr)
+                        current = None
+                        active_sigint_count = 0
+                        composer.set_phase(InteractiveComposerPhase.IDLE)
+                    else:
+                        completed.closeout.observe_terminal(completed_terminal)
+                if current is None:
+                    if composer_task is None and not exit_after_closeout:
+                        composer_task = asyncio.create_task(
+                            _read_interactive_composer_event(
+                                composer=composer,
+                                generation=generation,
+                            )
+                        )
+                    if sigint_task is None:
+                        sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+                    continue
                 terminal = await completed.closeout.wait_closeout()
                 terminal_exit_code = await _finish_interactive_terminal(
                     terminal=terminal,
@@ -1658,19 +1936,20 @@ async def _drive_interactive_tty_repl(
                         generation=generation,
                     )
                     queued = None
+                    current_acceptance_task = queued_acceptance_task
+                    queued_acceptance_task = None
                     composer.set_phase(InteractiveComposerPhase.RUNNING)
                 else:
                     composer.set_phase(InteractiveComposerPhase.IDLE)
 
-            if current is None and (
-                deferred_exit_code is not None or exit_after_closeout
-            ):
+            if current is None and (deferred_exit_code is not None or exit_after_closeout):
                 normal_completion = True
                 if deferred_exit_code is not None:
                     return deferred_exit_code
                 return EXIT_KEYBOARD_INTERRUPT
 
-            accepting_input = deferred_exit_code is None and not exit_after_closeout
+            mutation_waiting_acceptance = current_acceptance_task is not None or queued_acceptance_task is not None
+            accepting_input = deferred_exit_code is None and not exit_after_closeout and not mutation_waiting_acceptance
             if composer_task is None and accepting_input:
                 composer_task = asyncio.create_task(
                     _read_interactive_composer_event(
@@ -1679,14 +1958,16 @@ async def _drive_interactive_tty_repl(
                     )
                 )
             if sigint_task is None:
-                sigint_task = asyncio.create_task(
-                    sigint_monitor.wait_next(observed_sigint_count)
-                )
+                sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
     finally:
         if composer_task is not None:
             await cancel_and_await_task(composer_task)
         if sigint_task is not None:
             await cancel_and_await_task(sigint_task)
+        if current_acceptance_task is not None:
+            await cancel_and_await_task(current_acceptance_task)
+        if queued_acceptance_task is not None:
+            await cancel_and_await_task(queued_acceptance_task)
         if not normal_completion:
             if current is not None:
                 cancel_task = current.closeout.cancel_task
@@ -1726,6 +2007,7 @@ def _start_interactive_turn(
     invocation: CliInvocation,
     session_id: str,
     turn_index: int,
+    client_request_id: str,
     generation: int,
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
@@ -1740,6 +2022,7 @@ def _start_interactive_turn(
     :param invocation: 当前 CLI invocation 身份。
     :param session_id: 目标 Session id。
     :param turn_index: 稳定轮次序号。
+    :param client_request_id: pending mutation 冻结的 Host request identity。
     :param generation: current turn generation。
     :param user_prompt: outer-trim 后的用户输入。
     :param run_overrides: 执行 override。
@@ -1767,6 +2050,7 @@ def _start_interactive_turn(
             invocation=invocation,
             session_id=session_id,
             turn_index=turn_index,
+            client_request_id=client_request_id,
             user_prompt=user_prompt,
             run_overrides=run_overrides,
             closeout=closeout,
@@ -1785,6 +2069,7 @@ def _start_interactive_queued_followup(
     invocation: CliInvocation,
     session_id: str,
     turn_index: int,
+    client_request_id: str,
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
     run_view: InteractiveRunView | None,
@@ -1798,6 +2083,7 @@ def _start_interactive_queued_followup(
     :param invocation: 当前 CLI invocation 身份。
     :param session_id: 目标 Session id。
     :param turn_index: 稳定轮次序号。
+    :param client_request_id: pending mutation 冻结的 Host request identity。
     :param user_prompt: outer-trim 后的用户输入。
     :param run_overrides: 执行 override。
     :param run_view: 可选 run view。
@@ -1823,6 +2109,7 @@ def _start_interactive_queued_followup(
             invocation=invocation,
             session_id=session_id,
             turn_index=turn_index,
+            client_request_id=client_request_id,
             user_prompt=user_prompt,
             run_overrides=run_overrides,
             closeout=closeout,
@@ -1841,6 +2128,7 @@ def _create_interactive_submit_task(
     invocation: CliInvocation,
     session_id: str,
     turn_index: int,
+    client_request_id: str,
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
     closeout: _ActiveTurnCloseout,
@@ -1855,6 +2143,7 @@ def _create_interactive_submit_task(
     :param invocation: 当前 CLI invocation 身份。
     :param session_id: 目标 Session id。
     :param turn_index: 稳定轮次序号。
+    :param client_request_id: pending mutation 冻结的 Host request identity。
     :param user_prompt: outer-trim 后的用户输入。
     :param run_overrides: 执行 override。
     :param closeout: 本 turn 唯一 acceptance/cancel/terminal coordinator。
@@ -1874,10 +2163,7 @@ def _create_interactive_submit_task(
                     operation=_INTERACTIVE_OPERATION_SUBMIT_FOLLOWUP,
                 ),
                 session_id=session_id,
-                client_request_id=interactive_submit_client_request_id(
-                    invocation,
-                    turn_index=turn_index,
-                ),
+                client_request_id=client_request_id,
                 user_prompt=user_prompt,
                 tool_names=runtime.scene_inputs.tool_selection.tool_names,
                 behavior=FollowupBehavior.QUEUE,
@@ -1941,11 +2227,7 @@ async def _request_interactive_cancel(
         exit_after=exit_after,
     )
     if was_pending:
-        if (
-            exit_after
-            and previous_intent is not _LocalCancelIntent.EXIT_AFTER_CANCEL
-            and runtime_display is not None
-        ):
+        if exit_after and previous_intent is not _LocalCancelIntent.EXIT_AFTER_CANCEL and runtime_display is not None:
             await runtime_display.render_local_exit_after_cancel()
         return
     if composer is not None:

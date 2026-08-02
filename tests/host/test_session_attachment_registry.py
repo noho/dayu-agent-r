@@ -1,9 +1,10 @@
 """Host Session attachment registry 的 owner-contract 测试。
 
-本模块只验证 Slice 1 internal contract：canonical key、唯一 live record、
+本模块主要验证 attachment registry owner contract：canonical key、唯一 live record、
 不可变 mode、RECOVERING / ACTIVE / CLOSING / CLOSED 生命周期、mutation /
 new-work lease、caller cancellation 下的共享 close cleanup，以及 Host close 的
-batch mark / drain / release 顺序；不接入 public Host Protocol 或 scheduler。
+batch mark / drain / release 顺序；另以最小 public 双 opener case 证明相同 label
+命中同一 Session 后，typed READ_ONLY rejection 在 owner boundary 零 durable 写入。
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import sqlite3
 from pathlib import Path
 from typing import Literal, cast
 
@@ -18,6 +20,7 @@ import pytest
 
 import dayu.host as host_package
 import dayu.host.session_attachment as session_attachment_module
+from dayu.host import HostSessionAttachment, open_host
 from dayu.host.api import (
     HostApiError,
     HostApiErrorCode,
@@ -27,13 +30,24 @@ from dayu.host.api import (
     HostSessionAttachmentConflictReason,
     HostSessionMutationErrorDetail,
     HostSessionMutationRejectionReason,
+    HostTerminalStatus,
 )
 from dayu.host.session_attachment import (
     HostSessionAttachmentRegistry,
     SessionNewWorkAccessPort,
     SessionWorkLease,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG, TABLE_HOST_RUNS
 from dayu.runtime.native_mutex import StrictNativeMutexUnavailableError
+from tests.host.public_smoke_support import (
+    FinalAnswerWorkerFactory,
+    close_attachment_shielded,
+    deterministic_runner_spec,
+    ensure_request,
+    followup_request,
+    open_host_options,
+    wait_for_status,
+)
 
 
 def _create_db(tmp_path: Path, *, name: str = "host.sqlite3") -> Path:
@@ -48,6 +62,26 @@ def _create_db(tmp_path: Path, *, name: str = "host.sqlite3") -> Path:
     db_path = tmp_path / name
     db_path.touch()
     return db_path
+
+
+def _durable_row_count(db_path: Path, *, table_name: str) -> int:
+    """统计 Host durable 指定 canonical table 的 row 数。
+
+    :param db_path: Host SQLite 路径。
+    :param table_name: schema 模块提供的 canonical table 常量。
+    :returns: 当前 row 数。
+    :raises ValueError: table name 不属于本测试允许的 canonical table 时抛出。
+    :raises AssertionError: SQLite 未返回 count row 时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时透传。
+    """
+
+    allowed_tables = {TABLE_EVENT_LOG, TABLE_HOST_RUNS}
+    if table_name not in allowed_tables:
+        raise ValueError("unsupported durable count table")
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def _activate_attachment(
@@ -284,6 +318,118 @@ async def test_different_sessions_are_independent_and_ro_never_upgrades(
     assert fresh.access_mode is HostSessionAccessMode.READ_WRITE
     await fresh.aclose()
     await session_two_owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_same_label_dual_attachment_rejects_read_only_without_durable_run(
+    tmp_path: Path,
+) -> None:
+    """真实双 opener 同 label 的 RO mutation typed 拒绝必须零 Run/EventLog。
+
+    owner 释放后既有 observer mode 仍不可变；只有关闭 observer 并 fresh attach
+    才重新竞争 RW。复用同一 request id 的 fresh RW submit 最终只创建一个 Run。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: label identity、typed rejection、mode 或 durable count 漂移时抛出。
+    :raises Exception: public Host open/attach/submit/close 失败时向上透传。
+    """
+
+    options = open_host_options(
+        tmp_path,
+        runner_spec=deterministic_runner_spec("f04-attachment-model"),
+        worker_factory=FinalAnswerWorkerFactory(),
+        allow_tool_calls=False,
+    )
+    owner_attachment: HostSessionAttachment | None = None
+    observer_attachment: HostSessionAttachment | None = None
+    fresh_attachment: HostSessionAttachment | None = None
+    async with open_host(options) as owner_host, open_host(options) as observer_host:
+        try:
+            owner_session = await owner_host.ensure_session(ensure_request("f04-shared-label"))
+            observer_session = await observer_host.ensure_session(ensure_request("f04-shared-label"))
+            assert observer_session.session_id == owner_session.session_id
+
+            owner_attachment = await owner_host.attach_session(owner_session.session_id)
+            observer_attachment = await observer_host.attach_session(observer_session.session_id)
+            assert owner_attachment.access_mode is HostSessionAccessMode.READ_WRITE
+            assert observer_attachment.access_mode is HostSessionAccessMode.READ_ONLY
+
+            request = followup_request(
+                owner_session.session_id,
+                "f04-stable-request",
+                "same semantic submission",
+            )
+            run_count_before = _durable_row_count(
+                options.db_path,
+                table_name=TABLE_HOST_RUNS,
+            )
+            event_count_before = _durable_row_count(
+                options.db_path,
+                table_name=TABLE_EVENT_LOG,
+            )
+            with pytest.raises(HostApiError) as exc_info:
+                await observer_host.submit_followup(owner_session.session_id, request)
+            _assert_mutation_rejection(
+                exc_info.value,
+                session_id=owner_session.session_id,
+                reason=HostSessionMutationRejectionReason.READ_ONLY,
+                actual_mode=HostSessionAccessMode.READ_ONLY,
+            )
+            assert observer_attachment.access_mode is HostSessionAccessMode.READ_ONLY
+            assert (
+                _durable_row_count(
+                    options.db_path,
+                    table_name=TABLE_HOST_RUNS,
+                )
+                == run_count_before
+            )
+            assert (
+                _durable_row_count(
+                    options.db_path,
+                    table_name=TABLE_EVENT_LOG,
+                )
+                == event_count_before
+            )
+
+            await close_attachment_shielded(owner_attachment)
+            owner_attachment = None
+            assert observer_attachment.access_mode is HostSessionAccessMode.READ_ONLY
+            await close_attachment_shielded(observer_attachment)
+            observer_attachment = None
+
+            fresh_attachment = await observer_host.attach_session(owner_session.session_id)
+            assert fresh_attachment.access_mode is HostSessionAccessMode.READ_WRITE
+            accepted = await observer_host.submit_followup(
+                owner_session.session_id,
+                request,
+            )
+            await wait_for_status(
+                observer_host,
+                accepted.accepted_run_id,
+                HostTerminalStatus.SUCCEEDED,
+            )
+            assert (
+                _durable_row_count(
+                    options.db_path,
+                    table_name=TABLE_HOST_RUNS,
+                )
+                == run_count_before + 1
+            )
+            assert (
+                _durable_row_count(
+                    options.db_path,
+                    table_name=TABLE_EVENT_LOG,
+                )
+                > event_count_before
+            )
+        finally:
+            if fresh_attachment is not None:
+                await close_attachment_shielded(fresh_attachment)
+            if observer_attachment is not None:
+                await close_attachment_shielded(observer_attachment)
+            if owner_attachment is not None:
+                await close_attachment_shielded(owner_attachment)
 
 
 @pytest.mark.asyncio

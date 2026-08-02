@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from types import FrameType, TracebackType
 from typing import TypeAlias, cast
@@ -68,6 +69,8 @@ from dayu.host.api import (
     HostSessionEventIterator,
     HostSessionAccessMode,
     HostSessionAttachment,
+    HostSessionMutationErrorDetail,
+    HostSessionMutationRejectionReason,
     HostStreamCursor,
     HostTerminalStatus,
     HostTransientDelta,
@@ -274,16 +277,28 @@ class _FakeHostEventIterator:
 class _FakeSessionAttachment:
     """CLI interactive fake Host 返回的显式 RW attachment。"""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        access_mode: HostSessionAccessMode = HostSessionAccessMode.READ_WRITE,
+        identity: str | None = None,
+        timeline: list[str] | None = None,
+    ) -> None:
         """初始化测试 attachment。
 
         :param session_id: attachment 绑定的 Session id。
+        :param access_mode: attachment 生命周期内冻结的 mode。
+        :param identity: timeline 中使用的可选 attachment identity。
+        :param timeline: 可选生命周期顺序记录。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         self.session_id = session_id
-        self.access_mode = HostSessionAccessMode.READ_WRITE
+        self.access_mode = access_mode
+        self.identity = identity
+        self.timeline = timeline
         self.close_count = 0
 
     async def aclose(self) -> None:
@@ -294,6 +309,13 @@ class _FakeSessionAttachment:
         """
 
         self.close_count += 1
+        if self.timeline is not None and self.identity is not None:
+            self.timeline.extend(
+                (
+                    f"close-start:{self.identity}",
+                    f"close-complete:{self.identity}",
+                )
+            )
 
 
 class _FakeHost:
@@ -525,6 +547,239 @@ class _FakeHost:
         if self.block_cancel_after_record:
             await asyncio.Event().wait()
         return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
+
+
+def _test_attachment_controller(
+    host: _FakeHost,
+    *,
+    access_mode: HostSessionAccessMode = HostSessionAccessMode.READ_WRITE,
+) -> session_execution._InteractiveSessionAttachmentController:
+    """构造 owner-level TTY driver 使用的 attachment controller。
+
+    :param host: 提供 fresh attach callback 的 fake Host。
+    :param access_mode: 初始 attachment 的冻结访问模式。
+    :returns: 绑定初始 attachment 与 fake Host fresh callback 的 controller。
+    :raises Exception: controller 构造不主动抛出异常。
+    """
+
+    initial = _FakeSessionAttachment("session-1", access_mode=access_mode)
+    return session_execution._InteractiveSessionAttachmentController(
+        current=initial,
+        open_fresh=partial(host.attach_session, "session-1"),
+        close_current=session_execution._close_interactive_session_attachment,
+    )
+
+
+class _AttachmentControllerLifecycleProbe:
+    """观测 attachment controller 关闭、打开与失败时序。"""
+
+    controller: session_execution._InteractiveSessionAttachmentController | None
+    close_error: BaseException | None
+    close_attempts: list[HostSessionAttachment]
+    close_states: list[tuple[HostSessionAttachment | None, bool, bool]]
+    open_errors: list[BaseException]
+    open_attempt_count: int
+    open_states: list[tuple[HostSessionAttachment | None, bool, bool]]
+
+    def __init__(
+        self,
+        *,
+        fresh_attachments: tuple[_FakeSessionAttachment, ...] = (),
+        close_error: BaseException | None = None,
+        open_errors: tuple[BaseException, ...] = (),
+        block_close: bool = False,
+    ) -> None:
+        """初始化可控 lifecycle callbacks。
+
+        :param fresh_attachments: open callback 依次返回的 fresh attachments。
+        :param close_error: close callback 记录尝试后抛出的原始异常。
+        :param open_errors: open callback 各次优先抛出的原始异常。
+        :param block_close: 是否阻塞 close，直到测试显式放行。
+        :returns: ``None``。
+        :raises Exception: 初始化不主动抛出异常。
+        """
+
+        self.controller = None
+        self.close_error = close_error
+        self.close_attempts = []
+        self.close_states = []
+        self.open_errors = list(open_errors)
+        self.open_attempt_count = 0
+        self.open_states = []
+        self._fresh_attachments = list(fresh_attachments)
+        self.close_started = asyncio.Event()
+        self._close_release = asyncio.Event()
+        if not block_close:
+            self._close_release.set()
+
+    def bind(
+        self,
+        controller: session_execution._InteractiveSessionAttachmentController,
+    ) -> None:
+        """绑定被观测的 controller。
+
+        :param controller: 使用本 probe callbacks 的 controller。
+        :returns: ``None``。
+        :raises AssertionError: probe 被重复绑定时抛出。
+        """
+
+        if self.controller is not None:
+            raise AssertionError("attachment controller probe already bound")
+        self.controller = controller
+
+    def release_close(self) -> None:
+        """放行被阻塞的 close callback。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._close_release.set()
+
+    async def close_current(self, attachment: HostSessionAttachment) -> None:
+        """记录 controller 在底层 close await 时已提交的状态。
+
+        :param attachment: controller take-and-clear 后交出的旧 attachment。
+        :returns: close 成功时返回 ``None``。
+        :raises BaseException: 配置了 close_error 时原样抛出。
+        :raises AssertionError: probe 尚未绑定 controller 时抛出。
+        """
+
+        controller = self.controller
+        if controller is None:
+            raise AssertionError("attachment controller probe is not bound")
+        self.close_attempts.append(attachment)
+        self.close_states.append((controller.current, controller.refresh_required, controller._closed))
+        self.close_started.set()
+        await self._close_release.wait()
+        if self.close_error is not None:
+            raise self.close_error
+        await attachment.aclose()
+
+    async def open_fresh(self) -> HostSessionAttachment:
+        """记录 open 前状态并按脚本失败或返回 fresh attachment。
+
+        :returns: 脚本中的下一个 fresh attachment。
+        :raises BaseException: 当前 open attempt 配置失败时原样抛出。
+        :raises AssertionError: probe 未绑定或 fresh 脚本耗尽时抛出。
+        """
+
+        controller = self.controller
+        if controller is None:
+            raise AssertionError("attachment controller probe is not bound")
+        self.open_attempt_count += 1
+        self.open_states.append((controller.current, controller.refresh_required, controller._closed))
+        if self.open_errors:
+            raise self.open_errors.pop(0)
+        if not self._fresh_attachments:
+            raise AssertionError("unexpected fresh attachment open")
+        return self._fresh_attachments.pop(0)
+
+
+def _controlled_attachment_controller(
+    *,
+    initial: _FakeSessionAttachment,
+    probe: _AttachmentControllerLifecycleProbe,
+) -> session_execution._InteractiveSessionAttachmentController:
+    """构造并绑定 lifecycle failure owner test controller。
+
+    :param initial: 初始 live attachment。
+    :param probe: 提供可控 close/open callbacks 的 probe。
+    :returns: 已绑定 probe 的 attachment controller。
+    :raises AssertionError: probe 已被其他 controller 绑定时抛出。
+    """
+
+    controller = session_execution._InteractiveSessionAttachmentController(
+        current=initial,
+        open_fresh=probe.open_fresh,
+        close_current=probe.close_current,
+    )
+    probe.bind(controller)
+    return controller
+
+
+class _ReadOnlyRetryHost(_FakeHost):
+    """按 attachment mode 真实拒绝 mutation 的 interactive Host fake。"""
+
+    def __init__(
+        self,
+        *,
+        attachment_modes: tuple[HostSessionAccessMode, ...],
+        submit_statuses: tuple[HostTerminalStatus | None, ...] = (),
+        rejection_reason: HostSessionMutationRejectionReason = (HostSessionMutationRejectionReason.READ_ONLY),
+        rejection_actual_mode: HostSessionAccessMode | None = (HostSessionAccessMode.READ_ONLY),
+    ) -> None:
+        """初始化 attachment mode 序列与 typed rejection。
+
+        :param attachment_modes: 每次 fresh attach 返回的冻结 mode。
+        :param submit_statuses: 成功接受 mutation 后的 terminal 序列。
+        :param rejection_reason: RO attachment submit 使用的 typed reason。
+        :param rejection_actual_mode: RO attachment submit 使用的 typed actual mode。
+        :returns: ``None``。
+        :raises ValueError: mode 序列为空时抛出。
+        """
+
+        if not attachment_modes:
+            raise ValueError("attachment_modes must not be empty")
+        super().__init__(submit_statuses=submit_statuses)
+        self.attachment_modes = attachment_modes
+        self.rejection_reason = rejection_reason
+        self.rejection_actual_mode = rejection_actual_mode
+        self.timeline: list[str] = []
+        self.mutation_attempts: list[SubmitFollowupRequest] = []
+
+    async def attach_session(self, session_id: str) -> HostSessionAttachment:
+        """按脚本创建 mode 不可变的 fresh attachment。
+
+        :param session_id: 目标 Session id。
+        :returns: 带稳定 identity 与 timeline 的 fake attachment。
+        :raises AssertionError: attach 次数超过脚本时抛出。
+        """
+
+        attach_index = len(self.attachments)
+        if attach_index >= len(self.attachment_modes):
+            raise AssertionError("unexpected fresh attachment")
+        identity = f"B{attach_index + 1}"
+        attachment = _FakeSessionAttachment(
+            session_id,
+            access_mode=self.attachment_modes[attach_index],
+            identity=identity,
+            timeline=self.timeline,
+        )
+        self.timeline.append(f"open:{identity}:{attachment.access_mode.value}")
+        self.attach_session_ids.append(session_id)
+        self.attachments.append(attachment)
+        return attachment
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """RO 时返回 typed rejection，RW 时委托既有 accepted Run fake。
+
+        :param session_id: 目标 Session id。
+        :param request: Host submit request。
+        :returns: RW attachment 下 accepted follow-up。
+        :raises HostApiError: current attachment 为 RO 时抛出配置的 typed rejection。
+        """
+
+        self.mutation_attempts.append(request)
+        current = self.attachments[-1]
+        if current.access_mode is HostSessionAccessMode.READ_ONLY:
+            raise HostApiError(
+                code=HostApiErrorCode.PERMISSION_DENIED,
+                message="opaque rejection text that must not drive CLI dispatch",
+                retryable=False,
+                detail=HostSessionMutationErrorDetail(
+                    kind="session_mutation_access",
+                    session_id=session_id,
+                    reason=self.rejection_reason,
+                    required_mode=HostSessionAccessMode.READ_WRITE,
+                    actual_mode=self.rejection_actual_mode,
+                ),
+            )
+        return await super().submit_followup(session_id, request)
 
 
 class _ControlledInteractiveHost(_FakeHost):
@@ -925,6 +1180,36 @@ class _BarrierScriptedComposer(_ScriptedComposer):
         return await super().read_event(prompt)
 
 
+class _ReadOnlyThenErrorComposer(_ScriptedComposer):
+    """首个 SUBMIT 后在下一次 REPL read 抛出测试异常。"""
+
+    read_count: int
+
+    def __init__(self, draft: str) -> None:
+        """初始化单次 submit 与后续异常脚本。
+
+        :param draft: 首次提交草稿。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__((draft,))
+        self.read_count = 0
+
+    async def read_event(self, prompt: str) -> InteractiveComposerEvent:
+        """首次委托 submit，第二次抛出稳定测试异常。
+
+        :param prompt: REPL prompt 文本。
+        :returns: 首次调用返回 SUBMIT event。
+        :raises RuntimeError: 第二次调用模拟 composer 异常。
+        """
+
+        self.read_count += 1
+        if self.read_count > 1:
+            raise RuntimeError("composer read failed after read-only rejection")
+        return await super().read_event(prompt)
+
+
 class _IdleSequencedComposer(_ScriptedComposer):
     """仅在 IDLE phase 投递下一份 submit 的测试 composer。"""
 
@@ -1301,6 +1586,7 @@ async def test_editor_failure_or_cancel_preserves_repl_until_explicit_submit(
                 run_overrides=ServiceRunOverrides(),
                 composer=composer,
                 sigint_monitor=_NoopSigintMonitor(),
+                attachment_controller=_test_attachment_controller(host),
             )
         )
         pipe_input.send_text("abc\x1b[D\x18\x05")
@@ -1315,6 +1601,7 @@ async def test_editor_failure_or_cancel_preserves_repl_until_explicit_submit(
         assert composer._history.get_strings() == []
         pipe_input.send_text("X\r")
         await _wait_for_submit_count(host, 1)
+        await _wait_for_real_composer_history(composer, ("abXc",))
         await _wait_for_real_composer_phase(
             composer,
             phase=InteractiveComposerPhase.IDLE,
@@ -2113,16 +2400,19 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
     )
     monitor = _ManualSigintMonitor()
 
-    driver = asyncio.create_task(session_execution._drive_interactive_tty_repl(
-        host=cast(Host, fake_host),
-        runtime=runtime,
-        workspace_root=tmp_path,
-        invocation=invocation,
-        session_id="session-1",
-        run_overrides=ServiceRunOverrides(),
-        composer=composer,
-        sigint_monitor=monitor,
-    ))
+    driver = asyncio.create_task(
+        session_execution._drive_interactive_tty_repl(
+            host=cast(Host, fake_host),
+            runtime=runtime,
+            workspace_root=tmp_path,
+            invocation=invocation,
+            session_id="session-1",
+            run_overrides=ServiceRunOverrides(),
+            composer=composer,
+            sigint_monitor=monitor,
+            attachment_controller=_test_attachment_controller(fake_host),
+        )
+    )
     await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
     monitor.notify()
     await _wait_for_sigint_observation(monitor, 1)
@@ -2411,6 +2701,421 @@ def test_interactive_failed_and_cancelled_continue_until_eof(
     assert "Cancelled." in captured.err
     assert "cancelled for run-2" not in captured.err
     assert len(fake_host.submit_requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_attachment_controller_close_failure_is_terminal_and_attempted_once() -> None:
+    """close 失败前先 terminal/take-and-clear，异常原样传播且后续 no-op。
+
+    :returns: ``None``。
+    :raises AssertionError: close attempt、状态或异常 identity 漂移时抛出。
+    """
+
+    initial = _FakeSessionAttachment("session-1", identity="B1")
+    close_error = RuntimeError("controlled attachment close failure")
+    probe = _AttachmentControllerLifecycleProbe(close_error=close_error)
+    controller = _controlled_attachment_controller(initial=initial, probe=probe)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await controller.close()
+
+    assert exc_info.value is close_error
+    assert probe.close_attempts == [initial]
+    assert probe.close_states == [(None, False, True)]
+    assert controller.current is None
+    assert controller._closed is True
+
+    await controller.close()
+    assert probe.close_attempts == [initial]
+
+
+@pytest.mark.asyncio
+async def test_attachment_controller_refresh_close_failure_retries_with_fresh_open() -> None:
+    """refresh close 失败不 open/double-close，下一次 mutation 只 fresh open。
+
+    :returns: ``None``。
+    :raises AssertionError: failure state、异常 identity 或 retry owner 偏序漂移时抛出。
+    """
+
+    initial = _FakeSessionAttachment("session-1", identity="B1")
+    fresh = _FakeSessionAttachment("session-1", identity="B2")
+    close_error = RuntimeError("controlled refresh close failure")
+    probe = _AttachmentControllerLifecycleProbe(
+        fresh_attachments=(fresh,),
+        close_error=close_error,
+    )
+    controller = _controlled_attachment_controller(initial=initial, probe=probe)
+    controller.require_refresh()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await controller.attachment_for_mutation()
+
+    assert exc_info.value is close_error
+    assert probe.close_attempts == [initial]
+    assert probe.close_states == [(None, True, False)]
+    assert probe.open_attempt_count == 0
+    assert controller.current is None
+    assert controller.refresh_required is True
+    assert controller._closed is False
+
+    probe.close_error = None
+    assert await controller.attachment_for_mutation() is fresh
+    assert probe.close_attempts == [initial]
+    assert probe.open_attempt_count == 1
+    assert probe.open_states == [(None, True, False)]
+    assert controller.current is fresh
+    assert controller.refresh_required is False
+
+
+@pytest.mark.asyncio
+async def test_attachment_controller_refresh_never_opens_before_close_completes() -> None:
+    """refresh 必须完整等待旧 attachment close 后才 fresh open。
+
+    :returns: ``None``。
+    :raises AssertionError: current 清理或 close-before-open 偏序漂移时抛出。
+    """
+
+    initial = _FakeSessionAttachment("session-1", identity="B1")
+    fresh = _FakeSessionAttachment("session-1", identity="B2")
+    probe = _AttachmentControllerLifecycleProbe(
+        fresh_attachments=(fresh,),
+        block_close=True,
+    )
+    controller = _controlled_attachment_controller(initial=initial, probe=probe)
+    controller.require_refresh()
+
+    refresh_task = asyncio.create_task(controller.attachment_for_mutation())
+    await probe.close_started.wait()
+
+    assert controller.current is None
+    assert controller.refresh_required is True
+    assert probe.close_attempts == [initial]
+    assert probe.open_attempt_count == 0
+    assert refresh_task.done() is False
+
+    probe.release_close()
+    assert await refresh_task is fresh
+    assert initial.close_count == 1
+    assert probe.open_attempt_count == 1
+    assert probe.open_states == [(None, True, False)]
+
+
+@pytest.mark.asyncio
+async def test_attachment_controller_open_failure_keeps_refresh_for_fresh_retry() -> None:
+    """fresh open 失败保持 None/refresh，下一次 mutation 再次 fresh open。
+
+    :returns: ``None``。
+    :raises AssertionError: open 异常、state 或 retry attempt 次数漂移时抛出。
+    """
+
+    initial = _FakeSessionAttachment("session-1", identity="B1")
+    fresh = _FakeSessionAttachment("session-1", identity="B2")
+    open_error = RuntimeError("controlled fresh open failure")
+    probe = _AttachmentControllerLifecycleProbe(
+        fresh_attachments=(fresh,),
+        open_errors=(open_error,),
+    )
+    controller = _controlled_attachment_controller(initial=initial, probe=probe)
+    controller.require_refresh()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await controller.attachment_for_mutation()
+
+    assert exc_info.value is open_error
+    assert probe.close_attempts == [initial]
+    assert initial.close_count == 1
+    assert probe.open_attempt_count == 1
+    assert controller.current is None
+    assert controller.refresh_required is True
+    assert controller._closed is False
+
+    assert await controller.attachment_for_mutation() is fresh
+    assert probe.close_attempts == [initial]
+    assert probe.open_attempt_count == 2
+    assert probe.open_states == [(None, True, False), (None, True, False)]
+    assert controller.current is fresh
+    assert controller.refresh_required is False
+
+
+def test_session_mutation_detail_rejects_raw_string_enum_values() -> None:
+    """Host typed detail owner 拒绝裸字符串，CLI 不提供 StrEnum 值兼容。
+
+    :returns: ``None``。
+    :raises AssertionError: typed enum contract 被宽松字符串输入绕过时抛出。
+    """
+
+    with pytest.raises(
+        TypeError,
+        match="reason must be HostSessionMutationRejectionReason",
+    ):
+        HostSessionMutationErrorDetail(
+            kind="session_mutation_access",
+            session_id="session-1",
+            reason=cast(HostSessionMutationRejectionReason, "read_only"),
+            required_mode=HostSessionAccessMode.READ_WRITE,
+            actual_mode=HostSessionAccessMode.READ_ONLY,
+        )
+
+    with pytest.raises(TypeError, match="actual_mode must be HostSessionAccessMode"):
+        HostSessionMutationErrorDetail(
+            kind="session_mutation_access",
+            session_id="session-1",
+            reason=HostSessionMutationRejectionReason.READ_ONLY,
+            required_mode=HostSessionAccessMode.READ_WRITE,
+            actual_mode=cast(HostSessionAccessMode, "read_only"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_interactive_read_only_retry_preserves_composer_and_uses_fresh_rw(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RO 拒绝保留 draft/cursor/history，同语义 fresh RW 后只接受一个 Run。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: REPL、identity、close-open 或 acceptance 不变量失效时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ReadOnlyRetryHost(
+        attachment_modes=(
+            HostSessionAccessMode.READ_ONLY,
+            HostSessionAccessMode.READ_WRITE,
+        ),
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+    )
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            stderr=stderr,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        execution = asyncio.create_task(
+            session_execution.execute_interactive_on_session(
+                host=cast(Host, host),
+                prepared=_prepared_interactive_execution(
+                    tmp_path=tmp_path,
+                    runtime=runtime,
+                ),
+                session_id="session-1",
+                composer=composer,
+                sigint_monitor_factory=_NoopSigintMonitor,
+                run_startup_reconnect=False,
+                detail=False,
+                thinking=False,
+            )
+        )
+        pipe_input.send_text("abc\x1b[D\r")
+        await _wait_for_mutation_attempt_count(host, 1)
+        await _wait_for_stderr_text(stderr, "session is read-only")
+
+        assert composer._draft == "abc"
+        assert composer._cursor_position == 2
+        assert composer._history.get_strings() == []
+        assert host._submit_index == 0
+        assert execution.done() is False
+
+        pipe_input.send_text("\r")
+        await _wait_for_mutation_attempt_count(host, 2)
+        await _wait_for_real_composer_history(composer, ("abc",))
+        await _wait_for_real_composer_phase(
+            composer,
+            phase=InteractiveComposerPhase.IDLE,
+        )
+        pipe_input.send_text("\x04")
+        exit_code = await asyncio.wait_for(execution, timeout=2.0)
+
+    request_ids = [request.client_request_id for request in host.mutation_attempts]
+    assert exit_code == EXIT_SUCCESS
+    assert request_ids[0] == request_ids[1]
+    assert host._submit_index == 1
+    assert host.timeline == [
+        "open:B1:read_only",
+        "close-start:B1",
+        "close-complete:B1",
+        "open:B2:read_write",
+        "close-start:B2",
+        "close-complete:B2",
+    ]
+    assert [attachment.close_count for attachment in host.attachments] == [1, 1]
+    assert stderr.getvalue().count("session is read-only") == 1
+
+
+@pytest.mark.asyncio
+async def test_interactive_repeated_read_only_keeps_identity_and_eof_closes_current(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """fresh attachment 仍 RO 时重复 typed 提示、零 Run，并在 EOF 关闭 current。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param capsys: pytest 输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: identity、REPL continuation 或 cleanup 次数漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ReadOnlyRetryHost(
+        attachment_modes=(
+            HostSessionAccessMode.READ_ONLY,
+            HostSessionAccessMode.READ_ONLY,
+        )
+    )
+    same_submit = InteractiveComposerEvent(
+        kind=InteractiveComposerEventKind.SUBMIT,
+        draft="same draft",
+        input_revision=1,
+    )
+    composer = _ScriptedComposer((same_submit, same_submit))
+
+    exit_code = await session_execution.execute_interactive_on_session(
+        host=cast(Host, host),
+        prepared=_prepared_interactive_execution(tmp_path=tmp_path, runtime=runtime),
+        session_id="session-1",
+        composer=composer,
+        sigint_monitor_factory=_NoopSigintMonitor,
+        run_startup_reconnect=False,
+        detail=False,
+        thinking=False,
+    )
+
+    captured = capsys.readouterr()
+    request_ids = [request.client_request_id for request in host.mutation_attempts]
+    assert exit_code == EXIT_SUCCESS
+    assert len(request_ids) == 2
+    assert request_ids[0] == request_ids[1]
+    assert host._submit_index == 0
+    assert composer.accepted_history_flags == []
+    assert captured.err.count("session is read-only") == 2
+    assert host.timeline.index("close-complete:B1") < host.timeline.index("open:B2:read_only")
+    assert [attachment.close_count for attachment in host.attachments] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_interactive_edit_after_read_only_allocates_new_turn_identity(
+    tmp_path: Path,
+) -> None:
+    """RO 后用户编辑才创建新 request/turn identity，旧 pending 不进 history。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: edited submission 复用旧 identity 或重复 Run 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ReadOnlyRetryHost(
+        attachment_modes=(
+            HostSessionAccessMode.READ_ONLY,
+            HostSessionAccessMode.READ_WRITE,
+        ),
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+    )
+    composer = _ScriptedComposer(
+        (
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.SUBMIT,
+                draft="draft",
+                input_revision=1,
+            ),
+            InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.SUBMIT,
+                draft="draft edited",
+                input_revision=2,
+            ),
+        )
+    )
+
+    exit_code = await session_execution.execute_interactive_on_session(
+        host=cast(Host, host),
+        prepared=_prepared_interactive_execution(tmp_path=tmp_path, runtime=runtime),
+        session_id="session-1",
+        composer=composer,
+        sigint_monitor_factory=_NoopSigintMonitor,
+        run_startup_reconnect=False,
+        detail=False,
+        thinking=False,
+    )
+
+    requests = host.mutation_attempts
+    assert exit_code == EXIT_SUCCESS
+    assert [request.user_prompt for request in requests] == ["draft", "draft edited"]
+    assert requests[0].client_request_id != requests[1].client_request_id
+    assert requests[0].client_request_id.endswith(":turn-1:submit")
+    assert requests[1].client_request_id.endswith(":turn-2:submit")
+    assert host._submit_index == 1
+    assert composer.accepted_history_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_interactive_read_only_then_composer_error_closes_without_double_close(
+    tmp_path: Path,
+) -> None:
+    """RO 后 composer 异常必须传播，并由 outer lifecycle 关闭 current 一次。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: 异常被吞、Run 被创建或 attachment 泄漏时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ReadOnlyRetryHost(attachment_modes=(HostSessionAccessMode.READ_ONLY,))
+
+    with pytest.raises(RuntimeError, match="composer read failed"):
+        await session_execution.execute_interactive_on_session(
+            host=cast(Host, host),
+            prepared=_prepared_interactive_execution(tmp_path=tmp_path, runtime=runtime),
+            session_id="session-1",
+            composer=_ReadOnlyThenErrorComposer("draft"),
+            sigint_monitor_factory=_NoopSigintMonitor,
+            run_startup_reconnect=False,
+            detail=False,
+            thinking=False,
+        )
+
+    assert host._submit_index == 0
+    assert [attachment.close_count for attachment in host.attachments] == [1]
+
+
+@pytest.mark.asyncio
+async def test_interactive_only_swallows_exact_typed_read_only_detail(
+    tmp_path: Path,
+) -> None:
+    """误导文本但 typed reason 非 READ_ONLY 的 Host 错误必须保持 fatal。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: CLI 使用 message 字符串匹配并误吞错误时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ReadOnlyRetryHost(
+        attachment_modes=(HostSessionAccessMode.READ_ONLY,),
+        rejection_reason=HostSessionMutationRejectionReason.ATTACHMENT_REQUIRED,
+        rejection_actual_mode=None,
+    )
+
+    with pytest.raises(HostApiError) as exc_info:
+        await session_execution.execute_interactive_on_session(
+            host=cast(Host, host),
+            prepared=_prepared_interactive_execution(tmp_path=tmp_path, runtime=runtime),
+            session_id="session-1",
+            composer=_ScriptedComposer(("draft",)),
+            sigint_monitor_factory=_NoopSigintMonitor,
+            run_startup_reconnect=False,
+            detail=False,
+            thinking=False,
+        )
+
+    detail = exc_info.value.detail
+    assert isinstance(detail, HostSessionMutationErrorDetail)
+    assert detail.reason is HostSessionMutationRejectionReason.ATTACHMENT_REQUIRED
+    assert host._submit_index == 0
+    assert [attachment.close_count for attachment in host.attachments] == [1]
 
 
 def test_interactive_lost_is_fatal(
@@ -3267,9 +3972,7 @@ def _reject_system_editor_fallback(
     :raises AssertionError: production 错误调用 system fallback 时始终抛出。
     """
 
-    raise AssertionError(
-        f"explicit editor entered system fallback: validate={validate_and_handle}"
-    )
+    raise AssertionError(f"explicit editor entered system fallback: validate={validate_and_handle}")
 
 
 def _configure_editor_failure_case(
@@ -3323,14 +4026,23 @@ async def _wait_for_editor_integration_completion(
     """
 
     for _attempt in range(1_000):
-        invalid_complete = case in {
-            _InteractiveEditorFailureCase.MISSING,
-            _InteractiveEditorFailureCase.NON_EXECUTABLE,
-        } and stderr.getvalue() != ""
-        explicit_complete = case in {
-            _InteractiveEditorFailureCase.SPAWN_ERROR,
-            _InteractiveEditorFailureCase.NONZERO,
-        } and bool(process.calls) and not composer._editor_tasks
+        invalid_complete = (
+            case
+            in {
+                _InteractiveEditorFailureCase.MISSING,
+                _InteractiveEditorFailureCase.NON_EXECUTABLE,
+            }
+            and stderr.getvalue() != ""
+        )
+        explicit_complete = (
+            case
+            in {
+                _InteractiveEditorFailureCase.SPAWN_ERROR,
+                _InteractiveEditorFailureCase.NONZERO,
+            }
+            and bool(process.calls)
+            and not composer._editor_tasks
+        )
         if invalid_complete or explicit_complete:
             await asyncio.sleep(0)
             return
@@ -3357,6 +4069,26 @@ async def _wait_for_real_composer_phase(
             return
         await asyncio.sleep(0)
     raise AssertionError(f"composer phase did not reach {phase}")
+
+
+async def _wait_for_real_composer_history(
+    composer: PromptToolkitInteractiveComposer,
+    expected: tuple[str, ...],
+) -> None:
+    """等待真实 composer history 达到 acceptance 后的精确内容。
+
+    :param composer: 真实 prompt_toolkit composer。
+    :param expected: 预期 history 字符串序列。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内 history 未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if tuple(composer._history.get_strings()) == expected:
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"composer history did not reach {expected}")
 
 
 def _start_tty_driver(
@@ -3397,6 +4129,7 @@ def _start_tty_driver(
             run_overrides=ServiceRunOverrides(),
             composer=composer,
             sigint_monitor=(_NoopSigintMonitor() if sigint_monitor is None else sigint_monitor),
+            attachment_controller=_test_attachment_controller(host),
             run_view=run_view,
             runtime_display=runtime_display,
         )
@@ -3420,6 +4153,41 @@ async def _wait_for_submit_count(
             return
         await asyncio.sleep(0)
     raise AssertionError(f"submit count did not reach {expected_count}")
+
+
+async def _wait_for_mutation_attempt_count(
+    host: _ReadOnlyRetryHost,
+    expected_count: int,
+) -> None:
+    """等待 RO/RW Host fake 观察到指定 mutation attempt 数。
+
+    :param host: typed READ_ONLY retry Host fake。
+    :param expected_count: 预期最小 mutation attempt 数。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if len(host.mutation_attempts) >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"mutation attempt count did not reach {expected_count}")
+
+
+async def _wait_for_stderr_text(stderr: io.StringIO, expected: str) -> None:
+    """等待 stderr 出现指定稳定用户提示。
+
+    :param stderr: 被测 CLI stderr 流。
+    :param expected: 必须出现的文本。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内文本未出现时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if expected in stderr.getvalue():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"stderr did not contain {expected}")
 
 
 async def _wait_for_prompt_call_count(
