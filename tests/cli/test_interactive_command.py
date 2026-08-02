@@ -5,15 +5,21 @@ from __future__ import annotations
 import asyncio
 import io
 import signal
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import FrameType, TracebackType
 from typing import TypeAlias, cast
 
 import pytest
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 import dayu.cli.agent_entrypoint as agent_entrypoint
+import dayu.cli.composer as composer_module
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
@@ -22,6 +28,7 @@ from dayu.cli.composer import (
     InteractiveComposerEvent,
     InteractiveComposerEventKind,
     InteractiveComposerPhase,
+    PromptToolkitInteractiveComposer,
 )
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.runtime_display import RuntimeDisplayController
@@ -106,6 +113,49 @@ _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
 )
 _API_KEY = "test-provider-key"
 _TRANSIENT_OBSERVED_AT = datetime(2026, 7, 20, 1, 2, 3, tzinfo=UTC)
+
+
+class _InteractiveEditorFailureCase(StrEnum):
+    """真实 composer 接入 REPL 的 editor 失败/取消矩阵。"""
+
+    MISSING = "missing"
+    NON_EXECUTABLE = "non_executable"
+    SPAWN_ERROR = "spawn_error"
+    NONZERO = "nonzero"
+
+
+class _InteractiveEditorProcess:
+    """记录 integration exact argv 并模拟 spawn/nonzero 结果。"""
+
+    case: _InteractiveEditorFailureCase
+    calls: list[tuple[str, ...]]
+
+    def __init__(self, case: _InteractiveEditorFailureCase) -> None:
+        """初始化 process 替身。
+
+        :param case: 当前 integration case。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.case = case
+        self.calls = []
+
+    def __call__(self, argv: tuple[str, ...]) -> int:
+        """记录 argv，并返回非零或抛 spawn ``OSError``。
+
+        :param argv: production 显式 launcher 生成的 exact argv。
+        :returns: nonzero case 返回九。
+        :raises OSError: spawn-error case 模拟进程启动失败。
+        :raises AssertionError: 非进程 case 错误进入 launcher 时抛出。
+        """
+
+        self.calls.append(argv)
+        if self.case is _InteractiveEditorFailureCase.SPAWN_ERROR:
+            raise OSError("secret integration spawn payload")
+        if self.case is _InteractiveEditorFailureCase.NONZERO:
+            return 9
+        raise AssertionError(f"invalid editor case entered process launcher: {self.case}")
 
 
 def _runtime_assembly_env() -> dict[str, str]:
@@ -1205,6 +1255,88 @@ def test_interactive_label_targets_shared_agent_slot_and_default_context(
     assert fake_host.ensure_requests[0].scope == "cli.agent"
     assert fake_host.ensure_requests[0].slot_key == "cli.agent.earnings"
     assert fake_host.create_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", tuple(_InteractiveEditorFailureCase))
+async def test_editor_failure_or_cancel_preserves_repl_until_explicit_submit(
+    case: _InteractiveEditorFailureCase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """missing/nonexec/spawn/nonzero 后同一 REPL 保留 draft/cursor/history 与零 Run。
+
+    :param case: editor 失败或取消 integration case。
+    :param tmp_path: pytest 临时 workspace。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: editor 动作提前提交、破坏草稿或退出 REPL 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
+    process = _InteractiveEditorProcess(case)
+    monkeypatch.setattr(composer_module, "_run_editor_process", process)
+    monkeypatch.setattr(Buffer, "open_in_editor", _reject_system_editor_fallback)
+    _configure_editor_failure_case(case, tmp_path=tmp_path, monkeypatch=monkeypatch)
+    stderr = io.StringIO()
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            stderr=stderr,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        driver = asyncio.create_task(
+            session_execution._drive_interactive_tty_repl(
+                host=cast(Host, host),
+                runtime=runtime,
+                workspace_root=tmp_path,
+                invocation=session_execution.new_cli_invocation(
+                    command_name="interactive",
+                    scenario="interactive",
+                    display_user="本地 CLI 用户",
+                    ticker=None,
+                ),
+                session_id="session-1",
+                run_overrides=ServiceRunOverrides(),
+                composer=composer,
+                sigint_monitor=_NoopSigintMonitor(),
+            )
+        )
+        pipe_input.send_text("abc\x1b[D\x18\x05")
+        await _wait_for_editor_integration_completion(
+            case=case,
+            composer=composer,
+            process=process,
+            stderr=stderr,
+        )
+
+        assert host.submit_requests == []
+        assert composer._history.get_strings() == []
+        pipe_input.send_text("X\r")
+        await _wait_for_submit_count(host, 1)
+        await _wait_for_real_composer_phase(
+            composer,
+            phase=InteractiveComposerPhase.IDLE,
+        )
+        pipe_input.send_text("\x04")
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert [request.user_prompt for request in host.submit_requests] == ["abXc"]
+    assert composer._history.get_strings() == ["abXc"]
+    if case is _InteractiveEditorFailureCase.NONZERO:
+        assert stderr.getvalue() == ""
+    else:
+        diagnostic = stderr.getvalue()
+        assert "VISUAL" in diagnostic
+        assert "取消 VISUAL/EDITOR" in diagnostic
+        assert "Traceback" not in diagnostic
+        assert "secret" not in diagnostic
+    if process.calls:
+        assert len(process.calls) == 1
+        assert process.calls[0][0] == str(Path(sys.executable).resolve())
+        assert not Path(process.calls[0][-1]).exists()
 
 
 @pytest.mark.parametrize(
@@ -3203,6 +3335,110 @@ async def test_interactive_sync_sigint_install_failure_rolls_back_state(
     monitor.close()
 
 
+def _reject_system_editor_fallback(
+    _buffer: Buffer,
+    validate_and_handle: bool = False,
+) -> asyncio.Task[None]:
+    """拒绝显式 editor integration 误入 public system fallback。
+
+    :param _buffer: prompt_toolkit public buffer。
+    :param validate_and_handle: fallback 的 accept 参数。
+    :returns: 正常路径不会返回。
+    :raises AssertionError: production 错误调用 system fallback 时始终抛出。
+    """
+
+    raise AssertionError(
+        f"explicit editor entered system fallback: validate={validate_and_handle}"
+    )
+
+
+def _configure_editor_failure_case(
+    case: _InteractiveEditorFailureCase,
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """设置 integration case 的 VISUAL，并保留一个不可 fallback 的 EDITOR。
+
+    :param case: editor 失败或取消 case。
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 收到未支持 case 时抛出。
+    """
+
+    if case is _InteractiveEditorFailureCase.MISSING:
+        visual = str(tmp_path / "missing-editor")
+    elif case is _InteractiveEditorFailureCase.NON_EXECUTABLE:
+        non_executable = tmp_path / "non-executable-editor"
+        non_executable.write_text("not executable", encoding="utf-8")
+        non_executable.chmod(0o600)
+        visual = str(non_executable)
+    elif case in {
+        _InteractiveEditorFailureCase.SPAWN_ERROR,
+        _InteractiveEditorFailureCase.NONZERO,
+    }:
+        visual = sys.executable
+    else:
+        raise AssertionError(f"unsupported editor integration case: {case}")
+    monkeypatch.setenv("VISUAL", visual)
+    monkeypatch.setenv("EDITOR", "/must/not/fallback")
+
+
+async def _wait_for_editor_integration_completion(
+    *,
+    case: _InteractiveEditorFailureCase,
+    composer: PromptToolkitInteractiveComposer,
+    process: _InteractiveEditorProcess,
+    stderr: io.StringIO,
+) -> None:
+    """等待 editor binding 完成失败/取消且恢复同一 composer。
+
+    :param case: editor 失败或取消 case。
+    :param composer: 真实 prompt_toolkit composer。
+    :param process: exact argv process 替身。
+    :param stderr: composer diagnostic 流。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内未完成时抛出。
+    """
+
+    for _attempt in range(1_000):
+        invalid_complete = case in {
+            _InteractiveEditorFailureCase.MISSING,
+            _InteractiveEditorFailureCase.NON_EXECUTABLE,
+        } and stderr.getvalue() != ""
+        explicit_complete = case in {
+            _InteractiveEditorFailureCase.SPAWN_ERROR,
+            _InteractiveEditorFailureCase.NONZERO,
+        } and bool(process.calls) and not composer._editor_tasks
+        if invalid_complete or explicit_complete:
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"editor integration case did not complete: {case}")
+
+
+async def _wait_for_real_composer_phase(
+    composer: PromptToolkitInteractiveComposer,
+    *,
+    phase: InteractiveComposerPhase,
+) -> None:
+    """等待真实 composer 进入指定 REPL phase。
+
+    :param composer: 真实 prompt_toolkit composer。
+    :param phase: 预期 phase。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内未进入指定 phase 时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if composer._phase is phase:
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"composer phase did not reach {phase}")
+
+
 def _start_tty_driver(
     *,
     host: _ControlledInteractiveHost,
@@ -3248,7 +3484,7 @@ def _start_tty_driver(
 
 
 async def _wait_for_submit_count(
-    host: _ControlledInteractiveHost,
+    host: _FakeHost,
     expected_count: int,
 ) -> None:
     """在有界 event-loop ticks 内等待 submit 请求数。
