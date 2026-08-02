@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -32,6 +33,8 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import Output
+
+from dayu.cli.run_keys import RunningKeyAction
 
 XTERM_MODIFY_OTHER_KEYS_SHIFT_ENTER: Final[str] = "\x1b[27;2;13~"
 """xterm modifyOtherKeys 协议中 Shift+Enter 的完整字节序列。"""
@@ -160,17 +163,8 @@ class InteractiveComposerEventKind(StrEnum):
     """interactive composer 对 REPL 暴露的封闭事件种类。"""
 
     SUBMIT = "submit"
-    CANCEL_ACTIVE = "cancel_active"
-    TOGGLE_ACTIVITY = "toggle_activity"
-    IDLE_INTERRUPT = "idle_interrupt"
+    RUNNING_KEY_ACTION = "running_key_action"
     EOF = "eof"
-
-
-class InteractiveCancelSource(StrEnum):
-    """composer cancel event 的本地输入来源。"""
-
-    ESCAPE = "escape"
-    CTRL_C = "ctrl_c"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,14 +175,14 @@ class InteractiveComposerEvent:
     :param draft: ``SUBMIT`` 的原始草稿；其它事件必须为 ``None``。
     :param input_revision: composer 已观察到的用户编辑版本，用于判定两次
         idle Ctrl+C 之间是否发生过正常编辑。
-    :param cancel_source: ``CANCEL_ACTIVE`` 的输入来源；其它事件必须为
-        ``None``。
+    :param running_key_action: active phase 的唯一 typed key action；其它事件
+        必须为 ``None``。
     """
 
     kind: InteractiveComposerEventKind
     draft: str | None = None
     input_revision: int = 0
-    cancel_source: InteractiveCancelSource | None = None
+    running_key_action: RunningKeyAction | None = None
 
     def __post_init__(self) -> None:
         """校验事件字段组合。
@@ -202,17 +196,17 @@ class InteractiveComposerEvent:
         if self.kind is InteractiveComposerEventKind.SUBMIT:
             if self.draft is None:
                 raise ValueError("submit event requires draft")
-            if self.cancel_source is not None:
-                raise ValueError("submit event must not carry cancel source")
+            if self.running_key_action is not None:
+                raise ValueError("submit event must not carry running key action")
             return
         if self.draft is not None:
             raise ValueError("non-submit event must not carry draft")
-        if self.kind is InteractiveComposerEventKind.CANCEL_ACTIVE:
-            if self.cancel_source is None:
-                raise ValueError("cancel event requires cancel source")
+        if self.kind is InteractiveComposerEventKind.RUNNING_KEY_ACTION:
+            if self.running_key_action is None:
+                raise ValueError("running key event requires action")
             return
-        if self.cancel_source is not None:
-            raise ValueError("non-cancel event must not carry cancel source")
+        if self.running_key_action is not None:
+            raise ValueError("non-running-key event must not carry action")
 
 
 class InteractiveComposer(Protocol):
@@ -524,7 +518,7 @@ def _build_interactive_key_bindings(
 
     @bindings.add("c-c")
     def _clear_or_interrupt(event: KeyPressEvent) -> None:
-        """按 phase 清空 idle draft 或投影 Ctrl+C typed event。
+        """idle 有草稿时清空，否则把 Ctrl+C 交给唯一 SIGINT monitor。
 
         :param event: prompt_toolkit 当前按键事件。
         :returns: ``None``。
@@ -536,18 +530,7 @@ def _build_interactive_key_bindings(
             if buffer.text != "":
                 buffer.reset()
                 return
-            _exit_with_composer_event(
-                event,
-                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
-                revision=revision_provider(),
-            )
-            return
-        _exit_with_composer_event(
-            event,
-            kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
-            revision=revision_provider(),
-            cancel_source=InteractiveCancelSource.CTRL_C,
-        )
+        _raise_sigint()
 
     @bindings.add("c-d")
     def _delete_or_eof(event: KeyPressEvent) -> None:
@@ -581,9 +564,9 @@ def _build_interactive_key_bindings(
 
         _exit_with_composer_event(
             event,
-            kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
+            kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
             revision=revision_provider(),
-            cancel_source=InteractiveCancelSource.ESCAPE,
+            running_key_action=RunningKeyAction.CANCEL_RUN,
         )
 
     @bindings.add("c-t", filter=active_phase)
@@ -597,8 +580,9 @@ def _build_interactive_key_bindings(
 
         _exit_with_composer_event(
             event,
-            kind=InteractiveComposerEventKind.TOGGLE_ACTIVITY,
+            kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
             revision=revision_provider(),
+            running_key_action=RunningKeyAction.TOGGLE_ACTIVITY,
         )
 
     @bindings.add("c-r")
@@ -1025,19 +1009,30 @@ def _write_editor_diagnostic(message: str, *, stderr: TextIO) -> None:
         return
 
 
+def _raise_sigint() -> None:
+    """把 prompt_toolkit 读取到的 Ctrl+C 重新交给进程 SIGINT owner。
+
+    :returns: ``None``。
+    :raises KeyboardInterrupt: invocation 尚未安装 SIGINT monitor 时由 Python
+        默认 handler 抛出。
+    """
+
+    signal.raise_signal(signal.SIGINT)
+
+
 def _exit_with_composer_event(
     event: KeyPressEvent,
     *,
     kind: InteractiveComposerEventKind,
     revision: int,
-    cancel_source: InteractiveCancelSource | None = None,
+    running_key_action: RunningKeyAction | None = None,
 ) -> None:
     """保存 exact buffer/cursor 并退出当前 prompt_toolkit application。
 
     :param event: prompt_toolkit 按键事件。
     :param kind: 待投影的 composer event kind。
     :param revision: 当前用户编辑版本。
-    :param cancel_source: cancel event 的本地输入来源。
+    :param running_key_action: active phase 的唯一 typed key action。
     :returns: ``None``。
     :raises Exception: application 无法退出时向上透传。
     """
@@ -1050,7 +1045,7 @@ def _exit_with_composer_event(
                 kind=kind,
                 draft=draft,
                 input_revision=revision,
-                cancel_source=cancel_source,
+                running_key_action=running_key_action,
             ),
             document=buffer.document,
         )
@@ -1108,7 +1103,6 @@ def new_interactive_composer(
 
 __all__: tuple[str, ...] = (
     "InteractiveComposer",
-    "InteractiveCancelSource",
     "InteractiveComposerEvent",
     "InteractiveComposerEventKind",
     "InteractiveComposerPhase",

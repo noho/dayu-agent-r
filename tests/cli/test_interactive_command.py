@@ -24,12 +24,12 @@ import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
 from dayu.cli.composer import (
-    InteractiveCancelSource,
     InteractiveComposerEvent,
     InteractiveComposerEventKind,
     InteractiveComposerPhase,
     PromptToolkitInteractiveComposer,
 )
+from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
@@ -876,7 +876,7 @@ class _ScriptedComposer:
             )
         if step.exception_type is KeyboardInterrupt:
             return InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
+                kind=InteractiveComposerEventKind.EOF,
                 input_revision=self._revision,
             )
         raise AssertionError(f"unsupported composer interrupt: {step.exception_type}")
@@ -2106,15 +2106,14 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
         display_user="本地 CLI 用户",
         ticker="AAPL",
     )
-    fake_host = _FakeHost()
-    composer = _ScriptedComposer(
-        (
-            _ComposerReadInterrupt(KeyboardInterrupt),
-            _ComposerReadInterrupt(EOFError),
-        )
+    fake_host = _ControlledInteractiveHost()
+    composer = _BarrierScriptedComposer(
+        (_ComposerReadInterrupt(EOFError),),
+        blocked_call_index=1,
     )
+    monitor = _ManualSigintMonitor()
 
-    exit_code = await session_execution._drive_interactive_tty_repl(
+    driver = asyncio.create_task(session_execution._drive_interactive_tty_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
@@ -2122,81 +2121,49 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
         session_id="session-1",
         run_overrides=ServiceRunOverrides(),
         composer=composer,
-        sigint_monitor=_NoopSigintMonitor(),
-    )
+        sigint_monitor=monitor,
+    ))
+    await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    assert not driver.done()
+    composer.release_read.set()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
 
     assert exit_code == EXIT_SUCCESS
-    assert composer.prompt_calls == ["dayu> ", "dayu> "]
-    assert fake_host.submit_requests == []
-    assert fake_host.cancel_requests == []
-
-
-def test_interactive_second_consecutive_input_keyboard_interrupt_exits_without_run_requests(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """输入态连续两次空 prompt Ctrl-C 应退出当前 command，且不发 submit / cancel。"""
-
-    fake_host = _FakeHost()
-    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    monkeypatch.setattr(
-        interactive_command,
-        "open_host",
-        lambda _options: _FakeOpenHostContext(fake_host),
-    )
-    _install_cli_tty_composer(
-        monkeypatch,
-        (
-            _ComposerReadInterrupt(KeyboardInterrupt),
-            _ComposerReadInterrupt(KeyboardInterrupt),
-        ),
-    )
-
-    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
-
-    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert composer.prompt_calls == ["dayu> "]
     assert fake_host.submit_requests == []
     assert fake_host.cancel_requests == []
 
 
 @pytest.mark.asyncio
-async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pending(
+async def test_interactive_second_consecutive_input_keyboard_interrupt_exits_without_run_requests(
     tmp_path: Path,
 ) -> None:
-    """输入态第一次 Ctrl-C 后提交正常输入，应重置本地退出待确认状态。"""
+    """输入态连续两次空 prompt Ctrl-C 应退出当前 command，且不发 submit / cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = session_execution.new_cli_invocation(
-        command_name="interactive",
-        scenario="interactive",
-        display_user="本地 CLI 用户",
-        ticker="AAPL",
+    fake_host = _ControlledInteractiveHost()
+    composer = _BarrierScriptedComposer(
+        (_ComposerReadInterrupt(EOFError),),
+        blocked_call_index=1,
     )
-    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
-    composer = _ScriptedComposer(
-        (
-            _ComposerReadInterrupt(KeyboardInterrupt),
-            "请总结收入变化",
-            _ComposerReadInterrupt(KeyboardInterrupt),
-            _ComposerReadInterrupt(EOFError),
-        )
-    )
-
-    exit_code = await session_execution._drive_interactive_tty_repl(
-        host=cast(Host, fake_host),
+    monitor = _ManualSigintMonitor()
+    driver = _start_tty_driver(
+        host=fake_host,
         runtime=runtime,
         workspace_root=tmp_path,
-        invocation=invocation,
-        session_id="session-1",
-        run_overrides=ServiceRunOverrides(),
         composer=composer,
-        sigint_monitor=_NoopSigintMonitor(),
+        sigint_monitor=monitor,
     )
+    await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    monitor.notify()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
 
-    assert exit_code == EXIT_SUCCESS
-    assert composer.prompt_calls == ["dayu> "] * 5
-    assert len(fake_host.submit_requests) == 1
-    assert fake_host.submit_requests[0].user_prompt == "请总结收入变化"
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert fake_host.submit_requests == []
     assert fake_host.cancel_requests == []
 
 
@@ -2603,8 +2570,8 @@ async def test_interactive_escape_crosses_pre_acceptance_barrier_once(
         (
             "第一轮",
             InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
-                cancel_source=InteractiveCancelSource.ESCAPE,
+                kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+                running_key_action=RunningKeyAction.CANCEL_RUN,
             ),
         )
     )
@@ -2630,17 +2597,11 @@ async def test_interactive_escape_crosses_pre_acceptance_barrier_once(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "cancel_source",
-    (InteractiveCancelSource.ESCAPE, InteractiveCancelSource.CTRL_C),
-)
-async def test_interactive_cancel_sources_merge_once_after_accepted_activity(
-    cancel_source: InteractiveCancelSource,
+async def test_interactive_repeated_escape_merges_once_after_accepted_activity(
     tmp_path: Path,
 ) -> None:
-    """accepted active turn 的 Escape/Ctrl+C 必须合并为 single cancel。
+    """accepted active turn 的重复 Escape 必须合并为 single cancel。
 
-    :param cancel_source: standalone Escape 或 composer Ctrl+C。
     :param tmp_path: pytest 临时 workspace。
     :returns: ``None``。
     :raises AssertionError: active cancel 次数或终态不符合契约时抛出。
@@ -2649,14 +2610,14 @@ async def test_interactive_cancel_sources_merge_once_after_accepted_activity(
     runtime = await _prepare_interactive_runtime(tmp_path)
     host = _ControlledInteractiveHost()
     cancel_event = InteractiveComposerEvent(
-        kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
-        cancel_source=cancel_source,
+        kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+        running_key_action=RunningKeyAction.CANCEL_RUN,
     )
     composer = _BarrierScriptedComposer(
         (
             "第一轮",
             cancel_event,
-            *((cancel_event,) if cancel_source is InteractiveCancelSource.ESCAPE else ()),
+            cancel_event,
         ),
         blocked_call_index=2,
     )
@@ -2698,8 +2659,8 @@ async def test_interactive_cancel_waiter_failure_propagates_before_submit_termin
         (
             "current",
             InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
-                cancel_source=InteractiveCancelSource.ESCAPE,
+                kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+                running_key_action=RunningKeyAction.CANCEL_RUN,
             ),
         )
     )
@@ -2729,27 +2690,30 @@ async def test_interactive_ctrl_c_first_cancels_second_exits_and_third_is_noop(
 
     runtime = await _prepare_interactive_runtime(tmp_path)
     host = _ControlledInteractiveHost()
-    ctrl_c = InteractiveComposerEvent(
-        kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
-        cancel_source=InteractiveCancelSource.CTRL_C,
-    )
-    composer = _ScriptedComposer(("第一轮", ctrl_c, ctrl_c, ctrl_c))
+    composer = _ScriptedComposer(("第一轮",))
+    monitor = _ManualSigintMonitor()
     driver = _start_tty_driver(
         host=host,
         runtime=runtime,
         workspace_root=tmp_path,
         composer=composer,
+        sigint_monitor=monitor,
     )
 
+    await _wait_for_submit_count(host, 1)
+    monitor.notify()
     await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
-    await _wait_for_prompt_call_count(composer, 3)
+    await _wait_for_sigint_observation(monitor, 1)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 2)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 3)
     assert not driver.done()
     host.release_cancel_terminal.set()
     exit_code = await asyncio.wait_for(driver, timeout=2.0)
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
     assert len(host.cancel_requests) == 1
-    assert len(composer._remaining) == 1
     assert not host.cancel_waiter_cancelled
 
 
@@ -2969,23 +2933,24 @@ async def test_interactive_exit_after_cancel_waits_accepted_sole_queue_terminal(
         host = _DelayedQueuedResponseHost()
     else:
         host = _ControlledInteractiveHost()
-    ctrl_c = InteractiveComposerEvent(
-        kind=InteractiveComposerEventKind.CANCEL_ACTIVE,
-        cancel_source=InteractiveCancelSource.CTRL_C,
-    )
-    composer = _ScriptedComposer(("current", "queued", ctrl_c, ctrl_c))
+    composer = _ScriptedComposer(("current", "queued"))
+    monitor = _ManualSigintMonitor()
     driver = _start_tty_driver(
         host=host,
         runtime=runtime,
         workspace_root=tmp_path,
         composer=composer,
+        sigint_monitor=monitor,
     )
 
     await _wait_for_submit_count(host, 2)
     if isinstance(host, _DelayedQueuedResponseHost):
         await asyncio.wait_for(host.queued_committed.wait(), timeout=2.0)
+    monitor.notify()
     await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
-    await _wait_for_prompt_call_count(composer, 4)
+    await _wait_for_sigint_observation(monitor, 1)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 2)
     host.release_cancel_terminal.set()
     await asyncio.sleep(0)
     assert not driver.done()
@@ -3001,52 +2966,6 @@ async def test_interactive_exit_after_cancel_waits_accepted_sole_queue_terminal(
     assert host.submit_requests[1].behavior is FollowupBehavior.QUEUE
     assert host.submit_requests[1].target_run_id is None
     assert not host.cancel_waiter_cancelled
-
-
-@pytest.mark.asyncio
-async def test_interactive_ctrl_t_preserves_existing_idle_interrupt_intent(
-    tmp_path: Path,
-) -> None:
-    """Ctrl+T 只能切换显示，不得清除既有 idle exit pending 状态。
-
-    :param tmp_path: pytest 临时 workspace。
-    :returns: ``None``。
-    :raises AssertionError: toggle 改写 idle/cancel owner 状态时抛出。
-    """
-
-    runtime = await _prepare_interactive_runtime(tmp_path)
-    host = _ControlledInteractiveHost()
-    composer = _ScriptedComposer(
-        (
-            InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
-                input_revision=7,
-            ),
-            InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.TOGGLE_ACTIVITY,
-                input_revision=7,
-            ),
-            InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.IDLE_INTERRUPT,
-                input_revision=7,
-            ),
-        )
-    )
-
-    exit_code = await asyncio.wait_for(
-        _start_tty_driver(
-            host=host,
-            runtime=runtime,
-            workspace_root=tmp_path,
-            composer=composer,
-        ),
-        timeout=2.0,
-    )
-
-    assert exit_code == EXIT_KEYBOARD_INTERRUPT
-    assert composer.prompt_calls == ["dayu> "] * 3
-    assert host.submit_requests == []
-    assert host.cancel_requests == []
 
 
 @pytest.mark.asyncio
@@ -3071,7 +2990,8 @@ async def test_interactive_ctrl_t_toggles_without_cancel(
         (
             "first",
             InteractiveComposerEvent(
-                kind=InteractiveComposerEventKind.TOGGLE_ACTIVITY,
+                kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+                running_key_action=RunningKeyAction.TOGGLE_ACTIVITY,
             ),
         )
     )

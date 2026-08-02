@@ -30,7 +30,6 @@ if os.name == "posix":
     import termios
 
 from dayu.cli.composer import (
-    InteractiveCancelSource,
     InteractiveComposerEvent,
     InteractiveComposerEventKind,
     InteractiveComposerPhase,
@@ -39,6 +38,7 @@ from dayu.cli.composer import (
     build_interactive_key_bindings,
     new_interactive_composer,
 )
+from dayu.cli.run_keys import RunningKeyAction
 
 _PTY_READINESS_TIMEOUT_SECONDS = 2.0
 _PTY_READINESS_POLL_SECONDS = 0.005
@@ -367,7 +367,7 @@ class _BufferChangeRecorder:
 
 
 def test_composer_event_rejects_open_field_combinations() -> None:
-    """typed event 必须拒绝缺 draft、额外 draft 与缺 cancel source。
+    """typed event 必须拒绝缺 draft、额外 draft 与缺 running action。
 
     :returns: ``None``。
     :raises AssertionError: 非法事件组合未在构造期拒绝时抛出。
@@ -380,8 +380,8 @@ def test_composer_event_rejects_open_field_combinations() -> None:
             kind=InteractiveComposerEventKind.EOF,
             draft="unexpected",
         )
-    with pytest.raises(ValueError, match="requires cancel source"):
-        InteractiveComposerEvent(kind=InteractiveComposerEventKind.CANCEL_ACTIVE)
+    with pytest.raises(ValueError, match="requires action"):
+        InteractiveComposerEvent(kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION)
     with pytest.raises(ValueError, match="non-negative"):
         InteractiveComposerEvent(
             kind=InteractiveComposerEventKind.EOF,
@@ -465,7 +465,7 @@ async def test_complete_csi_alt_and_bracketed_paste_do_not_emit_cancel(
     )
 
     assert event.kind is InteractiveComposerEventKind.SUBMIT
-    assert event.cancel_source is None
+    assert event.running_key_action is None
     assert event.draft is not None
     assert "问题" in event.draft
 
@@ -488,8 +488,8 @@ async def test_standalone_escape_waits_for_sequence_resolution_and_restores_draf
         pipe_input.send_text("ab\x1b[D\x1b")
         cancel_event = await asyncio.wait_for(cancel_task, timeout=2.0)
 
-        assert cancel_event.kind is InteractiveComposerEventKind.CANCEL_ACTIVE
-        assert cancel_event.cancel_source is InteractiveCancelSource.ESCAPE
+        assert cancel_event.kind is InteractiveComposerEventKind.RUNNING_KEY_ACTION
+        assert cancel_event.running_key_action is RunningKeyAction.CANCEL_RUN
 
         submit_task = asyncio.create_task(composer.read_event("dayu> "))
         pipe_input.send_text("X\r")
@@ -500,12 +500,29 @@ async def test_standalone_escape_waits_for_sequence_resolution_and_restores_draf
 
 
 @pytest.mark.asyncio
-async def test_ctrl_c_phase_matrix_and_submit_acknowledgement() -> None:
-    """Ctrl+C 应清 idle draft、active cancel，并只在确认后清草稿/history。
+async def test_ctrl_c_phase_matrix_uses_sigint_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl+C 应清 idle draft，并只通过唯一 SIGINT seam 通知 driver。
 
+    :param monkeypatch: pytest 属性替换夹具。
     :returns: ``None``。
     :raises AssertionError: phase 或 submit acknowledgement 语义不符时抛出。
     """
+
+    signal_count = 0
+
+    def record_sigint() -> None:
+        """记录 composer 转交给 SIGINT owner 的一次 Ctrl+C。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        nonlocal signal_count
+        signal_count += 1
+
+    monkeypatch.setattr(composer_module, "_raise_sigint", record_sigint)
 
     with create_pipe_input() as pipe_input:
         composer = PromptToolkitInteractiveComposer(
@@ -513,16 +530,18 @@ async def test_ctrl_c_phase_matrix_and_submit_acknowledgement() -> None:
             output=DummyOutput(),
         )
         idle_task = asyncio.create_task(composer.read_event("dayu> "))
-        pipe_input.send_text("   \x03\x03")
+        pipe_input.send_text("   \x03\x03\r")
         idle_event = await asyncio.wait_for(idle_task, timeout=2.0)
-        assert idle_event.kind is InteractiveComposerEventKind.IDLE_INTERRUPT
-        assert idle_event.input_revision > 0
+        assert idle_event.kind is InteractiveComposerEventKind.SUBMIT
+        assert idle_event.draft == ""
+        assert signal_count == 1
 
         composer.set_phase(InteractiveComposerPhase.RUNNING)
         cancel_task = asyncio.create_task(composer.read_event("dayu> "))
-        pipe_input.send_text("type-ahead\x03")
+        pipe_input.send_text("type-ahead\x03\x1b")
         cancel_event = await asyncio.wait_for(cancel_task, timeout=2.0)
-        assert cancel_event.cancel_source is InteractiveCancelSource.CTRL_C
+        assert cancel_event.running_key_action is RunningKeyAction.CANCEL_RUN
+        assert signal_count == 2
 
         submit_task = asyncio.create_task(composer.read_event("dayu> "))
         pipe_input.send_text("\r")
@@ -537,13 +556,31 @@ async def test_ctrl_c_phase_matrix_and_submit_acknowledgement() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("draft", ("非空草稿", "   "))
-async def test_ctrl_c_idle_draft_clears_before_idle_interrupt(draft: str) -> None:
-    """idle 非空或纯空白 draft 的首次 Ctrl+C 都只能清空并重绘。
+async def test_ctrl_c_idle_draft_clears_before_sigint(
+    draft: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """idle 非空 draft 的首次 Ctrl+C 清空，下一次才交给 SIGINT owner。
 
     :param draft: 待清空的非空或纯空白草稿。
+    :param monkeypatch: pytest 属性替换夹具。
     :returns: ``None``。
     :raises Exception: composer 未按期返回 typed event 时向上透传。
     """
+
+    signal_count = 0
+
+    def record_sigint() -> None:
+        """记录一次转交给 SIGINT owner 的 Ctrl+C。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        nonlocal signal_count
+        signal_count += 1
+
+    monkeypatch.setattr(composer_module, "_raise_sigint", record_sigint)
 
     with create_pipe_input() as pipe_input:
         composer = PromptToolkitInteractiveComposer(
@@ -554,10 +591,12 @@ async def test_ctrl_c_idle_draft_clears_before_idle_interrupt(draft: str) -> Non
         pipe_input.send_text(f"{draft}\x03")
         await asyncio.sleep(0.05)
         assert not task.done()
-        pipe_input.send_text("\x03")
+        pipe_input.send_text("\x03\r")
         event = await asyncio.wait_for(task, timeout=2.0)
 
-    assert event.kind is InteractiveComposerEventKind.IDLE_INTERRUPT
+    assert event.kind is InteractiveComposerEventKind.SUBMIT
+    assert event.draft == ""
+    assert signal_count == 1
     assert composer._draft == ""
 
 
@@ -1124,7 +1163,7 @@ async def test_real_posix_pty_exact_sequences_and_terminal_mode_restore() -> Non
     assert "paste\nbody" in submitted.draft
     assert ordinary_enter.kind is InteractiveComposerEventKind.SUBMIT
     assert ordinary_enter.draft == "ordinary"
-    assert cancelled.cancel_source is InteractiveCancelSource.ESCAPE
+    assert cancelled.running_key_action is RunningKeyAction.CANCEL_RUN
     assert _terminal_lflag_controls(restored_after_submit) == _terminal_lflag_controls(original_lflag)
     assert _terminal_lflag_controls(restored_after_ordinary_enter) == _terminal_lflag_controls(original_lflag)
     assert _terminal_lflag_controls(restored_after_escape) == _terminal_lflag_controls(original_lflag)

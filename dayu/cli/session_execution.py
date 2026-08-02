@@ -14,10 +14,11 @@ import asyncio
 import io
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import BinaryIO, Final, Never, TextIO
 
@@ -32,7 +33,6 @@ from dayu.cli.agent_entrypoint import (
 )
 from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.cli.composer import (
-    InteractiveCancelSource,
     InteractiveComposer,
     InteractiveComposerEvent,
     InteractiveComposerEventKind,
@@ -104,6 +104,7 @@ _INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
 _INTERACTIVE_QUEUED_DRAFT_MESSAGE: Final[str] = "Interactive: one follow-up is already queued; draft kept."
 _INTERACTIVE_INVALID_UTF8_MESSAGE: Final[str] = "interactive stdin is not valid UTF-8"
 _UsageErrorFactory = Callable[[str], ValueError]
+_CancelRunAndWait = Callable[[str, str], Awaitable[EntrypointRunTerminalResult]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,70 +143,222 @@ class PreparedInteractiveSessionExecution:
     usage_error_factory: _UsageErrorFactory
 
 
-class _PromptAcceptedRunState:
-    """prompt submit 后当前 accepted Run id 的本地状态。"""
+@dataclass(frozen=True, slots=True)
+class _PromptTurnOutcome:
+    """prompt outer driver 消费的 terminal 与 cleanup 后退出意图。
 
-    run_id: str | None
+    :param terminal: Host canonical terminal truth。
+    :param exit_after_cancel: second Ctrl+C 是否要求 outer cleanup 后返回 130。
+    """
 
-    def __init__(self) -> None:
-        """初始化 accepted Run 状态。
+    terminal: EntrypointRunTerminalResult
+    exit_after_cancel: bool
 
+
+class _LocalCancelIntent(StrEnum):
+    """单个 active turn 的单调本地取消意图。"""
+
+    NONE = "none"
+    CANCEL_REQUESTED = "cancel_requested"
+    EXIT_AFTER_CANCEL = "exit_after_cancel"
+
+
+@dataclass(slots=True)
+class _AcceptedRunBarrier:
+    """Host public acceptance callback 的唯一 Run id barrier。
+
+    :param accepted_run_id: Host callback 发布的 exact Run id。
+    :param accepted: acceptance 发布事件。
+    """
+
+    accepted_run_id: str | None = None
+    accepted: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def publish_accepted(self, run_id: str) -> None:
+        """发布 Host accepted Run id。
+
+        :param run_id: Host public acceptance callback 的 exact Run id。
         :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
+        :raises ValueError: Run id 为空或与已发布 identity 冲突时抛出。
         """
 
-        self.run_id = None
-
-    def record(self, run_id: str) -> None:
-        """记录 Host 已接受的 Run id。
-
-        :param run_id: Host accepted_run_id。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.run_id = run_id
-
-
-class _InteractiveAcceptedRunState:
-    """interactive 单轮 submit 后 accepted Run id 的本地状态。"""
-
-    run_id: str | None
-    _event: asyncio.Event
-
-    def __init__(self) -> None:
-        """初始化 accepted Run 状态。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.run_id = None
-        self._event = asyncio.Event()
-
-    def record(self, run_id: str) -> None:
-        """记录 Host 已接受的 Run id。
-
-        :param run_id: Host accepted_run_id。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.run_id = run_id
-        self._event.set()
+        if not run_id:
+            raise ValueError("accepted run id must not be empty")
+        if self.accepted_run_id is None:
+            self.accepted_run_id = run_id
+            self.accepted.set()
+            return
+        if self.accepted_run_id != run_id:
+            raise ValueError("accepted run id conflicts with published identity")
 
     async def wait_run_id(self) -> str:
-        """等待并返回 accepted Run id。
+        """等待并返回 Host callback 发布的 exact Run id。
 
-        :returns: Host accepted_run_id。
+        :returns: Host accepted Run id。
         :raises asyncio.CancelledError: 等待任务被取消时透传。
-        :raises RuntimeError: 状态事件触发但 run id 缺失时抛出。
+        :raises RuntimeError: event 已触发但 Run id 缺失时抛出。
         """
 
-        await self._event.wait()
-        if self.run_id is None:
+        await self.accepted.wait()
+        if self.accepted_run_id is None:
             raise RuntimeError("accepted run id missing")
-        return self.run_id
+        return self.accepted_run_id
+
+
+@dataclass(slots=True)
+class _ActiveTurnCloseout:
+    """协调单个 turn 的 acceptance、graceful cancel 与 canonical terminal。
+
+    本类型不持有或操作 composer、display、cursor、attachment、key/signal
+    monitor、generation、queued draft 或 history；这些副作用仍由 outer driver
+    唯一拥有。
+
+    :param cancel_run_and_wait: 针对本 turn 构造 Host cancel request 并等待
+        canonical terminal 的 typed callable。
+    :param barrier: Host public acceptance barrier。
+    :param intent: 当前单调本地取消意图。
+    """
+
+    cancel_run_and_wait: _CancelRunAndWait
+    barrier: _AcceptedRunBarrier = field(default_factory=_AcceptedRunBarrier)
+    intent: _LocalCancelIntent = _LocalCancelIntent.NONE
+    _cancel_reason: str | None = None
+    _cancel_task: asyncio.Task[EntrypointRunTerminalResult] | None = None
+    _terminal: EntrypointRunTerminalResult | None = None
+    _terminal_observed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def cancel_reason(self) -> str | None:
+        """返回首次冻结的 Host cancel reason。
+
+        :returns: 首次 cancel reason；尚未请求取消时为 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._cancel_reason
+
+    @property
+    def cancel_task(self) -> asyncio.Task[EntrypointRunTerminalResult] | None:
+        """返回 coordinator 唯一 Host cancel/terminal task。
+
+        :returns: 已创建的 cancel task；尚未请求取消时为 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._cancel_task
+
+    def publish_accepted(self, run_id: str) -> None:
+        """向唯一 acceptance barrier 发布 exact Run id。
+
+        :param run_id: Host public acceptance callback 的 exact Run id。
+        :returns: ``None``。
+        :raises ValueError: Run identity 冲突时抛出。
+        """
+
+        self.barrier.publish_accepted(run_id)
+
+    def request_cancel(
+        self,
+        *,
+        reason: str,
+        exit_after: bool,
+    ) -> _LocalCancelIntent:
+        """登记本地取消并确保至多一个 Host graceful cancel path。
+
+        :param reason: 首次请求冻结的 Host cancel reason。
+        :param exit_after: 是否把既有取消单调升级为 terminal 后退出意图。
+        :returns: 更新后的本地取消意图。
+        :raises ValueError: 首次 cancel reason 为空时抛出。
+        :raises RuntimeError: 当前线程没有运行中的 asyncio loop 时抛出。
+        """
+
+        if self.intent is _LocalCancelIntent.NONE:
+            if not reason:
+                raise ValueError("cancel reason must not be empty")
+            self._cancel_reason = reason
+            self.intent = _LocalCancelIntent.CANCEL_REQUESTED
+            self._cancel_task = asyncio.create_task(self.wait_accepted_then_cancel())
+            return self.intent
+        if exit_after:
+            self.intent = _LocalCancelIntent.EXIT_AFTER_CANCEL
+        return self.intent
+
+    async def wait_accepted_then_cancel(self) -> EntrypointRunTerminalResult:
+        """跨 acceptance barrier 发起一次 Host cancel 并等待 canonical terminal。
+
+        terminal 若先于 acceptance/cancel commit 到达，则保留真实 Host terminal，
+        且不发送迟到 cancel。
+
+        :returns: 本 turn 唯一 Host canonical terminal。
+        :raises asyncio.CancelledError: coordinator task 被 outer abnormal cleanup 取消时透传。
+        :raises RuntimeError: cancel reason 缺失或 terminal 状态不完整时抛出。
+        :raises Exception: Host cancel/terminal observation 失败时向上透传。
+        """
+
+        reason = self._cancel_reason
+        if reason is None:
+            raise RuntimeError("cancel reason missing")
+        accepted_task = asyncio.create_task(self.barrier.wait_run_id())
+        terminal_task = asyncio.create_task(self._terminal_observed.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                (accepted_task, terminal_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if terminal_task in done and accepted_task not in done:
+                return self._require_terminal()
+            run_id = await accepted_task
+            if self._terminal_observed.is_set():
+                return self._require_terminal()
+            terminal = await self.cancel_run_and_wait(run_id, reason)
+            self.observe_terminal(terminal)
+            return self._require_terminal()
+        finally:
+            await cancel_and_await_task(accepted_task)
+            await cancel_and_await_task(terminal_task)
+
+    def observe_terminal(self, result: EntrypointRunTerminalResult) -> None:
+        """记录本 turn 唯一 Host canonical terminal。
+
+        :param result: Host public terminal observation。
+        :returns: ``None``。
+        :raises ValueError: terminal Run identity 或结果与既有 truth 冲突时抛出。
+        """
+
+        accepted_run_id = self.barrier.accepted_run_id
+        if accepted_run_id is not None and result.run_id != accepted_run_id:
+            raise ValueError("terminal run id conflicts with accepted run id")
+        if self._terminal is None:
+            self._terminal = result
+            self._terminal_observed.set()
+            return
+        if self._terminal != result:
+            raise ValueError("terminal result conflicts with canonical terminal")
+
+    async def wait_closeout(self) -> EntrypointRunTerminalResult:
+        """等待 Host cancel 与 canonical terminal 协调完成。
+
+        :returns: 本 turn 唯一 Host canonical terminal。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        :raises RuntimeError: terminal event 与结果不一致时抛出。
+        :raises Exception: Host cancel/terminal task 失败时向上透传。
+        """
+
+        if self._cancel_task is not None:
+            await self._cancel_task
+        await self._terminal_observed.wait()
+        return self._require_terminal()
+
+    def _require_terminal(self) -> EntrypointRunTerminalResult:
+        """返回已观察 terminal 或报告 coordinator invariant failure。
+
+        :returns: 已观察的唯一 Host canonical terminal。
+        :raises RuntimeError: terminal 尚未记录时抛出。
+        """
+
+        if self._terminal is None:
+            raise RuntimeError("canonical terminal missing")
+        return self._terminal
 
 
 class _InteractiveExitIntent(StrEnum):
@@ -213,7 +366,6 @@ class _InteractiveExitIntent(StrEnum):
 
     CONTINUE = "continue"
     IDLE_EXIT_PENDING = "idle_exit_pending"
-    EXIT_AFTER_CANCEL = "exit_after_cancel"
 
 
 @dataclass(slots=True)
@@ -223,19 +375,15 @@ class _InteractiveActiveTurn:
     :param generation: 当前 turn 的 REPL generation。
     :param turn_index: 当前 invocation 内稳定轮次序号。
     :param submit_task: submit + canonical terminal waiter。
-    :param accepted_run: Host acceptance barrier 发布的 Run id 状态。
-    :param cancel_reason: 已合并的 single cancel 原因。
-    :param acceptance_task: cancel 等待 acceptance 的本地 task。
-    :param cancel_task: Host graceful cancel + canonical terminal waiter。
+    :param closeout: 本 turn 唯一 acceptance/cancel/terminal coordinator。
+    :param cancel_rendered: outer driver 是否已展示 cancel requested。
     """
 
     generation: int
     turn_index: int
     submit_task: asyncio.Task[EntrypointRunTerminalResult]
-    accepted_run: _InteractiveAcceptedRunState
-    cancel_reason: str | None = None
-    acceptance_task: asyncio.Task[str] | None = None
-    cancel_task: asyncio.Task[EntrypointRunTerminalResult] | None = None
+    closeout: _ActiveTurnCloseout
+    cancel_rendered: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,12 +392,12 @@ class _InteractiveQueuedFollowup:
 
     :param turn_index: queued submit 的稳定轮次序号。
     :param submit_task: queued submit + terminal waiter。
-    :param accepted_run: queued acceptance barrier 状态。
+    :param closeout: queued turn 原有 coordinator identity。
     """
 
     turn_index: int
     submit_task: asyncio.Task[EntrypointRunTerminalResult]
-    accepted_run: _InteractiveAcceptedRunState
+    closeout: _ActiveTurnCloseout
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,7 +537,7 @@ async def execute_prompt_on_session(
 
     attachment = await host.attach_session(session_id)
     try:
-        terminal = await _submit_prompt_turn_handling_sigint(
+        outcome = await _submit_prompt_turn_handling_sigint(
             host=host,
             runtime=prepared.runtime,
             invocation=prepared.invocation,
@@ -401,8 +549,7 @@ async def execute_prompt_on_session(
             thinking_renderer=_new_thinking_renderer() if thinking else None,
             key_monitor=new_running_key_monitor(),
         )
-        if terminal is None:
-            return EXIT_KEYBOARD_INTERRUPT
+        terminal = outcome.terminal
         render_exit_code = render_prompt_terminal_result(terminal)
         await advance_cli_terminal_cursor(
             workspace_root=prepared.workspace_root,
@@ -410,6 +557,8 @@ async def execute_prompt_on_session(
             terminal_event_id=terminal.terminal_event_id,
             event_sequence=terminal.event_sequence,
         )
+        if outcome.exit_after_cancel:
+            return EXIT_KEYBOARD_INTERRUPT
         return render_exit_code
     finally:
         await asyncio.shield(attachment.aclose())
@@ -895,7 +1044,7 @@ async def _submit_prompt_turn_handling_sigint(
     activity_renderer: CliActivityRenderer | None = None,
     thinking_renderer: CliThinkingRenderer | None = None,
     key_monitor: RunningKeyMonitor | None = None,
-) -> EntrypointRunTerminalResult | None:
+) -> _PromptTurnOutcome:
     """提交 prompt turn，并在 SIGINT 时按 Host public cancel 语义收口。
 
     :param host: Host public handle。
@@ -908,11 +1057,17 @@ async def _submit_prompt_turn_handling_sigint(
     :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
     :param thinking_renderer: 运行态 thinking renderer；``None`` 表示不输出。
     :param key_monitor: 运行态 TTY 按键 monitor；``None`` 表示 no-op。
-    :returns: Host terminal result；Run accepted 前 SIGINT 返回 ``None``。
+    :returns: Host terminal 与 second Ctrl+C cleanup 后退出意图。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
-    accepted_run = _PromptAcceptedRunState()
+    closeout = _ActiveTurnCloseout(
+        cancel_run_and_wait=partial(
+            _cancel_prompt_run_for_closeout,
+            host=host,
+            invocation=invocation,
+        )
+    )
     renderer = activity_renderer
     thinking = thinking_renderer
     runtime_display = _new_runtime_display_controller(
@@ -925,6 +1080,7 @@ async def _submit_prompt_turn_handling_sigint(
     key_task: asyncio.Task[RunningKeyAction] | None = None
     primary_error: BaseException | None = None
     terminal_result: EntrypointRunTerminalResult | None = None
+    observed_turn_sigint_count = 0
     try:
         if runtime_display is not None:
             await runtime_display.install_runtime_line_guard()
@@ -952,7 +1108,7 @@ async def _submit_prompt_turn_handling_sigint(
                 ),
                 scene_inputs=runtime.scene_inputs,
                 host_assembly=runtime.host_assembly,
-                on_run_accepted=accepted_run.record,
+                on_run_accepted=closeout.publish_accepted,
                 on_activity=None if renderer is None else renderer.record,
                 on_thinking=None if thinking is None else thinking.record,
                 callback_execution_port=runtime_display,
@@ -961,41 +1117,76 @@ async def _submit_prompt_turn_handling_sigint(
         sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
         key_task = asyncio.create_task(monitor.wait_next())
         while True:
+            wait_tasks: set[
+                asyncio.Task[EntrypointRunTerminalResult]
+                | asyncio.Task[int]
+                | asyncio.Task[RunningKeyAction]
+            ] = {submit_task, sigint_task, key_task}
+            cancel_task = closeout.cancel_task
+            if cancel_task is not None and not cancel_task.done():
+                wait_tasks.add(cancel_task)
             done, _pending = await asyncio.wait(
-                (submit_task, sigint_task, key_task),
+                wait_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if submit_task in done:
-                terminal_result = await submit_task
-                if runtime_display is not None:
-                    await runtime_display.finish_runtime_display()
-                break
             if key_task in done:
                 action = await key_task
                 if action is RunningKeyAction.TOGGLE_ACTIVITY:
                     if runtime_display is not None:
                         await runtime_display.toggle_activity_display()
-                    key_task = asyncio.create_task(monitor.wait_next())
-                    continue
-                terminal_result = await _cancel_prompt_turn_after_local_request(
-                    host=host,
-                    invocation=invocation,
-                    accepted_run=accepted_run,
-                    submit_task=submit_task,
-                    runtime_display=runtime_display,
+                else:
+                    was_pending = closeout.intent is not _LocalCancelIntent.NONE
+                    closeout.request_cancel(
+                        reason=CLI_SIGINT_REASON,
+                        exit_after=False,
+                    )
+                    if not was_pending:
+                        if runtime_display is not None:
+                            await runtime_display.finish_thinking_display()
+                            await runtime_display.render_cancel_requested()
+                key_task = asyncio.create_task(monitor.wait_next())
+            if sigint_task in done:
+                new_sigint_count = await sigint_task
+                pending_interrupts = new_sigint_count - observed_sigint_count
+                observed_sigint_count = new_sigint_count
+                for _interrupt_index in range(pending_interrupts):
+                    observed_turn_sigint_count += 1
+                    was_pending = closeout.intent is not _LocalCancelIntent.NONE
+                    exit_after = observed_turn_sigint_count >= 2
+                    closeout.request_cancel(
+                        reason=CLI_SIGINT_REASON,
+                        exit_after=exit_after,
+                    )
+                    if not was_pending:
+                        if runtime_display is not None:
+                            await runtime_display.finish_thinking_display()
+                            await runtime_display.render_cancel_requested()
+                    elif exit_after and runtime_display is not None:
+                        await runtime_display.render_local_exit_after_cancel()
+                sigint_task = asyncio.create_task(
+                    sigint_monitor.wait_next(observed_sigint_count)
                 )
+            if submit_task in done:
+                closeout.observe_terminal(await submit_task)
+                terminal_result = await closeout.wait_closeout()
+                if runtime_display is not None:
+                    await runtime_display.finish_runtime_display()
                 break
-            await sigint_task
-            terminal_result = await _cancel_prompt_turn_after_local_request(
-                host=host,
-                invocation=invocation,
-                accepted_run=accepted_run,
-                submit_task=submit_task,
-                runtime_display=runtime_display,
-            )
-            break
+            cancel_task = closeout.cancel_task
+            if cancel_task is not None and cancel_task in done:
+                terminal_result = await closeout.wait_closeout()
+                if runtime_display is not None:
+                    await runtime_display.finish_runtime_display()
+                break
     except BaseException as error:
         primary_error = error
+    closeout_cleanup_error: BaseException | None = None
+    closeout_task = closeout.cancel_task
+    if closeout_task is not None and not closeout_task.done():
+        try:
+            await cancel_and_await_task(closeout_task)
+        except BaseException as error:
+            closeout_cleanup_error = error
     cleanup_error = await _close_prompt_lifecycle(
         runtime_display=runtime_display,
         monitor=monitor,
@@ -1004,61 +1195,35 @@ async def _submit_prompt_turn_handling_sigint(
         sigint_task=sigint_task,
         key_task=key_task,
     )
+    if closeout_cleanup_error is not None:
+        if cleanup_error is not None:
+            _append_lifecycle_cleanup_cause(closeout_cleanup_error, cleanup_error)
+        cleanup_error = closeout_cleanup_error
     if primary_error is not None:
         _raise_lifecycle_primary(primary_error, cleanup_error)
     if cleanup_error is not None:
         raise cleanup_error
-    return terminal_result
-
-
-async def _cancel_prompt_turn_after_local_request(
-    *,
-    host: Host,
-    invocation: CliInvocation,
-    accepted_run: _PromptAcceptedRunState,
-    submit_task: asyncio.Task[EntrypointRunTerminalResult],
-    runtime_display: RuntimeDisplayController | None,
-) -> EntrypointRunTerminalResult | None:
-    """本地取消请求后取消 prompt turn 并等待 Host terminal。
-
-    :param host: Host public handle。
-    :param invocation: 当前 CLI invocation 身份。
-    :param accepted_run: 本轮 accepted Run id 状态。
-    :param submit_task: 正在运行的 submit / terminal wait task。
-    :param runtime_display: 运行态展示 controller。
-    :returns: cancel 后 terminal result；Run accepted 前返回 ``None``。
-    :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
-    """
-
-    if runtime_display is not None:
-        await runtime_display.finish_thinking_display()
-    if submit_task.done():
-        return await submit_task
-    submit_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await submit_task
-    if accepted_run.run_id is None:
-        return None
-    if runtime_display is not None:
-        await runtime_display.render_cancel_requested()
-    return await _cancel_prompt_run_and_wait_for_terminal(
-        host=host,
-        invocation=invocation,
-        run_id=accepted_run.run_id,
+    if terminal_result is None:
+        raise RuntimeError("prompt canonical terminal missing")
+    return _PromptTurnOutcome(
+        terminal=terminal_result,
+        exit_after_cancel=closeout.intent is _LocalCancelIntent.EXIT_AFTER_CANCEL,
     )
 
 
-async def _cancel_prompt_run_and_wait_for_terminal(
+async def _cancel_prompt_run_for_closeout(
+    run_id: str,
+    reason: str,
     *,
     host: Host,
     invocation: CliInvocation,
-    run_id: str,
 ) -> EntrypointRunTerminalResult:
     """发起 prompt Host graceful cancel，并等待 canonical terminal。
 
     :param host: Host public handle。
     :param invocation: 当前 CLI invocation 身份。
     :param run_id: 待取消 Run id。
+    :param reason: 首次本地取消冻结的 Host reason。
     :returns: Host canonical cancel terminal result。
     :raises Exception: cancel 或 terminal observation 失败时向上抛出。
     """
@@ -1076,7 +1241,7 @@ async def _cancel_prompt_run_and_wait_for_terminal(
                 turn_index=PROMPT_TURN_INDEX,
                 run_id=run_id,
             ),
-            reason=CLI_SIGINT_REASON,
+            reason=reason,
             mode=CancelMode.GRACEFUL,
         ),
     )
@@ -1177,8 +1342,6 @@ async def _run_interactive_non_tty_batch(
         runtime_display=runtime_display,
     )
     terminal, exit_after_cancel = await _wait_interactive_batch_terminal_handling_sigint(
-        host=host,
-        invocation=invocation,
         active=active,
         sigint_monitor=sigint_monitor,
         runtime_display=runtime_display,
@@ -1197,8 +1360,6 @@ async def _run_interactive_non_tty_batch(
 
 async def _wait_interactive_batch_terminal_handling_sigint(
     *,
-    host: Host,
-    invocation: CliInvocation,
     active: _InteractiveActiveTurn,
     sigint_monitor: CliSigintMonitor,
     runtime_display: RuntimeDisplayController | None,
@@ -1209,8 +1370,6 @@ async def _wait_interactive_batch_terminal_handling_sigint(
     ``130``；后续中断不再改变状态。submit 与 cancel canonical waiter 在正常
     SIGINT 路径始终保留到 Host terminal，只有调用方异常取消本 helper 时才回收。
 
-    :param host: Host public handle。
-    :param invocation: 当前 CLI invocation 身份。
     :param active: whole-batch 唯一 active turn。
     :param sigint_monitor: invocation 唯一 OS SIGINT monitor。
     :param runtime_display: 可选串行 display controller。
@@ -1221,7 +1380,7 @@ async def _wait_interactive_batch_terminal_handling_sigint(
 
     observed_sigint_count = sigint_monitor.count
     sigint_task: asyncio.Task[int] | None = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
-    exit_after_cancel = False
+    observed_turn_sigint_count = 0
     normal_completion = False
     try:
         while True:
@@ -1230,82 +1389,63 @@ async def _wait_interactive_batch_terminal_handling_sigint(
             }
             if sigint_task is not None:
                 wait_tasks.add(sigint_task)
-            if active.acceptance_task is not None and not active.acceptance_task.done():
-                wait_tasks.add(active.acceptance_task)
-            if active.cancel_task is not None and not active.cancel_task.done():
-                wait_tasks.add(active.cancel_task)
+            cancel_task = active.closeout.cancel_task
+            if cancel_task is not None and not cancel_task.done():
+                wait_tasks.add(cancel_task)
             done, _pending = await asyncio.wait(
                 wait_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-
-            if active.submit_task in done:
-                terminal = await active.submit_task
-                cancel_error: BaseException | None = None
-                if active.cancel_task is not None:
-                    try:
-                        cancel_terminal = await active.cancel_task
-                        if cancel_terminal.run_id != terminal.run_id:
-                            raise RuntimeError("interactive cancel terminal run id mismatch")
-                    except BaseException as error:
-                        cancel_error = error
-                if active.acceptance_task is not None:
-                    await cancel_and_await_task(active.acceptance_task)
-                if cancel_error is not None:
-                    raise cancel_error
-                normal_completion = True
-                return terminal, exit_after_cancel
-
-            if (
-                active.acceptance_task is not None
-                and active.acceptance_task in done
-                and active.cancel_reason is not None
-                and active.cancel_task is None
-            ):
-                run_id = await active.acceptance_task
-                if runtime_display is not None:
-                    await runtime_display.render_cancel_requested()
-                active.cancel_task = _start_interactive_cancel_task(
-                    host=host,
-                    invocation=invocation,
-                    active=active,
-                    run_id=run_id,
-                )
-
-            if active.cancel_task is not None and active.cancel_task in done and active.submit_task not in done:
-                await active.cancel_task
 
             if sigint_task is not None and sigint_task in done:
                 new_sigint_count = await sigint_task
                 sigint_task = None
                 pending_interrupts = new_sigint_count - observed_sigint_count
                 observed_sigint_count = new_sigint_count
-                if pending_interrupts > 0 and active.cancel_reason is None:
+                for _interrupt_index in range(pending_interrupts):
+                    observed_turn_sigint_count += 1
                     await _request_interactive_cancel(
-                        host=host,
-                        invocation=invocation,
                         active=active,
                         reason=CLI_SIGINT_REASON,
                         composer=None,
                         runtime_display=runtime_display,
+                        exit_after=observed_turn_sigint_count >= 2,
                     )
-                    pending_interrupts -= 1
-                if pending_interrupts > 0 and not exit_after_cancel:
-                    exit_after_cancel = True
-                    if runtime_display is not None:
-                        await runtime_display.render_local_exit_after_cancel()
+
+            await _render_interactive_cancel_requested_once(
+                active=active,
+                runtime_display=runtime_display,
+            )
+
+            if active.submit_task in done:
+                active.closeout.observe_terminal(await active.submit_task)
+                terminal = await active.closeout.wait_closeout()
+                normal_completion = True
+                return (
+                    terminal,
+                    active.closeout.intent is _LocalCancelIntent.EXIT_AFTER_CANCEL,
+                )
+
+            cancel_task = active.closeout.cancel_task
+            if cancel_task is not None and cancel_task in done:
+                terminal = await active.closeout.wait_closeout()
+                normal_completion = True
+                return (
+                    terminal,
+                    active.closeout.intent is _LocalCancelIntent.EXIT_AFTER_CANCEL,
+                )
 
             if sigint_task is None:
                 sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
     finally:
         if sigint_task is not None:
             await cancel_and_await_task(sigint_task)
-        if active.acceptance_task is not None and not active.acceptance_task.done():
-            await cancel_and_await_task(active.acceptance_task)
-        if not normal_completion:
-            if active.cancel_task is not None:
-                await cancel_and_await_task(active.cancel_task)
+        if not active.submit_task.done():
             await cancel_and_await_task(active.submit_task)
+        if not normal_completion:
+            cancel_task = active.closeout.cancel_task
+            if cancel_task is not None:
+                await cancel_and_await_task(cancel_task)
 
 
 async def _drive_interactive_tty_repl(
@@ -1344,7 +1484,8 @@ async def _drive_interactive_tty_repl(
     current: _InteractiveActiveTurn | None = None
     queued: _InteractiveQueuedFollowup | None = None
     exit_intent = _InteractiveExitIntent.CONTINUE
-    idle_interrupt_revision: int | None = None
+    exit_after_closeout = False
+    active_sigint_count = 0
     deferred_exit_code: int | None = None
     composer.set_phase(InteractiveComposerPhase.IDLE)
     composer_task: asyncio.Task[_InteractiveComposerCompletion] | None = asyncio.create_task(
@@ -1354,7 +1495,6 @@ async def _drive_interactive_tty_repl(
         )
     )
     observed_sigint_count = sigint_monitor.count
-    sigint_generation = generation
     sigint_task: asyncio.Task[int] | None = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
     normal_completion = False
     try:
@@ -1366,82 +1506,15 @@ async def _drive_interactive_tty_repl(
                 wait_tasks.add(sigint_task)
             if current is not None:
                 wait_tasks.add(current.submit_task)
-                if current.acceptance_task is not None and not current.acceptance_task.done():
-                    wait_tasks.add(current.acceptance_task)
-                if current.cancel_task is not None and not current.cancel_task.done():
-                    wait_tasks.add(current.cancel_task)
+                cancel_task = current.closeout.cancel_task
+                if cancel_task is not None and not cancel_task.done():
+                    wait_tasks.add(cancel_task)
             if not wait_tasks:
                 raise RuntimeError("interactive TTY driver has no waitable owner")
             done, _pending = await asyncio.wait(
                 wait_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-
-            terminal_generation: int | None = None
-            if current is not None and current.submit_task in done:
-                completed = current
-                terminal = await completed.submit_task
-                cancel_error: BaseException | None = None
-                if completed.cancel_task is not None:
-                    try:
-                        cancel_terminal = await completed.cancel_task
-                        if cancel_terminal.run_id != terminal.run_id:
-                            raise RuntimeError("interactive cancel terminal run id mismatch")
-                    except BaseException as error:
-                        cancel_error = error
-                if completed.acceptance_task is not None:
-                    await cancel_and_await_task(completed.acceptance_task)
-                terminal_exit_code = await _finish_interactive_terminal(
-                    terminal=terminal,
-                    workspace_root=workspace_root,
-                    session_id=session_id,
-                    run_view=run_view,
-                    runtime_display=runtime_display,
-                )
-                if terminal_exit_code != EXIT_SUCCESS:
-                    deferred_exit_code = terminal_exit_code
-                terminal_generation = completed.generation
-                current = None
-                generation += 1
-                if queued is not None:
-                    current = _promote_interactive_queued_followup(
-                        queued=queued,
-                        generation=generation,
-                    )
-                    queued = None
-                    composer.set_phase(InteractiveComposerPhase.RUNNING)
-                else:
-                    composer.set_phase(InteractiveComposerPhase.IDLE)
-                if cancel_error is not None:
-                    raise cancel_error
-
-            if (
-                current is not None
-                and current.acceptance_task is not None
-                and current.acceptance_task in done
-                and current.cancel_reason is not None
-                and current.cancel_task is None
-            ):
-                run_id = await current.acceptance_task
-                if runtime_display is not None:
-                    await runtime_display.render_cancel_requested()
-                current.cancel_task = _start_interactive_cancel_task(
-                    host=host,
-                    invocation=invocation,
-                    active=current,
-                    run_id=run_id,
-                )
-
-            if (
-                current is not None
-                and current.cancel_task is not None
-                and current.cancel_task in done
-                and current.submit_task not in done
-            ):
-                # cancel waiter 的失败必须由它自己的 owner 立即传播，不能等一个
-                # 可能永不出现的 submit terminal 才被观察。成功 terminal 仍由
-                # submit canonical waiter 作为 current truth 完成统一收口。
-                await current.cancel_task
 
             if composer_task is not None and composer_task in done:
                 completion = await composer_task
@@ -1450,15 +1523,13 @@ async def _drive_interactive_tty_repl(
                 stale_control = (
                     event.kind
                     in {
-                        InteractiveComposerEventKind.CANCEL_ACTIVE,
-                        InteractiveComposerEventKind.TOGGLE_ACTIVITY,
+                        InteractiveComposerEventKind.RUNNING_KEY_ACTION,
                     }
                     and completion.generation != generation
                 )
                 if not stale_control and deferred_exit_code is None:
                     if event.kind is InteractiveComposerEventKind.SUBMIT:
                         exit_intent = _InteractiveExitIntent.CONTINUE
-                        idle_interrupt_revision = None
                         draft = event.draft
                         if draft is None:
                             raise RuntimeError("interactive submit event draft is missing")
@@ -1499,40 +1570,26 @@ async def _drive_interactive_tty_repl(
                             composer.accept_submit(record_history=True)
                         else:
                             print(_INTERACTIVE_QUEUED_DRAFT_MESSAGE, file=sys.stderr)
-                    elif event.kind is InteractiveComposerEventKind.CANCEL_ACTIVE:
-                        if current is not None:
-                            if current.cancel_reason is None:
-                                await _request_interactive_cancel(
-                                    host=host,
-                                    invocation=invocation,
-                                    active=current,
-                                    reason=CLI_SIGINT_REASON,
-                                    composer=composer,
-                                    runtime_display=runtime_display,
-                                )
-                            elif (
-                                event.cancel_source is InteractiveCancelSource.CTRL_C
-                                and exit_intent is not _InteractiveExitIntent.EXIT_AFTER_CANCEL
-                            ):
-                                exit_intent = _InteractiveExitIntent.EXIT_AFTER_CANCEL
-                                if runtime_display is not None:
-                                    await runtime_display.render_local_exit_after_cancel()
-                    elif event.kind is InteractiveComposerEventKind.TOGGLE_ACTIVITY:
-                        if current is not None and runtime_display is not None:
+                    elif event.kind is InteractiveComposerEventKind.RUNNING_KEY_ACTION:
+                        action = event.running_key_action
+                        if action is None:
+                            raise RuntimeError("interactive running key action is missing")
+                        if action is RunningKeyAction.CANCEL_RUN and current is not None:
+                            await _request_interactive_cancel(
+                                active=current,
+                                reason=CLI_SIGINT_REASON,
+                                composer=composer,
+                                runtime_display=runtime_display,
+                                exit_after=False,
+                            )
+                        elif (
+                            action is RunningKeyAction.TOGGLE_ACTIVITY
+                            and current is not None
+                            and runtime_display is not None
+                        ):
                             await runtime_display.toggle_activity_display()
-                    elif event.kind is InteractiveComposerEventKind.IDLE_INTERRUPT:
-                        if current is None:
-                            if (
-                                exit_intent is _InteractiveExitIntent.IDLE_EXIT_PENDING
-                                and idle_interrupt_revision == event.input_revision
-                            ):
-                                normal_completion = True
-                                return EXIT_KEYBOARD_INTERRUPT
-                            exit_intent = _InteractiveExitIntent.IDLE_EXIT_PENDING
-                            idle_interrupt_revision = event.input_revision
                     elif event.kind is InteractiveComposerEventKind.EOF:
                         exit_intent = _InteractiveExitIntent.CONTINUE
-                        idle_interrupt_revision = None
                         if current is None:
                             normal_completion = True
                             return EXIT_SUCCESS
@@ -1540,40 +1597,80 @@ async def _drive_interactive_tty_repl(
             if sigint_task is not None and sigint_task in done:
                 new_sigint_count = await sigint_task
                 sigint_task = None
+                pending_interrupts = new_sigint_count - observed_sigint_count
                 observed_sigint_count = new_sigint_count
-                if terminal_generation is None or sigint_generation != terminal_generation:
+                for _interrupt_index in range(pending_interrupts):
                     if current is None:
                         if exit_intent is _InteractiveExitIntent.IDLE_EXIT_PENDING:
                             normal_completion = True
                             return EXIT_KEYBOARD_INTERRUPT
                         exit_intent = _InteractiveExitIntent.IDLE_EXIT_PENDING
-                        idle_interrupt_revision = None
-                    elif current.cancel_reason is None:
-                        await _request_interactive_cancel(
-                            host=host,
-                            invocation=invocation,
-                            active=current,
-                            reason=CLI_SIGINT_REASON,
-                            composer=composer,
-                            runtime_display=runtime_display,
-                        )
-                    elif exit_intent is not _InteractiveExitIntent.EXIT_AFTER_CANCEL:
-                        exit_intent = _InteractiveExitIntent.EXIT_AFTER_CANCEL
-                        if runtime_display is not None:
-                            await runtime_display.render_local_exit_after_cancel()
+                        continue
+                    active_sigint_count += 1
+                    exit_after = active_sigint_count >= 2
+                    await _request_interactive_cancel(
+                        active=current,
+                        reason=CLI_SIGINT_REASON,
+                        composer=composer,
+                        runtime_display=runtime_display,
+                        exit_after=exit_after,
+                    )
+                    if exit_after:
+                        exit_after_closeout = True
                         if composer_task is not None:
                             await cancel_and_await_task(composer_task)
                             composer_task = None
 
+            if current is not None:
+                await _render_interactive_cancel_requested_once(
+                    active=current,
+                    runtime_display=runtime_display,
+                )
+
+            current_cancel_task = None if current is None else current.closeout.cancel_task
+            if current is not None and (
+                current.submit_task in done
+                or (current_cancel_task is not None and current_cancel_task in done)
+            ):
+                completed = current
+                if completed.submit_task in done:
+                    completed.closeout.observe_terminal(await completed.submit_task)
+                terminal = await completed.closeout.wait_closeout()
+                terminal_exit_code = await _finish_interactive_terminal(
+                    terminal=terminal,
+                    workspace_root=workspace_root,
+                    session_id=session_id,
+                    run_view=run_view,
+                    runtime_display=runtime_display,
+                )
+                if terminal_exit_code != EXIT_SUCCESS:
+                    deferred_exit_code = terminal_exit_code
+                if completed.closeout.intent is _LocalCancelIntent.EXIT_AFTER_CANCEL:
+                    exit_after_closeout = True
+                if not completed.submit_task.done():
+                    await cancel_and_await_task(completed.submit_task)
+                current = None
+                generation += 1
+                active_sigint_count = 0
+                if queued is not None:
+                    current = _promote_interactive_queued_followup(
+                        queued=queued,
+                        generation=generation,
+                    )
+                    queued = None
+                    composer.set_phase(InteractiveComposerPhase.RUNNING)
+                else:
+                    composer.set_phase(InteractiveComposerPhase.IDLE)
+
             if current is None and (
-                deferred_exit_code is not None or exit_intent is _InteractiveExitIntent.EXIT_AFTER_CANCEL
+                deferred_exit_code is not None or exit_after_closeout
             ):
                 normal_completion = True
                 if deferred_exit_code is not None:
                     return deferred_exit_code
                 return EXIT_KEYBOARD_INTERRUPT
 
-            accepting_input = deferred_exit_code is None and exit_intent is not _InteractiveExitIntent.EXIT_AFTER_CANCEL
+            accepting_input = deferred_exit_code is None and not exit_after_closeout
             if composer_task is None and accepting_input:
                 composer_task = asyncio.create_task(
                     _read_interactive_composer_event(
@@ -1582,19 +1679,19 @@ async def _drive_interactive_tty_repl(
                     )
                 )
             if sigint_task is None:
-                sigint_generation = generation
-                sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+                sigint_task = asyncio.create_task(
+                    sigint_monitor.wait_next(observed_sigint_count)
+                )
     finally:
         if composer_task is not None:
             await cancel_and_await_task(composer_task)
         if sigint_task is not None:
             await cancel_and_await_task(sigint_task)
-        if current is not None and current.acceptance_task is not None:
-            await cancel_and_await_task(current.acceptance_task)
         if not normal_completion:
             if current is not None:
-                if current.cancel_task is not None:
-                    await cancel_and_await_task(current.cancel_task)
+                cancel_task = current.closeout.cancel_task
+                if cancel_task is not None:
+                    await cancel_and_await_task(cancel_task)
                 await cancel_and_await_task(current.submit_task)
             if queued is not None:
                 await cancel_and_await_task(queued.submit_task)
@@ -1653,7 +1750,14 @@ def _start_interactive_turn(
     :raises Exception: task 创建失败时向上透传。
     """
 
-    accepted_run = _InteractiveAcceptedRunState()
+    closeout = _ActiveTurnCloseout(
+        cancel_run_and_wait=partial(
+            _cancel_interactive_run_for_closeout,
+            host=host,
+            invocation=invocation,
+            turn_index=turn_index,
+        )
+    )
     return _InteractiveActiveTurn(
         generation=generation,
         turn_index=turn_index,
@@ -1665,12 +1769,12 @@ def _start_interactive_turn(
             turn_index=turn_index,
             user_prompt=user_prompt,
             run_overrides=run_overrides,
-            accepted_run=accepted_run,
+            closeout=closeout,
             run_view=run_view,
             thinking_renderer=thinking_renderer,
             runtime_display=runtime_display,
         ),
-        accepted_run=accepted_run,
+        closeout=closeout,
     )
 
 
@@ -1703,7 +1807,14 @@ def _start_interactive_queued_followup(
     :raises Exception: task 创建失败时向上透传。
     """
 
-    accepted_run = _InteractiveAcceptedRunState()
+    closeout = _ActiveTurnCloseout(
+        cancel_run_and_wait=partial(
+            _cancel_interactive_run_for_closeout,
+            host=host,
+            invocation=invocation,
+            turn_index=turn_index,
+        )
+    )
     return _InteractiveQueuedFollowup(
         turn_index=turn_index,
         submit_task=_create_interactive_submit_task(
@@ -1714,12 +1825,12 @@ def _start_interactive_queued_followup(
             turn_index=turn_index,
             user_prompt=user_prompt,
             run_overrides=run_overrides,
-            accepted_run=accepted_run,
+            closeout=closeout,
             run_view=run_view,
             thinking_renderer=thinking_renderer,
             runtime_display=runtime_display,
         ),
-        accepted_run=accepted_run,
+        closeout=closeout,
     )
 
 
@@ -1732,7 +1843,7 @@ def _create_interactive_submit_task(
     turn_index: int,
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
-    accepted_run: _InteractiveAcceptedRunState,
+    closeout: _ActiveTurnCloseout,
     run_view: InteractiveRunView | None,
     thinking_renderer: CliThinkingRenderer | None,
     runtime_display: RuntimeDisplayController | None,
@@ -1746,7 +1857,7 @@ def _create_interactive_submit_task(
     :param turn_index: 稳定轮次序号。
     :param user_prompt: outer-trim 后的用户输入。
     :param run_overrides: 执行 override。
-    :param accepted_run: acceptance barrier 状态 owner。
+    :param closeout: 本 turn 唯一 acceptance/cancel/terminal coordinator。
     :param run_view: 可选 run view。
     :param thinking_renderer: 可选 thinking renderer。
     :param runtime_display: 可选 display controller。
@@ -1775,7 +1886,7 @@ def _create_interactive_submit_task(
             ),
             scene_inputs=runtime.scene_inputs,
             host_assembly=runtime.host_assembly,
-            on_run_accepted=accepted_run.record,
+            on_run_accepted=closeout.publish_accepted,
             on_activity=(None if run_view is None else run_view.activity_sink().record_activity),
             on_thinking=(None if thinking_renderer is None else thinking_renderer.record),
             callback_execution_port=runtime_display,
@@ -1800,90 +1911,108 @@ def _promote_interactive_queued_followup(
         generation=generation,
         turn_index=queued.turn_index,
         submit_task=queued.submit_task,
-        accepted_run=queued.accepted_run,
+        closeout=queued.closeout,
     )
 
 
 async def _request_interactive_cancel(
     *,
-    host: Host,
-    invocation: CliInvocation,
     active: _InteractiveActiveTurn,
     reason: str,
     composer: InteractiveComposer | None,
     runtime_display: RuntimeDisplayController | None,
+    exit_after: bool,
 ) -> None:
     """按 current generation 合并并启动 single graceful cancel intent。
 
-    :param host: Host public handle。
-    :param invocation: 当前 CLI invocation 身份。
     :param active: 当前 active turn。
     :param reason: Host cancel reason。
     :param composer: TTY invocation 唯一 composer；non-TTY 时为 ``None``。
     :param runtime_display: 可选 display controller。
+    :param exit_after: 是否由 second Ctrl+C 升级为 terminal 后退出。
     :returns: ``None``。
     :raises Exception: display 或 cancel task 创建失败时向上透传。
     """
 
-    if active.cancel_reason is not None:
+    previous_intent = active.closeout.intent
+    was_pending = previous_intent is not _LocalCancelIntent.NONE
+    active.closeout.request_cancel(
+        reason=reason,
+        exit_after=exit_after,
+    )
+    if was_pending:
+        if (
+            exit_after
+            and previous_intent is not _LocalCancelIntent.EXIT_AFTER_CANCEL
+            and runtime_display is not None
+        ):
+            await runtime_display.render_local_exit_after_cancel()
         return
-    active.cancel_reason = reason
     if composer is not None:
         composer.set_phase(InteractiveComposerPhase.CANCELLING)
     if runtime_display is not None:
         await runtime_display.finish_thinking_display()
-    run_id = active.accepted_run.run_id
-    if run_id is None:
-        active.acceptance_task = asyncio.create_task(active.accepted_run.wait_run_id())
-        return
-    if runtime_display is not None:
-        await runtime_display.render_cancel_requested()
-    active.cancel_task = _start_interactive_cancel_task(
-        host=host,
-        invocation=invocation,
+    await _render_interactive_cancel_requested_once(
         active=active,
-        run_id=run_id,
+        runtime_display=runtime_display,
     )
 
 
-def _start_interactive_cancel_task(
+async def _render_interactive_cancel_requested_once(
+    *,
+    active: _InteractiveActiveTurn,
+    runtime_display: RuntimeDisplayController | None,
+) -> None:
+    """由 interactive outer driver 恰好展示一次取消请求。
+
+    :param active: 当前 active turn。
+    :param runtime_display: 可选 display controller。
+    :returns: ``None``。
+    :raises Exception: display 渲染失败时向上透传。
+    """
+
+    if active.cancel_rendered or active.closeout.cancel_reason is None:
+        return
+    if runtime_display is not None:
+        await runtime_display.render_cancel_requested()
+    active.cancel_rendered = True
+
+
+async def _cancel_interactive_run_for_closeout(
+    run_id: str,
+    reason: str,
     *,
     host: Host,
     invocation: CliInvocation,
-    active: _InteractiveActiveTurn,
-    run_id: str,
-) -> asyncio.Task[EntrypointRunTerminalResult]:
-    """为 current turn 创建唯一 Host graceful cancel waiter。
+    turn_index: int,
+) -> EntrypointRunTerminalResult:
+    """构造 interactive Host graceful cancel 并等待 canonical terminal。
 
-    :param host: Host public handle。
-    :param invocation: 当前 CLI invocation 身份。
-    :param active: 当前 active turn。
     :param run_id: acceptance barrier 发布的 exact Run id。
-    :returns: cancel + canonical terminal waiter task。
-    :raises Exception: task 创建失败时向上透传。
+    :param reason: 首次本地取消冻结的 Host reason。
+    :param host: Host public handle。
+    :param invocation: 当前 CLI invocation identity。
+    :param turn_index: 当前 invocation 内稳定 turn index。
+    :returns: Host canonical terminal observation。
+    :raises Exception: Host cancel 或 terminal observation 失败时向上透传。
     """
 
-    reason = active.cancel_reason
-    if reason is None:
-        raise RuntimeError("interactive cancel reason is missing")
-    return asyncio.create_task(
-        cancel_entrypoint_run_and_wait(
-            host,
-            request=EntrypointCancelRequest(
-                context=build_interactive_host_context(
-                    invocation,
-                    operation=_INTERACTIVE_OPERATION_CANCEL_RUN,
-                ),
-                run_id=run_id,
-                client_request_id=interactive_cancel_client_request_id(
-                    invocation,
-                    turn_index=active.turn_index,
-                    run_id=run_id,
-                ),
-                reason=reason,
-                mode=CancelMode.GRACEFUL,
+    return await cancel_entrypoint_run_and_wait(
+        host,
+        request=EntrypointCancelRequest(
+            context=build_interactive_host_context(
+                invocation,
+                operation=_INTERACTIVE_OPERATION_CANCEL_RUN,
             ),
-        )
+            run_id=run_id,
+            client_request_id=interactive_cancel_client_request_id(
+                invocation,
+                turn_index=turn_index,
+                run_id=run_id,
+            ),
+            reason=reason,
+            mode=CancelMode.GRACEFUL,
+        ),
     )
 
 
