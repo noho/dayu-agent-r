@@ -644,6 +644,17 @@
             "错误报告再次触发 UnicodeEncodeError、显示 Python Traceback，或因偶然终端编码返回 1。",
             "非法 UTF-8 输入已经可在 CLI 边界判定却创建 Host session、Run 或调用 provider。"
           ]
+        },
+        {
+          "predicate_id": "prompt.17-running-escape-sequence-disambiguation",
+          "expected": [
+            "prompt Run期间只有standalone Escape表达取消；input owner必须等待并解析足以区分standalone chord与完整ESC-prefixed sequence的输入。",
+            "完整CSI、Home/Delete、Alt与bracketed-paste sequence不得因首byte为ESC而取消one-shot Run；没有prompt composer时按该sequence自身语义忽略或完成终端导航处理。"
+          ],
+          "forbidden": [
+            "看到ESC prefix立即取消Run，导致方向键、Home/Delete、Alt或bracketed paste误触发cancel。",
+            "用固定单字节Escape监听绕过终端输入序列owner。"
+          ]
         }
       ],
       "allowed_variants": [
@@ -817,7 +828,12 @@
         "scenario_refs": [
           "P27R-P47",
           "P64",
-          "init-provider-matrix"
+          "init-provider-matrix",
+          "prompt.PS01-running-csi-sequence",
+          "prompt.PS02-running-alt-sequence",
+          "prompt.PS03-running-bracketed-paste-sequence",
+          "prompt.PX01-label-prompt-to-interactive",
+          "prompt.PX02-label-interactive-to-prompt"
         ],
         "summary": [
           "package fallback、init-selected default 和单次 --model override 均通过真实 Runner identity 验证。",
@@ -845,12 +861,16 @@
           "补充 PFB-01 至 PFB-05 使用真实 provider、真实 list_documents 与真实 AAPL corpus：当前计数单位实际为 batch；仅全失败 batch 加一；全成功或 mixed success/failure batch 都清零；threshold=1 + raise_error 令 Run failed/exit 1；threshold=2 连续全失败 + force_answer 令 degraded Run succeeded/exit 0。",
           "PFB-04 证明同一 batch 内两个失败 records 只累计一个失败 batch；PFB-05 证明一个成功、一个失败的 mixed batch 会清零，因此其后的单个全失败 batch 不触发 threshold。",
           "PFB-02/PFB-04 的 Engine scenario.log 明确记录 fallback runner tool_count=0 且底层 runner tool_schema_count=0；public Tool Trace reconstruction 中的 disable_tools=false/tool_schema_count=11 来自同 Attempt 首次 pre-start manifest 的 Host-frozen source snapshot。IterationStartedData 未向 Host 暴露本轮 tool set 或 typed fallback kind，故两项证据表达不同 owner 的事实，不构成跨层不一致；实际 fallback 禁用工具必须由 Engine/Runner 边界证据证明，不能从该 Host source snapshot 反推。"
-        ]
+        ],
+        "supplemental_report": {
+          "report_id": "pr190-closure/observed-behavior-pr190-closeout",
+          "sha256": "6aa8c8c7430e979b95f3bd8551f44ae34432e5e55172231c296d634932aa712f"
+        }
       },
       "user_adjudication": {
         "decision": "accepted",
-        "date": "2026-07-31",
-        "notes": "按用户逐项回复冻结观察清单第 1 至 12 项，并以用户给出的 replacement behavior 冻结第 13、14 项；第 15 项仅冻结 prompt Run 中 Ctrl+D 不取消或排队退出，composer 状态明确不适用于 prompt 并转入 interactive mandatory coverage。第 12 项的内部 closeout reason 暴露、第 13 项的第二次 SIGINT 强退和第 14 项的启动期 Traceback 都是明确 conformance gap。第 16 项的补充 PT01 已观察双向 Ctrl+T，用户最终宣布 prompt 第一轮运行全部裁决完毕，因此该现状已接受。第 17 项是 Codex 参考信息，按用户裁决排除出 Dayu observation/oracle。第 18、19 项按用户 replacement behavior 冻结，并要求扩充完整日志参数运行矩阵；第 20 项 append 行为按现有观察接受；第 21 项按确定性 exit-code 分类接受并要求扩充 owner matrix。第 22 项是 CI 取证充分性陈述，不是 Dayu 产品行为 predicate；它继续由 handbook evidence contract 和 frozen report 证明，不进入 oracle。补充 PF03 已证明真实 prompt 从 AAPL 2025 10-K 工具 response 读取并回答 416,161 百万美元，用户裁决为正确；download/process 只构成 corpus 前置证据，不在 prompt oracle 中裁决。补充清单第 23 至 29 项均已完成裁决；#26 的 batch 计数、清零和 fallback 语义按 PFB-01 至 PFB-05 冻结。六个已确认 implementation gaps 为：内部 closeout 字符串泄漏、重复 Ctrl+C 未等待 Host terminal/本地清理、启动期 Ctrl+C Traceback/强退、日志 selector/debug-stream contract 不符、log-file 缺失父目录错误映射、非法 UTF-8 输入边界错误。force_answer fallback 实际 tools=() 属于 Engine-owned per-call 策略；Host Tool Trace 中复用的 pre-start tool schema snapshot 是 continuation reconstruction/sizing source，不是第七个 gap。prompt mandatory scenarios 必须写入正式 registry 并通过 command-level readiness proof；全局 registry 仍因 init 及其它命令尚未完成而保持 calibration。"
+        "date": "2026-08-02",
+        "notes": "既有prompt oracle保持不变；补充冻结完整ESC-prefixed sequence不得误取消Run，并把prompt/interactive双向label连续性写入正式scenario。当前误取消行为是F03 implementation finding。"
       },
       "applicable_from": {
         "date": "2026-07-31",
@@ -1003,11 +1023,13 @@
           "predicate_id": "interactive.09-external-editor",
           "expected": [
             "Ctrl+X Ctrl+E 打开外部 editor；editor 成功修改后的 draft 由用户后续提交并形成对应 Run。",
-            "editor 取消或非零返回时不伪造 Run，恢复 composer；依赖库拥有 editor/tempfile 子进程机制，Dayu 拥有公开 binding 与失败投影。"
+            "editor 取消或非零返回时不伪造 Run并恢复原 composer；依赖库拥有 editor/tempfile 子进程机制，Dayu 拥有公开 binding 与失败投影。",
+            "EDITOR或VISUAL未配置时可以使用系统 editor fallback；环境显式配置但目标不存在、不可执行或无法启动时，必须显示清晰错误并返回原 composer。"
           ],
           "forbidden": [
             "editor 未产生已接受 draft 时创建 Host Run。",
-            "把 prompt_toolkit 内部 editor 机制误记为 Host或Engine能力。"
+            "把 prompt_toolkit 内部 editor 机制误记为 Host或Engine能力。",
+            "显式无效的EDITOR/VISUAL被静默忽略并回退到另一系统editor。"
           ]
         },
         {
@@ -1071,12 +1093,14 @@
           "predicate_id": "interactive.15-session-attachment-access",
           "expected": [
             "同一 Session 同时只有一个 READ_WRITE attachment，其余 attachment 是生命周期内不可变的 READ_ONLY observer。",
-            "READ_ONLY 客户端可以订阅并展示 durable/live事件，但不能提交 follow-up、cancel或其它 mutation。",
-            "并发客户端不得因 UI 补偿而绕过 Host single-writer contract。"
+            "READ_ONLY 客户端可以订阅并展示 durable/live事件；提交follow-up、cancel或其它mutation时显示明确只读失败，但保留REPL且不exit 1、不创建第二个Run、不改变composer可编辑状态。",
+            "原writer释放后，CLI可在下一次mutation时关闭旧READ_ONLY attachment并fresh attach重新竞争READ_WRITE；若仍被占用则再次明确失败。attachment不得原地升级。",
+            "fresh reattach后的同一次用户提交复用稳定client_request_id，不能因UI重试重复创建Run。"
           ],
           "forbidden": [
-            "为改善 CLI 提交体验而授予第二个并发客户端 mutation 权限。",
-            "B 的被拒绝输入创建第二个 Run。"
+            "为改善CLI提交体验而授予第二个并发客户端mutation权限，或在同一attachment生命周期内静默升级mode。",
+            "B的被拒绝输入创建第二个Run。",
+            "READ_ONLY rejection作为未捕获HostApiError终止整个interactive进程或返回exit 1。"
           ]
         },
         {
@@ -1229,7 +1253,7 @@
             "每个Run/input snapshot最多一个proactive durable compaction operation；live owner执行中的incomplete operation不属于crash recovery，只有owner停止或crash后的fresh READ_WRITE attachment才可按原operation id、冻结snapshot与剩余attempt budget恢复。",
             "成功路径必须观察同源CONTEXT_COMPACTION_REQUESTED、compactor_proposal runner manifest、CONTEXT_COMPACTED和可校验compact artifact，并证明Conversation Memory projection与post-compact RunInputBuilder实际消费同一accepted compact truth。",
             "同一compaction operation精确一个canonical terminal；迟到或stale compactor result只能被拒绝或记为不改变业务状态的diagnostic，不能追加第二个CONTEXT_COMPACTION_FAILED或改写已提交outcome。",
-            "真实compaction失败后可以按policy使用deterministic recent-window fallback继续普通dispatch；runner_call_trigger_reason=context_compaction_completed表示context-governance阶段已经完成，不单独宣称compact成功，真实成功或失败仍以CONTEXT_COMPACTED/CONTEXT_COMPACTION_FAILED及其artifact/fallback refs为准。",
+            "真实compaction失败后可以按policy使用deterministic recent-window fallback继续普通dispatch；runner_call_trigger_reason=context_governance_resolved表示context governance已经收口并允许下一次dispatch，不单独宣称compact成功，真实成功或失败仍以CONTEXT_COMPACTED/CONTEXT_COMPACTION_FAILED及其artifact/fallback refs为准。",
             "成功compact后至少两个真实follow-up必须分别证明compact前财报事实的数值、单位、期间、来源连续性，以及新口径下按需调用真实财报工具取得新证据；failed compaction fallback后的连续性不能替代该成功路径。"
           ],
           "forbidden": [
@@ -1251,6 +1275,33 @@
             "把没有final answer的Run标记为SUCCEEDED，或用空字符串、纯空白、日志、preview、tool summary替代final answer。",
             "为了动态命中CLI防御分支而伪造Host response、直接写private SQLite/EventLog、调用private API或绕过Engine/Host owner contract。",
             "把CLI succeeded/no-final防御文案当作正常用户流程、accepted variant或真实运行mandatory branch。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.28-tool-registration-boundary",
+          "expected": [
+            "interactive可以注册财报读取与下载工具，但effective tool set不向Host注册start_fins_preprocess。",
+            "start_fins_preprocess实现代码可以保留；独立process/preprocess命令的正确性仍由其command campaign裁决。"
+          ],
+          "forbidden": [
+            "interactive scene、tool tag或Service assembly把start_fins_preprocess注册进本次Host Run。",
+            "为满足interactive边界而删除独立preprocess工具实现。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.29-compactor-output-accept-repair-fallback",
+          "expected": [
+            "Host Context Governance accept barrier是compact candidate有效性的唯一owner；有compactable history时，全空、diagnostics-only、无法证明semantic coverage、超过同源section cap、unknown/duplicate JSON key或重复semantic item的candidate不得被接受。",
+            "input source boundary与represented/explicitly-dropped semantic coverage是不同typed facts；Conversation Memory只能按accepted coverage删除raw item。",
+            "无效proposal形成bounded attempt rejection；后续whole-candidate repair收到脱敏、自解释的上一轮validation摘要并完整重产candidate，不合并rejected partial patch。",
+            "无效candidate不得写compact artifact、CONTEXT_COMPACTED或进入Conversation Memory；attempt budget耗尽后只写一个CONTEXT_COMPACTION_FAILED，再进入既有tier 1-3/tier 4-5 fallback或fail closed。",
+            "成功compact、失败fallback、rolling compact与迟到结果必须保持compact artifact、Memory、RunInput、canonical terminal和公开trace同源。"
+          ],
+          "forbidden": [
+            "把session_summary=null且所有semantic集合为空的candidate记为quality accepted或CONTEXT_COMPACTED。",
+            "用整个request source list冒充candidate实际represented coverage并删除未被保留的recent raw。",
+            "先写成功compact，再由Memory projector因section cap静默丢弃内容。",
+            "把同一immutable prompt的无反馈重复调用标为semantic repair，或让迟到结果产生第二个canonical terminal。"
           ]
         }
       ],
@@ -1337,29 +1388,38 @@
         "report_id": "interactive-20260731T142441Z-ae6bb96f/observed-behavior",
         "report_digest_sha256": "72f91665365ace75e6328409ef66450fae9470c75e3d3854c683f5dbe38c103a",
         "report_frozen": true,
-        "scenario_refs": [],
+        "supplemental_evidence": [
+          {
+            "report_id": "pr190-closure/observed-behavior-pr190-closeout",
+            "sha256": "6aa8c8c7430e979b95f3bd8551f44ae34432e5e55172231c296d634932aa712f"
+          },
+          {
+            "report_id": "pr190-closure/compaction-invalid-response-audit",
+            "sha256": "fed1a2ae29baf2b59b3d16d90460661c563ae18233f93530b241645ada38fb61"
+          },
+          {
+            "report_id": "pr190-closure/interactive-coverage-reconciliation",
+            "sha256": "e2e3361dff7de1d8af26824d164fc47b39218dbdb5869d8ef0186268a47c0cb6"
+          }
+        ],
+        "scenario_refs": [
+          "docs/cli_ci_scenarios.json#command=interactive"
+        ],
         "summary": [
-          "本报告包含635条真实运行记录；当前正式interactive scenarios尚未生成，accepted predicates必须在实现修复后据此建立scenario并真实重跑。",
-          "当前legacy --config/--ticker、分离label namespace、缺Shift+Enter、pipe逐行多Run、pre-accept Escape丢失、完整ESC-prefixed sequence误取消、重复Ctrl+C提前退出和type-ahead丢失均是implementation findings，不改变本oracle。",
-          "Ctrl+D、idle Escape/CSI/Alt/paste、Run中完整ESC-prefixed sequence、startup SIGINT/lost和type-ahead默认QUEUE均已完成裁决并进入predicate。",
-          "queued Run退出后重连仍是coverage gap；尚无真实观察，但同一Run由fresh writer唤醒ordinary governance、自动promotion并恰好执行一次的结果已经冻结。",
-          "I0552已观察active RUNNING owner SIGKILL后fresh同label重连等待180秒仍停留running，构成unfinished recovery的明确implementation finding。",
-          "RUNNING正常关闭/其它crash、QUEUED、accepted steer及cancel non-resurrection的exit/crash/SIGKILL矩阵仍需补跑；正确结果已冻结，不再等待裁决。",
-          "I0523证明AAPL真实财报、跨轮memory与Tool Trace request/response业务路径，但argv使用removed interactive --ticker，必须改由用户prompt提供AAPL后重跑；报告中的read_document是措辞错误，实际成功链以list_documents/get_financial_statement/get_document_sections/search_document/read_section为准。",
-          "tool not_found、0.001秒handshake timeout、failed-batch raise_error/force_answer、provider failure与cancel后的下一Run隔离行为已裁决正确；独立download/preprocess命令不进入interactive oracle。",
-          "I0543只刻意降低soft threshold并使用真实qwen-plus触发compaction，没有注入失败；wake-driven promotion与0.2秒periodic owned-session reconciliation并发进入同一Run，错误提交proactive_operation_invalid_or_exhausted，随后又为同一operation提交stale_compaction_result，均是明确implementation finding。",
-          "context compaction成功路径和durable cancelling重连仍有evidence gap；必须补真实CONTEXT_COMPACTED、artifact、provider identity、memory/RunInput消费与compact后两个follow-up，未用失败fallback或邻接状态伪装成成功覆盖。",
-          "I0554证明public contract无法产生succeeded/no-final：Engine空白final映射runner_empty_final_content failure，Host ingest保持RUN_FAILED，Host public SUCCEEDED要求final_answer；用户接受三条owner-level tests作为该不可达分支的static closure。"
+          "原始635条运行与PR190收口补跑共同覆盖700个mandatory obligations：604条正式scenario，96条parser/dynamic inventory、shared-owner或static closure。",
+          "用户已裁决行为项#1至#47；当前实现偏差作为F01-F07 findings保留，不改变accepted oracle。",
+          "真实running/queue/steer恢复、cancel non-resurrection、cross-entry label、财报grounding、compaction失败fallback、真实CONTEXT_COMPACTED/provider identity及compact后follow-up均已观察。",
+          "修复后仍需按正式scenario补跑F01-F07受影响路径并更新evidence；修复本身不能替代conformance observation。"
         ]
       },
       "user_adjudication": {
         "decision": "accepted",
-        "date": "2026-08-01",
-        "notes": "interactive行为项#1至#28、#30已完成裁决：采用用户明确决定，并对原待定项#11/#12/#14/#18/#20采用Agent已提出且用户接受的建议。#23/#24按用户优先级与Host设计真源冻结unfinished recovery和cancel non-resurrection；#25/#26冻结memory/真实财报/Tool Trace并排除独立download/preprocess命令；#27冻结failure isolation；#28冻结context compaction的single-flight、唯一terminal、失败fallback与成功路径证据要求；#30冻结成功必须携带final answer，并接受public-contract不可达分支的owner-level static proof closure。行为项#29仍等待F13修复后的真实compactor output identity证据，因此该增量accepted oracle尚不表示整个interactive command完成裁决。"
+        "date": "2026-08-02",
+        "notes": "interactive行为项#1至#47全部完成裁决。PR190后新增裁决冻结：彻底删除全局--config；显式无效editor报错并回composer；标准Ctrl+D；pre-accept/active Escape与Ctrl+C优雅语义；READ_ONLY失败保留REPL并通过fresh attach重新竞争；failed/cancelled accepted input进入memory但不提升为成功事实；不注册start_fins_preprocess；post-compaction trigger改名context_governance_resolved；无效compactor candidate必须由Host accept barrier拒绝并进入bounded repair/fallback；成功必须有final answer。F01-F07是实现finding，不是oracle gap。"
       },
       "applicable_from": {
-        "date": "2026-08-01",
-        "target": "next-interactive-conformance-run-after-confirmed-fixes"
+        "date": "2026-08-02",
+        "target": "next-interactive-conformance-run-after-F01-F07"
       },
       "supersedes": null,
       "superseded_by": null
