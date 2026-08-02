@@ -36,6 +36,7 @@ from dayu.cli.host_context import (
     prompt_create_session_client_request_id,
 )
 from dayu.cli.output import render_cli_error
+from dayu.cli.run_keys import new_running_key_monitor
 from dayu.cli.session_execution import (
     execute_prompt_on_session,
     prepare_prompt_session_execution,
@@ -101,33 +102,44 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
     :raises Exception: runtime assembly 或 Host public API 失败时向上抛出。
     """
 
-    ticker = _prompt_ticker(args)
-    prepared = await prepare_prompt_session_execution(
-        args,
-        command_name=COMMAND_PROMPT,
-        scenario=CLI_PROMPT_SCENARIO,
-        user_prompt=args.prompt,
-        ticker=ticker,
-        context_slot_values=build_prompt_context_slot_values(
-            ticker=ticker,
-            fmp_api_key=os.environ.get(FMP_API_KEY_ENV),
-        ),
-        usage_error_factory=CliCommandUsageError,
-    )
-    async with open_host(prepared.runtime.host_assembly.options) as host:
-        session_id = await _ensure_prompt_session(
-            host=host,
-            args=args,
-            invocation=prepared.invocation,
-        )
-        return await execute_prompt_on_session(
-            host=host,
-            prepared=prepared,
-            session_id=session_id,
-            sigint_monitor=CliSigintMonitor(),
-            detail=args.detail,
-            thinking=args.thinking,
-        )
+    sigint_monitor = CliSigintMonitor()
+    key_monitor = new_running_key_monitor()
+    sigint_monitor.install()
+    try:
+        try:
+            key_monitor.start()
+            ticker = _prompt_ticker(args)
+            prepared = await prepare_prompt_session_execution(
+                args,
+                command_name=COMMAND_PROMPT,
+                scenario=CLI_PROMPT_SCENARIO,
+                user_prompt=args.prompt,
+                ticker=ticker,
+                context_slot_values=build_prompt_context_slot_values(
+                    ticker=ticker,
+                    fmp_api_key=os.environ.get(FMP_API_KEY_ENV),
+                ),
+                usage_error_factory=CliCommandUsageError,
+            )
+            async with open_host(prepared.runtime.host_assembly.options) as host:
+                session_id = await _ensure_prompt_session(
+                    host=host,
+                    args=args,
+                    invocation=prepared.invocation,
+                )
+                return await execute_prompt_on_session(
+                    host=host,
+                    prepared=prepared,
+                    session_id=session_id,
+                    sigint_monitor=sigint_monitor,
+                    key_monitor=key_monitor,
+                    detail=args.detail,
+                    thinking=args.thinking,
+                )
+        finally:
+            key_monitor.close()
+    finally:
+        sigint_monitor.close()
 
 
 async def _ensure_prompt_session(

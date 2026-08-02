@@ -233,6 +233,24 @@ class InteractiveComposer(Protocol):
 
         ...
 
+    def has_pending_submit_intent(self) -> bool:
+        """返回非空提交是否已由输入 owner 解码但尚未被 REPL 确认。
+
+        :returns: 已按下普通 Enter 提交非空草稿且尚未确认时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        ...
+
+    def reject_submit_delivery(self) -> None:
+        """结束被 REPL 拒绝的提交交付，同时保留 exact editable draft。
+
+        :returns: ``None``。
+        :raises RuntimeError: 当前没有待处理 ``SUBMIT`` 时抛出。
+        """
+
+        ...
+
     async def read_event(self, prompt: str) -> InteractiveComposerEvent:
         """读取下一次类型化 composer 事件。
 
@@ -271,6 +289,7 @@ class _ComposerEventSignal(Exception):
 
 _PhaseProvider = Callable[[], InteractiveComposerPhase]
 _RevisionProvider = Callable[[], int]
+_SubmitIntentRecorder = Callable[[str], None]
 
 
 class PromptToolkitInteractiveComposer:
@@ -283,6 +302,7 @@ class PromptToolkitInteractiveComposer:
     _cursor_position: int
     _input_revision: int
     _pending_submit: bool
+    _pending_submit_intent: bool
     _tracking_user_edits: bool
     _editor_tasks: set[_EditorTask]
 
@@ -308,6 +328,7 @@ class PromptToolkitInteractiveComposer:
         self._cursor_position = 0
         self._input_revision = 0
         self._pending_submit = False
+        self._pending_submit_intent = False
         self._tracking_user_edits = False
         self._editor_tasks = set()
         self._session = PromptSession(
@@ -316,6 +337,7 @@ class PromptToolkitInteractiveComposer:
                 stderr=sys.stderr if stderr is None else stderr,
                 phase_provider=self._current_phase,
                 revision_provider=self._current_input_revision,
+                submit_intent_recorder=self._record_submit_intent,
                 editor_tasks=self._editor_tasks,
             ),
             enable_history_search=True,
@@ -353,6 +375,30 @@ class PromptToolkitInteractiveComposer:
         self._draft = ""
         self._cursor_position = 0
         self._pending_submit = False
+        self._pending_submit_intent = False
+
+    def has_pending_submit_intent(self) -> bool:
+        """返回输入 owner 是否已解析出待交付的非空提交意图。
+
+        :returns: 普通 Enter 已提交非空草稿且 REPL 尚未确认时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._pending_submit_intent
+
+    def reject_submit_delivery(self) -> None:
+        """结束被 REPL 拒绝的交付意图并保留可再次编辑的精确文档。
+
+        本方法只终结当前 delivery intent；``_pending_submit``、草稿、光标、
+        input revision 与 history 均保持原样，由下一次 ``read_event`` 恢复。
+
+        :returns: ``None``。
+        :raises RuntimeError: 当前没有待处理 ``SUBMIT`` 时抛出。
+        """
+
+        if not self._pending_submit:
+            raise RuntimeError("interactive composer has no pending submit")
+        self._pending_submit_intent = False
 
     async def read_event(self, prompt: str) -> InteractiveComposerEvent:
         """读取下一次 interactive typed event。
@@ -366,6 +412,7 @@ class PromptToolkitInteractiveComposer:
             # 上一份 SUBMIT 未被 REPL 确认，保留 exact draft/cursor，但允许
             # 用户继续编辑并重新提交。
             self._pending_submit = False
+            self._pending_submit_intent = False
         document = Document(
             text=self._draft,
             cursor_position=self._cursor_position,
@@ -421,6 +468,19 @@ class PromptToolkitInteractiveComposer:
 
         self._tracking_user_edits = True
 
+    def _record_submit_intent(self, draft: str) -> None:
+        """同步记录 Enter chord 已解析出的非空提交意图。
+
+        该状态先于 ``prompt_async`` task 向 REPL 返回 typed ``SUBMIT``，使紧随
+        Enter 的 SIGINT 可以绑定同一待接受 turn，而不依赖 task 调度或时间窗口。
+
+        :param draft: Enter 发生时的 exact composer 草稿。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._pending_submit_intent = draft.strip() != ""
+
     def _record_text_change(self, _buffer: Buffer) -> None:
         """记录 application 运行期间的真实 buffer 文本变化。
 
@@ -463,6 +523,7 @@ def build_interactive_key_bindings(
         stderr=sys.stderr if stderr is None else stderr,
         phase_provider=_idle_phase if phase_provider is None else phase_provider,
         revision_provider=_zero_revision if revision_provider is None else revision_provider,
+        submit_intent_recorder=_ignore_submit_intent,
         editor_tasks=set(),
     )
 
@@ -472,6 +533,7 @@ def _build_interactive_key_bindings(
     stderr: TextIO,
     phase_provider: _PhaseProvider,
     revision_provider: _RevisionProvider,
+    submit_intent_recorder: _SubmitIntentRecorder,
     editor_tasks: set[_EditorTask],
 ) -> KeyBindings:
     """构造绑定并接入当前 composer 持有的 editor task 集合。
@@ -479,6 +541,7 @@ def _build_interactive_key_bindings(
     :param stderr: 安全 editor diagnostic 输出流。
     :param phase_provider: 当前 composer phase provider。
     :param revision_provider: 当前用户编辑版本 provider。
+    :param submit_intent_recorder: 普通 Enter 的同步 typed submit intent recorder。
     :param editor_tasks: composer 强引用并在 teardown 清理的唯一 pending editor task。
     :returns: prompt_toolkit key bindings。
     :raises Exception: KeyBindings 构造失败时向上透传。
@@ -510,6 +573,7 @@ def _build_interactive_key_bindings(
         if _is_exact_xterm_shift_enter(event):
             event.app.current_buffer.insert_text("\n")
             return
+        submit_intent_recorder(event.app.current_buffer.text)
         _exit_with_composer_event(
             event,
             kind=InteractiveComposerEventKind.SUBMIT,
@@ -1085,6 +1149,17 @@ def _zero_revision() -> int:
     """
 
     return 0
+
+
+def _ignore_submit_intent(_draft: str) -> None:
+    """忽略 standalone key-binding 测试不消费的 submit intent。
+
+    :param _draft: Enter 发生时的 exact 草稿；standalone binding 不持久化。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return
 
 
 def new_interactive_composer(

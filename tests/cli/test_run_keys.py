@@ -672,6 +672,76 @@ async def test_tty_running_key_monitor_reads_action_and_restores_terminal() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX PTY contract")
+async def test_tty_running_key_monitor_preserves_prestart_standalone_escape() -> None:
+    """monitor 安装不得清空 invocation 启动后已到达的 standalone Escape。
+
+    :returns: ``None``。
+    :raises AssertionError: prestart byte 被 flush、误分类或 terminal mode 未恢复时抛出。
+    """
+
+    master_fd, slave_fd = pty.openpty()
+    slave_stream = cast(TextIO, os.fdopen(slave_fd, "r", encoding="utf-8", buffering=1))
+    original_lflag = termios.tcgetattr(slave_fd)[3]
+    monitor = TtyRunningKeyMonitor(stdin=slave_stream, poll_interval_seconds=0.01)
+    try:
+        os.write(master_fd, b"\x1b")
+        monitor.start()
+
+        action = await asyncio.wait_for(monitor.wait_next(), timeout=1.0)
+
+        assert action is RunningKeyAction.CANCEL_RUN
+    finally:
+        monitor.close()
+        restored_lflag = termios.tcgetattr(slave_fd)[3]
+        slave_stream.close()
+        with suppress(OSError):
+            os.close(master_fd)
+    assert _terminal_lflag_controls(restored_lflag) == _terminal_lflag_controls(original_lflag)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX PTY contract")
+@pytest.mark.parametrize(
+    "sequence",
+    (
+        b"\x1bx",
+        b"\x1b[H\x1b[3~",
+        b"\x1b[200~paste\nbody\x1b[201~",
+    ),
+)
+async def test_tty_running_key_monitor_preserves_prestart_complete_sequences(
+    sequence: bytes,
+) -> None:
+    """prestart Alt/CSI/paste 必须保留且不得降级为 standalone Escape。
+
+    :param sequence: monitor 安装前已到达的完整 ESC-prefixed bytes。
+    :returns: ``None``。
+    :raises AssertionError: 序列被 flush、误取消或 terminal mode 未恢复时抛出。
+    """
+
+    master_fd, slave_fd = pty.openpty()
+    slave_stream = cast(TextIO, os.fdopen(slave_fd, "r", encoding="utf-8", buffering=1))
+    original_lflag = termios.tcgetattr(slave_fd)[3]
+    monitor = TtyRunningKeyMonitor(stdin=slave_stream, poll_interval_seconds=0.01)
+    try:
+        os.write(master_fd, sequence)
+        monitor.start()
+        os.write(master_fd, b"\x14")
+
+        action = await asyncio.wait_for(monitor.wait_next(), timeout=1.0)
+
+        assert action is RunningKeyAction.TOGGLE_ACTIVITY
+    finally:
+        monitor.close()
+        restored_lflag = termios.tcgetattr(slave_fd)[3]
+        slave_stream.close()
+        with suppress(OSError):
+            os.close(master_fd)
+    assert _terminal_lflag_controls(restored_lflag) == _terminal_lflag_controls(original_lflag)
+
+
+@pytest.mark.asyncio
 async def test_tty_running_key_monitor_close_is_idempotent() -> None:
     """TTY monitor close 应可重复调用，避免 finally 清理竞态。"""
 

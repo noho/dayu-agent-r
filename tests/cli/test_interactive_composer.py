@@ -441,6 +441,73 @@ async def test_ordinary_enter_submits_without_inserting_lf() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ordinary_enter_records_submit_intent_until_repl_accepts() -> None:
+    """普通 Enter 的非空提交意图必须持续到 REPL 明确认领。
+
+    :returns: ``None``。
+    :raises AssertionError: typed intent 生命周期早于 acceptance 被清除时抛出。
+    """
+
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        read_task = asyncio.create_task(composer.read_event("dayu> "))
+        pipe_input.send_text("ordinary\r")
+        event = await asyncio.wait_for(read_task, timeout=2.0)
+
+        assert event.kind is InteractiveComposerEventKind.SUBMIT
+        assert composer.has_pending_submit_intent()
+
+        composer.accept_submit(record_history=True)
+
+    assert not composer.has_pending_submit_intent()
+
+
+@pytest.mark.asyncio
+async def test_reject_submit_delivery_clears_only_intent_and_restores_exact_draft() -> None:
+    """拒绝 submit delivery 只能清 intent，并允许 exact document 原样重提。
+
+    :returns: ``None``。
+    :raises AssertionError: draft、cursor、revision、history 或 pending 状态漂移时抛出。
+    """
+
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        with pytest.raises(RuntimeError, match="no pending submit"):
+            composer.reject_submit_delivery()
+
+        first_read = asyncio.create_task(composer.read_event("dayu> "))
+        pipe_input.send_text("abc\x1b[D\r")
+        first_event = await asyncio.wait_for(first_read, timeout=2.0)
+        draft_before = composer._draft
+        cursor_before = composer._cursor_position
+        revision_before = composer._input_revision
+
+        composer.reject_submit_delivery()
+
+        assert not composer.has_pending_submit_intent()
+        assert composer._pending_submit
+        assert composer._draft == draft_before == "abc"
+        assert composer._cursor_position == cursor_before == 2
+        assert composer._input_revision == revision_before == first_event.input_revision
+        assert composer._history.get_strings() == []
+
+        retry_read = asyncio.create_task(composer.read_event("dayu> "))
+        pipe_input.send_text("\r")
+        retry_event = await asyncio.wait_for(retry_read, timeout=2.0)
+
+        assert retry_event.draft == "abc"
+        assert retry_event.input_revision == revision_before
+        assert composer._cursor_position == cursor_before
+        composer.reject_submit_delivery()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "prefix",
     (

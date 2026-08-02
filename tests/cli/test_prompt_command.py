@@ -880,7 +880,7 @@ async def _raise_session_ensure_startup_interrupt(
 
 
 class _InterruptedInstallSigintMonitor(CliSigintMonitor):
-    """在 prompt Run cancellation hook 安装阶段模拟 Ctrl+C。"""
+    """在 prompt invocation 输入 owner 安装阶段模拟 Ctrl+C。"""
 
     def install(self) -> None:
         """在 handler 完全安装前抛出启动中断。
@@ -1039,18 +1039,18 @@ def test_prompt_startup_interrupt_before_session_commit_closes_host_context(
     assert fake_host.submit_requests == []
 
 
-def test_prompt_startup_interrupt_during_monitor_install_closes_resources(
+def test_prompt_startup_interrupt_during_monitor_install_precedes_host_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Run monitor 安装中断必须关闭 attachment/context 且不得 submit Run。
+    """invocation 输入 owner 安装中断必须发生在 runtime/Host 业务状态之前。
 
     :param tmp_path: pytest 临时 workspace root。
     :param monkeypatch: pytest argv、环境与类替换夹具。
     :param capsys: pytest 标准输出捕获夹具。
     :returns: ``None``。
-    :raises AssertionError: cleanup、Run 零创建、退出码或输出 contract 失败时抛出。
+    :raises AssertionError: 零 Host 状态、退出码或输出 contract 失败时抛出。
     """
 
     fake_host = _FakeHost(submit_terminal=None)
@@ -1076,12 +1076,142 @@ def test_prompt_startup_interrupt_during_monitor_install_closes_resources(
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out
     assert "Traceback" not in captured.err
-    assert host_context.exit_count == 1
-    assert len(fake_host.create_requests) == 1
+    assert host_context.exit_count == 0
+    assert fake_host.create_requests == []
     assert fake_host.ensure_requests == []
     assert fake_host.submit_requests == []
     assert fake_host.cancel_requests == []
-    assert fake_host.attach_session_ids == ["session-1"]
+    assert fake_host.attach_session_ids == []
+    assert fake_host.attachments == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_key_monitor_start_failure_restores_input_owners_before_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """按键 monitor 启动异常必须恢复按键与 SIGINT owner 且不打开 Host。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest 输入 owner 与 Host opener 替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: cleanup 次数、异常或零 Host 状态 contract 漂移时抛出。
+    """
+
+    sigint_monitor = _PreloadedSigintMonitor(0)
+    key_monitor = _FailingStartRunningKeyMonitor()
+    for env_name, env_value in _runtime_assembly_env().items():
+        monkeypatch.setenv(env_name, env_value)
+    monkeypatch.setattr(
+        prompt_command,
+        "CliSigintMonitor",
+        lambda: sigint_monitor,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "new_running_key_monitor",
+        lambda: key_monitor,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _raise_host_open_startup_interrupt,
+    )
+    args = parse_cli_args(
+        ("prompt", "--base", str(tmp_path), "请总结收入变化")
+    )
+
+    with pytest.raises(RuntimeError, match="running key monitor start failed"):
+        await prompt_command._run_prompt_command_async(args)
+
+    assert sigint_monitor.install_count == 1
+    assert sigint_monitor.close_count == 1
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
+    assert not (tmp_path / ".dayu" / "host" / "dayu_host.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("early_action", "early_sigint_count"),
+    (
+        (RunningKeyAction.CANCEL_RUN, 0),
+        (None, 1),
+        (None, 2),
+    ),
+)
+async def test_prompt_very_early_cancel_intent_binds_same_accepted_run_and_waits_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    early_action: RunningKeyAction | None,
+    early_sigint_count: int,
+) -> None:
+    """runtime prepare 前 Escape/Ctrl+C 必须绑定随后接受的 Run 并等待 terminal。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest 环境与输入 owner 替换夹具。
+    :param early_action: invocation 起点已解码的运行按键 action。
+    :param early_sigint_count: invocation 起点已观察到的 SIGINT 次数。
+    :returns: ``None``。
+    :raises AssertionError: Run、cancel、terminal、cleanup 或退出码 contract 漂移时抛出。
+    """
+
+    fake_host = _ControlledCancelHost()
+    host_context = _FakeOpenHostContext(fake_host)
+    sigint_monitor = _PreloadedSigintMonitor(early_sigint_count)
+    actions = () if early_action is None else (early_action,)
+    key_monitor = _FakeRunningKeyMonitor(actions)
+    for env_name, env_value in _runtime_assembly_env().items():
+        monkeypatch.setenv(env_name, env_value)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _FixedOpenHostFactory(host_context),
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "CliSigintMonitor",
+        lambda: sigint_monitor,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "new_running_key_monitor",
+        lambda: key_monitor,
+    )
+    args = parse_cli_args(
+        ("prompt", "--base", str(tmp_path), "请总结收入变化")
+    )
+    execution = asyncio.create_task(prompt_command._run_prompt_command_async(args))
+
+    try:
+        await asyncio.wait_for(
+            fake_host.cancel_recorded.wait(),
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+        assert not execution.done()
+        assert len(fake_host.submit_requests) == 1
+        assert len(fake_host.cancel_requests) == 1
+        assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
+        assert fake_host.cancel_requests[0].reason == "cli_sigint"
+
+        fake_host.release_cancel_terminal.set()
+        exit_code = await asyncio.wait_for(
+            execution,
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+    finally:
+        fake_host.release_cancel_terminal.set()
+        if not execution.done():
+            execution.cancel()
+            with suppress(asyncio.CancelledError):
+                await execution
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert host_context.exit_count == 1
+    assert sigint_monitor.install_count == 1
+    assert sigint_monitor.close_count == 1
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
     assert [attachment.close_count for attachment in fake_host.attachments] == [1]
 
 
@@ -1225,6 +1355,48 @@ class _ControlledSigintMonitor(CliSigintMonitor):
         self.closed_count += 1
 
 
+class _PreloadedSigintMonitor(CliSigintMonitor):
+    """在 prompt runtime prepare 前已收到指定次数中断的 invocation monitor。"""
+
+    install_count: int
+    close_count: int
+
+    def __init__(self, signal_count: int) -> None:
+        """初始化 durable SIGINT count 与幂等 lifecycle 计数。
+
+        :param signal_count: command 进入 Host 前已收到的 SIGINT 次数。
+        :returns: ``None``。
+        :raises ValueError: 次数为负数时抛出。
+        """
+
+        if signal_count < 0:
+            raise ValueError("signal_count must not be negative")
+        super().__init__()
+        self.count = signal_count
+        self.install_count = 0
+        self.close_count = 0
+
+    def install(self) -> None:
+        """记录唯一 invocation-level handler 安装。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.install_count == 0:
+            self.install_count = 1
+
+    def close(self) -> None:
+        """记录唯一 invocation-level handler 恢复。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.close_count == 0:
+            self.close_count = 1
+
+
 class _FakeRunningKeyMonitor:
     """测试用运行态按键 monitor。"""
 
@@ -1263,7 +1435,8 @@ class _FakeRunningKeyMonitor:
         :raises Exception: 不主动抛出异常。
         """
 
-        self.started_count += 1
+        if self.started_count == 0:
+            self.started_count = 1
 
     async def wait_next(self) -> RunningKeyAction:
         """返回下一条预设按键动作。
@@ -1288,8 +1461,32 @@ class _FakeRunningKeyMonitor:
         :raises Exception: 不主动抛出异常。
         """
 
-        self.closed_count += 1
+        if self.closed_count == 0:
+            self.closed_count = 1
         self._closed_event.set()
+
+
+class _FailingStartRunningKeyMonitor(_FakeRunningKeyMonitor):
+    """在 terminal input owner 启动阶段失败的运行按键 monitor。"""
+
+    def __init__(self) -> None:
+        """初始化无预设 action 的失败 monitor。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(())
+
+    def start(self) -> None:
+        """模拟 terminal mode 安装后的启动异常。
+
+        :returns: 正常路径不返回。
+        :raises RuntimeError: 每次调用均抛出固定启动错误。
+        """
+
+        super().start()
+        raise RuntimeError("running key monitor start failed")
 
 
 class _ControlledRunningKeyMonitor:
@@ -2934,7 +3131,7 @@ async def test_prompt_sigint_monitor_waits_for_notification() -> None:
 
 @pytest.mark.asyncio
 async def test_prompt_sigint_monitor_restores_previous_process_handler() -> None:
-    """关闭 monitor 必须恢复 asyncio runner 已有的进程级 SIGINT handler。
+    """重复 install/close 必须只管理一次 handler 并恢复 runner 原状态。
 
     :returns: ``None``。
     :raises AssertionError: monitor 关闭后 handler identity 漂移时抛出。
@@ -2947,6 +3144,9 @@ async def test_prompt_sigint_monitor_restores_previous_process_handler() -> None
     monitor.install()
     installed_handler = signal.getsignal(signal.SIGINT)
     assert installed_handler != previous_handler
+    monitor.install()
+    assert signal.getsignal(signal.SIGINT) == installed_handler
+    monitor.close()
     monitor.close()
 
     assert signal.getsignal(signal.SIGINT) == previous_handler

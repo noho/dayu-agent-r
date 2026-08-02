@@ -7,6 +7,7 @@ import io
 import signal
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
@@ -1047,8 +1048,10 @@ class _ScriptedComposer:
     prompt_calls: list[str]
     phase_calls: list[InteractiveComposerPhase]
     accepted_history_flags: list[bool]
+    rejected_delivery_count: int
     _remaining: list[_ComposerReadStep]
     _pending_submit: bool
+    _pending_submit_intent: bool
     _revision: int
     _phase: InteractiveComposerPhase
     _phase_changed: asyncio.Event
@@ -1064,8 +1067,10 @@ class _ScriptedComposer:
         self.prompt_calls = []
         self.phase_calls = []
         self.accepted_history_flags = []
+        self.rejected_delivery_count = 0
         self._remaining = list(steps)
         self._pending_submit = False
+        self._pending_submit_intent = False
         self._revision = 0
         self._phase = InteractiveComposerPhase.IDLE
         self._phase_changed = asyncio.Event()
@@ -1093,7 +1098,29 @@ class _ScriptedComposer:
         if not self._pending_submit:
             raise RuntimeError("scripted composer has no pending submit")
         self._pending_submit = False
+        self._pending_submit_intent = False
         self.accepted_history_flags.append(record_history)
+
+    def has_pending_submit_intent(self) -> bool:
+        """返回 scripted composer 是否已有待交付的非空提交。
+
+        :returns: scripted submit 已登记且尚未确认时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._pending_submit_intent
+
+    def reject_submit_delivery(self) -> None:
+        """结束 scripted submit delivery intent 并保留 pending editable draft。
+
+        :returns: ``None``。
+        :raises RuntimeError: 当前没有 pending submit 时抛出。
+        """
+
+        if not self._pending_submit:
+            raise RuntimeError("scripted composer has no pending submit")
+        self._pending_submit_intent = False
+        self.rejected_delivery_count += 1
 
     async def read_event(self, prompt: str) -> InteractiveComposerEvent:
         """读取下一条 scripted typed event。
@@ -1116,6 +1143,7 @@ class _ScriptedComposer:
         if isinstance(step, str):
             self._revision += 1
             self._pending_submit = True
+            self._pending_submit_intent = step.strip() != ""
             return InteractiveComposerEvent(
                 kind=InteractiveComposerEventKind.SUBMIT,
                 draft=step,
@@ -1123,6 +1151,11 @@ class _ScriptedComposer:
             )
         if isinstance(step, InteractiveComposerEvent):
             self._pending_submit = step.kind is InteractiveComposerEventKind.SUBMIT
+            self._pending_submit_intent = (
+                step.kind is InteractiveComposerEventKind.SUBMIT
+                and step.draft is not None
+                and step.draft.strip() != ""
+            )
             return step
         if step.exception_type is EOFError:
             return InteractiveComposerEvent(
@@ -1135,6 +1168,40 @@ class _ScriptedComposer:
                 input_revision=self._revision,
             )
         raise AssertionError(f"unsupported composer interrupt: {step.exception_type}")
+
+
+class _PendingSubmitBarrierComposer(_ScriptedComposer):
+    """模拟 Enter 已被输入 owner 解码、typed SUBMIT 尚未交付的 composer。"""
+
+    submit_intent_recorded: asyncio.Event
+    release_submit_event: asyncio.Event
+
+    def __init__(self, draft: str) -> None:
+        """初始化单次非空提交与交付 barrier。
+
+        :param draft: Enter 发生时的 exact 非空草稿。
+        :returns: ``None``。
+        :raises ValueError: 草稿为空白时抛出。
+        """
+
+        if draft.strip() == "":
+            raise ValueError("pending submit barrier requires a non-empty draft")
+        super().__init__((draft,))
+        self.submit_intent_recorded = asyncio.Event()
+        self.release_submit_event = asyncio.Event()
+
+    async def read_event(self, prompt: str) -> InteractiveComposerEvent:
+        """先发布同步 submit intent，再等待测试允许 typed event 交付。
+
+        :param prompt: 输入提示文本。
+        :returns: 父类生成的 typed ``SUBMIT`` event。
+        :raises Exception: 父类读取失败时向上透传。
+        """
+
+        self._pending_submit_intent = True
+        self.submit_intent_recorded.set()
+        await self.release_submit_event.wait()
+        return await super().read_event(prompt)
 
 
 class _BarrierScriptedComposer(_ScriptedComposer):
@@ -1420,6 +1487,7 @@ class _ManualSigintMonitor(CliSigintMonitor):
     """测试可逐次触发并观察消费进度的 OS SIGINT monitor。"""
 
     observed_counts: list[int]
+    wait_requests: list[int]
 
     def __init__(self) -> None:
         """初始化手动 SIGINT 计数与消费记录。
@@ -1430,6 +1498,7 @@ class _ManualSigintMonitor(CliSigintMonitor):
 
         super().__init__()
         self.observed_counts = []
+        self.wait_requests = []
 
     async def wait_next(self, observed_count: int) -> int:
         """等待下一次手动通知并记录 driver 已消费的新计数。
@@ -1439,6 +1508,7 @@ class _ManualSigintMonitor(CliSigintMonitor):
         :raises asyncio.CancelledError: driver cleanup 取消等待时透传。
         """
 
+        self.wait_requests.append(observed_count)
         new_count = await super().wait_next(observed_count)
         self.observed_counts.append(new_count)
         return new_count
@@ -2914,6 +2984,9 @@ async def test_interactive_read_only_retry_preserves_composer_and_uses_fresh_rw(
         await _wait_for_mutation_attempt_count(host, 1)
         await _wait_for_stderr_text(stderr, "session is read-only")
 
+        rejected_revision = composer._input_revision
+        assert not composer.has_pending_submit_intent()
+        assert composer._pending_submit
         assert composer._draft == "abc"
         assert composer._cursor_position == 2
         assert composer._history.get_strings() == []
@@ -2927,6 +3000,7 @@ async def test_interactive_read_only_retry_preserves_composer_and_uses_fresh_rw(
             composer,
             phase=InteractiveComposerPhase.IDLE,
         )
+        assert composer._input_revision == rejected_revision
         pipe_input.send_text("\x04")
         exit_code = await asyncio.wait_for(execution, timeout=2.0)
 
@@ -2944,6 +3018,85 @@ async def test_interactive_read_only_retry_preserves_composer_and_uses_fresh_rw(
     ]
     assert [attachment.close_count for attachment in host.attachments] == [1, 1]
     assert stderr.getvalue().count("session is read-only") == 1
+
+
+@pytest.mark.asyncio
+async def test_interactive_idle_sigint_after_read_only_does_not_cancel_retry_run(
+    tmp_path: Path,
+) -> None:
+    """READ_ONLY 后 idle SIGINT 不得污染 fresh attachment 上的同语义重提。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: intent、identity、Run 数或 cancel 归属漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ReadOnlyRetryHost(
+        attachment_modes=(
+            HostSessionAccessMode.READ_ONLY,
+            HostSessionAccessMode.READ_WRITE,
+        ),
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+    )
+    same_submit = InteractiveComposerEvent(
+        kind=InteractiveComposerEventKind.SUBMIT,
+        draft="same draft",
+        input_revision=1,
+    )
+    composer = _BarrierScriptedComposer(
+        (same_submit, same_submit),
+        blocked_call_index=2,
+    )
+    monitor = _InvocationManualSigintMonitor()
+    execution = asyncio.create_task(
+        session_execution.execute_interactive_on_session(
+            host=cast(Host, host),
+            prepared=_prepared_interactive_execution(
+                tmp_path=tmp_path,
+                runtime=runtime,
+            ),
+            session_id="session-1",
+            composer=composer,
+            sigint_monitor_factory=lambda: monitor,
+            run_startup_reconnect=False,
+            detail=False,
+            thinking=False,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
+        assert composer.rejected_delivery_count == 1
+        assert not composer.has_pending_submit_intent()
+        assert host._submit_index == 0
+
+        monitor.notify()
+        await _wait_for_sigint_observation(monitor, 1)
+        await _wait_for_sigint_rearm(monitor, 1)
+        assert not execution.done()
+        assert host.cancel_requests == []
+
+        composer.release_read.set()
+        exit_code = await asyncio.wait_for(execution, timeout=2.0)
+    finally:
+        composer.release_read.set()
+        if not execution.done():
+            execution.cancel()
+            with suppress(asyncio.CancelledError):
+                await execution
+
+    request_ids = [request.client_request_id for request in host.mutation_attempts]
+    assert exit_code == EXIT_SUCCESS
+    assert len(request_ids) == 2
+    assert request_ids[0] == request_ids[1]
+    assert len(host.submit_requests) == 1
+    assert host._submit_index == 1
+    assert host.cancel_requests == []
+    assert composer.accepted_history_flags == [True]
+    assert monitor.install_count == 1
+    assert monitor.close_count == 1
+    assert [attachment.close_count for attachment in host.attachments] == [1, 1]
 
 
 @pytest.mark.asyncio
@@ -3295,6 +3448,77 @@ async def test_interactive_escape_crosses_pre_acceptance_barrier_once(
     exit_code = await asyncio.wait_for(driver, timeout=2.0)
 
     assert exit_code == EXIT_SUCCESS
+    assert len(host.cancel_requests) == 1
+    assert host.cancel_requests[0].mode is CancelMode.GRACEFUL
+    assert host.cancel_requests[0].reason == "cli_sigint"
+    assert not host.cancel_waiter_cancelled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sigint_count", "expected_exit_code"),
+    ((1, EXIT_SUCCESS), (2, EXIT_KEYBOARD_INTERRUPT)),
+)
+async def test_interactive_very_early_sigint_binds_pending_submit_to_accepted_run(
+    tmp_path: Path,
+    sigint_count: int,
+    expected_exit_code: int,
+) -> None:
+    """Enter 后极早 SIGINT 必须绑定同一 accepted Run 并等待 Host terminal。
+
+    :param tmp_path: pytest 临时 workspace。
+    :param sigint_count: typed SUBMIT 尚未交付时注入的 SIGINT 次数。
+    :param expected_exit_code: Host closeout 后预期退出码。
+    :returns: ``None``。
+    :raises AssertionError: Run、cancel、terminal 或退出意图 contract 漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _DelayedAcceptanceControlledHost()
+    composer = _PendingSubmitBarrierComposer("第一轮")
+    monitor = _ManualSigintMonitor()
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+        sigint_monitor=monitor,
+    )
+
+    try:
+        await asyncio.wait_for(composer.submit_intent_recorded.wait(), timeout=2.0)
+        for _interrupt_index in range(sigint_count):
+            monitor.notify()
+        await _wait_for_sigint_observation(monitor, sigint_count)
+
+        assert not driver.done()
+        assert host.submit_requests == []
+        assert host.cancel_requests == []
+
+        composer.release_submit_event.set()
+        await asyncio.wait_for(host.committed.wait(), timeout=2.0)
+        assert len(host.submit_requests) == 1
+        assert host.cancel_requests == []
+        assert not driver.done()
+
+        host.release_response.set()
+        await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+        assert len(host.cancel_requests) == 1
+        assert not driver.done()
+
+        host.release_cancel_terminal.set()
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+    finally:
+        composer.release_submit_event.set()
+        host.release_response.set()
+        host.release_cancel_terminal.set()
+        if not driver.done():
+            driver.cancel()
+            with suppress(asyncio.CancelledError):
+                await driver
+
+    assert exit_code == expected_exit_code
+    assert len(host.submit_requests) == 1
     assert len(host.cancel_requests) == 1
     assert host.cancel_requests[0].mode is CancelMode.GRACEFUL
     assert host.cancel_requests[0].reason == "cli_sigint"
@@ -4248,6 +4472,25 @@ async def _wait_for_sigint_observation(
             return
         await asyncio.sleep(0)
     raise AssertionError(f"SIGINT observation did not reach {expected_count}")
+
+
+async def _wait_for_sigint_rearm(
+    monitor: _ManualSigintMonitor,
+    observed_count: int,
+) -> None:
+    """等待 driver 消费 SIGINT 并以新 observed count 重新建立 waiter。
+
+    :param monitor: 手动 SIGINT monitor。
+    :param observed_count: 新 waiter 必须携带的已消费计数。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内 driver 未重新建立 waiter 时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if observed_count in monitor.wait_requests:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"SIGINT waiter did not rearm from {observed_count}")
 
 
 async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResult:

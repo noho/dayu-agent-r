@@ -73,6 +73,8 @@ class CliSigintMonitor:
         :raises ValueError: 当前线程不允许安装同步 signal handler 时抛出。
         """
 
+        if self._installation_mode is not _CliSigintInstallationMode.NONE:
+            return
         loop = asyncio.get_running_loop()
         previous_handler = signal.getsignal(signal.SIGINT)
         if previous_handler is None:

@@ -165,7 +165,10 @@ class TtyRunningKeyMonitor:
         try:
             fd = self._stdin.fileno()
             original_attrs = cast(_TerminalAttributes, termios.tcgetattr(fd))
-            tty.setcbreak(fd)
+            # invocation 启动后、monitor 安装前到达的按键仍属于本次输入。
+            # ``tty.setcbreak`` 默认使用 TCSAFLUSH，会丢弃这段 pre-accept 输入；
+            # TCSANOW 只切换本 owner 管理的模式，不清空已到达的 chord/sequence。
+            tty.setcbreak(fd, when=termios.TCSANOW)
         except (OSError, ValueError, termios.error):
             if fd is not None and original_attrs is not None:
                 _restore_terminal_attrs(fd, original_attrs)

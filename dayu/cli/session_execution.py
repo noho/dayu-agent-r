@@ -15,7 +15,6 @@ import io
 import os
 import sys
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import partial
@@ -646,6 +645,7 @@ async def execute_prompt_on_session(
     prepared: PreparedPromptSessionExecution,
     session_id: str,
     sigint_monitor: CliSigintMonitor,
+    key_monitor: RunningKeyMonitor | None = None,
     detail: bool = True,
     thinking: bool = True,
 ) -> int:
@@ -655,6 +655,8 @@ async def execute_prompt_on_session(
     :param prepared: prompt existing-session 执行准备结果。
     :param session_id: 已存在且调用方已选择的 Host Session id。
     :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :param key_monitor: prompt invocation 运行按键 monitor；命令入口可提前启动以
+        保存 pre-accept typed intent，省略时在本 helper 内创建。
     :param detail: 是否显示运行态 activity stream。
     :param thinking: 是否显示运行态 thinking 增量。
     :returns: CLI 退出码。
@@ -673,7 +675,7 @@ async def execute_prompt_on_session(
             sigint_monitor=sigint_monitor,
             activity_renderer=_new_detail_activity_renderer() if detail else None,
             thinking_renderer=_new_thinking_renderer() if thinking else None,
-            key_monitor=new_running_key_monitor(),
+            key_monitor=(new_running_key_monitor() if key_monitor is None else key_monitor),
         )
         terminal = outcome.terminal
         render_exit_code = render_prompt_terminal_result(terminal)
@@ -1217,7 +1219,9 @@ async def _submit_prompt_turn_handling_sigint(
         if runtime_display is not None:
             await runtime_display.install_runtime_line_guard()
         sigint_monitor.install()
-        observed_sigint_count = sigint_monitor.count
+        # monitor 属于当前 invocation；命令入口可能在 runtime prepare 前已安装，
+        # 因而必须从零消费其 durable count，不能把 pre-accept SIGINT 当成 baseline。
+        observed_sigint_count = 0
         monitor.start()
         submit_task = asyncio.create_task(
             submit_entrypoint_turn_and_wait(
@@ -1689,6 +1693,7 @@ async def _drive_interactive_tty_repl(
     exit_intent = _InteractiveExitIntent.CONTINUE
     exit_after_closeout = False
     active_sigint_count = 0
+    pending_submit_sigint_count = 0
     deferred_exit_code: int | None = None
     composer.set_phase(InteractiveComposerPhase.IDLE)
     composer_task: asyncio.Task[_InteractiveComposerCompletion] | None = asyncio.create_task(
@@ -1825,6 +1830,24 @@ async def _drive_interactive_tty_repl(
                             normal_completion = True
                             return EXIT_SUCCESS
 
+            if current is not None and pending_submit_sigint_count > 0:
+                # Enter chord 已由 composer owner 同步确认为非空 submit，但 typed
+                # SUBMIT task 可能晚于紧随其后的 SIGINT 被 outer driver 调度。这里
+                # 只把该 owner state 中的中断绑定刚创建的同一 turn，不按时间猜测。
+                for _interrupt_index in range(pending_submit_sigint_count):
+                    active_sigint_count += 1
+                    exit_after = active_sigint_count >= 2
+                    await _request_interactive_cancel(
+                        active=current,
+                        reason=CLI_SIGINT_REASON,
+                        composer=composer,
+                        runtime_display=runtime_display,
+                        exit_after=exit_after,
+                    )
+                    if exit_after:
+                        exit_after_closeout = True
+                pending_submit_sigint_count = 0
+
             if current_acceptance_task is not None and (
                 current_acceptance_task in done or (current is not None and current.closeout.barrier.accepted.is_set())
             ):
@@ -1849,6 +1872,9 @@ async def _drive_interactive_tty_repl(
                 observed_sigint_count = new_sigint_count
                 for _interrupt_index in range(pending_interrupts):
                     if current is None:
+                        if composer.has_pending_submit_intent():
+                            pending_submit_sigint_count += 1
+                            continue
                         if exit_intent is _InteractiveExitIntent.IDLE_EXIT_PENDING:
                             normal_completion = True
                             return EXIT_KEYBOARD_INTERRUPT
@@ -1889,6 +1915,7 @@ async def _drive_interactive_tty_repl(
                             or not _is_read_only_mutation_rejection(error)
                         ):
                             raise
+                        composer.reject_submit_delivery()
                         if current_acceptance_task is not None:
                             await cancel_and_await_task(current_acceptance_task)
                             current_acceptance_task = None
