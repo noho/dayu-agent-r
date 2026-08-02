@@ -306,7 +306,6 @@ async def test_real_delivery_interruption_recovers_once_and_renders_terminal_onc
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",

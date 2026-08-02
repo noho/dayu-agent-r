@@ -1193,8 +1193,8 @@ def test_interactive_label_targets_shared_agent_slot_and_default_context(
 
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
+    assert captured_requests[0].workspace_root == tmp_path
     assert captured_requests[0].scene_id == "interactive"
-    assert captured_requests[0].explicit_config_dir is None
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert tuple(captured_requests[0].context_slot_values) == (
         _FINS_DEFAULT_SUBJECT_SLOT,
@@ -3015,6 +3015,57 @@ def test_interactive_removed_debug_options_are_argparse_unknown(
     assert removed_args[0] in captured.err
 
 
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config=/tmp/x", "interactive"),
+        ("interactive", "--config=/tmp/x"),
+    ),
+)
+def test_interactive_removed_config_fails_before_service_preparation(
+    argv: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive 的旧配置选项必须在 Service preparation 前被拒绝。
+
+    :param argv: 覆盖 root 与 command scope 的旧选项调用。
+    :param capsys: pytest 标准错误捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: parser 未先失败或 Service 被调用时抛出。
+    """
+
+    captured_requests: list[EntrypointRuntimeRequest] = []
+
+    async def unexpected_prepare(
+        request: EntrypointRuntimeRequest,
+    ) -> EntrypointRuntimeResult:
+        """记录越过 parser boundary 的意外 Service 请求并立即失败。
+
+        :param request: 意外收到的 runtime request。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 只要被调用就抛出。
+        """
+
+        captured_requests.append(request)
+        raise AssertionError("Service preparation must not run")
+
+    monkeypatch.setattr(
+        session_execution,
+        "prepare_entrypoint_runtime",
+        unexpected_prepare,
+    )
+
+    exit_code = cli_main.main(argv)
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert "--config" in captured.err
+    assert captured_requests == []
+
+
 def test_interactive_rejects_all_removed_execution_flags_as_unknown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -3287,7 +3338,6 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id="interactive",
             context_slot_values={
                 _FINS_DEFAULT_SUBJECT_SLOT: "",

@@ -298,7 +298,6 @@ async def test_prompt_runtime_rejects_missing_required_context_slot(
             EntrypointRuntimeRequest(
                 workspace_root=tmp_path,
                 package_config_root=_PACKAGE_CONFIG_ROOT,
-                explicit_config_dir=None,
                 scene_id="prompt",
                 context_slot_values={
                     "current_time": _PROMPT_CURRENT_TIME_TEXT,
@@ -365,7 +364,6 @@ async def _prepare_prompt_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=_PACKAGE_CONFIG_ROOT,
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": fins_default_subject,

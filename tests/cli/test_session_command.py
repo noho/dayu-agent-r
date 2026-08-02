@@ -8,7 +8,7 @@ from io import StringIO
 from pathlib import Path
 from types import TracebackType
 from collections.abc import Callable
-from typing import cast
+from typing import Never, cast
 
 import pytest
 
@@ -616,6 +616,7 @@ def test_session_list_calls_host_public_api_and_renders_sessions(
 
     assert exit_code == EXIT_SUCCESS
     _assert_session_uses_admin_assembly(runtime_capture)
+    assert runtime_capture.requests[0].workspace_root == str(tmp_path)
     assert host.calls == ["list_sessions"]
     assert "session-anonymous\topen\tanonymous\t-" in captured.out
     assert "session-prompt\topen\tlabeled\tproj.v1\trun-active\t0" in captured.out
@@ -656,6 +657,56 @@ def test_real_session_list_succeeds_without_model_api_keys(
     assert captured.err == ""
 
 
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config=/tmp/x", "session", "list"),
+        ("session", "--config=/tmp/x", "list"),
+        ("session", "list", "--config=/tmp/x"),
+    ),
+)
+def test_session_removed_config_fails_before_service_preparation(
+    argv: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """session 的旧配置选项必须在 admin preparation 前被拒绝。
+
+    :param argv: 覆盖 root、command 与 action scope 的旧选项调用。
+    :param capsys: pytest 标准错误捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: parser 未先失败或 Service 被调用时抛出。
+    """
+
+    captured_requests: list[ServiceHostAdminRequest] = []
+
+    def unexpected_prepare(request: ServiceHostAdminRequest) -> Never:
+        """记录越过 parser boundary 的意外 admin 请求并立即失败。
+
+        :param request: 意外收到的 admin request。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 只要被调用就抛出。
+        """
+
+        captured_requests.append(request)
+        raise AssertionError("Service admin preparation must not run")
+
+    monkeypatch.setattr(
+        session_command,
+        "prepare_host_admin",
+        unexpected_prepare,
+    )
+
+    exit_code = cli_main.main(argv)
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert "--config" in captured.err
+    assert captured_requests == []
+
+
 def test_real_session_purge_succeeds_without_model_api_keys(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -685,7 +736,6 @@ def test_real_session_purge_succeeds_without_model_api_keys(
         ServiceHostAdminRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
-            config_overlay_dir=None,
         )
     )
     admin_options = admin_assembly.options

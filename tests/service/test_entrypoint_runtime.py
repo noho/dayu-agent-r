@@ -6,7 +6,7 @@ import ast
 import asyncio
 import json
 from collections.abc import Coroutine
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -1049,6 +1049,55 @@ async def test_prepare_entrypoint_runtime_assembles_scene_tools_and_host(
     assert result.locations.config_overlay_dir == tmp_path / "config"
     assert result.scene_inputs.tool_selection.tool_names == frozenset({"record_smoke_fact"})
     assert result.host_assembly.options.ordinary_run_baseline.runner_options.stream is True
+
+
+def test_entrypoint_runtime_request_has_no_explicit_config_field() -> None:
+    """entrypoint request schema 不再承诺显式配置覆盖字段。
+
+    :returns: ``None``。
+    :raises AssertionError: request schema 仍含旧字段时抛出。
+    """
+
+    field_names = {field.name for field in fields(EntrypointRuntimeRequest)}
+
+    assert "explicit_config_dir" not in field_names
+
+
+@pytest.mark.asyncio
+async def test_prepare_entrypoint_runtime_uses_package_fallback_without_workspace_config(
+    tmp_path: Path,
+) -> None:
+    """workspace config 不存在时必须使用 package prompt 与 manifest。
+
+    :param tmp_path: pytest 临时 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: location owner 未选择 package fallback 时抛出。
+    """
+
+    result = await prepare_entrypoint_runtime(
+        EntrypointRuntimeRequest(
+            workspace_root=tmp_path,
+            package_config_root=_PACKAGE_CONFIG_ROOT,
+            scene_id="prompt",
+            context_slot_values={
+                CURRENT_TIME_SLOT: current_time(_NOW),
+                "fins_default_subject": "测试财报主体",
+            },
+            assembly_overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env=_runtime_assembly_env(),
+        )
+    )
+
+    assert result.locations.config_overlay_dir is None
+    assert result.locations.prompt_asset_root == _PACKAGE_CONFIG_ROOT / "prompts"
+    assert result.locations.scene_manifest_root == (
+        _PACKAGE_CONFIG_ROOT / "prompts" / "manifests"
+    )
 
 
 @pytest.mark.asyncio
@@ -3285,7 +3334,6 @@ async def _prepare_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=_PACKAGE_CONFIG_ROOT,
-            explicit_config_dir=None,
             scene_id="smoke_host_public_multiturn",
             context_slot_values={
                 CURRENT_TIME_SLOT: current_time(_NOW),

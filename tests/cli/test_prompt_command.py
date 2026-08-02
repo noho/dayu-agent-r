@@ -1312,8 +1312,8 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert captured.out.strip() == "prompt answer"
     assert "Activity:" in captured.err
     assert "工具批次完成" in captured.err
+    assert captured_requests[0].workspace_root == workspace_root
     assert captured_requests[0].scene_id == "prompt"
-    assert captured_requests[0].explicit_config_dir is None
     assert captured_requests[0].context_slot_values["fins_default_subject"] == "# 当前分析对象\n你正在分析的是 AAPL。"
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
@@ -2130,7 +2130,6 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
@@ -2675,6 +2674,57 @@ def test_prompt_removed_debug_options_are_argparse_unknown(
     assert removed_args[0] in captured.err
 
 
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config=/tmp/x", "prompt", "请总结收入变化"),
+        ("prompt", "--config=/tmp/x", "请总结收入变化"),
+    ),
+)
+def test_prompt_removed_config_fails_before_service_preparation(
+    argv: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt 的旧配置选项必须在 Service preparation 前由 parser 拒绝。
+
+    :param argv: 覆盖 root 与 command scope 的旧选项调用。
+    :param capsys: pytest 标准错误捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: parser 未先失败或 Service 被调用时抛出。
+    """
+
+    captured_requests: list[EntrypointRuntimeRequest] = []
+
+    async def unexpected_prepare(
+        request: EntrypointRuntimeRequest,
+    ) -> EntrypointRuntimeResult:
+        """记录越过 parser boundary 的意外 Service 请求并立即失败。
+
+        :param request: 意外收到的 runtime request。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 只要被调用就抛出。
+        """
+
+        captured_requests.append(request)
+        raise AssertionError("Service preparation must not run")
+
+    monkeypatch.setattr(
+        session_execution,
+        "prepare_entrypoint_runtime",
+        unexpected_prepare,
+    )
+
+    exit_code = cli_main.main(argv)
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert "--config" in captured.err
+    assert captured_requests == []
+
+
 def test_prompt_command_rejects_all_removed_execution_flags_as_unknown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2886,7 +2936,6 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",

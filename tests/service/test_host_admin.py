@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from pathlib import Path
 
 from dayu.service.host_admin import (
@@ -11,25 +12,33 @@ from dayu.service.host_admin import (
 )
 
 
-def _write_host_runtime(config_root: Path) -> None:
+def _write_host_runtime(
+    config_root: Path,
+    *,
+    runtime_id: str,
+    database_path: str,
+) -> None:
     """写入不依赖其它 runtime catalog 的 Host runtime 配置。
 
     :param config_root: 测试 package config 根目录。
+    :param runtime_id: 待写入的 Host runtime id。
+    :param database_path: 相对 workspace 的 SQLite 路径。
     :returns: ``None``。
     :raises OSError: 文件写入失败时透传。
     """
 
     config_root.mkdir(parents=True, exist_ok=True)
+    (config_root / "prompts" / "manifests").mkdir(parents=True)
     (config_root / "host_runtime.json").write_text(
         json.dumps(
             {
-                "default_host_runtime_id": "admin-test",
+                "default_host_runtime_id": runtime_id,
                 "runtimes": {
-                    "admin-test": {
+                    runtime_id: {
                         "store_root": ".dayu/host",
                         "artifact_root": ".dayu/artifacts",
                         "sqlite": {
-                            "path": ".dayu/host/admin.sqlite3",
+                            "path": database_path,
                             "busy_timeout_seconds": 0.25,
                             "write_busy_retry_count": 5,
                             "write_retry_initial_delay_seconds": 0.001,
@@ -76,13 +85,16 @@ def test_prepare_host_admin_loads_only_host_runtime_without_models_or_secrets(
     package_config_root = tmp_path / "package-config"
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
-    _write_host_runtime(package_config_root)
+    _write_host_runtime(
+        package_config_root,
+        runtime_id="admin-test",
+        database_path=".dayu/host/admin.sqlite3",
+    )
 
     result = prepare_host_admin(
         ServiceHostAdminRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root,
-            config_overlay_dir=None,
         )
     )
 
@@ -103,3 +115,52 @@ def test_prepare_host_admin_loads_only_host_runtime_without_models_or_secrets(
     assert not hasattr(result.options, "lane_name")
     assert not hasattr(result.options, "tooling_options")
     assert not hasattr(result.options, "ordinary_run_baseline")
+
+
+def test_service_host_admin_request_has_no_config_override_field() -> None:
+    """Service admin request 不再承诺显式配置覆盖字段。
+
+    :returns: ``None``。
+    :raises AssertionError: request schema 仍含旧字段时抛出。
+    """
+
+    field_names = {field.name for field in fields(ServiceHostAdminRequest)}
+
+    assert "config_overlay_dir" not in field_names
+
+
+def test_prepare_host_admin_uses_workspace_config_when_present(
+    tmp_path: Path,
+) -> None:
+    """admin assembly 必须通过 runtime location owner 使用 workspace config。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: workspace 配置未覆盖 package fallback 时抛出。
+    """
+
+    package_config_root = tmp_path / "package-config"
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    _write_host_runtime(
+        package_config_root,
+        runtime_id="package-admin",
+        database_path=".dayu/host/package.sqlite3",
+    )
+    _write_host_runtime(
+        workspace_root / "config",
+        runtime_id="workspace-admin",
+        database_path=".dayu/host/workspace.sqlite3",
+    )
+
+    result = prepare_host_admin(
+        ServiceHostAdminRequest(
+            workspace_root=workspace_root,
+            package_config_root=package_config_root,
+        )
+    )
+
+    assert result.host_runtime_id == "workspace-admin"
+    assert result.options.db_path == (
+        workspace_root / ".dayu/host/workspace.sqlite3"
+    ).resolve()

@@ -971,7 +971,6 @@ async def test_interactive_runtime_requires_subject_and_current_time_context_slo
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=_PACKAGE_CONFIG_ROOT,
-            explicit_config_dir=None,
             scene_id="interactive",
             context_slot_values={
                 "fins_default_subject": _INTERACTIVE_SUBJECT_TEXT,
@@ -1281,7 +1280,6 @@ async def _prepare_interactive_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=_PACKAGE_CONFIG_ROOT,
-            explicit_config_dir=None,
             scene_id="interactive",
             context_slot_values={
                 "fins_default_subject": _INTERACTIVE_SUBJECT_TEXT,

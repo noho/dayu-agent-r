@@ -12,6 +12,7 @@ from pathlib import Path
 
 from dayu.host.api import OpenHostAdminOptions
 from dayu.runtime.config_loader import ConfigLoader, HostRuntimeProfileConfig
+from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.workspace_paths import resolve_workspace_path
 
 
@@ -21,14 +22,11 @@ class ServiceHostAdminRequest:
 
     :param workspace_root: 当前 workspace 根目录。
     :param package_config_root: 包内默认配置目录。
-    :param config_overlay_dir: 显式 workspace 配置覆盖目录；``None`` 表示只用
-        包内默认 Host runtime 配置。
     :param host_runtime_id: 显式 Host runtime id；``None`` 使用配置默认值。
     """
 
     workspace_root: Path
     package_config_root: Path
-    config_overlay_dir: Path | None
     host_runtime_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -44,13 +42,6 @@ class ServiceHostAdminRequest:
         if not isinstance(self.package_config_root, Path):
             raise TypeError(
                 "ServiceHostAdminRequest.package_config_root must be Path"
-            )
-        if self.config_overlay_dir is not None and not isinstance(
-            self.config_overlay_dir,
-            Path,
-        ):
-            raise TypeError(
-                "ServiceHostAdminRequest.config_overlay_dir must be Path or None"
             )
         if self.host_runtime_id is not None and self.host_runtime_id.strip() == "":
             raise ValueError(
@@ -75,13 +66,18 @@ def prepare_host_admin(request: ServiceHostAdminRequest) -> ServiceHostAdminResu
 
     :param request: admin assembly 请求。
     :returns: admin opener options 与实际 runtime id。
+    :raises RuntimeLocationError: runtime location 依赖的包内资产缺失时抛出。
     :raises ConfigLoadError: Host runtime 配置缺失或字段非法时抛出。
     :raises ValueError: 显式 runtime id 不存在或路径逃逸 workspace 时抛出。
     """
 
+    locations = resolve_runtime_locations(
+        workspace_root=request.workspace_root,
+        package_config_root=request.package_config_root,
+    )
     host_runtime_config = ConfigLoader(
         package_config_dir=request.package_config_root
-    ).load_host_runtime(workspace_config_dir=request.config_overlay_dir)
+    ).load_host_runtime(workspace_config_dir=locations.config_overlay_dir)
     host_runtime_id = (
         request.host_runtime_id
         if request.host_runtime_id is not None

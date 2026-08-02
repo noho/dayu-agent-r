@@ -160,7 +160,6 @@ class ParsedCliArgs(argparse.Namespace):
 
     command_name: str
     workspace_root: str
-    config_dir: str | None
     log_level: DiagnosticLogLevel
     _root_log_level_selectors: list[DiagnosticLogLevel]
     _command_log_level_selectors: list[DiagnosticLogLevel]
@@ -223,19 +222,16 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     root_common_parent = _build_common_arguments_parent(
         log_level_selectors_dest=_ROOT_LOG_LEVEL_SELECTORS_DEST
     )
-    root_runtime_parent = _build_runtime_arguments_parent(root_common_parent)
     command_common_parent = _build_common_arguments_parent(
         log_level_selectors_dest=_COMMAND_LOG_LEVEL_SELECTORS_DEST
     )
-    command_runtime_parent = _build_runtime_arguments_parent(command_common_parent)
     action_common_parent = _build_common_arguments_parent(
         log_level_selectors_dest=_ACTION_LOG_LEVEL_SELECTORS_DEST
     )
-    action_runtime_parent = _build_runtime_arguments_parent(action_common_parent)
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Dayu 财报分析命令行入口。",
-        parents=[root_runtime_parent],
+        parents=[root_common_parent],
     )
     subparsers = cast(
         CommandSubparserRegistry,
@@ -248,23 +244,22 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     _register_init_command(subparsers, command_common_parent)
     _register_prompt_command(subparsers, command_common_parent)
     _register_interactive_command(subparsers, command_common_parent)
-    _register_download_command(subparsers, command_runtime_parent)
-    _register_upload_filing_command(subparsers, command_runtime_parent)
-    _register_upload_material_command(subparsers, command_runtime_parent)
-    _register_upload_filings_from_command(subparsers, command_runtime_parent)
-    _register_process_command(subparsers, command_runtime_parent)
-    _register_process_filing_command(subparsers, command_runtime_parent)
-    _register_process_material_command(subparsers, command_runtime_parent)
+    _register_download_command(subparsers, command_common_parent)
+    _register_upload_filing_command(subparsers, command_common_parent)
+    _register_upload_material_command(subparsers, command_common_parent)
+    _register_upload_filings_from_command(subparsers, command_common_parent)
+    _register_process_command(subparsers, command_common_parent)
+    _register_process_filing_command(subparsers, command_common_parent)
+    _register_process_material_command(subparsers, command_common_parent)
     _register_session_command(
         subparsers,
-        command_parent=command_runtime_parent,
-        action_common_parent=action_common_parent,
-        action_runtime_parent=action_runtime_parent,
+        command_parent=command_common_parent,
+        action_parent=action_common_parent,
     )
     _register_tool_trace_command(
         subparsers,
-        command_parent=command_runtime_parent,
-        action_parent=action_runtime_parent,
+        command_parent=command_common_parent,
+        action_parent=action_common_parent,
     )
     return parser
 
@@ -283,35 +278,7 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> ParsedCliArgs:
     namespace = parser.parse_args(effective_argv, namespace=_new_default_namespace())
     parsed_args = cast(ParsedCliArgs, namespace)
     _finalize_log_level_selection(parsed_args, parser=parser)
-    _reject_disallowed_explicit_config(parsed_args, parser=parser)
     return parsed_args
-
-
-def _reject_disallowed_explicit_config(
-    parsed_args: ParsedCliArgs,
-    *,
-    parser: argparse.ArgumentParser,
-) -> None:
-    """按最终命令路由拒绝不允许的显式配置参数。
-
-    :param parsed_args: argparse 已填充的类型化 namespace。
-    :param parser: 负责输出公共 usage diagnostic 的顶层 parser。
-    :returns: ``None``。
-    :raises SystemExit: init、prompt、interactive 或 session resume 携带
-        ``--config`` 时由 parser 以用法错误 2 退出。
-    """
-
-    if parsed_args.config_dir is None:
-        return
-    if parsed_args.command_name == COMMAND_INIT:
-        parser.error("init 命令不接受 --config")
-    if parsed_args.command_name in (COMMAND_PROMPT, COMMAND_INTERACTIVE):
-        parser.error(f"{parsed_args.command_name} 命令不接受 --config")
-    if (
-        parsed_args.command_name == COMMAND_SESSION
-        and parsed_args.session_action == SESSION_ACTION_RESUME
-    ):
-        parser.error("session resume 命令不接受 --config")
 
 
 def _require_valid_utf8_invocation(
@@ -371,7 +338,6 @@ def _new_default_namespace() -> ParsedCliArgs:
 
     namespace = ParsedCliArgs()
     namespace.workspace_root = DEFAULT_WORKSPACE
-    namespace.config_dir = None
     namespace.log_level = DEFAULT_LOG_LEVEL
     namespace._root_log_level_selectors = []
     namespace._command_log_level_selectors = []
@@ -429,7 +395,7 @@ def _build_common_arguments_parent(
 
     :param log_level_selectors_dest: 当前 argparse scope 独占的 selector
         occurrence 列表字段名。
-    :returns: 不含 help 与 ``--config`` 的公共参数解析器。
+    :returns: 不含 help 的公共参数解析器。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
 
@@ -514,26 +480,6 @@ def _parse_public_log_level(value: str) -> DiagnosticLogLevel:
             "expected one of: " + ", ".join(LOG_LEVEL_CHOICES)
         )
     return canonical_level
-
-
-def _build_runtime_arguments_parent(
-    common_parent: argparse.ArgumentParser,
-) -> argparse.ArgumentParser:
-    """创建 Agent runtime 命令使用的参数父解析器。
-
-    :param common_parent: 所有命令共用且不含 ``--config`` 的父解析器。
-    :returns: 在公共参数上增加 ``--config`` 的 runtime 参数解析器。
-    :raises ValueError: argparse 参数注册失败时透传底层异常。
-    """
-
-    parser = argparse.ArgumentParser(add_help=False, parents=[common_parent])
-    parser.add_argument(
-        "--config",
-        dest="config_dir",
-        default=argparse.SUPPRESS,
-        help="显式配置目录；未提供时使用 <base>/config 或随包默认配置。",
-    )
-    return parser
 
 
 def _add_command_parser(
@@ -645,15 +591,13 @@ def _register_session_command(
     subparsers: CommandSubparserRegistry,
     *,
     command_parent: argparse.ArgumentParser,
-    action_common_parent: argparse.ArgumentParser,
-    action_runtime_parent: argparse.ArgumentParser,
+    action_parent: argparse.ArgumentParser,
 ) -> None:
     """注册 ``session`` 命令及其二级 action 参数。
 
     :param subparsers: 顶层 subparsers 注册器。
-    :param command_parent: command scope 的 runtime 参数父解析器。
-    :param action_common_parent: 不含显式配置参数的 action scope 父解析器。
-    :param action_runtime_parent: 含显式配置参数的 action scope 父解析器。
+    :param command_parent: command scope 的公共参数父解析器。
+    :param action_parent: action scope 的公共参数父解析器。
     :returns: ``None``。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
@@ -672,9 +616,9 @@ def _register_session_command(
             required=True,
         ),
     )
-    _register_session_list_action(action_subparsers, action_runtime_parent)
-    _register_session_resume_action(action_subparsers, action_common_parent)
-    _register_session_purge_action(action_subparsers, action_runtime_parent)
+    _register_session_list_action(action_subparsers, action_parent)
+    _register_session_resume_action(action_subparsers, action_parent)
+    _register_session_purge_action(action_subparsers, action_parent)
 
 
 def _register_tool_trace_command(
@@ -686,8 +630,8 @@ def _register_tool_trace_command(
     """注册 ``tool_trace analyze`` operator 命令。
 
     :param subparsers: 顶层 subparsers 注册器。
-    :param command_parent: command scope 的 runtime 参数父解析器。
-    :param action_parent: action scope 的 runtime 参数父解析器。
+    :param command_parent: command scope 的公共参数父解析器。
+    :param action_parent: action scope 的公共参数父解析器。
     :returns: ``None``。
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """

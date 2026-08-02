@@ -599,7 +599,6 @@ async def _prepare_session_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id=scenario,
             context_slot_values=context_slot_values,
             assembly_overrides=ServiceAssemblyOverrides(

@@ -17,7 +17,6 @@ from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     optional_stripped_text,
     package_config_root,
-    resolve_explicit_config_dir,
     resolve_workspace_root,
 )
 from dayu.cli.arg_parsing import (
@@ -206,7 +205,7 @@ def _prepare_session_admin(
 
     :param args: argparse 已解析的 session 命令参数。
     :returns: HostAdmin opener 装配结果。
-    :raises CliSessionUsageError: workspace 或 config 参数非法时抛出。
+    :raises CliSessionUsageError: workspace 参数非法时抛出。
     :raises Exception: Host runtime 配置或路径装配失败时向上抛出。
     """
 
@@ -214,16 +213,10 @@ def _prepare_session_admin(
         args.workspace_root,
         error_factory=CliSessionUsageError,
     )
-    explicit_config_dir = resolve_explicit_config_dir(
-        config_dir=args.config_dir,
-        workspace_root=workspace_root,
-        error_factory=CliSessionUsageError,
-    )
     return prepare_host_admin(
         ServiceHostAdminRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            config_overlay_dir=explicit_config_dir,
         )
     )
 

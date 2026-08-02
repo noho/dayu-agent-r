@@ -22,7 +22,6 @@ from dayu.service.host_assembly import ServiceRunOverrides
 UsageErrorFactory = Callable[[str], ValueError]
 
 BASE_OPTION_NAME: str = "--base"
-CONFIG_DIR_OPTION_NAME: str = "--config"
 FALLBACK_MODE_OPTION_NAME: str = "--fallback-mode"
 FALLBACK_PROMPT_OPTION_NAME: str = "--fallback-prompt"
 _TaskResult = TypeVar("_TaskResult")
@@ -198,41 +197,6 @@ def resolve_workspace_root(value: str, *, error_factory: UsageErrorFactory) -> P
     return Path(stripped).expanduser().resolve(strict=False)
 
 
-def resolve_explicit_config_dir(
-    *,
-    config_dir: str | None,
-    workspace_root: Path,
-    error_factory: UsageErrorFactory,
-) -> Path | None:
-    """解析并校验显式 ``--config`` 目录。
-
-    :param config_dir: 用户显式传入的配置目录；未提供时为 ``None``。
-    :param workspace_root: 已解析的 workspace root。
-    :param error_factory: 用于构造当前命令用法错误的异常工厂。
-    :returns: 解析后的显式配置目录；未提供时为 ``None``。
-    :raises ValueError: 路径为空、逃逸 workspace 或不是目录时通过
-        ``error_factory`` 抛出。
-    """
-
-    if config_dir is None:
-        return None
-    stripped = require_cli_text(
-        config_dir,
-        field_name=CONFIG_DIR_OPTION_NAME,
-        error_factory=error_factory,
-    )
-    raw_path = Path(stripped).expanduser()
-    candidate = raw_path if raw_path.is_absolute() else workspace_root / raw_path
-    resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(workspace_root)
-    except ValueError as exc:
-        raise error_factory(f"{CONFIG_DIR_OPTION_NAME} must stay inside workspace root: {resolved}") from exc
-    if not resolved.is_dir():
-        raise error_factory(f"{CONFIG_DIR_OPTION_NAME} is not a directory: {resolved}")
-    return resolved
-
-
 def optional_stripped_text(
     value: str | None,
     *,
@@ -327,7 +291,6 @@ __all__: tuple[str, ...] = (
     "cancel_and_await_task",
     "package_config_root",
     "optional_stripped_text",
-    "resolve_explicit_config_dir",
     "resolve_workspace_root",
     "service_run_overrides_from_args",
 )
