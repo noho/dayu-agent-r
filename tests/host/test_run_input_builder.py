@@ -3763,7 +3763,17 @@ def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
         request = _build_post_compaction_request(store, recovery, policy)
         contents = tuple(_message_content(message) for message in request.messages)
         system_content = _single_system_content(request.messages)
+        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(
+            store
+        )
 
+        assert hot_manifest["runner_call_kind"] == "post_compaction_dispatch"
+        assert hot_manifest["runner_call_trigger_reason"] == (
+            "context_governance_resolved"
+        )
+        assert durable_manifest["runner_call_trigger_reason"] == (
+            "context_governance_resolved"
+        )
         assert "请列出四条关键风险" in contents
         assert answer_text in contents
         assert "3. 第三条是客户集中度升高，需要拆解前五大客户变化。" in ("\n".join(contents))
@@ -3924,7 +3934,17 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
 
         request = builder.build(_attempt_snapshot(recovery))
         contents = tuple(_message_content(message) for message in request.messages)
+        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(
+            store
+        )
 
+        assert hot_manifest["runner_call_kind"] == "post_compaction_dispatch"
+        assert hot_manifest["runner_call_trigger_reason"] == (
+            "context_governance_resolved"
+        )
+        assert durable_manifest["runner_call_trigger_reason"] == (
+            "context_governance_resolved"
+        )
         assert all(answer_text not in content for content in contents)
         assert _message_occurrences(contents, current_prompt) == 1
         assert contents[-1] == current_prompt
@@ -4315,6 +4335,34 @@ def _build_request_with_memory(
         compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
     )
     return builder.build(_attempt_snapshot(seeded))
+
+
+def _single_runner_call_manifest_payloads(
+    store: HostDurableStore,
+) -> tuple[Mapping[str, JsonValue], Mapping[str, JsonValue]]:
+    """读取唯一 runner-call event 的 hot 与 durable manifest payload。
+
+    :param store: Host durable store。
+    :returns: ``(hot_payload, durable_manifest_payload)``。
+    :raises AssertionError: runner-call event 数量不是一个时抛出。
+    :raises HostDurableError: durable manifest payload 无法严格解析时抛出。
+    """
+
+    manifest_events = _events_by_type(
+        store.transaction_runner,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+    )
+    assert len(manifest_events) == 1
+    manifest_event = manifest_events[0]
+    hot_payload = _payload_object(manifest_event)
+    durable_payload = store.transaction_runner.run_read(
+        lambda transaction: event_payload_object(
+            transaction,
+            manifest_event,
+            payload_label="runner-call manifest",
+        )
+    )
+    return hot_payload, durable_payload
 
 
 def _build_post_compaction_request(

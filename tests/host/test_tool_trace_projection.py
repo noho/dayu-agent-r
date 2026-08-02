@@ -2388,7 +2388,7 @@ def test_tool_trace_resolves_large_tool_call_arguments_without_internal_refs(
 
 
 def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
-    """Tool Trace hot row 只复制 shared owner 校验后的 fixed scalars。"""
+    """Tool Trace 透传治理收口 trigger，且不从中反推精确 outcome。"""
 
     cold_path = tmp_path / "trace" / "runner-call.jsonl"
     manifest_digest = sha256_digest_json({"manifest": "runner-call"})
@@ -2405,8 +2405,8 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "attempt_id": "attempt-1",
                 "execution_id": "execution-1",
                 "runner_call_index": 0,
-                "runner_call_kind": "initial_user_dispatch",
-                "runner_call_trigger_reason": "initial_user_input",
+                "runner_call_kind": "post_compaction_dispatch",
+                "runner_call_trigger_reason": "context_governance_resolved",
                 "iteration_id": "iteration-1",
                 "iteration_index": 0,
                 "manifest_payload_ref": "payload-runner-call-manifest",
@@ -2443,12 +2443,19 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
         assert row is not None
         assert row.result_digest == manifest_digest
         assert row.trace_summary["runner_call_index"] == 0
+        assert row.trace_summary["runner_call_kind"] == "post_compaction_dispatch"
+        assert row.trace_summary["runner_call_trigger_reason"] == (
+            "context_governance_resolved"
+        )
         assert row.trace_summary["manifest_ref"] == "payload-runner-call-manifest"
         assert row.trace_summary["manifest_digest"] == manifest_digest
         assert row.trace_summary["message_count"] == 2
         assert row.trace_summary["role_sequence_digest"] == role_digest
         assert row.trace_summary["input_projection_digest"] == projection_digest
         assert "projector_metadata_summary" not in row.trace_summary
+        assert "context_compaction_outcome" not in row.trace_summary
+        assert "compact_artifact_ref" not in row.trace_summary
+        assert "fallback_action" not in row.trace_summary
         assert row.trace_summary["diagnostic"] == {
             "status": "complete",
             "reason": None,

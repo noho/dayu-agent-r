@@ -154,7 +154,7 @@ _RUNNER_CALL_TRIGGER_REASONS = frozenset(
         "host_retry",
         "host_replay",
         "host_resume",
-        "context_compaction_completed",
+        "context_governance_resolved",
         "context_compaction_initial_proposal",
         "context_compaction_repair_attempt",
         "context_compaction_retry_attempt",

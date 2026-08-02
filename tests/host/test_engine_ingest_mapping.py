@@ -1413,6 +1413,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         hot = parse_runner_call_hot_payload(
             _payload(recovery_manifest_event)
         )
+        assert hot.runner_call_trigger_reason == "context_governance_resolved"
         manifest_json = store.transaction_runner.run_read(
             lambda transaction: sqlite_payload_object(
                 transaction,
@@ -1424,6 +1425,9 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         manifest = parse_runner_call_manifest(
             manifest_json,
             hot_payload=hot,
+        )
+        assert manifest.identity.runner_call_trigger_reason == (
+            "context_governance_resolved"
         )
         recovery_attempt_id = hot.attempt_id
         recovery_execution_id = hot.execution_id
@@ -2771,6 +2775,24 @@ async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
         assert isinstance(failed_payload["fallback_budget_result"], Mapping)
         assert failed_payload["fallback_budget_result"]["status"] == (
             "within_hard_budget"
+        )
+        fallback_manifest_event = result.events[4]
+        hot = parse_runner_call_hot_payload(_payload(fallback_manifest_event))
+        manifest_json = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=hot.manifest_payload_ref,
+                payload_digest=hot.manifest_digest,
+                payload_label="fallback recovery manifest",
+            )
+        )
+        manifest = parse_runner_call_manifest(
+            manifest_json,
+            hot_payload=hot,
+        )
+        assert hot.runner_call_trigger_reason == "context_governance_resolved"
+        assert manifest.identity.runner_call_trigger_reason == (
+            "context_governance_resolved"
         )
 
 
@@ -6052,7 +6074,7 @@ def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
     ("runner_call_kind", "trigger_reason"),
     (
         ("followup_user_dispatch", "followup_user_input"),
-        ("post_compaction_dispatch", "context_compaction_completed"),
+        ("post_compaction_dispatch", "context_governance_resolved"),
     ),
 )
 def test_iteration_started_links_all_ordinary_dispatch_kinds(
@@ -6102,6 +6124,74 @@ def test_iteration_started_links_all_ordinary_dispatch_kinds(
             manifest_event.event_id
         )
         assert _payload(result.events[0])["runner_call_kind"] == runner_call_kind
+
+
+@pytest.mark.parametrize(
+    "invalid_trigger_reason",
+    (
+        "context_compaction_" + "completed",
+        "unknown_context_governance_trigger",
+    ),
+)
+def test_runner_call_manifest_rejects_stale_and_unknown_governance_trigger(
+    tmp_path: Path,
+    invalid_trigger_reason: str,
+) -> None:
+    """strict hot/manifest reader 拒绝旧治理 trigger 与未知值。
+
+    :param tmp_path: pytest 临时目录。
+    :param invalid_trigger_reason: 待拒绝的旧值或未知值。
+    :returns: ``None``。
+    :raises AssertionError: strict reader 未拒绝非法 trigger 时抛出。
+    """
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        event = _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-governance-resolved",
+            runner_call_index=0,
+            runner_call_kind="post_compaction_dispatch",
+            runner_call_trigger_reason="context_governance_resolved",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        hot_payload = _payload(event)
+        hot = parse_runner_call_hot_payload(hot_payload)
+        manifest_json = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=hot.manifest_payload_ref,
+                payload_digest=hot.manifest_digest,
+                payload_label="governance-resolved manifest",
+            )
+        )
+        manifest = parse_runner_call_manifest(
+            manifest_json,
+            hot_payload=hot,
+        )
+
+        assert hot.runner_call_trigger_reason == "context_governance_resolved"
+        assert manifest.identity.runner_call_trigger_reason == (
+            "context_governance_resolved"
+        )
+
+        invalid_hot_payload = dict(hot_payload)
+        invalid_hot_payload["runner_call_trigger_reason"] = invalid_trigger_reason
+        with pytest.raises(HostDurableError, match="runner_call_trigger_reason"):
+            parse_runner_call_hot_payload(invalid_hot_payload)
+
+        invalid_manifest_json = dict(manifest_json)
+        invalid_manifest_json["runner_call_trigger_reason"] = (
+            invalid_trigger_reason
+        )
+        with pytest.raises(HostDurableError, match="runner_call_trigger_reason"):
+            parse_runner_call_manifest(
+                invalid_manifest_json,
+                hot_payload=hot,
+            )
 
 
 def test_iteration_started_does_not_link_compactor_manifest(tmp_path: Path) -> None:

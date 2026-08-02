@@ -3163,7 +3163,7 @@ Closed `RunnerCallTriggerReason` enum：
 | `host_retry` | Host retry operation |
 | `host_replay` | Host replay operation |
 | `host_resume` | Host resume operation |
-| `context_compaction_completed` | accepted compact or fallback permits next dispatch |
+| `context_governance_resolved` | context governance 已收口并允许下一次 dispatch；精确 success / failure outcome 仍只由 `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` 及其 artifact / fallback refs 拥有 |
 | `context_compaction_initial_proposal` | first compactor proposal attempt for a compaction operation |
 | `context_compaction_repair_attempt` | compactor repair attempt after proposal rejection |
 | `context_compaction_retry_attempt` | compactor retry attempt after proposal execution failure |

@@ -335,7 +335,7 @@ _PRE_START_RUNNER_CALL_KINDS = frozenset(
 _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
 _RUNNER_CALL_TRIGGER_FOLLOWUP_USER_INPUT = "followup_user_input"
 _RUNNER_CALL_TRIGGER_HOST_RESUME = "host_resume"
-_RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
+_RUNNER_CALL_TRIGGER_CONTEXT_GOVERNANCE_RESOLVED = "context_governance_resolved"
 _RUNNER_CALL_VALIDATION_COMPLETE = "complete"
 _PROJECTOR_ID_SYSTEM_CONTEXT = "run_input_system_context"
 _PROJECTOR_ID_USER_INPUT = "user_input_message"
@@ -6671,7 +6671,7 @@ def _prepared_candidate_kind_and_trigger(
     ):
         return (
             _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
-            _RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED,
+            _RUNNER_CALL_TRIGGER_CONTEXT_GOVERNANCE_RESOLVED,
         )
     return (
         _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH,
@@ -7976,7 +7976,7 @@ def _runner_call_kind_and_trigger(
     ):
         return (
             _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
-            _RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED,
+            _RUNNER_CALL_TRIGGER_CONTEXT_GOVERNANCE_RESOLVED,
         )
     if started_payload.start_reason is RunStartReason.RESUME:
         return (
