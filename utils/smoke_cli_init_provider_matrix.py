@@ -2383,7 +2383,6 @@ async def _read_effective_identities(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root,
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values=context_slots,
             assembly_overrides=ServiceAssemblyOverrides(),

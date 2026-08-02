@@ -805,7 +805,6 @@ async def _prepare_packaged_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=_PACKAGE_CONFIG_ROOT,
-            explicit_config_dir=None,
             scene_id=scene_id,
             context_slot_values={
                 "fins_default_subject": "DAYU",
