@@ -350,48 +350,70 @@ git diff --check
 
 `run_keys.py` 保留现有“后台 reader thread + asyncio queue”架构，并固定使用 prompt_toolkit public `Vt100Parser`；不迁移 fd 到 event loop、不写第二套 byte parser。实现细节已收口为：
 
-1. `TtyRunningKeyMonitor._read_loop()` 在 **reader thread 内**创建唯一 `Vt100Parser(callback)` 与 UTF-8 incremental decoder；parser 不在线程外创建，也不被其它线程调用。
-2. reader thread 用 chunk read；decoded chunk 只在该线程调用 `parser.feed(...)`。原始 chunk出现 ESC 后设置/刷新命名常量 `_ESCAPE_SEQUENCE_AMBIGUITY_SECONDS` 对应的 monotonic deadline；ambiguity pending 时每个后续 chunk都刷新 deadline。
-3. `select` 没有新字节且 deadline 到期时，由同一个 reader thread调用一次 `parser.flush()` 并清空 deadline。该 deadline只解决 ESC ambiguity，不是 Run timeout、poll budget或 cancel deadline。
-4. parser callback也在 reader thread执行；它只把 `KeyPress` 分类成 typed `RunningKeyAction`，并仅通过 `loop.call_soon_threadsafe(queue.put_nowait, action)` 投递。只有 `key is Keys.Escape` 且 `data == "\x1b"` 才投递 `CANCEL_RUN`；Ctrl+T仍投递 `TOGGLE_ACTIVITY`；其它完整序列不投递 action。
-5. CSI/Home/Delete/SS3、Alt组合与 bracketed paste 即使跨 chunk，也先由 parser收齐；完整 sequence callback不会满足 standalone ESC 条件。完整序列之后的空 flush是 no-op，不能取消。
-6. `close()` 仍由 monitor owner设置 stop、join thread并恢复 termios；parser/decoder不泄漏到 cleanup线程。
+1. `TtyRunningKeyMonitor._read_loop()` 在 **reader thread 内**创建唯一 public `Vt100Parser(callback)` 与唯一标准库 UTF-8 incremental decoder；parser、decoder和callback collector都不在线程外创建或调用。类型只从 public `prompt_toolkit.input.vt100_parser.Vt100Parser`、`prompt_toolkit.key_binding.KeyPress` 与 `prompt_toolkit.keys.Keys` 导入；禁止导入/实例化 `KeyProcessor`，禁止访问 parser private state。
+2. parser callback不得立即投递 action。reader thread持有一个只供该线程使用的 `list[KeyPress]` collector；每次调用一次 public `parser.feed(decoded_chunk)` 或 `parser.flush()` 前确认collector为空，调用同步返回后把本次产生的callbacks冻结为一个 **parser resolution batch**，清空collector，再由模块级typed helper分类整个batch。一个 public `feed`或`flush`调用就是唯一batch boundary；不得按raw byte、callback到达时间或event-loop调度重新分组。
+3. reader thread用chunk read，raw bytes只交给唯一incremental decoder，decoded text只交给唯一parser。ambiguity常量固定为`_ESCAPE_SEQUENCE_AMBIGUITY_SECONDS: Final[float] = 0.1`；raw chunk出现ESC后设置/刷新对应的monotonic deadline，deadline已armed时每个后续非空chunk都刷新为“本次feed时刻 + 0.1s”。这里只观察“是否出现ESC”以管理flush时机，不解析sequence、Alt、CSI、SS3或paste，因此不构成第二套raw-byte parser；chunk read size只是非语义性能参数，不得改变batch定义。
+4. deadline采用 **conservative armed until one flush**：一旦含ESC的raw chunk使其armed，就不能根据本次callback batch为空、非空或callback形状推断public parser是否仍有pending prefix，也不能在feed后提前清除。`select`没有新字节且deadline到期时，由同一reader thread调用恰好一次`parser.flush()`，按独立flush resolution batch分类，并在该次flush返回后无条件清除deadline；已解析完整sequence时这一次空flush是预期no-op，不得循环或重复cancel。若deadline到期与fd readable同轮成立，必须先读取、decode并`feed`新字节并刷新deadline；只有确认本轮没有新字节才允许flush。`select`等待取poll interval与剩余ambiguity时间的较小值；该0.1s deadline只解决ESC ambiguity，不是Run timeout、poll budget或cancel deadline。
+5. batch classifier把每个`Keys.Escape` callback视为 **provisional Escape**，绝不在callback现场发出cancel。当前batch后续任一callback证明该Escape属于同一次parser resolution的Alt/meta/invalid-prefix continuation时，只抑制这个provisional Escape；后续callback仍按自身语义继续分类。特别是后续`Keys.ControlT`仍独立产生一次`TOGGLE_ACTIVITY`，不能因抑制Escape而吞掉；普通字符、navigation、Home/Delete、SS3和`Keys.BracketedPaste`自身不产生运行态action。
+6. `CANCEL_RUN`只有一个产生条件：ambiguity deadline触发的 **flush batch** 长度精确为1，且唯一member同时满足`key is Keys.Escape`与`data == "\x1b"`。只匹配key或只匹配data均非法；known-meta中`key is Keys.Escape`但`data`为完整sequence的callback不得取消。`feed` batch即使出现Escape callback也不能直接cancel；flush batch若同时含任何continuation callback也不能cancel。该规则与public parser的直接证据一致：`feed("\x1b")`无callback，随后`flush()`只回调Escape；`feed("\x1bx")`及跨chunk的`feed("\x1b")`/`feed("x")`都在同一个最终feed batch回调Escape后再回调`x`。
+7. CSI arrows、Home/Delete、SS3、已知meta sequence与bracketed paste即使跨raw/UTF-8 chunk，也只由同一个parser收齐和解析；完整sequence不能产生cancel。`Keys.BracketedPaste`自身始终是running-action no-op，但同一resolution batch中paste end之后的`Keys.ControlT`仍独立产生一次`TOGGLE_ACTIVITY`。完整序列之后deadline导致的一次空flush是预期no-op。Alt+Unicode还必须经过同一个incremental decoder，在Unicode code point完整后形成与Alt+ASCII相同的feed batch分类。
+8. 终端层无法区分“用户按ESC后在ambiguity window内紧接普通字符”与“用户按Alt+该字符”：两者都是相同bytes并形成相同`Escape + character` callback batch。S3按冻结oracle优先保证Alt不误取消，因此该batch不cancel；这只是既有terminal ambiguity的明确记录，不新增ESC+普通字符的产品承诺，不修改oracle/scenario，也不扩展任意terminal protocol语义。
+9. `close()`仍由monitor owner设置stop、join reader thread并恢复termios。close/EOF不能为了清空parser而合成flush或新action；pending ambiguity在teardown时丢弃，parser/decoder/collector不泄漏到cleanup线程。
 
 `session_execution.py` 新增/重构以下最小共享 typed state；prompt 与 interactive 共享 acceptance/cancel/graceful-closeout 语义，但 attachment、composer、generation、queue 与 history 仍由 interactive outer state拥有：
 
 - `_LocalCancelIntent(StrEnum)`：`NONE`、`CANCEL_REQUESTED`、`EXIT_AFTER_CANCEL`。
 - `@dataclass(slots=True) _AcceptedRunBarrier`：`accepted_run_id: str | None`、`accepted: asyncio.Event`；唯一允许 `publish_accepted(run_id)`，相同 id重复回调幂等、冲突 id fail fast；`wait_run_id()`只等待 Host public acceptance callback。
-- `@dataclass(slots=True) _ActiveTurnCloseout`：只冻结 turn identity、`_AcceptedRunBarrier`、`_LocalCancelIntent`、exactly-once Host cancel task与 canonical terminal observation；提供 `publish_accepted(run_id)`、`request_cancel(exit_after: bool)`、`wait_accepted_then_cancel()`、`observe_terminal(result)`、`wait_closeout()`。submit task仍由各 outer driver拥有；本类型不携带 composer、attachment、generation、queued draft或History。
-- `_PromptControlKey(StrEnum)`：`CANCEL`、`TOGGLE_THINKING`；`run_keys` 只输出 typed key，不直接取消 task。
+- `@dataclass(slots=True) _ActiveTurnCloseout`：只冻结 turn identity、`_AcceptedRunBarrier`、`_LocalCancelIntent`、首个cancel reason、exactly-once Host cancel task与 canonical terminal observation；构造时只接收完成相应prompt/interactive Host cancel request所需的直接typed输入，不携带 composer、display、cursor、attachment、key/signal monitor、generation、queued draft或History。submit task仍由各outer driver拥有。
+- `RunningKeyAction`保留为`run_keys`唯一typed key contract：reader只可投递`CANCEL_RUN`或`TOGGLE_ACTIVITY`，prompt/interactive driver直接消费；不新增`_PromptControlKey`或第二个等价enum。Ctrl+C不属于该contract，**只由SIGINT monitor产生与计数**，VT parser/batch classifier不得处理或合成Ctrl+C。
+
+`_ActiveTurnCloseout` method contract固定如下；这些方法都不得直接改变composer/display/cursor/attachment或关闭key/signal资源：
+
+| method | coordinator-owned effect | 明确无副作用 |
+|---|---|---|
+| `publish_accepted(run_id: str) -> None` | 向唯一barrier发布exact run id；同id幂等、冲突id fail fast；若cancel已登记，只唤醒已存在/唯一的cancel path | 不render、不切composer phase、不关闭资源 |
+| `request_cancel(*, reason: str, exit_after: bool) -> _LocalCancelIntent` | 首次调用冻结reason并把`NONE -> CANCEL_REQUESTED`，确保至多一个`wait_accepted_then_cancel`/Host cancel task；只有来自SIGINT monitor的第二次Ctrl+C可单调升级为`EXIT_AFTER_CANCEL`，后续调用幂等 | 不本地取消submit task、不调用OS强杀、不立即返回130 |
+| `wait_accepted_then_cancel() -> EntrypointRunTerminalResult` | 等barrier的exact id后发起恰好一次Host graceful cancel并等待canonical terminal；若canonical terminal已先成立，保留真实结果且不得发迟到cancel | 不finish thinking/runtime display，不render cancel/terminal |
+| `observe_terminal(result: EntrypointRunTerminalResult) -> None` | 记录与本turn匹配的Host canonical terminal；相同结果幂等，冲突terminal fail fast，并唤醒closeout waiter | 不映射exit code、不advance cursor |
+| `wait_closeout() -> EntrypointRunTerminalResult` | 等acceptance/cancel task与canonical terminal observation完成协调并返回唯一terminal truth | **不等待或执行** composer/display/cursor/attachment/key/signal cleanup；这些属于outer driver |
 
 prompt/interactive 的统一 call path：
 
 ```text
 创建 _ActiveTurnCloseout + shielded submit task
-  -> local Escape / first Ctrl+C: request_cancel(False)
+  -> RunningKeyAction.CANCEL_RUN / SIGINT monitor 的 first Ctrl+C:
+       request_cancel(reason=..., exit_after=False)
        accepted id 未到：只记录 intent，submit 继续跨 barrier
        accepted id 已到：exactly-once Host graceful cancel
-  -> second Ctrl+C: request_cancel(True)
+  -> SIGINT monitor 的 second Ctrl+C:
+       request_cancel(reason=..., exit_after=True)
        只设置 EXIT_AFTER_CANCEL；不取消 Host wait，不立即返回 130
   -> submit publishes accepted id
        若已有 cancel intent，立即 exactly-once Host cancel
   -> 等待 Host canonical terminal
        必须为/观察到 CANCELLED（若 terminal 已先成立则尊重 canonical truth）
-  -> 关闭 observer、renderer、composer/key reader、signal bridge、attachment
-  -> EXIT_AFTER_CANCEL ? return 130 : 返回既有 cancelled result
+  -> wait_closeout 返回唯一 Host terminal（此时未宣称UI/resource cleanup完成）
+  -> outer driver按各自既有顺序关闭observer/display/composer/key/signal/attachment并完成cursor
+  -> outer cleanup完成后，EXIT_AFTER_CANCEL ? return 130 : 返回既有terminal mapping
 ```
+
+outer-driver side-effect contract固定如下：
+
+- prompt outer driver拥有thinking/runtime display finish、cancel-requested/terminal render、prompt key monitor与SIGINT monitor teardown，以及既有prompt exit mapping；它先让closeout观察canonical terminal，再完成这些副作用，最后才返回既有cancel结果/130。
+- interactive outer driver拥有`InteractiveComposerPhase.CANCELLING/RUNNING/IDLE`切换、thinking/runtime display finish、cancel-requested/local-exit/terminal render、`advance_cli_terminal_cursor`、queued promotion，以及composer/key/signal/attachment teardown；它只能在`wait_closeout()`返回且上述cleanup完成后决定130。
+- coordinator拥有的“canonical terminal observation”不等于outer cleanup完成；测试必须分别记录二者时序，禁止把UI或attachment引用塞进coordinator以制造伪原子closeout。
 
 现有 accepted-state/cancel consumers 到最小 shared coordinator 的机械映射固定如下，不留给 implementation重新发现：
 
 | 当前 site | 当前职责 | 替换后 |
 |---|---|---|
 | `_PromptAcceptedRunState.record` 与 `submit_entrypoint_turn_and_wait(... on_run_accepted=...)` | 发布 prompt accepted id | callback 直接调用 `_ActiveTurnCloseout.publish_accepted` |
-| `_cancel_prompt_turn_after_local_request(...)` | pre-accept 时取消 submit 并返回 | 删除本地 `submit_task.cancel()`；改为 `request_cancel(False)`，submit跨 barrier继续，accepted后exactly-once Host cancel并等 canonical terminal |
+| `_cancel_prompt_turn_after_local_request(...)` | pre-accept 时取消 submit 并返回 | 删除本地 `submit_task.cancel()`；改为`request_cancel(reason=..., exit_after=False)`，submit跨barrier继续，accepted后exactly-once Host cancel并等canonical terminal |
 | `_InteractiveAcceptedRunState.record/wait_run_id` | interactive acceptance event | 由 `_AcceptedRunBarrier.publish_accepted/wait_run_id` 唯一承担 |
 | `_start_interactive_turn`、`_start_interactive_queued_followup`、`_promote_interactive_queued_followup` | 创建/携带 accepted state | 创建或原样携带同一个 `_ActiveTurnCloseout`；queued promotion不得换 identity |
 | `_InteractiveActiveTurn.cancel_reason/acceptance_task/cancel_task` | cancel intent、等待 accepted、Host cancel | 收敛到 `_ActiveTurnCloseout`；outer turn只保留 generation、turn index、submit task和interactive state |
 | `_request_interactive_cancel`、`_start_interactive_cancel_task` | 合并取消并启动 Host cancel | 委托 `request_cancel` / `wait_accepted_then_cancel`；重复输入不能创建第二 cancel task |
-| `_wait_interactive_batch_terminal_handling_sigint` | non-TTY first/second Ctrl+C与terminal收口 | first=`request_cancel(False)`，second=`request_cancel(True)`；await同一 coordinator closeout后决定130 |
+| `_wait_interactive_batch_terminal_handling_sigint` | non-TTY SIGINT monitor的first/second Ctrl+C与terminal收口 | first=`request_cancel(reason=CLI_SIGINT_REASON, exit_after=False)`，second=`request_cancel(reason=CLI_SIGINT_REASON, exit_after=True)`；await同一coordinator closeout，outer cleanup后决定130 |
 | `_drive_interactive_tty_repl` 的 composer cancel、SIGINT、submit completion与 finally cleanup | TTY竞态收口 | 先消费同 batch typed intents，再 `observe_terminal`；退出只在 canonical terminal和outer resource cleanup完成后发生 |
 
 旧 `_PromptAcceptedRunState`、`_InteractiveAcceptedRunState` 与只做透传的兼容 wrapper全部删除。shared coordinator只消费 Host public accepted callback、cancel API和terminal result，不从 task顺序、日志、字符串或时间戳反推 Host事实。
@@ -410,18 +432,28 @@ CANCEL_IN_FLIGHT/EXIT_PENDING_CANCEL + Host CANCELLED
                                  -> CLEANUP -> normal-cancel/130
 ```
 
-- first Escape 与 first Ctrl+C 的 cancel 语义相同；只有第二次 Ctrl+C 请求最终 130，Escape 不累计 exit intent。
+- first Escape 与SIGINT monitor的first Ctrl+C在closeout层的cancel intent语义相同；Ctrl+C只由SIGINT monitor拥有，只有它观察到的第二次Ctrl+C请求最终130，Escape不累计exit intent。
 - 第三次及更多 Ctrl+C 在 closeout 完成前是幂等 no-op/已有 intent，不产生第二 cancel call。
 - pre-accept intent 绑定到当前 turn identity，不能泄漏到下一 prompt。
 - event-loop 同一 batch 中 terminal 与 key 同时 ready 时，先登记本 batch 的 control intents，再由 `_ActiveTurnCloseout` 依据 Host canonical terminal 收敛；不得因 task list 顺序丢失 key。
 - CLI task cancellation 只用于自身 cleanup，不能代替 Host `cancel_run(...)`；accepted 后恰好一次 Host cancel。
 - double Ctrl+C 的 130 只能在 Host terminal observation 与全部 cleanup 完成后返回；若 Host 报告非 CANCELLED canonical terminal，保存该 terminal truth并按现有 terminal policy处理，不能覆盖成 CANCELLED。
+- parser resolution batch必须先完整分类，再向event loop投递；任何provisional Escape都不能越过reader-thread boundary。batch内Escape suppression只影响该Escape，不能抑制同batch后续Ctrl+T或改变后续turn state。
+- deadline/readable竞态中continuation优先feed并刷新armed deadline；deadline/close竞态中close优先且不得合成cancel。不能从callback batch空/非空推断parser pending；armed deadline只能在一次flush返回后清除，resolved sequence造成的空flush是预期行为且不得重复。
+- 公开parser、incremental decoder、collector、deadline与termios都由同一个reader thread/monitor owner管理；任何时刻最多一个parser、一个decoder、一个未完成parser resolution调用。
+- acceptance barrier、double Ctrl+C与Host graceful closeout的原计划语义不因parser correction改变：`_ActiveTurnCloseout`仍只消费typed local intent，Host仍唯一拥有accepted Run、graceful cancel和canonical terminal。
 
 ### 5.4 Owner-level tests 与预期断言
 
-- `test_run_keys.py` 以分块字节覆盖：standalone ESC（named deadline/flush 后一次 cancel）、CSI arrows、Home、Delete、SS3、Alt+字符、ESC 与后续字节跨 chunk、完整 bracketed paste；除 standalone ESC 外 cancel count 均为 0。记录 parser create/feed/flush 的 thread id必须都等于 reader thread id，queue写入必须只经 `call_soon_threadsafe`。
+- `test_run_keys.py` 先锁定resolved public seam：`feed("\x1b")`零callback且deadline `flush()`得到单一Escape；`feed("\x1bx")`以及跨chunk Alt+X得到同一feed batch的`Escape, x`；public upstream同版本`test_escape`、`test_flush_1`、`test_flush_2`、`test_special_double_keys`行为不得被私有API替代。
+- batch classifier矩阵：deadline flush-only batch长度为1且唯一member同时满足`key is Keys.Escape`、`data == "\x1b"`时恰好一次cancel；feed `[Escape, x]`零cancel；feed/flush `[Escape, Ctrl+T]`只toggle一次；`[Escape, x, Ctrl+T]`只toggle一次；known-meta tuple覆盖`Escape` callback的完整sequence data并断言零cancel；普通`Ctrl+T`仍toggle一次。另分别用错误data与错误key反证不能只检查单字段；provisional Escape从不直接进入queue。
+- raw/decode/parser chunk矩阵：standalone ESC在固定0.1s deadline/flush后一次cancel；Alt+ASCII同chunk/跨chunk、Alt+Unicode在多字节中间切chunk、CSI arrows、Home、Delete、SS3、完整bracketed paste的start/content/end任意代表性切分均零cancel；paste payload内Ctrl+T是paste data，`[BracketedPaste, ControlT]`同一batch只toggle一次。
+- race/ownership矩阵：用可控monotonic clock与patched `select.select`推进0.1s，不使用wall-clock sleep；fd readable与deadline同轮时先feed continuation并refresh deadline且零cancel；完整sequence产生非空callback后deadline仍armed，到期恰好一次空flush并清除；同一feed产生callback且以ESC结尾时仍在0.1s后flush出standalone cancel；close与deadline同轮时零新action；flush后不重复cancel；parser create/feed/flush/callback、decoder decode和collector drain的thread id都等于reader thread id；queue写入只经`call_soon_threadsafe`；构造计数精确一个parser和一个decoder。
+- 明确记录ESC后在ambiguity window内普通字符与Alt字符不可区分的terminal事实；owner test只断言两者同batch不cancel，不把它提升为新的用户可见oracle或独立scenario。
 - prompt pre-accept Escape/Ctrl+C：submit future 暂不返回，先注入 key，再返回 accepted id；断言 submit 未被本地取消、Host cancel 恰好一次、目标 id 正确、最终等待 CANCELLED。
+- Ctrl+C owner：向VT parser输入对应control byte不能产生Ctrl+C cancel intent；只有SIGINT monitor计数触发first/second Ctrl+C状态迁移，确保不存在第二signal owner。
 - interactive 同样覆盖 pre-accept first/second Ctrl+C；第二次后 exit task 仍未完成，直到 Host CANCELLED 与 attachment/composer/renderer cleanup 全部记录完成才为 130。
+- `_ActiveTurnCloseout` method/outer side-effect matrix：逐个断言publish冲突、cancel reason冻结、exactly-once cancel task、terminal冲突和`wait_closeout()`返回条件；同时证明它不调用composer/display/cursor/attachment/key/signal接口。prompt/interactive分别记录“canonical terminal observed -> outer display/render/cursor/composer/teardown -> 130 decision”的偏序。
 - provider/tool/closeout 三个阶段参数化 double Ctrl+C；断言一个 Run、一个 Host cancel、一个 canonical terminal、无 pending task。
 - accepted terminal 与 key 同 batch 两种调度顺序；断言无 stale intent、无第二 terminal、下一 turn 不被取消。
 - Escape 取消后回到/退出行为按 frozen oracle；Escape 再 Escape 不能等价 double Ctrl+C。
@@ -438,10 +470,10 @@ git diff --check
 
 ### 5.5 Stop signal、产物与 residual risk
 
-- 完成信号：parser thread ownership、named ambiguity deadline/flush、所有完整序列反例、pre-accept、double Ctrl+C 三阶段、同 batch 竞态通过；Host cancel/terminal/cleanup 次数满足不变量。
-- 立即停止信号：需要改 Host terminal 语义或用本地 synthetic CANCELLED 才能让测试通过；这表明 owner 越界，不能继续。
-- Slice artifact：raw byte→typed key 表、state transition trace、Host public cancel/terminal trace、PTY screen、cleanup task census、focused tests/pyright。
-- Residual risk：`MEDIUM`，来自真实终端分块和信号竞态；由 parser chunk matrix、确定性 scheduler tests 与 S8 PTY evidence 收敛。
+- 完成信号：public parser seam contract、single parser/decoder thread ownership、feed/flush batch classification、固定0.1s conservative armed deadline、Alt/CSI/SS3/Home/Delete/paste反例、Ctrl+T独立分类、SIGINT-only Ctrl+C、`_ActiveTurnCloseout`/outer side-effect contract、pre-accept、double Ctrl+C三阶段与同batch竞态全部通过；Host cancel/terminal/cleanup次数满足不变量。
+- 立即停止信号：resolved public `Vt100Parser`不再保证同步callback batch或上述feed/flush形状；需要读取private parser state、引入第二套raw-byte parser、`KeyProcessor`、本地synthetic `CANCELLED`或修改Host terminal语义才能通过。此时必须记录直接依赖证据并回plan，不能以compatibility branch、依赖pin或下游补偿继续。
+- Slice artifact：public parser callback batch表、raw byte→decoder→parser batch→typed action表、state transition trace、Host public cancel/terminal trace、PTY screen、cleanup task census、focused tests/pyright。
+- Residual risk：`MEDIUM`，来自真实终端分块、ESC/Alt不可区分窗口和信号竞态；public seam/owner matrix在S3覆盖，真实PTY和不同timing由后续已批准S8 evidence覆盖。该风险不改变冻结产品语义。
 - 非目标：不支持任意 terminal protocol 扩展，不改变 SIGTERM/EOF 语义，不修改 Host cancel implementation。
 
 ---
