@@ -733,27 +733,41 @@ def test_fake_compactor_proposal_does_not_echo_material_markers() -> None:
 
     proposal = _fake_compaction_proposal_from_material_json(
         {
-            "trace_material": [{"label": "T1"}],
-            "evidence_material": [
+            "schema": "dayu.context_compaction.input.v2",
+            "current_input": {"readable_text": "继续分析"},
+            "source_boundary": [
                 {
-                    "label": "E1",
-                    "response_text": _SMOKE_REACTIVE_OLD_MARKER,
-                }
-            ],
-            "answer_material": [
+                    "source_label": "T1",
+                    "source_kind": "trace_material",
+                    "readable_text": "已确认分析范围",
+                },
                 {
-                    "label": "A1",
-                    "answer_text": _SMOKE_REACTIVE_OLD_MARKER,
-                }
+                    "source_label": "E1",
+                    "source_kind": "evidence_material",
+                    "readable_text": _SMOKE_REACTIVE_OLD_MARKER,
+                },
+                {
+                    "source_label": "A1",
+                    "source_kind": "answer_material",
+                    "readable_text": _SMOKE_REACTIVE_OLD_MARKER,
+                },
             ],
         }
     )
     parsed = json.loads(proposal)
 
     assert _SMOKE_REACTIVE_OLD_MARKER not in proposal
-    assert parsed["session_summary"]["source_labels"] == ["T1", "E1", "A1"]
-    assert parsed["evidence_backed_facts"][0]["evidence_labels"] == ["E1"]
-    assert parsed["answer_anchors"][0]["answer_source_labels"] == ["A1"]
+    assert parsed["schema"] == "dayu.context_compaction.output.v2"
+    assert parsed["session_summary"]["source_labels"] == ["T1"]
+    assert parsed["evidence_facts"][0]["support_labels"] == ["E1"]
+    assert parsed["answer_anchors"][0]["source_labels"] == ["A1"]
+    assert parsed["explicitly_dropped_sources"] == []
+    represented_labels = {
+        *parsed["session_summary"]["source_labels"],
+        *parsed["evidence_facts"][0]["support_labels"],
+        *parsed["answer_anchors"][0]["source_labels"],
+    }
+    assert represented_labels == {"T1", "E1", "A1"}
 
 
 def test_fallback_acceptance_helper_requires_proactive_request_and_window() -> None:

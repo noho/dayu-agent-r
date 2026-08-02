@@ -46,6 +46,7 @@ from dayu.host import (
     OperationContext,
     cancel_run,
     ensure_session as ensure_public_session,
+    get_run,
 )
 from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import (
@@ -106,6 +107,11 @@ from dayu.host.engine_ingest import (
     EngineEventIngestor,
     EngineIngestStatus,
     LocalEngineEnvelope,
+)
+from dayu.host.lifecycle_events import (
+    HostAttemptEventType,
+    HostRunEventType,
+    closeout_attempt_terminal_event_type_for_status,
 )
 from dayu.host.memory import default_memory_projection_policy
 from tests.host.execution_handle_support import create_execution_command_handle
@@ -276,6 +282,8 @@ class _ScriptedLocalWorkerHandle:
         self._session_id: str | None = None
         self._run_id: str | None = None
         self._request: AgentRunRequest | None = None
+        self._events_started = asyncio.Event()
+        self._closed_event = asyncio.Event()
         self.cancel_reasons: list[str] = []
         self.closed = False
 
@@ -295,6 +303,7 @@ class _ScriptedLocalWorkerHandle:
         :raises RuntimeError: ``crash`` 模式模拟 worker event stream 异常。
         """
 
+        self._events_started.set()
         if self._mode == _WORKER_MODE_FINAL:
             yield EngineEvent(
                 occurred_at=_NOW,
@@ -363,6 +372,25 @@ class _ScriptedLocalWorkerHandle:
         """
 
         self.closed = True
+        self._closed_event.set()
+
+    async def wait_until_events_started(self) -> None:
+        """等待 scheduler 开始消费 worker event stream。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        await self._events_started.wait()
+
+    async def wait_until_closed(self) -> None:
+        """等待 scheduler 完成 worker closeout。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        await self._closed_event.wait()
 
     def bind_dispatch(
         self,
@@ -502,24 +530,26 @@ async def test_start_run_fake_worker_final_answer_succeeds(
     )
     try:
         accepted = _accept_public_run(host, "start-final-answer")
+        worker_factory = _SequencedLocalWorkerFactory((handle,))
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
                 store,
-                _SequencedLocalWorkerFactory((handle,)),
+                worker_factory,
             )
             try:
                 await scheduler.run_queue_promotion(accepted.session_id)
+                await handle.wait_until_closed()
                 refs = _refs(options.db_path, accepted.run_id)
-                drain = await scheduler.drain_once()
-                assert drain.dispatched == 1
-                await _wait_for_run_status(
-                    options.db_path,
-                    refs.run_id,
-                    RunStatus.SUCCEEDED,
-                )
-                assert _attempt_status(options.db_path, refs.attempt_id) == (
-                    AttemptStatus.SUCCEEDED
+                _assert_exactly_once_dispatch_outcome(
+                    host=host,
+                    db_path=options.db_path,
+                    refs=refs,
+                    expected_run_status=RunStatus.SUCCEEDED,
+                    expected_attempt_status=AttemptStatus.SUCCEEDED,
+                    terminal_event_type=HostRunEventType.RUN_SUCCEEDED,
+                    worker_factory=worker_factory,
+                    expected_factory_creations=1,
                 )
             finally:
                 await scheduler.close()
@@ -539,23 +569,26 @@ async def test_start_run_fake_worker_run_failed_fails(tmp_path: Path) -> None:
     )
     try:
         accepted = _accept_public_run(host, "start-run-failed")
+        worker_factory = _SequencedLocalWorkerFactory((handle,))
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
                 store,
-                _SequencedLocalWorkerFactory((handle,)),
+                worker_factory,
             )
             try:
                 await scheduler.run_queue_promotion(accepted.session_id)
+                await handle.wait_until_closed()
                 refs = _refs(options.db_path, accepted.run_id)
-                assert (await scheduler.drain_once()).dispatched == 1
-                await _wait_for_run_status(
-                    options.db_path,
-                    refs.run_id,
-                    RunStatus.FAILED,
-                )
-                assert _attempt_status(options.db_path, refs.attempt_id) == (
-                    AttemptStatus.FAILED
+                _assert_exactly_once_dispatch_outcome(
+                    host=host,
+                    db_path=options.db_path,
+                    refs=refs,
+                    expected_run_status=RunStatus.FAILED,
+                    expected_attempt_status=AttemptStatus.FAILED,
+                    terminal_event_type=HostRunEventType.RUN_FAILED,
+                    worker_factory=worker_factory,
+                    expected_factory_creations=1,
                 )
             finally:
                 await scheduler.close()
@@ -575,25 +608,27 @@ async def test_start_run_fake_worker_clean_eof_fails(tmp_path: Path) -> None:
     )
     try:
         accepted = _accept_public_run(host, "start-clean-eof")
+        worker_factory = _SequencedLocalWorkerFactory((handle,))
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
                 store,
-                _SequencedLocalWorkerFactory((handle,)),
+                worker_factory,
             )
             try:
                 await scheduler.run_queue_promotion(accepted.session_id)
+                await handle.wait_until_closed()
                 refs = _refs(options.db_path, accepted.run_id)
-                assert (await scheduler.drain_once()).dispatched == 1
-                await _wait_for_run_status(
-                    options.db_path,
-                    refs.run_id,
-                    RunStatus.FAILED,
+                _assert_exactly_once_dispatch_outcome(
+                    host=host,
+                    db_path=options.db_path,
+                    refs=refs,
+                    expected_run_status=RunStatus.FAILED,
+                    expected_attempt_status=AttemptStatus.FAILED,
+                    terminal_event_type=HostRunEventType.RUN_FAILED,
+                    worker_factory=worker_factory,
+                    expected_factory_creations=1,
                 )
-                assert _attempt_status(options.db_path, refs.attempt_id) == (
-                    AttemptStatus.FAILED
-                )
-                assert _event_type_count(options.db_path, "RUN_FAILED") == 1
             finally:
                 await scheduler.close()
     finally:
@@ -612,25 +647,27 @@ async def test_start_run_fake_worker_crash_loses(tmp_path: Path) -> None:
     )
     try:
         accepted = _accept_public_run(host, "start-crash")
+        worker_factory = _SequencedLocalWorkerFactory((handle,))
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
                 store,
-                _SequencedLocalWorkerFactory((handle,)),
+                worker_factory,
             )
             try:
                 await scheduler.run_queue_promotion(accepted.session_id)
+                await handle.wait_until_closed()
                 refs = _refs(options.db_path, accepted.run_id)
-                assert (await scheduler.drain_once()).dispatched == 1
-                await _wait_for_run_status(
-                    options.db_path,
-                    refs.run_id,
-                    RunStatus.LOST,
+                _assert_exactly_once_dispatch_outcome(
+                    host=host,
+                    db_path=options.db_path,
+                    refs=refs,
+                    expected_run_status=RunStatus.LOST,
+                    expected_attempt_status=AttemptStatus.LOST,
+                    terminal_event_type=HostRunEventType.RUN_LOST,
+                    worker_factory=worker_factory,
+                    expected_factory_creations=1,
                 )
-                assert _attempt_status(options.db_path, refs.attempt_id) == (
-                    AttemptStatus.LOST
-                )
-                assert _event_type_count(options.db_path, "RUN_LOST") == 1
             finally:
                 await scheduler.close()
     finally:
@@ -650,17 +687,19 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
     )
     try:
         accepted = _accept_public_run(host, "start-cancel-active")
+        worker_factory = _SequencedLocalWorkerFactory((handle,))
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
                 store,
-                _SequencedLocalWorkerFactory((handle,)),
+                worker_factory,
                 active_registry=active_registry,
             )
             try:
                 await scheduler.run_queue_promotion(accepted.session_id)
+                await handle.wait_until_events_started()
                 refs = _refs(options.db_path, accepted.run_id)
-                assert (await scheduler.drain_once()).dispatched == 1
+                assert get_run(host, refs.run_id).status is RunStatus.RUNNING
                 assert _attempt_status(options.db_path, refs.attempt_id) == (
                     AttemptStatus.RUNNING
                 )
@@ -673,13 +712,16 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
 
                 assert cancelling.status == RunStatus.CANCELLING
                 assert handle.cancel_reasons == ["user_stop"]
-                await _wait_for_run_status(
-                    options.db_path,
-                    refs.run_id,
-                    RunStatus.CANCELLED,
-                )
-                assert _attempt_status(options.db_path, refs.attempt_id) == (
-                    AttemptStatus.CANCELLED
+                await handle.wait_until_closed()
+                _assert_exactly_once_dispatch_outcome(
+                    host=host,
+                    db_path=options.db_path,
+                    refs=refs,
+                    expected_run_status=RunStatus.CANCELLED,
+                    expected_attempt_status=AttemptStatus.CANCELLED,
+                    terminal_event_type=HostRunEventType.RUN_CANCELLED,
+                    worker_factory=worker_factory,
+                    expected_factory_creations=1,
                 )
             finally:
                 await scheduler.close()
@@ -713,30 +755,47 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
             terminal_host,
             _start_request(terminal_session_id, "start-terminal-queued"),
         )
+        terminal_worker_factory = _SequencedLocalWorkerFactory(
+            (first_terminal, promoted_terminal)
+        )
         with open_host_durable_store(
             _durable_options(tmp_path / "terminal")
         ) as store:
             scheduler = await _open_scheduler(
                 tmp_path / "terminal",
                 store,
-                _SequencedLocalWorkerFactory(
-                    (first_terminal, promoted_terminal)
-                ),
+                terminal_worker_factory,
             )
             try:
                 await scheduler.run_queue_promotion(terminal_session_id)
-                terminal_refs = _refs(
+                await first_terminal.wait_until_closed()
+                await promoted_terminal.wait_until_closed()
+                first_terminal_refs = _refs(
                     terminal_options.db_path, terminal_active.run_id
                 )
-                assert (await scheduler.drain_once()).dispatched == 1
-                await _wait_for_run_status(
-                    terminal_options.db_path,
-                    terminal_queued.run_id,
-                    RunStatus.SUCCEEDED,
+                promoted_terminal_refs = _refs(
+                    terminal_options.db_path, terminal_queued.run_id
                 )
-                assert _event_type_count(
-                    terminal_options.db_path, "ATTEMPT_RUNNING"
-                ) == 2
+                _assert_exactly_once_dispatch_outcome(
+                    host=terminal_host,
+                    db_path=terminal_options.db_path,
+                    refs=first_terminal_refs,
+                    expected_run_status=RunStatus.SUCCEEDED,
+                    expected_attempt_status=AttemptStatus.SUCCEEDED,
+                    terminal_event_type=HostRunEventType.RUN_SUCCEEDED,
+                    worker_factory=terminal_worker_factory,
+                    expected_factory_creations=2,
+                )
+                _assert_exactly_once_dispatch_outcome(
+                    host=terminal_host,
+                    db_path=terminal_options.db_path,
+                    refs=promoted_terminal_refs,
+                    expected_run_status=RunStatus.SUCCEEDED,
+                    expected_attempt_status=AttemptStatus.SUCCEEDED,
+                    terminal_event_type=HostRunEventType.RUN_SUCCEEDED,
+                    worker_factory=terminal_worker_factory,
+                    expected_factory_creations=2,
+                )
             finally:
                 await scheduler.close()
     finally:
@@ -765,36 +824,52 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
             cancel_host,
             _start_request(cancel_session_id, "start-cancel-queued"),
         )
+        cancel_worker_factory = _SequencedLocalWorkerFactory(
+            (first_cancel, promoted_cancel)
+        )
         with open_host_durable_store(_durable_options(tmp_path / "cancel")) as store:
             scheduler = await _open_scheduler(
                 tmp_path / "cancel",
                 store,
-                _SequencedLocalWorkerFactory((first_cancel, promoted_cancel)),
+                cancel_worker_factory,
                 active_registry=active_registry,
             )
             try:
                 await scheduler.run_queue_promotion(cancel_session_id)
+                await first_cancel.wait_until_events_started()
                 cancel_refs = _refs(cancel_options.db_path, cancel_active.run_id)
-                assert (await scheduler.drain_once()).dispatched == 1
+                assert get_run(cancel_host, cancel_refs.run_id).status is RunStatus.RUNNING
                 cancelling = cancel_run(
                     cancel_host,
                     cancel_refs.run_id,
                     _cancel_run_request("cancel-promote-active"),
                 )
                 assert cancelling.status == RunStatus.CANCELLING
-                await _wait_for_run_status(
-                    cancel_options.db_path,
-                    cancel_refs.run_id,
-                    RunStatus.CANCELLED,
+                await first_cancel.wait_until_closed()
+                await promoted_cancel.wait_until_closed()
+                promoted_cancel_refs = _refs(
+                    cancel_options.db_path, cancel_queued.run_id
                 )
-                await _wait_for_run_status(
-                    cancel_options.db_path,
-                    cancel_queued.run_id,
-                    RunStatus.SUCCEEDED,
+                _assert_exactly_once_dispatch_outcome(
+                    host=cancel_host,
+                    db_path=cancel_options.db_path,
+                    refs=cancel_refs,
+                    expected_run_status=RunStatus.CANCELLED,
+                    expected_attempt_status=AttemptStatus.CANCELLED,
+                    terminal_event_type=HostRunEventType.RUN_CANCELLED,
+                    worker_factory=cancel_worker_factory,
+                    expected_factory_creations=2,
                 )
-                assert _event_type_count(
-                    cancel_options.db_path, "ATTEMPT_RUNNING"
-                ) == 2
+                _assert_exactly_once_dispatch_outcome(
+                    host=cancel_host,
+                    db_path=cancel_options.db_path,
+                    refs=promoted_cancel_refs,
+                    expected_run_status=RunStatus.SUCCEEDED,
+                    expected_attempt_status=AttemptStatus.SUCCEEDED,
+                    terminal_event_type=HostRunEventType.RUN_SUCCEEDED,
+                    worker_factory=cancel_worker_factory,
+                    expected_factory_creations=2,
+                )
             finally:
                 await scheduler.close()
     finally:
@@ -1440,23 +1515,6 @@ def _pending_dispatch(refs: _RunRefs) -> PendingDispatchRecord:
     )
 
 
-def _run_status(db_path: Path, run_id: str) -> RunStatus:
-    """读取 Run status。
-
-    :param db_path: SQLite DB 路径。
-    :param run_id: Run id。
-    :returns: RunStatus。
-    """
-
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            "SELECT status FROM host_runs WHERE run_id = ?",
-            (run_id,),
-        ).fetchone()
-    assert row is not None
-    return RunStatus(str(row[0]))
-
-
 def _attempt_status(db_path: Path, attempt_id: str) -> AttemptStatus:
     """读取 Attempt status。
 
@@ -1474,37 +1532,108 @@ def _attempt_status(db_path: Path, attempt_id: str) -> AttemptStatus:
     return AttemptStatus(str(row[0]))
 
 
-def _event_type_count(db_path: Path, event_type: str) -> int:
-    """统计指定 EventLog 类型数量。
-
-    :param db_path: SQLite DB 路径。
-    :param event_type: event type。
-    :returns: 指定事件类型 row 数。
-    """
-
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
-            (event_type,),
-        ).fetchone()
-    assert row is not None
-    return int(row[0])
-
-
-async def _wait_for_run_status(
-    db_path: Path, run_id: str, status: RunStatus
+def _assert_exactly_once_dispatch_outcome(
+    *,
+    host: HostCommandHandle,
+    db_path: Path,
+    refs: _RunRefs,
+    expected_run_status: RunStatus,
+    expected_attempt_status: AttemptStatus,
+    terminal_event_type: HostRunEventType,
+    worker_factory: _SequencedLocalWorkerFactory,
+    expected_factory_creations: int,
 ) -> None:
-    """等待 Run 到达指定状态。
+    """用 public 与 durable owner 证据断言目标 Run 只 dispatch 一次。
 
+    :param host: public Host command handle。
     :param db_path: SQLite DB 路径。
-    :param run_id: Run id。
-    :param status: 期望状态。
+    :param refs: 目标 Run 的 durable refs。
+    :param expected_run_status: 期望 Run 终态。
+    :param expected_attempt_status: 期望 Attempt 终态。
+    :param terminal_event_type: 期望 canonical Run terminal event type。
+    :param worker_factory: 本场景使用的 worker factory。
+    :param expected_factory_creations: 场景累计应创建的 worker 数。
     :returns: ``None``。
-    :raises AssertionError: 超时未到达状态时抛出。
+    :raises AssertionError: public 或 durable exact-once contract 不成立时抛出。
     """
 
-    for _index in range(100):
-        if _run_status(db_path, run_id) == status:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"Run {run_id} did not reach {status}")
+    assert get_run(host, refs.run_id).status is expected_run_status
+    with sqlite3.connect(db_path) as connection:
+        run_rows = connection.execute(
+            """
+            SELECT status, current_attempt_id, terminal_event_id,
+                   terminal_event_sequence
+            FROM host_runs
+            WHERE run_id = ?
+            """,
+            (refs.run_id,),
+        ).fetchall()
+        attempt_rows = connection.execute(
+            """
+            SELECT attempt_id, status, terminal_event_id,
+                   terminal_event_sequence
+            FROM host_attempts
+            WHERE run_id = ?
+            """,
+            (refs.run_id,),
+        ).fetchall()
+        dispatch_count_row = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM host_attempt_dispatch_records
+            WHERE run_id = ? AND attempt_id = ?
+            """,
+            (refs.run_id, refs.attempt_id),
+        ).fetchone()
+        running_event_rows = connection.execute(
+            """
+            SELECT event_id, event_sequence
+            FROM event_log
+            WHERE run_id = ? AND attempt_id = ? AND event_type = ?
+            """,
+            (
+                refs.run_id,
+                refs.attempt_id,
+                HostAttemptEventType.ATTEMPT_RUNNING.value,
+            ),
+        ).fetchall()
+        terminal_event_rows = connection.execute(
+            """
+            SELECT event_id, event_sequence
+            FROM event_log
+            WHERE run_id = ? AND attempt_id = ? AND event_type = ?
+            """,
+            (refs.run_id, refs.attempt_id, terminal_event_type.value),
+        ).fetchall()
+        attempt_terminal_event_rows = connection.execute(
+            """
+            SELECT event_id, event_sequence
+            FROM event_log
+            WHERE run_id = ? AND attempt_id = ? AND event_type = ?
+            """,
+            (
+                refs.run_id,
+                refs.attempt_id,
+                closeout_attempt_terminal_event_type_for_status(
+                    expected_attempt_status
+                ).value,
+            ),
+        ).fetchall()
+
+    assert len(run_rows) == 1
+    assert run_rows[0][0] == expected_run_status.value
+    assert run_rows[0][1] == refs.attempt_id
+    assert len(attempt_rows) == 1
+    assert attempt_rows[0][0] == refs.attempt_id
+    assert attempt_rows[0][1] == expected_attempt_status.value
+    assert dispatch_count_row is not None
+    assert int(dispatch_count_row[0]) == 1
+    assert len(running_event_rows) == 1
+    assert len(terminal_event_rows) == 1
+    assert len(attempt_terminal_event_rows) == 1
+    run_terminal_ref = (run_rows[0][2], run_rows[0][3])
+    attempt_terminal_ref = (attempt_rows[0][2], attempt_rows[0][3])
+    assert run_terminal_ref == terminal_event_rows[0]
+    assert attempt_terminal_ref == attempt_terminal_event_rows[0]
+    assert attempt_terminal_ref[1] < run_terminal_ref[1]
+    assert worker_factory.created == expected_factory_creations

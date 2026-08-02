@@ -301,9 +301,21 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         continuation_prompt=("Continue the strict JSON object without repeating content already emitted."),
         max_consecutive_failed_tool_batches=1,
     )
-    assert "compaction_request" in compactor_baseline.compactor_system_prompt
-    assert "严格 JSON" in compactor_baseline.compactor_system_prompt
-    assert "<<compaction_request>>" in (compactor_baseline.compactor_user_prompt_template)
+    assert "<<compaction_request>>" not in compactor_baseline.compactor_system_prompt
+    assert "dayu.context_compaction.input.v2" not in compactor_baseline.compactor_system_prompt
+    assert "dayu.context_compaction.output.v2" not in compactor_baseline.compactor_system_prompt
+    assert "完整 replacement candidate" in compactor_baseline.compactor_system_prompt
+    assert "source label 只是本次请求内的引用标签" in (
+        compactor_baseline.compactor_system_prompt
+    )
+    assert "<<compaction_request>>" in compactor_baseline.compactor_user_prompt_template
+    assert "dayu.context_compaction.input.v2" in (
+        compactor_baseline.compactor_user_prompt_template
+    )
+    assert "dayu.context_compaction.output.v2" in (
+        compactor_baseline.compactor_user_prompt_template
+    )
+    assert "覆盖规则" in compactor_baseline.compactor_user_prompt_template
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
