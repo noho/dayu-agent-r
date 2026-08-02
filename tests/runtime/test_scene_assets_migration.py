@@ -617,35 +617,63 @@ def test_prompt_prepared_output_filters_long_transaction_guidance() -> None:
         assert marker not in result.system_prompt
 
 
-def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidance() -> None:
-    """interactive/wechat scene 应暴露下载、预处理和当前时间指引。"""
+def test_interactive_prepared_output_keeps_download_without_preprocess_guidance() -> None:
+    """interactive scene 应保留下载/读取能力，并排除预处理与上传指引。"""
 
-    for scene_id in ("interactive", "wechat"):
-        context_slot_values = {"current_time": "测试当前时间"}
-        if scene_id == "interactive":
-            context_slot_values["fins_default_subject"] = ""
-        result = prepare_scene(
-            ScenePrepareRequest(
-                scene_id=scene_id,
-                scene_manifest_root=_manifest_root(),
-                prompt_asset_root=_prompt_asset_root(),
-                context_slot_values=context_slot_values,
-                available_tools=_fake_tool_catalog(),
-            )
+    result = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="interactive",
+            scene_manifest_root=_manifest_root(),
+            prompt_asset_root=_prompt_asset_root(),
+            context_slot_values={
+                "current_time": "测试当前时间",
+                "fins_default_subject": "",
+            },
+            available_tools=_fake_tool_catalog(),
         )
+    )
 
-        selected = result.tool_selection.tool_names
-        assert selected is not None
-        assert "start_fins_download" in selected
-        assert "start_fins_preprocess" in selected
-        assert "get_current_time" in selected
-        assert "start_fins_upload" not in selected
-        assert "start_fins_download" in result.system_prompt
-        assert "start_fins_preprocess" in result.system_prompt
-        assert "get_current_time" in result.system_prompt
-        assert "start_fins_upload" not in result.system_prompt
-        for marker in _PREPARED_CONDITIONAL_MARKERS:
-            assert marker not in result.system_prompt
+    selected = result.tool_selection.tool_names
+    assert selected is not None
+    assert "list_documents" in selected
+    assert "read_section" in selected
+    assert "start_fins_download" in selected
+    assert "start_fins_preprocess" not in selected
+    assert "get_current_time" in selected
+    assert "start_fins_upload" not in selected
+    assert "start_fins_download" in result.system_prompt
+    assert "start_fins_preprocess" not in result.system_prompt
+    assert "get_current_time" in result.system_prompt
+    assert "start_fins_upload" not in result.system_prompt
+    for marker in _PREPARED_CONDITIONAL_MARKERS:
+        assert marker not in result.system_prompt
+
+
+def test_wechat_prepared_output_keeps_download_preprocess_guidance() -> None:
+    """wechat scene 应继续由自身 manifest 暴露下载、预处理和当前时间指引。"""
+
+    result = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="wechat",
+            scene_manifest_root=_manifest_root(),
+            prompt_asset_root=_prompt_asset_root(),
+            context_slot_values={"current_time": "测试当前时间"},
+            available_tools=_fake_tool_catalog(),
+        )
+    )
+
+    selected = result.tool_selection.tool_names
+    assert selected is not None
+    assert "start_fins_download" in selected
+    assert "start_fins_preprocess" in selected
+    assert "get_current_time" in selected
+    assert "start_fins_upload" not in selected
+    assert "start_fins_download" in result.system_prompt
+    assert "start_fins_preprocess" in result.system_prompt
+    assert "get_current_time" in result.system_prompt
+    assert "start_fins_upload" not in result.system_prompt
+    for marker in _PREPARED_CONDITIONAL_MARKERS:
+        assert marker not in result.system_prompt
 
 
 def test_get_current_time_tool_is_selected_only_for_interactive_wechat_scenes() -> None:

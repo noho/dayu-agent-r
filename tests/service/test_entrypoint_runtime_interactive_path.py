@@ -96,6 +96,8 @@ _DEFAULT_INTERACTIVE_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _DEFAULT_DOWNLOAD_TOOL_NAME = "start_fins_download"
 _DEFAULT_PREPROCESS_TOOL_NAME = "start_fins_preprocess"
+_DEFAULT_LIST_TOOL_NAME = "list_documents"
+_DEFAULT_READ_TOOL_NAME = "read_section"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
 _INTERACTIVE_SUBJECT_TEXT = "# 当前分析对象\n你正在分析的是 AAPL。"
 _INTERACTIVE_CURRENT_TIME_TEXT = (
@@ -942,7 +944,9 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert _DEFAULT_INTERACTIVE_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_LIST_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_READ_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert result.host_assembly.options.wait_poller_policy is not None
     assert result.host_assembly.options.wait_poller_policy.enabled
@@ -951,7 +955,7 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert "财报工具指引" in result.scene_inputs.system_prompt
     assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
     assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.system_prompt
-    assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.system_prompt
     assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
     assert "<when_tag" not in result.scene_inputs.system_prompt
     assert "</when_tag>" not in result.scene_inputs.system_prompt
@@ -959,6 +963,40 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert "</when_tool>" not in result.scene_inputs.system_prompt
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
+
+
+def test_interactive_real_host_effective_schemas_exclude_preprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 manifest/discovery/Service/Host 链只从最终 schema 排除 preprocess。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: 用于安装记录型真实 Host opener 与 non-TTY 输入。
+    :returns: ``None``。
+    :raises AssertionError: 最终 Engine request 工具 schema 不符合 interactive 契约时抛出。
+    """
+
+    worker_factory = FinalAnswerWorkerFactory()
+    _install_recording_cli_host(monkeypatch, worker_factory=worker_factory)
+
+    exit_code = _run_agent_surface(
+        "interactive",
+        workspace_root=tmp_path,
+        label=None,
+        user_prompt="读取本地财报",
+        monkeypatch=monkeypatch,
+    )
+
+    assert exit_code == 0
+    assert len(worker_factory.requests) == 1
+    schema_names = frozenset(
+        schema.function.name for schema in worker_factory.requests[0].tool_schemas
+    )
+    assert _DEFAULT_PREPROCESS_TOOL_NAME not in schema_names
+    assert _DEFAULT_DOWNLOAD_TOOL_NAME in schema_names
+    assert _DEFAULT_LIST_TOOL_NAME in schema_names
+    assert _DEFAULT_READ_TOOL_NAME in schema_names
 
 
 @pytest.mark.asyncio
