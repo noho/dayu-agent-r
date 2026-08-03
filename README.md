@@ -80,8 +80,8 @@ dayu-cli init --base ./my-workspace --overwrite
 dayu-cli init --base ./my-workspace --reset
 ```
 
-`init` 不接受 `--config`；无论把它写在命令前还是命令后，都会作为用法错误退出
-`2`。不传 `--base` 时仍使用 `./workspace`。
+`init` 通过 `--base` / `-b` / `--workspace` 选择工作区；不传时使用
+`./workspace`。配置固定读取该工作区的 `config/`，不存在时使用包内默认配置。
 
 `init` 只有以下四种状态：
 
@@ -170,7 +170,6 @@ dayu-cli <command> --help
 | 参数 | 说明 |
 |---|---|
 | `--base` / `--workspace` | 工作区根目录，默认 `./workspace` |
-| `--config` | 部分独立 runtime 命令使用的显式配置目录；`prompt`、`interactive` 及其 `session resume` 模式不接受该参数，统一读取工作区 `config/` 或包内默认配置 |
 | `--log-level LEVEL` | 可选 `debug`、`verbose`、`info`、`warning`、`error`、`critical`、`quiet`；`warn` 与 `warning` 等价 |
 | `--debug` / `--verbose` / `--info` / `--warning` / `--error` / `--critical` / `--quiet` | 对应日志等级的快捷参数；同时保留与 `--warning` 等价的 `--warn` |
 | `--debug-stream` | 额外打开高频 stream/SSE 诊断，不改变普通日志等级；不可与 `quiet` 组合 |
@@ -238,6 +237,10 @@ TTY 输入中，Enter 提交，`Ctrl+J` 或支持 xterm Shift+Enter 序列的终
 空闲且输入为空时，`Ctrl-D` 正常退出；运行期间 `Ctrl-D` 不取消任务。stdin 不是 TTY
 时，`interactive` 会读取整个 UTF-8 输入流，只做一次提交，不显示提示符，也不把换行
 拆成多个 Run；空白流不提交，非法 UTF-8 作为稳定用法错误退出。
+
+交互会话可以按问题需要下载财报、列出已入库文档并读取财报内容，但不在会话中执行
+预处理。需要预处理时，请使用第 5.4 节的 `process`、`process_filing` 或
+`process_material` 独立命令。
 
 ## 5. 下载、上传与预处理
 
@@ -376,7 +379,8 @@ dayu-cli session resume \
 ```
 
 label selector 不再接受 `--kind`。`--mode` 只选择本次输入方式；prompt 模式仍可使用
-`--ticker`，interactive 模式不接受 `--ticker`。两个模式也都不接受显式 `--config`。
+`--ticker`，interactive 模式不接受 `--ticker`。两个模式都从所选工作区的 `config/`
+读取配置；该目录不存在时使用包内默认配置。
 
 清理 Session 需要显式确认；CLI 不会自动 close 或 cancel：
 
@@ -420,8 +424,7 @@ tool-trace-analysis.md
 artifacts；单文件或 tool-trace 目录输入是 cold-only，不会从父目录猜测 hot
 数据库或 payload root，因此报告会明确标记相应 `limited_signal`，而不是把
 “无法证明”写成“未发生”。同一输入若同时匹配多个布局会拒绝执行；此时传入更具体的
-`.dayu` 目录或 cold JSONL 文件。全局 `--base` / `--config` 不参与 Analyzer
-输入发现。
+`.dayu` 目录或 cold JSONL 文件。工作区路径参数不参与 Analyzer 输入发现。
 
 报告中的 findings 和 limitations 不改变成功退出码。输入路径或布局错误返回 `2`；
 可信读取、分析或发布失败返回 `1`。发布第二个文件失败时，命令会分别列出本次已发布
