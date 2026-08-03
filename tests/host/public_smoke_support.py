@@ -14,6 +14,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 
 import pytest
 
@@ -245,6 +246,30 @@ class ProviderSmokeCase:
     model: str
     supports_stream_usage: bool
     provider_request: ProviderRequestExtension
+
+
+class ProviderEnvironmentUnavailableKind(StrEnum):
+    """真实 provider smoke 可接受的环境不可用分类。"""
+
+    MISSING_CREDENTIAL = "missing_credential"
+    NETWORK_UNAVAILABLE = "network_unavailable"
+    SERVER_OVERLOADED_OR_TRANSIENT = "server_overloaded_or_transient"
+    EXPLICIT_UNAVAILABLE = "explicit_unavailable"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEnvironmentUnavailable:
+    """真实 provider smoke 的结构化环境不可用结果。
+
+    :param provider_name: provider case 名称。
+    :param kind: 精确环境分类。
+    :param reason: 可直接写入 pytest skip/evidence 的脱敏原因。
+    """
+
+    provider_name: str
+    kind: ProviderEnvironmentUnavailableKind
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -882,9 +907,33 @@ def api_key_or_skip(case: ProviderSmokeCase) -> str:
     :raises pytest.skip.Exception: 环境变量缺失或为空时跳过。
     """
 
+    credential = provider_api_key_or_unavailable(case)
+    if isinstance(credential, ProviderEnvironmentUnavailable):
+        pytest.skip(credential.reason)
+    return credential
+
+
+def provider_api_key_or_unavailable(
+    case: ProviderSmokeCase,
+) -> str | ProviderEnvironmentUnavailable:
+    """读取 provider API key 或返回结构化缺失分类。
+
+    :param case: provider case。
+    :returns: 非空 API key，或精确的 credential 环境不可用结果。
+    :raises Exception: 不主动抛出异常。
+    """
+
     api_key = os.environ.get(case.env_var)
     if api_key is None or api_key.strip() == "":
-        pytest.skip(f"provider={case.name} missing_env={case.env_var}")
+        kind = ProviderEnvironmentUnavailableKind.MISSING_CREDENTIAL
+        return ProviderEnvironmentUnavailable(
+            provider_name=case.name,
+            kind=kind,
+            reason=(
+                f"provider={case.name} provider_availability={kind.value} "
+                f"missing_env={case.env_var}"
+            ),
+        )
     return api_key
 
 
@@ -1248,6 +1297,37 @@ def skip_if_provider_exception(case: ProviderSmokeCase, exc: BaseException) -> N
     _skip_if_provider_failure_message(case, str(exc))
 
 
+def classify_provider_failure_message(
+    case: ProviderSmokeCase,
+    message: str,
+) -> ProviderEnvironmentUnavailable | None:
+    """按既有 marker 真源分类 provider 环境不可用消息。
+
+    :param case: provider case。
+    :param message: 已由调用边界脱敏的 provider/runner 错误摘要。
+    :returns: 匹配时返回结构化环境分类；其它失败返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    lowered = message.lower()
+    if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
+        kind = ProviderEnvironmentUnavailableKind.NETWORK_UNAVAILABLE
+        return _provider_environment_unavailable(case, kind, message)
+    if any(
+        marker in lowered
+        for marker in _TEMPORARY_PROVIDER_UNAVAILABLE_MARKERS
+    ):
+        kind = ProviderEnvironmentUnavailableKind.SERVER_OVERLOADED_OR_TRANSIENT
+        return _provider_environment_unavailable(case, kind, message)
+    if any(marker in lowered for marker in _EXPLICIT_UNAVAILABLE_MARKERS):
+        kind = ProviderEnvironmentUnavailableKind.EXPLICIT_UNAVAILABLE
+        return _provider_environment_unavailable(case, kind, message)
+    if any(marker in lowered for marker in _TEMPORARY_PROVIDER_RATE_LIMIT_MARKERS):
+        kind = ProviderEnvironmentUnavailableKind.RESOURCE_EXHAUSTED
+        return _provider_environment_unavailable(case, kind, message)
+    return None
+
+
 def _skip_if_provider_failure_message(
     case: ProviderSmokeCase, message: str
 ) -> None:
@@ -1259,31 +1339,38 @@ def _skip_if_provider_failure_message(
     :raises pytest.skip.Exception: 匹配 provider 环境失败时跳过。
     """
 
-    lowered = message.lower()
-    if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
-        pytest.skip(
+    unavailable = classify_provider_failure_message(case, message)
+    if unavailable is not None:
+        pytest.skip(unavailable.reason)
+
+
+def _provider_environment_unavailable(
+    case: ProviderSmokeCase,
+    kind: ProviderEnvironmentUnavailableKind,
+    message: str,
+) -> ProviderEnvironmentUnavailable:
+    """构造 provider 调用失败的统一结构化环境分类。
+
+    :param case: provider case。
+    :param kind: 已由 marker 真源判定的精确分类。
+    :param message: 已由调用边界脱敏的错误摘要。
+    :returns: 可复用于旧 skip helper 与 fallback selector 的分类结果。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    field_name = (
+        "provider_quota_or_rate_limit"
+        if kind is ProviderEnvironmentUnavailableKind.RESOURCE_EXHAUSTED
+        else "provider_availability"
+    )
+    return ProviderEnvironmentUnavailable(
+        provider_name=case.name,
+        kind=kind,
+        reason=(
             f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_availability=network_unavailable message={message}"
-        )
-    if any(
-        marker in lowered
-        for marker in _TEMPORARY_PROVIDER_UNAVAILABLE_MARKERS
-    ):
-        pytest.skip(
-            f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_availability=server_overloaded_or_transient "
-            f"message={message}"
-        )
-    if any(marker in lowered for marker in _EXPLICIT_UNAVAILABLE_MARKERS):
-        pytest.skip(
-            f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_availability=explicit_unavailable message={message}"
-        )
-    if any(marker in lowered for marker in _TEMPORARY_PROVIDER_RATE_LIMIT_MARKERS):
-        pytest.skip(
-            f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_quota_or_rate_limit=resource_exhausted message={message}"
-        )
+            f"{field_name}={kind.value} message={message}"
+        ),
+    )
 
 
 def mock_tooling_options() -> HostToolingOptions:
