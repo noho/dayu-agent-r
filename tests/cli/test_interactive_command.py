@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import signal
 import sys
 from collections.abc import Callable
@@ -26,13 +27,14 @@ import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 import dayu.cli.session_execution as session_execution
 from dayu.cli.composer import (
+    InteractiveComposer,
     InteractiveComposerEvent,
     InteractiveComposerEventKind,
     InteractiveComposerPhase,
     PromptToolkitInteractiveComposer,
 )
-from dayu.cli.run_keys import RunningKeyAction
-from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
+from dayu.cli.run_keys import ESCAPE_SEQUENCE_AMBIGUITY_SECONDS, RunningKeyAction
+from dayu.cli.run_view import InteractiveRunView, InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
 from dayu.cli.agent_entrypoint import (
@@ -117,6 +119,7 @@ _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
 )
 _API_KEY = "test-provider-key"
 _TRANSIENT_OBSERVED_AT = datetime(2026, 7, 20, 1, 2, 3, tzinfo=UTC)
+_INPUT_RESOLUTION_MARGIN_SECONDS = 0.05
 
 
 class _InteractiveEditorFailureCase(StrEnum):
@@ -126,6 +129,59 @@ class _InteractiveEditorFailureCase(StrEnum):
     NON_EXECUTABLE = "non_executable"
     SPAWN_ERROR = "spawn_error"
     NONZERO = "nonzero"
+
+
+class _RealSigintPhase(StrEnum):
+    """真实 POSIX SIGINT ordering 的受测 active turn 阶段。"""
+
+    PROVIDER_WAIT = "provider_wait"
+    TOOL_EXECUTION = "tool_execution"
+    CLOSEOUT = "closeout"
+
+
+class _BlockingTerminalFinisher:
+    """在 canonical terminal owner 内提供第二次真实 SIGINT 注入 barrier。"""
+
+    entered: asyncio.Event
+    release: asyncio.Event
+    terminals: list[EntrypointRunTerminalResult]
+
+    def __init__(self) -> None:
+        """初始化 closeout barrier 与 terminal 记录。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.terminals = []
+
+    async def __call__(
+        self,
+        *,
+        terminal: EntrypointRunTerminalResult,
+        workspace_root: Path,
+        session_id: str,
+        run_view: InteractiveRunView | None,
+        runtime_display: RuntimeDisplayController | None,
+    ) -> int:
+        """记录 canonical terminal 并阻塞 owner 清空 current。
+
+        :param terminal: Host canonical terminal projection。
+        :param workspace_root: 当前测试 workspace；仅用于匹配 production seam。
+        :param session_id: 当前 Session id；仅用于匹配 production seam。
+        :param run_view: 可选 run view；仅用于匹配 production seam。
+        :param runtime_display: 可选 display；仅用于匹配 production seam。
+        :returns: 释放后返回成功 terminal mapping。
+        :raises asyncio.CancelledError: driver 被异常取消时透传。
+        """
+
+        del workspace_root, session_id, run_view, runtime_display
+        self.terminals.append(terminal)
+        self.entered.set()
+        await self.release.wait()
+        return EXIT_SUCCESS
 
 
 class _InteractiveEditorProcess:
@@ -1131,6 +1187,16 @@ class _ScriptedComposer:
         """
 
         self.prompt_calls.append(prompt)
+        while self._phase is InteractiveComposerPhase.SUBMITTING and (
+            not self._remaining
+            or isinstance(self._remaining[0], str)
+            or (
+                isinstance(self._remaining[0], InteractiveComposerEvent)
+                and self._remaining[0].kind is InteractiveComposerEventKind.SUBMIT
+            )
+        ):
+            self._phase_changed.clear()
+            await self._phase_changed.wait()
         if not self._remaining:
             while self._phase is not InteractiveComposerPhase.IDLE:
                 self._phase_changed.clear()
@@ -1150,12 +1216,9 @@ class _ScriptedComposer:
                 input_revision=self._revision,
             )
         if isinstance(step, InteractiveComposerEvent):
-            self._pending_submit = step.kind is InteractiveComposerEventKind.SUBMIT
-            self._pending_submit_intent = (
-                step.kind is InteractiveComposerEventKind.SUBMIT
-                and step.draft is not None
-                and step.draft.strip() != ""
-            )
+            if step.kind is InteractiveComposerEventKind.SUBMIT:
+                self._pending_submit = True
+                self._pending_submit_intent = step.draft is not None and step.draft.strip() != ""
             return step
         if step.exception_type is EOFError:
             return InteractiveComposerEvent(
@@ -3067,6 +3130,7 @@ async def test_interactive_idle_sigint_after_read_only_does_not_cancel_retry_run
 
     try:
         await asyncio.wait_for(composer.read_entered.wait(), timeout=2.0)
+        await _wait_for_rejected_delivery_count(composer, 1)
         assert composer.rejected_delivery_count == 1
         assert not composer.has_pending_submit_intent()
         assert host._submit_index == 0
@@ -3455,6 +3519,62 @@ async def test_interactive_escape_crosses_pre_acceptance_barrier_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("escape_delay_seconds", (0.0, 0.01, 0.02))
+async def test_real_pipe_early_escape_binds_submit_across_application_handoff(
+    escape_delay_seconds: float,
+    tmp_path: Path,
+) -> None:
+    """Enter 后 0/10/20ms Escape 必须由第二个真实 app 绑定同一 Run。
+
+    :param escape_delay_seconds: Enter 与 standalone Escape 的精确注入间隔。
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: app handoff、single cancel、terminal 或 REPL 延续漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _DelayedAcceptanceControlledHost()
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        driver = _start_tty_driver(
+            host=host,
+            runtime=runtime,
+            workspace_root=tmp_path,
+            composer=composer,
+        )
+        pipe_input.send_text("第一轮\r")
+        if escape_delay_seconds > 0:
+            await asyncio.sleep(escape_delay_seconds)
+        pipe_input.send_text("\x1b")
+        await asyncio.wait_for(host.committed.wait(), timeout=2.0)
+        await asyncio.sleep(
+            ESCAPE_SEQUENCE_AMBIGUITY_SECONDS + _INPUT_RESOLUTION_MARGIN_SECONDS
+        )
+        assert host.cancel_requests == []
+
+        host.release_response.set()
+        await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+        host.release_cancel_terminal.set()
+        await _wait_for_real_composer_phase(
+            composer,
+            phase=InteractiveComposerPhase.IDLE,
+        )
+        pipe_input.send_text("\x04")
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(host.submit_requests) == 1
+    assert host.calls.count("cancel:run-1") == 1
+    assert len(host.cancel_requests) == 1
+    assert host.cancel_requests[0].mode is CancelMode.GRACEFUL
+    assert tuple(composer._history.get_strings()) == ("第一轮",)
+    assert not host.cancel_waiter_cancelled
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("sigint_count", "expected_exit_code"),
     ((1, EXIT_SUCCESS), (2, EXIT_KEYBOARD_INTERRUPT)),
@@ -3698,6 +3818,78 @@ async def test_interactive_os_sigint_first_second_and_third_follow_same_lifecycl
     assert len(fallback.signal_calls) == 2
     assert fallback.signal_calls[1] is signal.SIG_IGN
     assert fallback.current_handler is signal.SIG_IGN
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal contract")
+@pytest.mark.parametrize("phase", tuple(_RealSigintPhase))
+async def test_real_posix_double_sigint_exits_after_single_canonical_closeout(
+    phase: _RealSigintPhase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provider/tool/closeout 的第二个真实 SIGINT 必须在唯一 cleanup 后退出 130。
+
+    :param phase: 第二次 SIGINT 所在 active turn 阶段。
+    :param tmp_path: pytest 临时 workspace。
+    :param monkeypatch: closeout phase 使用的 production seam 替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: durable count、single cancel、canonical terminal 或恢复语义漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _ScriptedComposer(("current",))
+    monitor = CliSigintMonitor()
+    previous_handler = signal.getsignal(signal.SIGINT)
+    finisher = _BlockingTerminalFinisher()
+    if phase is _RealSigintPhase.CLOSEOUT:
+        monkeypatch.setattr(
+            session_execution,
+            "_finish_interactive_terminal",
+            finisher,
+        )
+    monitor.install()
+    try:
+        driver = _start_tty_driver(
+            host=host,
+            runtime=runtime,
+            workspace_root=tmp_path,
+            composer=composer,
+            sigint_monitor=monitor,
+        )
+        await _wait_for_submit_count(host, 1)
+        if phase is _RealSigintPhase.TOOL_EXECUTION:
+            await host._run_watchers["run-1"].push(_activity_event(run_id="run-1"))
+
+        os.kill(os.getpid(), signal.SIGINT)
+        await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+        if phase is _RealSigintPhase.CLOSEOUT:
+            host.release_cancel_terminal.set()
+            await asyncio.wait_for(finisher.entered.wait(), timeout=2.0)
+        os.kill(os.getpid(), signal.SIGINT)
+        await _wait_for_monitor_count(monitor, 2)
+        if phase is _RealSigintPhase.CLOSEOUT:
+            finisher.release.set()
+        else:
+            host.release_cancel_terminal.set()
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+    finally:
+        finisher.release.set()
+        host.release_cancel_terminal.set()
+        monitor.close()
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert monitor.count == 2
+    assert len(host.submit_requests) == 1
+    assert host.calls.count("cancel:run-1") == 1
+    assert len(host.cancel_requests) == 1
+    assert [watcher.closed_count for watcher in host.watchers] == [1, 1]
+    assert not host.cancel_waiter_cancelled
+    if phase is _RealSigintPhase.CLOSEOUT:
+        assert len(finisher.terminals) == 1
+        assert finisher.terminals[0].terminal_status is HostTerminalStatus.CANCELLED
+    assert signal.getsignal(signal.SIGINT) == previous_handler
 
 
 @pytest.mark.asyncio
@@ -4320,7 +4512,7 @@ def _start_tty_driver(
     host: _ControlledInteractiveHost,
     runtime: EntrypointRuntimeResult,
     workspace_root: Path,
-    composer: _ScriptedComposer,
+    composer: InteractiveComposer,
     sigint_monitor: CliSigintMonitor | None = None,
     run_view: TerminalInteractiveRunView | None = None,
     runtime_display: RuntimeDisplayController | None = None,
@@ -4330,7 +4522,7 @@ def _start_tty_driver(
     :param host: 可控 Host fake。
     :param runtime: 真实 interactive runtime assembly。
     :param workspace_root: 测试 workspace root。
-    :param composer: scripted typed composer。
+    :param composer: typed composer；可使用真实 PromptToolkit owner 或脚本替身。
     :param sigint_monitor: 可选手动 SIGINT monitor；省略时永不触发。
     :param run_view: 可选 terminal run view。
     :param runtime_display: 可选串行 display controller。
@@ -4414,6 +4606,25 @@ async def _wait_for_stderr_text(stderr: io.StringIO, expected: str) -> None:
     raise AssertionError(f"stderr did not contain {expected}")
 
 
+async def _wait_for_rejected_delivery_count(
+    composer: _ScriptedComposer,
+    expected_count: int,
+) -> None:
+    """等待 driver 完成指定次数的 typed submit delivery 拒绝。
+
+    :param composer: scripted composer。
+    :param expected_count: 预期最小拒绝次数。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if composer.rejected_delivery_count >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"rejected delivery count did not reach {expected_count}")
+
+
 async def _wait_for_prompt_call_count(
     composer: _ScriptedComposer,
     expected_count: int,
@@ -4468,10 +4679,29 @@ async def _wait_for_sigint_observation(
     """
 
     for _attempt in range(1_000):
-        if monitor.observed_counts and monitor.observed_counts[-1] >= expected_count:
+        if monitor.count >= expected_count:
             return
         await asyncio.sleep(0)
     raise AssertionError(f"SIGINT observation did not reach {expected_count}")
+
+
+async def _wait_for_monitor_count(
+    monitor: CliSigintMonitor,
+    expected_count: int,
+) -> None:
+    """等待真实 monitor durable count 达到指定值。
+
+    :param monitor: 已安装的 CLI SIGINT monitor。
+    :param expected_count: 预期最小 durable count。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内 durable count 未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if monitor.count >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"SIGINT monitor count did not reach {expected_count}")
 
 
 async def _wait_for_sigint_rearm(

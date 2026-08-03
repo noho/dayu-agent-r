@@ -34,7 +34,7 @@ from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import Output
 
-from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.run_keys import ESCAPE_SEQUENCE_AMBIGUITY_SECONDS, RunningKeyAction
 
 XTERM_MODIFY_OTHER_KEYS_SHIFT_ENTER: Final[str] = "\x1b[27;2;13~"
 """xterm modifyOtherKeys 协议中 Shift+Enter 的完整字节序列。"""
@@ -155,6 +155,7 @@ class InteractiveComposerPhase(StrEnum):
     """interactive composer 当前输入阶段。"""
 
     IDLE = "idle"
+    SUBMITTING = "submitting"
     RUNNING = "running"
     CANCELLING = "cancelling"
 
@@ -290,6 +291,19 @@ class _ComposerEventSignal(Exception):
 _PhaseProvider = Callable[[], InteractiveComposerPhase]
 _RevisionProvider = Callable[[], int]
 _SubmitIntentRecorder = Callable[[str], None]
+_RunningActionRecorder = Callable[[RunningKeyAction], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingSubmitDocument:
+    """等待 driver 接受或拒绝的 exact submit 文档。
+
+    :param text: Enter chord 提交时的完整文本。
+    :param cursor_position: Enter chord 提交时的光标位置。
+    """
+
+    text: str
+    cursor_position: int
 
 
 class PromptToolkitInteractiveComposer:
@@ -303,6 +317,9 @@ class PromptToolkitInteractiveComposer:
     _input_revision: int
     _pending_submit: bool
     _pending_submit_intent: bool
+    _pending_submit_document: _PendingSubmitDocument | None
+    _submit_handoff_started: bool
+    _pending_running_actions: list[RunningKeyAction]
     _tracking_user_edits: bool
     _editor_tasks: set[_EditorTask]
 
@@ -329,6 +346,9 @@ class PromptToolkitInteractiveComposer:
         self._input_revision = 0
         self._pending_submit = False
         self._pending_submit_intent = False
+        self._pending_submit_document = None
+        self._submit_handoff_started = False
+        self._pending_running_actions = []
         self._tracking_user_edits = False
         self._editor_tasks = set()
         self._session = PromptSession(
@@ -338,6 +358,7 @@ class PromptToolkitInteractiveComposer:
                 phase_provider=self._current_phase,
                 revision_provider=self._current_input_revision,
                 submit_intent_recorder=self._record_submit_intent,
+                running_action_recorder=self._record_pending_running_action,
                 editor_tasks=self._editor_tasks,
             ),
             enable_history_search=True,
@@ -346,6 +367,8 @@ class PromptToolkitInteractiveComposer:
             output=output,
         )
         self._session.default_buffer.on_text_changed += self._record_text_change
+        self._session.app.timeoutlen = ESCAPE_SEQUENCE_AMBIGUITY_SECONDS
+        self._session.app.ttimeoutlen = ESCAPE_SEQUENCE_AMBIGUITY_SECONDS
 
     def set_phase(self, phase: InteractiveComposerPhase) -> None:
         """更新按键阶段。
@@ -370,12 +393,20 @@ class PromptToolkitInteractiveComposer:
 
         if not self._pending_submit:
             raise RuntimeError("interactive composer has no pending submit")
+        pending_document = self._pending_submit_document
+        if pending_document is None:
+            raise RuntimeError("interactive composer pending submit document is missing")
         if record_history:
-            self._history.append_string(self._draft)
-        self._draft = ""
-        self._cursor_position = 0
+            self._history.append_string(pending_document.text)
+        if not self._submit_handoff_started:
+            self._draft = ""
+            self._cursor_position = 0
         self._pending_submit = False
         self._pending_submit_intent = False
+        self._pending_submit_document = None
+        self._submit_handoff_started = False
+        if record_history:
+            self._phase = InteractiveComposerPhase.RUNNING
 
     def has_pending_submit_intent(self) -> bool:
         """返回输入 owner 是否已解析出待交付的非空提交意图。
@@ -398,7 +429,11 @@ class PromptToolkitInteractiveComposer:
 
         if not self._pending_submit:
             raise RuntimeError("interactive composer has no pending submit")
+        self._restore_pending_submit_document()
+        self._submit_handoff_started = False
         self._pending_submit_intent = False
+        self._pending_running_actions.clear()
+        self._phase = InteractiveComposerPhase.IDLE
 
     async def read_event(self, prompt: str) -> InteractiveComposerEvent:
         """读取下一次 interactive typed event。
@@ -408,15 +443,31 @@ class PromptToolkitInteractiveComposer:
         :raises Exception: prompt_toolkit 运行失败时向上透传。
         """
 
-        if self._pending_submit:
+        submit_handoff = self._pending_submit and self._phase is InteractiveComposerPhase.SUBMITTING
+        if submit_handoff:
+            # 原提交文档由 pending snapshot 持有；第二个 application 立即接管
+            # stdin，并以独立空 buffer 保存 acceptance 前的运行态输入。
+            self._submit_handoff_started = True
+            self._draft = ""
+            self._cursor_position = 0
+        elif self._pending_submit:
             # 上一份 SUBMIT 未被 REPL 确认，保留 exact draft/cursor，但允许
             # 用户继续编辑并重新提交。
+            self._restore_pending_submit_document()
             self._pending_submit = False
             self._pending_submit_intent = False
+            self._pending_submit_document = None
+            self._submit_handoff_started = False
         document = Document(
             text=self._draft,
             cursor_position=self._cursor_position,
         )
+        if self._pending_running_actions:
+            return InteractiveComposerEvent(
+                kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+                input_revision=self._input_revision,
+                running_key_action=self._pending_running_actions.pop(0),
+            )
         self._tracking_user_edits = False
         try:
             submitted_text = await self._session.prompt_async(
@@ -424,17 +475,21 @@ class PromptToolkitInteractiveComposer:
                 multiline=False,
                 handle_sigint=False,
                 default=document,
-                pre_run=self._begin_tracking_user_edits,
+                pre_run=partial(
+                    self._begin_tracking_user_edits,
+                    flush_submit_handoff=submit_handoff,
+                ),
             )
         except _ComposerEventSignal as signal:
             self._remember_document(signal.document)
-            self._pending_submit = signal.event.kind is InteractiveComposerEventKind.SUBMIT
+            if signal.event.kind is InteractiveComposerEventKind.SUBMIT:
+                self._record_pending_submit_document(signal.document)
             return signal.event
         finally:
             self._tracking_user_edits = False
             await _cancel_editor_tasks(self._editor_tasks)
         self._remember_document(Document(submitted_text))
-        self._pending_submit = True
+        self._record_pending_submit_document(Document(submitted_text))
         return InteractiveComposerEvent(
             kind=InteractiveComposerEventKind.SUBMIT,
             draft=submitted_text,
@@ -459,14 +514,38 @@ class PromptToolkitInteractiveComposer:
 
         return self._input_revision
 
-    def _begin_tracking_user_edits(self) -> None:
+    def _begin_tracking_user_edits(self, *, flush_submit_handoff: bool) -> None:
         """在 prompt_toolkit 完成默认文档恢复后开始记录用户编辑。
 
+        :param flush_submit_handoff: 是否需要 flush 前一 app 遗留的 ESC prefix。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         self._tracking_user_edits = True
+        if flush_submit_handoff:
+            self._session.app.create_background_task(
+                self._flush_submit_handoff_input()
+            )
+
+    async def _flush_submit_handoff_input(self) -> None:
+        """在歧义期后主动 flush 上一个 application 遗留的 ESC prefix。
+
+        PromptToolkit 会保留 application 结束后的完整 key typeahead，但 VT
+        parser 中尚未形成 ``KeyPress`` 的孤立 ESC 需要由下一 application 的
+        input owner 显式 flush；continuation 在歧义期内到达时会先完成完整序列。
+
+        :returns: ``None``。
+        :raises Exception: PromptToolkit input 或 key processor 失败时向上透传。
+        """
+
+        await asyncio.sleep(ESCAPE_SEQUENCE_AMBIGUITY_SECONDS)
+        application = self._session.app
+        if application.is_done:
+            return
+        keys = application.input.flush_keys()
+        application.key_processor.feed_multiple(keys)
+        application.key_processor.process_keys()
 
     def _record_submit_intent(self, draft: str) -> None:
         """同步记录 Enter chord 已解析出的非空提交意图。
@@ -480,6 +559,20 @@ class PromptToolkitInteractiveComposer:
         """
 
         self._pending_submit_intent = draft.strip() != ""
+        if self._pending_submit_intent:
+            # 同一 parser feed 中 Enter 后续字节必须立即进入 active 输入语义；
+            # driver 稍后只负责把该 typed intent 绑定 Host acceptance。
+            self._phase = InteractiveComposerPhase.SUBMITTING
+
+    def _record_pending_running_action(self, action: RunningKeyAction) -> None:
+        """保存与同步 submit chord 同一 parser feed 产生的运行态动作。
+
+        :param action: 已由 PromptToolkit 完整 sequence resolution 得到的动作。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._pending_running_actions.append(action)
 
     def _record_text_change(self, _buffer: Buffer) -> None:
         """记录 application 运行期间的真实 buffer 文本变化。
@@ -503,6 +596,34 @@ class PromptToolkitInteractiveComposer:
         self._draft = document.text
         self._cursor_position = document.cursor_position
 
+    def _record_pending_submit_document(self, document: Document) -> None:
+        """冻结等待 driver 决策的 exact submit 文档。
+
+        :param document: PromptToolkit application 提交时的文档。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._pending_submit = True
+        self._pending_submit_document = _PendingSubmitDocument(
+            text=document.text,
+            cursor_position=document.cursor_position,
+        )
+        self._submit_handoff_started = False
+
+    def _restore_pending_submit_document(self) -> None:
+        """把被拒绝交付的 exact submit 文档恢复为 editable draft。
+
+        :returns: ``None``。
+        :raises RuntimeError: pending submit snapshot 缺失时抛出。
+        """
+
+        pending_document = self._pending_submit_document
+        if pending_document is None:
+            raise RuntimeError("interactive composer pending submit document is missing")
+        self._draft = pending_document.text
+        self._cursor_position = pending_document.cursor_position
+
 
 def build_interactive_key_bindings(
     *,
@@ -524,6 +645,7 @@ def build_interactive_key_bindings(
         phase_provider=_idle_phase if phase_provider is None else phase_provider,
         revision_provider=_zero_revision if revision_provider is None else revision_provider,
         submit_intent_recorder=_ignore_submit_intent,
+        running_action_recorder=_ignore_running_action,
         editor_tasks=set(),
     )
 
@@ -534,6 +656,7 @@ def _build_interactive_key_bindings(
     phase_provider: _PhaseProvider,
     revision_provider: _RevisionProvider,
     submit_intent_recorder: _SubmitIntentRecorder,
+    running_action_recorder: _RunningActionRecorder,
     editor_tasks: set[_EditorTask],
 ) -> KeyBindings:
     """构造绑定并接入当前 composer 持有的 editor task 集合。
@@ -542,6 +665,7 @@ def _build_interactive_key_bindings(
     :param phase_provider: 当前 composer phase provider。
     :param revision_provider: 当前用户编辑版本 provider。
     :param submit_intent_recorder: 普通 Enter 的同步 typed submit intent recorder。
+    :param running_action_recorder: 同一 submit feed 中运行态动作的 typed recorder。
     :param editor_tasks: composer 强引用并在 teardown 清理的唯一 pending editor task。
     :returns: prompt_toolkit key bindings。
     :raises Exception: KeyBindings 构造失败时向上透传。
@@ -572,6 +696,8 @@ def _build_interactive_key_bindings(
 
         if _is_exact_xterm_shift_enter(event):
             event.app.current_buffer.insert_text("\n")
+            return
+        if phase_provider() is InteractiveComposerPhase.SUBMITTING:
             return
         submit_intent_recorder(event.app.current_buffer.text)
         _exit_with_composer_event(
@@ -617,7 +743,25 @@ def _build_interactive_key_bindings(
             return
         buffer.delete(count=event.arg)
 
-    @bindings.add("escape", filter=active_phase)
+    @bindings.add(Keys.Escape, Keys.Any, filter=active_phase)
+    def _handle_complete_escape_prefixed_chord(event: KeyPressEvent) -> None:
+        """完整 ESC-prefixed chord 只执行 continuation 自身的控制语义。
+
+        :param event: PromptToolkit 已解析出的完整双键 chord。
+        :returns: ``None``。
+        :raises Exception: application 退出失败时向上透传。
+        """
+
+        continuation = event.key_sequence[-1]
+        if continuation.key is Keys.ControlT:
+            _exit_with_composer_event(
+                event,
+                kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+                revision=revision_provider(),
+                running_key_action=RunningKeyAction.TOGGLE_ACTIVITY,
+            )
+
+    @bindings.add(Keys.Escape, filter=active_phase)
     def _cancel_active_with_escape(event: KeyPressEvent) -> None:
         """只在完整解析出 standalone Escape 后请求取消 active Run。
 
@@ -626,6 +770,11 @@ def _build_interactive_key_bindings(
         :raises Exception: application 退出失败时向上透传。
         """
 
+        if not _is_exact_standalone_escape(event):
+            return
+        if phase_provider() is InteractiveComposerPhase.SUBMITTING and event.app.is_done:
+            running_action_recorder(RunningKeyAction.CANCEL_RUN)
+            return
         _exit_with_composer_event(
             event,
             kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
@@ -642,6 +791,9 @@ def _build_interactive_key_bindings(
         :raises Exception: application 退出失败时向上透传。
         """
 
+        if phase_provider() is InteractiveComposerPhase.SUBMITTING and event.app.is_done:
+            running_action_recorder(RunningKeyAction.TOGGLE_ACTIVITY)
+            return
         _exit_with_composer_event(
             event,
             kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
@@ -1131,6 +1283,21 @@ def _is_exact_xterm_shift_enter(event: KeyPressEvent) -> bool:
     )
 
 
+def _is_exact_standalone_escape(event: KeyPressEvent) -> bool:
+    """判断当前 resolution 是否为 ambiguity timeout 后的独立 Escape。
+
+    :param event: PromptToolkit 按键事件。
+    :returns: 仅单一 key 与原始 data 都精确匹配 Escape 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        len(event.key_sequence) == 1
+        and event.key_sequence[0].key is Keys.Escape
+        and event.key_sequence[0].data == "\x1b"
+    )
+
+
 def _idle_phase() -> InteractiveComposerPhase:
     """返回默认 key-binding 测试使用的 idle phase。
 
@@ -1155,6 +1322,17 @@ def _ignore_submit_intent(_draft: str) -> None:
     """忽略 standalone key-binding 测试不消费的 submit intent。
 
     :param _draft: Enter 发生时的 exact 草稿；standalone binding 不持久化。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return
+
+
+def _ignore_running_action(_action: RunningKeyAction) -> None:
+    """忽略 standalone key-binding 测试不持久化的运行态动作。
+
+    :param _action: 已完成 sequence resolution 的运行态动作。
     :returns: ``None``。
     :raises Exception: 不主动抛出异常。
     """

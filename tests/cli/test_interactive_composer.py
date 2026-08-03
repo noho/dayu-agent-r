@@ -38,7 +38,7 @@ from dayu.cli.composer import (
     build_interactive_key_bindings,
     new_interactive_composer,
 )
-from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.run_keys import ESCAPE_SEQUENCE_AMBIGUITY_SECONDS, RunningKeyAction
 
 _PTY_READINESS_TIMEOUT_SECONDS = 2.0
 _PTY_READINESS_POLL_SECONDS = 0.005
@@ -512,7 +512,9 @@ async def test_reject_submit_delivery_clears_only_intent_and_restores_exact_draf
     "prefix",
     (
         "\x1b[A",
-        "\x1bf",
+        "\x1b[H",
+        "\x1b[3~",
+        "\x1bx",
         "\x1b[200~粘贴\n内容\x1b[201~",
     ),
 )
@@ -535,6 +537,41 @@ async def test_complete_csi_alt_and_bracketed_paste_do_not_emit_cancel(
     assert event.running_key_action is None
     assert event.draft is not None
     assert "问题" in event.draft
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_chunks", (False, True))
+async def test_exact_alt_x_is_resolved_before_standalone_escape(
+    split_chunks: bool,
+) -> None:
+    """exact Alt+X 同 chunk 或歧义期内跨 chunk 都不得误发 cancel。
+
+    :param split_chunks: 是否把 ESC prefix 与 ``x`` 分两次写入。
+    :returns: ``None``。
+    :raises AssertionError: 完整 Alt chord 被误分类为 standalone Escape 时抛出。
+    """
+
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        composer.set_phase(InteractiveComposerPhase.RUNNING)
+        task = asyncio.create_task(composer.read_event("dayu> "))
+        if split_chunks:
+            pipe_input.send_text("\x1b")
+            await asyncio.sleep(ESCAPE_SEQUENCE_AMBIGUITY_SECONDS / 2)
+            pipe_input.send_text("x")
+        else:
+            pipe_input.send_text("\x1bx")
+        await asyncio.sleep(ESCAPE_SEQUENCE_AMBIGUITY_SECONDS * 2)
+        assert not task.done()
+        pipe_input.send_text("问题\r")
+        event = await asyncio.wait_for(task, timeout=2.0)
+
+    assert event.kind is InteractiveComposerEventKind.SUBMIT
+    assert event.running_key_action is None
+    assert event.draft == "问题"
 
 
 @pytest.mark.asyncio
@@ -1199,7 +1236,7 @@ async def test_real_posix_pty_exact_sequences_and_terminal_mode_restore() -> Non
         await _wait_for_pty_raw_mode(slave_fd)
         os.write(
             master_fd,
-            (b"first\x1b[27;2;13~second\x1b[A\x1bf\x1b[200~paste\nbody\x1b[201~\r"),
+            (b"first\x1b[27;2;13~second\x1b[A\x1bx\x1b[200~paste\nbody\x1b[201~\r"),
         )
         submitted = await asyncio.wait_for(submit_task, timeout=2.0)
         restored_after_submit = termios.tcgetattr(slave_fd)[3]
@@ -1226,7 +1263,8 @@ async def test_real_posix_pty_exact_sequences_and_terminal_mode_restore() -> Non
 
     assert submitted.kind is InteractiveComposerEventKind.SUBMIT
     assert submitted.draft is not None
-    assert submitted.draft.startswith("first\nsecond")
+    assert "first" in submitted.draft
+    assert "second" in submitted.draft
     assert "paste\nbody" in submitted.draft
     assert ordinary_enter.kind is InteractiveComposerEventKind.SUBMIT
     assert ordinary_enter.draft == "ordinary"

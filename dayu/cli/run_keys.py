@@ -29,7 +29,8 @@ _ESC: Final[bytes] = b"\x1b"
 _ESC_TEXT: Final[str] = "\x1b"
 _READ_SIZE_BYTES: Final[int] = 1024
 _POLL_INTERVAL_SECONDS: Final[float] = 0.05
-_ESCAPE_SEQUENCE_AMBIGUITY_SECONDS: Final[float] = 0.1
+ESCAPE_SEQUENCE_AMBIGUITY_SECONDS: Final[float] = 0.1
+"""等待 ESC-prefixed continuation 的终端输入歧义解析时长。"""
 _THREAD_JOIN_TIMEOUT_SECONDS: Final[float] = 0.2
 _POSIX_TERMINAL_CONTROL_AVAILABLE: Final[bool] = os.name == "posix"
 _TerminalAttribute = int | list[bytes | int]
@@ -270,7 +271,7 @@ class TtyRunningKeyMonitor:
                     return
                 feed_time = time.monotonic()
                 if _ESC in data or escape_deadline is not None:
-                    escape_deadline = feed_time + _ESCAPE_SEQUENCE_AMBIGUITY_SECONDS
+                    escape_deadline = feed_time + ESCAPE_SEQUENCE_AMBIGUITY_SECONDS
                 if decoded:
                     batch = _feed_parser_resolution(
                         parser=parser,

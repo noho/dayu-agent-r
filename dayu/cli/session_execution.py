@@ -1776,6 +1776,7 @@ async def _drive_interactive_tty_repl(
                                 thinking_renderer=thinking_renderer,
                                 runtime_display=runtime_display,
                             )
+                            composer.set_phase(InteractiveComposerPhase.SUBMITTING)
                             current_acceptance_task = asyncio.create_task(current.closeout.barrier.wait_run_id())
                         elif queued is None:
                             if pending_mutation is None or not pending_mutation.same_semantic_submission(
@@ -1866,12 +1867,13 @@ async def _drive_interactive_tty_repl(
                 composer.accept_submit(record_history=True)
 
             if sigint_task is not None and sigint_task in done:
-                new_sigint_count = await sigint_task
+                await sigint_task
                 sigint_task = None
-                pending_interrupts = new_sigint_count - observed_sigint_count
-                observed_sigint_count = new_sigint_count
-                for _interrupt_index in range(pending_interrupts):
-                    if current is None:
+            pending_interrupts = sigint_monitor.count - observed_sigint_count
+            if pending_interrupts > 0:
+                observed_sigint_count = sigint_monitor.count
+                if current is None:
+                    for _interrupt_index in range(pending_interrupts):
                         if composer.has_pending_submit_intent():
                             pending_submit_sigint_count += 1
                             continue
@@ -1879,17 +1881,18 @@ async def _drive_interactive_tty_repl(
                             normal_completion = True
                             return EXIT_KEYBOARD_INTERRUPT
                         exit_intent = _InteractiveExitIntent.IDLE_EXIT_PENDING
-                        continue
-                    active_sigint_count += 1
-                    exit_after = active_sigint_count >= 2
-                    await _request_interactive_cancel(
+                else:
+                    (
+                        active_sigint_count,
+                        observed_exit_after_closeout,
+                    ) = await _consume_interactive_active_sigints(
                         active=current,
-                        reason=CLI_SIGINT_REASON,
+                        interrupt_count=pending_interrupts,
+                        active_sigint_count=active_sigint_count,
                         composer=composer,
                         runtime_display=runtime_display,
-                        exit_after=exit_after,
                     )
-                    if exit_after:
+                    if observed_exit_after_closeout:
                         exit_after_closeout = True
                         if composer_task is not None:
                             await cancel_and_await_task(composer_task)
@@ -1915,6 +1918,9 @@ async def _drive_interactive_tty_repl(
                             or not _is_read_only_mutation_rejection(error)
                         ):
                             raise
+                        if composer_task is not None:
+                            await cancel_and_await_task(composer_task)
+                            composer_task = None
                         composer.reject_submit_delivery()
                         if current_acceptance_task is not None:
                             await cancel_and_await_task(current_acceptance_task)
@@ -1948,6 +1954,24 @@ async def _drive_interactive_tty_repl(
                     run_view=run_view,
                     runtime_display=runtime_display,
                 )
+                # closeout rendering/cleanup 可以让出 event loop；在清空 current
+                # 前必须再次消费 monitor durable count，把迟到的第二次 SIGINT
+                # 单调升级到同一个 closeout，而不是落入下一轮 idle 语义。
+                closeout_interrupts = sigint_monitor.count - observed_sigint_count
+                if closeout_interrupts > 0:
+                    observed_sigint_count = sigint_monitor.count
+                    (
+                        active_sigint_count,
+                        observed_exit_after_closeout,
+                    ) = await _consume_interactive_active_sigints(
+                        active=completed,
+                        interrupt_count=closeout_interrupts,
+                        active_sigint_count=active_sigint_count,
+                        composer=composer,
+                        runtime_display=runtime_display,
+                    )
+                    if observed_exit_after_closeout:
+                        exit_after_closeout = True
                 if terminal_exit_code != EXIT_SUCCESS:
                     deferred_exit_code = terminal_exit_code
                 if completed.closeout.intent is _LocalCancelIntent.EXIT_AFTER_CANCEL:
@@ -1975,7 +1999,7 @@ async def _drive_interactive_tty_repl(
                     return deferred_exit_code
                 return EXIT_KEYBOARD_INTERRUPT
 
-            mutation_waiting_acceptance = current_acceptance_task is not None or queued_acceptance_task is not None
+            mutation_waiting_acceptance = queued_acceptance_task is not None
             accepting_input = deferred_exit_code is None and not exit_after_closeout and not mutation_waiting_acceptance
             if composer_task is None and accepting_input:
                 composer_task = asyncio.create_task(
@@ -2265,6 +2289,46 @@ async def _request_interactive_cancel(
         active=active,
         runtime_display=runtime_display,
     )
+
+
+async def _consume_interactive_active_sigints(
+    *,
+    active: _InteractiveActiveTurn,
+    interrupt_count: int,
+    active_sigint_count: int,
+    composer: InteractiveComposer,
+    runtime_display: RuntimeDisplayController | None,
+) -> tuple[int, bool]:
+    """把 durable SIGINT 增量消费到同一个 active turn closeout。
+
+    :param active: 当前尚未由 driver 清空的 active turn。
+    :param interrupt_count: 本次尚未消费的正数 SIGINT 增量。
+    :param active_sigint_count: 当前 turn 已消费的 SIGINT 总数。
+    :param composer: invocation 唯一 composer。
+    :param runtime_display: 可选 display controller。
+    :returns: 更新后的 turn SIGINT 总数与是否已升级 exit-after-closeout。
+    :raises ValueError: ``interrupt_count`` 非正数或既有计数为负时抛出。
+    :raises Exception: cancel/display owner 失败时向上透传。
+    """
+
+    if interrupt_count <= 0:
+        raise ValueError("interactive SIGINT increment must be positive")
+    if active_sigint_count < 0:
+        raise ValueError("interactive active SIGINT count must be non-negative")
+    exit_after_closeout = False
+    for _interrupt_index in range(interrupt_count):
+        active_sigint_count += 1
+        exit_after = active_sigint_count >= 2
+        await _request_interactive_cancel(
+            active=active,
+            reason=CLI_SIGINT_REASON,
+            composer=composer,
+            runtime_display=runtime_display,
+            exit_after=exit_after,
+        )
+        if exit_after:
+            exit_after_closeout = True
+    return active_sigint_count, exit_after_closeout
 
 
 async def _render_interactive_cancel_requested_once(
