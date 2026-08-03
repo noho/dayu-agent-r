@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from collections.abc import Callable
 from typing import Literal
@@ -16,6 +17,7 @@ from dayu.engine.contracts.runner_identity import (
 from dayu.host.compaction import (
     COMPACT_INPUT_SCHEMA_V2,
     COMPACT_OUTPUT_SCHEMA_V2,
+    MAX_COMPACT_REPAIR_FEEDBACK_CHARS,
     CompactAcceptedTruthV2,
     CompactAnswerAnchorV2,
     CompactCandidateDiagnosticV2,
@@ -39,7 +41,11 @@ from dayu.host.context_events import (
     CompactorProposalManifestReference,
     build_context_compacted_payload,
 )
-from dayu.host.context_governance import accept_compact_candidate_v2
+from dayu.host.context_governance import (
+    accept_compact_candidate_v2,
+    build_compact_repair_feedback_v2,
+)
+from dayu.host.llm_compaction import _repair_feedback_prompt_json_vnext
 from dayu.host.memory import (
     MemoryProjectionPolicy,
     default_memory_projection_policy,
@@ -463,6 +469,113 @@ def test_session_summary_size_cap_accepts_equal_and_rejects_plus_one() -> None:
     assert CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
 
 
+def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> None:
+    """五个 section 同时越界时保留全部九条同源、可操作的 cap issues。
+
+    :returns: ``None``。
+    :raises AssertionError: owner 数值、计量说明、动作或 projector 完整性漂移时抛出。
+    """
+
+    item_cap = 1
+    char_cap = 1
+    candidate = _all_section_cap_candidate()
+    policy = replace(
+        default_memory_projection_policy(),
+        session_summary_char_cap=char_cap,
+        evidence_fact_item_cap=item_cap,
+        evidence_fact_char_cap=char_cap,
+        answer_anchor_item_cap=item_cap,
+        answer_anchor_char_cap=char_cap,
+        forward_intent_item_cap=item_cap,
+        forward_intent_char_cap=char_cap,
+        reference_continuity_item_cap=item_cap,
+        reference_continuity_char_cap=char_cap,
+    )
+
+    rejected = accept_compact_candidate_v2(_cap_input(), candidate, policy)
+
+    assert isinstance(rejected, CompactValidationReportV2)
+    assert len(rejected.issues) == 9
+    feedback = build_compact_repair_feedback_v2(
+        rejected,
+        previous_attempt_number=1,
+    )
+    assert len(feedback.issues) == 9
+    assert feedback.additional_issue_count == 0
+    evidence_texts = tuple(item.claim for item in candidate.evidence_facts)
+    answer_texts = tuple(f"{item.title}\n{item.detail}" for item in candidate.answer_anchors)
+    forward_texts = tuple(item.text for item in candidate.forward_intents)
+    reference_texts = tuple(item.text for item in candidate.reference_continuity)
+    assert candidate.session_summary is not None
+    summary_size = estimate_memory_size_units(candidate.session_summary.text).units
+    section_expectations: tuple[
+        tuple[_CapSection, tuple[str, ...], str],
+        ...,
+    ] = (
+        ("evidence_facts", evidence_texts, "各 claim 字符数之和"),
+        (
+            "answer_anchors",
+            answer_texts,
+            "每项 title、一个换行符和 detail 的字符数之和",
+        ),
+        ("forward_intents", forward_texts, "各 text 字符数之和"),
+        ("reference_continuity", reference_texts, "各 text 字符数之和"),
+    )
+    expected_messages: dict[
+        tuple[CompactValidationIssueCodeV2, str],
+        str,
+    ] = {
+        (
+            CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED,
+            '$["session_summary"]["text"]',
+        ): (
+            f"session_summary.text 当前为 {summary_size} 个字符，上限 {char_cap} 个字符；"
+            f"请缩减 session_summary.text 到不超过 {char_cap} 个字符。"
+        ),
+    }
+    for section, texts, measurement in section_expectations:
+        path = f'$["{section}"]'
+        total = sum(estimate_memory_size_units(text).units for text in texts)
+        expected_messages[
+            (CompactValidationIssueCodeV2.POLICY_ITEM_CAP_EXCEEDED, path)
+        ] = (
+            f"{section} 当前为 {len(texts)} 项，上限 {item_cap} 项；"
+            f"请删减或合并 {section}，只保留不超过 {item_cap} 项。"
+        )
+        expected_messages[
+            (CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED, path)
+        ] = (
+            f"{section} 的{measurement}当前为 {total} 个字符，上限 {char_cap} 个字符；"
+            f"请缩减 {section} 的文本总量到不超过 {char_cap} 个字符。"
+        )
+    actual_messages = {
+        (issue.code, issue.json_path): issue.message
+        for issue in feedback.issues
+    }
+    assert actual_messages == expected_messages
+
+    projected = _repair_feedback_prompt_json_vnext(feedback)
+    assert projected == {
+        "required_action": feedback.required_action,
+        "issues": [
+            {
+                "code": issue.code.value,
+                "json_path": issue.json_path,
+                "message": issue.message,
+                "source_labels": list(issue.source_labels),
+            }
+            for issue in feedback.issues
+        ],
+    }
+    projected_issues = projected["issues"]
+    assert isinstance(projected_issues, list)
+    assert len(projected_issues) == 9
+    assert (
+        len(json.dumps(projected, ensure_ascii=False, sort_keys=True))
+        <= MAX_COMPACT_REPAIR_FEEDBACK_CHARS
+    )
+
+
 def _cap_input() -> CompactInputV2:
     """构造覆盖四个 Memory section source-kind 的 input。
 
@@ -562,6 +675,66 @@ def _cap_candidate(
             )
             if section == "reference_continuity"
             else ()
+        ),
+        diagnostics=(),
+        explicitly_dropped_sources=(),
+    )
+
+
+def _all_section_cap_candidate() -> CompactCandidateV2:
+    """构造 summary 与四个可计量 section 同时超过最小 cap 的 candidate。
+
+    :returns: exact coverage 且只产生九条 policy cap issues 的 candidate。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return CompactCandidateV2(
+        schema=COMPACT_OUTPUT_SCHEMA_V2,
+        session_summary=CompactSessionSummaryV2(
+            text="summary-over-cap",
+            source_labels=("E1", "A1", "T1"),
+        ),
+        evidence_facts=(
+            CompactEvidenceFactV2(claim="evidence-one", support_labels=("E1",)),
+            CompactEvidenceFactV2(claim="evidence-two", support_labels=("E1",)),
+        ),
+        answer_anchors=(
+            CompactAnswerAnchorV2(
+                title="title-one",
+                detail="detail-one",
+                source_labels=("A1",),
+            ),
+            CompactAnswerAnchorV2(
+                title="title-two",
+                detail="detail-two",
+                source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            CompactForwardIntentV2(
+                intent_type="next_step",
+                text="forward-one",
+                status=CompactForwardIntentStatusV2.OPEN,
+                source_labels=("T1",),
+            ),
+            CompactForwardIntentV2(
+                intent_type="next_step",
+                text="forward-two",
+                status=CompactForwardIntentStatusV2.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity=(
+            CompactReferenceContinuityV2(
+                text="reference-one",
+                reason="继续保留第一个指代",
+                source_labels=("T1",),
+            ),
+            CompactReferenceContinuityV2(
+                text="reference-two",
+                reason="继续保留第二个指代",
+                source_labels=("T1",),
+            ),
         ),
         diagnostics=(),
         explicitly_dropped_sources=(),

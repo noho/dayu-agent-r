@@ -46,6 +46,10 @@ from dayu.runtime.diagnostic_text import (
 
 _REPAIR_REDACTION_MARKER = "<redacted>"
 _REPAIR_TRUNCATED_SUFFIX = "..."
+_EVIDENCE_FACTS_SIZE_MEASUREMENT = "各 claim 字符数之和"
+_ANSWER_ANCHORS_SIZE_MEASUREMENT = "每项 title、一个换行符和 detail 的字符数之和"
+_FORWARD_INTENTS_SIZE_MEASUREMENT = "各 text 字符数之和"
+_REFERENCE_CONTINUITY_SIZE_MEASUREMENT = "各 text 字符数之和"
 
 
 CompactAcceptanceResultV2 = CompactAcceptedTruthV2 | CompactValidationReportV2
@@ -115,7 +119,7 @@ def build_compact_repair_feedback_v2(
     *,
     previous_attempt_number: int,
 ) -> CompactRepairFeedbackV2:
-    """从 reject report 构造 bounded、脱敏的 whole-candidate feedback。
+    """从 reject report 构造 bounded、脱敏的 Host internal feedback。
 
     :param report: 前次 semantic validation report。
     :param previous_attempt_number: 前次 attempt number。
@@ -485,15 +489,18 @@ def _collect_policy_issues(
     :returns: ``None``。
     """
 
-    if (
-        candidate.session_summary is not None
-        and estimate_memory_size_units(candidate.session_summary.text).units > policy.session_summary_char_cap
-    ):
+    if candidate.session_summary is not None:
+        summary_size = estimate_memory_size_units(candidate.session_summary.text).units
+    else:
+        summary_size = None
+    if summary_size is not None and summary_size > policy.session_summary_char_cap:
         issues.append(
             _issue(
                 CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED,
                 '$["session_summary"]["text"]',
-                "session_summary 超过 Memory policy size cap。",
+                f"session_summary.text 当前为 {summary_size} 个字符，上限 "
+                f"{policy.session_summary_char_cap} 个字符；请缩减 session_summary.text 到不超过 "
+                f"{policy.session_summary_char_cap} 个字符。",
             )
         )
     _section_caps(
@@ -501,6 +508,7 @@ def _collect_policy_issues(
         tuple(item.claim for item in candidate.evidence_facts),
         policy.evidence_fact_item_cap,
         policy.evidence_fact_char_cap,
+        _EVIDENCE_FACTS_SIZE_MEASUREMENT,
         issues,
     )
     _section_caps(
@@ -508,6 +516,7 @@ def _collect_policy_issues(
         tuple(f"{item.title}\n{item.detail}" for item in candidate.answer_anchors),
         policy.answer_anchor_item_cap,
         policy.answer_anchor_char_cap,
+        _ANSWER_ANCHORS_SIZE_MEASUREMENT,
         issues,
     )
     _section_caps(
@@ -515,6 +524,7 @@ def _collect_policy_issues(
         tuple(item.text for item in candidate.forward_intents),
         policy.forward_intent_item_cap,
         policy.forward_intent_char_cap,
+        _FORWARD_INTENTS_SIZE_MEASUREMENT,
         issues,
     )
     _section_caps(
@@ -522,6 +532,7 @@ def _collect_policy_issues(
         tuple(item.text for item in candidate.reference_continuity),
         policy.reference_continuity_item_cap,
         policy.reference_continuity_char_cap,
+        _REFERENCE_CONTINUITY_SIZE_MEASUREMENT,
         issues,
     )
 
@@ -531,6 +542,7 @@ def _section_caps(
     texts: tuple[str, ...],
     item_cap: int,
     size_cap: int,
+    size_measurement: str,
     issues: list[CompactValidationIssueV2],
 ) -> None:
     """检查一个 Memory semantic section 的 count/size caps。
@@ -539,6 +551,7 @@ def _section_caps(
     :param texts: section item texts。
     :param item_cap: item count cap。
     :param size_cap: aggregate size cap。
+    :param size_measurement: section aggregate size 的业务可读计量说明。
     :param issues: issue accumulator。
     :returns: ``None``。
     """
@@ -548,7 +561,8 @@ def _section_caps(
             _issue(
                 CompactValidationIssueCodeV2.POLICY_ITEM_CAP_EXCEEDED,
                 f'$["{section}"]',
-                f"{section} 超过 Memory policy item cap。",
+                f"{section} 当前为 {len(texts)} 项，上限 {item_cap} 项；"
+                f"请删减或合并 {section}，只保留不超过 {item_cap} 项。",
             )
         )
     total = sum(estimate_memory_size_units(text).units for text in texts)
@@ -557,7 +571,8 @@ def _section_caps(
             _issue(
                 CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED,
                 f'$["{section}"]',
-                f"{section} 超过 Memory policy size cap。",
+                f"{section} 的{size_measurement}当前为 {total} 个字符，上限 {size_cap} 个字符；"
+                f"请缩减 {section} 的文本总量到不超过 {size_cap} 个字符。",
             )
         )
 
@@ -758,7 +773,7 @@ def _validation_issue_sort_key(
 
 
 def _bounded_issue_message(issue: CompactValidationIssueV2) -> CompactValidationIssueV2:
-    """脱敏并截断所有 LLM-facing issue 字段。
+    """脱敏并截断所有 internal repair transport issue 字段。
 
     :param issue: validation issue。
     :returns: path、message 与 labels 均脱敏且 bounded 的 issue。
@@ -796,7 +811,7 @@ def _bounded_feedback_text(value: str) -> str:
 
 
 def _feedback_char_count(feedback: CompactRepairFeedbackV2) -> int:
-    """计算 LLM-facing feedback JSON 字符数。
+    """计算 durable/internal feedback serialization 的 JSON 字符数。
 
     :param feedback: typed feedback。
     :returns: UTF-8 无关的 Python 字符数。

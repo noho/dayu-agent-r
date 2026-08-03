@@ -77,6 +77,8 @@ _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
 _UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
 _UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
+_REPAIR_FEEDBACK_BEGIN = "REPAIR_FEEDBACK_JSON_BEGIN"
+_REPAIR_FEEDBACK_END = "REPAIR_FEEDBACK_JSON_END"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
 _COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
 _COMPACTOR_PROJECTION_SCHEMA_VERSION = "compactor_input_projection.v1"
@@ -662,16 +664,43 @@ def _user_prompt_vnext(
     )
     if repair_feedback is None:
         return rendered
+    repair_feedback_json = _repair_feedback_prompt_json_vnext(repair_feedback)
     return (
         rendered
-        + "\n\nPREVIOUS_VALIDATION_REPORT_JSON\n"
+        + f"\n\n{_REPAIR_FEEDBACK_BEGIN}\n"
         + json.dumps(
-            repair_feedback.to_json(),
+            repair_feedback_json,
             ensure_ascii=False,
-            indent=2,
             sort_keys=True,
         )
+        + f"\n{_REPAIR_FEEDBACK_END}"
     )
+
+
+def _repair_feedback_prompt_json_vnext(
+    feedback: CompactRepairFeedbackV2,
+) -> dict[str, JsonValue]:
+    """把 typed internal feedback 投影为最小 LLM-facing repair JSON。
+
+    :param feedback: 已脱敏且有界的 typed repair feedback。
+    :returns: 只含完整重产动作与逐项问题的 JSON object。
+    :raises TypeError: ``feedback`` 类型非法时抛出。
+    """
+
+    if not isinstance(feedback, CompactRepairFeedbackV2):
+        raise TypeError("feedback must be CompactRepairFeedbackV2")
+    return {
+        "required_action": feedback.required_action,
+        "issues": [
+            {
+                "code": issue.code.value,
+                "json_path": issue.json_path,
+                "message": issue.message,
+                "source_labels": list(issue.source_labels),
+            }
+            for issue in feedback.issues
+        ],
+    }
 
 
 def _compaction_request_prompt_block_vnext(request: CompactInputV2) -> str:

@@ -69,8 +69,22 @@
 
 修复反馈：
 
-- 如果请求末尾含前一次完整 candidate 的脱敏校验反馈，它只用于说明前次输出的问题和直接修复动作，不是新的业务材料。
-- 必须按反馈从同一输入重新生成整个 JSON object；不得复制、拼接、补写或复用前一次输出的任何部分。
+- 首次请求没有修复反馈。只有前次输出被拒绝后，请求末尾才会出现一个修复反馈数据块；它由独占行 `REPAIR_FEEDBACK_JSON_BEGIN` 和 `REPAIR_FEEDBACK_JSON_END` 包围，两个 marker 之间必须是一个严格 JSON object。
+- 修复反馈 JSON 顶层必须且只含以下两个字段，二者都必填：
+  - `required_action`: 非空字符串。它给出本次必须执行的动作：基于同一输入重新生成完整输出，而不是修改前次输出。
+  - `issues`: 非空 array。每项是一个问题 object，必须且只含以下四个字段：
+    - `code`: 非空字符串，表示问题类别；必填。
+    - `json_path`: 非空字符串，表示问题所在的输出 JSON 路径；必填。
+    - `message`: 非空字符串，以业务可读方式说明实际问题、约束和直接修复动作；必填。
+    - `source_labels`: 字符串 array，可为空；必填。它只用于定位该问题涉及的输入引用标签，不是业务事实或推理依据。
+- 整个修复反馈数据块只说明前次输出的问题和动作，不是 `source_boundary` 的业务材料，不得把反馈文字写成财报事实、业务结论或后续任务。
+- 收到修复反馈后，必须执行 `required_action` 并逐项修复全部 `issues`，基于本次请求中的同一输入重新生成整个 JSON object。输出必须是完整 replacement candidate，不是 patch；不得复制、拼接、补写或复用前次被拒绝的输出或任何片段。
+
+修复反馈 JSON 最小示例（仅说明两个 marker 之间的 JSON schema；真实请求以实际数据块为准）：
+
+```json
+{"issues":[{"code":"uncovered_source","json_path":"$[\"explicitly_dropped_sources\"]","message":"引用标签 S2 尚未被业务语义代表或显式丢弃；请在完整新输出中保留或显式丢弃 S2。","source_labels":["S2"]}],"required_action":"基于本次请求中的同一输入，重新生成一个符合当前输出 schema 的完整 replacement candidate（一个完整 JSON object）；必须完整替换前次输出，不是 patch；不得复制、拼接、补写或复用前次输出的任何部分。"}
+```
 
 完整同源示例输入：
 

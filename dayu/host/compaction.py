@@ -1620,14 +1620,15 @@ MAX_COMPACT_REPAIR_FEEDBACK_CHARS = 8192
 """完整 repair feedback 的字符上限。"""
 
 COMPACT_REPAIR_REQUIRED_ACTION = (
-    "返回一个符合当前 schema 的完整 replacement candidate；它不是 patch，不得沿用、合并或补写先前 JSON 的任何部分。"
+    "基于本次请求中的同一输入，重新生成一个符合当前输出 schema 的完整 replacement candidate（一个完整 JSON "
+    "object）；必须完整替换前次输出，不是 patch；不得复制、拼接、补写或复用前次输出的任何部分。"
 )
 """repair 的固定 whole-candidate 动作要求。"""
 
 
 @dataclass(frozen=True, slots=True)
 class CompactRepairFeedbackV2:
-    """下一次 semantic repair 使用的脱敏、bounded feedback。
+    """Host internal semantic repair 使用的脱敏、bounded feedback。
 
     :param previous_attempt_number: 产生报告的前次 attempt number。
     :param issues: bounded issues。
@@ -1659,7 +1660,7 @@ class CompactRepairFeedbackV2:
             raise ValueError("CompactRepairFeedbackV2.required_action is invalid")
 
     def to_json(self) -> JsonValue:
-        """转换为 LLM-facing 脱敏 JSON。
+        """转换为 durable/internal serialization JSON。
 
         :returns: JSON object。
         """
