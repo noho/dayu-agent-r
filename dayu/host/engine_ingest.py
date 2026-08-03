@@ -107,9 +107,6 @@ from dayu.host.compact_pipeline import (
     build_reactive_pass_queue_plan,
     compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
-from dayu.host.compact_material import (
-    conversation_compact_input_vnext_from_material_pack,
-)
 from dayu.host.compaction import (
     CompactAcceptedTruthV2,
     CompactMaterialBlockKind,
@@ -2791,7 +2788,7 @@ class EngineEventIngestor:
         ).pass_requests
         compactor = self._context_compactor
         artifact_root = self._compact_artifact_root
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         if len(compact_input.source_boundary) == 0:
             operation_result = CompactionOperationResult(
                 accepted_truth=None,

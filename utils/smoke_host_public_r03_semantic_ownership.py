@@ -53,10 +53,15 @@ from dayu.host.accepted_result_projection import (
 from dayu.host.compact_material import (
     build_compact_material_pack,
     build_pre_dispatch_compact_material_view,
-    conversation_compact_input_vnext_from_material_pack,
     select_compact_segment,
 )
-from dayu.host.compaction import CompactSegmentTrigger, CompactSourceKindV2
+from dayu.host.compaction import (
+    CompactSegmentTrigger,
+    CompactSourceKindV2,
+    CompactionRequest,
+)
+from dayu.host.context_budget import BudgetEstimate
+from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
@@ -1274,7 +1279,32 @@ def _compact_source_notes(
         previous_compacted_view=view.previous_compacted_view,
         previous_compacted_readable_view=view.previous_compacted_readable_view,
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(pack)
+    compact_request = CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=None,
+        material_pack=pack,
+        segment_selection=selection,
+        evidence_backed_fact_refs=(),
+        recent_raw_turn_refs=(run.input_event_id,),
+        older_raw_turn_refs=(),
+        existing_episode_summary_refs=(),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=100,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest=sha256_digest_json(
+                {"owner": "r03-smoke-compact-input"}
+            ),
+            overage_reason=None,
+        ),
+    )
+    compact_input = compact_request.compact_input
     notes = tuple(
         source_line.removeprefix("来源：")
         for item in compact_input.source_boundary

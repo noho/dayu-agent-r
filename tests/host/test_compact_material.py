@@ -41,7 +41,7 @@ from dayu.host.compact_material import (
     build_compact_material_pack,
     build_pre_dispatch_compact_material_view,
     check_compact_memory_snapshot_cursor,
-    conversation_compact_input_vnext_from_material_pack,
+    initial_segment_selection,
     normalized_material_text,
     prompt_local_evidence_map,
     retained_previous_compacted_view_labels_for_recovery,
@@ -59,6 +59,8 @@ from dayu.host.compaction import (
     PreviousCompactReadableView,
     CompactMaterialSection,
     CompactSegmentTrigger,
+    CompactionRequest,
+    ContextCompactionTriggerSource,
     CompactInputV2,
     CompactCandidateV2,
     CompactEvidenceFactV2,
@@ -75,6 +77,7 @@ from dayu.host.compaction import (
     CompactSourceBoundaryEntryV2,
 )
 from dayu.host.context_events import build_context_compacted_payload
+from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import accept_compact_candidate_v2
 from dayu.host.durable.codec import (
     canonical_json_dumps,
@@ -151,6 +154,49 @@ _SESSION_ID = "session-compact-material"
 _POLICY_DIGEST = "policy-digest-compact-material"
 _NOW = "2026-05-24T00:00:00.000000Z"
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _compaction_request_for_material_pack(
+    material_pack: CompactMaterialPack,
+) -> CompactionRequest:
+    """把 material pack 绑定为使用 production input owner 的测试请求。
+
+    :param material_pack: 待验证 strict v2 input 投影的 material pack。
+    :returns: 以 ``CompactionRequest.compact_input`` 为唯一 projector 的请求。
+    :raises ValueError: material pack 缺少 current source ref 时抛出。
+    """
+
+    current_refs = material_pack.current_input_anchor.canonical_source_refs
+    if len(current_refs) == 0:
+        raise ValueError("material pack current input source ref is required")
+    current_ref = current_refs[0]
+    return CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id=_SESSION_ID,
+        run_id="run-compact-material",
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=None,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=1,
+            material_pack=material_pack,
+        ),
+        evidence_backed_fact_refs=(),
+        recent_raw_turn_refs=(current_ref,),
+        older_raw_turn_refs=(),
+        existing_episode_summary_refs=(),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=100,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest=_DIGEST,
+            overage_reason=None,
+        ),
+    )
 
 
 def _successful_response_identity(
@@ -918,7 +964,7 @@ def test_conversation_compact_input_vnext_maps_material_without_citable_current_
         ),
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
     vnext_json = vnext_input.to_json()
 
     _assert_material_pack_shape(
@@ -982,7 +1028,7 @@ def test_conversation_compact_input_vnext_maps_user_turn_to_trace() -> None:
         evidence_materials=(),
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     trace_entries = _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)
     assert tuple(item.readable_text for item in trace_entries) == ("old user input",)
@@ -1010,7 +1056,7 @@ def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> Non
         evidence_materials=(),
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     answer_entries = _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)
     assert tuple(item.readable_text for item in answer_entries) == ("old assistant answer",)
@@ -1051,7 +1097,7 @@ def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer
         current_input_text="current input",
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     answer_entries = _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)
     assert tuple(item.readable_text for item in answer_entries) == ("assistant final answer",)
@@ -1081,7 +1127,7 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
         ),
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
     assert tuple(item.source_label for item in evidence_entries) == ("E1",)
@@ -1171,7 +1217,7 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
         previous_compacted_readable_view=readable_view,
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     assert tuple(
         item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY)
@@ -1264,7 +1310,7 @@ def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items()
         previous_compacted_readable_view=readable_view,
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     assert tuple(
         item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_FORWARD_INTENT)
@@ -1296,7 +1342,7 @@ def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> 
         evidence_materials=(),
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     trace_entries = _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)
     assert tuple(item.readable_text for item in trace_entries) == ("run is waiting for user confirmation",)
@@ -1318,7 +1364,7 @@ def test_conversation_compact_input_vnext_current_anchor_not_citable() -> None:
         evidence_materials=(),
     )
 
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     assert vnext_input.current_input.readable_text == "current input"
     assert "C1" not in vnext_input.source_labels
@@ -1511,7 +1557,7 @@ def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     assert evidence_map["E1"].source_locator_refs == ()
     assert evidence_map["E1"].chunk_parent_label is None
     assert evidence_map["E1"].chunk_ordinal is None
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
     evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
     assert tuple(item.source_label for item in evidence_entries) == ("E1",)
     assert large_text in evidence_entries[0].readable_text
@@ -1541,7 +1587,7 @@ def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
     expected = " ".join(long_current_input.split())
     assert pack.current_input_anchor.anchor_text == expected
     assert pack.current_input_anchor.truncated is False
-    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_input = _compaction_request_for_material_pack(pack).compact_input
     assert vnext_input.current_input.readable_text == expected
 
 
@@ -3001,7 +3047,7 @@ def test_build_compact_material_pack_uses_explicit_previous_view_without_snapsho
         ),
     )
     _assert_vnext_input_shape(
-        conversation_compact_input_vnext_from_material_pack(pack),
+        _compaction_request_for_material_pack(pack).compact_input,
         expected=_VNextInputShape(
             top_level_keys=_VNEXT_TOP_LEVEL_KEYS,
             previous_count=1,

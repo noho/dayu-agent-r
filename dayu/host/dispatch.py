@@ -167,7 +167,6 @@ from dayu.host.compact_payload import (
 from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     build_pre_dispatch_compact_material_view,
-    conversation_compact_input_vnext_from_material_pack,
 )
 from dayu.host.compact_pipeline import (
     CompactPipelineRequestPlan,
@@ -3008,7 +3007,7 @@ class HostDispatchScheduler:
             selected_recent_window_turn_floor=(memory_policy.selected_recent_window_turn_floor),
         )
         request = request_plan.request
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         if existing_state is None and len(compact_input.source_boundary) == 0:
             fallback_sizing = _build_candidate_sizing_result(
                 transaction,

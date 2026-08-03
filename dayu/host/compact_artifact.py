@@ -22,9 +22,6 @@ from dayu.host.compaction import (
     CompactAcceptedTruthV2,
     CompactionRequest,
 )
-from dayu.host.compact_material import (
-    conversation_compact_input_vnext_from_material_pack,
-)
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
 from dayu.host.durable.payload import PayloadDescriptor, PayloadStore
@@ -63,7 +60,7 @@ class CompactArtifactWriteRequest:
         if not isinstance(self.accepted_truth, CompactAcceptedTruthV2):
             raise TypeError("CompactArtifactWriteRequest.accepted_truth must be CompactAcceptedTruthV2")
         self.accepted_truth.validate_input_binding(
-            conversation_compact_input_vnext_from_material_pack(self.compaction_request.material_pack)
+            self.compaction_request.compact_input
         )
         if not is_sha256_digest(self.policy_digest):
             raise ValueError("CompactArtifactWriteRequest.policy_digest is invalid")

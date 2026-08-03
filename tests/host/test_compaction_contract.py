@@ -8,6 +8,11 @@ from typing import Literal
 
 import pytest
 
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.compaction import (
     COMPACT_INPUT_SCHEMA_V2,
     COMPACT_OUTPUT_SCHEMA_V2,
@@ -28,6 +33,11 @@ from dayu.host.compaction import (
     CompactSourceKindV2,
     CompactValidationIssueCodeV2,
     CompactValidationReportV2,
+)
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
+from dayu.host.context_events import (
+    CompactorProposalManifestReference,
+    build_context_compacted_payload,
 )
 from dayu.host.context_governance import accept_compact_candidate_v2
 from dayu.host.memory import (
@@ -102,6 +112,105 @@ def test_accept_owner_derives_exact_coverage_and_canonical_label_order() -> None
         "event:user-1",
     )
     assert result.current_input_ref == "event:current"
+
+
+def test_accept_owner_canonicalizes_reverse_drops_for_committed_round_trip() -> None:
+    """逆序 multi-drop 经 accept 与 committed parse 后仍按 root boundary 同源。
+
+    :returns: ``None``。
+    :raises AssertionError: accepted truth 或 durable payload drop 顺序漂移时抛出。
+    """
+
+    operation_id = "operation-drop-order"
+    engine_run_id = "compactor-run-drop-order"
+    candidate = replace(
+        _candidate(
+            summary_labels=("S1",),
+            fact_labels=("E1",),
+        ),
+        evidence_facts=(),
+        explicitly_dropped_sources=(
+            CompactExplicitDropV2(
+                source_label="T1",
+                reason=CompactDropReasonV2.OUT_OF_SCOPE,
+            ),
+            CompactExplicitDropV2(
+                source_label="E1",
+                reason=CompactDropReasonV2.OUT_OF_SCOPE,
+            ),
+        ),
+    )
+
+    accepted = accept_compact_candidate_v2(
+        _input(),
+        candidate,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(accepted, CompactAcceptedTruthV2)
+    expected_drop_labels = ("E1", "T1")
+    assert tuple(
+        drop.source_label
+        for drop in accepted.candidate.explicitly_dropped_sources
+    ) == expected_drop_labels
+    assert (
+        accepted.explicitly_dropped_coverage.source_labels
+        == expected_drop_labels
+    )
+    payload = build_context_compacted_payload(
+        operation_id=operation_id,
+        accepted_attempt_number=1,
+        compact_artifact_ref="compact-artifact:drop-order",
+        compact_artifact_digest=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        accepted_truth=accepted,
+        budget_after_compact=64,
+        prompt_local_label_mapping_refs=("prompt-label:S1",),
+        accepted_evidence_mapping_refs=(),
+        projection_signal="conversation_memory_projection_catchup",
+        successful_response_identity=SuccessfulRunnerResponseIdentity(
+            effective_provider="test-compactor",
+            effective_model="test-compactor-model",
+            runner_request_identity=build_runner_request_identity(
+                run_id=engine_run_id,
+                attempt_id=None,
+                execution_id=None,
+                iteration_id="drop-order-iteration",
+                iteration_index=0,
+                runner_call_index=1,
+            ),
+            provider_request_id_availability=(
+                ProviderRequestIdAvailability.UNAVAILABLE
+            ),
+            provider_request_id=None,
+        ),
+        accepted_proposal_manifest_reference=(
+            CompactorProposalManifestReference(
+                manifest_event_id="manifest-event-drop-order",
+                manifest_payload_ref="manifest-payload-drop-order",
+                manifest_digest=(
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                compactor_input_projection_ref="projection-drop-order",
+                compactor_input_projection_digest=(
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                ),
+                compaction_operation_id=operation_id,
+                compaction_attempt_number=1,
+                compactor_engine_run_id=engine_run_id,
+            )
+        ),
+    )
+    parsed = parse_context_compacted_semantic_payload(payload)
+    assert tuple(
+        drop.source_label
+        for drop in parsed.accepted_candidate.explicitly_dropped_sources
+    ) == expected_drop_labels
+    assert (
+        parsed.explicitly_dropped_coverage.source_labels
+        == expected_drop_labels
+    )
 
 
 @pytest.mark.parametrize(

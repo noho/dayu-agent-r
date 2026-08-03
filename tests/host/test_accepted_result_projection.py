@@ -25,17 +25,21 @@ from dayu.host.accepted_result_projection import (
     project_planned_accepted_tool_result,
 )
 from dayu.host.compact_material import (
+    CompactMaterialPack,
     PreDispatchCompactMaterialView,
     build_compact_material_pack,
     build_pre_dispatch_compact_material_view,
-    conversation_compact_input_vnext_from_material_pack,
+    initial_segment_selection,
     select_compact_segment,
 )
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
     CompactSourceKindV2,
+    CompactionRequest,
 )
+from dayu.host.context_budget import BudgetEstimate
+from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
@@ -122,6 +126,49 @@ _OPAQUE_SENTINEL_REFS = (
         digest=None,
     ),
 )
+
+
+def _compaction_request_for_material_pack(
+    material_pack: CompactMaterialPack,
+) -> CompactionRequest:
+    """把跨消费者 material pack 绑定到唯一 production input owner。
+
+    :param material_pack: 已由 production builder 构造的 material pack。
+    :returns: 可通过 ``CompactionRequest.compact_input`` 读取输入的请求。
+    :raises ValueError: material pack 缺少 current source ref 时抛出。
+    """
+
+    current_refs = material_pack.current_input_anchor.canonical_source_refs
+    if len(current_refs) == 0:
+        raise ValueError("material pack current input source ref is required")
+    current_ref = current_refs[0]
+    return CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id=_SESSION_ID,
+        run_id=_RUN_ID,
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=None,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=1,
+            material_pack=material_pack,
+        ),
+        evidence_backed_fact_refs=(),
+        recent_raw_turn_refs=(current_ref,),
+        older_raw_turn_refs=(),
+        existing_episode_summary_refs=(),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=100,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest=_DIGEST,
+            overage_reason=None,
+        ),
+    )
 
 
 def test_planned_and_committed_projection_share_one_owner_contract(
@@ -1321,7 +1368,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
         current_input_ref=current_row.event_id,
         current_input_text="current question",
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(compact_pack)
+    compact_input = _compaction_request_for_material_pack(compact_pack).compact_input
     evidence_sources = tuple(
         source
         for source in compact_input.source_boundary

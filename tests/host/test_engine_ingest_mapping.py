@@ -146,9 +146,6 @@ from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
 )
-from dayu.host.compact_material import (
-    conversation_compact_input_vnext_from_material_pack,
-)
 from dayu.host.compaction import (
     COMPACT_OUTPUT_SCHEMA_V2,
     CompactRepairFeedbackV2,
@@ -743,7 +740,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
 
         del cancellation_token
         self._prepared_request = request
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         agent_request = _proposal_agent_request(
             request,
             compaction_operation_id=compaction_operation_id,

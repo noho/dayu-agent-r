@@ -22,7 +22,6 @@ from dayu.host.compact_material import (
     run_input_material_block,
     selected_material_source_refs,
     selected_material_view_digest,
-    conversation_compact_input_vnext_from_material_pack,
 )
 from dayu.host.compact_pipeline import (
     CompactPipelineSourceSnapshot,
@@ -127,7 +126,7 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
         )
         if repair_feedback is not None:
             return proposal
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         reference_entry = next(
             (
                 entry
@@ -340,9 +339,9 @@ def test_reactive_pass_queue_builds_single_block_passes() -> None:
         == root.selected_segment.selected_block_ids
     )
     assert all(request.current_input_ref == snapshot.current_input_ref for request in queue.pass_requests)
-    root_input = conversation_compact_input_vnext_from_material_pack(root.request.material_pack)
+    root_input = root.request.compact_input
     pass_inputs = tuple(
-        conversation_compact_input_vnext_from_material_pack(request.material_pack) for request in queue.pass_requests
+        request.compact_input for request in queue.pass_requests
     )
     flattened_boundary = tuple(entry for compact_input in pass_inputs for entry in compact_input.source_boundary)
     assert {entry.source_label: entry for entry in flattened_boundary} == {
@@ -384,7 +383,7 @@ async def test_reactive_multi_pass_forms_one_root_accepted_truth() -> None:
     assert result.failure_reason is None
     assert result.accepted_truth is not None
     result.accepted_truth.validate_input_binding(
-        conversation_compact_input_vnext_from_material_pack(root.request.material_pack)
+        root.request.compact_input
     )
     assert result.accepted_attempt_number == len(queue.pass_requests)
 
@@ -513,7 +512,7 @@ def test_compacted_payload_input_derives_semantic_refs() -> None:
         budget_before_compact=_budget(),
         selected_recent_window_turn_floor=0,
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(plan.request.material_pack)
+    compact_input = plan.request.compact_input
     candidate = replace(
         _candidate_with_evidence_fact(),
         explicitly_dropped_sources=tuple(

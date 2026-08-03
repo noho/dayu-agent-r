@@ -39,7 +39,6 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
-from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
     CompactAnswerAnchorV2,
     CompactCandidateDiagnosticV2,
@@ -307,7 +306,7 @@ class LLMContextCompactor(ContextCompactor):
             raise TypeError("request must be CompactionRequest")
         if compaction_attempt_number <= 0:
             raise ValueError("compaction_attempt_number must be positive")
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         compactor_engine_run_id = _compactor_engine_run_id(
             request=request,
             compaction_operation_id=compaction_operation_id,

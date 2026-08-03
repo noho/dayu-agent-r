@@ -666,7 +666,12 @@ def _canonical_candidate(candidate: CompactCandidateV2, boundary_order: dict[str
             )
             for item in candidate.diagnostics
         ),
-        explicitly_dropped_sources=candidate.explicitly_dropped_sources,
+        explicitly_dropped_sources=tuple(
+            sorted(
+                candidate.explicitly_dropped_sources,
+                key=lambda drop: boundary_order[drop.source_label],
+            )
+        ),
     )
 
 

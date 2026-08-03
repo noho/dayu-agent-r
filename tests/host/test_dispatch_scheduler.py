@@ -104,7 +104,6 @@ from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
     PreDispatchCompactMaterialView,
     build_pre_dispatch_compact_material_view,
-    conversation_compact_input_vnext_from_material_pack,
     run_input_material_block,
 )
 from dayu.host.compact_pipeline import (
@@ -731,7 +730,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
 
         self.prepared_requests.append(request)
         self._prepared_request = request
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         agent_request = _proposal_compactor_agent_request(
             request,
             cancellation_token=cancellation_token,

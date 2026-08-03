@@ -32,7 +32,6 @@ from dayu.host._runner_call_manifest import (
     runner_call_projector_metadata_descriptor,
     runner_call_sizing_snapshot_json,
 )
-from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compact_payload import accepted_compact_business_texts
 from dayu.host.compaction import (
     CompactAcceptedTruthV2,
@@ -108,7 +107,7 @@ _EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX = "event-compaction-rejected-dia
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 _DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = "material_pack_to_compact_input"
 _DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION = "proposal_execution"
-_DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = "conversation_compact_input_vnext_from_material_pack"
+_DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = "CompactionRequest.compact_input"
 _DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION = "compactor_proposal_execution"
 
 
@@ -1063,7 +1062,7 @@ async def _run_compaction_operation(
         pass_index += 1
         if pass_index < len(requests):
             continue
-        root_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        root_input = request.compact_input
         root_candidate = _aggregate_pass_candidates(
             root_input=root_input,
             pass_truths=_required_pass_truths(accepted_pass_truths),
@@ -1401,7 +1400,7 @@ def _operation_pass_requests(
 
     if len(pass_queue) == 0:
         return (request,)
-    root_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    root_input = request.compact_input
     pass_boundary_entries: list[CompactSourceBoundaryEntryV2] = []
     for pass_request in pass_queue:
         if not isinstance(pass_request, CompactionRequest):
@@ -1414,7 +1413,7 @@ def _operation_pass_requests(
             or pass_request.execution_id != request.execution_id
         ):
             raise ValueError("pass_queue request identity must match root request")
-        pass_input = conversation_compact_input_vnext_from_material_pack(pass_request.material_pack)
+        pass_input = pass_request.compact_input
         if pass_input.current_input != root_input.current_input:
             raise ValueError("pass_queue current input must match root request")
         pass_boundary_entries.extend(pass_input.source_boundary)
@@ -1522,7 +1521,7 @@ async def _prepare_compactor_proposal(
             proposal_manifest_reference=manifest_reference,
             successful_response_identity=(proposal.successful_response_identity),
         )
-    compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    compact_input = request.compact_input
     _ensure_compactor_proposal_active(
         cancellation_token,
         proposal_manifest_reference=None,

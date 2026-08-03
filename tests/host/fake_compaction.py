@@ -29,7 +29,6 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
-from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
     CompactAnswerAnchorV2,
     COMPACT_OUTPUT_SCHEMA_V2,
@@ -293,7 +292,7 @@ class FakeContextCompactor(ContextCompactor):
         if compaction_attempt_number <= 0:
             raise ValueError("compaction_attempt_number must be positive")
         operation_identity = "unbound" if compaction_operation_id is None else compaction_operation_id
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         agent_request = _fake_compactor_agent_request(
             request=request,
             cancellation_token=cancellation_token,
@@ -374,7 +373,7 @@ class FakeContextCompactor(ContextCompactor):
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
         del repair_feedback
-        compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+        compact_input = request.compact_input
         candidate = await FakeConversationCompactorVNext().compact(
             compact_input,
             cancellation_token,

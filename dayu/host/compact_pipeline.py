@@ -26,7 +26,6 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     build_compact_material_pack,
-    conversation_compact_input_vnext_from_material_pack,
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
     retained_previous_compacted_view_labels_for_recovery,
@@ -617,7 +616,7 @@ def build_reactive_pass_queue_plan(
         requests.append(
             _bind_reactive_pass_to_root_labels(
                 request=pass_request,
-                root_input=conversation_compact_input_vnext_from_material_pack(root_request_plan.request.material_pack),
+                root_input=root_request_plan.request.compact_input,
             )
         )
     return CompactPipelinePassQueuePlan(
@@ -639,7 +638,7 @@ def _bind_reactive_pass_to_root_labels(
     :raises ValueError: pass source 无法唯一绑定到 root 时抛出。
     """
 
-    pass_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    pass_input = request.compact_input
     root_by_identity = {
         (entry.source_kind, entry.source_refs, entry.readable_text): entry for entry in root_input.source_boundary
     }
@@ -689,7 +688,7 @@ def _bind_reactive_pass_to_root_labels(
         },
     )
     rebound_request = replace(request, material_pack=rebound_pack)
-    rebound_input = conversation_compact_input_vnext_from_material_pack(rebound_request.material_pack)
+    rebound_input = rebound_request.compact_input
     expected_entries = tuple(
         root_by_identity[(entry.source_kind, entry.source_refs, entry.readable_text)]
         for entry in pass_input.source_boundary
@@ -722,7 +721,7 @@ def build_compacted_payload_input(
     :returns: accepted payload input。
     """
 
-    accepted_truth.validate_input_binding(conversation_compact_input_vnext_from_material_pack(request.material_pack))
+    accepted_truth.validate_input_binding(request.compact_input)
     return CompactPipelineAcceptedPayloadInput(
         request=request,
         accepted_truth=accepted_truth,

@@ -21,11 +21,6 @@ from dayu.host.compaction import (
     CompactMaterialPack,
     CompactMaterialSection,
     PreviousCompactReadableView,
-    CompactInputV2,
-    COMPACT_INPUT_SCHEMA_V2,
-    CompactCurrentInputV2,
-    CompactSourceBoundaryEntryV2,
-    CompactSourceKindV2,
     EvidenceReadableItemVNext,
     CompactSegmentSelection,
     CompactSegmentTrigger,
@@ -549,106 +544,6 @@ def selected_material_view_digest(
             ]
         }
     )
-
-
-def conversation_compact_input_vnext_from_material_pack(
-    material_pack: CompactMaterialPack,
-) -> CompactInputV2:
-    """从 compact material pack 构造 vNext LLM-readable input。
-
-    :param material_pack: production vNext material pack。
-    :returns: vNext compactor input。
-    :raises TypeError: material pack 类型非法时抛出。
-    """
-
-    if not isinstance(material_pack, CompactMaterialPack):
-        raise TypeError("material_pack must be CompactMaterialPack")
-    current_refs = material_pack.current_input_anchor.canonical_source_refs
-    if len(current_refs) == 0:
-        raise ValueError("current input anchor must include canonical source ref")
-    return CompactInputV2(
-        schema=COMPACT_INPUT_SCHEMA_V2,
-        current_input=CompactCurrentInputV2(
-            source_ref=current_refs[0],
-            readable_text=material_pack.current_input_anchor.anchor_text,
-        ),
-        source_boundary=_source_boundary_v2(material_pack),
-    )
-
-
-def _source_boundary_v2(
-    material_pack: CompactMaterialPack,
-) -> tuple[CompactSourceBoundaryEntryV2, ...]:
-    """从冻结 material pack 逐项构造 strict v2 source boundary。
-
-    :param material_pack: 已校验且冻结的 material pack。
-    :returns: 不含 current input 的 source boundary。
-    """
-
-    entries: list[CompactSourceBoundaryEntryV2] = []
-    for block in material_pack.previous_compacted_view:
-        entries.append(
-            CompactSourceBoundaryEntryV2(
-                source_label=block.block_label,
-                source_kind=_previous_source_kind_v2(block.kind),
-                source_refs=block.canonical_source_refs,
-                readable_text=block.text,
-            )
-        )
-    for block in material_pack.trace_material:
-        entries.append(
-            CompactSourceBoundaryEntryV2(
-                source_label=block.block_label,
-                source_kind=CompactSourceKindV2.TRACE_MATERIAL,
-                source_refs=block.canonical_source_refs,
-                readable_text=block.text,
-            )
-        )
-    for block in material_pack.evidence_material:
-        entries.append(
-            CompactSourceBoundaryEntryV2(
-                source_label=block.evidence_label,
-                source_kind=CompactSourceKindV2.EVIDENCE_MATERIAL,
-                source_refs=block.canonical_source_refs,
-                readable_text=(
-                    f"工具：{block.readable_tool_name}\n"
-                    f"查询：{block.readable_query_text}\n"
-                    f"结果：{block.raw_result_text}\n"
-                    f"来源：{block.readable_source_text}"
-                ),
-            )
-        )
-    for block in material_pack.answer_material:
-        entries.append(
-            CompactSourceBoundaryEntryV2(
-                source_label=block.block_label,
-                source_kind=CompactSourceKindV2.ANSWER_MATERIAL,
-                source_refs=block.canonical_source_refs,
-                readable_text=block.text,
-            )
-        )
-    return tuple(entries)
-
-
-def _previous_source_kind_v2(kind: CompactMaterialBlockKind) -> CompactSourceKindV2:
-    """映射 previous semantic block kind。
-
-    :param kind: previous material block kind。
-    :returns: 精确 previous-* source kind。
-    :raises ValueError: kind 不属于 previous semantic sections 时抛出。
-    """
-
-    mapping = {
-        CompactMaterialBlockKind.SESSION_SUMMARY: CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY,
-        CompactMaterialBlockKind.EVIDENCE_BACKED_FACT: CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT,
-        CompactMaterialBlockKind.ANSWER_ANCHOR: CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR,
-        CompactMaterialBlockKind.FORWARD_INTENT: CompactSourceKindV2.PREVIOUS_FORWARD_INTENT,
-        CompactMaterialBlockKind.REFERENCE_CONTINUITY: CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY,
-    }
-    try:
-        return mapping[kind]
-    except KeyError as exc:
-        raise ValueError("previous compact material block kind is invalid") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -3256,7 +3151,6 @@ __all__ = [
     "build_compact_material_pack",
     "build_pre_dispatch_compact_material_view",
     "check_compact_memory_snapshot_cursor",
-    "conversation_compact_input_vnext_from_material_pack",
     "current_input_anchor_label",
     "initial_segment_selection",
     "material_label",

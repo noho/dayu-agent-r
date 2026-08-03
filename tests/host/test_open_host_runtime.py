@@ -49,6 +49,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostSessionAttachment,
+    HostSessionAccessMode,
     HostSessionEvent,
     HostSessionEventIterator,
     HostTerminalStatus,
@@ -152,6 +153,68 @@ from tests.host.execution_handle_support import create_execution_command_handle
 T = TypeVar("T")
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
 _PROMOTION_BARRIER_EXPIRED_AT = datetime(2026, 5, 18, 3, 0, 0, tzinfo=UTC)
+
+
+class _CloseRecordingAttachment:
+    """记录底层 attachment close 调用的协议实现。"""
+
+    def __init__(self, session_id: str) -> None:
+        """初始化 close 观测。
+
+        :param session_id: 测试 attachment 对应的 Session id。
+        :returns: ``None``。
+        :raises ValueError: session id 为空时抛出。
+        """
+
+        if session_id.strip() == "":
+            raise ValueError("session_id must be non-empty")
+        self._session_id = session_id
+        self.close_calls = 0
+
+    @property
+    def session_id(self) -> str:
+        """返回测试 Session id。
+
+        :returns: Session id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._session_id
+
+    @property
+    def access_mode(self) -> HostSessionAccessMode:
+        """返回固定读写模式。
+
+        :returns: ``READ_WRITE``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return HostSessionAccessMode.READ_WRITE
+
+    async def aclose(self) -> None:
+        """记录一次底层 close。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_calls += 1
+
+
+async def _raise_delayed_recovery_join_failure(
+    host: _PublicHostHandle,
+    session_id: str,
+) -> None:
+    """为 cleanup 回归注入 delayed recovery join 失败。
+
+    :param host: 被 monkeypatch 的 public Host handle。
+    :param session_id: 当前 attachment Session id。
+    :returns: 永不正常返回。
+    :raises RuntimeError: 固定抛出 join 失败。
+    """
+
+    del host, session_id
+    raise RuntimeError("forced delayed recovery join failure")
 
 
 def _successful_response_identity(
@@ -2407,6 +2470,39 @@ async def test_attachment_recovery_failure_does_not_fail_open_host(
             await host.attach_session(session.session_id)
 
     assert catch_up_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_attachment_close_releases_resource_when_recovery_join_fails(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delayed recovery join 失败仍关闭底层资源并传播原始失败。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 底层 close 未调用或 join 失败被吞掉时抛出。
+    """
+
+    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
+    public_host = cast(_PublicHostHandle, await manager.__aenter__())
+    attachment = _CloseRecordingAttachment("session-close-after-join-failure")
+    monkeypatch.setattr(
+        _PublicHostHandle,
+        "_cancel_and_join_delayed_attachment_recovery",
+        _raise_delayed_recovery_join_failure,
+    )
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="forced delayed recovery join failure",
+        ):
+            await public_host._close_managed_attachment(attachment)
+        assert attachment.close_calls == 1
+    finally:
+        await manager.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio

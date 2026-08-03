@@ -1372,11 +1372,15 @@ class _PublicHostHandle:
 
         :param attachment: 当前 managed RW attachment 的底层资源。
         :returns: ``None``。
-        :raises Exception: 底层 attachment close 失败时透传。
+        :raises Exception: delayed recovery join 或底层 attachment close 失败时透传。
         """
 
-        await self._cancel_and_join_delayed_attachment_recovery(attachment.session_id)
-        await attachment.aclose()
+        try:
+            await self._cancel_and_join_delayed_attachment_recovery(
+                attachment.session_id
+            )
+        finally:
+            await attachment.aclose()
 
     async def _cancel_and_join_delayed_attachment_recovery(
         self,

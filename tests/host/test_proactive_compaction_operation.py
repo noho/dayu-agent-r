@@ -31,7 +31,6 @@ from dayu.engine.contracts.runner_spec import (
 from dayu.host.compact_material import (
     InitialHistoryMaterial,
     build_initial_material_pack,
-    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.host.compaction import (
@@ -187,7 +186,7 @@ def _prepare_proposal_evidence(
         operation_id=operation_id,
         attempt_number=attempt_number,
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    compact_input = request.compact_input
     projection: Mapping[str, JsonValue] = {
         "projection_kind": "proactive_owner_fixture",
         "compaction_request_digest": request.digest(),

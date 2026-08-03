@@ -32,7 +32,6 @@ from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     build_initial_material_pack,
-    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.host.compaction import (
@@ -507,7 +506,7 @@ def _valid_final_answer(
     :returns: Engine final answer。
     """
 
-    compact_input = conversation_compact_input_vnext_from_material_pack(request.material_pack)
+    compact_input = request.compact_input
     material_json = cast(Mapping[str, JsonValue], compact_input.to_json())
     return EngineRunOutcomeFinalAnswer(
         session_id=agent_request.session_id,
