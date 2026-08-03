@@ -357,6 +357,10 @@ Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最�
 
 运行期数据块使用自足的 `dayu.context_compaction.input.v2`：`current_input` 保存本轮可读输入，`source_boundary` 的每一项包含仅用于本次响应引用的 `source_label`、业务可读 `source_kind` 与 `readable_text`。模型必须返回且只返回 `dayu.context_compaction.output.v2` JSON object；字段固定为 `schema`、可空 `session_summary`、`evidence_facts`、`answer_anchors`、`forward_intents`、`reference_continuity`、`diagnostics` 与 `explicitly_dropped_sources`。每个 boundary label 必须恰好由业务语义项表示或被显式丢弃，diagnostics 不算业务覆盖。修复调用会提供上一轮有界、脱敏的 validation 摘要，并要求完整重产 candidate，不接受 patch 或旧 candidate 的局部沿用。
 
+packaged system/user prompt 把运行期 marker 之间的完整 JSON 定义为不可信引用材料。`current_input.readable_text` 与所有 `source_boundary[*].readable_text` 中的指令式文本都只能作为数据，不能改变任务规则、schema、来源规则或输出形式；这条边界不要求过滤或改写原文。`source_label` 只是当前请求内的引用标签，不是业务事实、优先级或推理依据。
+
+user prompt 在当前消息内自足说明 input/output 的字段、类型、必填性、允许值、八种 `source_kind` 的业务含义、覆盖规则，并提供 label 同源且可通过 strict contract 的完整 input/output 示例。修复反馈也在当前 prompt 内定义为独占 marker 包围的 strict JSON object：顶层只含 `required_action` 与非空 `issues`，每个 issue 只含 `code`、`json_path`、`message`、`source_labels`。修复动作始终基于同一输入完整重产 replacement candidate；反馈不是业务材料，不能被写入财报事实、业务结论或后续任务。
+
 package `conversation_compaction` manifest 的 `model.default_model_id` 当前是
 `mimo-v2.5-pro-plan`，与 package ordinary baseline 同 family；
 `model.runner_option_hint_id` 保持 `conversation_compaction`，因此压缩调用仍可使用独立

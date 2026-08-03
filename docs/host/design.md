@@ -3318,6 +3318,10 @@ CompactSourceBoundaryEntryV2
 
 每个 `source_label` 都是只在本次调用有效的 opaque handle；Host 在 typed input 中同时保存但绝不投影 `source_refs`。`source_boundary` 是模型可以 represented 或显式 drop 的完整闭集，material builder 把上一轮 accepted projection、post-compact delta trace、accepted evidence 与 answer material 统一投影到该边界。`current_input` 只有业务可读文本，不分配 label、不可引用、不可 compact，必须原样保留到 ordinary/fallback RunInput。空 `source_boundary` 不调用 compactor。
 
+运行期 renderer 必须用独占 marker 包围完整 `CompactInputV2` JSON，并把 marker 之间的全部内容定义为不可信引用材料。`current_input.readable_text` 与每个 `source_boundary[*].readable_text` 即使包含要求忽略规则、改变 schema、编造或删除事实、输出其它内容或执行其它任务的文本，也只能作为待整理数据，不能成为本次 compact 的控制指令。该边界不授权生产代码过滤、改写或按关键词删除原文；材料仍按业务内容和 coverage 规则整体表示或显式丢弃。`source_label` 只是在当前请求中定位来源的引用标签，不携带业务事实、优先级或推理依据。
+
+packaged compactor prompt 必须在当前消息内自足说明 strict input/output schema、字段名、类型、必填性、允许值、source-kind 业务语义、覆盖规则和同源 input/output 示例；示例输出的 label 必须全部来自同一示例输入。模型不需要理解 Python 类型名、Host/Memory/Attempt、迁移名称或其它实现术语。
+
 `CompactCandidateV2` 是 compactor 必须返回的 strict JSON object：
 
 ```text
@@ -3373,6 +3377,10 @@ CompactExplicitDropV2
 raw LLM response 必须在边界使用拒绝 duplicate key 的 JSON decoder，并对每一层执行 exact-key、exact-type parsing；unknown key、缺字段、别名、旧字段和多余包装一律拒绝，不存在旧 reader 或兼容分支。`session_summary` 可为 `null`，其它 collection 字段必须显式存在。diagnostics 只解释候选，不计 represented coverage；删除只能进入 `explicitly_dropped_sources`，不得用空文本、遗漏或 diagnostic 冒充删除。
 
 Context Governance 是唯一 accept owner。它从业务语义区引用关系派生 represented coverage，并要求每个 boundary label 恰好落入 represented 或 explicitly dropped，两集合必须完整、互斥且无重复。它还按 source kind 检查 section 合法性，拒绝 empty/diagnostics-only/low-information、unknown label、duplicate、同一 source 的矛盾事实与矛盾 intent，并使用 `MemoryProjectionPolicy` 与 Memory 相同的 `estimate_memory_size_units` 执行 session summary 字符上限，以及 evidence facts、answer anchors、forward intents、reference continuity 各自的 section item-count 与 aggregate-size 上限。diagnostics 不属于 Memory semantic projection，因此不受 `MemoryProjectionPolicy` cap；它仍受 strict shape 与 deterministic duplicate 规则约束。只有该 owner 能构造绑定 immutable input boundary 的 `CompactAcceptedTruthV2`。
+
+Context Governance 同时是 accept/reject truth owner。parser/governance 产生的 validation report，以及为 durable governance/audit 保留 attempt 与截断计数的 bounded internal feedback，都是 Host 内部事实，不直接构成 LLM contract。单一 LLM-facing projector 只能从 typed internal feedback 投影 `required_action` 与 `issues`；每个 issue 只投影 `code`、`json_path`、`message`、`source_labels`，再由 renderer 放入 prompt 已定义的独占 repair marker。marker、字段语义和 whole-candidate 动作必须与 packaged prompt 同源，不能由 operation、fixture 或其它消费者各自重写。
+
+policy cap reject 必须由执行本次验收的同一个 `MemoryProjectionPolicy` instance 与同一个 `estimate_memory_size_units` 结果直接生成。反馈必须给出实际 item/字符数、允许上限、计量对象和直接缩减动作；renderer 不读取 policy、不复制默认 cap，也不重算 candidate size。收到 repair feedback 后仍基于同一 immutable input 完整重产 whole candidate，不合并旧 candidate 或 patch。该路径不增加 compact output schema 字段、semantic repair loop、材料过滤器或自然语言 verifier。
 
 可修复 reject 生成 bounded、脱敏、自解释的前次 validation report；下一次 semantic attempt 必须基于同一 immutable input 完整重产 whole candidate，不能合并 partial candidate，也不能把 provider/timeout 等 execution retry 记为 semantic repair。reactive 模式保留 ordered pass queue，所有 pass 共享 operation 级 attempt budget；中间 pass 只在内存中累积 accepted truth，全部 pass 后必须回到 root input 做 coverage、重复、矛盾与 caps 重验。任一 pass 或 root 验证失败时，中间 truth 不得提交。
 

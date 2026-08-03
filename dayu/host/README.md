@@ -521,6 +521,10 @@ LLM compactor 返回成功 candidate 时同时保留 Engine `FinalAnswerData.res
 
 compact attempt 被拒绝时，Host 会在 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` canonical payload 中保留 operation、attempt、failure stage、parser / validator、offending block locator、digest 与 diagnostic artifact ref 等小字段；若失败发生在 material projection 或 proposal 准备边界，raw previous compacted view / offending block text 只写入 Host diagnostic artifact，并通过 `payload_descriptors` 的 artifact descriptor 追踪，不进入 EventLog canonical payload、Conversation Memory、LLM-facing compact material 或普通 RunInput。
 
+Context Governance 是 compact candidate 的唯一 accept/reject truth owner：strict parser 与 governance 共同形成 typed validation report，只有 governance 可以基于 immutable input boundary 形成 accepted truth。供 durable governance / audit 使用的 internal feedback 保留 attempt、截断问题计数和有界问题详情；它不直接投给模型。`LLMContextCompactor` 的唯一 repair projector 只输出 `required_action` 与 `issues`，每个 issue 只含 `code`、`json_path`、`message`、`source_labels`；renderer 负责把该最小 JSON 放入 packaged prompt 约定的独占 marker，不从 raw mapping、字符串或 artifact 重建反馈。
+
+repair marker 与 whole-candidate action 的 LLM-facing contract 由 packaged prompt 定义，renderer 只负责精确投影和机械渲染；Context Governance 继续独占 reject 原因、实际计量值与 policy decision。item/字符 cap feedback 必须从本次 accept 使用的同一个 `MemoryProjectionPolicy` 和 `estimate_memory_size_units` 结果产生，包含实际值、上限、计量对象与直接缩减动作。projector/renderer 不读取 policy、不复制 cap、不重算 candidate，也不增加 output schema、repair loop、材料 filter 或 verifier。
+
 ### Purge
 
 `purge_session` 只接受已经 `CLOSED` 且所有 Run 均为终态、没有 active / queued / waiting / cancelling / recovering Run 的 Session。成功后，Host 删除目标 Session 的本地可恢复事实和派生视图数据，保留独立 purge tombstone、purge 幂等记录和 append-only audit JSONL。purge tombstone 不位于被 purge 的 Session EventLog 中，也不参与 resume、retry、replay、memory、RunInputBuilder 或普通 read truth。
