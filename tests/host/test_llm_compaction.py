@@ -371,12 +371,68 @@ def test_prompt_assets_are_self_contained_for_fresh_v2_contract() -> None:
         "不得用它代替覆盖",
     ):
         assert open_field_semantics in user_prompt
+    for session_summary_semantics in (
+        "整体任务背景、已完成进展、当前状态与关键约束",
+        "只能概括 `source_labels` 对应材料中已有的内容",
+        "不得加入材料没有的事实、结论或任务",
+        "直接参与形成该摘要的 source 引用标签",
+        "本次完整 replacement 不包含 session summary",
+        "candidate 被接受后，当前会话摘要变为空",
+        "清除先前已接受的摘要",
+        "不影响同一 candidate 中其它四类业务语义项",
+    ):
+        assert session_summary_semantics in user_prompt
+    for evidence_fact_semantics in (
+        "accepted evidence 直接支持的业务事实",
+        "accepted `evidence_material` 或 `previous_evidence_fact` 直接支持",
+        "不得把 `trace_material` 或 `answer_material` 当作事实依据",
+        "对 `claim` 提供直接事实支持",
+        "不能直接支持 `claim`",
+        "不能弥补缺失或不充分的 `support_labels`",
+    ):
+        assert evidence_fact_semantics in user_prompt
+    for answer_anchor_semantics in (
+        "后续对话仍需沿用的既有回答、判断或结论锚点",
+        "不把工具证据、未来动作或新推断伪装成既有结论",
+        "用于识别该既有回答或结论主题的简短业务标题",
+        "保留继续对话所需的条件、边界或不确定性",
+        "只能整理 source 中已经表达的结论",
+        "不得发明新结论",
+        "直接承载该既有回答或结论的 source 引用标签",
+        "`answer_material` 或 `previous_answer_anchor`",
+    ):
+        assert answer_anchor_semantics in user_prompt
+    for drop_reason_semantics in (
+        "`superseded`: 该 source 的业务内容已被更新、更完整或更权威的 source 替代",
+        "继续保留旧内容会过时、冲突或误导",
+        "replacement 中保留的是替代后的当前内容",
+        "`redundant`: 该 source 的内容仍然有效",
+        "丢弃它不会损失独立业务信息",
+        "不得用它掩盖冲突或尚未被表达的信息",
+        "`out_of_scope`: 该 source 即使有效，也与当前输入、当前会话任务及可预见后续对话无关",
+        "不得仅因内容难以分类、存在冲突或依据不足",
+        "`policy_limit`: 该 source 的内容仍相关且原本应保留",
+        "当前 repair feedback 已明确给出一个具体 cap",
+        "为使完整 replacement 落入该 cap 而必须舍弃",
+        "首次请求、没有 repair feedback、或当前 feedback 没有明示具体 cap 时禁止猜测或使用",
+        "不得用它隐藏冲突、无依据内容或分类困难",
+        "四种 reason 是对 source 实际业务关系的互斥解释，不是固定优先级",
+    ):
+        assert drop_reason_semantics in user_prompt
     for forbidden in (
         "schema_version",
         "current_input_anchor",
         "previous_compacted_view",
         "evidence_backed_facts",
         "reference_continuity_items",
+        "Compact",
+        "compaction.py",
+        "context_governance",
+        "memory.py",
+        "MemoryProjectionPolicy",
+        "SessionSummaryMemoryView",
+        "event_id",
+        "payload_ref",
     ):
         assert forbidden not in user_prompt
     assert "source label 只是本次请求内的引用标签" in system_prompt

@@ -31,17 +31,19 @@
 输出必须完整且只含以下字段；全部字段必填：
 
 - `schema`: 字符串，必须为 `dayu.context_compaction.output.v2`。
-- `session_summary`: null，或只含 `text`、`source_labels` 的 object。
-  - `text`: 非空字符串。
-  - `source_labels`: 非空字符串 array。
+- `session_summary`: null，或只含 `text`、`source_labels` 的 object。object 保存后续对话仍需知道的整体任务背景、已完成进展、当前状态与关键约束的紧凑业务摘要；它是总体上下文，不机械重复每条证据、既有回答或待办。null 表示本次完整 replacement 不包含 session summary；candidate 被接受后，当前会话摘要变为空，包括清除先前已接受的摘要，但不影响同一 candidate 中其它四类业务语义项。
+  - `text`: 非空字符串，是可独立阅读的业务摘要；只能概括 `source_labels` 对应材料中已有的内容，不得加入材料没有的事实、结论或任务。
+  - `source_labels`: 非空字符串 array；是直接参与形成该摘要的 source 引用标签。每个标签只是本次请求内的引用标签，不是事实或推理依据。
 - `evidence_facts`: array；每项只含：
-  - `claim`: 非空字符串。
-  - `support_labels`: 非空字符串 array，只能引用 kind 为 `evidence_material` 或 `previous_evidence_fact` 的 source。
-  - `context_labels`: 字符串 array，可空，只能引用 kind 为 `trace_material` 或 `answer_material` 的 source。
+  - 本 section 保存后续分析仍可能需要、且有 accepted evidence 直接支持的业务事实；它不是回答结论、推测、待办或仅有对话背景的描述。
+  - `claim`: 非空字符串，是可独立阅读的业务事实；必须由 `support_labels` 对应的 accepted `evidence_material` 或 `previous_evidence_fact` 直接支持，不得把 `trace_material` 或 `answer_material` 当作事实依据。
+  - `support_labels`: 非空字符串 array，是对 `claim` 提供直接事实支持的 source 引用标签；只能引用 kind 为 `evidence_material` 或 `previous_evidence_fact` 的 source。
+  - `context_labels`: 字符串 array，可空，只能引用 kind 为 `trace_material` 或 `answer_material` 的 source；只补充理解该事实所需的对话背景、限定条件或既有回答上下文，不能直接支持 `claim`，也不能弥补缺失或不充分的 `support_labels`。
 - `answer_anchors`: array；每项只含：
-  - `title`: 非空字符串。
-  - `detail`: 非空字符串。
-  - `source_labels`: 非空字符串 array，只能引用 kind 为 `answer_material` 或 `previous_answer_anchor` 的 source。
+  - 本 section 保存后续对话仍需沿用的既有回答、判断或结论锚点；它记录已经形成的回答语义，不把工具证据、未来动作或新推断伪装成既有结论。
+  - `title`: 非空字符串，是用于识别该既有回答或结论主题的简短业务标题。
+  - `detail`: 非空字符串，是可独立阅读的既有回答或结论内容；应保留继续对话所需的条件、边界或不确定性，只能整理 source 中已经表达的结论，不得发明新结论。
+  - `source_labels`: 非空字符串 array，是直接承载该既有回答或结论的 source 引用标签；只能引用 kind 为 `answer_material` 或 `previous_answer_anchor` 的 source。
 - `forward_intents`: array；每项只含：
   - `intent_type`: 非空字符串，表示业务可读的后续动作类别，例如 `next_analysis_step`；不得写系统调度状态、程序类型或内部错误码。
   - `text`: 非空字符串。
@@ -58,6 +60,12 @@
 - `explicitly_dropped_sources`: array；每项只含：
   - `source_label`: 非空字符串。
   - `reason`: 字符串，只能为 `superseded`、`redundant`、`out_of_scope`、`policy_limit`。
+    - `superseded`: 该 source 的业务内容已被更新、更完整或更权威的 source 替代，继续保留旧内容会过时、冲突或误导；replacement 中保留的是替代后的当前内容。
+    - `redundant`: 该 source 的内容仍然有效，但其必要信息已被其它 retained source 或业务语义项完整表达；丢弃它不会损失独立业务信息。不得用它掩盖冲突或尚未被表达的信息。
+    - `out_of_scope`: 该 source 即使有效，也与当前输入、当前会话任务及可预见后续对话无关，不需要进入本次 replacement。不得仅因内容难以分类、存在冲突或依据不足就标记为 `out_of_scope`。
+    - `policy_limit`: 该 source 的内容仍相关且原本应保留，但当前 repair feedback 已明确给出一个具体 cap，并且为使完整 replacement 落入该 cap 而必须舍弃它。首次请求、没有 repair feedback、或当前 feedback 没有明示具体 cap 时禁止猜测或使用 `policy_limit`；也不得用它隐藏冲突、无依据内容或分类困难。
+
+四种 reason 是对 source 实际业务关系的互斥解释，不是固定优先级；必须按 source 的真实关系选择。
 
 覆盖规则：
 

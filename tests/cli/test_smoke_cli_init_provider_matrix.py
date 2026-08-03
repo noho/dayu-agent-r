@@ -93,7 +93,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_CONFIG_ROOT = PROJECT_ROOT / "dayu" / "config"
 FROZEN_MANIFEST_PATH = PROJECT_ROOT / "docs" / "cli_init_workspace_manifest_v1.json"
 FROZEN_MANIFEST_SHA256 = (
-    "d63fb2ca415e914c9aaa3959b0b88be2072d1997b70799c9a2ac7de91fce2408"
+    "fb6d0ba8fbf01b093419d178daf09c145bc8643e03b900703a91f2a3ff005f6c"
 )
 
 
