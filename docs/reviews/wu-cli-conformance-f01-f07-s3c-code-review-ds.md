@@ -97,7 +97,7 @@
 
 - **测试覆盖**: `test_real_pipe_early_escape_binds_submit_across_application_handoff` 参数化 0ms/10ms/20ms 三种间隔，使用真实 `PromptToolkitInteractiveComposer` + `create_pipe_input` + `_DelayedAcceptanceControlledHost`，验证：1 个 submit、1 个 `cancel:run-1`、1 个 GRACEFUL cancel、history 写入一次、exit 0。✓
 
-- **边界确认**: 
+- **边界确认**:
   - Escape 在 Enter 之前到达（pre-submit）→ 由 driver 在 `pending_submit_sigint_count` 路径处理（行 1834-1850），绑定随即创建的同一 turn ✓
   - Escape 在 acceptance 完成后到达 → 此时 phase 已变更为 RUNNING，Escape 走正常 `_exit_with_composer_event` 路径 ✓
   - Enter + Escape 同 batch → `event.app.is_done` 为 True，通过 `running_action_recorder` 延迟投递 ✓
@@ -123,7 +123,7 @@
 
 **验证结果: PASS**
 
-- **实现路径**: 
+- **实现路径**:
   1. `sigint_monitor.wait_next(observed_sigint_count)` → 返回新 count
   2. `pending_interrupts = sigint_monitor.count - observed_sigint_count` → 批量捕获所有未消费 interrupt
   3. `observed_sigint_count = sigint_monitor.count` → 快照更新
@@ -152,7 +152,7 @@
 
 - **实现路径**: 第一个 application 因 Enter 退出 → `read_event` 冻结 `_pending_submit_document` 快照 → 下一次 `read_event` 检测 `submit_handoff` 条件 → 第二个 application 以空 buffer 启动并接管 stdin → `pre_run` 中 `_begin_tracking_user_edits(flush_submit_handoff=True)` 创建 `_flush_submit_handoff_input` background task → task 在 `ESCAPE_SEQUENCE_AMBIGUITY_SECONDS` 后调用 `application.input.flush_keys()` + `key_processor.feed_multiple()` + `key_processor.process_keys()` 将上一 app 的 VT parser 残留 ESC prefix 注入当前 key processor → 若有完整 continuation 已在歧义期内到达 pipe，由当前 parser 先解析完整 chord
 
-- **关键设计决策**: 
+- **关键设计决策**:
   - `_submit_handoff_started` flag (行 450) 确保 `accept_submit` 不清空已在第二 app 中编辑的 draft
   - `_pending_submit_document` frozen snapshot (行 297-306) 使 acceptance 时仍可拿到原始 Enter 时刻的 exact draft 写入 history，即使第二 app 的 buffer 已被修改
   - `application.input.flush_keys()` + `key_processor.feed_multiple()` + `key_processor.process_keys()` 的显式 flush seam（行 546-548）确保 PromptToolkit 内部 input buffer 与 key processor 之间无隐式 typeahead 丢失

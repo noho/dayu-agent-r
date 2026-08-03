@@ -466,6 +466,41 @@ async def test_ordinary_enter_records_submit_intent_until_repl_accepts() -> None
 
 
 @pytest.mark.asyncio
+async def test_current_input_revision_tracks_type_and_delete_mutations() -> None:
+    """public revision 必须单调记录普通输入与删除 mutation。
+
+    :returns: ``None``。
+    :raises AssertionError: public revision 未由 composer 编辑 owner 单调推进时抛出。
+    """
+
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        assert composer.current_input_revision() == 0
+
+        read_task = asyncio.create_task(composer.read_event("dayu> "))
+        pipe_input.send_text("x")
+        typed_revision = await _wait_for_input_revision(
+            composer,
+            minimum_revision=1,
+        )
+        pipe_input.send_text("\x7f")
+        deleted_revision = await _wait_for_input_revision(
+            composer,
+            minimum_revision=typed_revision + 1,
+        )
+        pipe_input.send_text("\x04")
+        event = await asyncio.wait_for(read_task, timeout=2.0)
+
+    assert deleted_revision > typed_revision
+    assert composer.current_input_revision() == deleted_revision
+    assert event.kind is InteractiveComposerEventKind.EOF
+    assert event.input_revision == deleted_revision
+
+
+@pytest.mark.asyncio
 async def test_reject_submit_delivery_clears_only_intent_and_restores_exact_draft() -> None:
     """拒绝 submit delivery 只能清 intent，并允许 exact document 原样重提。
 
@@ -1296,6 +1331,27 @@ async def _read_pipe_event(
         task = asyncio.create_task(composer.read_event("dayu> "))
         pipe_input.send_text(text)
         return await asyncio.wait_for(task, timeout=2.0)
+
+
+async def _wait_for_input_revision(
+    composer: PromptToolkitInteractiveComposer,
+    *,
+    minimum_revision: int,
+) -> int:
+    """等待 composer public input revision 达到指定下界。
+
+    :param composer: 真实 prompt_toolkit composer。
+    :param minimum_revision: 预期达到的最小非负版本。
+    :returns: 首个达到下界的 public revision。
+    :raises AssertionError: 有界调度内 revision 未达到下界时抛出。
+    """
+
+    for _attempt in range(1_000):
+        current_revision = composer.current_input_revision()
+        if current_revision >= minimum_revision:
+            return current_revision
+        await asyncio.sleep(0)
+    raise AssertionError(f"input revision did not reach {minimum_revision}")
 
 
 def _invalid_editor_configuration_value(

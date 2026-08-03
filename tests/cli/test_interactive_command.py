@@ -18,6 +18,7 @@ from typing import TypeAlias, cast
 
 import pytest
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.input import create_input
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
@@ -102,6 +103,10 @@ from dayu.service.entrypoint_runtime import (
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
+if os.name == "posix":
+    import pty
+    import termios
+
 _MODEL_ID = "deepseek-v4-flash"
 _FINS_DEFAULT_SUBJECT_SLOT = "fins_default_subject"
 _CURRENT_TIME_SLOT = "current_time"
@@ -120,6 +125,11 @@ _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
 _API_KEY = "test-provider-key"
 _TRANSIENT_OBSERVED_AT = datetime(2026, 7, 20, 1, 2, 3, tzinfo=UTC)
 _INPUT_RESOLUTION_MARGIN_SECONDS = 0.05
+_FROZEN_PROVIDER_TOOL_FIRST_SIGINT_DELAY_SECONDS = 0.01
+_FROZEN_CLOSEOUT_FIRST_SIGINT_DELAY_SECONDS = 0.1
+_FROZEN_SECOND_SIGINT_DELAY_SECONDS = 0.05
+_PTY_READINESS_TIMEOUT_SECONDS = 2.0
+_PTY_READINESS_POLL_SECONDS = 0.005
 
 
 class _InteractiveEditorFailureCase(StrEnum):
@@ -940,6 +950,51 @@ class _ControlledInteractiveHost(_FakeHost):
         await asyncio.sleep(0)
 
 
+class _AcceptedThenReadOnlyControlledHost(_ControlledInteractiveHost):
+    """接受首轮 Run，并以 typed READ_ONLY 拒绝下一次 mutation。"""
+
+    mutation_attempts: list[SubmitFollowupRequest]
+
+    def __init__(self) -> None:
+        """初始化 accepted/cancel barrier 与 mutation attempt 记录。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.mutation_attempts = []
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """接受首次 mutation，并 typed 拒绝后续 mutation。
+
+        :param session_id: 目标 Session id。
+        :param request: Host submit request。
+        :returns: 首次 mutation 的 accepted snapshot。
+        :raises HostApiError: 第二次及后续 mutation 以 READ_ONLY detail 拒绝。
+        """
+
+        self.mutation_attempts.append(request)
+        if len(self.mutation_attempts) == 1:
+            return await super().submit_followup(session_id, request)
+        raise HostApiError(
+            code=HostApiErrorCode.PERMISSION_DENIED,
+            message="opaque typed mutation rejection",
+            retryable=False,
+            detail=HostSessionMutationErrorDetail(
+                kind="session_mutation_access",
+                session_id=session_id,
+                reason=HostSessionMutationRejectionReason.READ_ONLY,
+                required_mode=HostSessionAccessMode.READ_WRITE,
+                actual_mode=HostSessionAccessMode.READ_ONLY,
+            ),
+        )
+
+
 class _DelayedAcceptanceControlledHost(_ControlledInteractiveHost):
     """把第一轮 durable acceptance 与 public submit response 分离。"""
 
@@ -1166,6 +1221,15 @@ class _ScriptedComposer:
 
         return self._pending_submit_intent
 
+    def current_input_revision(self) -> int:
+        """返回 scripted composer 当前单调输入版本。
+
+        :returns: 当前非负输入版本。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._revision
+
     def reject_submit_delivery(self) -> None:
         """结束 scripted submit delivery intent 并保留 pending editable draft。
 
@@ -1217,6 +1281,9 @@ class _ScriptedComposer:
             )
         if isinstance(step, InteractiveComposerEvent):
             if step.kind is InteractiveComposerEventKind.SUBMIT:
+                if step.input_revision < self._revision:
+                    raise AssertionError("scripted input revision must be monotonic")
+                self._revision = step.input_revision
                 self._pending_submit = True
                 self._pending_submit_intent = step.draft is not None and step.draft.strip() != ""
             return step
@@ -1354,6 +1421,35 @@ class _IdleSequencedComposer(_ScriptedComposer):
         while self._phase is not InteractiveComposerPhase.IDLE:
             self._phase_changed.clear()
             await self._phase_changed.wait()
+        return await super().read_event(prompt)
+
+
+class _ReadOnlyChordBarrierComposer(_IdleSequencedComposer):
+    """在 typed READ_ONLY rejection 后阻塞 EOF，暴露 idle chord 断言点。"""
+
+    release_eof: asyncio.Event
+
+    def __init__(self, steps: tuple[_ComposerReadStep, ...]) -> None:
+        """初始化 idle-only submit 脚本与 rejection 后 EOF barrier。
+
+        :param steps: 首轮 accepted 与后续 rejected mutation 脚本。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(steps)
+        self.release_eof = asyncio.Event()
+
+    async def read_event(self, prompt: str) -> InteractiveComposerEvent:
+        """在 rejection 后的下一次 read 等待测试释放 EOF。
+
+        :param prompt: REPL prompt 文本。
+        :returns: parent composer 产生的 typed event。
+        :raises Exception: parent composer 失败时向上透传。
+        """
+
+        if self.rejected_delivery_count > 0:
+            await self.release_eof.wait()
         return await super().read_event(prompt)
 
 
@@ -3893,6 +3989,355 @@ async def test_real_posix_double_sigint_exits_after_single_canonical_closeout(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX PTY signal contract")
+@pytest.mark.parametrize("phase", tuple(_RealSigintPhase))
+async def test_real_posix_frozen_double_sigint_survives_fast_cancelled_closeout(
+    phase: _RealSigintPhase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """frozen +0.05s 第二击必须跨快速 cancelled closeout 后退出 130。
+
+    :param phase: frozen provider wait、tool execution 或 closeout 等价路径。
+    :param tmp_path: pytest 临时 workspace。
+    :param monkeypatch: canonical terminal finisher seam 替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: chord owner、single cancel、terminal 或恢复语义漂移时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    finisher = _BlockingTerminalFinisher()
+    finisher.release.set()
+    monkeypatch.setattr(
+        session_execution,
+        "_finish_interactive_terminal",
+        finisher,
+    )
+    master_fd, slave_fd = pty.openpty()
+    slave_stream = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+    original_lflag = termios.tcgetattr(slave_fd)[3]
+    prompt_input = create_input(stdin=slave_stream)
+    composer = PromptToolkitInteractiveComposer(
+        input=prompt_input,
+        output=DummyOutput(),
+    )
+    monitor = CliSigintMonitor()
+    previous_handler = signal.getsignal(signal.SIGINT)
+    second_signal: asyncio.TimerHandle | None = None
+    monitor.install()
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+        sigint_monitor=monitor,
+    )
+    try:
+        await _wait_for_pty_raw_mode(slave_fd)
+        os.write(master_fd, b"current\r")
+        await _wait_for_submit_count(host, 1)
+        if phase is _RealSigintPhase.TOOL_EXECUTION:
+            await host._run_watchers["run-1"].push(_activity_event(run_id="run-1"))
+
+        first_sigint_delay = (
+            _FROZEN_CLOSEOUT_FIRST_SIGINT_DELAY_SECONDS
+            if phase is _RealSigintPhase.CLOSEOUT
+            else _FROZEN_PROVIDER_TOOL_FIRST_SIGINT_DELAY_SECONDS
+        )
+        await asyncio.sleep(first_sigint_delay)
+        host.release_cancel_terminal.set()
+        os.kill(os.getpid(), signal.SIGINT)
+        second_signal = asyncio.get_running_loop().call_later(
+            _FROZEN_SECOND_SIGINT_DELAY_SECONDS,
+            os.kill,
+            os.getpid(),
+            signal.SIGINT,
+        )
+        await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+        await _wait_for_real_composer_phase(
+            composer,
+            phase=InteractiveComposerPhase.IDLE,
+        )
+        assert monitor.count == 1
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+        restored_lflag = termios.tcgetattr(slave_fd)[3]
+    finally:
+        if second_signal is not None:
+            second_signal.cancel()
+        finisher.release.set()
+        host.release_cancel_terminal.set()
+        if not driver.done():
+            driver.cancel()
+            with suppress(asyncio.CancelledError):
+                await driver
+        monitor.close()
+        prompt_input.close()
+        slave_stream.close()
+        os.close(slave_fd)
+        with suppress(OSError):
+            os.close(master_fd)
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert monitor.count == 2
+    assert host.calls.count("cancel:run-1") == 1
+    assert len(host.cancel_requests) == 1
+    assert len(finisher.terminals) == 1
+    assert finisher.terminals[0].terminal_status is HostTerminalStatus.CANCELLED
+    assert [watcher.closed_count for watcher in host.watchers] == [1, 1]
+    assert signal.getsignal(signal.SIGINT) == previous_handler
+    assert _terminal_lflag_controls(restored_lflag) == _terminal_lflag_controls(original_lflag)
+
+
+@pytest.mark.asyncio
+async def test_interactive_idle_type_and_delete_end_cancelled_closeout_sigint_chord(
+    tmp_path: Path,
+) -> None:
+    """closeout 后的真实输入再删除必须让下一次 SIGINT 成为新首击。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: composer revision mutation 未终结旧 chord 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    host.release_cancel_terminal.set()
+    monitor = _ManualSigintMonitor()
+    with create_pipe_input() as pipe_input:
+        composer = PromptToolkitInteractiveComposer(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        driver = _start_tty_driver(
+            host=host,
+            runtime=runtime,
+            workspace_root=tmp_path,
+            composer=composer,
+            sigint_monitor=monitor,
+        )
+
+        pipe_input.send_text("current\r")
+        await _wait_for_submit_count(host, 1)
+        monitor.notify()
+        await _wait_for_sigint_observation(monitor, 1)
+        await _wait_for_real_composer_phase(
+            composer,
+            phase=InteractiveComposerPhase.IDLE,
+        )
+        frozen_revision = composer.current_input_revision()
+
+        pipe_input.send_text("x\x7f")
+        edited_revision = await _wait_for_composer_input_revision(
+            composer,
+            minimum_revision=frozen_revision + 2,
+        )
+        monitor.notify()
+        await _wait_for_sigint_observation(monitor, 2)
+        assert not driver.done()
+        assert len(host.cancel_requests) == 1
+
+        pipe_input.send_text("\x04")
+        exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert edited_revision > frozen_revision
+    assert exit_code == EXIT_SUCCESS
+    assert host.calls.count("cancel:run-1") == 1
+    assert len(host.cancel_requests) == 1
+    assert [watcher.closed_count for watcher in host.watchers] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_interactive_queued_submit_before_closeout_prevents_old_sigint_rearm(
+    tmp_path: Path,
+) -> None:
+    """首击后的 queued SUBMIT 必须在旧 closeout arm 前终结旧 chord。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: queued mutation 后单次 SIGINT 被误当作旧第二击时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    composer = _BarrierScriptedComposer(
+        ("current", "queued"),
+        blocked_call_index=2,
+    )
+    monitor = _ManualSigintMonitor()
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+        sigint_monitor=monitor,
+    )
+
+    await _wait_for_submit_count(host, 1)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    await asyncio.wait_for(host.cancel_started.wait(), timeout=2.0)
+    composer.release_read.set()
+    await _wait_for_submit_count(host, 2)
+
+    host.release_cancel_terminal.set()
+    await _wait_for_run_watcher_close_count(host, run_id="run-1", expected_count=1)
+    await _wait_for_scripted_composer_phase(
+        composer,
+        phase=InteractiveComposerPhase.RUNNING,
+    )
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 2)
+    await _wait_for_cancel_request_count(host, 2)
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert host.calls.count("cancel:run-1") == 1
+    assert host.calls.count("cancel:run-2") == 1
+    assert len(host.cancel_requests) == 2
+    assert [watcher.closed_count for watcher in host.watchers] == [1, 1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_interactive_read_only_rejection_does_not_revive_old_sigint_chord(
+    tmp_path: Path,
+) -> None:
+    """typed READ_ONLY mutation rejection 后单次 idle SIGINT 不得退出 130。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: rejected mutation 复活 cancelled closeout chord 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _AcceptedThenReadOnlyControlledHost()
+    host.release_cancel_terminal.set()
+    composer = _ReadOnlyChordBarrierComposer(("current", "rejected"))
+    monitor = _ManualSigintMonitor()
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+        sigint_monitor=monitor,
+    )
+
+    await _wait_for_submit_count(host, 1)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    await _wait_for_rejected_delivery_count(composer, 1)
+    assert len(host.mutation_attempts) == 2
+
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 2)
+    assert not driver.done()
+    assert len(host.cancel_requests) == 1
+
+    composer.release_eof.set()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert host.calls.count("cancel:run-1") == 1
+    assert len(host.cancel_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_interactive_submit_clears_cancelled_closeout_sigint_chord(
+    tmp_path: Path,
+) -> None:
+    """cancelled closeout 后的新 submit 必须清除上一轮 SIGINT chord state。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: 新 mutation 后单次 SIGINT 被误当作第二击时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    host.release_cancel_terminal.set()
+    composer = _BarrierScriptedComposer(
+        ("first", "second"),
+        blocked_call_index=2,
+    )
+    monitor = _ManualSigintMonitor()
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+        sigint_monitor=monitor,
+    )
+
+    await _wait_for_submit_count(host, 1)
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    await _wait_for_scripted_composer_phase(
+        composer,
+        phase=InteractiveComposerPhase.IDLE,
+    )
+    composer.release_read.set()
+    await _wait_for_submit_count(host, 2)
+
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 2)
+    await _wait_for_cancel_request_count(host, 2)
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert host.calls.count("cancel:run-1") == 1
+    assert host.calls.count("cancel:run-2") == 1
+    assert len(host.cancel_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_interactive_escape_cancel_does_not_arm_sigint_chord(
+    tmp_path: Path,
+) -> None:
+    """standalone Escape cancel 后单次 idle SIGINT 不得直接退出 130。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: Escape 错误武装 SIGINT chord state 时抛出。
+    """
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    host = _ControlledInteractiveHost()
+    host.release_cancel_terminal.set()
+    cancel_event = InteractiveComposerEvent(
+        kind=InteractiveComposerEventKind.RUNNING_KEY_ACTION,
+        running_key_action=RunningKeyAction.CANCEL_RUN,
+    )
+    composer = _BarrierScriptedComposer(
+        ("current", cancel_event),
+        blocked_call_index=3,
+    )
+    monitor = _ManualSigintMonitor()
+    driver = _start_tty_driver(
+        host=host,
+        runtime=runtime,
+        workspace_root=tmp_path,
+        composer=composer,
+        sigint_monitor=monitor,
+    )
+
+    await _wait_for_cancel_request_count(host, 1)
+    await _wait_for_scripted_composer_phase(
+        composer,
+        phase=InteractiveComposerPhase.IDLE,
+    )
+    monitor.notify()
+    await _wait_for_sigint_observation(monitor, 1)
+    assert not driver.done()
+    assert len(host.cancel_requests) == 1
+
+    composer.release_read.set()
+    exit_code = await asyncio.wait_for(driver, timeout=2.0)
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(host.cancel_requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_interactive_typeahead_creates_sole_queue_and_preserves_rejected_draft(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -4487,6 +4932,61 @@ async def _wait_for_real_composer_phase(
     raise AssertionError(f"composer phase did not reach {phase}")
 
 
+async def _wait_for_scripted_composer_phase(
+    composer: _ScriptedComposer,
+    *,
+    phase: InteractiveComposerPhase,
+) -> None:
+    """等待 scripted composer 进入指定 REPL phase。
+
+    :param composer: scripted typed composer。
+    :param phase: 预期 phase。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内未进入指定 phase 时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if composer._phase is phase:
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"scripted composer phase did not reach {phase}")
+
+
+def _terminal_lflag_controls(lflag: int) -> tuple[bool, bool, bool, bool]:
+    """提取 PTY 测试关心的 echo/canonical/signal/extension flags。
+
+    :param lflag: ``termios`` local flags。
+    :returns: ECHO、ICANON、ISIG、IEXTEN 是否启用。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        bool(lflag & termios.ECHO),
+        bool(lflag & termios.ICANON),
+        bool(lflag & termios.ISIG),
+        bool(lflag & termios.IEXTEN),
+    )
+
+
+async def _wait_for_pty_raw_mode(slave_fd: int) -> int:
+    """等待真实 PTY slave 进入 prompt_toolkit raw mode。
+
+    :param slave_fd: PTY slave 文件描述符。
+    :returns: 观察到四项 local control flags 均关闭时的 ``lflag``。
+    :raises AssertionError: 有界时间内未观察到 raw mode 时抛出。
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PTY_READINESS_TIMEOUT_SECONDS
+    while loop.time() < deadline:
+        lflag = termios.tcgetattr(slave_fd)[3]
+        if _terminal_lflag_controls(lflag) == (False, False, False, False):
+            return lflag
+        await asyncio.sleep(_PTY_READINESS_POLL_SECONDS)
+    raise AssertionError("PTY did not enter prompt_toolkit raw mode")
+
+
 async def _wait_for_real_composer_history(
     composer: PromptToolkitInteractiveComposer,
     expected: tuple[str, ...],
@@ -4569,6 +5069,69 @@ async def _wait_for_submit_count(
             return
         await asyncio.sleep(0)
     raise AssertionError(f"submit count did not reach {expected_count}")
+
+
+async def _wait_for_cancel_request_count(
+    host: _ControlledInteractiveHost,
+    expected_count: int,
+) -> None:
+    """等待可控 Host 收到指定数量的 graceful cancel 请求。
+
+    :param host: 可控 interactive Host fake。
+    :param expected_count: 预期最小 cancel 请求数。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内 cancel 请求数未达到预期时抛出。
+    """
+
+    for _attempt in range(1_000):
+        if len(host.cancel_requests) >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"cancel request count did not reach {expected_count}")
+
+
+async def _wait_for_run_watcher_close_count(
+    host: _ControlledInteractiveHost,
+    *,
+    run_id: str,
+    expected_count: int,
+) -> None:
+    """等待指定 Run 的 canonical submit watcher 达到关闭次数。
+
+    :param host: 可控 interactive Host fake。
+    :param run_id: 已 accepted 的 Run id。
+    :param expected_count: 预期最小 close 次数。
+    :returns: ``None``。
+    :raises AssertionError: 有界调度内 watcher 未达到预期时抛出。
+    """
+
+    watcher = host._run_watchers[run_id]
+    for _attempt in range(1_000):
+        if watcher.closed_count >= expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"run watcher {run_id} close count did not reach {expected_count}")
+
+
+async def _wait_for_composer_input_revision(
+    composer: InteractiveComposer,
+    *,
+    minimum_revision: int,
+) -> int:
+    """等待 typed composer public revision 达到指定下界。
+
+    :param composer: input revision owner protocol。
+    :param minimum_revision: 预期达到的最小非负版本。
+    :returns: 首个达到下界的当前 revision。
+    :raises AssertionError: 有界调度内 revision 未达到下界时抛出。
+    """
+
+    for _attempt in range(1_000):
+        current_revision = composer.current_input_revision()
+        if current_revision >= minimum_revision:
+            return current_revision
+        await asyncio.sleep(0)
+    raise AssertionError(f"composer input revision did not reach {minimum_revision}")
 
 
 async def _wait_for_mutation_attempt_count(

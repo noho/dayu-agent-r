@@ -157,4 +157,3 @@ active SIGINT count consumer；没有创建通用 terminal framework、God helpe
 ## 9. Gate marker
 
 `READY-FOR-DUAL-S3C-CODE-REVIEW`
-

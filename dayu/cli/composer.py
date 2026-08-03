@@ -243,6 +243,15 @@ class InteractiveComposer(Protocol):
 
         ...
 
+    def current_input_revision(self) -> int:
+        """返回 composer 已观察到的单调用户输入版本。
+
+        :returns: 非负且只在真实用户输入 mutation 后递增的版本。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        ...
+
     def reject_submit_delivery(self) -> None:
         """结束被 REPL 拒绝的提交交付，同时保留 exact editable draft。
 
@@ -356,7 +365,7 @@ class PromptToolkitInteractiveComposer:
             key_bindings=_build_interactive_key_bindings(
                 stderr=sys.stderr if stderr is None else stderr,
                 phase_provider=self._current_phase,
-                revision_provider=self._current_input_revision,
+                revision_provider=self.current_input_revision,
                 submit_intent_recorder=self._record_submit_intent,
                 running_action_recorder=self._record_pending_running_action,
                 editor_tasks=self._editor_tasks,
@@ -505,10 +514,10 @@ class PromptToolkitInteractiveComposer:
 
         return self._phase
 
-    def _current_input_revision(self) -> int:
-        """返回当前用户编辑版本。
+    def current_input_revision(self) -> int:
+        """返回 composer 已观察到的单调用户输入版本。
 
-        :returns: 非负编辑版本。
+        :returns: 非负且只在真实用户输入 mutation 后递增的版本。
         :raises Exception: 不主动抛出异常。
         """
 

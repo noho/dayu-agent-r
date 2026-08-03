@@ -532,6 +532,7 @@ class _FreshQueuedLifecycleComposer:
         self._worker_factory = worker_factory
         self._sigint_monitor = sigint_monitor
         self._call_index = 0
+        self._input_revision = 0
         self._pending_submit = False
         self.phase_calls: list[InteractiveComposerPhase] = []
         self.observed_current_and_queue: tuple[RunRow, RunRow] | None = None
@@ -559,6 +560,15 @@ class _FreshQueuedLifecycleComposer:
         if not record_history:
             raise AssertionError("fresh lifecycle non-empty submit must record history")
         self._pending_submit = False
+
+    def current_input_revision(self) -> int:
+        """返回真实 Host lifecycle composer 的单调输入版本。
+
+        :returns: 已投递 submit mutation 的数量。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._input_revision
 
     async def read_event(self, _prompt: str) -> InteractiveComposerEvent:
         """按 owner barrier 依次提交 current、queued 与两次 Ctrl+C。
@@ -602,11 +612,12 @@ class _FreshQueuedLifecycleComposer:
 
         if self._pending_submit:
             raise AssertionError("fresh lifecycle submit acknowledgement is missing")
+        self._input_revision += 1
         self._pending_submit = True
         return InteractiveComposerEvent(
             kind=InteractiveComposerEventKind.SUBMIT,
             draft=draft,
-            input_revision=self._call_index,
+            input_revision=self._input_revision,
         )
 
 

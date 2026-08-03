@@ -81,6 +81,7 @@ from dayu.host.api import (
     HostSessionAttachment,
     HostSessionMutationErrorDetail,
     HostSessionMutationRejectionReason,
+    HostTerminalStatus,
 )
 from dayu.service.entrypoint_runtime import (
     DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS,
@@ -114,6 +115,8 @@ _INTERACTIVE_READ_ONLY_MESSAGE: Final[str] = (
     "Interactive: session is read-only; draft kept. Submit again to retry with a fresh attachment."
 )
 _INTERACTIVE_INVALID_UTF8_MESSAGE: Final[str] = "interactive stdin is not valid UTF-8"
+_INTERACTIVE_SINGLE_SIGINT_COUNT: Final[int] = 1
+_INTERACTIVE_EXIT_SIGINT_COUNT: Final[int] = 2
 _UsageErrorFactory = Callable[[str], ValueError]
 _CancelRunAndWait = Callable[[str, str], Awaitable[EntrypointRunTerminalResult]]
 _OpenFreshSessionAttachment = Callable[[], Awaitable[HostSessionAttachment]]
@@ -378,7 +381,104 @@ class _InteractiveExitIntent(StrEnum):
     """interactive REPL 本地退出意图。"""
 
     CONTINUE = "continue"
-    IDLE_EXIT_PENDING = "idle_exit_pending"
+    SIGINT_CHORD_PENDING = "sigint_chord_pending"
+
+
+@dataclass(slots=True)
+class _InteractiveSigintChordState:
+    """持有 interactive invocation 唯一 Ctrl+C chord 语义。
+
+    :param input_revision: 首击发生时 composer 的单调输入版本；无 chord 时为 ``None``。
+    :param active_signal_count: 当前 active turn 在同一输入版本下已消费的 SIGINT 数。
+    :param exit_intent: cancelled closeout 或 idle 首击后等待第二击的本地退出意图。
+    """
+
+    input_revision: int | None = None
+    active_signal_count: int = 0
+    exit_intent: _InteractiveExitIntent = _InteractiveExitIntent.CONTINUE
+
+    def clear_for_user_input_mutation(self) -> None:
+        """在 typed user-input mutation boundary 清除旧 chord。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.input_revision = None
+        self.active_signal_count = 0
+        self.exit_intent = _InteractiveExitIntent.CONTINUE
+
+    def reconcile_input_revision(self, input_revision: int) -> None:
+        """在消费 signal 前按 composer revision 终结已过期 chord。
+
+        revision 变化表示首击后发生过普通编辑或 submit mutation；此时先清除
+        旧 chord，再把当前 revision 冻结为随后 signal 的新 chord identity。
+
+        :param input_revision: composer 当前单调输入版本。
+        :returns: ``None``。
+        :raises ValueError: 输入版本为负数时抛出。
+        """
+
+        if input_revision < 0:
+            raise ValueError("interactive input revision must be non-negative")
+        if self.input_revision == input_revision:
+            return
+        self.clear_for_user_input_mutation()
+        self.input_revision = input_revision
+
+    def consume_active_signal(self, input_revision: int) -> bool:
+        """消费同一 active turn 的一次 SIGINT。
+
+        :param input_revision: signal 消费时 composer 的当前输入版本。
+        :returns: 当前 signal 是否为同一 revision chord 的第二击或后续击。
+        :raises ValueError: 输入版本为负数时抛出。
+        """
+
+        self.reconcile_input_revision(input_revision)
+        self.active_signal_count += 1
+        return self.active_signal_count >= _INTERACTIVE_EXIT_SIGINT_COUNT
+
+    def consume_idle_signal(self, input_revision: int) -> bool:
+        """消费没有 active turn 时的一次 SIGINT。
+
+        :param input_revision: signal 消费时 composer 的当前输入版本。
+        :returns: 已存在同 revision 首击、当前 signal 应退出时返回 ``True``。
+        :raises ValueError: 输入版本为负数时抛出。
+        """
+
+        self.reconcile_input_revision(input_revision)
+        if self.exit_intent is _InteractiveExitIntent.SIGINT_CHORD_PENDING:
+            return True
+        self.exit_intent = _InteractiveExitIntent.SIGINT_CHORD_PENDING
+        return False
+
+    def finish_active_closeout(
+        self,
+        *,
+        terminal_status: HostTerminalStatus,
+        input_revision: int,
+    ) -> None:
+        """在 active closeout 完成时按最新 revision 决定是否保留首击。
+
+        :param terminal_status: Host canonical terminal 状态。
+        :param input_revision: closeout arm 前 composer 的当前输入版本。
+        :returns: ``None``。
+        :raises ValueError: 输入版本为负数时抛出。
+        """
+
+        if input_revision < 0:
+            raise ValueError("interactive input revision must be non-negative")
+        if self.input_revision != input_revision:
+            self.clear_for_user_input_mutation()
+            return
+        if (
+            terminal_status is HostTerminalStatus.CANCELLED
+            and self.active_signal_count == _INTERACTIVE_SINGLE_SIGINT_COUNT
+        ):
+            self.exit_intent = _InteractiveExitIntent.SIGINT_CHORD_PENDING
+        self.active_signal_count = 0
+        if self.exit_intent is _InteractiveExitIntent.CONTINUE:
+            self.input_revision = None
 
 
 @dataclass(slots=True)
@@ -1690,9 +1790,8 @@ async def _drive_interactive_tty_repl(
     current_acceptance_task: asyncio.Task[str] | None = None
     queued_acceptance_task: asyncio.Task[str] | None = None
     pending_mutation: _InteractivePendingMutation | None = None
-    exit_intent = _InteractiveExitIntent.CONTINUE
+    sigint_chord = _InteractiveSigintChordState()
     exit_after_closeout = False
-    active_sigint_count = 0
     pending_submit_sigint_count = 0
     deferred_exit_code: int | None = None
     composer.set_phase(InteractiveComposerPhase.IDLE)
@@ -1741,7 +1840,7 @@ async def _drive_interactive_tty_repl(
                 )
                 if not stale_control and deferred_exit_code is None:
                     if event.kind is InteractiveComposerEventKind.SUBMIT:
-                        exit_intent = _InteractiveExitIntent.CONTINUE
+                        sigint_chord.clear_for_user_input_mutation()
                         draft = event.draft
                         if draft is None:
                             raise RuntimeError("interactive submit event draft is missing")
@@ -1826,7 +1925,7 @@ async def _drive_interactive_tty_repl(
                         ):
                             await runtime_display.toggle_activity_display()
                     elif event.kind is InteractiveComposerEventKind.EOF:
-                        exit_intent = _InteractiveExitIntent.CONTINUE
+                        sigint_chord.clear_for_user_input_mutation()
                         if current is None:
                             normal_completion = True
                             return EXIT_SUCCESS
@@ -1836,8 +1935,9 @@ async def _drive_interactive_tty_repl(
                 # SUBMIT task 可能晚于紧随其后的 SIGINT 被 outer driver 调度。这里
                 # 只把该 owner state 中的中断绑定刚创建的同一 turn，不按时间猜测。
                 for _interrupt_index in range(pending_submit_sigint_count):
-                    active_sigint_count += 1
-                    exit_after = active_sigint_count >= 2
+                    exit_after = sigint_chord.consume_active_signal(
+                        composer.current_input_revision()
+                    )
                     await _request_interactive_cancel(
                         active=current,
                         reason=CLI_SIGINT_REASON,
@@ -1877,26 +1977,38 @@ async def _drive_interactive_tty_repl(
                         if composer.has_pending_submit_intent():
                             pending_submit_sigint_count += 1
                             continue
-                        if exit_intent is _InteractiveExitIntent.IDLE_EXIT_PENDING:
+                        if sigint_chord.consume_idle_signal(
+                            composer.current_input_revision()
+                        ):
                             normal_completion = True
                             return EXIT_KEYBOARD_INTERRUPT
-                        exit_intent = _InteractiveExitIntent.IDLE_EXIT_PENDING
                 else:
-                    (
-                        active_sigint_count,
-                        observed_exit_after_closeout,
-                    ) = await _consume_interactive_active_sigints(
-                        active=current,
-                        interrupt_count=pending_interrupts,
-                        active_sigint_count=active_sigint_count,
-                        composer=composer,
-                        runtime_display=runtime_display,
+                    sigint_chord.reconcile_input_revision(
+                        composer.current_input_revision()
                     )
-                    if observed_exit_after_closeout:
+                    if (
+                        sigint_chord.exit_intent
+                        is _InteractiveExitIntent.SIGINT_CHORD_PENDING
+                    ):
                         exit_after_closeout = True
                         if composer_task is not None:
                             await cancel_and_await_task(composer_task)
                             composer_task = None
+                    else:
+                        observed_exit_after_closeout = (
+                            await _consume_interactive_active_sigints(
+                                active=current,
+                                interrupt_count=pending_interrupts,
+                                sigint_chord=sigint_chord,
+                                composer=composer,
+                                runtime_display=runtime_display,
+                            )
+                        )
+                        if observed_exit_after_closeout:
+                            exit_after_closeout = True
+                            if composer_task is not None:
+                                await cancel_and_await_task(composer_task)
+                                composer_task = None
 
             if current is not None:
                 await _render_interactive_cancel_requested_once(
@@ -1931,7 +2043,7 @@ async def _drive_interactive_tty_repl(
                         attachment_controller.require_refresh()
                         print(_INTERACTIVE_READ_ONLY_MESSAGE, file=sys.stderr)
                         current = None
-                        active_sigint_count = 0
+                        sigint_chord.clear_for_user_input_mutation()
                         composer.set_phase(InteractiveComposerPhase.IDLE)
                     else:
                         completed.closeout.observe_terminal(completed_terminal)
@@ -1960,13 +2072,10 @@ async def _drive_interactive_tty_repl(
                 closeout_interrupts = sigint_monitor.count - observed_sigint_count
                 if closeout_interrupts > 0:
                     observed_sigint_count = sigint_monitor.count
-                    (
-                        active_sigint_count,
-                        observed_exit_after_closeout,
-                    ) = await _consume_interactive_active_sigints(
+                    observed_exit_after_closeout = await _consume_interactive_active_sigints(
                         active=completed,
                         interrupt_count=closeout_interrupts,
-                        active_sigint_count=active_sigint_count,
+                        sigint_chord=sigint_chord,
                         composer=composer,
                         runtime_display=runtime_display,
                     )
@@ -1976,11 +2085,14 @@ async def _drive_interactive_tty_repl(
                     deferred_exit_code = terminal_exit_code
                 if completed.closeout.intent is _LocalCancelIntent.EXIT_AFTER_CANCEL:
                     exit_after_closeout = True
+                sigint_chord.finish_active_closeout(
+                    terminal_status=terminal.terminal_status,
+                    input_revision=composer.current_input_revision(),
+                )
                 if not completed.submit_task.done():
                     await cancel_and_await_task(completed.submit_task)
                 current = None
                 generation += 1
-                active_sigint_count = 0
                 if queued is not None:
                     current = _promote_interactive_queued_followup(
                         queued=queued,
@@ -2295,30 +2407,29 @@ async def _consume_interactive_active_sigints(
     *,
     active: _InteractiveActiveTurn,
     interrupt_count: int,
-    active_sigint_count: int,
+    sigint_chord: _InteractiveSigintChordState,
     composer: InteractiveComposer,
     runtime_display: RuntimeDisplayController | None,
-) -> tuple[int, bool]:
+) -> bool:
     """把 durable SIGINT 增量消费到同一个 active turn closeout。
 
     :param active: 当前尚未由 driver 清空的 active turn。
     :param interrupt_count: 本次尚未消费的正数 SIGINT 增量。
-    :param active_sigint_count: 当前 turn 已消费的 SIGINT 总数。
+    :param sigint_chord: invocation 唯一 typed SIGINT chord state。
     :param composer: invocation 唯一 composer。
     :param runtime_display: 可选 display controller。
-    :returns: 更新后的 turn SIGINT 总数与是否已升级 exit-after-closeout。
-    :raises ValueError: ``interrupt_count`` 非正数或既有计数为负时抛出。
+    :returns: 是否已升级 exit-after-closeout。
+    :raises ValueError: ``interrupt_count`` 非正数或 composer revision 非法时抛出。
     :raises Exception: cancel/display owner 失败时向上透传。
     """
 
     if interrupt_count <= 0:
         raise ValueError("interactive SIGINT increment must be positive")
-    if active_sigint_count < 0:
-        raise ValueError("interactive active SIGINT count must be non-negative")
     exit_after_closeout = False
     for _interrupt_index in range(interrupt_count):
-        active_sigint_count += 1
-        exit_after = active_sigint_count >= 2
+        exit_after = sigint_chord.consume_active_signal(
+            composer.current_input_revision()
+        )
         await _request_interactive_cancel(
             active=active,
             reason=CLI_SIGINT_REASON,
@@ -2328,7 +2439,7 @@ async def _consume_interactive_active_sigints(
         )
         if exit_after:
             exit_after_closeout = True
-    return active_sigint_count, exit_after_closeout
+    return exit_after_closeout
 
 
 async def _render_interactive_cancel_requested_once(
