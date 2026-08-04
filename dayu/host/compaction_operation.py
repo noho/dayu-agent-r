@@ -280,6 +280,8 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 compaction_operation_id=compaction_operation_id,
                 compaction_attempt_number=compaction_attempt_number,
                 compactor_input_projection_ref=projection_descriptor.payload_ref,
+                compactor_input_projection_digest=(projection_descriptor.payload_digest),
+                compactor_input_projection_size_bytes=(projection_descriptor.payload_size_bytes),
             )
             manifest_digest = sha256_digest_json(manifest)
             manifest_payload_ref = _runner_call_manifest_payload_ref(event_id)
@@ -325,8 +327,8 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                         manifest_payload_ref=manifest_descriptor.payload_ref,
                         manifest_digest=manifest_digest,
                     ),
-                    payload_ref=None,
-                    payload_digest=None,
+                    payload_ref=manifest_descriptor.payload_ref,
+                    payload_digest=manifest_digest,
                 ),
             )
             return CompactorProposalManifestReference(
@@ -1745,6 +1747,8 @@ def _compactor_runner_call_manifest_body(
     compaction_operation_id: str,
     compaction_attempt_number: int,
     compactor_input_projection_ref: str,
+    compactor_input_projection_digest: str,
+    compactor_input_projection_size_bytes: int,
 ) -> Mapping[str, JsonValue]:
     """构造 compactor proposal runner-call manifest body。
 
@@ -1754,6 +1758,8 @@ def _compactor_runner_call_manifest_body(
     :param compaction_operation_id: Host compaction operation id。
     :param compaction_attempt_number: operation 内 proposal attempt 序号。
     :param compactor_input_projection_ref: compactor input projection descriptor ref。
+    :param compactor_input_projection_digest: compactor input projection digest。
+    :param compactor_input_projection_size_bytes: compactor input projection 字节数。
     :returns: manifest canonical JSON object。
     """
 
@@ -1792,6 +1798,9 @@ def _compactor_runner_call_manifest_body(
         "role_sequence_digest": prepared_input.role_sequence_digest,
         "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
         "input_projection_digest": input_projection_digest,
+        "runner_call_projection_artifact_ref": compactor_input_projection_ref,
+        "runner_call_projection_artifact_digest": (compactor_input_projection_digest),
+        "runner_call_projection_artifact_size_bytes": (compactor_input_projection_size_bytes),
         "message_entries": list(message_entries),
         "source_cursor_refs": list(source_cursor_refs),
         "tool_schema_snapshot_refs": [],
@@ -1858,9 +1867,18 @@ def _compactor_runner_call_hot_payload(
                 manifest,
                 "input_projection_digest",
             ),
-            runner_call_projection_artifact_ref=None,
-            runner_call_projection_artifact_digest=None,
-            runner_call_projection_artifact_size_bytes=None,
+            runner_call_projection_artifact_ref=_required_manifest_text(
+                manifest,
+                "runner_call_projection_artifact_ref",
+            ),
+            runner_call_projection_artifact_digest=_required_manifest_text(
+                manifest,
+                "runner_call_projection_artifact_digest",
+            ),
+            runner_call_projection_artifact_size_bytes=_required_manifest_int(
+                manifest,
+                "runner_call_projection_artifact_size_bytes",
+            ),
             diagnostic=complete_runner_call_hot_diagnostic(
                 status=_RUNNER_CALL_VALIDATION_COMPLETE,
                 message_count=message_count,

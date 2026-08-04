@@ -211,8 +211,6 @@ from dayu.host.run_input import (
 )
 from dayu.host._runner_call_manifest import (
     RunnerCallSizingUnavailableReason,
-    parse_runner_call_hot_payload,
-    parse_runner_call_manifest,
     unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.proactive_compaction import (
@@ -240,7 +238,6 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.payload import PayloadStore
-from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
@@ -288,10 +285,18 @@ from dayu.host.durable.transaction import (
     HostTransaction,
     HostTransactionRunner,
 )
+from dayu.host.durable.tool_trace import (
+    read_runner_call_reconstruction_signals_by_run,
+    resolve_runner_call_projection_from_signal,
+)
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import _host_event_from_row
 from dayu.host.run_input import PreparedRunnerCallCandidate
+from dayu.host.tool_trace import (
+    ToolTraceSinkOptions,
+    catch_up_tool_trace_projection,
+)
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneAcquireOutcome,
@@ -306,6 +311,13 @@ from dayu.runtime.lane import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
 _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT = 2
+_COMPACTOR_RUNNER_CALL_KIND = "compactor_proposal"
+_ACCEPTED_ATTEMPT_NUMBER_FIELD = "accepted_attempt_number"
+_ATTEMPT_NUMBER_FIELD = "attempt_number"
+_ACCEPTED_MANIFEST_REF_FIELD = "accepted_proposal_manifest_ref"
+_ACCEPTED_MANIFEST_DIGEST_FIELD = "accepted_proposal_manifest_digest"
+_REJECTED_MANIFEST_REF_FIELD = "proposal_manifest_ref"
+_REJECTED_MANIFEST_DIGEST_FIELD = "proposal_manifest_digest"
 
 
 def _successful_response_identity_for_agent_request(
@@ -1017,6 +1029,36 @@ class _QualityRejectOnceCompactor(_PreparedManifestProactiveCompactor):
                 successful_response_identity=(proposal.successful_response_identity),
             )
         return proposal
+
+
+class _AlwaysQualityRejectingCompactor(_PreparedManifestProactiveCompactor):
+    """每次 runner call 成功但 candidate 都被 quality contract 拒绝的 compactor。"""
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> CompactorProposal:
+        """返回携带同源成功响应身份的无效 candidate。
+
+        :param prepared_input: 已准备且可记录 manifest 的 proposal input。
+        :returns: 必然触发 quality rejection 的 compaction proposal。
+        :raises Exception: 基类 fake proposal 执行失败时透传。
+        """
+
+        proposal = await super().run_prepared_compactor_proposal(prepared_input)
+        return CompactorProposal(
+            candidate=replace(
+                proposal.candidate,
+                diagnostics=(
+                    CompactCandidateDiagnosticV2(
+                        code="invalid-current-anchor",
+                        message="invalid current anchor citation",
+                        source_labels=("C1",),
+                    ),
+                ),
+            ),
+            successful_response_identity=proposal.successful_response_identity,
+        )
 
 
 class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
@@ -7149,7 +7191,12 @@ async def test_proactive_invalid_multiple_terminals_fail_closed_without_third_or
 async def test_proactive_compaction_retries_quality_rejection_before_accept(
     tmp_path: Path,
 ) -> None:
-    """proactive compact 首次 quality rejection 后 retry 并写入 accepted fact。"""
+    """proactive compact 首次 quality rejection 后 retry 并写入 accepted fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: repair attempt 或 formal trace identity 不同源时抛出。
+    """
 
     compactor = _QualityRejectOnceCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -7207,6 +7254,14 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             assert rejected_payload["failure_category"] == ("quality_check_rejected")
             _assert_rejected_payload_has_proposal_manifest(rejected_payload)
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
+            _resolve_and_assert_compactor_calls(
+                store.transaction_runner,
+                tmp_path=tmp_path,
+                run_id=seeded.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=(rejected_payload, compacted_payload),
+                accepted_attempt_number=2,
+            )
         finally:
             await scheduler.close()
 
@@ -8007,10 +8062,15 @@ async def test_proactive_compaction_recovery_stale_during_tier_proposal_discards
 async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallback(
     tmp_path: Path,
 ) -> None:
-    """normal 与 tier 1-3 全失败后只写一次 failed 并进入 tier 4 dispatch。"""
+    """normal 与 tier 1-3 全失败后只写一次 failed 并进入 tier 4 dispatch。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: invalid attempts、formal traces 或 fallback 不闭合时抛出。
+    """
 
     factory = _FakeWorkerFactory()
-    compactor = _RecoveryScenarioCompactor(accept_call=99)
+    compactor = _AlwaysQualityRejectingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         _append_previous_compacted_event(
@@ -8071,7 +8131,7 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
                 3,
                 4,
             )
-            assert all(payload["failure_category"] == "proposal_failed" for payload in rejected_payloads)
+            assert all(payload["failure_category"] == "quality_check_rejected" for payload in rejected_payloads)
             for payload in rejected_payloads:
                 _assert_rejected_payload_has_proposal_manifest(payload)
             failed_payload = _event_payload(
@@ -8084,6 +8144,14 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
             assert failed_payload["attempt_count"] == len(rejected_events)
             assert failed_payload["retry_repair_budget_exhausted"] is True
             assert len(factory.accepted_requests) == 1
+            _resolve_and_assert_compactor_calls(
+                store.transaction_runner,
+                tmp_path=tmp_path,
+                run_id=seeded.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=rejected_payloads,
+                accepted_attempt_number=None,
+            )
         finally:
             await scheduler.close()
 
@@ -8479,9 +8547,15 @@ async def test_pre_start_governance_without_safe_operation_id_fails_run(
 async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
     tmp_path: Path,
 ) -> None:
-    """多轮 Run 经 proactive compact 后写入 accepted closeout。"""
+    """多轮 Run 经 proactive compact 后写入 accepted closeout。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: accepted compactor trace 或 subsequent input 不可重构时抛出。
+    """
 
     factory = _FinalAnswerWorkerFactory()
+    compactor = _PreparedManifestProactiveCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(
             tmp_path,
@@ -8494,7 +8568,7 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
                 soft_threshold_tokens=60,
                 hard_threshold_tokens=260,
             ),
-            context_compactor=_PreparedManifestProactiveCompactor(),
+            context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
             memory_projection_policy=_compact_floor_one_memory_policy(),
         )
@@ -8540,28 +8614,37 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
                     CONTEXT_COMPACTED,
                 )
             )
-            runner_call_event = _latest_event_for_run(
+            _resolve_and_assert_compactor_calls(
                 store.transaction_runner,
-                compacted.run_id,
-                "RUNNER_CALL_INPUT_ASSEMBLED",
+                tmp_path=tmp_path,
+                run_id=compacted.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=(compacted_payload,),
+                accepted_attempt_number=1,
             )
-            hot = parse_runner_call_hot_payload(_event_payload(runner_call_event))
-            manifest_json = store.transaction_runner.run_read(
-                lambda transaction: sqlite_payload_object(
+            runner_call_page = store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
                     transaction,
-                    payload_ref=hot.manifest_payload_ref,
-                    payload_digest=hot.manifest_digest,
-                    payload_label="proactive post-compact manifest",
+                    compacted.run_id,
+                    after_event_sequence=0,
+                    limit=100,
                 )
             )
-            manifest = parse_runner_call_manifest(
-                manifest_json,
-                hot_payload=hot,
+            ordinary_signals = tuple(
+                signal for signal in runner_call_page.signals if signal.runner_call_kind != _COMPACTOR_RUNNER_CALL_KIND
+            )
+            assert len(ordinary_signals) == 1
+            ordinary_call = store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction,
+                    ordinary_signals[0],
+                )
             )
 
             assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < (event_types.index(CONTEXT_COMPACTED))
             assert event_types.index(CONTEXT_COMPACTED) < event_types.index("RUN_STARTED")
-            assert manifest.sizing_snapshot.sizing_stage is (ContextSizingStage.POST_COMPACT)
+            sizing_snapshot = _required_json_mapping(ordinary_call.manifest.payload["sizing_snapshot"])
+            assert sizing_snapshot["sizing_stage"] == ContextSizingStage.POST_COMPACT.value
             assert compacted_payload["operation_id"] != ""
             assert compacted_payload["accepted_attempt_number"] == 1
             assert compacted_payload["compact_artifact_ref"] != ""
@@ -11554,6 +11637,109 @@ def _append_proactive_rejection_after_terminal(
     transaction_runner.run_write(_operation)
 
 
+def _resolve_and_assert_compactor_calls(
+    transaction_runner: HostTransactionRunner,
+    *,
+    tmp_path: Path,
+    run_id: str,
+    prepared_inputs: tuple[CompactorProposalRunInput, ...],
+    attempt_payloads: tuple[Mapping[str, JsonValue], ...],
+    accepted_attempt_number: int | None,
+) -> None:
+    """通过 public Tool Trace contract 重构并核对全部 compactor calls。
+
+    :param transaction_runner: 当前 Host durable transaction runner。
+    :param tmp_path: 当前 pytest 临时目录。
+    :param run_id: compaction 所属 Host Run id。
+    :param prepared_inputs: recorder 实际消费的逐 attempt prepared inputs。
+    :param attempt_payloads: 与 attempts 对齐的 rejected/accepted canonical payloads。
+    :param accepted_attempt_number: accepted attempt 序号；全部失败时为 ``None``。
+    :returns: ``None``。
+    :raises AssertionError: manifest、projection、attempt 或 response identity
+        任一无法同源重构时抛出。
+    :raises HostDurableError: Tool Trace catch-up 或 formal resolver fail closed 时透传。
+    """
+
+    assert len(prepared_inputs) == len(attempt_payloads)
+    catch_up_tool_trace_projection(
+        transaction_runner,
+        options=ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "tool-trace" / "cold.jsonl"),
+    )
+    page = transaction_runner.run_read(
+        lambda transaction: read_runner_call_reconstruction_signals_by_run(
+            transaction,
+            run_id,
+            after_event_sequence=0,
+            limit=100,
+        )
+    )
+    signals = tuple(signal for signal in page.signals if signal.runner_call_kind == _COMPACTOR_RUNNER_CALL_KIND)
+    assert len(signals) == len(prepared_inputs)
+    resolved_calls = transaction_runner.run_read(
+        lambda transaction: tuple(resolve_runner_call_projection_from_signal(transaction, signal) for signal in signals)
+    )
+    source_events = {
+        row.event_id: row
+        for row in _events_for_run_by_type(
+            transaction_runner,
+            run_id,
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+        )
+    }
+
+    for attempt_number, (prepared_input, attempt_payload, resolved) in enumerate(
+        zip(prepared_inputs, attempt_payloads, resolved_calls, strict=True),
+        start=1,
+    ):
+        is_accepted = attempt_number == accepted_attempt_number
+        attempt_field = _ACCEPTED_ATTEMPT_NUMBER_FIELD if is_accepted else _ATTEMPT_NUMBER_FIELD
+        manifest_ref_field = _ACCEPTED_MANIFEST_REF_FIELD if is_accepted else _REJECTED_MANIFEST_REF_FIELD
+        manifest_digest_field = _ACCEPTED_MANIFEST_DIGEST_FIELD if is_accepted else _REJECTED_MANIFEST_DIGEST_FIELD
+        signal = resolved.signal
+        source_event = source_events[signal.event_id]
+        hot_payload = _event_payload(source_event)
+        assert signal.runner_call_index == attempt_number - 1
+        assert _required_json_int(attempt_payload[attempt_field]) == attempt_number
+        assert source_event.payload_ref == signal.manifest_ref
+        assert source_event.payload_digest == signal.manifest_digest
+        assert _required_json_text(hot_payload["manifest_payload_ref"]) == signal.manifest_ref
+        assert _required_json_text(hot_payload["manifest_digest"]) == signal.manifest_digest
+        assert resolved.manifest.payload_ref == signal.manifest_ref
+        assert resolved.manifest.payload_digest == signal.manifest_digest
+        assert resolved.manifest.payload_ref == _required_json_text(attempt_payload[manifest_ref_field])
+        assert resolved.manifest.payload_digest == _required_json_text(attempt_payload[manifest_digest_field])
+
+        compactor_identity = _required_json_mapping(resolved.manifest.payload["compactor_identity"])
+        assert _required_json_int(compactor_identity["compaction_attempt_number"]) == attempt_number
+        assert (
+            _required_json_text(compactor_identity["compactor_engine_run_id"]) == prepared_input.compactor_engine_run_id
+        )
+        assert _required_json_text(compactor_identity["compaction_operation_id"]) == _required_json_text(
+            attempt_payload["operation_id"]
+        )
+        assert resolved.runner_input_projection.payload_ref == _required_json_text(
+            compactor_identity["compactor_input_projection_ref"]
+        )
+        assert _required_json_text(hot_payload["runner_call_projection_artifact_ref"]) == (
+            resolved.runner_input_projection.payload_ref
+        )
+        assert _required_json_text(hot_payload["runner_call_projection_artifact_digest"]) == (
+            resolved.runner_input_projection.payload_digest
+        )
+        assert resolved.runner_input_projection.payload_digest == (prepared_input.compactor_input_projection_digest)
+        assert resolved.runner_input_projection.payload == (prepared_input.compactor_input_projection)
+
+        response_identity = _required_json_mapping(attempt_payload["successful_response_identity"])
+        assert _required_json_text(response_identity["effective_provider"]) == (
+            prepared_input.agent_request.runner_spec.provider
+        )
+        assert _required_json_text(response_identity["effective_model"]) == (
+            prepared_input.agent_request.runner_spec.model
+        )
+        runner_request_identity = _required_json_mapping(response_identity["runner_request_identity"])
+        assert _required_json_text(runner_request_identity["run_id"]) == (prepared_input.compactor_engine_run_id)
+
+
 def _assert_accepted_payload_has_proposal_manifest(
     payload: Mapping[str, JsonValue],
 ) -> None:
@@ -11929,6 +12115,44 @@ def _require_text(value: str | None) -> str:
     """
 
     assert value is not None
+    return value
+
+
+def _required_json_mapping(value: JsonValue) -> Mapping[str, JsonValue]:
+    """读取测试 canonical payload 中的 JSON object。
+
+    :param value: 待校验 JSON 值。
+    :returns: 严格字符串 key 的 JSON mapping。
+    :raises AssertionError: 值不是 JSON object 时抛出。
+    """
+
+    assert isinstance(value, Mapping)
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _required_json_text(value: JsonValue) -> str:
+    """读取测试 canonical payload 中的非空文本。
+
+    :param value: 待校验 JSON 值。
+    :returns: 非空文本。
+    :raises AssertionError: 值不是非空文本时抛出。
+    """
+
+    assert isinstance(value, str)
+    assert value != ""
+    return value
+
+
+def _required_json_int(value: JsonValue) -> int:
+    """读取测试 canonical payload 中的严格整数。
+
+    :param value: 待校验 JSON 值。
+    :returns: 严格整数。
+    :raises AssertionError: 值不是严格整数时抛出。
+    """
+
+    assert isinstance(value, int)
+    assert not isinstance(value, bool)
     return value
 
 

@@ -1845,6 +1845,70 @@ def test_runner_call_projection_resolver_reads_artifact_projection_payload(
         )
 
 
+def test_runner_call_query_rejects_event_row_and_hot_manifest_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    """EventLog row descriptor 与 hot manifest identity 分裂时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: public Tool Trace 查询未拒绝 identity mismatch 时抛出。
+    """
+
+    manifest_ref = "payload-manifest-row-hot-mismatch"
+    manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:row-hot-mismatch",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=("system", "user"),
+    )
+    manifest_digest = sha256_digest_json(manifest)
+    hot_payload = _hot_payload_for_manifest(
+        manifest,
+        manifest_ref=manifest_ref,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_payload(
+                    transaction,
+                    payload_ref=manifest_ref,
+                    payload_id="sqlite-manifest-row-hot-mismatch",
+                    payload=manifest,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-row-descriptor-mismatch",
+                    payload_id="sqlite-row-descriptor-mismatch",
+                    payload=manifest,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-row-hot-mismatch",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload=hot_payload,
+            payload_ref="payload-row-descriptor-mismatch",
+            payload_digest=manifest_digest,
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        with pytest.raises(
+            HostDurableError,
+            match="tool trace row and runner-call hot identity mismatch",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                    transaction,
+                    "run-1",
+                    after_event_sequence=0,
+                    limit=10,
+                )
+            )
+
+
 def test_runner_call_hot_owner_fails_closed_for_missing_manifest_ref() -> None:
     """runner-call hot payload 缺 manifest ref 时在 shared owner fail closed。
 
