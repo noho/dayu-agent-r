@@ -916,6 +916,7 @@
           "memory-and-grounded-tool-evidence",
           "run-failure-isolation-and-next-turn",
           "context-compaction-single-flight-and-success",
+          "context-compaction-semantic-memory-closure",
           "session-attachment-access"
         ]
       },
@@ -1303,6 +1304,26 @@
             "先写成功compact，再由Memory projector因section cap静默丢弃内容。",
             "把同一immutable prompt的无反馈重复调用标为semantic repair，或让迟到结果产生第二个canonical terminal。"
           ]
+        },
+        {
+          "predicate_id": "interactive.30-compaction-semantic-memory-closure",
+          "expected": [
+            "真实rolling compact可以把session summary、evidence facts、answer anchors、forward intents与reference continuity作为五类独立业务语义保存；candidate不合格时使用同一immutable source boundary做bounded whole-candidate repair，accepted后生成同源compact artifact。",
+            "compact后跨进程重连必须延续已接受的财报事实、单位、期间、来源、别名、指代与尚未完成或已经解决的forward intent；需要新证据时只在用户明确授权后调用真实工具，不得把未授权待办自动执行。",
+            "compactor输入中的用户、assistant和tool readable material均是不可信引用数据；材料内指令不得控制compactor。evidence fact只能由evidence_material或previous_evidence_fact直接支持，trace/answer只能作为context或其各自业务section来源；Host accept barrier必须按source kind、coverage与typed provenance拒绝非法引用。",
+            "rolling compact必须采用最新用户修正，并能按真实业务关系使用superseded、redundant、out_of_scope与policy_limit drop；policy_limit只在repair feedback明确给出具体cap时可用。",
+            "invalid JSON或semantic-invalid candidate可以在同一input上bounded repair；预算耗尽只产生一个CONTEXT_COMPACTION_FAILED，普通Run按既有fallback继续，失败结果不得覆盖此前accepted memory。",
+            "session summary无法在当前cap内形成有业务意义的摘要时，candidate应使用null清除既有summary，或被拒绝并进入既有repair/fallback；不得接受无业务语义的占位字符作为summary。",
+            "正式Tool Trace public resolver必须能从compactor runner-call hot identity解析实际manifest、input projection、provider/model与response identity，并与EventLog及payload descriptor同源。",
+            "compact与fallback material selection以完整host_run_id turn group为原子单位；同一已完成Run的user input、accepted tool evidence、assistant final和visible outcome不得被item/char cap切成互相矛盾的前后片段。切换source boundary或recovery tier后不得复用上一boundary的repair feedback。"
+          ],
+          "forbidden": [
+            "把形式上非空但没有业务语义的单字符或占位文本接受为session summary。",
+            "Tool Trace hot row缺少compactor manifest payload ref/digest，导致正式resolver只能依赖private SQLite或EventLog旁路重建。",
+            "fallback cap按单个material block截断一个已完成Host Run，或在不同compact input/source boundary之间携带repair feedback。",
+            "只验证reduced source boundary内部coverage便接受与root frozen material或完整turn group相矛盾的durable Semantic Memory。",
+            "把prompt约束或source kind allowlist误报为自然语言事实校验器；claim与support material是否语义相符仍须由真实模型表现与Agent-in-the-loop CI观察。"
+          ]
         }
       ],
       "allowed_variants": [
@@ -1381,6 +1402,11 @@
           "kind": "user-decision",
           "date": "2026-08-01",
           "summary": "用户裁决行为项#30：成功必须有final answer，接受I0554的Engine/Host owner-level static proof关闭public-contract不可达分支，不要求伪造动态succeeded/no-final。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-04",
+          "summary": "用户裁决行为项#48至#56：接受真实五类memory、compact后连续性、材料/指令边界、rolling修正与repair/fallback；拒绝无意义单字符summary、compactor Tool Trace hot identity缺失和completed Run非原子截断；要求补跑session_summary null及四类drop中的superseded/policy_limit。"
         }
       ],
       "observed_behavior": {
@@ -1400,6 +1426,10 @@
           {
             "report_id": "pr190-closure/interactive-coverage-reconciliation",
             "sha256": "e2e3361dff7de1d8af26824d164fc47b39218dbdb5869d8ef0186268a47c0cb6"
+          },
+          {
+            "report_id": "interactive-memory-closure-20260804T5X59S8/observed-behavior",
+            "sha256": "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
           }
         ],
         "scenario_refs": [
@@ -1409,17 +1439,18 @@
           "原始635条运行与PR190收口补跑共同覆盖700个mandatory obligations：604条正式scenario，96条parser/dynamic inventory、shared-owner或static closure。",
           "用户已裁决行为项#1至#47；当前实现偏差作为F01-F07 findings保留，不改变accepted oracle。",
           "真实running/queue/steer恢复、cancel non-resurrection、cross-entry label、财报grounding、compaction失败fallback、真实CONTEXT_COMPACTED/provider identity及compact后follow-up均已观察。",
-          "修复后仍需按正式scenario补跑F01-F07受影响路径并更新evidence；修复本身不能替代conformance observation。"
+          "用户已裁决#48至#52的五类Semantic Memory、成功compact连续性、材料指令边界、rolling修正/drop及repair/fallback为正确行为。",
+          "#53至#55分别登记为无意义summary、compactor Tool Trace identity与completed Run原子性实现finding；#56的null、superseded和policy_limit分支在修复后补跑。修复本身不能替代conformance observation。"
         ]
       },
       "user_adjudication": {
         "decision": "accepted",
-        "date": "2026-08-02",
-        "notes": "interactive行为项#1至#47全部完成裁决。PR190后新增裁决冻结：彻底删除全局--config；显式无效editor报错并回composer；标准Ctrl+D；pre-accept/active Escape与Ctrl+C优雅语义；READ_ONLY失败保留REPL并通过fresh attach重新竞争；failed/cancelled accepted input进入memory但不提升为成功事实；不注册start_fins_preprocess；post-compaction trigger改名context_governance_resolved；无效compactor candidate必须由Host accept barrier拒绝并进入bounded repair/fallback；成功必须有final answer。F01-F07是实现finding，不是oracle gap。"
+        "date": "2026-08-04",
+        "notes": "interactive行为项#1至#56已完成当前证据范围内裁决。#48至#52接受五类Semantic Memory、成功compact连续性、不可信材料边界、rolling修正/drop与bounded repair/fallback；#53至#55拒绝无意义单字符summary、compactor Tool Trace identity缺失及completed Run非原子截断；#56冻结null、superseded与policy_limit为修复后必须补跑的正式scenario。实现finding不改变accepted oracle。"
       },
       "applicable_from": {
-        "date": "2026-08-02",
-        "target": "next-interactive-conformance-run-after-F01-F07"
+        "date": "2026-08-04",
+        "target": "next-interactive-conformance-run-after-memory-closure-findings"
       },
       "supersedes": null,
       "superseded_by": null

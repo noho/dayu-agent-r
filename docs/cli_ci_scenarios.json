@@ -112530,6 +112530,515 @@
       "applicable_from": "next-interactive-conformance-run-after-F01-F07",
       "supersedes": null,
       "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.summary-null",
+      "source_scenario_id": "interactive.MC14-forced-summary-null-repair",
+      "version": 1,
+      "status": "accepted",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "accepted-nonempty-session-summary"
+        ],
+        "interactive_branch_option_ids": [
+          "session-summary-null"
+        ],
+        "input_class_ids": [
+          "explicit-summary-cap-repair"
+        ],
+        "combination_high_risk_ids": [
+          "summary-clear-preserves-other-memory-sections"
+        ],
+        "cross_command_assertion_ids": [
+          "interactive.memory.null-summary-reconnect"
+        ],
+        "raw_stable_claims": [
+          "interactive.g06.summary-null"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<summary-null>",
+          "--label",
+          "memory-summary-null",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "已有非空summary，在明确cap下由真实provider形成replacement，接受后跨进程消费"
+        ]
+      },
+      "precondition": {
+        "state_id": "accepted-nonempty-session-summary",
+        "workspace": "<run-root>/workspaces/chains/<summary-null>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@1"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-session-summary-null"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-environment-and-input-timeline",
+        "terminal-screen-and-process-result",
+        "accepted-candidate-and-compact-artifact",
+        "memory-before-after-and-cross-process-consumption",
+        "formal-tool-trace",
+        "secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [
+          "interactive-memory-closure-20260804T5X59S8"
+        ],
+        "report_ids": [
+          "interactive-memory-closure-20260804T5X59S8/observed-behavior"
+        ],
+        "report_sha256": [
+          "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
+        ],
+        "relative_refs": [
+          "evidence/interactive.MC14-forced-summary-null-repair"
+        ],
+        "execution_outcome": "success",
+        "exit_codes": [
+          0
+        ],
+        "evidence_status": "missing",
+        "gap_kind": "not-run",
+        "conformance_at_observation": "implementation-finding",
+        "implementation_finding_refs": [
+          "F08-meaningless-session-summary"
+        ]
+      },
+      "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
+      "applicable_from": "next-interactive-conformance-run-after-F08-F10",
+      "supersedes": null,
+      "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.tool-trace-formal",
+      "source_scenario_id": "interactive.MC32-intent-resolution-rolling-compact",
+      "version": 1,
+      "status": "accepted",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "successful-or-failed-real-compactor-call"
+        ],
+        "interactive_branch_option_ids": [
+          "formal-compactor-tool-trace-query"
+        ],
+        "input_class_ids": [
+          "runner-call-public-read"
+        ],
+        "combination_high_risk_ids": [
+          "eventlog-hot-projection-manifest-identity"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "interactive.g06.tool-trace-formal"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<tool-trace-formal>",
+          "--label",
+          "memory-tool-trace-formal",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "分别触发successful compact与invalid/repair/fallback，再通过Host formal Tool Trace resolver读取compactor runner calls"
+        ]
+      },
+      "precondition": {
+        "state_id": "real-compactor-call-observed",
+        "workspace": "<run-root>/workspaces/chains/<tool-trace-formal>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@1"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-formal-compactor-tool-trace"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "formal-tool-trace-query-result",
+        "runner-call-manifest-and-input-projection",
+        "provider-model-response-identity",
+        "eventlog-payload-descriptor-correlation",
+        "secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [
+          "interactive-memory-closure-20260804T5X59S8"
+        ],
+        "report_ids": [
+          "interactive-memory-closure-20260804T5X59S8/observed-behavior"
+        ],
+        "report_sha256": [
+          "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
+        ],
+        "relative_refs": [
+          "evidence/interactive.MC32-intent-resolution-rolling-compact/tool-trace.json"
+        ],
+        "execution_outcome": "success",
+        "exit_codes": [
+          0
+        ],
+        "evidence_status": "missing",
+        "gap_kind": "public-observability-gap",
+        "conformance_at_observation": "implementation-finding",
+        "implementation_finding_refs": [
+          "F09-compactor-tool-trace-hot-identity"
+        ]
+      },
+      "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
+      "applicable_from": "next-interactive-conformance-run-after-F08-F10",
+      "supersedes": null,
+      "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.turn-group-atomicity",
+      "source_scenario_id": "interactive.MC32-intent-resolution-rolling-compact",
+      "version": 1,
+      "status": "accepted",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "completed-multi-tool-run-aged-beyond-recent-floor"
+        ],
+        "interactive_branch_option_ids": [
+          "proactive-root-repair-tier1-tier2"
+        ],
+        "input_class_ids": [
+          "three-tool-completed-run"
+        ],
+        "combination_high_risk_ids": [
+          "turn-group-cap-boundary",
+          "source-boundary-feedback-binding"
+        ],
+        "cross_command_assertion_ids": [
+          "interactive.memory.post-tier-reconnect-after-raw-tail-ages-out"
+        ],
+        "raw_stable_claims": [
+          "interactive.g06.turn-group-atomicity"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<turn-group-atomicity>",
+          "--label",
+          "memory-turn-group-atomicity",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "完整三工具Run及final answer进入rolling compact；root/repair被拒后进入tier1/2；继续足够多轮让旧raw tail离开floor再重连"
+        ]
+      },
+      "precondition": {
+        "state_id": "completed-multi-tool-run-plus-post-resolution-delta",
+        "workspace": "<run-root>/workspaces/chains/<turn-group-atomicity>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@1"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-turn-group-atomicity",
+        "interactive.30-repair-feedback-input-binding",
+        "interactive.30-durable-public-memory-consistency"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "root-and-per-attempt-source-boundaries",
+        "turn-group-id-and-canonical-event-correlation",
+        "repair-feedback-input-binding",
+        "accepted-memory-artifact-runinput",
+        "cross-process-consumption-after-raw-tail-ages-out",
+        "formal-tool-trace",
+        "secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [
+          "interactive-memory-closure-20260804T5X59S8"
+        ],
+        "report_ids": [
+          "interactive-memory-closure-20260804T5X59S8/observed-behavior"
+        ],
+        "report_sha256": [
+          "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
+        ],
+        "relative_refs": [
+          "evidence/interactive.MC31-intent-resolution-delta",
+          "evidence/interactive.MC32-intent-resolution-rolling-compact",
+          "evidence/interactive.MC33-intent-resolution-reconnect"
+        ],
+        "execution_outcome": "success",
+        "exit_codes": [
+          0
+        ],
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "implementation-finding",
+        "implementation_finding_refs": [
+          "F10-proactive-recovery-turn-group-atomicity"
+        ]
+      },
+      "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
+      "applicable_from": "next-interactive-conformance-run-after-F08-F10",
+      "supersedes": null,
+      "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.drop-superseded",
+      "source_scenario_id": null,
+      "version": 1,
+      "status": "accepted",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "accepted-old-business-state-plus-explicit-correction"
+        ],
+        "interactive_branch_option_ids": [
+          "drop-superseded"
+        ],
+        "input_class_ids": [
+          "temporal-correction"
+        ],
+        "combination_high_risk_ids": [
+          "old-new-conflict"
+        ],
+        "cross_command_assertion_ids": [
+          "interactive.memory.superseded-reconnect"
+        ],
+        "raw_stable_claims": [
+          "interactive.g06.drop-superseded"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<drop-superseded>",
+          "--label",
+          "memory-drop-superseded",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "建立旧事实/指代/状态，随后给出明确且有来源的新值，触发rolling compact并跨进程验证"
+        ]
+      },
+      "precondition": {
+        "state_id": "accepted-old-business-state-plus-explicit-correction",
+        "workspace": "<run-root>/workspaces/chains/<drop-superseded>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@1"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-drop-superseded"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-environment-and-input-timeline",
+        "old-and-new-source-boundary",
+        "accepted-candidate-explicit-drop",
+        "memory-artifact-runinput",
+        "cross-process-consumption",
+        "formal-tool-trace",
+        "secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [],
+        "report_ids": [],
+        "report_sha256": [],
+        "relative_refs": [],
+        "execution_outcome": null,
+        "exit_codes": [],
+        "evidence_status": "missing",
+        "gap_kind": "not-run",
+        "conformance_at_observation": "not-observed"
+      },
+      "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
+      "applicable_from": "next-interactive-conformance-run-after-F08-F10",
+      "supersedes": null,
+      "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.drop-policy-limit",
+      "source_scenario_id": null,
+      "version": 1,
+      "status": "accepted",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "relevant-material-over-explicit-repair-cap"
+        ],
+        "interactive_branch_option_ids": [
+          "drop-policy-limit"
+        ],
+        "input_class_ids": [
+          "repair-feedback-explicit-cap"
+        ],
+        "combination_high_risk_ids": [
+          "relevant-material-must-be-dropped-without-hiding-conflict"
+        ],
+        "cross_command_assertion_ids": [
+          "interactive.memory.policy-limit-reconnect"
+        ],
+        "raw_stable_claims": [
+          "interactive.g06.drop-policy-limit"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<drop-policy-limit>",
+          "--label",
+          "memory-drop-policy-limit",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "构造多个仍相关source；首次candidate超过明确cap；repair feedback给出具体cap；完整replacement使用policy_limit选择必要drop"
+        ]
+      },
+      "precondition": {
+        "state_id": "relevant-material-over-explicit-repair-cap",
+        "workspace": "<run-root>/workspaces/chains/<drop-policy-limit>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@1"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-drop-policy-limit"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-environment-and-input-timeline",
+        "initial-rejection-and-repair-feedback",
+        "explicit-cap-and-accepted-policy-limit-drop",
+        "memory-artifact-runinput",
+        "cross-process-consumption",
+        "formal-tool-trace",
+        "secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [],
+        "report_ids": [],
+        "report_sha256": [],
+        "relative_refs": [],
+        "execution_outcome": null,
+        "exit_codes": [],
+        "evidence_status": "missing",
+        "gap_kind": "not-run",
+        "conformance_at_observation": "not-observed"
+      },
+      "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
+      "applicable_from": "next-interactive-conformance-run-after-F08-F10",
+      "supersedes": null,
+      "superseded_by": null
     }
   ],
   "readiness_proof": {
