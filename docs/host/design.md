@@ -3752,10 +3752,10 @@ compact material selection 必须满足：
 - proactive path 的目标是压缩旧 prefix，为当前 Run dispatch 腾出预算；current input anchor 与 protected recent floor 必须保留。
 - reactive path 来自被冻结的 overflow ordinary input material list，优先压缩 older prefix；current input anchor 与 protected recent floor 必须保留到 recovery dispatch。
 - selection 的候选集合是 `post_compact_delta_material`，不从 `latest_accepted_compacted_view` 中重新选择 raw recent window；fallback 与 ordinary selected recent window 复用同一个 recent-window selection 语义，只替换 fallback caps / tier。
-- selection 按完整 material block 与 budget 压力裁剪，不按 raw item、固定轮数或字段字符数裁剪；一轮中包含的长 tool result 可以单独形成 evidence material block 或 evidence-block 内部分段。
+- selection 先按稳定 material 顺序归并完整 `host_run_id` turn group，再把不属于 turn group 的合法 material block 作为 singleton atomic unit；current input、protected recent floor、already represented、previous compacted view 与 segment boundary 的任一排除命中都会排除完整 atomic unit。随后只对 eligible atomic unit 做 strict prefix item/字符 budget，item 数按 unit 内真实 block 数计算；首个 oversized unit 也不得越 cap、拆组或跳过后继续选择更晚 unit。
 - 给定 input cursor、material source cursor、policy 与 ordinary input material list，selection 必须确定性输出本次进入 compact input 的 block ids，供 tests、trace 与 audit 解释。
 - 已被 latest accepted compacted view 代表的旧 raw turns / old tool results 不应在下一次 compact 中重新展开。
-- selection 输出的 block id / provenance 必须从 selection 到 rendering 全程同源；LLM-facing material 缩小时只能 whole-block keep-drop、section-aware keep-drop、chunking with provenance 或 fail closed，不能用字段级 silent truncation 或 lossy preview 冒充完整 material。
+- selection 输出的 block id / provenance 必须从 selection 到 rendering 全程同源；root selection 为每个 selected block 保存同序的 canonical source refs 与最终 pack content digest，transient pass 只能取该 root proof 的精确子集。LLM-facing material 缩小时只能 whole atomic-unit keep-drop、section-aware keep-drop 或 fail closed，不能在 selected packer 中做文本去重、字段级 silent truncation 或 lossy preview 冒充完整 material。相同文本但 canonical ref 不同的 selected block 必须保留；selected history/evidence 与 current input anchor 共享 canonical ref 时必须在 pipeline 和 provider 前 fail closed。
 
 material data block 的 section 映射必须一对一，不允许同一 canonical content 同时进入两个 LLM-facing section：
 
@@ -3782,10 +3782,11 @@ repair / failure policy 收口，不能盲打 provider。
 
 reactive compact 来自 provider context overflow，不能把已经 overflow 的 ordinary messages 原样一次性交给 compactor。Host 必须冻结
 overflowed ordinary input material list，优先压缩 older prefix，保留 selected recent window 与 current input anchor；若完整 material
-list 仍超过 compactor budget，应按 compact material block 分段多 pass 压缩。分段单位是 trace block、evidence block、summary block、
-answer block 与 current input anchor，而不是固定轮数。若单个 evidence block 自身超过 compactor budget，必须在同一
-canonical evidence provenance 下做 evidence-block 内部分段。reactive path 不依赖估算证明成功，而是通过 bounded multi-pass compact
-与真实 recovery dispatch / provider overflow 闭环收敛，超过 `max_reactive_compactions_per_run` 后 fail closed。
+list 仍超过 compactor budget，应按 root atomic selection 形成的 block partition 执行多 pass。每个 transient pass 都绑定同一 root
+selection digest，并携带 root selected provenance 的精确子集；全部 pass 对 root proof 必须无重叠、无遗漏，每个 pass 在 provider 前还要
+校验 proof 与自身 material pack 完全一致。单个 oversized atomic unit 不拆分，留在完整 canonical snapshot 中并进入既有 tier 4/5
+raw-window 或 fail-closed 决策。reactive path 不依赖估算证明成功，而是通过 bounded multi-pass compact 与真实 recovery dispatch /
+provider overflow 闭环收敛，超过 `max_reactive_compactions_per_run` 后 fail closed。
 
 reactive multi-pass 是同一个 compaction operation 内的 material block batch processing，不追加新的
 `CONTEXT_COMPACTION_REQUESTED`，也不单独消耗 `max_reactive_compactions_per_run`。每个 pass 的外部 LLM proposal 消耗
@@ -3793,6 +3794,12 @@ reactive multi-pass 是同一个 compaction operation 内的 material block batc
 artifact 暂存；Host 只能在所有 required passes 通过 quality / budget gate 后提交一个合并的 `CONTEXT_COMPACTED`。若中间 pass
 失败且 repair budget 耗尽，整个 operation 写入一个最终 `CONTEXT_COMPACTION_FAILED`，不得提交孤立的 partial compacted event，
 memory projection 也不得消费中间产物。
+
+repair feedback 只绑定产生它的 immutable request digest 与 source-boundary digest。相同 root request 的 repair 可以复用；tier、material
+boundary 或任一 digest 改变时必须清空旧 feedback，operation 即使绕过 dispatcher 收到 mismatch 也要在 provider 前以既有
+non-repairable failure transport 收口。两个治理 digest 只参与 Host 内部 binding、audit 与 request serialization，不进入 LLM-facing
+repair JSON。最终 durable accept 必须重新验证原始 aggregate root 的完整 turn-group 二分、selected proof 与 pack 边界；transient
+accepted truth 不能单独形成 artifact、Memory 或 terminal。
 
 ### 25.1 Compact Event 响应路径
 

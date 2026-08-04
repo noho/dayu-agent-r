@@ -23,6 +23,7 @@ from dayu.host.compaction import (
     PreviousCompactReadableView,
     EvidenceReadableItemVNext,
     CompactSegmentSelection,
+    CompactSegmentSelectionScope,
     CompactSegmentTrigger,
     CurrentInputAnchor,
     CompactCandidateV2,
@@ -37,6 +38,8 @@ from dayu.host.compaction import (
     TraceReadableItemVNext,
     TraceReadableKindVNext,
     previous_answer_anchor_block_text,
+    SelectedBlockProvenance,
+    TurnGroupMembership,
     validate_previous_compacted_view_pair,
 )
 from dayu.host.context_budget import BudgetTextFragment
@@ -91,6 +94,14 @@ _REASON_ALREADY_REPRESENTED = "already_represented"
 _REASON_BUDGET_LIMIT = "budget_limit"
 _REASON_NOT_IN_SEGMENT = "not_in_segment"
 _REASON_PREVIOUS_COMPACTED_VIEW = "previous_compacted_view_not_selected"
+_COLLECTIVE_EXCLUSION_PRECEDENCE = (
+    _REASON_PROTECTED_CURRENT_INPUT,
+    _REASON_PROTECTED_RECENT_RAW_FLOOR,
+    _REASON_ALREADY_REPRESENTED,
+    _REASON_PREVIOUS_COMPACTED_VIEW,
+    _REASON_NOT_IN_SEGMENT,
+)
+_COLLECTIVE_EXCLUSION_PRIORITY = {reason: priority for priority, reason in enumerate(_COLLECTIVE_EXCLUSION_PRECEDENCE)}
 _STABLE_GOALS_BLOCK_ID = "stable:goals"
 _STABLE_FACTS_BLOCK_ID = "stable:evidence_backed_facts"
 _STABLE_ASSUMPTIONS_BLOCK_ID = "stable:questions_assumptions"
@@ -294,6 +305,18 @@ class RunInputMaterialBlock:
                 or self.accepted_tool_evidence is not None
             ):
                 raise ValueError("non-evidence block must not carry evidence provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class _AtomicMaterialUnit:
+    """selector 阶段一产生的原子 material unit。
+
+    :param blocks: 按稳定 material 顺序排列的一个完整 group 或 singleton。
+    :param membership: turn group 的完整 membership；singleton 时为 ``None``。
+    """
+
+    blocks: tuple[RunInputMaterialBlock, ...]
+    membership: TurnGroupMembership | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -813,37 +836,53 @@ def select_compact_segment(
         max_selected_size_units=max_selected_size_units,
         max_selected_item_count=max_selected_item_count,
     )
-    protected_recent_ids = _protected_recent_turn_group_block_ids(
+    sorted_blocks = _sorted_material_blocks(
         material_blocks,
+        memory_snapshot_cursor=memory_snapshot_cursor,
+    )
+    protected_recent_ids = _protected_recent_turn_group_block_ids(
+        sorted_blocks,
         selected_recent_window_turn_floor,
     )
+    atomic_units = _atomic_material_units(sorted_blocks)
     selected: list[str] = []
     excluded_reasons: dict[str, str] = {}
-    selected_units = 0
-    budget_blocked = False
-    for block in _sorted_material_blocks(material_blocks, memory_snapshot_cursor=memory_snapshot_cursor):
-        if budget_blocked:
-            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+    eligible_units: list[_AtomicMaterialUnit] = []
+    for unit in atomic_units:
+        reason = _collective_exclusion_reason(
+            unit,
+            protected_recent_ids=protected_recent_ids,
+        )
+        if reason is None:
+            eligible_units.append(unit)
             continue
-        reason = _block_exclusion_reason(block, protected_recent_ids)
-        if reason is not None:
+        for block in unit.blocks:
             excluded_reasons[block.block_id] = reason
+
+    selected_size_units = 0
+    selected_item_count = 0
+    budget_blocked = False
+    for unit in eligible_units:
+        if budget_blocked:
+            for block in unit.blocks:
+                excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
             continue
-        if (
-            max_selected_size_units is not None
-            and selected_units + block.size_units > max_selected_size_units
-            and (len(selected) > 0 or max_selected_item_count is not None)
-        ):
-            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
-            if max_selected_item_count is not None:
-                budget_blocked = True
-            continue
-        if max_selected_item_count is not None and len(selected) >= max_selected_item_count:
-            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+        unit_size_units = sum(block.size_units for block in unit.blocks)
+        unit_item_count = len(unit.blocks)
+        exceeds_size_cap = (
+            max_selected_size_units is not None and selected_size_units + unit_size_units > max_selected_size_units
+        )
+        exceeds_item_cap = (
+            max_selected_item_count is not None and selected_item_count + unit_item_count > max_selected_item_count
+        )
+        if exceeds_size_cap or exceeds_item_cap:
+            for block in unit.blocks:
+                excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
             budget_blocked = True
             continue
-        selected.append(block.block_id)
-        selected_units += block.size_units
+        selected.extend(block.block_id for block in unit.blocks)
+        selected_size_units += unit_size_units
+        selected_item_count += unit_item_count
     protected_ids = tuple(
         block_id
         for block_id, reason in excluded_reasons.items()
@@ -857,7 +896,15 @@ def select_compact_segment(
         selected=tuple(selected),
         excluded_reasons=excluded_reasons,
     )
+    selected_provenance = selected_block_provenance_for_material_blocks(
+        sorted_blocks,
+        selected_block_ids=tuple(selected),
+    )
     digest_input = {
+        "scope": CompactSegmentSelectionScope.ROOT.value,
+        "turn_group_memberships": [unit.membership.to_json() for unit in atomic_units if unit.membership is not None],
+        "selected_block_provenance": [provenance.to_json() for provenance in selected_provenance],
+        "root_selection_digest": None,
         "selected_block_ids": selected,
         "excluded_protected_ids": list(protected_ids),
         "excluded_reason_codes": _ordered_reason_mapping(excluded_reasons),
@@ -868,6 +915,10 @@ def select_compact_segment(
         "deterministic_reason_codes": list(reason_codes),
     }
     return CompactSegmentSelection(
+        scope=CompactSegmentSelectionScope.ROOT,
+        turn_group_memberships=tuple(unit.membership for unit in atomic_units if unit.membership is not None),
+        selected_block_provenance=selected_provenance,
+        root_selection_digest=None,
         selected_block_ids=tuple(selected),
         excluded_protected_ids=protected_ids,
         trigger_source=trigger_source,
@@ -1108,7 +1159,6 @@ def build_compact_material_pack(
     selected_blocks = _selected_material_blocks(
         selected_segment.selected_block_ids,
         material_blocks,
-        current_anchor=current_anchor,
     )
     if previous_compacted_view is None:
         previous_blocks = ()
@@ -1334,11 +1384,26 @@ def initial_segment_selection(
     :returns: segment selection。
     """
 
-    selected = material_pack.all_labels
+    selected = (
+        *tuple(block.block_label for block in material_pack.trace_material),
+        *tuple(block.evidence_label for block in material_pack.evidence_material),
+        *tuple(block.block_label for block in material_pack.answer_material),
+    )
+    selected_provenance = _initial_selected_block_provenance(material_pack)
+    excluded_reasons = {
+        **{block.block_label: _REASON_PREVIOUS_COMPACTED_VIEW for block in material_pack.previous_compacted_view},
+        material_pack.current_input_anchor.anchor_label: (_REASON_PROTECTED_CURRENT_INPUT),
+    }
     reasons = _initial_reason_codes(material_pack)
     digest = sha256_digest_json(
         {
+            "scope": CompactSegmentSelectionScope.ROOT.value,
+            "turn_group_memberships": [],
+            "selected_block_provenance": [provenance.to_json() for provenance in selected_provenance],
+            "root_selection_digest": None,
             "selected_block_ids": list(selected),
+            "excluded_protected_ids": [material_pack.current_input_anchor.anchor_label],
+            "excluded_reason_codes": _ordered_reason_mapping(excluded_reasons),
             "trigger_source": trigger_source.value,
             "input_cursor": input_cursor,
             "policy_digest": _INITIAL_POLICY_DIGEST,
@@ -1346,15 +1411,66 @@ def initial_segment_selection(
         }
     )
     return CompactSegmentSelection(
+        scope=CompactSegmentSelectionScope.ROOT,
+        turn_group_memberships=(),
+        selected_block_provenance=selected_provenance,
+        root_selection_digest=None,
         selected_block_ids=selected,
-        excluded_protected_ids=(),
+        excluded_protected_ids=(material_pack.current_input_anchor.anchor_label,),
         trigger_source=trigger_source,
         input_cursor=input_cursor,
         memory_snapshot_cursor=None,
         policy_digest=_INITIAL_POLICY_DIGEST,
         deterministic_reason_codes=reasons,
         selection_digest=digest,
+        excluded_reason_codes=excluded_reasons,
     )
+
+
+def _initial_selected_block_provenance(
+    material_pack: CompactMaterialPack,
+) -> tuple[SelectedBlockProvenance, ...]:
+    """从已经构造的 initial pack 读取 selected block provenance。
+
+    该 helper 只服务没有 raw source snapshot 的 initial test/smoke material
+    builder；digest 直接消费最终 pack block，不重新解释 source 文本。
+
+    :param material_pack: 已通过 typed validation 的 initial material pack。
+    :returns: 与 initial selected labels 同序的 provenance tuple。
+    """
+
+    ordinary_blocks = (
+        *material_pack.trace_material,
+        *material_pack.answer_material,
+    )
+    ordinary_by_label = {block.block_label: block for block in ordinary_blocks}
+    evidence_by_label = {block.evidence_label: block for block in material_pack.evidence_material}
+    selected_labels = (
+        *tuple(block.block_label for block in material_pack.trace_material),
+        *tuple(block.evidence_label for block in material_pack.evidence_material),
+        *tuple(block.block_label for block in material_pack.answer_material),
+    )
+    result: list[SelectedBlockProvenance] = []
+    for label in selected_labels:
+        ordinary = ordinary_by_label.get(label)
+        if ordinary is not None:
+            result.append(
+                SelectedBlockProvenance(
+                    block_id=label,
+                    canonical_source_refs=ordinary.canonical_source_refs,
+                    packed_content_digest=ordinary.content_digest,
+                )
+            )
+            continue
+        evidence = evidence_by_label[label]
+        result.append(
+            SelectedBlockProvenance(
+                block_id=label,
+                canonical_source_refs=evidence.canonical_source_refs,
+                packed_content_digest=evidence.content_digest,
+            )
+        )
+    return tuple(result)
 
 
 def _history_blocks(materials: tuple[InitialHistoryMaterial, ...]) -> tuple[CompactMaterialBlock, ...]:
@@ -1555,6 +1671,21 @@ def _text_digest(text: str) -> str:
     return sha256_digest_json({"text": text})
 
 
+def _packed_content_digest(block: RunInputMaterialBlock) -> str:
+    """计算 selected source block 进入最终 material pack 后的内容 digest。
+
+    :param block: selected source block。
+    :returns: ordinary block 的 packed text digest，或 evidence result text digest。
+    :raises HostDurableError: accepted evidence 缺少 typed material 时抛出。
+    """
+
+    if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        if block.accepted_tool_evidence is None:
+            raise HostDurableError("RunInputMaterialBlock.accepted_tool_evidence is required")
+        return _text_digest(block.accepted_tool_evidence.result_text)
+    return _text_digest(block.text)
+
+
 def _validate_selection_inputs(
     *,
     trigger_source: CompactSegmentTrigger,
@@ -1589,6 +1720,9 @@ def _validate_selection_inputs(
         raise ValueError("memory_snapshot_cursor must be non-negative")
     _require_non_empty_text(policy_digest, "policy_digest")
     _require_material_block_tuple(material_blocks, "material_blocks")
+    block_ids = tuple(block.block_id for block in material_blocks)
+    if len(block_ids) != len(set(block_ids)):
+        raise ValueError("material_blocks block_id values must be unique")
     if selected_recent_window_turn_floor < 0:
         raise ValueError("selected_recent_window_turn_floor must be non-negative")
     if max_selected_size_units is not None and max_selected_size_units < 0:
@@ -1700,6 +1834,112 @@ def _sorted_material_blocks(
             ),
         )
     )
+
+
+def _atomic_material_units(
+    sorted_blocks: tuple[RunInputMaterialBlock, ...],
+) -> tuple[_AtomicMaterialUnit, ...]:
+    """把稳定排序后的 blocks 归并为 turn group 或 singleton 原子 unit。
+
+    :param sorted_blocks: 已按 canonical material order 排序的 blocks。
+    :returns: unit 按首成员位置排列，group 成员保持稳定顺序。
+    :raises ValueError: turn material 缺 group id 时抛出。
+    """
+
+    grouped: dict[str, list[RunInputMaterialBlock]] = {}
+    for block in sorted_blocks:
+        if not is_turn_group_material_block(block):
+            continue
+        if block.turn_group_id is None:
+            raise ValueError("turn-group material block is missing turn_group_id")
+        grouped.setdefault(block.turn_group_id, []).append(block)
+
+    emitted_groups: set[str] = set()
+    units: list[_AtomicMaterialUnit] = []
+    for block in sorted_blocks:
+        if not is_turn_group_material_block(block):
+            units.append(_AtomicMaterialUnit(blocks=(block,), membership=None))
+            continue
+        if block.turn_group_id is None:
+            raise ValueError("turn-group material block is missing turn_group_id")
+        if block.turn_group_id in emitted_groups:
+            continue
+        group_blocks = tuple(grouped[block.turn_group_id])
+        units.append(
+            _AtomicMaterialUnit(
+                blocks=group_blocks,
+                membership=TurnGroupMembership(
+                    turn_group_id=block.turn_group_id,
+                    member_block_ids=tuple(item.block_id for item in group_blocks),
+                ),
+            )
+        )
+        emitted_groups.add(block.turn_group_id)
+    return tuple(units)
+
+
+def turn_group_memberships_for_material_blocks(
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    memory_snapshot_cursor: int | None,
+) -> tuple[TurnGroupMembership, ...]:
+    """从 raw material blocks 派生 selector 使用的唯一完整 group proof。
+
+    :param material_blocks: frozen source snapshot 的 raw blocks。
+    :param memory_snapshot_cursor: stable block 排序所需 cursor。
+    :returns: 按首成员 canonical 位置排列的完整 memberships。
+    :raises TypeError: material block tuple 非法时抛出。
+    :raises ValueError: block id 重复或 turn material 缺 group id 时抛出。
+    """
+
+    _require_material_block_tuple(material_blocks, "material_blocks")
+    block_ids = tuple(block.block_id for block in material_blocks)
+    if len(block_ids) != len(set(block_ids)):
+        raise ValueError("material_blocks block_id values must be unique")
+    units = _atomic_material_units(
+        _sorted_material_blocks(
+            material_blocks,
+            memory_snapshot_cursor=memory_snapshot_cursor,
+        )
+    )
+    return tuple(unit.membership for unit in units if unit.membership is not None)
+
+
+def selected_block_provenance_for_material_blocks(
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    selected_block_ids: tuple[str, ...],
+) -> tuple[SelectedBlockProvenance, ...]:
+    """从 raw source blocks 机械派生 selected block 的最终 pack provenance。
+
+    :param material_blocks: 同一 canonical source snapshot 的 raw blocks。
+    :param selected_block_ids: selection 声明的 stable selected ids。
+    :returns: 与 selected ids 同序一一对应的 provenance tuple。
+    :raises TypeError: material blocks 或 selected ids 类型非法时抛出。
+    :raises ValueError: block id 重复或 selected id 未知时抛出。
+    :raises HostDurableError: accepted evidence 缺少 typed material 时抛出。
+    """
+
+    _require_material_block_tuple(material_blocks, "material_blocks")
+    _require_string_tuple(selected_block_ids, "selected_block_ids")
+    if len(selected_block_ids) != len(set(selected_block_ids)):
+        raise ValueError("selected_block_ids must contain unique values")
+    block_by_id = {block.block_id: block for block in material_blocks}
+    if len(block_by_id) != len(material_blocks):
+        raise ValueError("material_blocks block_id values must be unique")
+    provenance: list[SelectedBlockProvenance] = []
+    for block_id in selected_block_ids:
+        block = block_by_id.get(block_id)
+        if block is None:
+            raise ValueError("selected block provenance references unknown material block")
+        provenance.append(
+            SelectedBlockProvenance(
+                block_id=block.block_id,
+                canonical_source_refs=block.canonical_source_refs,
+                packed_content_digest=_packed_content_digest(block),
+            )
+        )
+    return tuple(provenance)
 
 
 def _block_event_sequence(block: RunInputMaterialBlock, memory_snapshot_cursor: int | None) -> int:
@@ -1822,6 +2062,26 @@ def _block_exclusion_reason(block: RunInputMaterialBlock, protected_recent_ids: 
     ):
         return _REASON_NOT_IN_SEGMENT
     return None
+
+
+def _collective_exclusion_reason(
+    unit: _AtomicMaterialUnit,
+    *,
+    protected_recent_ids: frozenset[str],
+) -> str | None:
+    """按固定 precedence 计算一个原子 unit 的 collective exclusion。
+
+    :param unit: 完整 turn group 或 singleton unit。
+    :param protected_recent_ids: protected recent raw ids。
+    :returns: 全 unit 统一 reason；所有成员均 eligible 时为 ``None``。
+    """
+
+    reasons = tuple(
+        reason for block in unit.blocks if (reason := _block_exclusion_reason(block, protected_recent_ids)) is not None
+    )
+    if len(reasons) == 0:
+        return None
+    return min(reasons, key=_COLLECTIVE_EXCLUSION_PRIORITY.__getitem__)
 
 
 def _selection_reason_codes(
@@ -2557,14 +2817,11 @@ def _current_input_anchor(current_input_ref: str, current_input_text: str) -> Cu
 def _selected_material_blocks(
     selected_block_ids: tuple[str, ...],
     material_blocks: tuple[RunInputMaterialBlock, ...],
-    *,
-    current_anchor: CurrentInputAnchor,
 ) -> tuple[RunInputMaterialBlock, ...]:
-    """按 selection ids 取回 material blocks，并过滤当前输入重复 raw turn。
+    """按 selection ids 一项不漏地取回 material blocks。
 
     :param selected_block_ids: selection 输出的 ordinary block ids。
     :param material_blocks: 同源 material list。
-    :param current_anchor: current input anchor。
     :returns: selected material blocks。
     :raises ValueError: selection 引用未知 block id 时抛出。
     """
@@ -2575,27 +2832,8 @@ def _selected_material_blocks(
         block = block_by_id.get(block_id)
         if block is None:
             raise ValueError("selected segment references unknown material block")
-        if _is_current_input_history_duplicate(block, current_anchor):
-            continue
         selected.append(block)
     return tuple(selected)
-
-
-def _is_current_input_history_duplicate(block: RunInputMaterialBlock, current_anchor: CurrentInputAnchor) -> bool:
-    """判断 history block 是否重复当前输入 anchor。
-
-    :param block: material block。
-    :param current_anchor: current input anchor。
-    :returns: 重复当前输入时返回 ``True``。
-    """
-
-    if block.section is not CompactMaterialSection.TRACE_MATERIAL:
-        return False
-    if block.kind is not CompactMaterialBlockKind.USER_INPUT:
-        return False
-    if current_anchor.canonical_source_refs[0] in block.canonical_source_refs:
-        return True
-    return block.content_digest == current_anchor.content_digest
 
 
 def _pack_previous_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactMaterialBlock, ...]:
@@ -2647,7 +2885,7 @@ def _compact_material_block(block: RunInputMaterialBlock, ordinal: int) -> Compa
         size_units=block.size_units,
         source_labels=block.source_labels,
         canonical_source_refs=block.canonical_source_refs,
-        content_digest=block.content_digest,
+        content_digest=_packed_content_digest(block),
     )
 
 
@@ -2674,7 +2912,7 @@ def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[Co
                 readable_source_text=material.source_text,
                 size_units=len(material.result_text),
                 canonical_source_refs=block.canonical_source_refs,
-                content_digest=_text_digest(material.result_text),
+                content_digest=_packed_content_digest(block),
             )
         )
     return tuple(result)
@@ -2734,7 +2972,7 @@ def _provenance_from_evidence_blocks(
                 kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
                 canonical_source_refs=source.canonical_source_refs,
                 source_event_refs=(source.tool_result_event_ref,),
-                content_digest=source.content_digest,
+                content_digest=_packed_content_digest(source),
                 accepted_evidence_id=source.accepted_evidence_id,
                 tool_result_event_ref=source.tool_result_event_ref,
                 tool_call_event_ref=source.tool_call_event_ref,
@@ -2756,6 +2994,8 @@ def _raise_on_duplicate_section_owner(entries: tuple[PromptLocalProvenanceEntry,
 
     seen: dict[tuple[tuple[str, ...], str], CompactMaterialSection] = {}
     for entry in entries:
+        if entry.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR:
+            continue
         key = (tuple(sorted(entry.canonical_source_refs)), entry.content_digest)
         existing = seen.get(key)
         if existing is None:
@@ -3161,6 +3401,8 @@ __all__ = [
     "select_compact_segment",
     "selected_material_source_refs",
     "selected_material_view_digest",
+    "selected_block_provenance_for_material_blocks",
     "transform_previous_compacted_view_pair_for_recovery",
+    "turn_group_memberships_for_material_blocks",
     "validate_material_label",
 ]

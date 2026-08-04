@@ -117,11 +117,15 @@ def accept_compact_candidate_v2(
 def build_compact_repair_feedback_v2(
     report: CompactValidationReportV2,
     *,
+    request_digest: str,
+    source_boundary_digest: str,
     previous_attempt_number: int,
 ) -> CompactRepairFeedbackV2:
     """从 reject report 构造 bounded、脱敏的 Host internal feedback。
 
     :param report: 前次 semantic validation report。
+    :param request_digest: 产生报告的 immutable request digest。
+    :param source_boundary_digest: 产生报告的 source boundary digest。
     :param previous_attempt_number: 前次 attempt number。
     :returns: 满足 32/240/8192 边界的 typed feedback。
     :raises TypeError: report 类型非法时抛出。
@@ -136,6 +140,8 @@ def build_compact_repair_feedback_v2(
     selected = list(bounded_all[:MAX_COMPACT_REPAIR_ISSUES])
     additional = len(bounded_all) - len(selected)
     feedback = CompactRepairFeedbackV2(
+        request_digest=request_digest,
+        source_boundary_digest=source_boundary_digest,
         previous_attempt_number=previous_attempt_number,
         issues=tuple(selected),
         additional_issue_count=additional,
@@ -144,6 +150,8 @@ def build_compact_repair_feedback_v2(
         selected.pop()
         additional += 1
         feedback = CompactRepairFeedbackV2(
+            request_digest=request_digest,
+            source_boundary_digest=source_boundary_digest,
             previous_attempt_number=previous_attempt_number,
             issues=tuple(selected),
             additional_issue_count=additional,
@@ -159,6 +167,8 @@ def build_compact_repair_feedback_v2(
             source_labels=only_issue.source_labels[:-1],
         )
         feedback = CompactRepairFeedbackV2(
+            request_digest=request_digest,
+            source_boundary_digest=source_boundary_digest,
             previous_attempt_number=previous_attempt_number,
             issues=tuple(selected),
             additional_issue_count=additional,
@@ -779,12 +789,7 @@ def _bounded_issue_message(issue: CompactValidationIssueV2) -> CompactValidation
     :returns: path、message 与 labels 均脱敏且 bounded 的 issue。
     """
 
-    safe_labels = tuple(
-        dict.fromkeys(
-            _bounded_feedback_text(label)
-            for label in issue.source_labels
-        )
-    )
+    safe_labels = tuple(dict.fromkeys(_bounded_feedback_text(label) for label in issue.source_labels))
     return CompactValidationIssueV2(
         code=issue.code,
         json_path=_bounded_feedback_text(issue.json_path),

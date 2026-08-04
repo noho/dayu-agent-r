@@ -1061,6 +1061,21 @@ class _AlwaysQualityRejectingCompactor(_PreparedManifestProactiveCompactor):
         )
 
 
+def _retain_feedback_without_binding_for_defensive_test(
+    feedback: CompactRepairFeedbackV2 | None,
+    request: CompactionRequest,
+) -> CompactRepairFeedbackV2 | None:
+    """绕过 dispatcher 正常清理，仅用于验证 operation defensive guard。
+
+    :param feedback: 前一 attempt feedback。
+    :param request: 当前 attempt request；测试 seam 故意不校验。
+    :returns: 原 feedback。
+    """
+
+    del request
+    return feedback
+
+
 class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
     """manifest 提交后阻塞 provider result 的 proactive compactor。"""
 
@@ -3859,7 +3874,12 @@ async def test_drain_loop_continues_when_dispatch_arrives_during_empty_window(
     factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
         scheduler._queue = _EnqueueOnSecondEmptyQueue(_pending_dispatch(seeded))
         scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
         try:
@@ -8107,6 +8127,17 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
             )
 
             assert compactor.calls == 4
+            root, root_repair, tier_1, tier_2 = compactor.prepared_requests
+            assert root_repair == root
+            assert compactor.prepared_inputs[0].repair_feedback is None
+            root_feedback = compactor.prepared_inputs[1].repair_feedback
+            assert root_feedback is not None
+            assert root_feedback.request_digest == root.digest()
+            assert root_feedback.source_boundary_digest == root.source_boundary_digest()
+            assert compactor.prepared_inputs[2].repair_feedback is None
+            assert compactor.prepared_inputs[3].repair_feedback is None
+            assert tier_1.digest() != root.digest()
+            assert tier_2.source_boundary_digest() != tier_1.source_boundary_digest()
             assert (
                 len(
                     _events_for_run_by_type(
@@ -8152,6 +8183,91 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
                 attempt_payloads=rejected_payloads,
                 accepted_attempt_number=None,
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_defensive_feedback_mismatch_stops_schedule_with_single_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """绕过 dispatcher 清理时 operation 拒绝跨 tier feedback 且只收口一次。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: 仅用于让 mismatch feedback 到达 operation 的测试 seam。
+    :returns: ``None``。
+    """
+
+    monkeypatch.setattr(
+        "dayu.host.dispatch._repair_feedback_for_request",
+        _retain_feedback_without_binding_for_defensive_test,
+    )
+    factory = _FakeWorkerFactory()
+    compactor = _AlwaysQualityRejectingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-defensive-feedback-previous",
+            event_id="event-defensive-feedback-previous-compact",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-defensive-feedback-mismatch",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(
+                max_compaction_attempts_per_operation=3,
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
+
+            assert compactor.calls == 2
+            assert len(compactor.prepared_inputs) == 2
+            assert (
+                _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+                == ()
+            )
+            assert (
+                len(
+                    _events_for_run_by_type(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTION_FAILED,
+                    )
+                )
+                == 1
+            )
+            rejected_events = _events_for_run_by_type(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            )
+            assert len(rejected_events) == 3
+            assert _event_payload(rejected_events[-1])["failure_category"] == ("proposal_failed")
+            assert len(factory.accepted_requests) == 1
         finally:
             await scheduler.close()
 

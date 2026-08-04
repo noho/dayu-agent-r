@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Literal, Protocol
 
 from dayu.contracts.cancellation import CancellationToken
@@ -30,6 +31,7 @@ COMPACT_INPUT_SCHEMA_V2 = "dayu.context_compaction.input.v2"
 
 COMPACT_OUTPUT_SCHEMA_V2 = "dayu.context_compaction.output.v2"
 """严格 compactor 输出 schema。"""
+
 
 class CompactMaterialSection(StrEnum):
     """vNext compact material pack 的 LLM-facing section。"""
@@ -168,6 +170,13 @@ class CompactSegmentTrigger(StrEnum):
 
     PROACTIVE = "proactive"
     REACTIVE = "reactive"
+
+
+class CompactSegmentSelectionScope(StrEnum):
+    """Compact segment selection 的闭集治理 scope。"""
+
+    ROOT = "root"
+    TRANSIENT = "transient"
 
 
 PromptLocalMaterialLabel = str
@@ -1630,12 +1639,16 @@ COMPACT_REPAIR_REQUIRED_ACTION = (
 class CompactRepairFeedbackV2:
     """Host internal semantic repair 使用的脱敏、bounded feedback。
 
+    :param request_digest: 产生 feedback 的 immutable request digest。
+    :param source_boundary_digest: 产生 feedback 的 source boundary digest。
     :param previous_attempt_number: 产生报告的前次 attempt number。
     :param issues: bounded issues。
     :param additional_issue_count: 未携带的剩余问题数。
     :param required_action: 固定 whole-candidate replacement 要求。
     """
 
+    request_digest: str
+    source_boundary_digest: str
     previous_attempt_number: int
     issues: tuple[CompactValidationIssueV2, ...]
     additional_issue_count: int
@@ -1648,6 +1661,14 @@ class CompactRepairFeedbackV2:
         :raises ValueError: attempt/count/action 或 issue 数量非法时抛出。
         """
 
+        _require_non_empty(
+            self.request_digest,
+            field_name="CompactRepairFeedbackV2.request_digest",
+        )
+        _require_non_empty(
+            self.source_boundary_digest,
+            field_name="CompactRepairFeedbackV2.source_boundary_digest",
+        )
         if self.previous_attempt_number <= 0:
             raise ValueError("CompactRepairFeedbackV2.previous_attempt_number must be positive")
         if len(self.issues) == 0 or len(self.issues) > MAX_COMPACT_REPAIR_ISSUES:
@@ -1666,6 +1687,8 @@ class CompactRepairFeedbackV2:
         """
 
         return {
+            "request_digest": self.request_digest,
+            "source_boundary_digest": self.source_boundary_digest,
             "previous_attempt_number": self.previous_attempt_number,
             "issues": [issue.to_json() for issue in self.issues],
             "additional_issue_count": self.additional_issue_count,
@@ -1763,9 +1786,102 @@ def _validation_issue_sort_key(issue: CompactValidationIssueV2) -> tuple[str, st
 
 
 @dataclass(frozen=True, slots=True)
+class TurnGroupMembership:
+    """一个 Host Run turn group 的完整 material block membership。
+
+    :param turn_group_id: 非空 Host Run id。
+    :param member_block_ids: 按 material 稳定顺序排列的非空唯一 block ids。
+    """
+
+    turn_group_id: str
+    member_block_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """校验 turn-group membership。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: group id、成员为空或成员重复时抛出。
+        """
+
+        _require_non_empty(
+            self.turn_group_id,
+            field_name="TurnGroupMembership.turn_group_id",
+        )
+        _require_unique_string_tuple(
+            self.member_block_ids,
+            field_name="TurnGroupMembership.member_block_ids",
+        )
+        if len(self.member_block_ids) == 0:
+            raise ValueError("TurnGroupMembership.member_block_ids must not be empty")
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: turn-group membership JSON object。
+        """
+
+        return {
+            "turn_group_id": self.turn_group_id,
+            "member_block_ids": _string_list_json(self.member_block_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedBlockProvenance:
+    """一个 selected source block 到最终 pack 内容的内部同源证明。
+
+    :param block_id: selection 内部 block identity。
+    :param canonical_source_refs: source block 直接提供的非空唯一 canonical refs。
+    :param packed_content_digest: 最终 compact material pack 业务内容 digest。
+    """
+
+    block_id: str
+    canonical_source_refs: tuple[str, ...]
+    packed_content_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 selected block provenance。
+
+        :returns: ``None``。
+        :raises TypeError: refs 类型非法时抛出。
+        :raises ValueError: id、refs 或 digest 为空或 refs 重复时抛出。
+        """
+
+        _require_non_empty(
+            self.block_id,
+            field_name="SelectedBlockProvenance.block_id",
+        )
+        _require_non_empty_unique_string_tuple(
+            self.canonical_source_refs,
+            field_name="SelectedBlockProvenance.canonical_source_refs",
+        )
+        _require_non_empty(
+            self.packed_content_digest,
+            field_name="SelectedBlockProvenance.packed_content_digest",
+        )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: selected block provenance JSON object。
+        """
+
+        return {
+            "block_id": self.block_id,
+            "canonical_source_refs": _string_list_json(self.canonical_source_refs),
+            "packed_content_digest": self.packed_content_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CompactSegmentSelection:
     """Compaction selected segment 摘要。
 
+    :param scope: root 或 operation-private transient scope。
+    :param turn_group_memberships: root material 中完整、稳定排序的 turn groups。
+    :param selected_block_provenance: 与 selected block ids 同序一一对应的内部证明。
+    :param root_selection_digest: transient selection 绑定的 immutable root digest。
     :param selected_block_ids: 已选择 block ids。
     :param excluded_protected_ids: 被保护排除的 block ids。
     :param trigger_source: segment selection 触发来源。
@@ -1777,6 +1893,10 @@ class CompactSegmentSelection:
     :param selection_digest: selection canonical digest。
     """
 
+    scope: CompactSegmentSelectionScope
+    turn_group_memberships: tuple[TurnGroupMembership, ...]
+    selected_block_provenance: tuple[SelectedBlockProvenance, ...]
+    root_selection_digest: str | None
     selected_block_ids: tuple[str, ...]
     excluded_protected_ids: tuple[str, ...]
     trigger_source: CompactSegmentTrigger
@@ -1795,11 +1915,45 @@ class CompactSegmentSelection:
         :raises ValueError: 字段值非法时抛出。
         """
 
-        _require_string_tuple(
+        if not isinstance(self.scope, CompactSegmentSelectionScope):
+            raise TypeError("CompactSegmentSelection.scope is invalid")
+        if not isinstance(self.turn_group_memberships, tuple):
+            raise TypeError("CompactSegmentSelection.turn_group_memberships must be tuple")
+        group_ids: list[str] = []
+        member_ids: list[str] = []
+        for membership in self.turn_group_memberships:
+            if not isinstance(membership, TurnGroupMembership):
+                raise TypeError("CompactSegmentSelection.turn_group_memberships item is invalid")
+            group_ids.append(membership.turn_group_id)
+            member_ids.extend(membership.member_block_ids)
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("CompactSegmentSelection turn_group_id values must be unique")
+        if len(member_ids) != len(set(member_ids)):
+            raise ValueError("CompactSegmentSelection member block ids must be globally unique")
+        if not isinstance(self.selected_block_provenance, tuple):
+            raise TypeError("CompactSegmentSelection.selected_block_provenance must be tuple")
+        provenance_ids: list[str] = []
+        for provenance in self.selected_block_provenance:
+            if not isinstance(provenance, SelectedBlockProvenance):
+                raise TypeError("CompactSegmentSelection.selected_block_provenance item is invalid")
+            provenance_ids.append(provenance.block_id)
+        if self.scope is CompactSegmentSelectionScope.ROOT:
+            if self.root_selection_digest is not None:
+                raise ValueError("root selection must not bind another root selection")
+        else:
+            if self.root_selection_digest is None:
+                raise ValueError("transient selection must bind root selection digest")
+            _require_non_empty(
+                self.root_selection_digest,
+                field_name="CompactSegmentSelection.root_selection_digest",
+            )
+        _require_unique_string_tuple(
             self.selected_block_ids,
             field_name="CompactSegmentSelection.selected_block_ids",
         )
-        _require_string_tuple(
+        if tuple(provenance_ids) != self.selected_block_ids:
+            raise ValueError("selected block provenance must exactly match selected block ids")
+        _require_unique_string_tuple(
             self.excluded_protected_ids,
             field_name="CompactSegmentSelection.excluded_protected_ids",
         )
@@ -1820,6 +1974,26 @@ class CompactSegmentSelection:
             self.excluded_reason_codes,
             field_name="CompactSegmentSelection.excluded_reason_codes",
         )
+        sorted_excluded_reasons = {
+            block_id: self.excluded_reason_codes[block_id]
+            for block_id in sorted(self.excluded_reason_codes)
+        }
+        object.__setattr__(
+            self,
+            "excluded_reason_codes",
+            MappingProxyType(sorted_excluded_reasons),
+        )
+        selected = set(self.selected_block_ids)
+        excluded = set(self.excluded_reason_codes)
+        if selected.intersection(excluded):
+            raise ValueError("selected and excluded block ids must be disjoint")
+        if not set(self.excluded_protected_ids).issubset(excluded):
+            raise ValueError("excluded protected ids must be excluded")
+        if self.scope is CompactSegmentSelectionScope.ROOT:
+            for membership in self.turn_group_memberships:
+                members = set(membership.member_block_ids)
+                if not (members.issubset(selected) or members.issubset(excluded)):
+                    raise ValueError("root turn group must be wholly selected or wholly excluded")
         _require_non_empty(
             self.selection_digest,
             field_name="CompactSegmentSelection.selection_digest",
@@ -1832,6 +2006,12 @@ class CompactSegmentSelection:
         """
 
         return {
+            "scope": self.scope.value,
+            "turn_group_memberships": [membership.to_json() for membership in self.turn_group_memberships],
+            "selected_block_provenance": [
+                provenance.to_json() for provenance in self.selected_block_provenance
+            ],
+            "root_selection_digest": self.root_selection_digest,
             "selected_block_ids": _string_list_json(self.selected_block_ids),
             "excluded_protected_ids": _string_list_json(self.excluded_protected_ids),
             "trigger_source": self.trigger_source.value,
@@ -2095,6 +2275,14 @@ class CompactionRequest:
         """
 
         return sha256_digest_json(self.to_json())
+
+    def source_boundary_digest(self) -> str:
+        """计算 immutable source boundary digest。
+
+        :returns: strict v2 source boundary canonical JSON 的 sha256 digest。
+        """
+
+        return sha256_digest_json([entry.to_json() for entry in self.compact_input.source_boundary])
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -2519,6 +2707,8 @@ def _require_one_section_per_canonical_content(pack: CompactMaterialPack) -> Non
     seen: dict[tuple[tuple[str, ...], str], CompactMaterialSection] = {}
     for label in pack.all_labels:
         entry = pack.provenance_map[label]
+        if entry.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR:
+            continue
         key = (tuple(sorted(entry.canonical_source_refs)), entry.content_digest)
         existing_section = seen.get(key)
         if existing_section is None:
@@ -3305,6 +3495,7 @@ __all__ = [
     "CompactValidationIssueCodeV2",
     "PreviousCompactReadableView",
     "CompactSegmentSelection",
+    "CompactSegmentSelectionScope",
     "CompactSegmentTrigger",
     "CompactionRequest",
     "CompactorProposal",
@@ -3332,10 +3523,12 @@ __all__ = [
     "ReadableFactItemVNext",
     "ReadableForwardIntentVNext",
     "ReadableReferenceContinuityItemVNext",
+    "SelectedBlockProvenance",
     "CompactReferenceContinuityV2",
     "CompactSessionSummaryV2",
     "TraceReadableItemVNext",
     "TraceReadableKindVNext",
+    "TurnGroupMembership",
     "MAX_COMPACT_REPAIR_FEEDBACK_CHARS",
     "MAX_COMPACT_REPAIR_ISSUES",
     "MAX_COMPACT_REPAIR_ISSUE_MESSAGE_CHARS",

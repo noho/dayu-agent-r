@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import NamedTuple
+from types import MappingProxyType
+from typing import NamedTuple, cast
 
 import pytest
 
@@ -58,6 +59,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     PreviousCompactReadableView,
     CompactMaterialSection,
+    CompactSegmentSelectionScope,
     CompactSegmentTrigger,
     CompactionRequest,
     ContextCompactionTriggerSource,
@@ -75,6 +77,7 @@ from dayu.host.compaction import (
     CompactSessionSummaryV2,
     CompactSourceKindV2,
     CompactSourceBoundaryEntryV2,
+    TurnGroupMembership,
 )
 from dayu.host.context_events import build_context_compacted_payload
 from dayu.host.context_budget import BudgetEstimate
@@ -430,7 +433,52 @@ def test_segment_selection_is_deterministic_for_same_inputs() -> None:
     )
 
     assert first.selected_block_ids == second.selected_block_ids
+    assert first.selected_block_provenance == second.selected_block_provenance
     assert first.selection_digest == second.selection_digest
+
+
+def test_excluded_reason_mapping_is_sorted_copied_and_read_only() -> None:
+    """excluded mapping 的存储、JSON 与外部 mutation 都保持 canonical。"""
+
+    blocks = (
+        _history_block(
+            "mapping-first",
+            event_sequence=1,
+            text="first",
+            turn_group_id="run-first",
+        ),
+        _history_block(
+            "mapping-second",
+            event_sequence=2,
+            text="second",
+            turn_group_id="run-second",
+        ),
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_item_count=0,
+    )
+    reversed_mapping = dict(reversed(tuple(selection.excluded_reason_codes.items())))
+    frozen = replace(selection, excluded_reason_codes=reversed_mapping)
+    expected = {
+        "mapping-first": "budget_limit",
+        "mapping-second": "budget_limit",
+    }
+
+    assert isinstance(frozen.excluded_reason_codes, MappingProxyType)
+    assert tuple(frozen.excluded_reason_codes) == tuple(sorted(expected))
+    assert frozen.excluded_reason_codes == expected
+    serialized = frozen.to_json()
+    assert isinstance(serialized, dict)
+    assert serialized["excluded_reason_codes"] == expected
+    reversed_mapping.clear()
+    assert frozen.excluded_reason_codes == expected
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, str], frozen.excluded_reason_codes)["other"] = "budget_limit"
 
 
 def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> None:
@@ -548,8 +596,18 @@ def test_recovery_segment_selection_enforces_fallback_item_cap() -> None:
     """S4 tier 1/3 selection 按 fallback item cap whole-drop。"""
 
     blocks = (
-        _history_block("history-a", event_sequence=1, text="history a"),
-        _history_block("history-b", event_sequence=2, text="history b"),
+        _history_block(
+            "history-a",
+            event_sequence=1,
+            text="history a",
+            turn_group_id="run-a",
+        ),
+        _history_block(
+            "history-b",
+            event_sequence=2,
+            text="history b",
+            turn_group_id="run-b",
+        ),
         _current_block("current", event_sequence=3, text="current user"),
     )
 
@@ -571,8 +629,18 @@ def test_recovery_segment_selection_does_not_use_later_block_to_evade_char_cap()
     """S4 strict cap 首个 block 超预算后不选择更晚小 block 绕过顺序。"""
 
     blocks = (
-        _history_block("history-large", event_sequence=1, text="large material"),
-        _history_block("history-small", event_sequence=2, text="x"),
+        _history_block(
+            "history-large",
+            event_sequence=1,
+            text="large material",
+            turn_group_id="run-large",
+        ),
+        _history_block(
+            "history-small",
+            event_sequence=2,
+            text="x",
+            turn_group_id="run-small",
+        ),
         _current_block("current", event_sequence=3, text="current user"),
     )
 
@@ -589,6 +657,279 @@ def test_recovery_segment_selection_does_not_use_later_block_to_evade_char_cap()
     assert selection.selected_block_ids == ()
     assert selection.excluded_reason_codes["history-large"] == "budget_limit"
     assert selection.excluded_reason_codes["history-small"] == "budget_limit"
+
+
+def test_turn_group_selection_uses_real_block_count_and_never_splits() -> None:
+    """同一 Run 的 user/tool/final 三个真实 blocks 按三项计数且全入全不入。"""
+
+    blocks = (
+        _history_block(
+            "run-user",
+            event_sequence=1,
+            text="user",
+            turn_group_id="run-grouped",
+        ),
+        _evidence_block(
+            "run-tool",
+            event_sequence=2,
+            text="tool",
+            turn_group_id="run-grouped",
+        ),
+        _history_block(
+            "run-answer",
+            event_sequence=3,
+            text="answer",
+            kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            turn_group_id="run-grouped",
+        ),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=4,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=10_000,
+        max_selected_item_count=2,
+    )
+
+    assert selection.scope is CompactSegmentSelectionScope.ROOT
+    assert selection.selected_block_ids == ()
+    assert set(selection.excluded_reason_codes.values()) == {"budget_limit"}
+    assert selection.turn_group_memberships[0].member_block_ids == (
+        "run-user",
+        "run-tool",
+        "run-answer",
+    )
+
+
+def test_turn_group_char_cap_accepts_exact_total_and_rejects_one_less() -> None:
+    """group 聚合 size 等于 cap 时全选，cap 少一字符时全组排除。"""
+
+    blocks = (
+        _history_block(
+            "exact-user",
+            event_sequence=1,
+            text="abcd",
+            turn_group_id="run-exact",
+        ),
+        _history_block(
+            "exact-answer",
+            event_sequence=2,
+            text="efgh",
+            kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            turn_group_id="run-exact",
+        ),
+    )
+    exact_size = sum(block.size_units for block in blocks)
+
+    exact = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=exact_size,
+        max_selected_item_count=2,
+    )
+    oversized = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=exact_size - 1,
+        max_selected_item_count=2,
+    )
+
+    assert exact.selected_block_ids == ("exact-user", "exact-answer")
+    assert oversized.selected_block_ids == ()
+    assert set(oversized.excluded_reason_codes.values()) == {"budget_limit"}
+
+
+def test_turn_group_budget_preserves_atomic_prefix_after_oversized_middle() -> None:
+    """前组可放、中间大组不可放时不跳到后续小组。"""
+
+    blocks = (
+        _history_block(
+            "prefix-first",
+            event_sequence=1,
+            text="aa",
+            turn_group_id="run-first",
+        ),
+        _history_block(
+            "prefix-large-user",
+            event_sequence=2,
+            text="bbbb",
+            turn_group_id="run-large",
+        ),
+        _history_block(
+            "prefix-large-answer",
+            event_sequence=3,
+            text="cccc",
+            kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            turn_group_id="run-large",
+        ),
+        _history_block(
+            "prefix-late-small",
+            event_sequence=4,
+            text="d",
+            turn_group_id="run-late",
+        ),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=5,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=7,
+        max_selected_item_count=4,
+    )
+
+    assert selection.selected_block_ids == ("prefix-first",)
+    assert selection.excluded_reason_codes == {
+        "prefix-large-user": "budget_limit",
+        "prefix-large-answer": "budget_limit",
+        "prefix-late-small": "budget_limit",
+    }
+
+
+def test_turn_group_collective_exclusion_uses_fixed_precedence() -> None:
+    """成员顺序变化不改变 protected 对 already-represented 的全组优先级。"""
+
+    represented = _history_block(
+        "mixed-represented",
+        event_sequence=1,
+        text="represented",
+        already_represented=True,
+        turn_group_id="run-mixed",
+    )
+    protected = replace(
+        _history_block(
+            "mixed-protected",
+            event_sequence=2,
+            text="protected",
+            turn_group_id="run-mixed",
+        ),
+        protected_recent_raw_turn=True,
+    )
+
+    first = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(represented, protected),
+    )
+    second = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(protected, represented),
+    )
+
+    assert first.excluded_reason_codes == second.excluded_reason_codes
+    assert set(first.excluded_reason_codes.values()) == {"protected_recent_raw_floor"}
+
+
+def test_turn_group_membership_changes_selection_digest() -> None:
+    """block 内容不变但真实 group partition 改变时 selection digest 必须变化。"""
+
+    first = _history_block(
+        "digest-first",
+        event_sequence=1,
+        text="first",
+        turn_group_id="run-together",
+    )
+    second = _history_block(
+        "digest-second",
+        event_sequence=2,
+        text="second",
+        turn_group_id="run-together",
+    )
+    together = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(first, second),
+    )
+    separate = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(
+            first,
+            replace(second, turn_group_id="run-separate"),
+        ),
+    )
+
+    assert together.selection_digest != separate.selection_digest
+
+
+def test_root_selection_contract_rejects_partial_turn_group_membership() -> None:
+    """root contract 自身拒绝把一个 membership 二分为 selected 与 excluded。"""
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(
+            _history_block(
+                "contract-selected",
+                event_sequence=1,
+                text="a",
+                turn_group_id="run-selected",
+            ),
+            _history_block(
+                "contract-excluded",
+                event_sequence=2,
+                text="b",
+                turn_group_id="run-excluded",
+            ),
+        ),
+        max_selected_item_count=1,
+    )
+
+    with pytest.raises(ValueError, match="wholly selected or wholly excluded"):
+        replace(
+            selection,
+            turn_group_memberships=(
+                TurnGroupMembership(
+                    turn_group_id="run-forged-partial",
+                    member_block_ids=(
+                        "contract-selected",
+                        "contract-excluded",
+                    ),
+                ),
+            ),
+        )
+
+
+def test_turn_group_identity_is_required_without_recent_floor() -> None:
+    """即使 recent floor 为零，turn material 缺 group id 也必须 fail closed。"""
+
+    missing = _history_block(
+        "missing-group-without-floor",
+        event_sequence=1,
+        text="missing",
+        turn_group_id=None,
+    )
+
+    with pytest.raises(ValueError, match="missing turn_group_id"):
+        select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            memory_snapshot_cursor=None,
+            policy_digest=_POLICY_DIGEST,
+            material_blocks=(missing,),
+        )
 
 
 def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() -> None:
@@ -799,8 +1140,14 @@ def test_already_represented_blocks_are_not_reexpanded() -> None:
             event_sequence=1,
             text="already summarized",
             already_represented=True,
+            turn_group_id="run-represented",
         ),
-        _history_block("needs-compact", event_sequence=2, text="needs compact"),
+        _history_block(
+            "needs-compact",
+            event_sequence=2,
+            text="needs compact",
+            turn_group_id="run-needs-compact",
+        ),
     )
 
     selection = select_compact_segment(
@@ -829,6 +1176,7 @@ def test_vnext_snapshot_does_not_bridge_old_goal_into_previous_view() -> None:
         text="current_goal=same goal",
         canonical_source_refs=("snapshot-duplicate",),
         event_sequence=1,
+        turn_group_id="run-duplicate",
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -869,6 +1217,7 @@ def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() 
         text="duplicate readable content",
         canonical_source_refs=("snapshot-duplicate-owner",),
         event_sequence=1,
+        turn_group_id="run-duplicate-owner",
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -898,8 +1247,8 @@ def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() 
         )
 
 
-def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
-    """当前输入 anchor 进入 C1 后不能再作为 history raw turn 出现。"""
+def test_selected_packer_preserves_same_ref_history_for_pipeline_validation() -> None:
+    """packer 不静默删除 selected block，same-ref 由 pipeline owner 拒绝。"""
 
     current_history = run_input_material_block(
         block_id="history-current",
@@ -908,8 +1257,14 @@ def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
         text="current input",
         canonical_source_refs=("event-current",),
         event_sequence=5,
+        turn_group_id="run-current",
     )
-    old_history = _history_block("history-old", event_sequence=1, text="old input")
+    old_history = _history_block(
+        "history-old",
+        event_sequence=1,
+        text="old input",
+        turn_group_id="run-old",
+    )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.REACTIVE,
         input_cursor=5,
@@ -928,7 +1283,14 @@ def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
     )
 
     assert pack.current_input_anchor.anchor_text == "current input"
-    assert tuple(block.text for block in pack.trace_material) == ("old input",)
+    assert tuple(block.text for block in pack.trace_material) == (
+        "old input",
+        "current input",
+    )
+    assert tuple(item.block_id for item in selection.selected_block_provenance) == (
+        "history-old",
+        "history-current",
+    )
 
 
 def test_conversation_compact_input_vnext_maps_material_without_citable_current_anchor() -> None:
@@ -1081,6 +1443,7 @@ def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer
         text="assistant final answer",
         canonical_source_refs=("event-run-succeeded",),
         event_sequence=2,
+        turn_group_id="run-answer",
     )
     pack = build_compact_material_pack(
         selected_segment=select_compact_segment(
@@ -1551,7 +1914,9 @@ def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     assert evidence_map["E1"].tool_result_event_ref == "tool-result:evidence-large"
     assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-large"
     assert evidence_map["E1"].canonical_source_refs == ("event:evidence-large",)
-    assert evidence_map["E1"].content_digest == evidence.content_digest
+    assert evidence_map["E1"].content_digest == pack.evidence_material[0].content_digest
+    assert evidence_map["E1"].content_digest != evidence.content_digest
+    assert selection.selected_block_provenance[0].packed_content_digest == (pack.evidence_material[0].content_digest)
     assert evidence_map["E1"].payload_refs == ("payload:evidence-large",)
     assert evidence_map["E1"].artifact_refs == ("artifact:evidence-large",)
     assert evidence_map["E1"].source_locator_refs == ()

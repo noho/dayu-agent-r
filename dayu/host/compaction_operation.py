@@ -37,6 +37,8 @@ from dayu.host.compaction import (
     CompactAcceptedTruthV2,
     CompactMaterialBlock,
     CompactRepairFeedbackV2,
+    CompactSegmentSelectionScope,
+    SelectedBlockProvenance,
     CompactSessionSummaryV2,
     CompactSourceBoundaryEntryV2,
     CompactValidationReportV2,
@@ -109,6 +111,8 @@ _DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = "material_pack_to_compact_inp
 _DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION = "proposal_execution"
 _DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = "CompactionRequest.compact_input"
 _DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION = "compactor_proposal_execution"
+_DIAGNOSTIC_SUFFIX_ROOT_BOUNDARY = "root_boundary_mismatch"
+_DIAGNOSTIC_SUFFIX_FEEDBACK_BINDING = "repair_feedback_binding_mismatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -785,8 +789,30 @@ async def _run_compaction_operation(
         raise ValueError("last_execution_attempt_number must not precede first_attempt_number")
     if last_execution_attempt_number > max_attempt_number:
         raise ValueError("last_execution_attempt_number must not exceed max_attempt_number")
-    requests = _operation_pass_requests(request=request, pass_queue=pass_queue)
     rejected: list[CompactionAttemptRejected] = []
+    try:
+        _validate_operation_root_request(request)
+        if initial_repair_feedback is not None and not _repair_feedback_matches_request(
+            initial_repair_feedback,
+            request,
+        ):
+            raise ValueError(_DIAGNOSTIC_SUFFIX_FEEDBACK_BINDING)
+        requests = _operation_pass_requests(request=request, pass_queue=pass_queue)
+    except (TypeError, ValueError) as exc:
+        diagnostic_suffix = (
+            _DIAGNOSTIC_SUFFIX_FEEDBACK_BINDING
+            if str(exc) == _DIAGNOSTIC_SUFFIX_FEEDBACK_BINDING
+            else _DIAGNOSTIC_SUFFIX_ROOT_BOUNDARY
+        )
+        return _non_repairable_contract_failure_result(
+            request=request,
+            attempt_number=first_attempt_number,
+            compaction_operation_id=compaction_operation_id,
+            diagnostic_suffix=diagnostic_suffix,
+            exception=exc,
+            rejected=rejected,
+            last_budget=None,
+        )
     last_budget: int | None = None
     accepted_pass_truths: list[CompactAcceptedTruthV2 | None] = [None for _ in requests]
     repair_feedback_by_pass: list[CompactRepairFeedbackV2 | None] = [None for _ in requests]
@@ -876,6 +902,8 @@ async def _run_compaction_operation(
                         )
                     repair_feedback = build_compact_repair_feedback_v2(
                         exc.validation_report,
+                        request_digest=pass_request.digest(),
+                        source_boundary_digest=(pass_request.source_boundary_digest()),
                         previous_attempt_number=attempt_number,
                     )
                     repair_feedback_by_pass[pass_index] = repair_feedback
@@ -1029,6 +1057,8 @@ async def _run_compaction_operation(
                     )
                 repair_feedback = build_compact_repair_feedback_v2(
                     acceptance,
+                    request_digest=pass_request.digest(),
+                    source_boundary_digest=pass_request.source_boundary_digest(),
                     previous_attempt_number=attempt_number,
                 )
                 repair_feedback_by_pass[pass_index] = repair_feedback
@@ -1098,6 +1128,8 @@ async def _run_compaction_operation(
             )
             routed_feedback = build_compact_repair_feedback_v2(
                 routed_report,
+                request_digest=requests[routed_index].digest(),
+                source_boundary_digest=(requests[routed_index].source_boundary_digest()),
                 previous_attempt_number=_required_attempt_number(pass_attempt_numbers[routed_index]),
             )
             if attempt_number > last_execution_attempt_number:
@@ -1143,6 +1175,8 @@ async def _run_compaction_operation(
             )
             routed_feedback = build_compact_repair_feedback_v2(
                 routed_report,
+                request_digest=requests[routed_index].digest(),
+                source_boundary_digest=(requests[routed_index].source_boundary_digest()),
                 previous_attempt_number=_required_attempt_number(pass_attempt_numbers[routed_index]),
             )
             if attempt_number > last_execution_attempt_number:
@@ -1156,6 +1190,20 @@ async def _run_compaction_operation(
             accepted_pass_truths[routed_index] = None
             pass_index = routed_index
             continue
+        try:
+            _validate_operation_root_request(request)
+        except (TypeError, ValueError) as exc:
+            return _non_repairable_contract_failure_result(
+                request=request,
+                attempt_number=(
+                    accepted_attempt_number if accepted_attempt_number is not None else first_attempt_number
+                ),
+                compaction_operation_id=compaction_operation_id,
+                diagnostic_suffix=_DIAGNOSTIC_SUFFIX_ROOT_BOUNDARY,
+                exception=exc,
+                rejected=rejected,
+                last_budget=last_budget,
+            )
         return CompactionOperationResult(
             accepted_truth=root_acceptance,
             rejected_attempts=tuple(rejected),
@@ -1388,6 +1436,63 @@ def _failed_operation_result(
     )
 
 
+def _non_repairable_contract_failure_result(
+    *,
+    request: CompactionRequest,
+    attempt_number: int,
+    compaction_operation_id: str | None,
+    diagnostic_suffix: str,
+    exception: Exception,
+    rejected: list[CompactionAttemptRejected],
+    last_budget: int | None,
+) -> CompactionOperationResult:
+    """把 Host boundary contract violation 映射为既有 non-repairable failure。
+
+    :param request: 发生 contract violation 的 operation root request。
+    :param attempt_number: 当前全局 attempt number。
+    :param compaction_operation_id: durable operation id。
+    :param diagnostic_suffix: 中性的 Host boundary diagnostic suffix。
+    :param exception: 已捕获且不会逃逸 scheduler 的 contract error。
+    :param rejected: operation 已有 rejection accumulator。
+    :param last_budget: 最后一次预算估算；尚未调用 provider 时为 ``None``。
+    :returns: 不含 accepted truth 与 repair feedback 的既有 proposal-failed transport。
+    """
+
+    diagnostic = _proposal_failure_diagnostic(
+        request=request,
+        compaction_operation_id=compaction_operation_id,
+        attempt_number=attempt_number,
+        failure_category=_FAILURE_PROPOSAL_FAILED,
+        diagnostic_suffix=diagnostic_suffix,
+        exception=exception,
+        proposal_manifest_reference=None,
+    )
+    rejected_attempt = _attempt_rejected(
+        request=request,
+        attempt_number=attempt_number,
+        failure_category=_FAILURE_PROPOSAL_FAILED,
+        repairable=False,
+        next_policy_decision=_NEXT_DECISION_FAIL_COMPACTION,
+        budget_after_attempted_compact=last_budget,
+        diagnostic_suffix=diagnostic_suffix,
+        proposal_manifest_reference=None,
+        successful_response_identity=None,
+        diagnostic=diagnostic,
+    )
+    rejected.append(rejected_attempt)
+    _log_rejected_attempt(
+        request=request,
+        rejected=rejected_attempt,
+        exception=exception,
+    )
+    return _failed_operation_result(
+        rejected=rejected,
+        failure_reason=_FAILURE_PROPOSAL_FAILED,
+        last_budget=last_budget,
+        next_repair_feedback=None,
+    )
+
+
 def _operation_pass_requests(
     *, request: CompactionRequest, pass_queue: tuple[CompactionRequest, ...]
 ) -> tuple[CompactionRequest, ...]:
@@ -1403,6 +1508,12 @@ def _operation_pass_requests(
     if len(pass_queue) == 0:
         return (request,)
     root_input = request.compact_input
+    root_provenance_by_id = {
+        provenance.block_id: provenance for provenance in request.segment_selection.selected_block_provenance
+    }
+    if len(root_provenance_by_id) != len(request.segment_selection.selected_block_provenance):
+        raise ValueError("root selected block provenance ids must be unique")
+    observed_pass_block_ids: set[str] = set()
     pass_boundary_entries: list[CompactSourceBoundaryEntryV2] = []
     for pass_request in pass_queue:
         if not isinstance(pass_request, CompactionRequest):
@@ -1415,6 +1526,20 @@ def _operation_pass_requests(
             or pass_request.execution_id != request.execution_id
         ):
             raise ValueError("pass_queue request identity must match root request")
+        if pass_request.segment_selection.scope is not CompactSegmentSelectionScope.TRANSIENT:
+            raise ValueError("pass_queue selection must be transient")
+        if pass_request.segment_selection.root_selection_digest != request.segment_selection.selection_digest:
+            raise ValueError("pass_queue selection root digest mismatch")
+        if pass_request.segment_selection.turn_group_memberships != request.segment_selection.turn_group_memberships:
+            raise ValueError("pass_queue turn-group membership mismatch")
+        _validate_operation_selected_pack(pass_request)
+        for provenance in pass_request.segment_selection.selected_block_provenance:
+            root_provenance = root_provenance_by_id.get(provenance.block_id)
+            if root_provenance is None or provenance != root_provenance:
+                raise ValueError("pass_queue selected block provenance is not an exact root subset")
+            if provenance.block_id in observed_pass_block_ids:
+                raise ValueError("pass_queue selected block provenance overlaps")
+            observed_pass_block_ids.add(provenance.block_id)
         pass_input = pass_request.compact_input
         if pass_input.current_input != root_input.current_input:
             raise ValueError("pass_queue current input must match root request")
@@ -1423,7 +1548,116 @@ def _operation_pass_requests(
     pass_entries_by_label = {entry.source_label: entry for entry in pass_boundary_entries}
     if len(pass_boundary_entries) != len(pass_entries_by_label) or pass_entries_by_label != root_entries_by_label:
         raise ValueError("pass_queue boundaries must be disjoint exact partitions of root")
+    if observed_pass_block_ids != set(root_provenance_by_id):
+        raise ValueError("pass_queue selected block provenance must exactly partition root")
     return pass_queue
+
+
+def _validate_operation_root_request(request: CompactionRequest) -> None:
+    """验证 operation root selection 与 compact boundary 的 durable accept 前提。
+
+    :param request: immutable operation root request。
+    :returns: ``None``。
+    :raises TypeError: request 类型非法时抛出。
+    :raises ValueError: scope、group 二分或 boundary/provenance 不一致时抛出。
+    """
+
+    if not isinstance(request, CompactionRequest):
+        raise TypeError("request must be CompactionRequest")
+    selection = request.segment_selection
+    if selection.scope is not CompactSegmentSelectionScope.ROOT:
+        raise ValueError("operation request selection must be root")
+    if selection.root_selection_digest is not None:
+        raise ValueError("operation root selection must not bind another root")
+    if selection.trigger_source.value != request.trigger_source.value:
+        raise ValueError("operation root trigger source mismatch")
+    if tuple(provenance.block_id for provenance in selection.selected_block_provenance) != selection.selected_block_ids:
+        raise ValueError("operation root selected block provenance identity mismatch")
+    selected = set(selection.selected_block_ids)
+    excluded = set(selection.excluded_reason_codes)
+    for membership in selection.turn_group_memberships:
+        members = set(membership.member_block_ids)
+        if not (members.issubset(selected) or members.issubset(excluded)):
+            raise ValueError("operation root turn group is partial")
+    _validate_operation_selected_pack(request)
+    compact_input = request.compact_input
+    pack_labels = tuple(
+        (
+            *[block.block_label for block in request.material_pack.previous_compacted_view],
+            *[block.block_label for block in request.material_pack.trace_material],
+            *[block.evidence_label for block in request.material_pack.evidence_material],
+            *[block.block_label for block in request.material_pack.answer_material],
+        )
+    )
+    if pack_labels != tuple(entry.source_label for entry in compact_input.source_boundary):
+        raise ValueError("operation root compact boundary provenance mismatch")
+
+
+def _validate_operation_selected_pack(request: CompactionRequest) -> None:
+    """验证 request selected proof 与其最终 pack 精确同源且不覆盖 current input。
+
+    :param request: root 或 transient compaction request。
+    :returns: ``None``。
+    :raises ValueError: proof 与 pack refs/digest 不一致或覆盖 current ref 时抛出。
+    """
+
+    proof_values = _sorted_selected_provenance_values(request.segment_selection.selected_block_provenance)
+    packed_blocks = (
+        *request.material_pack.trace_material,
+        *request.material_pack.evidence_material,
+        *request.material_pack.answer_material,
+    )
+    pack_values = tuple(
+        sorted(
+            (
+                block.canonical_source_refs,
+                block.content_digest,
+            )
+            for block in packed_blocks
+        )
+    )
+    if proof_values != pack_values:
+        raise ValueError("selected block provenance does not match compact material pack")
+    current_refs = set(request.material_pack.current_input_anchor.canonical_source_refs)
+    if any(current_refs.intersection(block.canonical_source_refs) for block in packed_blocks):
+        raise ValueError("selected compact material overlaps current input canonical ref")
+
+
+def _sorted_selected_provenance_values(
+    provenance: tuple[SelectedBlockProvenance, ...],
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    """返回不依赖 prompt label/section 排列的 selected proof canonical multiset。
+
+    :param provenance: selected block provenance tuple。
+    :returns: 按 canonical refs/digest 排序、保留重复项的 tuple。
+    """
+
+    return tuple(
+        sorted(
+            (
+                item.canonical_source_refs,
+                item.packed_content_digest,
+            )
+            for item in provenance
+        )
+    )
+
+
+def _repair_feedback_matches_request(
+    feedback: CompactRepairFeedbackV2,
+    request: CompactionRequest,
+) -> bool:
+    """判断 feedback 是否精确绑定当前 immutable request 与 source boundary。
+
+    :param feedback: scheduler 或 operation loop 提供的 semantic feedback。
+    :param request: 当前 proposal request。
+    :returns: 两个 governance digest 均相同时返回 ``True``。
+    """
+
+    return (
+        feedback.request_digest == request.digest()
+        and feedback.source_boundary_digest == request.source_boundary_digest()
+    )
 
 
 def _requires_budget_acceptance(request: CompactionRequest) -> bool:

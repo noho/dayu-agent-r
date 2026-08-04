@@ -20,11 +20,13 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     run_input_material_block,
+    selected_block_provenance_for_material_blocks,
     selected_material_source_refs,
     selected_material_view_digest,
 )
 from dayu.host.compact_pipeline import (
     CompactPipelineSourceSnapshot,
+    _validate_segment_against_source_snapshot,
     build_compacted_payload_input,
     build_fallback_decision_input,
     build_normal_compact_request_plan,
@@ -39,6 +41,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     PreviousCompactReadableView,
     CompactMaterialSection,
+    CompactSegmentSelectionScope,
     CompactCandidateV2,
     CompactAcceptedTruthV2,
     CompactDropReasonV2,
@@ -244,6 +247,7 @@ def test_normal_request_plan_keeps_current_input_out_of_selected_segment() -> No
     )
 
     assert plan.request.trigger_source is ContextCompactionTriggerSource.PROACTIVE
+    assert plan.selected_segment.scope is CompactSegmentSelectionScope.ROOT
     assert plan.request.attempt_id is None
     assert plan.request.execution_id is None
     assert snapshot.current_input_ref in plan.request.recent_raw_turn_refs
@@ -305,13 +309,25 @@ def test_tier_recovery_request_plans_use_fallback_caps_degrade_and_delta_only() 
         "tier_3_delta_only",
     )
     tier_1, tier_2, tier_3 = (plan.request_plan.request for plan in plans)
-    assert len(tier_1.segment_selection.selected_block_ids) <= 1
+    assert tier_1.segment_selection.selected_block_ids == ()
+    assert {
+        block_id: reason
+        for block_id, reason in tier_1.segment_selection.excluded_reason_codes.items()
+        if block_id.startswith(("user-old", "evidence-old", "answer-old"))
+    } == {
+        "user-old": "budget_limit",
+        "evidence-old": "budget_limit",
+        "answer-old": "budget_limit",
+    }
     assert tier_2.segment_selection == tier_1.segment_selection
     assert tier_2.segment_selection != root.request.segment_selection
     assert tuple(block.kind for block in tier_2.material_pack.previous_compacted_view) == (
         CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
     )
     assert tier_3.material_pack.previous_compacted_view == ()
+    assert all(plan.request_plan.source_snapshot.material_blocks == snapshot.material_blocks for plan in plans)
+    assert tier_1.source_boundary_digest() != tier_2.source_boundary_digest()
+    assert tier_1.digest() != tier_2.digest()
 
 
 def test_reactive_pass_queue_builds_single_block_passes() -> None:
@@ -339,16 +355,123 @@ def test_reactive_pass_queue_builds_single_block_passes() -> None:
         == root.selected_segment.selected_block_ids
     )
     assert all(request.current_input_ref == snapshot.current_input_ref for request in queue.pass_requests)
-    root_input = root.request.compact_input
-    pass_inputs = tuple(
-        request.compact_input for request in queue.pass_requests
+    assert all(
+        request.segment_selection.scope is CompactSegmentSelectionScope.TRANSIENT for request in queue.pass_requests
     )
+    assert all(
+        request.segment_selection.root_selection_digest == root.selected_segment.selection_digest
+        for request in queue.pass_requests
+    )
+    assert all(
+        request.segment_selection.turn_group_memberships == root.selected_segment.turn_group_memberships
+        for request in queue.pass_requests
+    )
+    assert tuple(
+        request.segment_selection.selected_block_provenance[0]
+        for request in queue.pass_requests
+    ) == root.selected_segment.selected_block_provenance
+    root_input = root.request.compact_input
+    pass_inputs = tuple(request.compact_input for request in queue.pass_requests)
     flattened_boundary = tuple(entry for compact_input in pass_inputs for entry in compact_input.source_boundary)
     assert {entry.source_label: entry for entry in flattened_boundary} == {
         entry.source_label: entry for entry in root_input.source_boundary
     }
     assert len({entry.source_label for entry in flattened_boundary}) == len(flattened_boundary)
     assert all(compact_input.current_input == root_input.current_input for compact_input in pass_inputs)
+
+
+def test_same_text_different_ref_preserves_complete_selected_group() -> None:
+    """历史 user 与 current 文本相同但 ref 不同时完整 group 仍进入 pack/proof。"""
+
+    snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
+    old_user = snapshot.material_blocks[0]
+    same_text_user = replace(
+        old_user,
+        text=snapshot.current_input_text,
+        size_units=len(snapshot.current_input_text),
+        content_digest=sha256_digest_json({"text": snapshot.current_input_text}),
+    )
+    same_text_snapshot = replace(
+        snapshot,
+        material_blocks=(same_text_user, *snapshot.material_blocks[1:]),
+    )
+
+    plan = build_normal_compact_request_plan(
+        source_snapshot=same_text_snapshot,
+        selection_policy_digest="memory-policy-digest",
+        budget_before_compact=_budget(),
+        selected_recent_window_turn_floor=0,
+    )
+
+    assert plan.selected_segment.selected_block_ids[:3] == (
+        "user-old",
+        "evidence-old",
+        "answer-old",
+    )
+    assert tuple(
+        provenance.block_id
+        for provenance in plan.selected_segment.selected_block_provenance[:3]
+    ) == ("user-old", "evidence-old", "answer-old")
+    assert plan.request.material_pack.trace_material[0].text == snapshot.current_input_text
+
+
+def test_same_canonical_current_ref_fails_during_pipeline_request_build() -> None:
+    """selected history 与 current anchor 共用 canonical ref 时 provider 前 fail closed。"""
+
+    snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
+    same_ref_user = replace(
+        snapshot.material_blocks[0],
+        canonical_source_refs=(snapshot.current_input_ref,),
+    )
+    same_ref_snapshot = replace(
+        snapshot,
+        material_blocks=(same_ref_user, *snapshot.material_blocks[1:]),
+    )
+
+    with pytest.raises(ValueError, match="overlaps current input canonical ref"):
+        build_normal_compact_request_plan(
+            source_snapshot=same_ref_snapshot,
+            selection_policy_digest="memory-policy-digest",
+            budget_before_compact=_budget(),
+            selected_recent_window_turn_floor=0,
+        )
+
+
+def test_unknown_selected_block_id_fails_against_source_snapshot() -> None:
+    """等数量 unknown ids 即使复用真实 refs/digest 也不能通过 pipeline proof。"""
+
+    snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
+    root = build_normal_compact_request_plan(
+        source_snapshot=snapshot,
+        selection_policy_digest="memory-policy-digest",
+        budget_before_compact=_budget(),
+        selected_recent_window_turn_floor=0,
+    )
+    original = root.selected_segment
+    forged_provenance = tuple(
+        replace(provenance, block_id=f"unknown-{index}")
+        for index, provenance in enumerate(
+            original.selected_block_provenance,
+            start=1,
+        )
+    )
+    forged = replace(
+        original,
+        selected_block_ids=tuple(
+            provenance.block_id for provenance in forged_provenance
+        ),
+        selected_block_provenance=forged_provenance,
+        excluded_reason_codes={
+            block.block_id: "budget_limit" for block in snapshot.material_blocks
+        },
+        selection_digest="sha256:" + ("3" * 64),
+    )
+
+    with pytest.raises(ValueError, match="outside source snapshot"):
+        _validate_segment_against_source_snapshot(
+            source_snapshot=snapshot,
+            selected_segment=forged,
+        )
 
 
 @pytest.mark.asyncio
@@ -382,10 +505,148 @@ async def test_reactive_multi_pass_forms_one_root_accepted_truth() -> None:
 
     assert result.failure_reason is None
     assert result.accepted_truth is not None
-    result.accepted_truth.validate_input_binding(
-        root.request.compact_input
-    )
+    result.accepted_truth.validate_input_binding(root.request.compact_input)
     assert result.accepted_attempt_number == len(queue.pass_requests)
+    assert result.accepted_truth.source_boundary == root.request.compact_input.source_boundary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper_kind", ("root_subset", "pass_pack"))
+async def test_reactive_pass_provenance_tamper_fails_before_provider(
+    tamper_kind: str,
+) -> None:
+    """transient proof 必须既是 root subset 又与自身 pack 同源。
+
+    :param tamper_kind: 篡改 root subset proof 或 pass pack。
+    """
+
+    snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
+    root = build_normal_compact_request_plan(
+        source_snapshot=snapshot,
+        selection_policy_digest="memory-policy-digest",
+        budget_before_compact=_budget(),
+        selected_recent_window_turn_floor=0,
+        attempt_id="attempt-reactive",
+        execution_id="execution-reactive",
+    )
+    queue = build_reactive_pass_queue_plan(
+        source_snapshot=snapshot,
+        root_request_plan=root,
+    )
+    first = queue.pass_requests[0]
+    assert len(first.material_pack.trace_material) == 1
+    forged_digest = "sha256:" + ("6" * 64)
+    forged_trace = replace(
+        first.material_pack.trace_material[0],
+        content_digest=forged_digest,
+    )
+    forged_pack = replace(
+        first.material_pack,
+        trace_material=(forged_trace,),
+    )
+    if tamper_kind == "root_subset":
+        forged_provenance = replace(
+            first.segment_selection.selected_block_provenance[0],
+            packed_content_digest=forged_digest,
+        )
+        forged_selection = replace(
+            first.segment_selection,
+            selected_block_provenance=(forged_provenance,),
+            selection_digest="sha256:" + ("5" * 64),
+        )
+    else:
+        forged_selection = first.segment_selection
+    forged_first = replace(
+        first,
+        material_pack=forged_pack,
+        segment_selection=forged_selection,
+    )
+    compactor = _LaterPassFailingCompactor()
+
+    result = await run_compaction_operation(
+        request=root.request,
+        compactor=compactor,
+        first_attempt_number=1,
+        max_attempt_number=len(queue.pass_requests),
+        cancellation_token=ControllableCancellationToken(),
+        pass_queue=(forged_first, *queue.pass_requests[1:]),
+        compaction_operation_id=f"operation-reactive-{tamper_kind}",
+        memory_policy=default_memory_projection_policy(),
+    )
+
+    assert compactor.run_calls == 0
+    assert result.accepted_truth is None
+    assert result.failure_reason == "proposal_failed"
+    assert result.next_repair_feedback is None
+    assert result.rejected_attempts[0].repairable is False
+
+
+@pytest.mark.asyncio
+async def test_whole_group_swap_proof_fails_before_provider() -> None:
+    """等数量完整 group swap 不能复用原 root material pack。"""
+
+    snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
+    group_blocks = (
+        _user_block("group-a", event_sequence=1, turn_group_id="run-group-a"),
+        _answer_block("group-a", event_sequence=2, turn_group_id="run-group-a"),
+        _user_block("group-b", event_sequence=3, turn_group_id="run-group-b"),
+        _answer_block("group-b", event_sequence=4, turn_group_id="run-group-b"),
+    )
+    grouped_snapshot = replace(snapshot, material_blocks=group_blocks)
+    root = build_normal_compact_request_plan(
+        source_snapshot=grouped_snapshot,
+        selection_policy_digest="memory-policy-digest",
+        budget_before_compact=_budget(),
+        selected_recent_window_turn_floor=0,
+    )
+    memory_policy = replace(
+        default_memory_projection_policy(),
+        selected_recent_window_turn_floor=0,
+        fallback_selected_recent_window_item_cap=2,
+    )
+    tier_request = build_tier_recovery_request_plans(
+        source_snapshot=grouped_snapshot,
+        root_request_plan=root,
+        memory_policy=memory_policy,
+    )[0].request_plan.request
+    selection = tier_request.segment_selection
+    assert selection.selected_block_ids == ("user-group-a", "answer-group-a")
+    swapped_ids = ("user-group-b", "answer-group-b")
+    swapped_provenance = selected_block_provenance_for_material_blocks(
+        group_blocks,
+        selected_block_ids=swapped_ids,
+    )
+    swapped_selection = replace(
+        selection,
+        selected_block_ids=swapped_ids,
+        selected_block_provenance=swapped_provenance,
+        excluded_reason_codes={
+            "answer-group-a": "budget_limit",
+            "user-group-a": "budget_limit",
+        },
+        selection_digest="sha256:" + ("4" * 64),
+    )
+    forged_request = replace(
+        tier_request,
+        segment_selection=swapped_selection,
+    )
+    compactor = _LaterPassFailingCompactor()
+
+    result = await run_compaction_operation(
+        request=forged_request,
+        compactor=compactor,
+        first_attempt_number=1,
+        max_attempt_number=2,
+        cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-whole-group-swap",
+        memory_policy=memory_policy,
+    )
+
+    assert compactor.run_calls == 0
+    assert result.accepted_truth is None
+    assert result.failure_reason == "proposal_failed"
+    assert result.next_repair_feedback is None
+    assert result.rejected_attempts[0].repairable is False
 
 
 @pytest.mark.asyncio
@@ -460,10 +721,7 @@ async def test_reactive_later_pass_failure_returns_no_partial_truth() -> None:
     assert result.accepted_attempt_number is None
     assert result.accepted_successful_response_identity is None
     assert result.accepted_proposal_manifest_reference is None
-    assert all(
-        rejected.failure_category.value == "proposal_failed"
-        for rejected in result.rejected_attempts
-    )
+    assert all(rejected.failure_category.value == "proposal_failed" for rejected in result.rejected_attempts)
 
 
 @pytest.mark.asyncio

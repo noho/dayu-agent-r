@@ -357,7 +357,8 @@ def test_real_compactor_owner_setup_produces_exact_cap_feedback() -> None:
     :raises AssertionError: typed input、governance reject 或 cap 数值不同源时抛出。
     """
 
-    compact_input = _real_compactor_adversarial_request().compact_input
+    compaction_request = _real_compactor_adversarial_request()
+    compact_input = compaction_request.compact_input
     policy = _real_compactor_memory_policy()
     result = accept_compact_candidate_v2(
         compact_input,
@@ -370,7 +371,12 @@ def test_real_compactor_owner_setup_produces_exact_cap_feedback() -> None:
         CompactValidationIssueCodeV2.POLICY_ITEM_CAP_EXCEEDED,
         CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED,
     )
-    feedback = build_compact_repair_feedback_v2(result, previous_attempt_number=1)
+    feedback = build_compact_repair_feedback_v2(
+        result,
+        request_digest=compaction_request.digest(),
+        source_boundary_digest=compaction_request.source_boundary_digest(),
+        previous_attempt_number=1,
+    )
     assert any(
         f"上限 {policy.evidence_fact_item_cap} 项" in issue.message
         for issue in feedback.issues
@@ -1199,6 +1205,8 @@ async def test_real_compactor_resists_injection_and_repairs_policy_caps(
     )
     feedback = build_compact_repair_feedback_v2(
         rejected,
+        request_digest=compaction_request.digest(),
+        source_boundary_digest=compaction_request.source_boundary_digest(),
         previous_attempt_number=1,
     )
     assert any(

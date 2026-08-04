@@ -52,6 +52,9 @@ from dayu.host.memory import (
     estimate_memory_size_units,
 )
 
+_REQUEST_DIGEST = "sha256:" + ("d" * 64)
+_SOURCE_BOUNDARY_DIGEST = "sha256:" + ("e" * 64)
+
 
 def test_fresh_v2_contract_uses_exact_schema_literals() -> None:
     """fresh contract 只接受当前 strict schema literal。
@@ -498,8 +501,12 @@ def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> N
     assert len(rejected.issues) == 9
     feedback = build_compact_repair_feedback_v2(
         rejected,
+        request_digest=_REQUEST_DIGEST,
+        source_boundary_digest=_SOURCE_BOUNDARY_DIGEST,
         previous_attempt_number=1,
     )
+    assert feedback.request_digest == _REQUEST_DIGEST
+    assert feedback.source_boundary_digest == _SOURCE_BOUNDARY_DIGEST
     assert len(feedback.issues) == 9
     assert feedback.additional_issue_count == 0
     evidence_texts = tuple(item.claim for item in candidate.evidence_facts)

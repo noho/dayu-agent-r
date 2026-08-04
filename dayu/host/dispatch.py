@@ -2291,6 +2291,10 @@ class HostDispatchScheduler:
         budget_after_attempted_compact: int | None = None
         repair_feedback: CompactRepairFeedbackV2 | None = None
         for attempt_plan in execution_plans:
+            attempt_feedback = _repair_feedback_for_request(
+                repair_feedback,
+                attempt_plan.request,
+            )
             attempt_result = await run_compaction_attempt(
                 request=attempt_plan.request,
                 compactor=compactor,
@@ -2300,7 +2304,7 @@ class HostDispatchScheduler:
                 compaction_operation_id=pending.operation_id,
                 proposal_manifest_recorder=proposal_manifest_recorder,
                 memory_policy=self._local_execution.memory_projection_policy,
-                repair_feedback=repair_feedback,
+                repair_feedback=attempt_feedback,
             )
             accepted_request = attempt_plan.request
             accepted_result = attempt_result
@@ -2321,6 +2325,8 @@ class HostDispatchScheduler:
                         pending.operation_id,
                         attempt_plan.stage.value,
                     )
+                break
+            if _compaction_result_is_non_repairable(attempt_result):
                 break
             repair_feedback = attempt_result.next_repair_feedback
             if cancellation_token.is_cancelled():
@@ -5795,6 +5801,43 @@ def _compaction_result_accepted(result: CompactionOperationResult) -> bool:
     """
 
     return result.accepted_truth is not None and result.failure_reason is None
+
+
+def _repair_feedback_for_request(
+    feedback: CompactRepairFeedbackV2 | None,
+    request: CompactionRequest,
+) -> CompactRepairFeedbackV2 | None:
+    """只保留精确绑定当前 request 与 source boundary 的 feedback。
+
+    :param feedback: 前一 attempt 返回的 feedback；首次为 ``None``。
+    :param request: 当前 frozen attempt request。
+    :returns: 双 digest 同源时返回原 feedback，否则返回 ``None``。
+    """
+
+    if feedback is None:
+        return None
+    if (
+        feedback.request_digest != request.digest()
+        or feedback.source_boundary_digest != request.source_boundary_digest()
+    ):
+        return None
+    return feedback
+
+
+def _compaction_result_is_non_repairable(
+    result: CompactionOperationResult,
+) -> bool:
+    """判断 operation failure 是否明确禁止继续 proactive schedule。
+
+    :param result: 当前 attempt 的 operation result。
+    :returns: 最后一个 rejection 明确 non-repairable 时返回 ``True``。
+    """
+
+    return (
+        result.accepted_truth is None
+        and len(result.rejected_attempts) > 0
+        and not result.rejected_attempts[-1].repairable
+    )
 
 
 def _is_worker_acceptable(

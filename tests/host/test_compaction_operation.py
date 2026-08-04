@@ -19,6 +19,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactRepairFeedbackV2,
     CompactSegmentTrigger,
+    SelectedBlockProvenance,
     CompactValidationIssueCodeV2,
     CompactValidationIssueV2,
     CompactValidationReportV2,
@@ -29,8 +30,10 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import (
     CompactionOperationResult,
     CompactorProposalRunInput,
+    run_compaction_attempt,
     run_compaction_operation,
 )
+from dayu.host.context_governance import build_compact_repair_feedback_v2
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.llm_compaction import LLMCompactionValidationError
@@ -280,6 +283,8 @@ async def test_semantic_reject_gets_bounded_feedback_and_full_replacement() -> N
     feedback = compactor.prepared_inputs[1].repair_feedback
     assert feedback is not None
     assert feedback.previous_attempt_number == 1
+    assert feedback.request_digest == _request().digest()
+    assert feedback.source_boundary_digest == _request().source_boundary_digest()
     assert feedback.issues[0].code is CompactValidationIssueCodeV2.REPRESENTED_AND_DROPPED
     assert "完整 replacement candidate" in feedback.required_action
     assert compactor.prepared_inputs[0].compact_input == compactor.prepared_inputs[1].compact_input
@@ -427,6 +432,176 @@ async def test_accepted_result_missing_manifest_or_response_identity_fails_close
         missing_identity.required_successful_response_identity()
 
 
+@pytest.mark.asyncio
+async def test_mismatched_initial_feedback_fails_before_provider_call() -> None:
+    """直接注入跨 request feedback 时复用 non-repairable failure 且不调用 provider。"""
+
+    request = _request()
+    feedback = build_compact_repair_feedback_v2(
+        CompactValidationReportV2(
+            issues=(
+                CompactValidationIssueV2(
+                    code=CompactValidationIssueCodeV2.UNKNOWN_JSON_KEY,
+                    json_path="$.unexpected",
+                    message="unexpected key",
+                    source_labels=(),
+                ),
+            )
+        ),
+        request_digest="sha256:" + ("f" * 64),
+        source_boundary_digest=request.source_boundary_digest(),
+        previous_attempt_number=1,
+    )
+    compactor = _PreparedRecordingCompactor()
+
+    result = await run_compaction_attempt(
+        request=request,
+        compactor=compactor,
+        attempt_number=2,
+        max_attempt_number=3,
+        cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-feedback-mismatch",
+        memory_policy=_policy(),
+        repair_feedback=feedback,
+    )
+
+    assert compactor.prepared_inputs == []
+    assert compactor.run_calls == 0
+    assert result.accepted_truth is None
+    assert result.failure_reason == "proposal_failed"
+    assert result.next_repair_feedback is None
+    assert len(result.rejected_attempts) == 1
+    assert result.rejected_attempts[0].repairable is False
+
+
+@pytest.mark.asyncio
+async def test_root_boundary_mismatch_fails_before_provider_call() -> None:
+    """root selected ids 与 compact boundary 不一致时不产生 durable accepted truth。"""
+
+    request = _request()
+    selection = request.segment_selection
+    partial_request = replace(
+        request,
+        segment_selection=replace(
+            selection,
+            selected_block_ids=selection.selected_block_ids[:-1],
+            selected_block_provenance=(selection.selected_block_provenance[:-1]),
+            selection_digest="sha256:" + ("9" * 64),
+        ),
+    )
+    compactor = _PreparedRecordingCompactor()
+
+    result = await run_compaction_operation(
+        request=partial_request,
+        compactor=compactor,
+        first_attempt_number=1,
+        max_attempt_number=2,
+        cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-root-boundary-mismatch",
+        memory_policy=_policy(),
+    )
+
+    assert compactor.prepared_inputs == []
+    assert result.accepted_truth is None
+    assert result.failure_reason == "proposal_failed"
+    assert result.next_repair_feedback is None
+    assert result.rejected_attempts[0].repairable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch_kind", ("unknown_block", "source_ref", "packed_digest"))
+async def test_root_selected_provenance_mismatch_fails_before_provider_call(
+    mismatch_kind: str,
+) -> None:
+    """等数量 id/ref/digest mismatch 都不能通过 root provider boundary。
+
+    :param mismatch_kind: 待伪造的 provenance 字段。
+    """
+
+    request = _request()
+    selection = request.segment_selection
+    original = selection.selected_block_provenance[0]
+    if mismatch_kind == "unknown_block":
+        forged = SelectedBlockProvenance(
+            block_id="unknown-selected-block",
+            canonical_source_refs=("unknown-source-ref",),
+            packed_content_digest=original.packed_content_digest,
+        )
+    elif mismatch_kind == "source_ref":
+        forged = replace(
+            original,
+            canonical_source_refs=("forged-source-ref",),
+        )
+    else:
+        forged = replace(
+            original,
+            packed_content_digest="sha256:" + ("7" * 64),
+        )
+    forged_provenance = (forged, *selection.selected_block_provenance[1:])
+    forged_ids = tuple(item.block_id for item in forged_provenance)
+    forged_request = replace(
+        request,
+        segment_selection=replace(
+            selection,
+            selected_block_ids=forged_ids,
+            selected_block_provenance=forged_provenance,
+            selection_digest="sha256:" + ("8" * 64),
+        ),
+    )
+    compactor = _PreparedRecordingCompactor()
+
+    result = await run_compaction_operation(
+        request=forged_request,
+        compactor=compactor,
+        first_attempt_number=1,
+        max_attempt_number=2,
+        cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id=f"operation-root-{mismatch_kind}",
+        memory_policy=_policy(),
+    )
+
+    assert compactor.prepared_inputs == []
+    assert compactor.run_calls == 0
+    assert result.accepted_truth is None
+    assert result.failure_reason == "proposal_failed"
+    assert result.next_repair_feedback is None
+    assert result.rejected_attempts[0].repairable is False
+
+
+@pytest.mark.asyncio
+async def test_current_input_ref_overlap_fails_before_provider_call() -> None:
+    """绕过 pipeline 注入 current/source ref overlap 时 operation 仍 fail closed。"""
+
+    request = _request()
+    selected_ref = request.material_pack.evidence_material[0].canonical_source_refs[0]
+    forged_pack = replace(
+        request.material_pack,
+        current_input_anchor=replace(
+            request.material_pack.current_input_anchor,
+            canonical_source_refs=(selected_ref,),
+        ),
+    )
+    forged_request = replace(request, material_pack=forged_pack)
+    compactor = _PreparedRecordingCompactor()
+
+    result = await run_compaction_operation(
+        request=forged_request,
+        compactor=compactor,
+        first_attempt_number=1,
+        max_attempt_number=2,
+        cancellation_token=ControllableCancellationToken(),
+        compaction_operation_id="operation-current-ref-overlap",
+        memory_policy=_policy(),
+    )
+
+    assert compactor.prepared_inputs == []
+    assert compactor.run_calls == 0
+    assert result.accepted_truth is None
+    assert result.failure_reason == "proposal_failed"
+    assert result.next_repair_feedback is None
+    assert result.rejected_attempts[0].repairable is False
+
+
 async def _run(
     compactor: FakeContextCompactor,
     *,
@@ -450,11 +625,7 @@ async def _run(
         compactor=compactor,
         first_attempt_number=1,
         max_attempt_number=max_attempt_number,
-        cancellation_token=(
-            ControllableCancellationToken()
-            if cancellation_token is None
-            else cancellation_token
-        ),
+        cancellation_token=(ControllableCancellationToken() if cancellation_token is None else cancellation_token),
         compaction_operation_id="operation-test",
         memory_policy=_policy() if policy is None else policy,
     )

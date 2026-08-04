@@ -259,9 +259,13 @@ def _compactor_manifest(
             }
         )
     value: dict[str, JsonValue] = dict(manifest)
-    value.pop("runner_call_projection_artifact_ref")
-    value.pop("runner_call_projection_artifact_digest")
-    value.pop("runner_call_projection_artifact_size_bytes")
+    value["runner_call_projection_artifact_ref"] = (
+        "payload-compactor-runner-call-projection"
+    )
+    value["runner_call_projection_artifact_digest"] = sha256_digest_json(
+        {"projection": "compactor-hot-contract"}
+    )
+    value["runner_call_projection_artifact_size_bytes"] = 192
     value["runner_call_kind"] = "compactor_proposal"
     value["runner_call_trigger_reason"] = "context_compaction_initial_proposal"
     value["projector_metadata"] = metadata

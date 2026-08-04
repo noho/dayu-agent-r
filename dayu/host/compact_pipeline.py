@@ -32,7 +32,9 @@ from dayu.host.compact_material import (
     select_compact_segment,
     selected_material_source_refs,
     selected_material_view_digest,
+    selected_block_provenance_for_material_blocks,
     transform_previous_compacted_view_pair_for_recovery,
+    turn_group_memberships_for_material_blocks,
 )
 from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.compact_payload import (
@@ -42,10 +44,12 @@ from dayu.host.compact_payload import (
 from dayu.host.compaction import (
     CompactMaterialBlock,
     CompactMaterialBlockKind,
+    CompactMaterialPack,
     CompactMaterialSection,
     PreviousCompactReadableView,
     CompactAcceptedTruthV2,
     CompactSegmentSelection,
+    CompactSegmentSelectionScope,
     CompactSegmentTrigger,
     CompactionRequest,
     CompactInputV2,
@@ -910,6 +914,10 @@ def _request_plan_from_segment(
     :returns: request plan。
     """
 
+    _validate_segment_against_source_snapshot(
+        source_snapshot=source_snapshot,
+        selected_segment=selected_segment,
+    )
     material_pack = build_compact_material_pack(
         selected_segment=selected_segment,
         material_blocks=source_snapshot.material_blocks,
@@ -920,6 +928,7 @@ def _request_plan_from_segment(
         previous_compacted_view=previous_compacted_view,
         previous_compacted_readable_view=previous_compacted_readable_view,
     )
+    _validate_selected_pack_current_input_separation(material_pack)
     selected_evidence_refs = _selected_evidence_refs(
         material_blocks=source_snapshot.material_blocks,
         selected_block_ids=selected_segment.selected_block_ids,
@@ -957,6 +966,65 @@ def _request_plan_from_segment(
     )
 
 
+def _validate_segment_against_source_snapshot(
+    *,
+    source_snapshot: CompactPipelineSourceSnapshot,
+    selected_segment: CompactSegmentSelection,
+) -> None:
+    """验证 selection 与同一 frozen source snapshot 的 block/group truth 同源。
+
+    :param source_snapshot: immutable compact source snapshot。
+    :param selected_segment: 待构造 request 的 root 或 transient selection。
+    :returns: ``None``。
+    :raises ValueError: block partition、group proof 或 transient root binding 不一致时抛出。
+    """
+
+    snapshot_block_ids = tuple(block.block_id for block in source_snapshot.material_blocks)
+    known_ids = set(snapshot_block_ids)
+    selected_ids = set(selected_segment.selected_block_ids)
+    excluded_ids = set(selected_segment.excluded_reason_codes)
+    if not selected_ids.issubset(known_ids) or not excluded_ids.issubset(known_ids):
+        raise ValueError("segment selection contains block outside source snapshot")
+    expected_memberships = turn_group_memberships_for_material_blocks(
+        source_snapshot.material_blocks,
+        memory_snapshot_cursor=selected_segment.memory_snapshot_cursor,
+    )
+    if selected_segment.turn_group_memberships != expected_memberships:
+        raise ValueError("segment turn-group membership does not match source snapshot")
+    expected_provenance = selected_block_provenance_for_material_blocks(
+        source_snapshot.material_blocks,
+        selected_block_ids=selected_segment.selected_block_ids,
+    )
+    if selected_segment.selected_block_provenance != expected_provenance:
+        raise ValueError("segment selected block provenance does not match source snapshot")
+    if selected_segment.scope is CompactSegmentSelectionScope.ROOT:
+        if selected_ids.union(excluded_ids) != known_ids:
+            raise ValueError("root segment must exactly partition source snapshot blocks")
+        return
+    if selected_segment.root_selection_digest is None:
+        raise ValueError("transient segment must bind root selection digest")
+
+
+def _validate_selected_pack_current_input_separation(
+    material_pack: CompactMaterialPack,
+) -> None:
+    """拒绝 selected history/evidence 与 current anchor 共享 canonical ref。
+
+    :param material_pack: 已由 selected source blocks 构造的最终 pack。
+    :returns: ``None``。
+    :raises ValueError: selected pack 与 current input canonical ref 重叠时抛出。
+    """
+
+    current_refs = set(material_pack.current_input_anchor.canonical_source_refs)
+    selected_refs = (
+        *(block.canonical_source_refs for block in material_pack.trace_material),
+        *(block.canonical_source_refs for block in material_pack.evidence_material),
+        *(block.canonical_source_refs for block in material_pack.answer_material),
+    )
+    if any(current_refs.intersection(refs) for refs in selected_refs):
+        raise ValueError("selected compact material overlaps current input canonical ref")
+
+
 def _segment_trigger(
     trigger_source: ContextCompactionTriggerSource,
 ) -> CompactSegmentTrigger:
@@ -989,8 +1057,35 @@ def _single_block_segment_selection(
     known = {block.block_id for block in material_blocks}
     if block_id not in known:
         raise ValueError("reactive pass block_id is not in material list")
+    root_provenance = tuple(
+        provenance
+        for provenance in root_request.segment_selection.selected_block_provenance
+        if provenance.block_id == block_id
+    )
+    if len(root_provenance) != 1:
+        raise ValueError("reactive pass block provenance is not present exactly once in root")
     excluded = {block.block_id: _REACTIVE_NOT_IN_PASS_REASON for block in material_blocks if block.block_id != block_id}
+    digest_input = {
+        "scope": CompactSegmentSelectionScope.TRANSIENT.value,
+        "turn_group_memberships": [
+            membership.to_json() for membership in root_request.segment_selection.turn_group_memberships
+        ],
+        "selected_block_provenance": [root_provenance[0].to_json()],
+        "root_selection_digest": root_request.segment_selection.selection_digest,
+        "selected_block_ids": [block_id],
+        "excluded_protected_ids": [],
+        "trigger_source": CompactSegmentTrigger.REACTIVE.value,
+        "input_cursor": root_request.segment_selection.input_cursor,
+        "memory_snapshot_cursor": root_request.segment_selection.memory_snapshot_cursor,
+        "policy_digest": root_request.segment_selection.policy_digest,
+        "deterministic_reason_codes": [_REACTIVE_SINGLE_PASS_REASON],
+        "excluded_reason_codes": excluded,
+    }
     return CompactSegmentSelection(
+        scope=CompactSegmentSelectionScope.TRANSIENT,
+        turn_group_memberships=(root_request.segment_selection.turn_group_memberships),
+        selected_block_provenance=root_provenance,
+        root_selection_digest=root_request.segment_selection.selection_digest,
         selected_block_ids=(block_id,),
         excluded_protected_ids=(),
         trigger_source=CompactSegmentTrigger.REACTIVE,
@@ -998,13 +1093,7 @@ def _single_block_segment_selection(
         memory_snapshot_cursor=root_request.segment_selection.memory_snapshot_cursor,
         policy_digest=root_request.segment_selection.policy_digest,
         deterministic_reason_codes=(_REACTIVE_SINGLE_PASS_REASON,),
-        selection_digest=sha256_digest_json(
-            {
-                "root_selection_digest": root_request.segment_selection.selection_digest,
-                "selected_block_ids": [block_id],
-                "excluded_reason_codes": excluded,
-            }
-        ),
+        selection_digest=sha256_digest_json(digest_input),
         excluded_reason_codes=excluded,
     )
 
