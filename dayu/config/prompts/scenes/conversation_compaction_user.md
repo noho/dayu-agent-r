@@ -31,7 +31,10 @@
 输出必须完整且只含以下字段；全部字段必填：
 
 - `schema`: 字符串，必须为 `dayu.context_compaction.output.v2`。
-- `session_summary`: null，或只含 `text`、`source_labels` 的 object。object 保存后续对话仍需知道的整体任务背景、已完成进展、当前状态与关键约束的紧凑业务摘要；它是总体上下文，不机械重复每条证据、既有回答或待办。null 表示本次完整 replacement 不包含 session summary；candidate 被接受后，当前会话摘要变为空，包括清除先前已接受的摘要，但不影响同一 candidate 中其它四类业务语义项。
+- `session_summary`: null，或只含 `text`、`source_labels` 的 object。object 保存后续对话仍需知道的整体任务背景、已完成进展、当前状态与关键约束的紧凑业务摘要；它是总体上下文，不机械重复每条证据、既有回答或待办。
+  - 非 null 的 summary 必须由至少一条完整、脱离原会话也可独立理解的业务陈述组成。只覆盖本次会话中实际存在且后续需要的内容：当前用户目标、已经建立的结论或进展，以及仍影响后续的关键约束或下一步；不存在或后续不需要的维度不要编造补齐。
+  - 如果当前明确 cap 内无法形成至少一条上述完整业务陈述，必须输出 JSON `null`。禁止用占位符、孤立字符、孤立标点、无上下文缩写或任何截断片段冒充 summary。
+  - null 表示本次完整 replacement 不包含 session summary；candidate 被接受后，当前会话摘要变为空，包括清除先前已接受的摘要，不表示保留旧 summary。其它四类业务语义项仍须根据本次材料各自独立输出，不得因 summary 为 null 而一并清空。
   - `text`: 非空字符串，是可独立阅读的业务摘要；只能概括 `source_labels` 对应材料中已有的内容，不得加入材料没有的事实、结论或任务。
   - `source_labels`: 非空字符串 array；是直接参与形成该摘要的 source 引用标签。每个标签只是本次请求内的引用标签，不是事实或推理依据。
 - `evidence_facts`: array；每项只含：

@@ -373,13 +373,23 @@ def test_prompt_assets_are_self_contained_for_fresh_v2_contract() -> None:
         assert open_field_semantics in user_prompt
     for session_summary_semantics in (
         "整体任务背景、已完成进展、当前状态与关键约束",
+        "至少一条完整、脱离原会话也可独立理解的业务陈述",
+        "本次会话中实际存在且后续需要的内容",
+        "当前用户目标、已经建立的结论或进展",
+        "仍影响后续的关键约束或下一步",
+        "不存在或后续不需要的维度不要编造补齐",
+        "当前明确 cap 内无法形成至少一条上述完整业务陈述",
+        "必须输出 JSON `null`",
+        "占位符、孤立字符、孤立标点、无上下文缩写或任何截断片段",
         "只能概括 `source_labels` 对应材料中已有的内容",
         "不得加入材料没有的事实、结论或任务",
         "直接参与形成该摘要的 source 引用标签",
         "本次完整 replacement 不包含 session summary",
         "candidate 被接受后，当前会话摘要变为空",
         "清除先前已接受的摘要",
-        "不影响同一 candidate 中其它四类业务语义项",
+        "不表示保留旧 summary",
+        "其它四类业务语义项仍须根据本次材料各自独立输出",
+        "不得因 summary 为 null 而一并清空",
     ):
         assert session_summary_semantics in user_prompt
     for evidence_fact_semantics in (

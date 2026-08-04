@@ -1406,10 +1406,10 @@ def test_accepted_compact_without_covered_refs_preserves_recent_window() -> None
 
 
 def test_accepted_compact_without_summary_clears_prior_session_summary() -> None:
-    """accepted candidate 是完整替换，缺席 summary 必须清除旧值。
+    """accepted candidate 是完整替换，null summary 只清除旧摘要。
 
     :returns: ``None``。
-    :raises AssertionError: facts-only compact 残留旧 summary 时抛出。
+    :raises AssertionError: 旧 summary 残留或其它四类业务语义被清空时抛出。
     """
 
     policy = _policy()
@@ -1426,7 +1426,7 @@ def test_accepted_compact_without_summary_clears_prior_session_summary() -> None
                 "compact-facts-only",
                 CONTEXT_COMPACTED,
                 _accepted_compact_payload(
-                    facts=[_fact("facts-only compact 仍保留旧 summary。")],
+                    facts=[_fact("本次 replacement 保留新的证据事实。")],
                     summary_text=None,
                 ),
             ),
@@ -1440,9 +1440,19 @@ def test_accepted_compact_without_summary_clears_prior_session_summary() -> None
     assert snapshot.latest_compaction_event_ref == "compact-facts-only"
     assert snapshot.session_summary_memory.summary_text is None
     assert snapshot.session_summary_memory.event_id is None
-    assert snapshot.evidence_fact_memory.evidence_backed_facts[-1].claim_text == (
-        "facts-only compact 仍保留旧 summary。"
+    assert tuple(fact.claim_text for fact in snapshot.evidence_fact_memory.evidence_backed_facts) == (
+        "本次 replacement 保留新的证据事实。",
     )
+    assert tuple(anchor.anchor_title for anchor in snapshot.answer_anchor_memory.anchors) == ("收入口径",)
+    assert tuple(intent.text for intent in snapshot.forward_intent_memory.intents) == ("下一轮继续核对费用率。",)
+    assert tuple(item.text for item in snapshot.trace_memory.reference_continuity_items) == (
+        "“该公司”继续指向当前分析主体。",
+    )
+
+    reloaded_snapshot = conversation_memory_snapshot_from_json_value(
+        conversation_memory_snapshot_to_json_value(snapshot)
+    )
+    assert reloaded_snapshot == snapshot
 
 
 def test_run_succeeded_summary_only_does_not_materialize_assistant_window() -> None:
