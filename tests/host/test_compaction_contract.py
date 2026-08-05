@@ -136,6 +136,7 @@ def test_compact_structure_owner_projects_template_schema_rules_and_parser() -> 
     schema = compact_output_json_schema_v3()
     rules = compact_output_prompt_rules_v3()
     assert tuple(template) == root_keys
+    assert tuple(item.value for item in CompactSemanticSectionV3) == tuple(template)[1:]
     assert schema["required"] == list(root_keys)
     assert rules["required_fields"] == list(root_keys)
     assert parse_compact_candidate_v3(
