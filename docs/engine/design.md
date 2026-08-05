@@ -56,6 +56,8 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 若 `EngineEvent stream` 结束但没有产出 terminal event，聚合入口返回
 `EngineRunOutcomeFailed(error_code=EngineRunErrorCode.MISSING_TERMINAL)`。
 
+公共入口原样消费 `AgentRunRequest.structured_output`，它是单次 run 的 provider-neutral 输出格式请求。Engine 不从 system / user prompt、tool schema、provider 名称、model 名称或调用场景推断该请求；`None` 明确表示本次 run 不要求 structured-output transport。
+
 成功终态额外携带 required `SuccessfulRunnerResponseIdentity`：`FinalAnswerData.response_identity`
 与 `EngineRunOutcomeFinalAnswer.response_identity` 必须是同一 typed fact。它由实际终结回答的
 effective provider/model、该逻辑调用的 `RunnerRequestIdentity`、以及
@@ -98,6 +100,7 @@ Engine 当前采用 run-scoped 一次性 Agent / Runner 模型：
 | `runner_spec` | Runner 规约 |
 | `runner_options` | 单次 Runner 调用参数 |
 | `agent_policy` | Agent 运行策略 |
+| `structured_output` | 本次 run 的显式 `StructuredOutputRequest | None` |
 | `tool_schemas` | 本次 run 暴露给 LLM 的工具 schema 快照 |
 | `tool_executor` | 工具执行协议 handle |
 | `cancellation_token` | 取消观察 token |
@@ -105,6 +108,19 @@ Engine 当前采用 run-scoped 一次性 Agent / Runner 模型：
 | `execution_id` | Host execution id；直接 Engine 或非 attempt 路径为 `None` |
 
 Engine 不读取配置文件，也不从 `ToolExecutor` 查询 schema。`tool_schemas` 是本次 run 模型可见工具的唯一输入快照。是否禁用工具由 `disable_tools`、`AgentPolicy.allow_tool_calls`、Runner `supports_tool_calling` 三者共同决定。
+
+`structured_output` 是显式一等字段，不得塞入 `provider_request`、headers、metadata、工具 schema 或开放 extra payload。其封闭联合只有 `JsonObjectStructuredOutputRequest` 与 `JsonSchemaStructuredOutputRequest(name, schema, strict)`；JSON Schema 使用中性 `Mapping[str, JsonValue]`，Engine 不解释 schema 的业务含义。request 与 `runner_spec.structured_output_capability` 的合法组合在发起任何 outbound provider call 前 fail fast 校验，不允许隐式 fallback。
+
+```text
+StructuredOutputCapability = "none" | "json_object" | "json_schema"
+JsonObjectStructuredOutputRequest
+JsonSchemaStructuredOutputRequest
+  name: str
+  schema: Mapping[str, JsonValue]
+  strict: bool
+StructuredOutputRequest = JsonObjectStructuredOutputRequest |
+                          JsonSchemaStructuredOutputRequest
+```
 
 `messages` 必须非空，且每个元素必须属于 `AgentMessage` 封闭联合。
 `SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolMessage` 在各自构造边界校验固有
@@ -141,6 +157,8 @@ Engine 不读取配置文件，也不从 `ToolExecutor` 查询 schema。`tool_sc
 9. 对 completed / failed / cancelled 工具 outcome 产出 `tool_result_accepted`，无 awaiting 时产出 `tool_calls_batch_done`，再注入 assistant tool calls 与 tool messages，进入下一轮 Runner。
 10. 对包含 awaiting 的 batch，先产出同批普通 outcome 的 `tool_result_accepted`，再产出 `tool_awaiting` 和 `run_suspended`，结束本次 run。
 11. 若普通工具轮次耗尽或连续失败工具批次达到阈值，按 `fallback_mode` 收口。
+
+initial、工具后续 iteration、length continuation 与 force-answer 都必须把 `AgentRunRequest.structured_output` 原样传给每次 Runner call。Agent 不根据本轮 tools、finish reason、provider error、provider / model 名称或历史响应改变 request；provider 拒绝 structured-output 时保留原 provider failure，不用较弱模式重试。
 
 Runner 异常会转为 `run_failed(runner_exception)`。Runner 流结束但没有 `runner_done` 会转为 `run_failed(runner_abnormal_stop)`。同一 run 内重复 `tool_call_id` 会转为 `run_failed(duplicate_tool_call_id)`。
 
@@ -183,6 +201,7 @@ class AsyncRunner(Protocol):
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None = None,
     ) -> AsyncIterator[RunnerEvent]: ...
 
@@ -206,6 +225,8 @@ Runner 不负责：
 - 执行工具或依赖 `ToolExecutor`。
 - 做 Agent 多轮迭代、fallback、续写、取消终态或 run 终态决策。
 
+`structured_output` 是 required、无 default 的 keyword-only 参数。该 Protocol breaking change 必须在同一个 accepted implementation commit 中同步迁移 `AsyncRunner` Protocol、所有 Runner 实现、Agent 调用点与全部 fake / stub / direct call sites；不得用 `=None` default 掩盖漏传。Runner 只能按 typed request 投影 transport，不得读取 provider / model 名称推断 capability，不得把 provider rejection 吞掉后降级重试。
+
 当前 `_build_runner` 固定构造 OpenAI-compatible `AsyncOpenAIRunner`。Runner 选择和配置事实由 `RunnerSpec` 表达；Engine 公共契约不接受开放的 `**extra_payloads`。
 
 OpenAI-compatible Runner 的当前传输规则：
@@ -226,11 +247,22 @@ OpenAI-compatible Runner 的当前传输规则：
 - provider、model、endpoint、api key 引用、headers。
 - client correlation policy。
 - 是否支持 tool calling、streaming、stream usage。
+- structured-output capability：`none`、`json_object` 或 `json_schema`。
 - 默认请求超时、最大重试次数。
 - provider 请求扩展。
 - SSE stream idle timeout 与 heartbeat。
 
 `supports_stream_usage` 是 stream usage 请求字段的能力门控。仅当 `RunnerCallOptions.stream=True` 且 `RunnerSpec.supports_stream_usage=True` 时，OpenAI-compatible Runner 才写入 `stream_options.include_usage=True`；不支持时不写该 provider 字段。
+
+`RunnerSpec.structured_output_capability` 是 required 的 `StructuredOutputCapability`，合法组合矩阵固定为：
+
+| capability | `None` | JSON object request | JSON Schema request |
+| --- | ---: | ---: | ---: |
+| `none` | allow | reject | reject |
+| `json_object` | allow | allow | reject |
+| `json_schema` | allow | allow | allow |
+
+不支持组合必须在 Agent / Runner outbound call 前抛 `ValueError`，不得降级。OpenAI-compatible payload builder 只按 typed request 写 `response_format`：JSON object 为 `{"type":"json_object"}`；JSON Schema 为 `{"type":"json_schema","json_schema":{"name": name,"strict": strict,"schema": schema}}`。schema request 的 name、strict 与实际 schema 必须原样投影，不从 `provider_request` 或配置补值。structured output 与 provider 私有 extension 是两条独立通道，前者不得进入后者。
 
 `stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 Runner 规约的一部分。`stream_idle_timeout_seconds=None` 表示不启用 SSE byte chunk 空闲检测；启用时必须为正数。`stream_idle_heartbeat_seconds` 只有在 idle timeout 启用时才允许设置，也必须为正数，且不得大于 `stream_idle_timeout_seconds`。
 
@@ -251,6 +283,8 @@ provider 请求扩展是封闭联合：
 - `stream`
 
 模型级 provider 扩展归入 `RunnerSpec.provider_request`。单次调用可变参数归入 `RunnerCallOptions`。Agent 不拼 provider 私有 payload。
+
+model / runtime config 可以把已验证的 capability 机械投影到 `RunnerSpec`，但 capability evidence 与 catalog 选择属于 Engine 上游装配；Engine contract 本身不按 provider 名称维护 capability 表，也不运行 provider probe。
 
 ### Client correlation
 
@@ -539,6 +573,8 @@ budget，也不做 proactive threshold compaction、provider-aware tokenizer
 是否压缩、如何压缩、如何重新构造消息、如何记录 before / after
 budget，以及是否再次发起 run，属于调用方在 Engine 之外的职责。
 Engine 只表达 provider context overflow 这一可恢复事实。
+
+Host-owned compactor 可以像任何 Engine 调用方一样读取 `RunnerSpec.structured_output_capability` 并构造显式 generic request；Engine 只校验 capability matrix并投影 provider-neutral transport，不知道 compact input/output schema、五类 memory、coverage、repair、artifact 或 Host attempt budget。Host 对 `none` / `json_object` / `json_schema` 的选择不得在 Engine 中变成 compactor special case，也不得按 provider 名称 dispatch。无论 capability 为何，Engine 都不自动升级、降级或重试成另一 structured-output mode。
 
 `finish_reason=LENGTH` 不属于 provider context overflow。它表示输出生成触达模型输出上限，应由 Length 续写或降级 final 处理；只有 Runner 明确报告上下文长度超限时，Engine 才产出 `context_compaction_requested`。
 

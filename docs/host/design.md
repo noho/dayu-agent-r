@@ -1785,7 +1785,7 @@ canonical ingest 必须满足：
 - 完整 LLM-facing rendered messages 不是 EventLog hot payload。若 debug、analyzer 或 smoke 需要保存完整 rendered messages，只能写为 derived payload/artifact kind `runner_call_input_projection`，由 runner-call manifest 中的 projection artifact ref / digest 指向；它不能成为 recovery、resume、memory projection、dispatch decision 或 Run / Attempt 状态迁移真源。
 - selected tool schema full JSON snapshot 使用 payload descriptor kind `selected_tool_schema_snapshot` 保存，并由 runner-call manifest 的 `tool_schema_snapshot_refs` 记录 ref / digest / size。Tool Trace hot/cold 只能保留 bounded refs/digests/summary；analyzer 通过 resolver 按需读取 snapshot，不得把完整 schema 内联进 hot row 或 cold JSONL。
 - `TOOL_CALL_REQUESTED` 接受的工具参数也使用冷热分离规则。规范化 canonical arguments JSON 字节数小于等于 `payload_inline_threshold_bytes` 时可以作为 bounded inline JSON 进入 canonical payload；超过阈值必须写 payload descriptor kind `tool_call_arguments_json`。工具运行时若能提供业务可读 semantic query，短文本可 bounded inline，长文本必须写 payload descriptor kind `tool_call_semantic_query_text`；没有 semantic query 是合法但可诊断状态。
-- compactor LLM proposal 输入投影使用 payload descriptor / artifact kind `compactor_input_projection`。该投影只记录 compactor 输入 data block 的 durable ref / digest，不能替代 `CONTEXT_COMPACTED` 的 accepted compact truth。
+- compactor LLM proposal 输入投影使用 payload descriptor / artifact schema `compactor_input_projection.v2`。该投影持久化 v3 input、真实 caps、可选 repair binding 与 provenance descriptor；它不能替代 `CONTEXT_COMPACTED` 的 accepted compact truth。
 - `payload_digest`、normalized args digest、result digest 和 evidence digest 必须基于确定性序列化 / canonicalization 计算；同一语义 payload 不能因 JSON key 顺序或无关默认值产生不同 digest。
 - 会参与 resume、memory、audit、`fetch_more`、replay 的 payload / ref / descriptor 缺失或 digest 不匹配时，Host 不能把该 fact 当作 accepted fact 使用。
 - preview / diagnostic / display-only payload 可以降级丢失；其缺失只能影响展示、深度审计或 trace 细节，不能伪装成恢复必要事实。
@@ -2053,6 +2053,28 @@ Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only sig
 diagnostic 字段固定为 `status`、`reason`、`missing_atom_kind`、`missing_ref_kind`、`missing_ref`、`observed_count`、`expected_count`、`observed_digest`、`expected_digest`、`consumer_boundary`。`reason` 在非 `complete` 时必填，只允许 `missing_runner_call_manifest`、`missing_projection_artifact`、`missing_tool_call_arguments_atom`、`missing_semantic_query_atom`、`missing_compactor_manifest`、`missing_memory_snapshot_body`、`unsupported_projector_version`、`message_count_mismatch`、`role_sequence_digest_mismatch`、`input_projection_digest_mismatch`、`payload_digest_mismatch`、`unresolvable_ref`、`provider_specific_atom_deferred`。`missing_atom_kind` 只允许 `tool_call_arguments`、`semantic_query`、`runner_call_manifest`、`compactor_manifest`、`projection_artifact`、`memory_snapshot_body`。`missing_ref_kind` 只允许 `payload_ref`、`artifact_ref`、`event_ref`、`cursor_ref`。`consumer_boundary` 只允许 `tool_trace_query`、`analyzer_fixture`、`compact_evidence_projection`、`public_smoke`；compact LLM-facing text 只能得到业务中性的 unavailable wording，不能得到 refs、digests、event ids、cursors 或 diagnostic ledger details。
 
 `RUNNER_CALL_INPUT_ITERATION_LINKED` 只复用 runner-call diagnostic 中的 `message_count_mismatch` 与 `role_sequence_digest_mismatch` 表达 Engine observed input 与 prepared manifest expected input 的差异。Engine ingest rejected reason 不属于 `RunnerCallReconstructionDiagnostic.reason` 闭集，不得写入 Tool Trace runner-call diagnostic。
+
+compactor runner-call 的正式 public reconstruction 还必须从 canonical compact terminal 解析 response identity。该语义的 owner 是 Host Tool Trace durable resolver，不是 Service、CLI、JSON / Markdown renderer 或 evidence harness。resolver 必须先通过 shared runner-call manifest owner 取得完整 typed manifest 与 `compactor_identity`，再在调用方持有的同一 read transaction 中读取该 identity 指向的 parent Host Run；普通 runner-call 不产生 compactor response projection。
+
+canonical terminal scan 只读取 `CONTEXT_COMPACTED` 与 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` 两类 event，使用固定正数 page size、严格单调的 `after_event_sequence` keyset cursor，并持续读取到 empty page 或 page 长度小于 page size。每页有界，但不得设置任意总页数上限；full page 后 cursor 不严格增大、row sequence 不大于当前 cursor、cursor 非法或 page 数据损坏都必须抛 durable error，不能降格为“terminal 未观察到”。只有完整 exhaustion 后确实没有 matching terminal 且没有冲突 row，resolver 才可返回 response identity 不可用，并让 analysis 附加稳定 limitation `compactor-response-terminal-not-observed`。
+
+matching terminal 必须唯一，并同时 exact match proposal manifest ref / digest、compaction operation id 与 attempt number。canonical payload 的字段集、枚举与 `SuccessfulRunnerResponseIdentity` strict parsing 继续由 compact event owner 统一负责，Tool Trace 只能复用该 public typed parser，不得复制 JSON key 读取逻辑。以下任一情况都必须 fail closed：同 operation / attempt 的 manifest ref 或 digest 不一致、同一 manifest 出现多个 terminal、payload malformed、successful identity 的 compactor Engine run id、attempt 或 Runner request identity 与 manifest 不一致。resolver 不得从 `RunnerSpec`、manifest provider / model、事件相邻性、timestamp、usage 或当前配置补建 response identity。
+
+public response projection 是封闭 typed contract：`CompactorResponseDisposition` 只允许 `ACCEPTED` / `ATTEMPT_REJECTED`；`ResolvedCompactorResponseIdentity` 字段固定为 disposition、terminal event id / sequence、compaction operation id / attempt number、proposal manifest ref / digest，以及 nullable `SuccessfulRunnerResponseIdentity`。`RunnerCallResolvedProjection.compactor_response_identity` 对 ordinary runner-call 固定为 `None`；compactor call 只有完整 exhaustion 后无 matching terminal 才为 `None`。post-success rejection 必须保留同源 successful identity；没有 Engine success 的 rejection 只能显式为 `None`。Tool Trace analysis 使用 fresh schema version 2，把该 contract 投影为 `ToolTraceCompactorResponseSummary` 并按 parent Host Run、operation、attempt、terminal sequence 稳定排序。v1 producer / reader / validation 不保留，JSON 与 Markdown 必须只从同一个 structured report 渲染。
+
+```text
+ResolvedCompactorResponseIdentity
+  disposition: CompactorResponseDisposition
+  terminal_event_id: str
+  terminal_event_sequence: int
+  compaction_operation_id: str
+  compaction_attempt_number: int
+  proposal_manifest_ref: str
+  proposal_manifest_digest: str
+  successful_response_identity: SuccessfulRunnerResponseIdentity | null
+```
+
+compactor response summary 采用显式安全字段白名单，只允许上述 binding、effective provider / model、Runner request identity，以及 provider request id availability / value。headers、credential / API key、authorization、endpoint、raw prompt、raw request / response body 与 provider diagnostic payload不得进入 public resolver、analysis JSON / Markdown、hot / cold trace 或 LLM-facing material。
 
 Engine ingest rejected reason 的 runner-call link 子集固定为：
 
@@ -3029,7 +3051,7 @@ ordinary RunInput 的 LLM-facing material 不得暴露内部治理标识。下�
 | projector metadata、projector id、schema version、source contract refs、projection artifact ref | 删除；只保留 section title 和业务文本 | 不写替代字段；manifest 保留 provenance。 |
 | Attempt ledger、execution ledger、attempt id、execution id、iteration id、runner call index | 删除；如影响当前继续目标，用用户可读恢复说明 | “Continue from the previous interrupted step.” |
 | scheduler、lane、worker、dispatch、recovery 内部状态 | 删除；如用户需要知道状态，只写业务可见状态 | “The previous step was interrupted before a final answer.” |
-| Python 类型名、Host / Engine 内部类名、内部 enum 名 | 删除；用当前 prompt 自足说明字段含义 | 使用业务 schema 名或普通自然语言；不得写 `CompactCandidateV2` 这类实现类型名。 |
+| Python 类型名、Host / Engine 内部类名、内部 enum 名 | 删除；用当前 prompt 自足说明字段含义 | 使用业务 schema 名或普通自然语言；不得写 `CompactCandidateV3` 这类实现类型名。 |
 
 system envelope merge 只能合并已经由各 input provider / projection policy 治理后的 bounded content，不得新增、展开或重新召回内容。实现必须保留各 section 原有 item cap、char cap、selected recent window cap、floor 和 compact / fallback budget 约束；merge 后的总 envelope 大小必须有可测断言：`len(merged_system_content) <= sum(len(candidate_system_content)) + deterministic_header_separator_overhead`，其中 `candidate_system_content` 是所有准备进入 system envelope 的 bounded rendered content，`deterministic_header_separator_overhead` 只包含非空 section 的固定 Markdown header、header 与内容之间的固定换行，以及 section 间固定 separator。若某 section 在 merge 前已超出其 provider cap，必须在 provider 边界 fail closed 或截断；merge helper 不得用新的全局截断掩盖上游 cap 失效。focused tests 必须覆盖 section cap preservation 或上述总字符数 sanity，并断言 merge 没有引入候选 system content 之外的新业务文本。
 
@@ -3288,103 +3310,102 @@ prompt-local label 是本次 LLM 调用内的 opaque citation handle，只用于
 
 LLM compact output 只能返回业务语义字段和 prompt-local labels。Host 负责把 labels 映射回 durable refs，校验 provenance、长度、枚举、source boundary 和 quality gate。模型不得返回 durable refs、event ids、digests、artifact refs、policy decisions 或任何 Host 内部状态字段。
 
+模型可见 compact input 必须显式携带本次真实 output caps，使模型在 initial request 就能按实际 section 上限生成候选。caps 只是 `MemoryProjectionPolicy` 的 immutable boundary projection：数值、默认值、合法性校验与 policy digest 仍只由 `MemoryProjectionPolicy` 拥有，compact input DTO 不得定义第二套 default、校验或配置读取。request digest 与 source-boundary digest 只属于 Host internal binding、audit 与 request serialization；initial / repair 的 system message、user message、template、示例和 validation feedback 都不得出现这两个 digest 的值或通用 digest 字段名。
+
+模型只负责五类业务语义与必要 provenance，不负责治理诊断、source omission ledger、drop reason、cap usage audit 或 coverage partition。represented coverage、omitted coverage 与 policy usage audit 都必须由 Host 在 strict parse 后从 immutable source boundary、accepted provenance 与同一 policy instance 确定性派生；不得把这些 Host-owned facts伪装成模型输出要求。
+
 compact material / prompt / query_text 的 LLM-facing 语义必须自解释。工具材料可以暴露业务可读 tool name、source-owned 业务可读 query text、符合 LLM-facing 文本约束的参数文本与工具响应/来源文本；不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、cursor、projection checkpoint、policy 名称、Attempt / execution ledger、Projector metadata 或 Host 内部账本字段。若工具只有 `semantic_input_digest` 而没有 durable semantic query text，Host 不得把 digest 当作 query 文本，也不得要求模型理解 digest；compact evidence projection 只能使用源头合规的 query / 参数文本或业务中性的 unavailable wording。若 accepted arguments atom 缺失，projection 必须产生 `missing_tool_call_arguments_atom` limited-signal，并避免向 LLM 展示内部诊断细节。
 
 F02 的稳定问题陈述固定为：`EvidenceReadableItem.tool_name` 已有业务可读位置；真实缺口是 `query_text` 缺少 durable arguments / semantic query 的业务可读表达。实现和测试不得把该问题降级成“tool name 缺失”，也不得用 `tool_call_id=...`、payload ref、digest 或 Host 内部 id 伪装成业务 query。
 
 LLM-facing memory / compact / RunInput material 不允许字段级 silent truncation、preview 化或 summary 化。任何给模型阅读的 `display_text`、`text`、`claim_text`、`answer_text`、`response_text`、`summary_text` 或等价业务字段，要么是完整选中 material / item / section 的可读内容，要么带明确 provenance 做 chunking，要么整体 keep / drop，要么 fail closed。上下文缩小只能通过 deterministic selection、whole-item 或 whole-section keep-drop、chunking with provenance、section-aware degrade 或 fail closed 表达；不得把超长字段静默切到固定字符数后继续让模型当作完整事实、完整证据或完整回答理解。
 
-### 24.3 Compact v2 I/O Contract
+### 24.3 Compact v3 I/O Contract
 
-Compact input 与 ordinary RunInput、fallback RunInput 共享同一套 material selection / rendering 语义：都从 `latest_accepted_compacted_view`、`post_compact_delta_material`、`current_input_anchor`、`selected_recent_window_policy` 与 `protected_recent_floor_policy` 推导 `rendered_context = assemble(...)`。三者差异只在 renderer、source label、accept barrier 与 tier output：compact input 使用 compactor renderer 和 prompt-local labels，并经过 compact output accept barrier；ordinary RunInput 使用普通 runner renderer；fallback RunInput 使用对应 fallback tier 的 bounded renderer。设计层不得为 compact input 另起一套 selector，也不得让 fallback selected recent window 变成独立 memory 系统。
+Compact input 与 ordinary RunInput、fallback RunInput 共享同一套 material selection / rendering 语义：都从 `latest_accepted_compacted_view`、`post_compact_delta_material`、`current_input_anchor`、`selected_recent_window_policy` 与 `protected_recent_floor_policy` 推导 `rendered_context = assemble(...)`。三者差异只在 renderer、source label、accept barrier 与 tier output；不得为 compact input 另起 selector，也不得让 fallback selected recent window 变成独立 memory 系统。
 
-`CompactInputV2` 是 Host 渲染给 compactor 的唯一 user material data block，结构固定为：
+`CompactInputV3` 是 Host 渲染给 compactor 的唯一 user material data block，root exact keys 固定为：
 
 ```text
-CompactInputV2
-  schema: "dayu.context_compaction.input.v2"
+CompactInputV3
+  schema: "dayu.context_compaction.input.v3"
   current_input:
     readable_text: str
-  source_boundary: list[CompactSourceBoundaryEntryV2]
+  source_boundary: list[CompactSourceBoundaryEntryV3]
+  output_caps: CompactOutputCapsV3
 
-CompactSourceBoundaryEntryV2
+CompactSourceBoundaryEntryV3
   source_label: str
   source_kind: "previous_session_summary" | "previous_evidence_fact" |
                "previous_answer_anchor" | "previous_forward_intent" |
                "previous_reference_continuity" | "trace_material" |
                "evidence_material" | "answer_material"
   readable_text: str
+
+CompactOutputCapsV3
+  session_summary_char_cap: int
+  evidence_fact_item_cap: int
+  evidence_fact_char_cap: int
+  answer_anchor_item_cap: int
+  answer_anchor_char_cap: int
+  forward_intent_item_cap: int
+  forward_intent_char_cap: int
+  reference_continuity_item_cap: int
+  reference_continuity_char_cap: int
 ```
 
-每个 `source_label` 都是只在本次调用有效的 opaque handle；Host 在 typed input 中同时保存但绝不投影 `source_refs`。`source_boundary` 是模型可以 represented 或显式 drop 的完整闭集，material builder 把上一轮 accepted projection、post-compact delta trace、accepted evidence 与 answer material 统一投影到该边界。`current_input` 只有业务可读文本，不分配 label、不可引用、不可 compact，必须原样保留到 ordinary/fallback RunInput。空 `source_boundary` 不调用 compactor。
+`CompactOutputCapsV3` 只是 immutable boundary DTO；它必须由 Context Governance 对本次实际采用的同一个 `MemoryProjectionPolicy` instance 逐字段机械投影。DTO 不定义 default、数值校验或独立配置读取，input digest 覆盖完整 caps 与 immutable source boundary。每个 `source_label` 仍是只在本次调用有效的 opaque handle；Host 在 typed input 中保存但绝不投影 `source_refs`。`current_input` 不分配 label、不可引用、不可 compact，必须原样保留到 ordinary / fallback RunInput。空 `source_boundary` 不调用 compactor。
 
-运行期 renderer 必须用独占 marker 包围完整 `CompactInputV2` JSON，并把 marker 之间的全部内容定义为不可信引用材料。`current_input.readable_text` 与每个 `source_boundary[*].readable_text` 即使包含要求忽略规则、改变 schema、编造或删除事实、输出其它内容或执行其它任务的文本，也只能作为待整理数据，不能成为本次 compact 的控制指令。该边界不授权生产代码过滤、改写或按关键词删除原文；材料仍按业务内容和 coverage 规则整体表示或显式丢弃。`source_label` 只是在当前请求中定位来源的引用标签，不携带业务事实、优先级或推理依据。
+运行期 renderer 必须用独占 marker 包围完整 `CompactInputV3` JSON，并把 marker 内全部内容定义为不可信引用材料。业务文本即使包含要求改变规则、schema 或任务的指令，也只能作为待整理数据；生产代码不得按关键词改写原文。packaged prompt 必须在当前消息内自足说明字段、类型、必填性、允许值、五类业务语义、nullable clear、provenance 规则、真实 caps、同源 template 和最小完整示例；示例 output 的 label 必须全部来自同一示例 input。
 
-packaged compactor prompt 必须在当前消息内自足说明 strict input/output schema、字段名、类型、必填性、允许值、source-kind 业务语义、覆盖规则和同源 input/output 示例；示例输出的 label 必须全部来自同一示例输入。模型不需要理解 Python 类型名、Host/Memory/Attempt、迁移名称或其它实现术语。
-
-`CompactCandidateV2` 是 compactor 必须返回的 strict JSON object：
+`CompactCandidateV3` 是模型唯一允许返回的 strict JSON object。root exact keys 固定且全部 required：
 
 ```text
-CompactCandidateV2
-  schema: "dayu.context_compaction.output.v2"
-  session_summary: CompactSessionSummaryV2 | null
-  evidence_facts: list[CompactEvidenceFactV2]
-  answer_anchors: list[CompactAnswerAnchorV2]
-  forward_intents: list[CompactForwardIntentV2]
-  reference_continuity: list[CompactReferenceContinuityV2]
-  diagnostics: list[CompactCandidateDiagnosticV2]
-  explicitly_dropped_sources: list[CompactExplicitDropV2]
-```
+CompactCandidateV3
+  schema: "dayu.context_compaction.output.v3"
+  session_summary: CompactSessionSummaryV3 | null
+  evidence_facts: list[CompactEvidenceFactV3]
+  answer_anchors: list[CompactAnswerAnchorV3]
+  forward_intents: list[CompactForwardIntentV3]
+  reference_continuity: list[CompactReferenceContinuityV3]
 
-子项 schema 固定为：
-
-```text
-CompactSessionSummaryV2
+CompactSessionSummaryV3
   text: str
   source_labels: list[str]
 
-CompactEvidenceFactV2
+CompactEvidenceFactV3
   claim: str
   support_labels: list[str]
   context_labels: list[str]
 
-CompactAnswerAnchorV2
+CompactAnswerAnchorV3
   title: str
   detail: str
   source_labels: list[str]
 
-CompactForwardIntentV2
+CompactForwardIntentV3
   intent_type: str
   text: str
-  status: "open" | "blocked" | "superseded"
+  status: CompactForwardIntentStatusV3 = "open" | "blocked" | "superseded"
   source_labels: list[str]
 
-CompactReferenceContinuityV2
+CompactReferenceContinuityV3
   text: str
   reason: str
   source_labels: list[str]
-
-CompactCandidateDiagnosticV2
-  code: str
-  message: str
-  source_labels: list[str]
-
-CompactExplicitDropV2
-  source_label: str
-  reason: "superseded" | "redundant" | "out_of_scope" | "policy_limit"
 ```
 
-raw LLM response 必须在边界使用拒绝 duplicate key 的 JSON decoder，并对每一层执行 exact-key、exact-type parsing；unknown key、缺字段、别名、旧字段和多余包装一律拒绝，不存在旧 reader 或兼容分支。`session_summary` 可为 `null`，其它 collection 字段必须显式存在。diagnostics 只解释候选，不计 represented coverage；删除只能进入 `explicitly_dropped_sources`，不得用空文本、遗漏或 diagnostic 冒充删除。
+`session_summary` key 必须存在；值为 `null` 表示完整 replacement 被接受后清空旧 summary，不影响同一 candidate 的其它四类语义。省略该 key 必须拒绝。`CompactForwardIntentV3.status="superseded"` 只描述待办自身状态，不得用来伪装 evidence correction、omission 或 drop reason。模型不返回 diagnostics、explicit drop ledger、drop reason、omission kind、coverage 或 policy usage；旧 `diagnostics`、`explicitly_dropped_sources` 及其子项一律作为 unknown key 拒绝，不保留兼容 reader。
 
-Context Governance 是唯一 accept owner。它从业务语义区引用关系派生 represented coverage，并要求每个 boundary label 恰好落入 represented 或 explicitly dropped，两集合必须完整、互斥且无重复。它还按 source kind 检查 section 合法性，拒绝 empty/diagnostics-only/low-information、unknown label、duplicate、同一 source 的矛盾事实与矛盾 intent，并使用 `MemoryProjectionPolicy` 与 Memory 相同的 `estimate_memory_size_units` 执行 session summary 字符上限，以及 evidence facts、answer anchors、forward intents、reference continuity 各自的 section item-count 与 aggregate-size 上限。diagnostics 不属于 Memory semantic projection，因此不受 `MemoryProjectionPolicy` cap；它仍受 strict shape 与 deterministic duplicate 规则约束。只有该 owner 能构造绑定 immutable input boundary 的 `CompactAcceptedTruthV2`。
+output v3 的 JSON 结构只有一个 owner：`compact_structure` 只拥有 immutable exact structural descriptors，以及从它们派生的 concrete template、JSON Schema `properties / required / additionalProperties=false` 和 parser exact-key checks。typed domain dataclass 由 compaction domain owner 唯一定义，structure owner 单向构造这些 types，不定义第二组 dataclass，也不拥有 acceptance、caps、durable state、Engine transport 或 prompt 业务文案。public API 固定为 `compact_output_template_v3() -> Mapping[str, JsonValue]`、`compact_output_json_schema_v3() -> Mapping[str, JsonValue]` 与 `parse_compact_candidate_v3(text: str) -> CompactCandidateV3`。JSON Schema name 固定为 `dayu_context_compaction_output_v3`，schema 以 immutable canonical JSON value 暴露，`compact_output_json_schema_digest_v3()` 使用 Host canonical JSON serialization计算 SHA-256。transport request、captured runner manifest 的 schema digest 与实际 payload 必须消费同一次 structure projection，不得分别重建。
 
-Context Governance 同时是 accept/reject truth owner。parser/governance 产生的 validation report，以及为 durable governance/audit 保留 attempt 与截断计数的 bounded internal feedback，都是 Host 内部事实，不直接构成 LLM contract。单一 LLM-facing projector 只能从 typed internal feedback 投影 `required_action` 与 `issues`；每个 issue 只投影 `code`、`json_path`、`message`、`source_labels`，再由 renderer 放入 prompt 已定义的独占 repair marker。marker、字段语义和 whole-candidate 动作必须与 packaged prompt 同源，不能由 operation、fixture 或其它消费者各自重写。
+raw LLM response 必须使用拒绝 duplicate key 的 JSON decoder，并对 root 与所有 nested object 执行 exact-key、exact-type parsing；所有 object 的 schema 都必须列出完整 required 且 `additionalProperties=false`。unknown key、缺字段、别名、旧字段和多余包装一律拒绝。Context Governance 是唯一 accept owner：它按 source kind 校验 provenance、empty / low-information、unknown label、duplicate 与 schema-provable contradiction，并用同一 `MemoryProjectionPolicy` instance 和 Memory estimator检查实际 caps。
 
-policy cap reject 必须由执行本次验收的同一个 `MemoryProjectionPolicy` instance 与同一个 `estimate_memory_size_units` 结果直接生成。反馈必须给出实际 item/字符数、允许上限、计量对象和直接缩减动作；renderer 不读取 policy、不复制默认 cap，也不重算 candidate size。收到 repair feedback 后仍基于同一 immutable input 完整重产 whole candidate，不合并旧 candidate 或 patch。该路径不增加 compact output schema 字段、semantic repair loop、材料过滤器或自然语言 verifier。
+accept owner 从 candidate provenance 派生 `CompactRepresentedCoverageV3`，再按 immutable root boundary 顺序计算 exact complement `CompactOmittedCoverageV3`；两集合必须不相交且并集 exact 等于 boundary。omitted 只表示 accepted candidate 没有通过 provenance 代表该 source，不携带原因，不证明内容业务上不重要，也不允许 Host 做自然语言或 subject matching 推断。`CompactPolicyUsageAuditV3` 从同一 caps projection、同一 estimator 与 candidate actuals 派生，逐 section 记录 item / char actual、cap、policy ref / digest。cap 失败返回 strict `CompactValidationReportV3`，不得先 accept 再由 Memory 丢弃。
 
-可修复 reject 生成 bounded、脱敏、自解释的前次 validation report；下一次 semantic attempt 必须基于同一 immutable input 完整重产 whole candidate，不能合并 partial candidate，也不能把 provider/timeout 等 execution retry 记为 semantic repair。reactive 模式保留 ordered pass queue，所有 pass 共享 operation 级 attempt budget；中间 pass 只在内存中累积 accepted truth，全部 pass 后必须回到 root input 做 coverage、重复、矛盾与 caps 重验。任一 pass 或 root 验证失败时，中间 truth 不得提交。
+只有 governance permit 能构造 `CompactAcceptedTruthV3`。它包含 candidate、immutable boundary、represented、omitted、policy usage audit 与 current input ref；`covered_source_refs` 从同一个 accepted partition 派生。artifact、canonical terminal、Memory、RunInput 与 Tool Trace 只能消费该 truth，不得各自重算 coverage、caps 或 semantic replacement。
 
-无效 attempt 和中间 pass 不得写 accepted artifact、`CONTEXT_COMPACTED`、Memory、ordinary RunInput 或 public trace。只有 terminal permit 可以把 final accepted truth 写为单一 aggregate artifact 与单一 `CONTEXT_COMPACTED`；exhaust 只写单一 `CONTEXT_COMPACTION_FAILED`，然后沿既有 fallback/fail-closed 路径。late/stale completion 在 terminal 已确定后不得产生第二 terminal。Memory 只能读取已提交 canonical event 的 strict v2 projection，并以 accepted represented 与 dropped coverage 的并集删除/替换旧投影；current input 继续保留。artifact、EventLog、Memory、RunInput 与 trace 必须由同一个 final accepted truth 派生。
+可修复 reject 生成 bounded、脱敏、自解释的 typed validation report；repair 继续受最多 issue 数、单 issue 字符数、总 feedback 字符数与 operation attempt budget 约束。repair 基于同一 immutable v3 input 完整重产 whole candidate，不合并旧 candidate、不接受 patch。invalid attempt、中间 pass 与 rejected candidate 不得写 accepted artifact、`CONTEXT_COMPACTED`、Memory、ordinary RunInput 或 public trace；只有 terminal permit 可以提交单一 aggregate accepted truth，budget exhaust 只写一个 `CONTEXT_COMPACTION_FAILED` 并进入既有 fallback。late / stale completion 不得产生第二 terminal。
 
 ### 24.4 Snapshot Typed Schema
 
@@ -3424,9 +3445,13 @@ ForwardIntentMemoryView
 
 `HostInternalRef` 是 Host 内部 typed provenance ref，不进入 LLM-readable prompt。Snapshot item 必须保存 internal source refs、source labels mapping digest、producer compact event ref、created cursor、last updated cursor、policy ref、item digest 与 bounded diagnostic。RunInputBuilder 渲染 snapshot 时只输出业务可读文本和必要的短来源说明，不输出 durable refs、digest 或 cursor。
 
+fresh persistence contract 固定如下：compactor input projection 使用 `compactor_input_projection.v2`，持久化完整 `CompactInputV3`、真实 output caps、可选 repair binding 与既有 provenance descriptor；compact artifact 的整数 schema version 固定为 `4`，accepted candidate 使用 output v3，coverage 字段固定为 `represented_coverage`、`omitted_coverage` 与 `policy_usage_audit`。artifact、canonical `CONTEXT_COMPACTED` semantic payload 与 Memory typed consumer 必须从同一个 `CompactAcceptedTruthV3` 投影。
+
+旧 compact input/output contract、schema-3 compact artifact、diagnostics、explicit drops / reasons 以及依赖这些 payload 的旧 Session replay 不支持读取，不迁移，也不保留 alias、双读 parser、re-export 或 compatibility wrapper。该 fresh cut 只约束旧 compact payload 与依赖它的 Session replay；未触及旧 compact payload 的其它 durable rows 继续按各自 schema 处理，不能把本限制扩大解释为“整个旧 DB 必然无法打开”。
+
 `latest_compaction_event_ref` 只是 provenance ref，用来说明当前 snapshot 的 compacted semantic view 来自哪个 accepted compact event；它不是 `latest_accepted_compacted_view` 本体。`TraceMemoryView.selected_recent_window` 与 `EvidenceFactMemoryView.recent_evidence_items` 如果物化在 snapshot 中，也只是对 `post_compact_delta_material` 的 bounded recent view，服务 ordinary RunInput 渲染与诊断；它们不是 compact output 生成的第六类 Semantic Memory，也不会自动生成 summary、answer anchor、forward intent 或 evidence-backed fact。
 
-accepted `CONTEXT_COMPACTED.source_boundary_refs` 的 typed read owner 固定为 compact payload source boundary。持久化顺序是 contract：第一项必须是 `current_input_ref`，其余去重 refs 是本次 accepted compact 实际覆盖的 `compacted_source_refs`；只有当前输入、没有被覆盖材料时，后者允许为空。strict parser 必须一次性校验列表非空、每项非空且全局唯一，并把两个角色投影为显式 typed fields；Conversation Memory 等消费者不得自行索引 raw list、按 ref 前缀猜角色，或从 event sequence / timestamp 推断覆盖范围。
+accepted `CONTEXT_COMPACTED.source_boundary_refs` 的 typed read owner 固定为 compact payload source boundary。持久化顺序是 contract：第一项必须是 `current_input_ref`，其余去重 refs 必须从 `CompactAcceptedTruthV3` 的 represented / omitted exact partition 派生为本次 accepted compact 的 `compacted_source_refs`；只有当前输入、source boundary 为空时，后者允许为空。strict parser 必须一次性校验列表非空、每项非空且全局唯一，并把两个角色投影为显式 typed fields；Conversation Memory 等消费者不得自行索引 raw list、按 ref 前缀猜角色，或从 event sequence / timestamp 推断覆盖范围。
 
 Conversation Memory projection 是 `selected_recent_window` 的唯一 owner。消费 accepted compact 时，它必须从既有 selected recent items 中移除 canonical source refs 与 `compacted_source_refs` 相交的项，显式保留 `current_input_ref` 对应项，并保留未被本次 compact selection 覆盖的 protected recent raw 项；随后 `recent_evidence_items` 只从更新后的 selected recent window 同源派生。compact event 之后的新 eligible canonical material 才继续形成 post-compact delta。incremental projection、full rebuild、inline delta repair 与 persisted snapshot reload 必须复用同一 projection rule 并得到相同结果。RunInput 只消费修正后的 typed memory view 并执行既有 memory / protected raw-tail source-ref 与 content-digest 去重，不得再实现一套 compact coverage filter。
 
@@ -3457,6 +3482,8 @@ Answer Anchor Memory 保存历史回答中可被用户后续指代的结构化�
 
 Forward Intent Memory 保存待澄清问题、未完成任务、下一步任务状态等前瞻意图。它不是真实世界事实，也不直接驱动工具执行，只辅助下一轮 prompt 构造或澄清问题。第一阶段不对 prompt / final answer 做 intent parser，也不生成 hidden plan；Forward Intent 只能来自 accepted compact output，或明确设计的非 prompt-conditioned producer。
 
+Conversation Memory 只消费 `CompactAcceptedTruthV3` 的五类 candidate semantic fields 与同源 accepted partition，不消费模型产生的 drop reason，因为 v3 不存在该语义。rolling correction 的确定性表达固定为：current replacement 的 provenance 被 accepted candidate 保留，旧 source labels 出现在 Host-derived omitted coverage，随后 artifact、Memory、ordinary RunInput 与 reconnect rebuild 都不再投影旧结论。Host 不生成 `superseded` / `redundant` 等主观 omission reason，也不做自然语言或 subject matching；forward intent 的 `superseded` 只属于待办自身状态。
+
 producer mapping 汇总如下；实现不得从旧字段或旧 renderer 反推新语义：
 
 | 语义 | compact 前 | compact 成功后 | post-compact delta | compact failure fallback |
@@ -3468,6 +3495,24 @@ producer mapping 汇总如下；实现不得从旧字段或旧 renderer 反推�
 | Forward Intent Memory | 空 | 通过 accept barrier 的 `forward_intents` | 不对 prompt / final answer 做 intent parser | tier 1-3 accepted output 可生成 intent；tier 4-5 为空，不生成 intent |
 
 ### 24.6 Prompt Assembly
+
+compactor initial 与 repair 共用同一个 packaged system contract，并消费同一次 `compact_structure` concrete template / schema source；Host 分别渲染 initial user body 与 repair user body，不得维护第二份手写 output shape。initial body 必须包含同一 immutable `CompactInputV3`、真实 caps、五类字段含义、`session_summary: null` 清空语义、provenance 规则、同源 template 与最小完整示例；实际 initial messages 不得包含 repair protocol、previous attempt 或 validation issues。
+
+repair body 必须自足包含同一 immutable `CompactInputV3`、同源完整 template / 字段规则、前次 attempt number、bounded / redacted issues 与 whole-candidate replacement 要求；不得只发送 patch 指令或依赖 initial 调用的隐式上下文。initial / repair 都不得包含 request digest、source-boundary digest 的值或通用 digest 字段名；这些值只保留在 Host-internal binding、audit、input projection persistence 与 request serialization。
+
+```text
+immutable CompactInputV3 + actual caps
+  -> initial request（无 repair protocol）
+  -> strict structure parse
+     -> valid + governance accept
+        -> one CONTEXT_COMPACTED -> schema-4 artifact -> Memory
+     -> invalid / reject
+        -> CONTEXT_COMPACTION_ATTEMPT_REJECTED
+        -> budget remains: self-contained whole-candidate repair on same binding
+        -> budget exhausted: one CONTEXT_COMPACTION_FAILED -> existing fallback
+```
+
+rejected candidate 不写 artifact、不进入 Memory、不生成 `CONTEXT_COMPACTED`；terminal permit 与 late-result 规则保证同一 operation 只有一个 terminal。
 
 Prompt Assembly 的 section 顺序是固定 contract，不根据当前 prompt 做 recall、parser、reranker 或动态重排：
 
@@ -3511,7 +3556,9 @@ Conversation Memory section header 必须使用 23 节 system envelope section t
 
 ### 24.7 测试与评测边界
 
-Conversation Memory 的完整评测 deferred owner 为 GitHub Issue 80。当前设计要求 WU-CM-01 至少覆盖以下可断言场景：empty compacted view、non-empty compacted view、post-compact delta、compact boundary、protected recent floor、deterministic bounded projection、provider context length fallback、invalid / missing / stale source label、schema invalid、provenance mismatch、partial candidate invalid、fallback 不生成高阶语义、compact roll-forward。
+Conversation Memory 的完整评测 deferred owner 为 GitHub Issue 80。当前 owner tests 至少覆盖：empty / non-empty compacted view、post-compact delta、compact boundary、protected recent floor、deterministic bounded projection、provider context length fallback、invalid / missing / stale source label、schema invalid、provenance mismatch、partial candidate invalid、fallback 不生成高阶语义与 compact roll-forward；output v3 template / JSON Schema / parser 的 root 与 nested key 集同源；all root keys required、summary required nullable、旧 v2 keys strict reject；schema immutable、name / digest / transport 同源；同一 `MemoryProjectionPolicy` 到 caps DTO 逐字段相等且 DTO 无 default / validation owner；represented / omitted 是 boundary exact complement，policy usage actual / cap 同源；initial 无 repair protocol、repair 自足且整体重产，两者 captured runner input 均不含 internal digest value 或字段名；schema-3 artifact与旧 compact/session replay拒绝。
+
+F11 owner tests 还必须覆盖 canonical terminal 位于一个或多个 full page 后仍能解析、short / empty page exhaustion、cursor 严格推进、倒退 / 重复 / 不推进 / malformed page fail closed、无任意 scan cap，以及 accepted / post-success rejected / no-success rejected / ordinary / terminal-not-observed、manifest ref / digest / operation / attempt / Engine run mismatch、duplicate terminal和secret whitelist。真实 provider observation 必须分别记录 capability=request 的实际装配与 provider outcome；deterministic test 或其它 provider 不能代替 mandatory provider row，也不得用 source text 推断最终 captured prompt。
 
 `utils/` Host public smoke 是 WU-CM-01 的初步验收标准，不等价于完整通过 GitHub Issue 80 的 benchmark。完整 eval harness 由 GitHub Issue 80 继续推进。
 
@@ -3524,8 +3571,9 @@ Host 负责：
 - provider-aware context budget policy。
 - RunInputBuilder 输入层预算观测。
 - proactive / reactive compact 触发。
-- `CompactInputV2` 构造。
-- `CompactCandidateV2` accept barrier。
+- `CompactInputV3` 与真实 `CompactOutputCapsV3` boundary projection 构造。
+- `CompactCandidateV3` strict structure parse 与 accept barrier。
+- represented / omitted exact partition 与 policy usage audit 派生。
 - compaction whole-candidate repair / retry 编排。
 - failure closeout、tier 1-3 compact recovery fallback 与 tier 4-5 dispatch fallback。
 - context overflow recovery dispatch。
@@ -3619,9 +3667,11 @@ Context Governance 与 Conversation Memory 的关系必须保持单向。Convers
 
 Proactive compact 的 material view 必须由 EventLog-backed compact material builder 生成，而不是由 Context Governance 临时拼接。该 builder 的职责是从 latest accepted `CONTEXT_COMPACTED` 构造 `previous_compacted_view`，从 latest compact cursor 之后到当前 input 之前的 committed canonical facts 构造 post-compact delta material，并把当前 `USER_INPUT_ACCEPTED` 作为 current input anchor。Context Governance 只消费 builder 输出做预算估算、segment selection 与 compact operation 编排。
 
-第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `CompactCandidateV2` 结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 vNext compact I/O contract 为准。
+第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `CompactCandidateV3` 的五类业务语义与必要 provenance；Host 负责 strict parse、governance accept、coverage / caps audit，并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 compact v3 I/O contract 为准。
 
-Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、accepted attempt number、accepted candidate digest、prompt-local label mapping refs、source boundary refs、quality check result、budget after compact 与 projection signal。是否将 session summary、evidence-backed fact candidates、answer anchors、forward intents 或 reference continuity items materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+Context Governance 的 accept owner 固定为 `accept_compact_candidate_v3(compact_input, candidate, memory_policy)`。它必须使用生成 `CompactInputV3.output_caps` 的同一个 `MemoryProjectionPolicy` instance；先从 candidate provenance 派生 represented，再按 root boundary 顺序派生 omitted exact complement，最后用同一 estimator 生成逐 section actual / cap 与 policy ref / digest audit。只有该 owner 能用 private permit 构造 `CompactAcceptedTruthV3`。Memory、artifact、event、RunInput 与 trace 只消费该 accepted truth，不能从 raw candidate、旧 drop ledger、配置或时间顺序重算。
+
+Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须从 `CompactAcceptedTruthV3` 记录 schema-4 compact artifact ref、accepted attempt number、v3 candidate digest、represented / omitted coverage、policy usage audit、prompt-local label mapping refs、source boundary refs、quality check result、budget after compact 与 projection signal。是否将 session summary、evidence-backed fact candidates、answer anchors、forward intents 或 reference continuity items materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
 
 Host-owned compactor proposal call 必须写入 runner-call manifest，并在 manifest 中提供 `CompactorRunnerCallIdentity`。该 identity 只标识“哪个 parent user Run 的哪个 compaction operation 发起了哪次 compactor LLM proposal input”，不表示新的 Host admitted user Run。字段固定为：
 
@@ -3633,7 +3683,7 @@ Host-owned compactor proposal call 必须写入 runner-call manifest，并在 ma
 | `compactor_engine_run_id` | `str` | yes | self Engine/runner id for compactor proposal call, e.g. `context-compactor:*` | must not be treated as Host admitted user Run id |
 | `compaction_attempt_number` | `int` | yes | proposal/repair attempt number within operation | positive and <= Host compaction policy max attempts |
 | `compaction_request_digest` | `Digest` | yes | digest of immutable compaction request | must match compactor input projection |
-| `compactor_input_projection_ref` | `HostInternalRef` | yes | artifact/descriptor for rendered compactor input data block | descriptor kind `compactor_input_projection` |
+| `compactor_input_projection_ref` | `HostInternalRef` | yes | artifact/descriptor for rendered compactor input data block | descriptor schema `compactor_input_projection.v2` |
 
 `CompactorRunnerCallIdentity` 只描述 proposal runner-call input 的 owner 与 input provenance，不保存 outcome ref。proposal manifest 在 runner call 前写入，不能回写 accepted / rejected outcome 字段，也不能重算 payload digest。`CONTEXT_COMPACTED` 继续拥有 accepted compact artifact refs、accepted attempt number、candidate digest、prompt-local label mapping refs、source boundary refs、quality check 与 budget after compact；accepted compact event 必须通过 `accepted_proposal_manifest_ref` / `accepted_proposal_manifest_digest` 反向引用 accepted proposal manifest。`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 必须通过 `proposal_manifest_ref` / `proposal_manifest_digest` 反向引用该 rejected attempt 的 proposal manifest。任何 rejected proposal content、中间 transient artifact 或 compactor input projection 都不能进入 Conversation Memory，也不能成为 accepted compacted view。
 
@@ -3641,7 +3691,7 @@ Compactor 与 retry / repair 的 owner 边界固定为：
 
 - Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
 - `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest`、Service 从 `compactor_baseline.scene_id` 指向的 scene 装配后传入的 system prompt / `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 指向的 prompt asset 读取后传入的 user prompt template，以及 Host lifecycle cancellation token 映射为一次 strict JSON proposal，并返回 typed candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection，也不得自行构造不可取消 token。Host 只把 request 渲染为 typed data block 并替换 user template 中的 compaction request 占位符，不从 config 读取 prompt asset。
-- Host Context Governance 拥有 semantic repair / retry：runner timeout、非 final outcome、`finish_reason=length`、空文本、非 JSON、top-level 非 object、缺必填 key、字段类型 / 值非法、未知 source label、provenance mismatch、source boundary violation、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 是 whole-candidate re-proposal：可以向 LLM 提供 Host-neutral 的失败类别 / validation issue 摘要，但每次必须重新产出完整 candidate；Host 不要求 LLM 返回 repair patch，不合并旧 proposal 的 valid fields 与新 patch，也不 partial materialize rejected candidate。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
+- Host Context Governance 拥有 semantic repair / retry：runner timeout、非 final outcome、`finish_reason=length`、空文本、非 JSON、top-level 非 object、缺必填 key、字段类型 / 值非法、未知 source label、provenance mismatch、source boundary violation、quality check reject、caps reject 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。initial call 必须使用无 repair protocol 的 user body；repair call 才使用自足 body，包含同一 immutable v3 input / caps / structure source、前次 attempt number、bounded issues 与 whole-candidate replacement 动作。每次 repair 都必须重新产出完整 candidate；Host 不接受 patch、不合并旧 candidate，也不 partial materialize rejected candidate。repair 必须复用同一个 immutable compaction request、source-boundary binding、Host-owned scene 与 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state；binding digest 只保留在 Host internal request / audit / persistence，不进入任何 LLM-facing message。
 - 每个 semantic proposal attempt 必须创建新的 Host-private linked cancellation child。child 只拥有当前 provider attempt 的 timeout；parent 继续拥有 Run / reactive operation 生命周期，且 parent reason / requested-at 始终优先。timeout 不得写 parent，也不得把 writable cancellation 加入 Engine public `CancellationToken` 观察协议；repair / retry 必须使用新的 child。
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。prepared proposal 在 runner-call manifest commit 后、provider call 前必须用同一个 attempt token 再检查一次；该检查可读取 durable snapshot，但不得跨 provider await 持有 Host transaction。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
@@ -3745,7 +3795,7 @@ compaction request/trigger/terminal，不扩展为通用 terminal framework。
 
 HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
 
-Compaction request 的输入边界固定为 `CompactInputV2`，而不是从 Session 起点重放 EventLog ledger。一次 compactor run 的 messages 只能由 compactor system prompt 和一个 user material data block 组成；data block 是 Host 对 latest accepted compacted view、post-compact delta material 与 current input anchor 的去重、分段、可读投影，不承载 Host 内部账本 dump。
+Compaction request 的输入边界固定为 `CompactInputV3`，而不是从 Session 起点重放 EventLog ledger。一次 compactor run 的 messages 只能由 shared packaged system contract 和一个 Host-rendered initial 或 repair user body 组成；body 中的 data block 是 Host 对 latest accepted compacted view、post-compact delta material、current input anchor 与真实 output caps 的去重、分段、可读投影，不承载 Host 内部账本 dump或治理 digest。
 
 compact material selection 必须满足：
 
@@ -3850,10 +3900,12 @@ reactive path 约束：
 - reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Host 可按 policy 完成 tier 1-3 compact recovery fallback，仍失败后再尝试 tier 4/5 dispatch fallback，并在 fallback 预算通过时创建新的 recovery Attempt。fallback 仍超预算或 policy 不允许 fallback 时，Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
 - `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 operation id、trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor、retry / repair budget snapshot 和 reason。
 - `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision；若 rejection 发生在 Engine 已返回成功 final 之后，还必须绑定产生被拒 candidate 的 `SuccessfulRunnerResponseIdentity`。
-- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、accepted candidate digest、prompt-local label mapping refs、source boundary refs、accepted evidence mapping refs、quality check result、budget after compact、projection signal，以及产生 accepted candidate 的 required `SuccessfulRunnerResponseIdentity`。
+- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、schema-4 compact artifact ref、v3 accepted candidate digest、represented / omitted coverage、policy usage audit、prompt-local label mapping refs、source boundary refs、accepted evidence mapping refs、quality check result、budget after compact、projection signal，以及产生 accepted candidate 的 required `SuccessfulRunnerResponseIdentity`。
 - `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs；若 policy decision 采用 tier 4/5 dispatch fallback，还必须记录 fallback tier、fallback input window / digest、fallback budget result，以及 fallback 后是 dispatch 还是 fail closed。
 
 `SuccessfulRunnerResponseIdentity` 必须直接来自同一个 compactor Engine success terminal，并包含 effective provider/model、终止调用的 `RunnerRequestIdentity` 以及严格配对的 provider request id availability/value。每个 Host semantic attempt 都重新准备一个 compactor `AgentRunRequest`，identity 必须与该 attempt 的 `compactor_engine_run_id`、proposal manifest、candidate/output 同源；Engine 内部 length continuation 的最终 runner call index 必须如实保留。provider request id 不可用时只允许 `unavailable + None`。不得从 Service model family、配置、manifest、usage、相邻 event 或时间顺序反推 response identity；endpoint、credential ref/value、headers、secret 和 provider raw request/response payload 不进入 accepted/rejected durable payload、artifact projection、trace、memory 或 LLM-facing material。
+
+canonical terminal payload 与 response identity parsing 继续由 compact event owner 负责，不能为了 public observation 改写 terminal ownership。Tool Trace public resolver 只在同一 read transaction 内把 typed proposal manifest 与 parent Run 的 compacted / attempt-rejected canonical terminal做 exact binding，经完整 keyset exhaustion 得到唯一 response projection；mismatch、duplicate、malformed 或 cursor corruption 均 fail closed。完整 exhaustion 后无 matching terminal 才报告 typed unavailable / limitation，不能把它推断为成功、失败或 provider 不可用。
 
 compact 不变量：
 
@@ -3863,7 +3915,7 @@ compact 不变量：
 - tier 4/5 dispatch fallback 只能影响本次 RunInputBuilder 输入选择，不得改写 EventLog 历史事实，不得提交 `CONTEXT_COMPACTED`，不得 materialize memory snapshot；但它必须有 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic 痕迹，不能静默发生。
 - 新 Attempt 必须有新的 `attempt_id` / `execution_id`；旧 Attempt 不 takeover、不 resume。
 - compact 必须有 policy 上限。proactive operation 内 bounded repair attempts 和 tier 1-3 compact recovery fallback 耗尽后，Host 必须 append `CONTEXT_COMPACTION_FAILED`；若 tier 4/5 dispatch fallback 预算通过，可继续 dispatch，否则按 failure policy 收口。reactive path 中 compact 后若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内追加下一次 reactive compact；超过上限后 append `CONTEXT_COMPACTION_FAILED`，可按 policy 尝试 tier 4/5 dispatch fallback，仍失败则让 Run 进入 `FAILED`。不得进入 `LOST`，不得无限 compact retry。
-- tool trace / audit 必须能解释哪些内容被保留、压缩、丢弃，以及为什么这样做。
+- tool trace / audit 必须从同一个 accepted truth 解释哪些 sources 被 candidate provenance represented、哪些属于 Host-derived omitted complement，以及各 section 的 actual / cap / policy audit。omitted 不携带模型主观原因，也不能被解释为“业务上不重要”。
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。
 
