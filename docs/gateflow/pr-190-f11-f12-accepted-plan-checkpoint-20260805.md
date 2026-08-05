@@ -27,7 +27,7 @@
 | Original independent review A | `docs/reviews/plan-review-20260805-144305.md` | `d9358fe2621e70ffc1790af2ad71678ccaccb2105df4cfc9833336b6005fcfd6` |
 | Original independent review B | `docs/reviews/plan-review-20260805-144405.md` | `e2bb882149f5e0de0528e99d6ee96f30fd6073a4ad2d64b214e99a7d968bace4` |
 | Independent re-review A / MiMo | `docs/reviews/plan-rereview-20260805-150612.md` | `6b0d7e1052d72609a6d75d095488df5855396555e332d7f29bb664bda1898a74` |
-| Independent re-review B / Claude | `docs/reviews/plan-rereview-20260805-ds.md` | `3fc01ceb800057ff30d6f5b423f0c7c951ad8c240ed66bc0dd485ce4c2f53301` |
+| Independent re-review B / Claude | `docs/reviews/plan-rereview-20260805-ds.md` | `538ff5193b45a70623c4c2bba881e03ceca89a9657f7e76424153bfcdcdc8d64` |
 
 Finding baseline 保持只读：
 
