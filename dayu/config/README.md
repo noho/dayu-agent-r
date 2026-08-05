@@ -106,6 +106,7 @@ dayu/config/
 | `supports_tool_calling` | 是否支持工具调用 |
 | `supports_stream` | 是否支持流式输出 |
 | `supports_stream_usage` | 是否支持流式 usage |
+| `structured_output_capability` | 必填枚举：`none`、`json_object` 或 `json_schema`；表示该模型已证实的最高 structured-output capability |
 | `default_timeout_seconds` | 默认请求超时秒数 |
 | `max_retries` | 默认最大重试次数；包内默认模型使用 `3` |
 | `sse_idle_timeout_seconds` | SSE 空闲超时秒数 |
@@ -116,7 +117,9 @@ dayu/config/
 
 `runtime_hints.runner_option_hints` 的每个 hint 都是默认 RunnerCallOptions 配置片段，只包含 `temperature`、`top_p` 与 `stream`。默认配置不提供输出 token cap；`RunnerCallOptions.max_tokens` 只保留给显式 per-run 或 provider adapter override 使用。execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
 
-模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。
+模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。`structured_output_capability` 在 base record 必填，派生记录直接继承；缺失、未知枚举或未知字段都会在 ConfigLoader 边界失败。
+
+当前包内 catalog 只把 DeepSeek base records 标为 `json_object`；MiMo 和其它没有直接 model capability 证据的 base records 均为 `none`。当前没有 `json_schema` record。Service 只把该 typed config 值机械投影到 `RunnerSpec`，不按 provider/model 名称推断、探测或自动降级。
 
 ## execution_profiles.json
 

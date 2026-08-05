@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import dataclasses
 from typing import TypedDict, Unpack
 
@@ -30,6 +32,7 @@ class _RunnerSpecChanges(TypedDict, total=False):
     supports_tool_calling: bool
     supports_streaming: bool
     supports_stream_usage: bool
+    structured_output_capability: StructuredOutputCapability
     default_timeout_seconds: float
     max_retries: int
     provider_request: ProviderRequestExtension | None
@@ -50,6 +53,9 @@ def make_spec(
     supports_tool_calling: bool = True,
     supports_streaming: bool = True,
     supports_stream_usage: bool = False,
+    structured_output_capability: StructuredOutputCapability = (
+        StructuredOutputCapability.NONE
+    ),
     default_timeout_seconds: float = 30.0,
     max_retries: int = 0,
     provider_request: ProviderRequestExtension | None = None,
@@ -69,6 +75,7 @@ def make_spec(
         supports_tool_calling=supports_tool_calling,
         supports_streaming=supports_streaming,
         supports_stream_usage=supports_stream_usage,
+        structured_output_capability=structured_output_capability,
         default_timeout_seconds=default_timeout_seconds,
         max_retries=max_retries,
         provider_request=provider_request,

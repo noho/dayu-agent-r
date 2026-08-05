@@ -33,6 +33,10 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.structured_output import (
+    StructuredOutputRequest,
+    validate_structured_output_request,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AwaitingToolExecutionRecord,
@@ -81,6 +85,8 @@ class AgentRunRequest:
     :param runner_spec: Runner 规约。
     :param runner_options: Runner 调用参数。
     :param agent_policy: Agent 策略。
+    :param structured_output: 本次 run 的显式 structured-output 请求；
+        ``None`` 表示不请求 structured-output transport。
     :param tool_schemas: 暴露给 LLM 的工具 schema 元组。
     :param tool_executor: 工具执行器，由 Host 通过 EngineWorker capability
         提供；EngineWorker 替 Host 在选定执行环境中代持并提供该 protocol
@@ -102,6 +108,7 @@ class AgentRunRequest:
     tool_schemas: tuple[ToolSchema, ...]
     tool_executor: ToolExecutor
     cancellation_token: CancellationToken
+    structured_output: StructuredOutputRequest | None = None
     attempt_id: str | None = None
     execution_id: str | None = None
 
@@ -133,6 +140,10 @@ class AgentRunRequest:
                 "AgentRunRequest.attempt_id and execution_id must both be "
                 "None or both be non-None"
             )
+        validate_structured_output_request(
+            capability=self.runner_spec.structured_output_capability,
+            request=self.structured_output,
+        )
 
 
 @dataclass(frozen=True, slots=True)

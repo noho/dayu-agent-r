@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import dataclasses
 import pathlib
@@ -499,6 +501,7 @@ def test_effective_execution_snapshot_rejects_unknown_provider_request_with_dura
             "supports_tool_calling": False,
             "supports_streaming": False,
             "supports_stream_usage": False,
+            "structured_output_capability": "none",
             "default_timeout_seconds": 1.0,
             "max_retries": 0,
             "provider_request": {"kind": "unknown-extension"},
@@ -610,6 +613,7 @@ def test_execution_projection_round_trips_complete_owner_contract() -> None:
     )
 
     assert list(headers_value) == ["X-Alpha", "X-Zeta"]
+    assert runner_spec_value["structured_output_capability"] == "none"
     assert runner_spec_from_json(runner_spec_value) == runner_spec
     assert runner_options_from_json(runner_options_value) == runner_options
     assert agent_policy_from_json(agent_policy_value) == agent_policy
@@ -1133,6 +1137,7 @@ def _runner_spec(model: str) -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,

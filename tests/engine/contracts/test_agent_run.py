@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import (
+    JsonObjectStructuredOutputRequest,
+    JsonSchemaStructuredOutputRequest,
+    StructuredOutputCapability,
+    StructuredOutputRequest,
+)
+
 import dataclasses
 from datetime import datetime
 from typing import cast
@@ -89,6 +96,41 @@ def test_agent_run_request_accepts_non_empty_messages() -> None:
     assert len(request.messages) == 1
 
 
+def test_agent_run_request_exposes_explicit_structured_output_field() -> None:
+    """AgentRunRequest 必须显式承载 typed structured-output request。"""
+
+    schema_request = JsonSchemaStructuredOutputRequest(
+        name="owner_schema",
+        schema={"type": "object"},
+        strict=True,
+    )
+    request = _request(
+        messages=(UserMessage(role=AgentMessageRole.USER, content="hello"),),
+        structured_output=schema_request,
+        structured_output_capability=StructuredOutputCapability.JSON_SCHEMA,
+    )
+    field = next(
+        item
+        for item in dataclasses.fields(AgentRunRequest)
+        if item.name == "structured_output"
+    )
+
+    assert request.structured_output is schema_request
+    assert field.default is None
+
+
+def test_agent_run_request_rejects_unsupported_structured_output() -> None:
+    """AgentRunRequest 在 Runner 调用前拒绝非法 capability/request 组合。"""
+
+    with pytest.raises(ValueError, match="does not support"):
+        _request(
+            messages=(
+                UserMessage(role=AgentMessageRole.USER, content="hello"),
+            ),
+            structured_output=JsonObjectStructuredOutputRequest(),
+        )
+
+
 def test_agent_run_request_rejects_message_outside_closed_union() -> None:
     """AgentRunRequest 拒绝静态 cast 注入的非 AgentMessage 实例。"""
 
@@ -156,12 +198,18 @@ def _request(
     messages: tuple[AgentMessage, ...],
     attempt_id: str | None = None,
     execution_id: str | None = None,
+    structured_output: StructuredOutputRequest | None = None,
+    structured_output_capability: StructuredOutputCapability = (
+        StructuredOutputCapability.NONE
+    ),
 ) -> AgentRunRequest:
     """构造 AgentRunRequest。
 
     :param messages: 请求消息。
     :param attempt_id: Host attempt id。
     :param execution_id: Host execution id。
+    :param structured_output: structured-output request。
+    :param structured_output_capability: Runner capability。
     :returns: AgentRunRequest。
     """
 
@@ -180,6 +228,7 @@ def _request(
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
+            structured_output_capability=structured_output_capability,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,
@@ -201,6 +250,7 @@ def _request(
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),
         cancellation_token=_Token(),
+        structured_output=structured_output,
         attempt_id=attempt_id,
         execution_id=execution_id,
     )

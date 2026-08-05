@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 
 class OpenAIReasoningEffort(StrEnum):
     """OpenAI reasoning effort 枚举。
@@ -268,6 +270,8 @@ class RunnerSpec:
         ``stream_options.include_usage``。仅当为 ``True`` 时 Runner
         会在请求中追加 ``stream_options.include_usage=True``；为
         ``False`` 时**不**写入该字段。
+    :param structured_output_capability: Runner 支持的最高 structured-output
+        capability。
     :param default_timeout_seconds: 默认请求超时秒数，必须为正数。
     :param max_retries: 最大重试次数，必须为非负整数。
     :param provider_request: provider 请求扩展；为 ``None`` 表示不带扩展。
@@ -289,6 +293,7 @@ class RunnerSpec:
     supports_tool_calling: bool
     supports_streaming: bool
     supports_stream_usage: bool
+    structured_output_capability: StructuredOutputCapability
     default_timeout_seconds: float
     max_retries: int
     provider_request: ProviderRequestExtension | None
@@ -312,6 +317,13 @@ class RunnerSpec:
 
         timeout = self.stream_idle_timeout_seconds
         heartbeat = self.stream_idle_heartbeat_seconds
+        if not isinstance(
+            self.structured_output_capability, StructuredOutputCapability
+        ):
+            raise TypeError(
+                "structured_output_capability must be "
+                "StructuredOutputCapability"
+            )
         if self.default_timeout_seconds <= 0:
             raise ValueError(
                 "default_timeout_seconds must be > 0; "

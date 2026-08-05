@@ -13,7 +13,7 @@
     {"path": ".dayu-init.lock", "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
     {"path": "config/execution_profiles.json", "content_sha256": "3fd7e6940e337f0668bbac315f6b99254e3eb3309473a2161efc91cfc1b2e1f5"},
     {"path": "config/host_runtime.json", "content_sha256": "0cce16e2390e5bcb0e58148112c331a700cd66fd6eefdfc5ccd312a27a3ed07d"},
-    {"path": "config/models.json", "content_sha256": "d817a17135a01e1e7d89ada9e6b93b107d29fa9715105340c7ff44d505cf8b68"},
+    {"path": "config/models.json", "content_sha256": "dc924f842be81599c00606dae0cbe464d6f766147581d4bbb4167e83044e5f2b"},
     {"path": "config/prompts/base/agents.md", "content_sha256": "90eb0b0b8cf7da8aa7420d1c1c152ac101afa047efb48587e0bf0fd57f67456d"},
     {"path": "config/prompts/base/fact_rules.md", "content_sha256": "a4e463527dafd2a81699e26b921055e5daa807bb2251a19b2813da9a075d7fa7"},
     {"path": "config/prompts/base/soul.md", "content_sha256": "88ae5ac24918ef27dff92e9e33c964dbc7bf41119026d9c3793debff91fc576e"},

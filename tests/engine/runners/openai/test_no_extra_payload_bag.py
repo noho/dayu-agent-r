@@ -35,13 +35,28 @@ def test_no_set_tools() -> None:
 
 
 def test_build_request_payload_signature_no_kwargs() -> None:
-    """``build_request_payload`` 仅接受关键字 ``messages/options/tools/spec``。"""
+    """Payload builder 只接受封闭的显式 keyword 参数。
+
+    :returns: ``None``。
+    :raises AssertionError: 参数集合、参数种类或 structured-output default
+        不符合 owner contract 时抛出。
+    """
 
     sig = inspect.signature(build_request_payload)
-    expected = {"messages", "options", "tools", "spec"}
+    expected = {
+        "messages",
+        "options",
+        "tools",
+        "spec",
+        "structured_output",
+    }
     assert set(sig.parameters.keys()) == expected
     for p in sig.parameters.values():
         assert p.kind is inspect.Parameter.KEYWORD_ONLY
+    assert (
+        sig.parameters["structured_output"].default
+        is inspect.Parameter.empty
+    )
 
 
 def _payload_source_tree() -> ast.Module:

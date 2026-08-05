@@ -60,6 +60,7 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
 from dayu.engine.runners.openai.cancellation_helpers import _RunnerInterrupted
 from dayu.engine.runners.openai.diagnostic_payload import (
     http_error_diagnostic_payload,
@@ -364,6 +365,7 @@ class AsyncOpenAIRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None = None,
     ) -> AsyncIterator[RunnerEvent]:
         """发起一次 LLM 调用并返回 :class:`RunnerEvent` 异步流。
@@ -371,13 +373,19 @@ class AsyncOpenAIRunner:
         :param messages: 消息序列。
         :param options: 单次调用参数。
         :param tools: 工具 schema 序列。
+        :param structured_output: 本次调用的显式 structured-output 请求；
+            ``None`` 表示不请求 structured-output transport。
         :param request_identity: 本次逻辑 Runner 调用的请求身份；policy
             开启时会映射为 OpenAI-compatible 客户端关联 header。
         :returns: :class:`RunnerEvent` 异步迭代器。
         """
 
         return self._call_impl(
-            messages, options, tools, request_identity=request_identity
+            messages,
+            options,
+            tools,
+            structured_output=structured_output,
+            request_identity=request_identity,
         )
 
     def is_supports_tool_calling(self) -> bool:
@@ -402,6 +410,7 @@ class AsyncOpenAIRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """``call`` 的真实异步生成器实现。
@@ -409,6 +418,8 @@ class AsyncOpenAIRunner:
         :param messages: 消息序列。
         :param options: 单次调用参数。
         :param tools: 工具 schema 序列。
+        :param structured_output: 本次调用的显式 structured-output 请求；
+            ``None`` 表示不请求 structured-output transport。
         :param request_identity: 本次逻辑 Runner 调用的请求身份；为 ``None``
             时不会发送客户端关联 id。
         :returns: :class:`RunnerEvent` 异步迭代器。
@@ -422,6 +433,7 @@ class AsyncOpenAIRunner:
             options=effective_options,
             tools=tools,
             spec=self._spec,
+            structured_output=structured_output,
         )
         headers = _build_request_headers(
             spec=self._spec,

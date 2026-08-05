@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 from collections.abc import Mapping
 from typing import cast
@@ -412,6 +414,7 @@ def _compactor() -> LLMContextCompactor:
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=1.0,
             max_retries=0,
             provider_request=None,

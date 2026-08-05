@@ -38,6 +38,7 @@ from dayu.contracts import (
 )
 from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
 from dayu.fins.direct_events import FinsOperationKind
 from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.fins.ingestion.observation_handle import (
@@ -67,7 +68,11 @@ from dayu.host.tool_duplicate_governance import (
 )
 from dayu.host.wait_adapter import WaitActivationRequest, WaitResumePolicy
 from dayu.host.waiting import ToolAwaitingAcceptedAck, ToolAwaitingEventRef
-from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
+from dayu.runtime.config_loader import (
+    ConfigLoader,
+    RuntimeConfig,
+    StructuredOutputCapabilityConfig,
+)
 from dayu.runtime.config_loader import (
     ToolDuplicateGovernanceMessagesConfig,
     ToolDuplicateGovernancePolicyConfig,
@@ -196,6 +201,27 @@ def _host_assembly_env() -> dict[str, str]:
     }
 
 
+def test_structured_output_capability_enums_map_mechanically_by_value() -> None:
+    """Service 装配边界锁定 runtime 与 Engine capability 的完整值域。
+
+    :returns: ``None``。
+    :raises AssertionError: 两侧完整 value 集合不一致或任一 runtime value
+        无法机械构造 Engine capability 时抛出。
+    """
+
+    runtime_values = {
+        capability.value for capability in StructuredOutputCapabilityConfig
+    }
+    engine_values = {
+        capability.value for capability in StructuredOutputCapability
+    }
+
+    assert runtime_values == engine_values
+    for runtime_capability in StructuredOutputCapabilityConfig:
+        engine_capability = StructuredOutputCapability(runtime_capability.value)
+        assert engine_capability.value == runtime_capability.value
+
+
 def test_compose_open_host_options_uses_runtime_tuning_from_config(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +305,10 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert (
         result.options.ordinary_run_baseline.runner_spec.client_correlation_policy
         is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    )
+    assert (
+        result.options.ordinary_run_baseline.runner_spec.structured_output_capability
+        is StructuredOutputCapability.JSON_OBJECT
     )
     assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
     compactor_baseline = result.options.compactor_runner_baseline
@@ -1496,6 +1526,10 @@ def test_runner_spec_from_ollama_model_skips_api_key_header() -> None:
     assert spec.api_key_ref is None
     assert spec.headers == {"Content-Type": "application/json"}
     assert spec.client_correlation_policy is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    assert (
+        spec.structured_output_capability
+        is StructuredOutputCapability.NONE
+    )
 
 
 def test_runner_spec_rejects_static_client_request_id_header() -> None:

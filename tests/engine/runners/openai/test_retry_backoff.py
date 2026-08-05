@@ -278,7 +278,7 @@ async def test_runner_sleeps_between_retries(
 
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     final_events = []
-    async for ev in runner.call(msgs, make_options(stream=False), []):
+    async for ev in runner.call(msgs, make_options(stream=False), [], structured_output=None):
         final_events.append(ev)
     await runner.close()
 

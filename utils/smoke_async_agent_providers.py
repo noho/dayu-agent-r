@@ -37,7 +37,7 @@ from dayu.engine import (
     QwenThinkingExtension,
     RunnerCallOptions,
     RunnerSpec,
-    ToolExecutor,
+    StructuredOutputCapability,
     UserMessage,
     run_agent_messages,
 )
@@ -70,6 +70,8 @@ class ProviderCase:
     :param endpoint: OpenAI-compatible chat completions endpoint。
     :param model: 模型名。
     :param supports_stream_usage: 是否支持 stream usage。
+    :param structured_output_capability: provider/model 已知的最高
+        structured-output capability。
     :param provider_request: provider thinking 请求扩展。
     """
 
@@ -79,6 +81,7 @@ class ProviderCase:
     endpoint: str
     model: str
     supports_stream_usage: bool
+    structured_output_capability: StructuredOutputCapability
     provider_request: ProviderRequestExtension
 
 
@@ -155,6 +158,7 @@ CASES: tuple[ProviderCase, ...] = (
         endpoint="https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
         model="mimo-v2.5-pro",
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         provider_request=MimoThinkingExtension(enabled=True),
     ),
     ProviderCase(
@@ -164,6 +168,7 @@ CASES: tuple[ProviderCase, ...] = (
         endpoint="https://api.deepseek.com/chat/completions",
         model="deepseek-v4-flash",
         supports_stream_usage=True,
+        structured_output_capability=StructuredOutputCapability.JSON_OBJECT,
         provider_request=DeepSeekThinkingExtension(enabled=True),
     ),
     ProviderCase(
@@ -176,6 +181,7 @@ CASES: tuple[ProviderCase, ...] = (
         ),
         model="gemini-2.5-flash",
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         provider_request=GeminiThinkingExtension(
             thinking_budget=_GEMINI_DYNAMIC_THINKING_BUDGET,
             include_thoughts=True,
@@ -191,6 +197,7 @@ CASES: tuple[ProviderCase, ...] = (
         ),
         model="qwen3.6-plus",
         supports_stream_usage=True,
+        structured_output_capability=StructuredOutputCapability.NONE,
         provider_request=QwenThinkingExtension(enable_thinking=True),
     ),
 )
@@ -276,6 +283,7 @@ def build_request(
         supports_tool_calling=False,
         supports_streaming=True,
         supports_stream_usage=case.supports_stream_usage,
+        structured_output_capability=case.structured_output_capability,
         default_timeout_seconds=timeout_seconds,
         max_retries=_DEFAULT_MAX_RETRIES,
         provider_request=case.provider_request,

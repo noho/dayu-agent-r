@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
+
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -10,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
@@ -187,6 +190,7 @@ class _ScriptedRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
@@ -194,6 +198,7 @@ class _ScriptedRunner:
         :param messages: Agent messages。
         :param options: Runner options。
         :param tools: 当前暴露的工具 schemas。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         """
@@ -686,6 +691,7 @@ def _policy_snapshot() -> PolicySnapshot:
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,

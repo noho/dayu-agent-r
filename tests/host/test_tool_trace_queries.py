@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1181,6 +1183,7 @@ def _record_real_ordinary_runner_call_manifest(
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,

@@ -105,6 +105,14 @@ class RunnerKind(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"
 
 
+class StructuredOutputCapabilityConfig(StrEnum):
+    """模型目录声明的 structured-output capability。"""
+
+    NONE = "none"
+    JSON_OBJECT = "json_object"
+    JSON_SCHEMA = "json_schema"
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerOptionHintConfig:
     """模型内 semantic RunnerCallOptions hint。
@@ -144,6 +152,8 @@ class ModelConfig:
     :param supports_tool_calling: 是否支持工具调用。
     :param supports_stream: 是否支持流式输出。
     :param supports_stream_usage: 是否支持流式 usage。
+    :param structured_output_capability: 模型支持的最高 structured-output
+        capability。
     :param default_timeout_seconds: 默认请求超时秒数。
     :param max_retries: 默认最大重试次数。
     :param sse_idle_timeout_seconds: SSE 空闲超时秒数。
@@ -163,6 +173,7 @@ class ModelConfig:
     supports_tool_calling: bool
     supports_stream: bool
     supports_stream_usage: bool
+    structured_output_capability: StructuredOutputCapabilityConfig
     default_timeout_seconds: float
     max_retries: int
     sse_idle_timeout_seconds: float
@@ -1205,6 +1216,7 @@ def _parse_model_config(*, record_id: str, record: JsonObject) -> ModelConfig:
                 "supports_tool_calling",
                 "supports_stream",
                 "supports_stream_usage",
+                "structured_output_capability",
                 "default_timeout_seconds",
                 "max_retries",
                 "sse_idle_timeout_seconds",
@@ -1230,6 +1242,14 @@ def _parse_model_config(*, record_id: str, record: JsonObject) -> ModelConfig:
         supports_tool_calling=_require_bool_field(record, field_name="supports_tool_calling", context=context),
         supports_stream=_require_bool_field(record, field_name="supports_stream", context=context),
         supports_stream_usage=_require_bool_field(record, field_name="supports_stream_usage", context=context),
+        structured_output_capability=_parse_structured_output_capability(
+            _require_str_field(
+                record,
+                field_name="structured_output_capability",
+                context=context,
+            ),
+            context=f"{context}.structured_output_capability",
+        ),
         default_timeout_seconds=_require_positive_float_field(record, field_name="default_timeout_seconds", context=context),
         max_retries=_require_non_negative_int_field(record, field_name="max_retries", context=context),
         sse_idle_timeout_seconds=_require_positive_float_field(record, field_name="sse_idle_timeout_seconds", context=context),
@@ -1256,6 +1276,25 @@ def _parse_runner_kind(value: str, *, context: str) -> RunnerKind:
         return RunnerKind(value)
     except ValueError as exc:
         raise ConfigFieldError(f"{context} has unsupported runner kind: {value}") from exc
+
+
+def _parse_structured_output_capability(
+    value: str, *, context: str
+) -> StructuredOutputCapabilityConfig:
+    """解析模型 structured-output capability。
+
+    :param value: 配置中的 capability 字符串。
+    :param context: 错误消息上下文。
+    :returns: structured-output capability enum。
+    :raises ConfigFieldError: 值不属于封闭枚举时抛出。
+    """
+
+    try:
+        return StructuredOutputCapabilityConfig(value)
+    except ValueError as exc:
+        raise ConfigFieldError(
+            f"{context} has unsupported structured output capability: {value}"
+        ) from exc
 
 
 def _parse_model_runtime_hints(

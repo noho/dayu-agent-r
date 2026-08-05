@@ -274,6 +274,7 @@ async def test_attempt_start_diagnostic_logged(
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             events: list[RunnerEvent] = []
             async for event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=False), tools=[]
             ):
                 events.append(event)
@@ -330,6 +331,7 @@ async def test_response_log_includes_client_correlation_id(
     ):
         events: list[RunnerEvent] = []
         async for event in runner.call(
+            structured_output=None,
             messages=[UserMessage(role=AgentMessageRole.USER, content="hi")],
             options=make_options(stream=False),
             tools=[],
@@ -422,6 +424,7 @@ async def test_cancelled_diagnostic_logged(
         with caplog.at_level(logging.DEBUG, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             async for _event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=False), tools=[]
             ):
                 pass
@@ -512,6 +515,7 @@ async def test_terminal_error_logged_at_warning_level(
         with caplog.at_level(logging.DEBUG, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             async for _event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=False), tools=[]
             ):
                 pass
@@ -553,6 +557,7 @@ async def test_runner_logs_use_dayu_namespace_only(
         with caplog.at_level(logging.DEBUG, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             async for _event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=False), tools=[]
             ):
                 pass
@@ -609,6 +614,7 @@ async def _collect_stream_diagnostic_events(
         msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
         events: list[RunnerEvent] = []
         async for event in runner.call(
+            structured_output=None,
             messages=msgs, options=make_options(stream=True), tools=[]
         ):
             events.append(event)

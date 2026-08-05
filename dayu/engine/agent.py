@@ -111,7 +111,6 @@ from dayu.engine.contracts.runner_events import (
     RunnerDiagnosticSource,
     RunnerDoneData,
     RunnerEvent,
-    RunnerEventType,
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
@@ -1343,6 +1342,7 @@ class _AsyncAgent:
                 messages,
                 self._request.runner_options,
                 tools,
+                structured_output=self._request.structured_output,
                 request_identity=request_identity,
             ):
                 if self._is_cancelled():

@@ -252,7 +252,7 @@ async def _run(
 
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
-    async for ev in runner.call(msgs, make_options(stream=False), []):
+    async for ev in runner.call(msgs, make_options(stream=False), [], structured_output=None):
         events.append(ev)
     return events
 
@@ -482,7 +482,7 @@ async def test_stream_read_failure_after_event_does_not_retry(
 
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
-    async for ev in runner.call(msgs, make_options(stream=True), []):
+    async for ev in runner.call(msgs, make_options(stream=True), [], structured_output=None):
         events.append(ev)
 
     assert len(session.calls) == 1

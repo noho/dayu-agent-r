@@ -198,7 +198,7 @@ Service 不解释 finding 规则，CLI 不导入 Host durable internals。
 
 ### Engine public contract
 
-Engine public contract 以 `AgentRunRequest` 为入口，以 `EngineEvent stream` 或 `AgentRunResult` 为输出。稳定入口是 `run_agent_messages(request)` 与 `run_agent_and_wait(request)`。核心类型包括 `AgentPolicy`、`AgentMessage`、`AssistantToolCall`、`RunnerSpec`、`RunnerCallOptions`、`AsyncRunner`、`RunnerEvent`、`EngineEvent`、provider request extension、client correlation 和 run outcome union。
+Engine public contract 以 `AgentRunRequest` 为入口，以 `EngineEvent stream` 或 `AgentRunResult` 为输出。稳定入口是 `run_agent_messages(request)` 与 `run_agent_and_wait(request)`。核心类型包括 `AgentPolicy`、`AgentMessage`、`AssistantToolCall`、`RunnerSpec`、`RunnerCallOptions`、`StructuredOutputCapability`、`StructuredOutputRequest`、`AsyncRunner`、`RunnerEvent`、`EngineEvent`、provider request extension、client correlation 和 run outcome union。Runtime config 声明模型 capability，Service 机械投影到 `RunnerSpec`，调用方在 `AgentRunRequest` 显式选择单次 request；Engine 只校验矩阵并投影 transport，不按 provider 名称推断或降级。
 
 Engine 契约只描述一次 run 的执行输入、Runner 调用、工具批次、取消观察、provider 归一、usage、context overflow、length continuation、fallback 和 terminal outcome。Session / Run / Attempt 生命周期、EventLog、memory、wait record、ToolRuntime、工具权限、业务工具发现和财报仓储不属于 Engine contract。
 

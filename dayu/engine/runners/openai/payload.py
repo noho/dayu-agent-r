@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import assert_never
+from typing import TypedDict, assert_never
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import GeminiToolCallState, ToolCallProviderState
@@ -55,6 +55,12 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
+from dayu.engine.contracts.structured_output import (
+    JsonObjectStructuredOutputRequest,
+    JsonSchemaStructuredOutputRequest,
+    StructuredOutputRequest,
+    validate_structured_output_request,
+)
 from dayu.engine.runners.openai._types import (
     _OpenAIChatMessage,
     _OpenAIExtraBody,
@@ -66,6 +72,38 @@ from dayu.engine.runners.openai._types import (
     _OpenAIToolFunctionSchema,
     _OpenAIToolSchema,
 )
+
+
+class _OpenAIJsonObjectResponseFormat(TypedDict):
+    """OpenAI-compatible JSON object response format。"""
+
+    type: str
+
+
+class _OpenAIJsonSchemaDefinition(TypedDict):
+    """OpenAI-compatible JSON Schema definition。"""
+
+    name: str
+    strict: bool
+    schema: Mapping[str, JsonValue]
+
+
+class _OpenAIJsonSchemaResponseFormat(TypedDict):
+    """OpenAI-compatible JSON Schema response format。"""
+
+    type: str
+    json_schema: _OpenAIJsonSchemaDefinition
+
+
+class _OpenAIRequestPayloadWithStructuredOutput(
+    _OpenAIRequestPayload,
+    total=False,
+):
+    """补充 generic structured-output 字段的 outbound payload。"""
+
+    response_format: (
+        _OpenAIJsonObjectResponseFormat | _OpenAIJsonSchemaResponseFormat
+    )
 
 
 def _serialize_arguments(arguments: Mapping[str, JsonValue]) -> str:
@@ -256,6 +294,41 @@ def _apply_provider_request(
             assert_never(provider_request)
 
 
+def _apply_structured_output_request(
+    payload: _OpenAIRequestPayloadWithStructuredOutput,
+    request: StructuredOutputRequest | None,
+) -> None:
+    """把 provider-neutral structured-output request 投影为响应格式。
+
+    :param payload: 待写入的 OpenAI-compatible payload。
+    :param request: structured-output request；``None`` 表示不写
+        ``response_format``。
+    :returns: ``None``；原地修改 ``payload``。
+    :raises AssertionError: structured-output 封闭联合出现未处理成员时抛出。
+    """
+
+    if request is None:
+        return
+    match request:
+        case JsonObjectStructuredOutputRequest():
+            payload["response_format"] = {"type": "json_object"}
+        case JsonSchemaStructuredOutputRequest(
+            name=name,
+            schema=schema,
+            strict=strict,
+        ):
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "strict": strict,
+                    "schema": schema,
+                },
+            }
+        case _:
+            assert_never(request)
+
+
 def _top_level_thinking_enabled(enabled: bool) -> _OpenAIThinkingTopLevel:
     """构造无预算字段的顶层 ``thinking`` 开关。
 
@@ -332,17 +405,25 @@ def build_request_payload(
     options: RunnerCallOptions,
     tools: Sequence[ToolSchema],
     spec: RunnerSpec,
-) -> _OpenAIRequestPayload:
+    structured_output: StructuredOutputRequest | None,
+) -> _OpenAIRequestPayloadWithStructuredOutput:
     """构建 OpenAI 兼容 chat completion 请求 payload。
 
     :param messages: 消息序列。
     :param options: 单次调用参数。
     :param tools: 工具 schema 序列。
     :param spec: Runner 规约。
+    :param structured_output: 本次调用的 structured-output request；
+        ``None`` 表示不写 ``response_format``。
     :returns: 强类型 :class:`_OpenAIRequestPayload`。
+    :raises ValueError: Runner capability 不支持请求 mode 时抛出。
     """
 
-    payload: _OpenAIRequestPayload = {
+    validate_structured_output_request(
+        capability=spec.structured_output_capability,
+        request=structured_output,
+    )
+    payload: _OpenAIRequestPayloadWithStructuredOutput = {
         "model": spec.model,
         "messages": [_serialize_message(m) for m in messages],
         "stream": options.stream,
@@ -359,6 +440,7 @@ def build_request_payload(
     if options.stream and spec.supports_stream_usage:
         stream_options: _OpenAIStreamOptions = {"include_usage": True}
         payload["stream_options"] = stream_options
+    _apply_structured_output_request(payload, structured_output)
     _apply_provider_request(payload, spec.provider_request)
     return payload
 

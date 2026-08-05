@@ -104,6 +104,8 @@ Engine 位于链路最下游。Host 可以调用 Engine public entry；Engine �
 - `runner_spec`：Runner 规约。
 - `runner_options`：单次 Runner 调用参数。
 - `agent_policy`：Agent loop 策略。
+- `structured_output`：本次 run 的 provider-neutral structured-output 请求；
+  `None` 表示不请求该 transport。
 - `tool_schemas`：本次 run 暴露给 LLM 的工具 schema 快照。
 - `tool_executor`：工具执行协议 handle。
 - `cancellation_token`：取消观察 token。
@@ -140,6 +142,7 @@ request = AgentRunRequest(
     tool_schemas=tool_schemas,
     tool_executor=tool_executor,
     cancellation_token=cancellation_token,
+    structured_output=None,
     attempt_id=attempt_id,
     execution_id=execution_id,
 )
@@ -182,8 +185,12 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 - `EngineEvent`：Engine 对调用方暴露的公共事件，字段包括 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`；构造时按唯一 mapping 校验 `EngineEventType` 与 data dataclass 配对，调用方不修复非法组合。
 - `EngineEventData`：Engine 事件 data 封闭联合，每个 `EngineEventType` 对应明确 data dataclass。
 - `RunnerEvent`：Runner 到 Agent 的协议归一事件，不含 `session_id` / `run_id`；构造时校验 `RunnerEventType` 与 data dataclass 的唯一配对，Runner adapter 复用 Engine contract 中的配对映射与派生 helper。
-- `AsyncRunner`：Engine 调用模型 provider 的协议，定义 `call(...)`、`is_supports_tool_calling()`、`close()`。
-- `RunnerSpec`：Runner 规约，包含 provider、model、endpoint、API key 引用、headers、client correlation policy、tool / stream capability、timeout、retry、provider 请求扩展、SSE idle 配置。
+- `StructuredOutputCapability` / `StructuredOutputRequest`：分别表达 Runner 的
+  `none` / `json_object` / `json_schema` 能力，以及单次 run 的 JSON object 或
+  JSON Schema typed request。
+- `AsyncRunner`：Engine 调用模型 provider 的协议；`call(...)` 的
+  `structured_output` 是 required、无 default 的 keyword-only 参数。
+- `RunnerSpec`：Runner 规约，包含 provider、model、endpoint、API key 引用、headers、client correlation policy、tool / stream / structured-output capability、timeout、retry、provider 请求扩展、SSE idle 配置。
 - `RunnerCallOptions`：单次 Runner 调用参数，包含 `temperature`、`max_tokens`、`top_p`、`stream`。
 - `RunnerRequestIdentity`：单次逻辑 Runner 调用身份，包含 `run_id`、可选且成对出现的 `attempt_id` / `execution_id`、`iteration_id`、`iteration_index`、`runner_call_index` 和派生 `client_correlation_id`。
 - `SuccessfulRunnerResponseIdentity`：实际终结成功回答的 Runner response identity，包含 effective provider/model、同一次 `RunnerRequestIdentity`，以及严格成对的 provider request id `present + value` 或 `unavailable + None`。
@@ -266,6 +273,9 @@ Stream 术语固定如下：
 当前默认实现是 OpenAI-compatible Runner：
 
 - 根据 `RunnerSpec` 与 `RunnerCallOptions` 构造 chat completion payload。
+- 在任何 outbound HTTP 前校验 capability/request 矩阵；OpenAI-compatible
+  payload 只按 typed request 写顶层 `response_format`。不支持的组合直接失败，
+  provider 拒绝后不降级成较弱 mode。
 - 当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时降级为非流式请求。
 - 只有在 effective stream 为 `True` 且 HTTP 200 response 的 media type 是 `text/event-stream` 时按 SSE 解析；流式请求缺失 `Content-Type` 时保留 SSE fallback 并记录诊断；其它 media type 按非流式 JSON 解析。
 - `supports_stream_usage=True` 时，流式请求写入 `stream_options.include_usage=True`；否则不写该字段。
@@ -304,7 +314,7 @@ run_agent_messages(request)
       -> emit iteration_started
       -> compute effective tools from disable_tools / AgentPolicy / Runner capability
       -> build RunnerRequestIdentity
-      -> AsyncRunner.call(messages, runner_options, tools, request_identity=identity)
+      -> AsyncRunner.call(..., structured_output=request.structured_output, request_identity=identity)
       -> consume RunnerEvent stream
       -> emit content / reasoning / usage / provider diagnostic / iteration events
       -> classify as final answer, tool calls, failure, or context compaction request
@@ -525,6 +535,6 @@ Engine / Runner 日志不输出完整 prompt、provider headers、API key、完�
 
 扩展 RunnerEvent 时，必须同步扩展 `RunnerEventType`、对应 data dataclass、`RunnerEventData` 封闭联合、Engine contract 中的 type/data 配对映射与派生 helper，以及 Runner 实现和 Agent 消费路径。
 
-扩展 provider 请求参数时，优先进入 `RunnerSpec.provider_request` 的 provider extension；单次采样、输出长度、top-p 和流式开关进入 `RunnerCallOptions`。
+扩展 provider 请求参数时，优先进入 `RunnerSpec.provider_request` 的 provider extension；单次采样、输出长度、top-p 和流式开关进入 `RunnerCallOptions`。Structured output 使用独立的 `AgentRunRequest.structured_output` 与 `RunnerSpec.structured_output_capability`，不得放入 provider extension、headers 或 extra payload。
 
 扩展工具能力时，在工具包中使用 `dayu.contracts` 的 `ToolDefinition` / `ToolBundle` 声明工具，由 Service / runtime discovery 装配给 Host / ToolRuntime；Host / ToolRuntime 将 `ToolSchema` 暴露给 Runner，并将受治理后的 `ToolExecutor` 提供给 Engine。Engine 不新增工具注册表，也不把工具部署位置、工具定义对象或 batch 内部执行策略写进 Engine 契约。

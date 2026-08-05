@@ -8,6 +8,10 @@ metadata。
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
+
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import dataclasses
 import logging
@@ -124,6 +128,7 @@ class _MetadataBoundaryRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
@@ -131,6 +136,7 @@ class _MetadataBoundaryRunner:
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
@@ -202,6 +208,7 @@ def _metadata_boundary_request() -> AgentRunRequest:
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=_RUNNER_DEFAULT_TIMEOUT_SECONDS,
             max_retries=0,
             provider_request=None,

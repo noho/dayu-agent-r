@@ -24,6 +24,7 @@ from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts import AgentFallbackMode
 from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
 from dayu.engine.provider_extensions import provider_request_extension_from_json
 from dayu.fins.ingestion.awaiting_resolution import (
     AWAITING_RESOLUTION_MODE_CONFIG_FIELD,
@@ -1803,6 +1804,9 @@ def _runner_spec_from_model(*, model: ModelConfig, env: Mapping[str, str]) -> Ru
         supports_tool_calling=model.supports_tool_calling,
         supports_streaming=model.supports_stream,
         supports_stream_usage=model.supports_stream_usage,
+        structured_output_capability=StructuredOutputCapability(
+            model.structured_output_capability.value
+        ),
         default_timeout_seconds=model.default_timeout_seconds,
         max_retries=model.max_retries,
         provider_request=provider_request_extension_from_json(model.provider_request_extension),

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
+
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import json
 import logging
@@ -150,6 +154,7 @@ class _ScriptedRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
@@ -157,6 +162,7 @@ class _ScriptedRunner:
         :param messages: Agent 消息。
         :param options: Runner 调用参数。
         :param tools: 本轮工具 schema。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
@@ -256,6 +262,7 @@ class _StateClearingRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回会破坏迭代状态不变量的 RunnerEvent 流。
@@ -263,6 +270,7 @@ class _StateClearingRunner:
         :param messages: Agent 消息。
         :param options: Runner 调用参数。
         :param tools: 本轮工具 schema。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
@@ -678,6 +686,7 @@ def _request(
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,

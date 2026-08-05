@@ -7,6 +7,10 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
+
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import os
 import pathlib
@@ -671,6 +675,7 @@ class _ScriptedToolRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
@@ -678,6 +683,7 @@ class _ScriptedToolRunner:
         :param messages: 当前 Agent messages。
         :param options: Runner call options。
         :param tools: 当前暴露的 tool schemas。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         :raises Exception: 不主动抛出异常。
@@ -731,6 +737,7 @@ class _AwaitingToolRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回等待型工具调用脚本。
@@ -738,6 +745,7 @@ class _AwaitingToolRunner:
         :param messages: 当前 Agent messages。
         :param options: Runner call options。
         :param tools: 当前暴露的 tool schemas。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         :raises Exception: 不主动抛出异常。
@@ -959,6 +967,7 @@ def runner_spec_for_case(case: ProviderSmokeCase, api_key: str) -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=True,
         supports_stream_usage=case.supports_stream_usage,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         max_retries=_DEFAULT_MAX_RETRIES,
         provider_request=None,
@@ -1061,6 +1070,7 @@ def deterministic_runner_spec(model: str = "slice6-test-model") -> RunnerSpec:
         supports_tool_calling=True,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
