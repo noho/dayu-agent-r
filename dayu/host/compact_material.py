@@ -26,7 +26,7 @@ from dayu.host.compaction import (
     CompactSegmentSelectionScope,
     CompactSegmentTrigger,
     CurrentInputAnchor,
-    CompactCandidateV2,
+    CompactCandidateV3,
     PromptLocalEvidenceMap,
     PromptLocalMaterialLabel,
     PromptLocalProvenanceEntry,
@@ -2256,7 +2256,7 @@ def _previous_compacted_view_pair_from_candidate(
     *,
     event_id: str,
     event_sequence: int,
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
 ) -> tuple[tuple[CompactMaterialBlock, ...], PreviousCompactReadableView | None]:
     """从 typed accepted candidate 原子生成 previous blocks 与 typed view。
 
@@ -2343,7 +2343,7 @@ def _previous_compacted_view_pair_from_candidate(
 
 
 def _readable_answer_anchors_from_candidate(
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
 ) -> tuple[ReadableAnswerAnchorVNext, ...]:
     """把 accepted candidate answer anchors 映射为无 label readable anchors。
 
@@ -2372,7 +2372,7 @@ def _readable_answer_anchors_from_candidate(
 
 
 def _readable_previous_view_from_candidate(
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
     blocks: tuple[CompactMaterialBlock, ...],
     *,
     readable_anchors: tuple[ReadableAnswerAnchorVNext, ...],

@@ -332,20 +332,16 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         max_consecutive_failed_tool_batches=1,
     )
     assert "<<compaction_request>>" not in compactor_baseline.compactor_system_prompt
-    assert "dayu.context_compaction.input.v2" not in compactor_baseline.compactor_system_prompt
-    assert "dayu.context_compaction.output.v2" not in compactor_baseline.compactor_system_prompt
-    assert "完整 replacement candidate" in compactor_baseline.compactor_system_prompt
-    assert "source label 只是本次请求内的引用标签" in (
+    assert "dayu.context_compaction.input.v3" not in compactor_baseline.compactor_system_prompt
+    assert "dayu.context_compaction.output.v3" not in compactor_baseline.compactor_system_prompt
+    assert "完整 replacement" in compactor_baseline.compactor_system_prompt
+    assert "source label 只是本次输入内的引用标签" in (
         compactor_baseline.compactor_system_prompt
     )
     assert "<<compaction_request>>" in compactor_baseline.compactor_user_prompt_template
-    assert "dayu.context_compaction.input.v2" in (
-        compactor_baseline.compactor_user_prompt_template
-    )
-    assert "dayu.context_compaction.output.v2" in (
-        compactor_baseline.compactor_user_prompt_template
-    )
-    assert "覆盖规则" in compactor_baseline.compactor_user_prompt_template
+    assert "<<compact_output_rules>>" in compactor_baseline.compactor_user_prompt_template
+    assert "<<compact_output_template>>" in compactor_baseline.compactor_user_prompt_template
+    assert "五类业务内容" in compactor_baseline.compactor_user_prompt_template
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
@@ -1221,7 +1217,11 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
     compactor_baseline = result.options.compactor_runner_baseline
     assert compactor_baseline is not None
     assert compactor_baseline.compactor_system_prompt == ("custom compactor system prompt")
-    assert compactor_baseline.compactor_user_prompt_template == ("custom compactor user prompt <<compaction_request>>")
+    assert compactor_baseline.compactor_user_prompt_template == (
+        "custom compactor user prompt <<compaction_request>>\n"
+        "<<compact_output_rules>>\n"
+        "<<compact_output_template>>"
+    )
     assert compactor_baseline.compactor_agent_policy.max_iterations == 1
     assert compactor_baseline.compactor_agent_policy.allow_tool_calls is False
 
@@ -3291,7 +3291,11 @@ def _custom_compactor_scene_locations(
         encoding="utf-8",
     )
     (scene_root / "custom_compactor_user.md").write_text(
-        "custom compactor user prompt <<compaction_request>>",
+        (
+            "custom compactor user prompt <<compaction_request>>\n"
+            "<<compact_output_rules>>\n"
+            "<<compact_output_template>>"
+        ),
         encoding="utf-8",
     )
     return RuntimeLocations(

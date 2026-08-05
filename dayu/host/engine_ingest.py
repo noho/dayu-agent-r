@@ -108,7 +108,7 @@ from dayu.host.compact_pipeline import (
     compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV2,
+    CompactAcceptedTruthV3,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactionRequest,
@@ -2776,6 +2776,7 @@ class EngineEventIngestor:
         request_plan = build_normal_compact_request_plan(
             source_snapshot=pending.source_snapshot,
             selection_policy_digest=digest_memory_projection_policy(memory_policy),
+            memory_policy=memory_policy,
             budget_before_compact=pending.estimate,
             selected_recent_window_turn_floor=(memory_policy.selected_recent_window_turn_floor),
             attempt_id=pending.context.attempt.attempt_id,
@@ -3028,7 +3029,7 @@ class EngineEventIngestor:
         decision: ContextBudgetDecision,
         operation_id: str,
         accepted_attempt_number: int,
-        accepted_truth: CompactAcceptedTruthV2,
+        accepted_truth: CompactAcceptedTruthV3,
         budget_after_compact: int,
         accepted_proposal_manifest_reference: CompactorProposalManifestReference,
         successful_response_identity: SuccessfulRunnerResponseIdentity,

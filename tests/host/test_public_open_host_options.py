@@ -384,7 +384,9 @@ def test_compactor_runner_baseline_validates_typed_fields(
         compactor_agent_policy=_agent_policy(),
         compactor_system_prompt="test compactor system prompt",
         compactor_user_prompt_template=(
-            "test compactor user prompt <<compaction_request>>"
+            "test compactor user prompt <<compaction_request>>\n"
+            "<<compact_output_rules>>\n"
+            "<<compact_output_template>>"
         ),
         compact_artifact_root=tmp_path / "compact",
     )

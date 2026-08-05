@@ -308,7 +308,7 @@ _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS = (
     "runner_call_index=",
     "checkpoint_event_id",
     "checkpoint_event_sequence",
-    "CompactCandidateV2",
+    "CompactCandidateV3",
 )
 _RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
 _RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-runner-call-input-manifest"

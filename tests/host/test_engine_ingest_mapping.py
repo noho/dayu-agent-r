@@ -149,8 +149,8 @@ from dayu.host.compact_payload import (
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V2,
-    CompactRepairFeedbackV2,
+    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactRepairFeedbackV3,
     CompactionRequest,
     CompactorProposal,
     ContextCompactor,
@@ -529,7 +529,7 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposal:
         """执行 vNext compact 并验证当前不在外层 write transaction 内。
 
@@ -567,7 +567,7 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposal:
         """推进 durable input sequence 后返回旧 snapshot 的 vNext candidate。
 
@@ -604,7 +604,7 @@ class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposal:
         """提交两个同 operation failed terminal 后返回 accepted candidate。
 
@@ -677,7 +677,7 @@ class _RaisingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposal:
         """抛出 vNext proposal 失败。
 
@@ -729,7 +729,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposalRunInput:
         """构造测试用 prepared compactor proposal input。
 
@@ -1401,7 +1401,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert compacted_payload["projection_signal"] == (COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP)
         accepted_candidate = compacted_payload["accepted_candidate"]
         assert isinstance(accepted_candidate, Mapping)
-        assert accepted_candidate["schema"] == (COMPACT_OUTPUT_SCHEMA_V2)
+        assert accepted_candidate["schema"] == (COMPACT_OUTPUT_SCHEMA_V3)
         assert "preserved_fact_refs" not in compacted_payload
         artifact_ref = compacted_payload["compact_artifact_ref"]
         assert isinstance(artifact_ref, str)
@@ -2382,11 +2382,12 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
             """
 
             nonlocal entered_count
-            del pass_queue, proposal_manifest_recorder, memory_policy
+            del pass_queue, proposal_manifest_recorder
             assert compactor is not None
             assert first_attempt_number == 1
             assert max_attempt_number == pending.policy.max_compaction_attempts_per_operation
             assert compaction_operation_id == pending.operation_id
+            assert memory_policy is not None
             if compaction_operation_id is None:
                 raise AssertionError("compaction operation id is required")
             contender_index = entered_count
@@ -2403,10 +2404,11 @@ async def test_reactive_same_pending_terminal_race_preserves_first_truth(
                 )
                 compactor_engine_run_id = proposal.successful_response_identity.runner_request_identity.run_id
                 return CompactionOperationResult(
-                    accepted_truth=accepted_truth_for_candidate(
-                        proposal.candidate,
-                        current_input_ref=request.current_input_ref,
-                    ),
+                        accepted_truth=accepted_truth_for_candidate(
+                            proposal.candidate,
+                            current_input_ref=request.current_input_ref,
+                            memory_policy=memory_policy,
+                        ),
                     rejected_attempts=(),
                     failure_reason=None,
                     budget_after_attempted_compact=(pending.estimate.estimated_input_tokens),

@@ -14,15 +14,13 @@ from dayu.host.compact_material import (
     initial_segment_selection,
 )
 from dayu.host.compaction import (
-    CompactDropReasonV2,
-    CompactExplicitDropV2,
     CompactMaterialBlockKind,
-    CompactRepairFeedbackV2,
+    CompactRepairFeedbackV3,
     CompactSegmentTrigger,
     SelectedBlockProvenance,
-    CompactValidationIssueCodeV2,
-    CompactValidationIssueV2,
-    CompactValidationReportV2,
+    CompactValidationIssueCodeV3,
+    CompactValidationIssueV3,
+    CompactValidationReportV3,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
@@ -33,7 +31,10 @@ from dayu.host.compaction_operation import (
     run_compaction_attempt,
     run_compaction_operation,
 )
-from dayu.host.context_governance import build_compact_repair_feedback_v2
+from dayu.host.context_governance import (
+    build_compact_repair_feedback_v3,
+    compact_output_caps_v3_from_memory_policy,
+)
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.llm_compaction import LLMCompactionValidationError
@@ -64,7 +65,7 @@ class _PreparedRecordingCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposalRunInput:
         """记录与真实 fake runner 同源的 prepared input。
 
@@ -100,7 +101,7 @@ class _PreparedRecordingCompactor(FakeContextCompactor):
 
 
 class _SemanticRejectOnceCompactor(_PreparedRecordingCompactor):
-    """首次返回 represented/drop overlap，第二次完整重产。"""
+    """首次返回重复业务项，第二次完整重产。"""
 
     async def run_prepared_compactor_proposal(
         self,
@@ -116,17 +117,12 @@ class _SemanticRejectOnceCompactor(_PreparedRecordingCompactor):
         proposal = await self._valid_proposal(prepared_input)
         if self.run_calls > 1:
             return proposal
-        represented_label = proposal.candidate.session_summary
-        assert represented_label is not None
+        facts = proposal.candidate.evidence_facts
+        assert facts
         return CompactorProposal(
             candidate=replace(
                 proposal.candidate,
-                explicitly_dropped_sources=(
-                    CompactExplicitDropV2(
-                        source_label=represented_label.source_labels[0],
-                        reason=CompactDropReasonV2.REDUNDANT,
-                    ),
-                ),
+                evidence_facts=facts + facts,
             ),
             successful_response_identity=proposal.successful_response_identity,
         )
@@ -149,10 +145,10 @@ class _ParserRejectOnceCompactor(_PreparedRecordingCompactor):
         self.run_calls += 1
         if self.run_calls == 1:
             raise LLMCompactionValidationError(
-                CompactValidationReportV2(
+                CompactValidationReportV3(
                     issues=(
-                        CompactValidationIssueV2(
-                            code=CompactValidationIssueCodeV2.UNKNOWN_JSON_KEY,
+                        CompactValidationIssueV3(
+                            code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
                             json_path="$.api_key=sk-secret-123",
                             message="顶层不允许字段；token=token-secret-456",
                             source_labels=(
@@ -232,7 +228,7 @@ class _AlwaysSemanticRejectCompactor(_SemanticRejectOnceCompactor):
         """每次复用首轮 invalid 生成逻辑。
 
         :param prepared_input: 同源 prepared input。
-        :returns: represented/drop overlap candidate。
+        :returns: duplicate semantic item candidate。
         """
 
         self.run_calls = 0
@@ -285,7 +281,7 @@ async def test_semantic_reject_gets_bounded_feedback_and_full_replacement() -> N
     assert feedback.previous_attempt_number == 1
     assert feedback.request_digest == _request().digest()
     assert feedback.source_boundary_digest == _request().source_boundary_digest()
-    assert feedback.issues[0].code is CompactValidationIssueCodeV2.REPRESENTED_AND_DROPPED
+    assert feedback.issues[0].code is CompactValidationIssueCodeV3.DUPLICATE_SEMANTIC_ITEM
     assert "完整 replacement candidate" in feedback.required_action
     assert compactor.prepared_inputs[0].compact_input == compactor.prepared_inputs[1].compact_input
     assert (
@@ -305,7 +301,7 @@ async def test_raw_parser_reject_is_semantic_repair_not_execution_retry() -> Non
     assert result.rejected_attempts[0].failure_category.value == "quality_check_rejected"
     feedback = compactor.prepared_inputs[1].repair_feedback
     assert feedback is not None
-    assert feedback.issues[0].code is CompactValidationIssueCodeV2.UNKNOWN_JSON_KEY
+    assert feedback.issues[0].code is CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY
     feedback_json = str(feedback.to_json())
     assert "<redacted>" in feedback_json
     for secret in (
@@ -372,11 +368,12 @@ async def test_root_hard_budget_reject_routes_whole_candidate_repair() -> None:
     """hard budget 只在 root candidate 上校验，并路由完整重产。"""
 
     compactor = _HardBudgetRejectOnceCompactor()
+    policy = _policy(session_summary_char_cap=2000)
     result = await _run(
         compactor,
         max_attempt_number=2,
-        request=_request(hard_threshold_tokens=300),
-        policy=_policy(session_summary_char_cap=2000),
+        request=_request(hard_threshold_tokens=300, policy=policy),
+        policy=policy,
     )
 
     assert result.accepted_truth is not None
@@ -384,7 +381,7 @@ async def test_root_hard_budget_reject_routes_whole_candidate_repair() -> None:
     assert result.rejected_attempts[0].failure_category.value == "hard_threshold_after_compact"
     feedback = compactor.prepared_inputs[1].repair_feedback
     assert feedback is not None
-    assert feedback.issues[0].code is CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED
+    assert feedback.issues[0].code is CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED
 
 
 @pytest.mark.asyncio
@@ -437,11 +434,11 @@ async def test_mismatched_initial_feedback_fails_before_provider_call() -> None:
     """直接注入跨 request feedback 时复用 non-repairable failure 且不调用 provider。"""
 
     request = _request()
-    feedback = build_compact_repair_feedback_v2(
-        CompactValidationReportV2(
+    feedback = build_compact_repair_feedback_v3(
+        CompactValidationReportV3(
             issues=(
-                CompactValidationIssueV2(
-                    code=CompactValidationIssueCodeV2.UNKNOWN_JSON_KEY,
+                CompactValidationIssueV3(
+                    code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
                     json_path="$.unexpected",
                     message="unexpected key",
                     source_labels=(),
@@ -620,21 +617,27 @@ async def _run(
     :returns: compaction operation result。
     """
 
+    effective_policy = _policy() if policy is None else policy
     return await run_compaction_operation(
-        request=_request() if request is None else request,
+        request=_request(policy=effective_policy) if request is None else request,
         compactor=compactor,
         first_attempt_number=1,
         max_attempt_number=max_attempt_number,
         cancellation_token=(ControllableCancellationToken() if cancellation_token is None else cancellation_token),
         compaction_operation_id="operation-test",
-        memory_policy=_policy() if policy is None else policy,
+        memory_policy=effective_policy,
     )
 
 
-def _request(*, hard_threshold_tokens: int = 4000) -> CompactionRequest:
+def _request(
+    *,
+    hard_threshold_tokens: int = 4000,
+    policy: MemoryProjectionPolicy | None = None,
+) -> CompactionRequest:
     """构造标准 proactive compaction request。
 
     :param hard_threshold_tokens: operation root hard budget。
+    :param policy: 与 request output caps 同源的 Memory policy。
     :returns: deterministic request。
     """
 
@@ -662,6 +665,7 @@ def _request(*, hard_threshold_tokens: int = 4000) -> CompactionRequest:
             ),
         ),
     )
+    effective_policy = _policy() if policy is None else policy
     return CompactionRequest(
         trigger_source=ContextCompactionTriggerSource.PROACTIVE,
         session_id="session-operation",
@@ -688,6 +692,7 @@ def _request(*, hard_threshold_tokens: int = 4000) -> CompactionRequest:
             estimator_digest=_DIGEST,
             overage_reason=None,
         ),
+        output_caps=compact_output_caps_v3_from_memory_policy(effective_policy),
     )
 
 
@@ -718,5 +723,5 @@ def _policy(*, session_summary_char_cap: int = 1024) -> MemoryProjectionPolicy:
         reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
-        policy_ref="test-operation-v2",
+        policy_ref="test-operation-v3",
     )

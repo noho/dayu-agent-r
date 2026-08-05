@@ -20,9 +20,9 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V2,
-    CompactCandidateV2,
-    CompactSessionSummaryV2,
+    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactCandidateV3,
+    CompactSessionSummaryV3,
 )
 from dayu.host.compaction_terminal import (
     CompactionOperationTerminalDisposition,
@@ -1011,16 +1011,16 @@ def _event_request(
     )
 
 
-def _candidate() -> CompactCandidateV2:
+def _candidate() -> CompactCandidateV3:
     """构造最小非空合法 compact candidate。
 
     :returns: 合法 vNext compact candidate。
     :raises Exception: candidate contract 构造失败时透传。
     """
 
-    return CompactCandidateV2(
-        schema=COMPACT_OUTPUT_SCHEMA_V2,
-        session_summary=CompactSessionSummaryV2(
+    return CompactCandidateV3(
+        schema=COMPACT_OUTPUT_SCHEMA_V3,
+        session_summary=CompactSessionSummaryV3(
             text="保留 terminal 测试状态",
             source_labels=("T1",),
         ),
@@ -1028,8 +1028,6 @@ def _candidate() -> CompactCandidateV2:
         answer_anchors=(),
         forward_intents=(),
         reference_continuity=(),
-        diagnostics=(),
-        explicitly_dropped_sources=(),
     )
 
 

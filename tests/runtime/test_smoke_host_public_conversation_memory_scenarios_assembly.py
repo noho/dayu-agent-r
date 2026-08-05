@@ -733,7 +733,7 @@ def test_fake_compactor_proposal_does_not_echo_material_markers() -> None:
 
     proposal = _fake_compaction_proposal_from_material_json(
         {
-            "schema": "dayu.context_compaction.input.v2",
+            "schema": "dayu.context_compaction.input.v3",
             "current_input": {"readable_text": "继续分析"},
             "source_boundary": [
                 {
@@ -757,11 +757,18 @@ def test_fake_compactor_proposal_does_not_echo_material_markers() -> None:
     parsed = json.loads(proposal)
 
     assert _SMOKE_REACTIVE_OLD_MARKER not in proposal
-    assert parsed["schema"] == "dayu.context_compaction.output.v2"
+    assert parsed["schema"] == "dayu.context_compaction.output.v3"
     assert parsed["session_summary"]["source_labels"] == ["T1"]
     assert parsed["evidence_facts"][0]["support_labels"] == ["E1"]
     assert parsed["answer_anchors"][0]["source_labels"] == ["A1"]
-    assert parsed["explicitly_dropped_sources"] == []
+    assert set(parsed) == {
+        "schema",
+        "session_summary",
+        "evidence_facts",
+        "answer_anchors",
+        "forward_intents",
+        "reference_continuity",
+    }
     represented_labels = {
         *parsed["session_summary"]["source_labels"],
         *parsed["evidence_facts"][0]["support_labels"],

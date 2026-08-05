@@ -32,6 +32,7 @@ from dayu.cli.init_catalog import (
 )
 from dayu.contracts import JsonValue
 from dayu.runtime.assembly import model_family_identity
+from dayu.runtime.config_loader import StructuredOutputCapabilityConfig
 from dayu.runtime.scene_prepare import (
     ScenePrepareRequest,
     SceneToolCatalog,
@@ -654,6 +655,11 @@ def test_custom_record_is_complete_current_schema_with_exact_eight_hints(tmp_pat
     assert custom.supports_tool_calling is True
     assert custom.supports_stream is True
     assert custom.supports_stream_usage is True
+    assert (
+        custom.structured_output_capability
+        is StructuredOutputCapabilityConfig.NONE
+    )
+    assert raw_custom["structured_output_capability"] == "none"
     assert custom.default_timeout_seconds == 3600.0
     assert custom.max_retries == 3
     assert custom.sse_idle_timeout_seconds == 120.0

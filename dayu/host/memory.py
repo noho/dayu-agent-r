@@ -10,13 +10,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.compact_payload import ContextCompactedSemanticPayload
 from dayu.host.compaction import (
-    CompactCandidateV2,
-    CompactForwardIntentStatusV2,
+    CompactCandidateV3,
+    CompactForwardIntentStatusV3,
+    compact_text_size_units_v3,
+    validate_compact_policy_usage_audit_candidate_binding_v3,
 )
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
@@ -25,6 +26,9 @@ from dayu.host.evidence import (
     AcceptedToolEvidenceLLMMaterial,
     render_accepted_tool_evidence_for_llm,
 )
+
+if TYPE_CHECKING:
+    from dayu.host.compact_payload import ContextCompactedSemanticPayload
 
 MemoryPolicyDigest: TypeAlias = str
 """Memory policy canonical JSON digest。"""
@@ -594,7 +598,7 @@ class ForwardIntent:
     item_id: str
     intent_type: str
     text: str
-    status: CompactForwardIntentStatusV2
+    status: CompactForwardIntentStatusV3
     source_refs: tuple[str, ...]
     event_id: str
     event_sequence: int
@@ -610,8 +614,8 @@ class ForwardIntent:
         _require_non_empty(self.item_id, "item_id")
         _require_non_empty(self.intent_type, "intent_type")
         _require_non_empty(self.text, "text")
-        if not isinstance(self.status, CompactForwardIntentStatusV2):
-            raise ValueError("status must be CompactForwardIntentStatusV2")
+        if not isinstance(self.status, CompactForwardIntentStatusV3):
+            raise ValueError("status must be CompactForwardIntentStatusV3")
         _require_non_empty_items(self.source_refs, "source_refs")
         _require_non_empty(self.event_id, "event_id")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -1028,7 +1032,7 @@ def estimate_memory_size_units(text: str) -> MemorySizeUnits:
 
     if not isinstance(text, str):
         raise ValueError("text must be str")
-    return MemorySizeUnits(units=len(text))
+    return MemorySizeUnits(units=compact_text_size_units_v3(text))
 
 
 def digest_memory_projection_policy(policy: MemoryProjectionPolicy) -> MemoryPolicyDigest:
@@ -1231,7 +1235,7 @@ def project_conversation_memory_event(
         if compacted_semantics is None:
             raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
         accepted_candidate = compacted_semantics.accepted_candidate
-        _validate_committed_candidate_policy(accepted_candidate, policy)
+        _validate_committed_policy_usage(compacted_semantics, policy)
         committed_compact_applied = True
         selected = _selected_recent_after_compaction(
             selected,
@@ -1649,77 +1653,54 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
     return render_accepted_tool_evidence_for_llm(material)
 
 
-def _validate_committed_candidate_policy(
-    candidate: CompactCandidateV2,
+def _validate_committed_policy_usage(
+    semantics: ContextCompactedSemanticPayload,
     policy: MemoryProjectionPolicy,
 ) -> None:
-    """重验 committed v2 candidate 未违反同一 Memory policy。
+    """验证 committed audit 绑定当前 Memory policy 且 actual 未超 cap。
 
-    该检查是 projection invariant，不做 truncate、merge 或默认补偿。
+    Memory 只消费 durable accepted truth 中的 Host-derived audit；本函数不从
+    candidate 文本重新计算 caps 或用量，也不做 truncate、merge 或默认补偿。
 
-    :param candidate: canonical event strict parser 恢复的 candidate。
+    :param semantics: canonical event strict parser 恢复的 accepted truth view。
     :param policy: 与 Context Governance 共用的 policy instance。
     :returns: ``None``。
-    :raises ValueError: committed projection 违反任一 count/size cap 时抛出。
+    :raises ValueError: policy binding、item actual 或任一 actual/cap 关系非法时抛出。
     """
 
-    if candidate.session_summary is not None and (
-        estimate_memory_size_units(candidate.session_summary.text).units > policy.session_summary_char_cap
-    ):
-        raise ValueError("committed session summary exceeds Memory policy")
-    _validate_committed_section_policy(
-        section="evidence_facts",
-        texts=tuple(item.claim for item in candidate.evidence_facts),
-        item_cap=policy.evidence_fact_item_cap,
-        size_cap=policy.evidence_fact_char_cap,
+    audit = semantics.policy_usage_audit
+    candidate = semantics.accepted_candidate
+    validate_compact_policy_usage_audit_candidate_binding_v3(candidate, audit)
+    if audit.policy_ref != policy.policy_ref:
+        raise ValueError("committed policy audit ref mismatch")
+    if audit.policy_digest != digest_memory_projection_policy(policy):
+        raise ValueError("committed policy audit digest mismatch")
+    cap_pairs = (
+        (audit.session_summary_char_actual, audit.session_summary_char_cap, policy.session_summary_char_cap),
+        (audit.evidence_fact_item_actual, audit.evidence_fact_item_cap, policy.evidence_fact_item_cap),
+        (audit.evidence_fact_char_actual, audit.evidence_fact_char_cap, policy.evidence_fact_char_cap),
+        (audit.answer_anchor_item_actual, audit.answer_anchor_item_cap, policy.answer_anchor_item_cap),
+        (audit.answer_anchor_char_actual, audit.answer_anchor_char_cap, policy.answer_anchor_char_cap),
+        (audit.forward_intent_item_actual, audit.forward_intent_item_cap, policy.forward_intent_item_cap),
+        (audit.forward_intent_char_actual, audit.forward_intent_char_cap, policy.forward_intent_char_cap),
+        (
+            audit.reference_continuity_item_actual,
+            audit.reference_continuity_item_cap,
+            policy.reference_continuity_item_cap,
+        ),
+        (
+            audit.reference_continuity_char_actual,
+            audit.reference_continuity_char_cap,
+            policy.reference_continuity_char_cap,
+        ),
     )
-    _validate_committed_section_policy(
-        section="answer_anchors",
-        texts=tuple(f"{item.title}\n{item.detail}" for item in candidate.answer_anchors),
-        item_cap=policy.answer_anchor_item_cap,
-        size_cap=policy.answer_anchor_char_cap,
-    )
-    _validate_committed_section_policy(
-        section="forward_intents",
-        texts=tuple(item.text for item in candidate.forward_intents),
-        item_cap=policy.forward_intent_item_cap,
-        size_cap=policy.forward_intent_char_cap,
-    )
-    _validate_committed_section_policy(
-        section="reference_continuity",
-        texts=tuple(item.text for item in candidate.reference_continuity),
-        item_cap=policy.reference_continuity_item_cap,
-        size_cap=policy.reference_continuity_char_cap,
-    )
-
-
-def _validate_committed_section_policy(
-    *,
-    section: str,
-    texts: tuple[str, ...],
-    item_cap: int,
-    size_cap: int,
-) -> None:
-    """重验单一 committed semantic section policy。
-
-    :param section: 自解释 section 名。
-    :param texts: section 业务文本。
-    :param item_cap: item count cap。
-    :param size_cap: aggregate size cap。
-    :returns: ``None``。
-    :raises ValueError: count 或 size 超出 policy 时抛出。
-    """
-
-    if len(texts) > item_cap:
-        raise ValueError(f"committed {section} exceeds Memory item cap")
-    total = sum(estimate_memory_size_units(text).units for text in texts)
-    if total > size_cap:
-        raise ValueError(f"committed {section} exceeds Memory size cap")
+    if any(cap != expected_cap or actual > cap for actual, cap, expected_cap in cap_pairs):
+        raise ValueError("committed policy audit cap binding is invalid")
 
 
 def _session_summary_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
 ) -> SessionSummaryMemoryView:
     """从 accepted compact event 物化 Session Summary Memory。
 
@@ -1811,7 +1792,7 @@ def _empty_session_summary_memory() -> SessionSummaryMemoryView:
 
 def _answer_anchors_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
 ) -> tuple[AnswerAnchor, ...]:
     """从 accepted compact event 物化 answer anchors。
 
@@ -1841,7 +1822,7 @@ def _answer_anchors_from_accepted_event(
 
 def _forward_intents_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
 ) -> tuple[ForwardIntent, ...]:
     """从 accepted compact event 物化 forward intents。
 
@@ -1871,7 +1852,7 @@ def _forward_intents_from_accepted_event(
 
 def _reference_continuity_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV2,
+    candidate: CompactCandidateV3,
 ) -> tuple[ReferenceContinuityItem, ...]:
     """从 accepted compact event 物化 reference continuity items。
 
@@ -2647,7 +2628,7 @@ def _forward_intent_from_json_value(value: JsonValue) -> ForwardIntent:
         item_id=_required_str(mapping, "item_id"),
         intent_type=_required_str(mapping, "intent_type"),
         text=_required_str(mapping, "text"),
-        status=CompactForwardIntentStatusV2(_required_str(mapping, "status")),
+        status=CompactForwardIntentStatusV3(_required_str(mapping, "status")),
         source_refs=_required_text_tuple(mapping, "source_refs"),
         event_id=_required_str(mapping, "event_id"),
         event_sequence=_required_int(mapping, "event_sequence"),

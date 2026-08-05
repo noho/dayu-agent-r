@@ -21,14 +21,14 @@ from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host._event_payload import tool_awaiting_payload
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V2,
-    CompactAnswerAnchorV2,
-    CompactCandidateV2,
-    CompactEvidenceFactV2,
-    CompactForwardIntentV2,
-    CompactForwardIntentStatusV2,
-    CompactReferenceContinuityV2,
-    CompactSessionSummaryV2,
+    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactAnswerAnchorV3,
+    CompactCandidateV3,
+    CompactEvidenceFactV3,
+    CompactForwardIntentV3,
+    CompactForwardIntentStatusV3,
+    CompactReferenceContinuityV3,
+    CompactSessionSummaryV3,
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
@@ -440,53 +440,54 @@ def _llm_facing_memory_text_view(
 
 def _accepted_compact_payload(
     *,
-    facts: list[CompactEvidenceFactV2] | None = None,
+    facts: list[CompactEvidenceFactV3] | None = None,
     summary_text: str | None = "用户关注收入增速和毛利率变化。",
     source_boundary_refs: tuple[str, ...] = ("event:user-1",),
+    policy: MemoryProjectionPolicy | None = None,
 ) -> dict[str, JsonValue]:
     """构造 accepted vNext compact payload。
 
     :param facts: 可选 evidence-backed fact candidates。
     :param summary_text: session summary 文本；``None`` 表示 compact owner 未提供替换 summary。
     :param source_boundary_refs: current input 在首位的 compact source boundary。
+    :param policy: 与 durable policy audit 同源的 Memory policy。
     :returns: CONTEXT_COMPACTED payload。
     """
 
-    candidate = CompactCandidateV2(
-        schema=COMPACT_OUTPUT_SCHEMA_V2,
+    effective_policy = _policy() if policy is None else policy
+    candidate = CompactCandidateV3(
+        schema=COMPACT_OUTPUT_SCHEMA_V3,
         session_summary=(
             None
             if summary_text is None
-            else CompactSessionSummaryV2(
+            else CompactSessionSummaryV3(
                 text=summary_text,
                 source_labels=("u1",),
             )
         ),
         evidence_facts=() if facts is None else tuple(facts),
         answer_anchors=(
-            CompactAnswerAnchorV2(
+            CompactAnswerAnchorV3(
                 title="收入口径",
                 detail="同比收入增速来自已接受证据。\n毛利率口径保持一致。",
                 source_labels=("a1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV2(
+            CompactForwardIntentV3(
                 intent_type="next_step_note",
                 text="下一轮继续核对费用率。",
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
                 source_labels=("u1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV2(
+            CompactReferenceContinuityV3(
                 text="“该公司”继续指向当前分析主体。",
                 reason="local_reference",
                 source_labels=("u1",),
             ),
         ),
-        diagnostics=(),
-        explicitly_dropped_sources=(),
     )
     additional_refs = source_boundary_refs[1:]
     accepted_truth = accepted_truth_for_candidate(
@@ -497,6 +498,7 @@ def _accepted_compact_payload(
             "e1": ("event:tool-1",),
             "a1": ("source:a1",),
         },
+        memory_policy=effective_policy,
     )
     return dict(
         build_context_compacted_payload(
@@ -842,14 +844,14 @@ def _assert_tool_query_projection_fails_closed(
         )
 
 
-def _fact(claim_text: str) -> CompactEvidenceFactV2:
+def _fact(claim_text: str) -> CompactEvidenceFactV3:
     """构造 fact candidate。
 
     :param claim_text: fact claim 文本。
     :returns: typed fact candidate。
     """
 
-    return CompactEvidenceFactV2(
+    return CompactEvidenceFactV3(
         claim=claim_text,
         support_labels=("e1",),
     )
@@ -1250,7 +1252,7 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
         (child.display_text, child.ordinal) for child in snapshot.answer_anchor_memory.anchors[0].anchor_items
     ) == (("同比收入增速来自已接受证据。\n毛利率口径保持一致。", None),)
     assert snapshot.forward_intent_memory.intents[0].intent_type == "next_step_note"
-    assert snapshot.forward_intent_memory.intents[0].status is CompactForwardIntentStatusV2.OPEN
+    assert snapshot.forward_intent_memory.intents[0].status is CompactForwardIntentStatusV3.OPEN
     assert snapshot.forward_intent_memory.intents[0].text == "下一轮继续核对费用率。"
     assert snapshot.trace_memory.reference_continuity_items[0].reason == "local_reference"
 
@@ -1979,11 +1981,11 @@ def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild()
         assert forbidden not in projected_text
 
 
-def test_committed_compact_over_item_cap_fails_projection_invariant() -> None:
-    """committed truth 超过共享 item cap 时 fail closed，不下游截断。"""
+def test_committed_compact_policy_digest_mismatch_fails_projection_invariant() -> None:
+    """committed audit 与当前 policy 不同源时 fail closed。"""
 
     policy = replace(_policy(), evidence_fact_item_cap=1, evidence_fact_floor=0)
-    with pytest.raises(ValueError, match="committed evidence_facts exceeds"):
+    with pytest.raises(ValueError, match="committed policy audit digest mismatch"):
         build_conversation_memory_snapshot_from_events(
             events=(
                 _event(
@@ -2005,19 +2007,25 @@ def test_committed_compact_over_item_cap_fails_projection_invariant() -> None:
         )
 
 
-def test_committed_compact_oversized_fact_fails_projection_invariant() -> None:
-    """超出 fact size cap 的 committed truth fail closed，不丢弃或截断。"""
+def test_committed_compact_tampered_fact_actual_fails_strict_parser() -> None:
+    """durable audit 的 fact actual 与 candidate 不同源时 fail closed。"""
 
-    policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
+    policy = _policy()
     long_claim = "这是一条超过上限且不能被前缀截断的完整事实。"
-    with pytest.raises(ValueError, match="committed evidence_facts exceeds"):
+    payload = _accepted_compact_payload(facts=[_fact(long_claim)], policy=policy)
+    audit = cast(dict[str, JsonValue], payload["policy_usage_audit"])
+    audit["evidence_fact_char_actual"] = policy.evidence_fact_char_cap + 1
+    with pytest.raises(
+        ValueError,
+        match="policy_usage_audit actuals must equal candidate-derived usage",
+    ):
         build_conversation_memory_snapshot_from_events(
             events=(
                 _event(
                     1,
                     "compact-oversized-fact",
                     CONTEXT_COMPACTED,
-                    _accepted_compact_payload(facts=[_fact(long_claim)]),
+                    payload,
                 ),
             ),
             session_id=_SESSION_ID,
@@ -2027,13 +2035,18 @@ def test_committed_compact_oversized_fact_fails_projection_invariant() -> None:
         )
 
 
-def test_committed_compact_oversized_summary_fails_projection_invariant() -> None:
-    """超出 summary size cap 的 committed truth fail closed，不下游截断。"""
+def test_committed_compact_tampered_summary_actual_fails_strict_parser() -> None:
+    """durable audit 的 summary actual 与 candidate 不同源时 fail closed。"""
 
-    policy = replace(_policy(), session_summary_char_cap=8)
+    policy = _policy()
     long_summary = "用户需要完整保留的长 summary，不能静默截断。"
-    payload = _accepted_compact_payload(summary_text=long_summary)
-    with pytest.raises(ValueError, match="committed session summary exceeds"):
+    payload = _accepted_compact_payload(summary_text=long_summary, policy=policy)
+    audit = cast(dict[str, JsonValue], payload["policy_usage_audit"])
+    audit["session_summary_char_actual"] = policy.session_summary_char_cap + 1
+    with pytest.raises(
+        ValueError,
+        match="policy_usage_audit actuals must equal candidate-derived usage",
+    ):
         build_conversation_memory_snapshot_from_events(
             events=(
                 _event(
@@ -2116,7 +2129,7 @@ def test_snapshot_json_roundtrip_preserves_vnext_sections() -> None:
     references = cast(list[JsonValue], trace_memory["reference_continuity_items"])
     reference = cast(dict[str, JsonValue], references[0])
     assert intent["intent_type"] == "next_step_note"
-    assert intent["status"] == CompactForwardIntentStatusV2.OPEN.value
+    assert intent["status"] == CompactForwardIntentStatusV3.OPEN.value
     assert reference["reason"] == "local_reference"
 
 

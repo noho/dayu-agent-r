@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,11 +23,15 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
     CompactionRequest,
-    CompactAcceptedTruthV2,
-    CompactValidationReportV2,
+    CompactAcceptedTruthV3,
+    CompactSemanticSectionV3,
+    CompactValidationReportV3,
 )
 from dayu.host.context_budget import BudgetEstimate
-from dayu.host.context_governance import accept_compact_candidate_v2
+from dayu.host.context_governance import (
+    accept_compact_candidate_v3,
+    compact_output_caps_v3_from_memory_policy,
+)
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_bytes
@@ -85,7 +90,7 @@ async def test_compact_artifact_store_writes_deterministic_descriptor_with_diges
         assert artifact_digest == expected_digest
         metadata = json.loads(metadata_json)
         assert metadata["artifact_kind"] == "context_compaction"
-        assert metadata["schema_version"] == 3
+        assert metadata["schema_version"] == 4
         assert metadata["compaction_request_digest"] == (write_request.compaction_request.digest())
         assert metadata["accepted_candidate_digest"] == (write_request.accepted_truth.candidate.digest())
 
@@ -98,12 +103,15 @@ async def test_compact_artifact_content_contains_required_vnext_fields() -> None
     artifact_json = compact_artifact_json(write_request)
 
     assert isinstance(artifact_json, dict)
-    assert artifact_json["schema_version"] == 3
+    assert artifact_json["schema_version"] == 4
     assert artifact_json["compaction_request_digest"] == (write_request.compaction_request.digest())
     assert artifact_json["accepted_candidate"] == (write_request.accepted_truth.candidate.to_json())
     assert artifact_json["represented_coverage"] == (write_request.accepted_truth.represented_coverage.to_json())
-    assert artifact_json["explicitly_dropped_coverage"] == (
-        write_request.accepted_truth.explicitly_dropped_coverage.to_json()
+    assert artifact_json["omitted_coverage"] == (
+        write_request.accepted_truth.omitted_coverage.to_json()
+    )
+    assert artifact_json["policy_usage_audit"] == (
+        write_request.accepted_truth.policy_usage_audit.to_json()
     )
     assert artifact_json["budget_after_compact"] == write_request.budget_after_compact
     assert artifact_json["policy_digest"] == write_request.policy_digest
@@ -113,6 +121,62 @@ async def test_compact_artifact_content_contains_required_vnext_fields() -> None
     assert "evidence_backed_fact_refs" not in artifact_json
 
 
+@pytest.mark.asyncio
+async def test_compact_artifact_write_rejects_candidate_audit_mismatch() -> None:
+    """artifact writer 不得持久化与 candidate 不同源的 audit actual。"""
+
+    request, accepted = await _candidate_bundle()
+    audit = accepted.policy_usage_audit
+    tampered = replace(
+        accepted,
+        policy_usage_audit=replace(
+            audit,
+            session_summary_char_actual=audit.session_summary_char_actual - 1,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="policy_usage_audit actuals must equal candidate-derived usage",
+    ):
+        CompactArtifactWriteRequest(
+            compaction_request=request,
+            accepted_truth=tampered,
+            policy_digest=_POLICY_DIGEST,
+            budget_after_compact=700,
+        )
+
+
+@pytest.mark.asyncio
+async def test_compact_artifact_write_rejects_candidate_coverage_mismatch() -> None:
+    """artifact writer 不得持久化与 candidate provenance 不同源的 coverage。"""
+
+    request, accepted = await _candidate_bundle()
+    first_source = accepted.represented_coverage.sources[0]
+    tampered = replace(
+        accepted,
+        represented_coverage=replace(
+            accepted.represented_coverage,
+            sources=(
+                replace(
+                    first_source,
+                    sections=(CompactSemanticSectionV3.REFERENCE_CONTINUITY,),
+                ),
+                *accepted.represented_coverage.sources[1:],
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="represented coverage must equal candidate-derived sections",
+    ):
+        CompactArtifactWriteRequest(
+            compaction_request=request,
+            accepted_truth=tampered,
+            policy_digest=_POLICY_DIGEST,
+            budget_after_compact=700,
+        )
 @pytest.mark.asyncio
 async def test_compact_artifact_store_rejects_corrupted_expected_digest(
     tmp_path: Path,
@@ -242,7 +306,7 @@ async def _write_request(
     )
 
 
-async def _candidate_bundle() -> tuple[CompactionRequest, CompactAcceptedTruthV2]:
+async def _candidate_bundle() -> tuple[CompactionRequest, CompactAcceptedTruthV3]:
     """构造已通过 vNext quality check 的 candidate bundle。
 
     :returns: request、candidate 与 quality result。
@@ -256,12 +320,12 @@ async def _candidate_bundle() -> tuple[CompactionRequest, CompactAcceptedTruthV2
     )
     candidate = proposal.candidate
     compact_input = request.compact_input
-    accepted = accept_compact_candidate_v2(
+    accepted = accept_compact_candidate_v3(
         compact_input,
         candidate,
         default_memory_projection_policy(),
     )
-    assert not isinstance(accepted, CompactValidationReportV2)
+    assert not isinstance(accepted, CompactValidationReportV3)
     return request, accepted
 
 
@@ -320,5 +384,8 @@ def _request() -> CompactionRequest:
             safety_margin_tokens=200,
             estimator_digest="estimate-digest",
             overage_reason=None,
+        ),
+        output_caps=compact_output_caps_v3_from_memory_policy(
+            default_memory_projection_policy()
         ),
     )

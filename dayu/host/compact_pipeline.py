@@ -46,13 +46,14 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactMaterialPack,
     CompactMaterialSection,
+    CompactOutputCapsV3,
     PreviousCompactReadableView,
-    CompactAcceptedTruthV2,
+    CompactAcceptedTruthV3,
     CompactSegmentSelection,
     CompactSegmentSelectionScope,
     CompactSegmentTrigger,
     CompactionRequest,
-    CompactInputV2,
+    CompactInputV3,
     validate_previous_compacted_view_pair,
 )
 from dayu.host.context_budget import BudgetEstimate
@@ -70,6 +71,7 @@ from dayu.host.context_fallback import (
     fallback_window_digest,
 )
 from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
+from dayu.host.context_governance import compact_output_caps_v3_from_memory_policy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import AttemptRow, RunRow
@@ -279,7 +281,7 @@ class CompactPipelineAcceptedPayloadInput:
     """
 
     request: CompactionRequest
-    accepted_truth: CompactAcceptedTruthV2
+    accepted_truth: CompactAcceptedTruthV3
     budget_after_compact: int
     accepted_attempt_number: int
     accepted_proposal_manifest_ref: str | None
@@ -457,6 +459,7 @@ def build_normal_compact_request_plan(
     *,
     source_snapshot: CompactPipelineSourceSnapshot,
     selection_policy_digest: str,
+    memory_policy: MemoryProjectionPolicy,
     budget_before_compact: BudgetEstimate,
     selected_recent_window_turn_floor: int,
     attempt_id: str | None = None,
@@ -466,6 +469,7 @@ def build_normal_compact_request_plan(
 
     :param source_snapshot: compact source snapshot。
     :param selection_policy_digest: memory selection policy digest。
+    :param memory_policy: 产生 v3 output caps 的同一 Memory policy。
     :param budget_before_compact: compact 前预算估算。
     :param selected_recent_window_turn_floor: protected recent turn floor。
     :param attempt_id: reactive attempt id；proactive 为 ``None``。
@@ -489,6 +493,7 @@ def build_normal_compact_request_plan(
         budget_before_compact=budget_before_compact,
         attempt_id=attempt_id,
         execution_id=execution_id,
+        output_caps=compact_output_caps_v3_from_memory_policy(memory_policy),
     )
 
 
@@ -530,6 +535,7 @@ def build_tier_recovery_request_plans(
                 budget_before_compact=root_request_plan.request.budget_before_compact,
                 attempt_id=root_request_plan.request.attempt_id,
                 execution_id=root_request_plan.request.execution_id,
+                output_caps=root_request_plan.request.output_caps,
             ),
         )
     ]
@@ -551,6 +557,7 @@ def build_tier_recovery_request_plans(
                     budget_before_compact=(root_request_plan.request.budget_before_compact),
                     attempt_id=root_request_plan.request.attempt_id,
                     execution_id=root_request_plan.request.execution_id,
+                    output_caps=root_request_plan.request.output_caps,
                 ),
             )
         )
@@ -570,6 +577,7 @@ def build_tier_recovery_request_plans(
                 budget_before_compact=root_request_plan.request.budget_before_compact,
                 attempt_id=root_request_plan.request.attempt_id,
                 execution_id=root_request_plan.request.execution_id,
+                output_caps=root_request_plan.request.output_caps,
             ),
         )
     )
@@ -616,6 +624,7 @@ def build_reactive_pass_queue_plan(
             budget_before_compact=(root_request_plan.request.budget_before_compact),
             attempt_id=root_request_plan.request.attempt_id,
             execution_id=root_request_plan.request.execution_id,
+            output_caps=root_request_plan.request.output_caps,
         ).request
         requests.append(
             _bind_reactive_pass_to_root_labels(
@@ -632,7 +641,7 @@ def build_reactive_pass_queue_plan(
 def _bind_reactive_pass_to_root_labels(
     *,
     request: CompactionRequest,
-    root_input: CompactInputV2,
+    root_input: CompactInputV3,
 ) -> CompactionRequest:
     """把单 pass 的局部编号重绑定到 immutable root labels。
 
@@ -705,7 +714,7 @@ def _bind_reactive_pass_to_root_labels(
 def build_compacted_payload_input(
     *,
     request: CompactionRequest,
-    accepted_truth: CompactAcceptedTruthV2,
+    accepted_truth: CompactAcceptedTruthV3,
     budget_after_compact: int,
     accepted_attempt_number: int,
     accepted_proposal_manifest_ref: str | None,
@@ -901,6 +910,7 @@ def _request_plan_from_segment(
     budget_before_compact: BudgetEstimate,
     attempt_id: str | None,
     execution_id: str | None,
+    output_caps: CompactOutputCapsV3,
 ) -> CompactPipelineRequestPlan:
     """按指定 segment 构造 request plan。
 
@@ -911,6 +921,7 @@ def _request_plan_from_segment(
     :param budget_before_compact: compact 前预算。
     :param attempt_id: reactive attempt id。
     :param execution_id: reactive execution id。
+    :param output_caps: 同一 Memory policy 的 immutable output caps DTO。
     :returns: request plan。
     """
 
@@ -948,6 +959,7 @@ def _request_plan_from_segment(
         attempt_id=attempt_id,
         execution_id=execution_id,
         memory_snapshot_cursor=None,
+        output_caps=output_caps,
         material_pack=material_pack,
         segment_selection=selected_segment,
         evidence_backed_fact_refs=selected_evidence_refs,

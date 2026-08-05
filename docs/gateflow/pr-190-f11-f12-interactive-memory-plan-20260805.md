@@ -316,6 +316,11 @@ Allowed tests/docs：
 - `tests/host/test_proactive_compaction_operation.py`
 - `tests/host/test_compaction_terminal.py`
 - `tests/host/test_compaction_cancellation_scope.py`
+- `tests/host/memory_snapshot_factories.py`（只迁移 fresh v3 typed fixture）
+- `tests/host/test_accepted_result_projection.py`（只迁移 fresh v3 typed assertion）
+- `tests/host/test_dispatch_scheduler.py`（只迁移直接 compact v2 consumer）
+- `tests/host/test_engine_ingest_mapping.py`（只迁移直接 compact v2 consumer）
+- `tests/host/test_tool_trace_queries.py`（只迁移直接 compact v2 fixture）
 - `tests/runtime/test_scene_assets_migration.py`
 - `tests/runtime/test_config_loader.py`
 - `tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py`
@@ -325,6 +330,11 @@ Allowed tests/docs：
 - S3 artifacts
 
 S3保持一个accepted原子vertical migration，不拆成可运行accepted checkpoints。理由：任何S3a式checkpoint都会保留v2 active owner同时引入未消费v3 contract，或让parser/prompt/persistence不同步；这违反fresh schema与单一owner，比审查大diff风险更严重。
+
+2026-08-05 scope correction：implementation dependency scan 证明上述五个补充测试直接
+import/构造将被 fresh v3 删除的 v2 contract。用户明确裁决“测试跟着相应修改”；因此它们只
+允许做 fresh v3 mechanical migration 与对应 owner assertion 更新。该 correction 不扩张生产
+scope、产品语义或 compatibility surface。
 
 Worktree内部实施顺序固定：
 

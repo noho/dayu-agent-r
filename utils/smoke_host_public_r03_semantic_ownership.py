@@ -57,7 +57,7 @@ from dayu.host.compact_material import (
 )
 from dayu.host.compaction import (
     CompactSegmentTrigger,
-    CompactSourceKindV2,
+    CompactSourceKindV3,
     CompactionRequest,
 )
 from dayu.host.context_budget import BudgetEstimate
@@ -80,8 +80,10 @@ from dayu.host.durable.tool_trace import (
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
+    default_memory_projection_policy,
     digest_memory_projection_policy,
 )
+from dayu.host.context_governance import compact_output_caps_v3_from_memory_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.open_host import _tool_trace_sink_options_from_open_host_options
 from dayu.host.payload_resolution import (
@@ -1303,12 +1305,15 @@ def _compact_source_notes(
             ),
             overage_reason=None,
         ),
+        output_caps=compact_output_caps_v3_from_memory_policy(
+            default_memory_projection_policy()
+        ),
     )
     compact_input = compact_request.compact_input
     notes = tuple(
         source_line.removeprefix("来源：")
         for item in compact_input.source_boundary
-        if item.source_kind is CompactSourceKindV2.EVIDENCE_MATERIAL
+        if item.source_kind is CompactSourceKindV3.EVIDENCE_MATERIAL
         for source_line in item.readable_text.splitlines()
         if source_line.startswith("来源：")
     )

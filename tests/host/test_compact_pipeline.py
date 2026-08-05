@@ -36,27 +36,25 @@ from dayu.host.compact_pipeline import (
     select_ordinary_protected_raw_tail,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V2,
+    COMPACT_OUTPUT_SCHEMA_V3,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     PreviousCompactReadableView,
     CompactMaterialSection,
     CompactSegmentSelectionScope,
-    CompactCandidateV2,
-    CompactAcceptedTruthV2,
-    CompactDropReasonV2,
-    CompactEvidenceFactV2,
-    CompactExplicitDropV2,
-    CompactReferenceContinuityV2,
-    CompactRepairFeedbackV2,
-    CompactSourceKindV2,
+    CompactCandidateV3,
+    CompactAcceptedTruthV3,
+    CompactEvidenceFactV3,
+    CompactReferenceContinuityV3,
+    CompactRepairFeedbackV3,
+    CompactSourceKindV3,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
     ReadableFactItemVNext,
 )
 from dayu.host.compaction_operation import run_compaction_operation
-from dayu.host.context_governance import accept_compact_candidate_v2
+from dayu.host.context_governance import accept_compact_candidate_v3
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
@@ -103,14 +101,14 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
         """
 
         super().__init__()
-        self.observed_feedback: list[CompactRepairFeedbackV2 | None] = []
+        self.observed_feedback: list[CompactRepairFeedbackV3 | None] = []
 
     async def compact(
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposal:
         """保留完整 pass candidate，但注入可由 root 证明的跨 pass duplicate。
 
@@ -136,9 +134,9 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
                 for entry in compact_input.source_boundary
                 if entry.source_kind
                 in (
-                    CompactSourceKindV2.TRACE_MATERIAL,
-                    CompactSourceKindV2.EVIDENCE_MATERIAL,
-                    CompactSourceKindV2.ANSWER_MATERIAL,
+                    CompactSourceKindV3.TRACE_MATERIAL,
+                    CompactSourceKindV3.EVIDENCE_MATERIAL,
+                    CompactSourceKindV3.ANSWER_MATERIAL,
                 )
             ),
             None,
@@ -149,7 +147,7 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
             candidate=replace(
                 proposal.candidate,
                 reference_continuity=(
-                    CompactReferenceContinuityV2(
+                    CompactReferenceContinuityV3(
                         text="cross-pass duplicate",
                         reason="recent_state",
                         source_labels=(reference_entry.source_label,),
@@ -176,7 +174,7 @@ class _LaterPassFailingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposal:
         """只允许第一个 pass 成功。
 
@@ -240,6 +238,7 @@ def test_normal_request_plan_keeps_current_input_out_of_selected_segment() -> No
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
     plan = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -260,12 +259,14 @@ def test_reactive_request_plan_sets_attempt_identity_without_semantic_drift() ->
     """reactive 与 proactive request 在忽略 attempt 身份后选择语义等价。"""
 
     proactive = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=_source_snapshot(ContextCompactionTriggerSource.PROACTIVE),
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
         selected_recent_window_turn_floor=1,
     )
     reactive = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=_source_snapshot(ContextCompactionTriggerSource.REACTIVE),
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -285,6 +286,7 @@ def test_tier_recovery_request_plans_use_fallback_caps_degrade_and_delta_only() 
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -335,6 +337,7 @@ def test_reactive_pass_queue_builds_single_block_passes() -> None:
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -397,6 +400,7 @@ def test_same_text_different_ref_preserves_complete_selected_group() -> None:
     )
 
     plan = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=same_text_snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -430,6 +434,7 @@ def test_same_canonical_current_ref_fails_during_pipeline_request_build() -> Non
 
     with pytest.raises(ValueError, match="overlaps current input canonical ref"):
         build_normal_compact_request_plan(
+            memory_policy=default_memory_projection_policy(),
             source_snapshot=same_ref_snapshot,
             selection_policy_digest="memory-policy-digest",
             budget_before_compact=_budget(),
@@ -442,6 +447,7 @@ def test_unknown_selected_block_id_fails_against_source_snapshot() -> None:
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -480,6 +486,7 @@ async def test_reactive_multi_pass_forms_one_root_accepted_truth() -> None:
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -522,6 +529,7 @@ async def test_reactive_pass_provenance_tamper_fails_before_provider(
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -594,6 +602,7 @@ async def test_whole_group_swap_proof_fails_before_provider() -> None:
     )
     grouped_snapshot = replace(snapshot, material_blocks=group_blocks)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=grouped_snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -655,6 +664,7 @@ async def test_reactive_cross_pass_duplicate_exhaust_leaks_no_partial_truth() ->
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -691,6 +701,7 @@ async def test_reactive_later_pass_failure_returns_no_partial_truth() -> None:
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -730,6 +741,7 @@ async def test_reactive_cross_pass_duplicate_routes_full_pass_repair() -> None:
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
     root = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
@@ -765,29 +777,20 @@ def test_compacted_payload_input_derives_semantic_refs() -> None:
     """accepted payload input 复用 compact payload helper 的 semantic refs。"""
 
     plan = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=_source_snapshot(ContextCompactionTriggerSource.PROACTIVE),
         selection_policy_digest="memory-policy-digest",
         budget_before_compact=_budget(),
         selected_recent_window_turn_floor=0,
     )
     compact_input = plan.request.compact_input
-    candidate = replace(
-        _candidate_with_evidence_fact(),
-        explicitly_dropped_sources=tuple(
-            CompactExplicitDropV2(
-                source_label=entry.source_label,
-                reason=CompactDropReasonV2.OUT_OF_SCOPE,
-            )
-            for entry in compact_input.source_boundary
-            if entry.source_label != "E1"
-        ),
-    )
-    accepted_truth = accept_compact_candidate_v2(
+    candidate = _candidate_with_evidence_fact()
+    accepted_truth = accept_compact_candidate_v3(
         compact_input,
         candidate,
         default_memory_projection_policy(),
     )
-    assert isinstance(accepted_truth, CompactAcceptedTruthV2)
+    assert isinstance(accepted_truth, CompactAcceptedTruthV3)
 
     payload_input = build_compacted_payload_input(
         request=plan.request,
@@ -1175,17 +1178,17 @@ def _budget() -> BudgetEstimate:
     )
 
 
-def _candidate_with_evidence_fact() -> CompactCandidateV2:
+def _candidate_with_evidence_fact() -> CompactCandidateV3:
     """构造引用 E1 evidence label 的 accepted candidate。
 
-    :returns: CompactCandidateV2。
+    :returns: CompactCandidateV3。
     """
 
-    return CompactCandidateV2(
-        schema=COMPACT_OUTPUT_SCHEMA_V2,
+    return CompactCandidateV3(
+        schema=COMPACT_OUTPUT_SCHEMA_V3,
         session_summary=None,
         evidence_facts=(
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim="accepted fact",
                 support_labels=("E1",),
             ),
@@ -1193,8 +1196,6 @@ def _candidate_with_evidence_fact() -> CompactCandidateV2:
         answer_anchors=(),
         forward_intents=(),
         reference_continuity=(),
-        diagnostics=(),
-        explicitly_dropped_sources=(),
     )
 
 
@@ -1205,6 +1206,7 @@ def test_memory_policy_digest_helper_is_selection_policy_source() -> None:
     snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
 
     plan = build_normal_compact_request_plan(
+        memory_policy=default_memory_projection_policy(),
         source_snapshot=snapshot,
         selection_policy_digest=digest_memory_projection_policy(memory_policy),
         budget_before_compact=_budget(),

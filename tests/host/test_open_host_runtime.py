@@ -2980,7 +2980,9 @@ def test_compactor_runner_baseline_maps_to_host_owned_compactor(
                 ),
                 compactor_system_prompt="test compactor system prompt",
                 compactor_user_prompt_template=(
-                    "test compactor user prompt <<compaction_request>>"
+                    "test compactor user prompt <<compaction_request>>\n"
+                    "rules <<compact_output_rules>>\n"
+                    "template <<compact_output_template>>"
                 ),
                 compact_artifact_root=tmp_path / "compact-artifacts",
                 compact_artifact_create_parent_dirs=False,

@@ -19,8 +19,10 @@ from dayu.host.compact_payload import (
     compact_artifact_payload_ref,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV2,
+    CompactAcceptedTruthV3,
     CompactionRequest,
+    validate_compact_policy_usage_audit_candidate_binding_v3,
+    validate_compact_represented_coverage_candidate_binding_v3,
 )
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
@@ -41,7 +43,7 @@ class CompactArtifactWriteRequest:
     """
 
     compaction_request: CompactionRequest
-    accepted_truth: CompactAcceptedTruthV2
+    accepted_truth: CompactAcceptedTruthV3
     policy_digest: str
     budget_after_compact: int
     payload_ref: str | None = None
@@ -57,10 +59,18 @@ class CompactArtifactWriteRequest:
 
         if not isinstance(self.compaction_request, CompactionRequest):
             raise TypeError("CompactArtifactWriteRequest.compaction_request must be CompactionRequest")
-        if not isinstance(self.accepted_truth, CompactAcceptedTruthV2):
-            raise TypeError("CompactArtifactWriteRequest.accepted_truth must be CompactAcceptedTruthV2")
+        if not isinstance(self.accepted_truth, CompactAcceptedTruthV3):
+            raise TypeError("CompactArtifactWriteRequest.accepted_truth must be CompactAcceptedTruthV3")
         self.accepted_truth.validate_input_binding(
             self.compaction_request.compact_input
+        )
+        validate_compact_policy_usage_audit_candidate_binding_v3(
+            self.accepted_truth.candidate,
+            self.accepted_truth.policy_usage_audit,
+        )
+        validate_compact_represented_coverage_candidate_binding_v3(
+            self.accepted_truth.candidate,
+            self.accepted_truth.represented_coverage,
         )
         if not is_sha256_digest(self.policy_digest):
             raise ValueError("CompactArtifactWriteRequest.policy_digest is invalid")

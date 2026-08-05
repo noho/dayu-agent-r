@@ -17,7 +17,12 @@ from urllib.parse import urlsplit
 
 from dayu.contracts import JsonValue
 from dayu.runtime.assembly import model_family_identity
-from dayu.runtime.config_loader import ConfigLoader, ModelConfig, ModelsConfig
+from dayu.runtime.config_loader import (
+    ConfigLoader,
+    ModelConfig,
+    ModelsConfig,
+    StructuredOutputCapabilityConfig,
+)
 
 _EXPECTED_CHOICE_COUNT: Final[int] = 15
 _MODELS_FILE_NAME: Final[str] = "models.json"
@@ -773,6 +778,7 @@ def _build_custom_openai_record(settings: CustomOpenAIModelSettings) -> dict[str
         "supports_tool_calling": True,
         "supports_stream": True,
         "supports_stream_usage": True,
+        "structured_output_capability": StructuredOutputCapabilityConfig.NONE.value,
         "default_timeout_seconds": 3600.0,
         "max_retries": 3,
         "sse_idle_timeout_seconds": 120.0,

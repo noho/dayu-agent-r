@@ -51,10 +51,10 @@ from dayu.host.compact_material import (
     transform_previous_compacted_view_pair_for_recovery,
 )
 from dayu.host.compaction import (
-    COMPACT_INPUT_SCHEMA_V2,
-    CompactAcceptedTruthV2,
-    CompactAnswerAnchorV2,
-    CompactCurrentInputV2,
+    COMPACT_INPUT_SCHEMA_V3,
+    CompactAcceptedTruthV3,
+    CompactAnswerAnchorV3,
+    CompactCurrentInputV3,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     PreviousCompactReadableView,
@@ -63,25 +63,28 @@ from dayu.host.compaction import (
     CompactSegmentTrigger,
     CompactionRequest,
     ContextCompactionTriggerSource,
-    CompactInputV2,
-    CompactCandidateV2,
-    CompactEvidenceFactV2,
-    CompactForwardIntentV2,
-    CompactForwardIntentStatusV2,
-    CompactReferenceContinuityV2,
+    CompactInputV3,
+    CompactCandidateV3,
+    CompactEvidenceFactV3,
+    CompactForwardIntentV3,
+    CompactForwardIntentStatusV3,
+    CompactReferenceContinuityV3,
     ReadableAnswerAnchorItemVNext,
     ReadableAnswerAnchorVNext,
     ReadableFactItemVNext,
     ReadableForwardIntentVNext,
     ReadableReferenceContinuityItemVNext,
-    CompactSessionSummaryV2,
-    CompactSourceKindV2,
-    CompactSourceBoundaryEntryV2,
+    CompactSessionSummaryV3,
+    CompactSourceKindV3,
+    CompactSourceBoundaryEntryV3,
     TurnGroupMembership,
 )
 from dayu.host.context_events import build_context_compacted_payload
 from dayu.host.context_budget import BudgetEstimate
-from dayu.host.context_governance import accept_compact_candidate_v2
+from dayu.host.context_governance import (
+    accept_compact_candidate_v3,
+    compact_output_caps_v3_from_memory_policy,
+)
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     sha256_digest_bytes,
@@ -164,7 +167,7 @@ def _compaction_request_for_material_pack(
 ) -> CompactionRequest:
     """把 material pack 绑定为使用 production input owner 的测试请求。
 
-    :param material_pack: 待验证 strict v2 input 投影的 material pack。
+    :param material_pack: 待验证 strict v3 input 投影的 material pack。
     :returns: 以 ``CompactionRequest.compact_input`` 为唯一 projector 的请求。
     :raises ValueError: material pack 缺少 current source ref 时抛出。
     """
@@ -198,6 +201,9 @@ def _compaction_request_for_material_pack(
             safety_margin_tokens=200,
             estimator_digest=_DIGEST,
             overage_reason=None,
+        ),
+        output_caps=compact_output_caps_v3_from_memory_policy(
+            default_memory_projection_policy()
         ),
     )
 
@@ -257,7 +263,7 @@ def _proposal_manifest_reference(
 
 
 _LONG_EVIDENCE_TEXT_CHAR_COUNT = 5000
-_CURRENT_VNEXT_MATERIAL_KEYS = ("current_input", "source_boundary")
+_CURRENT_VNEXT_MATERIAL_KEYS = ("current_input", "source_boundary", "output_caps")
 _VNEXT_TOP_LEVEL_KEYS = ("schema", *_CURRENT_VNEXT_MATERIAL_KEYS)
 
 
@@ -347,7 +353,7 @@ def _assert_material_pack_shape(pack: CompactMaterialPack, *, expected: _Materia
 
 
 def _vnext_input_shape(
-    vnext_input: CompactInputV2,
+    vnext_input: CompactInputV3,
 ) -> _VNextInputShape:
     """返回 vNext compactor input 的顶层 JSON / section count shape。
 
@@ -360,28 +366,28 @@ def _vnext_input_shape(
     assert isinstance(vnext_json, dict), "vNext material JSON must be an object"
     previous_kinds = frozenset(
         (
-            CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY,
-            CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT,
-            CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR,
-            CompactSourceKindV2.PREVIOUS_FORWARD_INTENT,
-            CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY,
+            CompactSourceKindV3.PREVIOUS_SESSION_SUMMARY,
+            CompactSourceKindV3.PREVIOUS_EVIDENCE_FACT,
+            CompactSourceKindV3.PREVIOUS_ANSWER_ANCHOR,
+            CompactSourceKindV3.PREVIOUS_FORWARD_INTENT,
+            CompactSourceKindV3.PREVIOUS_REFERENCE_CONTINUITY,
         )
     )
     return _VNextInputShape(
         top_level_keys=tuple(vnext_json),
         previous_count=sum(item.source_kind in previous_kinds for item in vnext_input.source_boundary),
-        trace_count=sum(item.source_kind is CompactSourceKindV2.TRACE_MATERIAL for item in vnext_input.source_boundary),
+        trace_count=sum(item.source_kind is CompactSourceKindV3.TRACE_MATERIAL for item in vnext_input.source_boundary),
         evidence_count=sum(
-            item.source_kind is CompactSourceKindV2.EVIDENCE_MATERIAL for item in vnext_input.source_boundary
+            item.source_kind is CompactSourceKindV3.EVIDENCE_MATERIAL for item in vnext_input.source_boundary
         ),
         answer_count=sum(
-            item.source_kind is CompactSourceKindV2.ANSWER_MATERIAL for item in vnext_input.source_boundary
+            item.source_kind is CompactSourceKindV3.ANSWER_MATERIAL for item in vnext_input.source_boundary
         ),
         current_input_text=vnext_input.current_input.readable_text,
     )
 
 
-def _assert_vnext_input_shape(vnext_input: CompactInputV2, *, expected: _VNextInputShape) -> None:
+def _assert_vnext_input_shape(vnext_input: CompactInputV3, *, expected: _VNextInputShape) -> None:
     """断言 vNext compactor input 的 section / top-level key shape。
 
     :param vnext_input: vNext compactor input。
@@ -395,12 +401,12 @@ def _assert_vnext_input_shape(vnext_input: CompactInputV2, *, expected: _VNextIn
 
 
 def _boundary_entries(
-    compact_input: CompactInputV2,
-    source_kind: CompactSourceKindV2,
-) -> tuple[CompactSourceBoundaryEntryV2, ...]:
+    compact_input: CompactInputV3,
+    source_kind: CompactSourceKindV3,
+) -> tuple[CompactSourceBoundaryEntryV3, ...]:
     """返回指定 kind 的 source boundary entries。
 
-    :param compact_input: strict v2 input。
+    :param compact_input: strict v3 input。
     :param source_kind: source kind。
     :returns: 匹配 entries。
     """
@@ -1352,14 +1358,14 @@ def test_conversation_compact_input_vnext_maps_material_without_citable_current_
         ),
     )
     assert "C1" not in vnext_input.source_labels
-    assert tuple(item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)) == (
+    assert tuple(item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV3.TRACE_MATERIAL)) == (
         "T1",
     )
-    assert tuple(item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)) == (
+    assert tuple(item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV3.ANSWER_MATERIAL)) == (
         "A1",
     )
     assert tuple(
-        item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
+        item.source_label for item in _boundary_entries(vnext_input, CompactSourceKindV3.EVIDENCE_MATERIAL)
     ) == ("E1",)
     assert isinstance(vnext_json, dict)
     for key in _CURRENT_VNEXT_MATERIAL_KEYS:
@@ -1392,7 +1398,7 @@ def test_conversation_compact_input_vnext_maps_user_turn_to_trace() -> None:
 
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
-    trace_entries = _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)
+    trace_entries = _boundary_entries(vnext_input, CompactSourceKindV3.TRACE_MATERIAL)
     assert tuple(item.readable_text for item in trace_entries) == ("old user input",)
     assert tuple(item.source_label for item in trace_entries) == ("T1",)
 
@@ -1420,7 +1426,7 @@ def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> Non
 
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
-    answer_entries = _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)
+    answer_entries = _boundary_entries(vnext_input, CompactSourceKindV3.ANSWER_MATERIAL)
     assert tuple(item.readable_text for item in answer_entries) == ("old assistant answer",)
     assert tuple(item.source_label for item in answer_entries) == ("A1",)
 
@@ -1462,7 +1468,7 @@ def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer
 
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
-    answer_entries = _boundary_entries(vnext_input, CompactSourceKindV2.ANSWER_MATERIAL)
+    answer_entries = _boundary_entries(vnext_input, CompactSourceKindV3.ANSWER_MATERIAL)
     assert tuple(item.readable_text for item in answer_entries) == ("assistant final answer",)
     assert all(item.readable_text != "summary text is navigation only" for item in answer_entries)
 
@@ -1492,7 +1498,7 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
 
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
-    evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
+    evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV3.EVIDENCE_MATERIAL)
     assert tuple(item.source_label for item in evidence_entries) == ("E1",)
     assert pack.evidence_labels == ("E1",)
     assert tuple(block.raw_result_text for block in pack.evidence_material) == (long_evidence_text,)
@@ -1551,7 +1557,7 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
                 source_label="P4",
                 intent_type="next_step_note",
                 text="follow up",
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
             ),
         ),
         reference_continuity_items=(
@@ -1583,19 +1589,19 @@ def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_SESSION_SUMMARY)
     ) == ("summary text",)
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_EVIDENCE_FACT)
     ) == ("Revenue increased year over year",)
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_ANSWER_ANCHOR)
     ) == ("answer title\n- answer child",)
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_FORWARD_INTENT)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_FORWARD_INTENT)
     ) == ("follow up",)
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_REFERENCE_CONTINUITY)
     ) == ("second factor",)
 
 
@@ -1633,13 +1639,13 @@ def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items()
                 source_label="P1",
                 intent_type="next_step_note",
                 text="follow up one",
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
             ),
             ReadableForwardIntentVNext(
                 source_label="P2",
                 intent_type="pending_user_visible_task",
                 text="follow up two\nwith wrapped source text",
-                status=CompactForwardIntentStatusV2.SUPERSEDED,
+                status=CompactForwardIntentStatusV3.SUPERSEDED,
             ),
         ),
         reference_continuity_items=(
@@ -1676,13 +1682,13 @@ def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items()
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_FORWARD_INTENT)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_FORWARD_INTENT)
     ) == (
         "follow up one",
         "follow up two\nwith wrapped source text",
     )
     assert tuple(
-        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY)
+        item.readable_text for item in _boundary_entries(vnext_input, CompactSourceKindV3.PREVIOUS_REFERENCE_CONTINUITY)
     ) == (
         "first reference",
         "second reference\nwith wrapped source text",
@@ -1707,7 +1713,7 @@ def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> 
 
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
 
-    trace_entries = _boundary_entries(vnext_input, CompactSourceKindV2.TRACE_MATERIAL)
+    trace_entries = _boundary_entries(vnext_input, CompactSourceKindV3.TRACE_MATERIAL)
     assert tuple(item.readable_text for item in trace_entries) == ("run is waiting for user confirmation",)
 
 
@@ -1923,7 +1929,7 @@ def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     assert evidence_map["E1"].chunk_parent_label is None
     assert evidence_map["E1"].chunk_ordinal is None
     vnext_input = _compaction_request_for_material_pack(pack).compact_input
-    evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV2.EVIDENCE_MATERIAL)
+    evidence_entries = _boundary_entries(vnext_input, CompactSourceKindV3.EVIDENCE_MATERIAL)
     assert tuple(item.source_label for item in evidence_entries) == ("E1",)
     assert large_text in evidence_entries[0].readable_text
     assert "E1.1" not in vnext_input.source_labels
@@ -4009,7 +4015,7 @@ def _append_compacted_event(
     *,
     event_id: str,
     accepted_evidence_refs: tuple[str, ...],
-    accepted_candidate: CompactCandidateV2 | None = None,
+    accepted_candidate: CompactCandidateV3 | None = None,
 ) -> EventLogRow:
     """追加 accepted CONTEXT_COMPACTED canonical fact。
 
@@ -4036,7 +4042,7 @@ def _append_compacted_event(
 def _compacted_payload(
     *,
     accepted_evidence_refs: tuple[str, ...],
-    accepted_candidate: CompactCandidateV2 | None = None,
+    accepted_candidate: CompactCandidateV3 | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 accepted compact payload。
 
@@ -4070,8 +4076,8 @@ def _compacted_payload(
 
 
 def _accepted_truth_for_candidate(
-    candidate: CompactCandidateV2,
-) -> CompactAcceptedTruthV2:
+    candidate: CompactCandidateV3,
+) -> CompactAcceptedTruthV3:
     """为测试 candidate 构造并验收同源 root input。
 
     :param candidate: 待验收 candidate。
@@ -4079,24 +4085,24 @@ def _accepted_truth_for_candidate(
     :raises AssertionError: candidate 未通过 owner accept 时抛出。
     """
 
-    label_kinds: dict[str, CompactSourceKindV2] = {}
+    label_kinds: dict[str, CompactSourceKindV3] = {}
     if candidate.session_summary is not None:
         for label in candidate.session_summary.source_labels:
-            label_kinds[label] = CompactSourceKindV2.TRACE_MATERIAL
+            label_kinds[label] = CompactSourceKindV3.TRACE_MATERIAL
     for fact in candidate.evidence_facts:
         for label in fact.support_labels:
-            label_kinds[label] = CompactSourceKindV2.EVIDENCE_MATERIAL
+            label_kinds[label] = CompactSourceKindV3.EVIDENCE_MATERIAL
     for anchor in candidate.answer_anchors:
         for label in anchor.source_labels:
-            label_kinds[label] = CompactSourceKindV2.ANSWER_MATERIAL
-    compact_input = CompactInputV2(
-        schema=COMPACT_INPUT_SCHEMA_V2,
-        current_input=CompactCurrentInputV2(
+            label_kinds[label] = CompactSourceKindV3.ANSWER_MATERIAL
+    compact_input = CompactInputV3(
+        schema=COMPACT_INPUT_SCHEMA_V3,
+        current_input=CompactCurrentInputV3(
             source_ref="source-boundary:test",
             readable_text="current",
         ),
         source_boundary=tuple(
-            CompactSourceBoundaryEntryV2(
+            CompactSourceBoundaryEntryV3(
                 source_label=label,
                 source_kind=kind,
                 source_refs=(f"source:{label}",),
@@ -4104,115 +4110,114 @@ def _accepted_truth_for_candidate(
             )
             for label, kind in label_kinds.items()
         ),
+        output_caps=compact_output_caps_v3_from_memory_policy(
+            default_memory_projection_policy()
+        ),
     )
-    result = accept_compact_candidate_v2(
+    result = accept_compact_candidate_v3(
         compact_input,
         candidate,
         default_memory_projection_policy(),
     )
-    assert isinstance(result, CompactAcceptedTruthV2)
+    assert isinstance(result, CompactAcceptedTruthV3)
     return result
 
 
-def _accepted_candidate() -> CompactCandidateV2:
+def _accepted_candidate() -> CompactCandidateV3:
     """构造测试用 accepted compact candidate。
 
-    :returns: CompactCandidateV2。
+    :returns: CompactCandidateV3。
     """
 
-    return CompactCandidateV2(
-        schema="dayu.context_compaction.output.v2",
-        session_summary=CompactSessionSummaryV2(
+    return CompactCandidateV3(
+        schema="dayu.context_compaction.output.v3",
+        session_summary=CompactSessionSummaryV3(
             text="accepted session summary",
             source_labels=("T1",),
         ),
         evidence_facts=(
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim="accepted fact",
                 support_labels=("E1",),
                 context_labels=(),
             ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV2(
+            CompactAnswerAnchorV3(
                 title="accepted anchor",
                 detail="accepted anchor item",
                 source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV2(
+            CompactForwardIntentV3(
                 intent_type="next_step_note",
                 text="accepted next step",
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
                 source_labels=("T1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV2(
+            CompactReferenceContinuityV3(
                 text="accepted reference",
                 reason="local_reference",
                 source_labels=("T1",),
             ),
         ),
-        diagnostics=(),
-        explicitly_dropped_sources=(),
     )
 
 
-def _accepted_candidate_with_multiple_items() -> CompactCandidateV2:
+def _accepted_candidate_with_multiple_items() -> CompactCandidateV3:
     """构造含多 fact / anchor 的 accepted compact candidate。
 
-    :returns: CompactCandidateV2。
+    :returns: CompactCandidateV3。
     """
 
-    return CompactCandidateV2(
-        schema="dayu.context_compaction.output.v2",
-        session_summary=CompactSessionSummaryV2(
+    return CompactCandidateV3(
+        schema="dayu.context_compaction.output.v3",
+        session_summary=CompactSessionSummaryV3(
             text="accepted session summary",
             source_labels=("T1",),
         ),
         evidence_facts=(
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim="accepted fact one",
                 support_labels=("E1",),
                 context_labels=(),
             ),
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim="accepted fact two",
                 support_labels=("E2",),
                 context_labels=(),
             ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV2(
+            CompactAnswerAnchorV3(
                 title="accepted anchor one",
                 detail="accepted anchor item one",
                 source_labels=("A1",),
             ),
-            CompactAnswerAnchorV2(
+            CompactAnswerAnchorV3(
                 title="accepted anchor two",
                 detail="accepted anchor item two",
                 source_labels=("A2",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV2(
+            CompactForwardIntentV3(
                 intent_type="next_step_note",
                 text="accepted next step",
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
                 source_labels=("T1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV2(
+            CompactReferenceContinuityV3(
                 text="accepted reference",
                 reason="local_reference",
                 source_labels=("T1",),
             ),
         ),
-        diagnostics=(),
-        explicitly_dropped_sources=(),
     )
 
 
@@ -4418,7 +4423,7 @@ def _snapshot_with_stable_blocks(
                         item_id="memory-item:forward-intent",
                         intent_type="next_step_note",
                         text="follow up",
-                        status=CompactForwardIntentStatusV2.OPEN,
+                        status=CompactForwardIntentStatusV3.OPEN,
                         source_refs=("event:intent",),
                         event_id="event-intent",
                         event_sequence=checkpoint_event_sequence,

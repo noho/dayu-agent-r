@@ -34,28 +34,28 @@ from dayu.host._runner_call_manifest import (
 )
 from dayu.host.compact_payload import accepted_compact_business_texts
 from dayu.host.compaction import (
-    CompactAcceptedTruthV2,
+    CompactAcceptedTruthV3,
     CompactMaterialBlock,
-    CompactRepairFeedbackV2,
+    CompactRepairFeedbackV3,
     CompactSegmentSelectionScope,
     SelectedBlockProvenance,
-    CompactSessionSummaryV2,
-    CompactSourceBoundaryEntryV2,
-    CompactValidationReportV2,
-    CompactValidationIssueCodeV2,
-    CompactValidationIssueV2,
+    CompactSessionSummaryV3,
+    CompactSourceBoundaryEntryV3,
+    CompactValidationReportV3,
+    CompactValidationIssueCodeV3,
+    CompactValidationIssueV3,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
     ContextCompactor,
-    CompactInputV2,
-    CompactCandidateV2,
+    CompactInputV3,
+    CompactCandidateV3,
 )
 from dayu.host.context_budget import estimate_post_compact_budget
 from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_governance import (
-    accept_compact_candidate_v2,
-    build_compact_repair_feedback_v2,
+    accept_compact_candidate_v3,
+    build_compact_repair_feedback_v3,
 )
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.durable.artifact import LocalArtifactStore
@@ -132,7 +132,7 @@ class CompactorProposalRunInput:
     :param compactor_input_projection_digest: projection body digest。
     """
 
-    compact_input: CompactInputV2
+    compact_input: CompactInputV3
     agent_request: AgentRunRequest
     compaction_request_digest: str
     compactor_engine_run_id: str
@@ -143,7 +143,7 @@ class CompactorProposalRunInput:
     user_prompt_digest: str
     compactor_input_projection: Mapping[str, JsonValue]
     compactor_input_projection_digest: str
-    repair_feedback: CompactRepairFeedbackV2 | None
+    repair_feedback: CompactRepairFeedbackV3 | None
 
 
 @runtime_checkable
@@ -157,7 +157,7 @@ class CompactorProposalPreparedCompactor(Protocol):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV2 | None,
+        repair_feedback: CompactRepairFeedbackV3 | None,
     ) -> CompactorProposalRunInput:
         """构造但不执行 compactor proposal runner call 输入。
 
@@ -496,14 +496,14 @@ class CompactionOperationResult:
         成功 Engine final 身份；operation 失败时为 ``None``。
     """
 
-    accepted_truth: CompactAcceptedTruthV2 | None
+    accepted_truth: CompactAcceptedTruthV3 | None
     rejected_attempts: tuple[CompactionAttemptRejected, ...]
     failure_reason: str | None
     budget_after_attempted_compact: int | None
     accepted_attempt_number: int | None
     accepted_successful_response_identity: SuccessfulRunnerResponseIdentity | None
     accepted_proposal_manifest_reference: CompactorProposalManifestReference | None
-    next_repair_feedback: CompactRepairFeedbackV2 | None = None
+    next_repair_feedback: CompactRepairFeedbackV3 | None = None
 
     def required_successful_response_identity(
         self,
@@ -545,8 +545,8 @@ class _CompactorProposalAttempt:
     :param successful_response_identity: 产生 candidate 的成功 Runner call 身份。
     """
 
-    compact_input: CompactInputV2
-    candidate: CompactCandidateV2
+    compact_input: CompactInputV3
+    candidate: CompactCandidateV3
     proposal_manifest_reference: CompactorProposalManifestReference | None
     successful_response_identity: SuccessfulRunnerResponseIdentity
 
@@ -566,7 +566,7 @@ class _CompactorProposalExecutionError(Exception):
     original_exception: Exception
     proposal_manifest_reference: CompactorProposalManifestReference | None
     successful_response_identity: SuccessfulRunnerResponseIdentity | None
-    validation_report: CompactValidationReportV2 | None
+    validation_report: CompactValidationReportV3 | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -709,7 +709,7 @@ async def run_compaction_attempt(
     compaction_operation_id: str | None = None,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None = None,
     memory_policy: MemoryProjectionPolicy,
-    repair_feedback: CompactRepairFeedbackV2 | None,
+    repair_feedback: CompactRepairFeedbackV3 | None,
 ) -> CompactionOperationResult:
     """执行 single-operation 全局预算内的精确一次 semantic attempt。
 
@@ -758,7 +758,7 @@ async def _run_compaction_operation(
     compaction_operation_id: str | None,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None,
     memory_policy: MemoryProjectionPolicy | None,
-    initial_repair_feedback: CompactRepairFeedbackV2 | None,
+    initial_repair_feedback: CompactRepairFeedbackV3 | None,
 ) -> CompactionOperationResult:
     """执行共享的 semantic attempt loop。
 
@@ -814,8 +814,8 @@ async def _run_compaction_operation(
             last_budget=None,
         )
     last_budget: int | None = None
-    accepted_pass_truths: list[CompactAcceptedTruthV2 | None] = [None for _ in requests]
-    repair_feedback_by_pass: list[CompactRepairFeedbackV2 | None] = [None for _ in requests]
+    accepted_pass_truths: list[CompactAcceptedTruthV3 | None] = [None for _ in requests]
+    repair_feedback_by_pass: list[CompactRepairFeedbackV3 | None] = [None for _ in requests]
     repair_feedback_by_pass[0] = initial_repair_feedback
     pass_attempt_numbers: list[int | None] = [None for _ in requests]
     pass_manifest_references: list[CompactorProposalManifestReference | None] = [None for _ in requests]
@@ -900,7 +900,7 @@ async def _run_compaction_operation(
                             failure_reason=_FAILURE_QUALITY_CHECK_REJECTED,
                             last_budget=last_budget,
                         )
-                    repair_feedback = build_compact_repair_feedback_v2(
+                    repair_feedback = build_compact_repair_feedback_v3(
                         exc.validation_report,
                         request_digest=pass_request.digest(),
                         source_boundary_digest=(pass_request.source_boundary_digest()),
@@ -1018,7 +1018,7 @@ async def _run_compaction_operation(
                     )
                 attempt_number += 1
                 continue
-            acceptance = accept_compact_candidate_v2(
+            acceptance = accept_compact_candidate_v3(
                 compact_input,
                 candidate,
                 memory_policy,
@@ -1027,7 +1027,7 @@ async def _run_compaction_operation(
                 compacted_business_texts=accepted_compact_business_texts(candidate),
                 current_input_text=compact_input.current_input.readable_text,
             )
-            if isinstance(acceptance, CompactValidationReportV2):
+            if isinstance(acceptance, CompactValidationReportV3):
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
                     attempt_number=attempt_number,
@@ -1055,7 +1055,7 @@ async def _run_compaction_operation(
                         accepted_successful_response_identity=None,
                         accepted_proposal_manifest_reference=None,
                     )
-                repair_feedback = build_compact_repair_feedback_v2(
+                repair_feedback = build_compact_repair_feedback_v3(
                     acceptance,
                     request_digest=pass_request.digest(),
                     source_boundary_digest=pass_request.source_boundary_digest(),
@@ -1099,12 +1099,12 @@ async def _run_compaction_operation(
             root_input=root_input,
             pass_truths=_required_pass_truths(accepted_pass_truths),
         )
-        root_acceptance = accept_compact_candidate_v2(
+        root_acceptance = accept_compact_candidate_v3(
             root_input,
             root_candidate,
             memory_policy,
         )
-        if isinstance(root_acceptance, CompactValidationReportV2):
+        if isinstance(root_acceptance, CompactValidationReportV3):
             routed = _route_root_validation_report(
                 report=root_acceptance,
                 pass_truths=_required_pass_truths(accepted_pass_truths),
@@ -1126,7 +1126,7 @@ async def _run_compaction_operation(
                 successful_response_identity=pass_response_identities[routed_index],
                 rejected=rejected,
             )
-            routed_feedback = build_compact_repair_feedback_v2(
+            routed_feedback = build_compact_repair_feedback_v3(
                 routed_report,
                 request_digest=requests[routed_index].digest(),
                 source_boundary_digest=(requests[routed_index].source_boundary_digest()),
@@ -1173,7 +1173,7 @@ async def _run_compaction_operation(
                 rejected=rejected,
                 failure_category=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
             )
-            routed_feedback = build_compact_repair_feedback_v2(
+            routed_feedback = build_compact_repair_feedback_v3(
                 routed_report,
                 request_digest=requests[routed_index].digest(),
                 source_boundary_digest=(requests[routed_index].source_boundary_digest()),
@@ -1222,9 +1222,9 @@ async def _run_compaction_operation(
 
 def _aggregate_pass_candidates(
     *,
-    root_input: CompactInputV2,
-    pass_truths: tuple[CompactAcceptedTruthV2, ...],
-) -> CompactCandidateV2:
+    root_input: CompactInputV3,
+    pass_truths: tuple[CompactAcceptedTruthV3, ...],
+) -> CompactCandidateV3:
     """按 frozen pass 顺序机械合并 operation-private truths。
 
     :param root_input: immutable operation root input。
@@ -1238,30 +1238,26 @@ def _aggregate_pass_candidates(
     summaries = tuple(
         truth.candidate.session_summary for truth in pass_truths if truth.candidate.session_summary is not None
     )
-    summary: CompactSessionSummaryV2 | None = None
+    summary: CompactSessionSummaryV3 | None = None
     if summaries:
         summary_labels = set(label for item in summaries for label in item.source_labels)
-        summary = CompactSessionSummaryV2(
+        summary = CompactSessionSummaryV3(
             text="\n".join(item.text for item in summaries),
             source_labels=tuple(label for label in root_input.source_labels if label in summary_labels),
         )
-    return CompactCandidateV2(
+    return CompactCandidateV3(
         schema=pass_truths[0].candidate.schema,
         session_summary=summary,
         evidence_facts=tuple(item for truth in pass_truths for item in truth.candidate.evidence_facts),
         answer_anchors=tuple(item for truth in pass_truths for item in truth.candidate.answer_anchors),
         forward_intents=tuple(item for truth in pass_truths for item in truth.candidate.forward_intents),
         reference_continuity=tuple(item for truth in pass_truths for item in truth.candidate.reference_continuity),
-        diagnostics=tuple(item for truth in pass_truths for item in truth.candidate.diagnostics),
-        explicitly_dropped_sources=tuple(
-            item for truth in pass_truths for item in truth.candidate.explicitly_dropped_sources
-        ),
     )
 
 
 def _required_pass_truths(
-    values: list[CompactAcceptedTruthV2 | None],
-) -> tuple[CompactAcceptedTruthV2, ...]:
+    values: list[CompactAcceptedTruthV3 | None],
+) -> tuple[CompactAcceptedTruthV3, ...]:
     """把已完整接受的 pass truth list 收敛为非空 tuple。
 
     :param values: 与 frozen pass queue 同序的 optional truths。
@@ -1289,9 +1285,9 @@ def _required_attempt_number(value: int | None) -> int:
 
 def _route_root_validation_report(
     *,
-    report: CompactValidationReportV2,
-    pass_truths: tuple[CompactAcceptedTruthV2, ...],
-) -> tuple[int, CompactValidationReportV2] | None:
+    report: CompactValidationReportV3,
+    pass_truths: tuple[CompactAcceptedTruthV3, ...],
+) -> tuple[int, CompactValidationReportV3] | None:
     """把首个 root issue 路由到最后一个稳定贡献 pass。
 
     :param report: aggregate root validation report。
@@ -1302,13 +1298,13 @@ def _route_root_validation_report(
     issue = report.issues[0]
     for index in range(len(pass_truths) - 1, -1, -1):
         if _pass_truth_contributes_to_issue(pass_truths[index], issue):
-            return index, CompactValidationReportV2(issues=(issue,))
+            return index, CompactValidationReportV3(issues=(issue,))
     return None
 
 
 def _pass_truth_contributes_to_issue(
-    truth: CompactAcceptedTruthV2,
-    issue: CompactValidationIssueV2,
+    truth: CompactAcceptedTruthV3,
+    issue: CompactValidationIssueV3,
 ) -> bool:
     """判断 pass 是否是 root issue 的稳定贡献者。
 
@@ -1327,30 +1323,25 @@ def _pass_truth_contributes_to_issue(
         ("answer_anchors", bool(candidate.answer_anchors)),
         ("forward_intents", bool(candidate.forward_intents)),
         ("reference_continuity", bool(candidate.reference_continuity)),
-        ("diagnostics", bool(candidate.diagnostics)),
-        (
-            "explicitly_dropped_sources",
-            bool(candidate.explicitly_dropped_sources),
-        ),
     )
     for section, present in section_presence:
         if section in issue.json_path:
             return present
-    if issue.code is CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED:
+    if issue.code is CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED:
         return any(present for _, present in section_presence)
     return False
 
 
-def _root_budget_validation_report() -> CompactValidationReportV2:
+def _root_budget_validation_report() -> CompactValidationReportV3:
     """构造 operation-root hard budget 的 whole-candidate repair report。
 
     :returns: 单问题 typed validation report。
     """
 
-    return CompactValidationReportV2(
+    return CompactValidationReportV3(
         issues=(
-            CompactValidationIssueV2(
-                code=CompactValidationIssueCodeV2.POLICY_SIZE_CAP_EXCEEDED,
+            CompactValidationIssueV3(
+                code=CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED,
                 json_path="$",
                 message="aggregate candidate 超过 operation hard budget；请压缩业务文本。",
             ),
@@ -1361,7 +1352,7 @@ def _root_budget_validation_report() -> CompactValidationReportV2:
 def _record_root_rejection(
     *,
     request: CompactionRequest,
-    report: CompactValidationReportV2,
+    report: CompactValidationReportV3,
     attempt_number: int,
     max_attempt_number: int,
     budget_after_attempted_compact: int | None,
@@ -1413,7 +1404,7 @@ def _failed_operation_result(
     rejected: list[CompactionAttemptRejected],
     failure_reason: CompactionFailureCategory,
     last_budget: int | None,
-    next_repair_feedback: CompactRepairFeedbackV2 | None = None,
+    next_repair_feedback: CompactRepairFeedbackV3 | None = None,
 ) -> CompactionOperationResult:
     """构造不泄漏 partial pass truth 的 operation failure arm。
 
@@ -1514,7 +1505,7 @@ def _operation_pass_requests(
     if len(root_provenance_by_id) != len(request.segment_selection.selected_block_provenance):
         raise ValueError("root selected block provenance ids must be unique")
     observed_pass_block_ids: set[str] = set()
-    pass_boundary_entries: list[CompactSourceBoundaryEntryV2] = []
+    pass_boundary_entries: list[CompactSourceBoundaryEntryV3] = []
     for pass_request in pass_queue:
         if not isinstance(pass_request, CompactionRequest):
             raise TypeError("pass_queue items must be CompactionRequest")
@@ -1644,7 +1635,7 @@ def _sorted_selected_provenance_values(
 
 
 def _repair_feedback_matches_request(
-    feedback: CompactRepairFeedbackV2,
+    feedback: CompactRepairFeedbackV3,
     request: CompactionRequest,
 ) -> bool:
     """判断 feedback 是否精确绑定当前 immutable request 与 source boundary。
@@ -1683,7 +1674,7 @@ async def _prepare_compactor_proposal(
     compaction_operation_id: str | None,
     compaction_attempt_number: int,
     proposal_manifest_recorder: CompactorProposalManifestRecorder | None,
-    repair_feedback: CompactRepairFeedbackV2 | None,
+    repair_feedback: CompactRepairFeedbackV3 | None,
 ) -> _CompactorProposalAttempt:
     """准备、记录并执行一次 compactor proposal。
 
@@ -2706,7 +2697,7 @@ def _attempt_rejected(
     )
 
 
-def _quality_suffix_vnext(quality: CompactValidationReportV2) -> str:
+def _quality_suffix_vnext(quality: CompactValidationReportV3) -> str:
     """构造 quality reject 诊断后缀。
 
     :param quality: quality check 结果。

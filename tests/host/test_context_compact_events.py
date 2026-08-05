@@ -20,18 +20,23 @@ from dayu.engine.contracts.runner_identity import (
 )
 from dayu.host.api import HostEventClass, HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
-    CompactAnswerAnchorV2,
-    CompactAcceptedTruthV2,
-    COMPACT_OUTPUT_SCHEMA_V2,
-    CompactCandidateV2,
-    CompactEvidenceFactV2,
-    CompactForwardIntentV2,
-    CompactForwardIntentStatusV2,
-    CompactReferenceContinuityV2,
-    CompactSessionSummaryV2,
-    CompactCandidateDiagnosticV2,
+    CompactAnswerAnchorV3,
+    CompactAcceptedTruthV3,
+    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactCandidateV3,
+    CompactEvidenceFactV3,
+    CompactForwardIntentV3,
+    CompactForwardIntentStatusV3,
+    CompactReferenceContinuityV3,
+    CompactRepresentedCoverageV3,
+    CompactSessionSummaryV3,
+    CompactSourceBoundaryEntryV3,
 )
 from dayu.host.compact_payload import (
+    accepted_candidate_fact_evidence_labels,
+    accepted_compact_business_texts,
+    accepted_evidence_mapping_refs,
+    compact_artifact_payload_ref,
     parse_context_compacted_semantic_payload,
 )
 from dayu.host.context_budget import ContextBudgetDecision
@@ -324,6 +329,25 @@ def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
     assert semantic.current_input_ref == "event-user-1"
     assert semantic.compacted_source_refs == ("evidence:accepted-1",)
     assert semantic.accepted_candidate.answer_anchors[0].detail == ("Revenue increased.\nMargin also expanded.")
+    assert accepted_evidence_mapping_refs(payload) == ("evidence:accepted-1",)
+    assert accepted_candidate_fact_evidence_labels(payload) == ("E1",)
+    assert accepted_compact_business_texts(semantic.accepted_candidate) == (
+        "Q1 review focused on revenue.",
+        "Revenue increased.",
+        "Revenue answer",
+        "Revenue increased.\nMargin also expanded.",
+        "Compare quarters next.",
+        "Keep revenue comparison context.",
+    )
+
+
+def test_compact_payload_public_helpers_reject_invalid_inputs() -> None:
+    """compact payload public helper 对弱类型 candidate 与非法 digest fail closed。"""
+
+    with pytest.raises(TypeError, match="candidate must be CompactCandidateV3"):
+        accepted_compact_business_texts(cast(CompactCandidateV3, "bad"))
+    with pytest.raises(ValueError, match="artifact_digest must be sha256 digest"):
+        compact_artifact_payload_ref("bad")
 
 
 @pytest.mark.parametrize(
@@ -431,7 +455,10 @@ def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> 
     candidate["evidence_facts"] = cast(list[JsonValue], facts)
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="evidence_kind is not supported"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown_json_key: \$\.evidence_facts\[0\]\.evidence_kind",
+    ):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -447,7 +474,7 @@ def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path
 
     with pytest.raises(
         ValueError,
-        match=r"accepted_candidate\.session_summary\.source_labels",
+        match=r"\$\.session_summary\.source_labels",
     ):
         parse_context_compacted_semantic_payload(payload)
 
@@ -457,11 +484,11 @@ def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path
     (
         (
             "support_labels",
-            r"accepted_candidate\.evidence_facts\[0\]\.support_labels\[1\]",
+            r"\$\.evidence_facts\[0\]\.support_labels\[1\]",
         ),
         (
             "context_labels",
-            r"accepted_candidate\.evidence_facts\[0\]\.context_labels\[1\]",
+            r"\$\.evidence_facts\[0\]\.context_labels\[1\]",
         ),
     ),
 )
@@ -499,7 +526,7 @@ def test_compacted_semantic_parser_rejects_duplicate_intent_source_labels_with_i
     with pytest.raises(
         ValueError,
         match=(
-            r"accepted_candidate\.forward_intents\[0\]\."
+            r"\$\.forward_intents\[0\]\."
             r"source_labels\[1\]"
         ),
     ):
@@ -514,12 +541,12 @@ def test_compacted_semantic_parser_rejects_wrong_nested_shape() -> None:
     candidate["answer_anchors"] = "not-a-list"
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="answer_anchors must be list"):
+    with pytest.raises(ValueError, match=r"invalid_field_type: \$\.answer_anchors"):
         parse_context_compacted_semantic_payload(payload)
 
 
 def test_compacted_semantic_parser_rejects_removed_anchor_children_field() -> None:
-    """fresh v2 anchor 不接受旧 child/ordinal 结构。"""
+    """fresh v3 anchor 不接受旧 child/ordinal 结构。"""
 
     payload = _valid_compacted_payload()
     candidate = _payload_mapping(payload["accepted_candidate"])
@@ -528,7 +555,10 @@ def test_compacted_semantic_parser_rejects_removed_anchor_children_field() -> No
     candidate["answer_anchors"] = cast(list[JsonValue], anchors)
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="anchor_items is not supported"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown_json_key: \$\.answer_anchors\[0\]\.anchor_items",
+    ):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -540,7 +570,7 @@ def test_compacted_semantic_parser_rejects_unknown_old_candidate_field() -> None
     candidate["episode_summary"] = "legacy"
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="episode_summary is not supported"):
+    with pytest.raises(ValueError, match=r"unknown_json_key: \$\.episode_summary"):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -641,6 +671,102 @@ def test_compacted_payload_rejects_tampered_coverage() -> None:
     payload["represented_coverage"] = {"sources": []}
 
     with pytest.raises(ValueError, match="coverage"):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_rejects_represented_omitted_overlap() -> None:
+    """represented/omitted 不是 exact partition 时 strict reader fail closed。"""
+
+    payload = _valid_compacted_payload()
+    payload["omitted_coverage"] = {"source_labels": ["E1"]}
+
+    with pytest.raises(
+        ValueError,
+        match="represented and omitted coverage must be disjoint",
+    ):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_semantic_view_rejects_invalid_source_boundary_types() -> None:
+    """typed durable view 在读取字段前拒绝非法 source boundary tuple 与 item。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 tuple 或非 typed boundary item 未触发 TypeError 时抛出。
+    """
+
+    semantics = parse_context_compacted_semantic_payload(_valid_compacted_payload())
+
+    with pytest.raises(TypeError, match="source_boundary must be tuple"):
+        replace(
+            semantics,
+            source_boundary=cast(tuple[CompactSourceBoundaryEntryV3, ...], []),
+        )
+    with pytest.raises(
+        TypeError,
+        match="source_boundary item must be CompactSourceBoundaryEntryV3",
+    ):
+        replace(
+            semantics,
+            source_boundary=cast(
+                tuple[CompactSourceBoundaryEntryV3, ...],
+                ("invalid",),
+            ),
+        )
+
+
+def test_compacted_semantic_view_rejects_invalid_represented_coverage_type() -> None:
+    """typed durable view 明确拒绝非法 represented coverage 类型。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 typed represented coverage 未触发 TypeError 时抛出。
+    """
+
+    semantics = parse_context_compacted_semantic_payload(_valid_compacted_payload())
+
+    with pytest.raises(
+        TypeError,
+        match="represented_coverage must be CompactRepresentedCoverageV3",
+    ):
+        replace(
+            semantics,
+            represented_coverage=cast(CompactRepresentedCoverageV3, "invalid"),
+        )
+
+
+@pytest.mark.parametrize(
+    "actual_field",
+    (
+        "session_summary_char_actual",
+        "evidence_fact_item_actual",
+        "evidence_fact_char_actual",
+        "answer_anchor_item_actual",
+        "answer_anchor_char_actual",
+        "forward_intent_item_actual",
+        "forward_intent_char_actual",
+        "reference_continuity_item_actual",
+        "reference_continuity_char_actual",
+    ),
+)
+def test_compacted_payload_rejects_candidate_audit_actual_mismatch(
+    actual_field: str,
+) -> None:
+    """九项 actual 被向下篡改时 strict reader fail closed。
+
+    :param actual_field: 待篡改的 durable audit 字段。
+    """
+
+    payload = _valid_compacted_payload()
+    audit = _payload_mapping(payload["policy_usage_audit"])
+    actual = audit[actual_field]
+    assert isinstance(actual, int)
+    assert actual > 0
+    audit[actual_field] = actual - 1
+    payload["policy_usage_audit"] = audit
+
+    with pytest.raises(
+        ValueError,
+        match="policy_usage_audit actuals must equal candidate-derived usage",
+    ):
         validate_context_compacted_payload(payload)
 
 
@@ -1556,58 +1682,50 @@ def _valid_compacted_payload() -> dict[str, JsonValue]:
     )
 
 
-def _candidate() -> CompactCandidateV2:
+def _candidate() -> CompactCandidateV3:
     """构造测试用 accepted vNext compaction candidate。
 
     :returns: vNext compaction candidate。
     """
 
-    return CompactCandidateV2(
-        schema=COMPACT_OUTPUT_SCHEMA_V2,
-        session_summary=CompactSessionSummaryV2(
+    return CompactCandidateV3(
+        schema=COMPACT_OUTPUT_SCHEMA_V3,
+        session_summary=CompactSessionSummaryV3(
             text="Q1 review focused on revenue.",
             source_labels=("E1", "A1"),
         ),
         evidence_facts=(
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim="Revenue increased.",
                 support_labels=("E1",),
             ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV2(
+            CompactAnswerAnchorV3(
                 title="Revenue answer",
                 detail="Revenue increased.\nMargin also expanded.",
                 source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV2(
+            CompactForwardIntentV3(
                 intent_type="next_step_note",
                 text="Compare quarters next.",
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
                 source_labels=("A1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV2(
+            CompactReferenceContinuityV3(
                 text="Keep revenue comparison context.",
                 reason="local_reference",
                 source_labels=("A1",),
             ),
         ),
-        diagnostics=(
-            CompactCandidateDiagnosticV2(
-                code="kept",
-                message="Host-only diagnostic text.",
-                source_labels=("E1",),
-            ),
-        ),
-        explicitly_dropped_sources=(),
     )
 
 
-def _accepted_truth() -> CompactAcceptedTruthV2:
+def _accepted_truth() -> CompactAcceptedTruthV3:
     """构造与 valid event fixture 同源的 accepted truth。
 
     :returns: production governance owner 生成的 accepted truth。

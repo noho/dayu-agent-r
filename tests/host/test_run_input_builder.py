@@ -123,16 +123,16 @@ from dayu.host.durable.state import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V2,
-    CompactAnswerAnchorV2,
+    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactAnswerAnchorV3,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CompactCandidateV2,
-    CompactEvidenceFactV2,
-    CompactForwardIntentV2,
-    CompactForwardIntentStatusV2,
-    CompactReferenceContinuityV2,
-    CompactSessionSummaryV2,
+    CompactCandidateV3,
+    CompactEvidenceFactV3,
+    CompactForwardIntentV3,
+    CompactForwardIntentStatusV3,
+    CompactReferenceContinuityV3,
+    CompactSessionSummaryV3,
 )
 from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.compact_material import (
@@ -1551,7 +1551,11 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(
+            store.transaction_runner,
+            session_id,
+            policy=_memory_policy(),
+        )
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -1603,7 +1607,11 @@ def test_memory_provider_renders_vnext_fact_section_from_snapshot(tmp_path: Path
     policy = _memory_policy(evidence_fact_char_cap=24)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(
+            store.transaction_runner,
+            session_id,
+            policy=_memory_policy(),
+        )
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -1639,7 +1647,7 @@ def test_vnext_fact_section_does_not_depend_on_old_subject_blocks(
     policy = _memory_policy(evidence_fact_char_cap=512)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -2989,7 +2997,7 @@ def test_inline_delta_includes_vnext_memory_sections(tmp_path: Path) -> None:
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         snapshot = build_conversation_memory_snapshot_from_events(
             events=(),
             session_id=session_id,
@@ -3025,7 +3033,7 @@ def test_missing_memory_snapshot_raises_repair_without_state_mutation(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3047,7 +3055,7 @@ def test_damaged_memory_snapshot_raises_repair_required(tmp_path: Path) -> None:
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3439,7 +3447,7 @@ def test_over_threshold_memory_lag_raises_repair_required(
     policy = _memory_policy(max_lag_events_for_inline_delta=0)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3550,7 +3558,7 @@ def test_run_input_memory_messages_include_context_compacted_projection(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3589,7 +3597,7 @@ def test_gross_margin_followup_uses_post_compact_evidence_backed_facts(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3623,7 +3631,7 @@ def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3718,7 +3726,7 @@ def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        _append_current_run_compacted_event(store.transaction_runner, seeded, policy=policy)
         recovery = _start_recovery_attempt(store.transaction_runner, seeded)
 
         request = _build_post_compaction_request(store, recovery, policy)
@@ -3788,7 +3796,7 @@ def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        _append_current_run_compacted_event(store.transaction_runner, seeded, policy=policy)
         recovery = _start_recovery_attempt(store.transaction_runner, seeded)
 
         builder = create_no_tool_run_input_builder(
@@ -3851,7 +3859,7 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        _append_current_run_compacted_event(store.transaction_runner, seeded, policy=policy)
         recovery = _start_recovery_attempt(store.transaction_runner, seeded)
         fallback = _active_fallback(
             selected_blocks=(
@@ -4044,6 +4052,7 @@ def test_reference_continuity_resolves_second_factor_without_full_long_input(
         compact_event = _append_reference_continuity_compact_marker(
             store.transaction_runner,
             session_id=session_id,
+            policy=policy,
         )
         seeded = _seed_current_run(
             store,
@@ -4379,11 +4388,17 @@ def _four_item_answer() -> str:
     )
 
 
-def _append_current_run_compacted_event(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> None:
+def _append_current_run_compacted_event(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> None:
     """为当前 Run 追加 accepted CONTEXT_COMPACTED fact。
 
     :param transaction_runner: Host transaction runner。
     :param seeded: 当前 Run 引用。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: ``None``。
     """
 
@@ -4429,6 +4444,7 @@ def _append_current_run_compacted_event(transaction_runner: HostTransactionRunne
                     operation_id=request_event_id,
                     summary_text="current run compacted semantic view",
                     pinned_patch={"candidate_id": "patch-current-run"},
+                    policy=policy,
                     fact_candidates=[],
                 ),
             ),
@@ -5140,11 +5156,17 @@ def _append_canonical_tool_result_for_memory(
     )
 
 
-def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner, session_id: str) -> None:
+def _append_rich_memory_source_events(
+    transaction_runner: HostTransactionRunner,
+    session_id: str,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> None:
     """追加 rich snapshot item 需要引用的 EventLog rows。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: ``None``。
     """
 
@@ -5230,6 +5252,7 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
                     summary_text="episode navigation only",
+                    policy=policy,
                     pinned_patch={
                         "candidate_id": "patch-memory",
                         "current_goal": {
@@ -5255,11 +5278,17 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
     transaction_runner.run_write(operation)
 
 
-def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunner, session_id: str) -> None:
+def _append_compacted_gross_margin_facts(
+    transaction_runner: HostTransactionRunner,
+    session_id: str,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> None:
     """追加 gross-margin follow-up 需要的 compacted facts。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: ``None``。
     """
 
@@ -5312,6 +5341,7 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
                     summary_text="gross margin episode navigation only",
+                    policy=policy,
                     pinned_patch={"candidate_id": "patch-gross-margin"},
                     fact_candidates=[
                         {
@@ -5337,12 +5367,16 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
 
 
 def _append_reference_continuity_compact_marker(
-    transaction_runner: HostTransactionRunner, *, session_id: str
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    policy: MemoryProjectionPolicy,
 ) -> EventLogRow:
     """追加 reference continuity snapshot 的 compact producer event。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: compact producer EventLog row。
     """
 
@@ -5388,6 +5422,7 @@ def _append_reference_continuity_compact_marker(
                     payload=_compact_payload(
                         summary_text="long input compacted to reference continuity",
                         pinned_patch={"candidate_id": "patch-second-factor"},
+                        policy=policy,
                         fact_candidates=[],
                         reference_continuity_items=[
                             {
@@ -7071,6 +7106,7 @@ def _compact_payload(
     operation_id: str = "event-compact-requested",
     summary_text: str,
     pinned_patch: dict[str, JsonValue],
+    policy: MemoryProjectionPolicy,
     fact_candidates: list[JsonValue] | None = None,
     reference_continuity_items: list[JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
@@ -7079,32 +7115,33 @@ def _compact_payload(
     :param operation_id: 对应 CONTEXT_COMPACTION_REQUESTED event id。
     :param summary_text: session summary 文本。
     :param pinned_patch: pinned patch candidate。
+    :param policy: 与 accepted truth audit 同源的 Memory policy。
     :param fact_candidates: 可选 evidence-backed fact candidates。
     :param reference_continuity_items: 可选 reference continuity candidates。
     :returns: compacted payload。
     """
 
-    resolved_fact_candidates: list[CompactEvidenceFactV2]
+    resolved_fact_candidates: list[CompactEvidenceFactV3]
     if fact_candidates is None:
         resolved_fact_candidates = [
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim="Revenue increased year over year",
                 support_labels=("evidence:memory-tool",),
             )
         ]
     else:
         resolved_fact_candidates = [
-            CompactEvidenceFactV2(
+            CompactEvidenceFactV3(
                 claim=str(candidate["claim_text"]),
                 support_labels=("evidence:memory-tool",),
             )
             for candidate in fact_candidates
             if isinstance(candidate, dict) and "claim_text" in candidate
         ]
-    resolved_reference_continuity_items: list[CompactReferenceContinuityV2]
+    resolved_reference_continuity_items: list[CompactReferenceContinuityV3]
     if reference_continuity_items is None:
         resolved_reference_continuity_items = [
-            CompactReferenceContinuityV2(
+            CompactReferenceContinuityV3(
                 text="second factor: margin mix",
                 reason="recent_state",
                 source_labels=("event-memory-raw-user",),
@@ -7112,7 +7149,7 @@ def _compact_payload(
         ]
     else:
         resolved_reference_continuity_items = [
-            CompactReferenceContinuityV2(
+            CompactReferenceContinuityV3(
                 text=str(candidate["text"]),
                 reason="ordinal_reference",
                 source_labels=("event-long-input",),
@@ -7134,31 +7171,29 @@ def _compact_payload(
             values = open_questions.get("value")
             if isinstance(values, list) and values and isinstance(values[0], str):
                 forward_text = values[0]
-    candidate = CompactCandidateV2(
-        schema=COMPACT_OUTPUT_SCHEMA_V2,
-        session_summary=CompactSessionSummaryV2(
+    candidate = CompactCandidateV3(
+        schema=COMPACT_OUTPUT_SCHEMA_V3,
+        session_summary=CompactSessionSummaryV3(
             text=summary_text,
             source_labels=("event-memory-raw-user",),
         ),
         evidence_facts=tuple(resolved_fact_candidates),
         answer_anchors=(
-            CompactAnswerAnchorV2(
+            CompactAnswerAnchorV3(
                 title="Compacted answer anchor",
                 detail=anchor_text,
                 source_labels=("event-memory-episode",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV2(
+            CompactForwardIntentV3(
                 intent_type="open_question",
                 text=forward_text,
-                status=CompactForwardIntentStatusV2.OPEN,
+                status=CompactForwardIntentStatusV3.OPEN,
                 source_labels=("event-memory-episode",),
             ),
         ),
         reference_continuity=tuple(resolved_reference_continuity_items),
-        diagnostics=(),
-        explicitly_dropped_sources=(),
     )
     accepted_truth = accepted_truth_for_candidate(
         candidate,
@@ -7169,6 +7204,7 @@ def _compact_payload(
             "evidence:memory-tool": ("evidence:memory-tool",),
             "event-long-input": ("event-long-input",),
         },
+        memory_policy=policy,
     )
     return dict(
         build_context_compacted_payload(

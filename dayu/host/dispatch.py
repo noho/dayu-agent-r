@@ -177,9 +177,9 @@ from dayu.host.compact_pipeline import (
     compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV2,
+    CompactAcceptedTruthV3,
     CompactionRequest,
-    CompactRepairFeedbackV2,
+    CompactRepairFeedbackV3,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
@@ -2289,7 +2289,7 @@ class HostDispatchScheduler:
         accepted_attempt_number: int | None = None
         operation_rejected_attempts: list[CompactionAttemptRejected] = []
         budget_after_attempted_compact: int | None = None
-        repair_feedback: CompactRepairFeedbackV2 | None = None
+        repair_feedback: CompactRepairFeedbackV3 | None = None
         for attempt_plan in execution_plans:
             attempt_feedback = _repair_feedback_for_request(
                 repair_feedback,
@@ -3009,6 +3009,7 @@ class HostDispatchScheduler:
         request_plan = build_normal_compact_request_plan(
             source_snapshot=source_snapshot,
             selection_policy_digest=digest_memory_projection_policy(memory_policy),
+            memory_policy=memory_policy,
             budget_before_compact=estimate,
             selected_recent_window_turn_floor=(memory_policy.selected_recent_window_turn_floor),
         )
@@ -3220,7 +3221,7 @@ class HostDispatchScheduler:
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
         request: CompactionRequest,
-        accepted_truth: CompactAcceptedTruthV2,
+        accepted_truth: CompactAcceptedTruthV3,
         operation_id: str,
         accepted_attempt_number: int,
         budget_after_compact: int,
@@ -5804,9 +5805,9 @@ def _compaction_result_accepted(result: CompactionOperationResult) -> bool:
 
 
 def _repair_feedback_for_request(
-    feedback: CompactRepairFeedbackV2 | None,
+    feedback: CompactRepairFeedbackV3 | None,
     request: CompactionRequest,
-) -> CompactRepairFeedbackV2 | None:
+) -> CompactRepairFeedbackV3 | None:
     """只保留精确绑定当前 request 与 source boundary 的 feedback。
 
     :param feedback: 前一 attempt 返回的 feedback；首次为 ``None``。

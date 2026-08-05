@@ -50,6 +50,7 @@ from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.memory import default_memory_projection_policy
+from dayu.host.context_governance import compact_output_caps_v3_from_memory_policy
 from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import fake_compaction_proposal_from_material_json
 
@@ -434,7 +435,11 @@ def _compactor() -> LLMContextCompactor:
             continuation_prompt="test continuation",
         ),
         system_prompt="Compact the supplied material.",
-        user_prompt_template="Material: <<compaction_request>>",
+        user_prompt_template=(
+            "Material: <<compaction_request>>\n"
+            "Rules: <<compact_output_rules>>\n"
+            "Template: <<compact_output_template>>"
+        ),
     )
 
 
@@ -493,6 +498,9 @@ def _request() -> CompactionRequest:
             safety_margin_tokens=200,
             estimator_digest="estimate-digest",
             overage_reason=None,
+        ),
+        output_caps=compact_output_caps_v3_from_memory_policy(
+            default_memory_projection_policy()
         ),
     )
 

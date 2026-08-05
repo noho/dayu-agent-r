@@ -20,7 +20,7 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV2,
+    CompactAcceptedTruthV3,
 )
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_budget import (
@@ -924,7 +924,8 @@ _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS = "prompt_local_label_mapping_refs"
 _FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
 _FIELD_SOURCE_BOUNDARY = "source_boundary"
 _FIELD_REPRESENTED_COVERAGE = "represented_coverage"
-_FIELD_EXPLICITLY_DROPPED_COVERAGE = "explicitly_dropped_coverage"
+_FIELD_OMITTED_COVERAGE = "omitted_coverage"
+_FIELD_POLICY_USAGE_AUDIT = "policy_usage_audit"
 _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _FIELD_PROJECTION_SIGNAL = "projection_signal"
 _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF = "accepted_proposal_manifest_ref"
@@ -1029,7 +1030,8 @@ _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
     _FIELD_SOURCE_BOUNDARY,
     _FIELD_REPRESENTED_COVERAGE,
-    _FIELD_EXPLICITLY_DROPPED_COVERAGE,
+    _FIELD_OMITTED_COVERAGE,
+    _FIELD_POLICY_USAGE_AUDIT,
     _FIELD_BUDGET_AFTER_COMPACT,
     _FIELD_PROJECTION_SIGNAL,
     _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF,
@@ -1196,7 +1198,7 @@ def build_context_compacted_payload(
     accepted_attempt_number: int,
     compact_artifact_ref: str,
     compact_artifact_digest: str,
-    accepted_truth: CompactAcceptedTruthV2,
+    accepted_truth: CompactAcceptedTruthV3,
     budget_after_compact: int,
     prompt_local_label_mapping_refs: tuple[str, ...],
     accepted_evidence_mapping_refs: tuple[str, ...],
@@ -1224,8 +1226,8 @@ def build_context_compacted_payload(
     :raises ValueError: payload 结构非法时抛出。
     """
 
-    if not isinstance(accepted_truth, CompactAcceptedTruthV2):
-        raise TypeError("accepted_truth must be CompactAcceptedTruthV2")
+    if not isinstance(accepted_truth, CompactAcceptedTruthV3):
+        raise TypeError("accepted_truth must be CompactAcceptedTruthV3")
     accepted_candidate = accepted_truth.candidate
     _validate_successful_response_manifest_binding(
         operation_id=operation_id,
@@ -1254,7 +1256,8 @@ def build_context_compacted_payload(
             for entry in accepted_truth.source_boundary
         ],
         _FIELD_REPRESENTED_COVERAGE: accepted_truth.represented_coverage.to_json(),
-        _FIELD_EXPLICITLY_DROPPED_COVERAGE: (accepted_truth.explicitly_dropped_coverage.to_json()),
+        _FIELD_OMITTED_COVERAGE: accepted_truth.omitted_coverage.to_json(),
+        _FIELD_POLICY_USAGE_AUDIT: accepted_truth.policy_usage_audit.to_json(),
         _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS: _string_list_json(accepted_evidence_mapping_refs),
         _FIELD_BUDGET_AFTER_COMPACT: budget_after_compact,
         _FIELD_PROJECTION_SIGNAL: projection_signal,
@@ -1287,7 +1290,8 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _required_text_list(payload, _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
     _required_mapping_list(payload, _FIELD_SOURCE_BOUNDARY)
     _required_mapping(payload, _FIELD_REPRESENTED_COVERAGE)
-    _required_mapping(payload, _FIELD_EXPLICITLY_DROPPED_COVERAGE)
+    _required_mapping(payload, _FIELD_OMITTED_COVERAGE)
+    _required_mapping(payload, _FIELD_POLICY_USAGE_AUDIT)
     _required_non_negative_int(payload, _FIELD_BUDGET_AFTER_COMPACT)
     _required_text(payload, _FIELD_PROJECTION_SIGNAL)
     _required_text(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF)

@@ -117,7 +117,7 @@ dayu/config/
 
 `runtime_hints.runner_option_hints` 的每个 hint 都是默认 RunnerCallOptions 配置片段，只包含 `temperature`、`top_p` 与 `stream`。默认配置不提供输出 token cap；`RunnerCallOptions.max_tokens` 只保留给显式 per-run 或 provider adapter override 使用。execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
 
-模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。`structured_output_capability` 在 base record 必填，派生记录直接继承；缺失、未知枚举或未知字段都会在 ConfigLoader 边界失败。
+模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。`structured_output_capability` 在 base record 必填，派生记录直接继承；缺失、未知枚举或未知字段都会在 ConfigLoader 边界失败。`dayu-cli init` 动态生成的 Custom OpenAI-compatible 完整记录显式写入 `none`；在没有目标模型直接 capability 证据前，不从 provider 名称推断或通过 loader 默认补值。
 
 当前包内 catalog 只把 DeepSeek base records 标为 `json_object`；MiMo 和其它没有直接 model capability 证据的 base records 均为 `none`。当前没有 `json_schema` record。Service 只把该 typed config 值机械投影到 `RunnerSpec`，不按 provider/model 名称推断、探测或自动降级。
 
@@ -356,13 +356,13 @@ Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最�
 
 只有 `interactive` 与 `wechat` manifest 通过 `"utils"` tag 选择 `get_current_time` 工具，使模型在用户明确要求获取此刻最新时间，或要求在等待、查询、下载、上传、处理等动作完成后再确认时间时可以主动调用工具。`prompt` 与其它 scene 即使需要当前时间，也只消费 `current_time` context slot，不通过 `"utils"` tag 暴露该工具。manifest 不写 `"time"` tag 或具体工具名也能通过 `"utils"` tag 获得默认实时时钟能力。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
 
-`conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
+`conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>`、`<<compact_output_rules>>` 与 `<<compact_output_template>>` 作为运行期同源投影占位符，这些占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
 
-运行期数据块使用自足的 `dayu.context_compaction.input.v2`：`current_input` 保存本轮可读输入，`source_boundary` 的每一项包含仅用于本次响应引用的 `source_label`、业务可读 `source_kind` 与 `readable_text`。模型必须返回且只返回 `dayu.context_compaction.output.v2` JSON object；字段固定为 `schema`、可空 `session_summary`、`evidence_facts`、`answer_anchors`、`forward_intents`、`reference_continuity`、`diagnostics` 与 `explicitly_dropped_sources`。每个 boundary label 必须恰好由业务语义项表示或被显式丢弃，diagnostics 不算业务覆盖。修复调用会提供上一轮有界、脱敏的 validation 摘要，并要求完整重产 candidate，不接受 patch 或旧 candidate 的局部沿用。
+运行期数据块使用自足的 `dayu.context_compaction.input.v3`：`current_input` 保存本轮可读输入，`source_boundary` 的每一项包含仅用于本次响应引用的 `source_label`、业务可读 `source_kind` 与 `readable_text`，`output_caps` 给出本次五类业务内容的真实 item / 字符上限。模型必须返回且只返回 `dayu.context_compaction.output.v3` JSON object；字段固定为 `schema`、可空 `session_summary`、`evidence_facts`、`answer_anchors`、`forward_intents` 与 `reference_continuity`。当前 summary cap 容不下有业务意义且可独立理解的摘要时，`session_summary` 必须为 `null`，不能用单字符、截断片段或占位文本凑非空。coverage、omission reason、policy usage 与其它治理账本不属于模型输出。修复调用会提供上一轮有界、脱敏的 validation 摘要，并要求基于同一完整输入重产 candidate，不接受 patch 或旧 candidate 的局部沿用。
 
 packaged system/user prompt 把运行期 marker 之间的完整 JSON 定义为不可信引用材料。`current_input.readable_text` 与所有 `source_boundary[*].readable_text` 中的指令式文本都只能作为数据，不能改变任务规则、schema、来源规则或输出形式；这条边界不要求过滤或改写原文。`source_label` 只是当前请求内的引用标签，不是业务事实、优先级或推理依据。
 
-user prompt 在当前消息内自足说明 input/output 的字段、类型、必填性、允许值、八种 `source_kind` 的业务含义、覆盖规则，并提供 label 同源且可通过 strict contract 的完整 input/output 示例。修复反馈也在当前 prompt 内定义为独占 marker 包围的 strict JSON object：顶层只含 `required_action` 与非空 `issues`，每个 issue 只含 `code`、`json_path`、`message`、`source_labels`。修复动作始终基于同一输入完整重产 replacement candidate；反馈不是业务材料，不能被写入财报事实、业务结论或后续任务。
+user prompt 在当前消息内自足说明 input/output 字段、类型、必填性、允许值、五类业务含义、来源规则与最小 concrete template。template 和简明字段规则与 provider-native formal JSON Schema、strict parser 由同一个 immutable structure descriptor 派生；formal schema 只用于 structured-output transport，不全文注入 LLM-facing prompt。字符计量规则由 Host 同一计量 owner 投影：summary 只计 `text`，facts 计各 `claim` 之和，anchors 计每项 `title + "\n" + detail` 之和，intents 与 references 计各 `text` 之和，reference `reason` 不计。修复反馈也在当前 prompt 内定义为独占 marker 包围的 strict JSON object：顶层只含 `required_action` 与非空 `issues`，每个 issue 只含 `code`、`json_path`、`message`、`source_labels`；repair-only 文本说明这些字段只是问题类别、字段位置、具体错误与动作、相关输入引用标签，引用标签不是业务事实。修复动作始终基于同一输入完整重产 replacement candidate；反馈不是业务材料，不能被写入财报事实、业务结论或后续任务。
 
 package `conversation_compaction` manifest 的 `model.default_model_id` 当前是
 `mimo-v2.5-pro-plan`，与 package ordinary baseline 同 family；

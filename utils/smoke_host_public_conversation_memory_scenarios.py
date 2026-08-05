@@ -98,9 +98,9 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V2,
-    CompactForwardIntentStatusV2,
-    CompactSourceKindV2,
+    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactForwardIntentStatusV3,
+    CompactSourceKindV3,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 from dayu.host.context_events import (
@@ -1992,8 +1992,8 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
         for item in boundary
         if item[1]
         in (
-            CompactSourceKindV2.PREVIOUS_SESSION_SUMMARY.value,
-            CompactSourceKindV2.TRACE_MATERIAL.value,
+            CompactSourceKindV3.PREVIOUS_SESSION_SUMMARY.value,
+            CompactSourceKindV3.TRACE_MATERIAL.value,
         )
     )
     fact_items = tuple(
@@ -2001,8 +2001,8 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
         for item in boundary
         if item[1]
         in (
-            CompactSourceKindV2.PREVIOUS_EVIDENCE_FACT.value,
-            CompactSourceKindV2.EVIDENCE_MATERIAL.value,
+            CompactSourceKindV3.PREVIOUS_EVIDENCE_FACT.value,
+            CompactSourceKindV3.EVIDENCE_MATERIAL.value,
         )
     )
     answer_items = tuple(
@@ -2010,22 +2010,22 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
         for item in boundary
         if item[1]
         in (
-            CompactSourceKindV2.PREVIOUS_ANSWER_ANCHOR.value,
-            CompactSourceKindV2.ANSWER_MATERIAL.value,
+            CompactSourceKindV3.PREVIOUS_ANSWER_ANCHOR.value,
+            CompactSourceKindV3.ANSWER_MATERIAL.value,
         )
     )
     intent_items = tuple(
         item
         for item in boundary
-        if item[1] == CompactSourceKindV2.PREVIOUS_FORWARD_INTENT.value
+        if item[1] == CompactSourceKindV3.PREVIOUS_FORWARD_INTENT.value
     )
     reference_items = tuple(
         item
         for item in boundary
-        if item[1] == CompactSourceKindV2.PREVIOUS_REFERENCE_CONTINUITY.value
+        if item[1] == CompactSourceKindV3.PREVIOUS_REFERENCE_CONTINUITY.value
     )
     proposal: dict[str, JsonValue] = {
-        "schema": COMPACT_OUTPUT_SCHEMA_V2,
+        "schema": COMPACT_OUTPUT_SCHEMA_V3,
         "session_summary": (
             {
                 "text": _SMOKE_COMPACTOR_SUMMARY_TEXT,
@@ -2054,7 +2054,7 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
             {
                 "intent_type": "next_step_note",
                 "text": f"{_SMOKE_COMPACTOR_FORWARD_TEXT} {text}",
-                "status": CompactForwardIntentStatusV2.OPEN.value,
+                "status": CompactForwardIntentStatusV3.OPEN.value,
                 "source_labels": [label],
             }
             for label, _, text in intent_items
@@ -2067,8 +2067,6 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
             }
             for label, _, text in reference_items
         ],
-        "diagnostics": [],
-        "explicitly_dropped_sources": [],
     }
     return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
 
@@ -2095,7 +2093,7 @@ def _invalid_current_anchor_citation_proposal() -> str:
     """
 
     proposal: Mapping[str, JsonValue] = {
-        "schema": COMPACT_OUTPUT_SCHEMA_V2,
+        "schema": COMPACT_OUTPUT_SCHEMA_V3,
         "session_summary": {
             "text": "invalid current-anchor citation",
             "source_labels": [_SMOKE_INVALID_CURRENT_ANCHOR_LABEL],
@@ -2104,8 +2102,6 @@ def _invalid_current_anchor_citation_proposal() -> str:
         "answer_anchors": [],
         "forward_intents": [],
         "reference_continuity": [],
-        "diagnostics": [],
-        "explicitly_dropped_sources": [],
     }
     return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
 
@@ -2113,7 +2109,7 @@ def _invalid_current_anchor_citation_proposal() -> str:
 def _proposal_boundary_items(
     material_json: Mapping[str, JsonValue],
 ) -> tuple[tuple[str, str, str], ...]:
-    """读取 fresh v2 source boundary。
+    """读取 fresh v3 source boundary。
 
     :param material_json: Host 投影给 compactor 的 material JSON。
     :returns: ``(label, kind, readable_text)`` 元组。
