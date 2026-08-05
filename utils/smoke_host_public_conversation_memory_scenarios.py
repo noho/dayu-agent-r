@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import pathlib
 import re
+import shutil
 import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
@@ -62,7 +64,10 @@ from dayu.contracts.tool_schema import (
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
+    EngineRunOutcomeCancelled,
+    EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
+    EngineRunOutcomeSuspended,
 )
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
@@ -72,6 +77,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
+from dayu.engine.contracts.structured_output import (
+    JsonObjectStructuredOutputRequest,
+    JsonSchemaStructuredOutputRequest,
+)
+from dayu.engine.runners.openai.payload import build_request_payload
 from dayu.engine.contracts.runner_identity import (
     ProviderRequestIdAvailability,
     SuccessfulRunnerResponseIdentity,
@@ -102,12 +112,14 @@ from dayu.host.compaction import (
     CompactForwardIntentStatusV3,
     CompactSourceKindV3,
 )
-from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+from dayu.host.context_budget import estimate_budget_text_tokens
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    parse_context_compacted_terminal_binding,
+    parse_context_compaction_attempt_rejected_terminal_binding,
 )
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -117,13 +129,25 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.tool_trace import (
+    RunnerCallResolvedProjection,
+    ToolTraceResolvedJsonPayload,
+    read_runner_call_reconstruction_signals_by_run,
+    resolve_runner_call_projection_from_signal,
+)
 from dayu.host.durable.transaction import HostTransaction
-from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    MemoryProjectionPolicy,
+    conversation_memory_snapshot_to_json_value,
+    digest_memory_projection_policy,
+)
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.log import LogLevel, configure
@@ -152,6 +176,10 @@ from dayu.service.host_assembly import (
     discover_service_tools,
 )
 from dayu.service.scene_context import CURRENT_TIME_SLOT, current_time
+from dayu.service.tool_trace_analysis import analyze_and_publish_tool_trace
+from dayu.host.tool_trace_analysis_contracts import (
+    ToolTraceCompactorResponseSummary,
+)
 from utils.smoke_host_public_diagnostics import (
     print_duplicate_governance_diagnostics,
 )
@@ -201,6 +229,7 @@ _STDOUT_PREFIX_COMPACT_ACCEPTANCE: Final[str] = "SMOKE COMPACT_ACCEPTANCE"
 _STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT: Final[str] = "SMOKE COMPACT_ARTIFACT_ROOT"
 _STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT: Final[str] = "SMOKE COMPACT_ARTIFACT_FILE_COUNT"
 _STDOUT_PREFIX_DETERMINISTIC_DISPATCH: Final[str] = "SMOKE DETERMINISTIC_DISPATCH"
+_STDOUT_PREFIX_EVIDENCE_OUTPUT: Final[str] = "SMOKE EVIDENCE_OUTPUT"
 _NO_TOOL_SELECTION: Final[frozenset[str]] = frozenset()
 _MOCK_PRESSURE_UNIT: Final[str] = (
     "DAYU_MEM_SCENARIO_PRESSURE_PAD 财报场景记忆压力文本，" "仅用于 public Host conversation memory smoke。"
@@ -217,6 +246,7 @@ _COMPACT_PRESSURE_MIN_PROMPT_TOKENS: Final[int] = 1_024
 _PRESSURE_LINE_CHARS: Final[int] = 120
 _COMPACT_ARTIFACT_PRINT_LIMIT: Final[int] = 10
 _COMPACT_EVENT_AUDIT_PAGE_SIZE: Final[int] = 512
+_RUNNER_CALL_EVIDENCE_PAGE_SIZE: Final[int] = 128
 _NORMALIZED_SPACE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s+")
 _ASSERTION_FAILURE_PREFIX: Final[str] = "answer assertion failed"
 _SOURCE_NAME: Final[str] = "utils.smoke_host_public_conversation_memory_scenarios"
@@ -312,6 +342,21 @@ _SMOKE_COMPACTOR_MARKERS: Final[tuple[str, ...]] = (
     _SMOKE_FALLBACK_CURRENT_MARKER,
 )
 _SMOKE_DETERMINISTIC_EVENT_TIME: Final[datetime] = datetime(2026, 6, 20, 0, 0, 0, tzinfo=UTC)
+_S4_OLD_FACT_MARKER: Final[str] = "DAYU_S4_OLD_MARGIN=18.2%"
+_S4_CURRENT_FACT_MARKER: Final[str] = "DAYU_S4_CURRENT_MARGIN=21.7%"
+_S4_SUMMARY_MARKER: Final[str] = "DAYU_S4_SUMMARY_BASELINE"
+_S4_ANSWER_MARKER: Final[str] = "DAYU_S4_ANSWER_BASELINE"
+_S4_FORWARD_MARKER: Final[str] = "DAYU_S4_FORWARD_OPEN"
+_S4_REFERENCE_MARKER: Final[str] = "DAYU_S4_REFERENCE_MARGIN"
+_S4_RECONNECT_MARKER: Final[str] = "DAYU_S4_RECONNECT_PROBE"
+_S4_EVIDENCE_SCHEMA_VERSION: Final[str] = "dayu.s4.real_provider_evidence.v1"
+_S4_REPAIR_CHAR_CAP: Final[int] = 30
+_S4_COMPACTOR_ATTEMPTS_FILE: Final[str] = "compactor-attempts.json"
+_S4_COMPACT_EVENTS_FILE: Final[str] = "compact-eventlog.json"
+_S4_MEMORY_FILE: Final[str] = "memory.json"
+_S4_RUNNER_PROJECTIONS_FILE: Final[str] = "public-runner-projections.json"
+_S4_ARTIFACT_INDEX_FILE: Final[str] = "compact-artifact-index.json"
+_S4_PROVIDER_IDENTITY_FILE: Final[str] = "provider-identity.json"
 
 _FIELD_COMPANY: Final[str] = "company"
 _FIELD_TICKER: Final[str] = "ticker"
@@ -612,6 +657,12 @@ class SuiteMode(StrEnum):
     MEMORY_COMPACT = "memory-compact"
     MEMORY_REACTIVE_COMPACT = "memory-reactive-compact"
     MEMORY_COMPACT_FALLBACK = "memory-compact-fallback"
+    MEMORY_REAL_BASELINE = "memory-real-baseline"
+    MEMORY_REAL_BOUNDARY = "memory-real-boundary"
+    MEMORY_REAL_REPLACEMENT = "memory-real-replacement"
+    MEMORY_REAL_REPAIR = "memory-real-repair"
+    MEMORY_RECONNECT_PROBE = "memory-reconnect-probe"
+    MEMORY_REAL_FALLBACK = "memory-real-fallback"
 
 
 class PressureMode(StrEnum):
@@ -623,6 +674,18 @@ class PressureMode(StrEnum):
 
     AUTO = "auto"
     OFF = "off"
+
+
+_REAL_PROVIDER_SUITES: Final[frozenset[SuiteMode]] = frozenset(
+    (
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_RECONNECT_PROBE,
+        SuiteMode.MEMORY_REAL_FALLBACK,
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -642,6 +705,7 @@ class SmokeArgs:
     :param long_rounds: long suite 轮数，范围为 20 到 25。
     :param pressure_mode: 压力注入模式。
     :param debug_smoke_output: 是否打印 smoke 自身的工具调用诊断。
+    :param evidence_output_dir: 可选 S4 单次 invocation 不可覆盖证据目录。
     """
 
     workspace_root: pathlib.Path
@@ -657,6 +721,7 @@ class SmokeArgs:
     long_rounds: int
     pressure_mode: PressureMode
     debug_smoke_output: bool
+    evidence_output_dir: pathlib.Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,6 +761,27 @@ class RoundResult:
     label: str
     run_id: str
     event: HostEvent
+
+
+@dataclass(frozen=True, slots=True)
+class RealCompactorAttemptCapture:
+    """真实 compactor 调用的脱敏 transport 与结果观测。
+
+    :param request: 实际传入 Engine 的 typed compactor request。
+    :param response_format_type: 同一 typed request 由正式 payload builder
+        投影出的 response format；未携带时为 ``None``。
+    :param outcome_kind: typed Engine outcome 分类；调用异常时为
+        ``provider_error``。
+    :param output_content: provider 成功 final 的完整输出；非 final 或异常时为
+        ``None``。
+    :param error_type: 调用异常类型名；未异常时为 ``None``。
+    """
+
+    request: AgentRunRequest
+    response_format_type: str | None
+    outcome_kind: str
+    output_content: str | None
+    error_type: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -933,6 +1019,120 @@ class SmokeCompactorRunner(Protocol):
         """
 
         ...
+
+
+class _RealCompactorCaptureRunner:
+    """capture-only wrapper；继续调用真实 compactor Engine runner。"""
+
+    def __init__(
+        self,
+        original_runner: SmokeCompactorRunner,
+        captures: list[RealCompactorAttemptCapture],
+    ) -> None:
+        """保存原 runner 与调用观测列表。
+
+        :param original_runner: 未替换的真实 Engine runner 函数。
+        :param captures: 本次 invocation 的 capture sink。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._original_runner = original_runner
+        self._captures = captures
+
+    async def __call__(
+        self,
+        request: AgentRunRequest,
+        *,
+        timeout_seconds: float,
+    ) -> AgentRunResult:
+        """镜像 typed transport 输入后继续调用真实 provider。
+
+        :param request: Host 产生的实际 compactor request。
+        :param timeout_seconds: Host 传入的 compactor deadline。
+        :returns: 原 runner 的真实结果。
+        :raises Exception: 原 runner/provider 异常原样抛出。
+        """
+
+        response_format_type = _response_format_type_for_request(request)
+        try:
+            outcome = await self._original_runner(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            self._captures.append(
+                RealCompactorAttemptCapture(
+                    request=request,
+                    response_format_type=response_format_type,
+                    outcome_kind="provider_error",
+                    output_content=None,
+                    error_type=type(exc).__name__,
+                )
+            )
+            raise
+        self._captures.append(
+            RealCompactorAttemptCapture(
+                request=request,
+                response_format_type=response_format_type,
+                outcome_kind=_engine_outcome_kind(outcome),
+                output_content=(
+                    outcome.content
+                    if isinstance(outcome, EngineRunOutcomeFinalAnswer)
+                    else None
+                ),
+                error_type=None,
+            )
+        )
+        return outcome
+
+
+def _response_format_type_for_request(request: AgentRunRequest) -> str | None:
+    """由正式 payload builder 读取本次实际 response format 类型。
+
+    :param request: 实际 compactor Agent request。
+    :returns: outbound payload 的 response format type；未携带时为 ``None``。
+    :raises ValueError: typed capability/request 组合非法时由 owner 抛出。
+    """
+
+    payload = cast(
+        Mapping[str, JsonValue],
+        build_request_payload(
+            messages=request.messages,
+            options=request.runner_options,
+            tools=request.tool_schemas,
+            spec=request.runner_spec,
+            structured_output=request.structured_output,
+        ),
+    )
+    response_format = payload.get("response_format")
+    if response_format is None:
+        return None
+    if not isinstance(response_format, Mapping):
+        raise TypeError("response_format must be a JSON object")
+    response_format_type = cast(Mapping[str, JsonValue], response_format).get("type")
+    if not isinstance(response_format_type, str) or response_format_type.strip() == "":
+        raise TypeError("response_format.type must be non-empty text")
+    return response_format_type
+
+
+def _engine_outcome_kind(outcome: AgentRunResult) -> str:
+    """把 typed Engine outcome 映射为稳定 evidence 分类。
+
+    :param outcome: 真实 Engine run 结果。
+    :returns: ``final_answer``、``failed``、``cancelled`` 或 ``suspended``。
+    :raises AssertionError: union 出现未知成员时抛出。
+    """
+
+    if isinstance(outcome, EngineRunOutcomeFinalAnswer):
+        return "final_answer"
+    if isinstance(outcome, EngineRunOutcomeFailed):
+        return "failed"
+    if isinstance(outcome, EngineRunOutcomeCancelled):
+        return "cancelled"
+    if isinstance(outcome, EngineRunOutcomeSuspended):
+        return "suspended"
+    raise AssertionError("unsupported AgentRunResult member")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1945,6 +2145,35 @@ def _patched_compactor_runner(runner: SmokeCompactorRunner) -> Iterator[None]:
         llm_compaction._run_agent_request = original_runner
 
 
+@contextmanager
+def _capturing_real_compactor_requests(
+    captures: list[RealCompactorAttemptCapture],
+) -> Iterator[None]:
+    """安装 capture-only wrapper，且始终恢复真实 runner。
+
+    :param captures: 本次 invocation 的 capture sink。
+    :returns: context manager iterator。
+    :raises RuntimeError: runner hook 不存在或 wrapper 安装失败时抛出。
+    :raises Exception: context 内异常原样向上抛出。
+    """
+
+    try:
+        original_runner = llm_compaction._run_agent_request
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Host compactor runner hook changed: "
+            "dayu.host.llm_compaction._run_agent_request is missing"
+        ) from exc
+    wrapper = _RealCompactorCaptureRunner(original_runner, captures)
+    try:
+        llm_compaction._run_agent_request = wrapper
+        if llm_compaction._run_agent_request is not wrapper:
+            raise RuntimeError("failed to install real compactor capture wrapper")
+        yield
+    finally:
+        llm_compaction._run_agent_request = original_runner
+
+
 def _compactor_user_prompt(request: AgentRunRequest) -> str:
     """读取 compactor request 的唯一 user prompt。
 
@@ -2217,6 +2446,14 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         choices=tuple(item.value for item in PressureMode),
         default=PressureMode.OFF.value,
     )
+    parser.add_argument(
+        "--evidence-output-dir",
+        default=None,
+        help=(
+            "S4 单次 invocation 的 fresh 证据目录；目录已存在时 fail closed，"
+            "deterministic fake suites 禁止使用。"
+        ),
+    )
     namespace = parser.parse_args(tuple(argv))
     workspace_root_text: str | None = namespace.workspace_root
     scene_id: str = namespace.scene_id
@@ -2230,13 +2467,28 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     suite_text: str = namespace.suite
     long_rounds: int = namespace.long_rounds
     pressure_mode_text: str = namespace.pressure_mode
+    evidence_output_text: str | None = namespace.evidence_output_dir
     pressure_suite = SuiteMode(suite_text)
     pressure_mode = PressureMode(pressure_mode_text)
     if pressure_suite in (
         SuiteMode.MEMORY_COMPACT,
         SuiteMode.MEMORY_COMPACT_FALLBACK,
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_REAL_FALLBACK,
     ) and pressure_mode is PressureMode.OFF:
         parser.error(f"--suite {pressure_suite.value} requires --pressure-mode auto")
+    if evidence_output_text is not None and pressure_suite in (
+        SuiteMode.MEMORY_REACTIVE_COMPACT,
+        SuiteMode.MEMORY_COMPACT_FALLBACK,
+    ):
+        parser.error("--evidence-output-dir forbids deterministic fake compact suites")
+    if evidence_output_text is None and pressure_suite in _REAL_PROVIDER_SUITES:
+        parser.error(
+            f"--suite {pressure_suite.value} requires --evidence-output-dir"
+        )
     log_level = LogLevel[log_level_text]
     return SmokeArgs(
         workspace_root=_resolve_workspace_root(workspace_root_text),
@@ -2252,7 +2504,23 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         long_rounds=long_rounds,
         pressure_mode=pressure_mode,
         debug_smoke_output=log_level is LogLevel.DEBUG,
+        evidence_output_dir=_optional_absolute_path(evidence_output_text),
     )
+
+
+def _optional_absolute_path(path_text: str | None) -> pathlib.Path | None:
+    """把可选 CLI 路径解析为绝对路径，但不创建目标。
+
+    :param path_text: 可选路径文本。
+    :returns: 绝对路径；未提供时返回 ``None``。
+    :raises ValueError: 路径文本为空时抛出。
+    """
+
+    if path_text is None:
+        return None
+    if path_text.strip() == "":
+        raise ValueError("evidence output path must be non-empty")
+    return pathlib.Path(path_text).expanduser().resolve()
 
 
 def _resolve_workspace_root(workspace_root_text: str | None) -> pathlib.Path:
@@ -2307,6 +2575,18 @@ def _round_specs_for_suite(
         return _reactive_compact_round_specs()
     if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
         return _fallback_compact_round_specs(user_pressure_text)
+    if suite is SuiteMode.MEMORY_REAL_BASELINE:
+        return _real_baseline_round_specs(user_pressure_text)
+    if suite is SuiteMode.MEMORY_REAL_BOUNDARY:
+        return _real_boundary_round_specs(user_pressure_text)
+    if suite is SuiteMode.MEMORY_REAL_REPLACEMENT:
+        return _real_replacement_round_specs(user_pressure_text)
+    if suite is SuiteMode.MEMORY_REAL_REPAIR:
+        return _real_repair_round_specs(user_pressure_text)
+    if suite is SuiteMode.MEMORY_RECONNECT_PROBE:
+        return _reconnect_probe_round_specs()
+    if suite is SuiteMode.MEMORY_REAL_FALLBACK:
+        return _real_fallback_round_specs(user_pressure_text)
     raise ValueError(f"unsupported suite: {suite.value}")
 
 
@@ -2749,6 +3029,202 @@ def _fallback_compact_round_specs(user_pressure_text: str) -> tuple[RoundSpec, .
     )
 
 
+def _evidence_round(label: str, prompt: str) -> RoundSpec:
+    """构造不依赖工具与回答措辞的真实 provider evidence 轮次。
+
+    :param label: 稳定轮次标签。
+    :param prompt: 进入真实普通 Run 与后续 compact boundary 的用户文本。
+    :returns: 无工具、无答案字符串特判的 ``RoundSpec``。
+    :raises ValueError: ``RoundSpec`` 校验字段非法时由其构造器抛出。
+    """
+
+    return RoundSpec(
+        label=label,
+        prompt=prompt,
+        tool_names=_NO_TOOL_SELECTION,
+        expected_tool_fact_key=None,
+        hard_answer_contains=(),
+        hard_answer_forbidden=(),
+        soft_answer_contains=(),
+        print_calls_by_key=False,
+    )
+
+
+def _real_baseline_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
+    """构造真实 provider 五类 compact 语义基线场景。
+
+    :param user_pressure_text: 触发 proactive compact 的自适应压力文本。
+    :returns: 五类业务语义、recent-floor 间隔与真实 compact 目标轮。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _evidence_round(
+            "s4-baseline-summary",
+            f"本会话总览标签是 {_S4_SUMMARY_MARKER}，研究对象为示例公司毛利率口径。",
+        ),
+        RoundSpec(
+            label="s4-baseline-fact",
+            prompt=(
+                "请调用 get_mock_finance_memory_fact 查询招商银行 600036.SH 2024H1 息差数据，"
+                "参数 company=招商银行、ticker=600036.SH、period=2024H1、"
+                "topic=net_interest_margin、metric=cmb_nim、include_pressure=false。"
+                f"同时记录待纠正的旧口径标签 {_S4_OLD_FACT_MARKER}。"
+            ),
+            tool_names=frozenset((_TOOL_NAME,)),
+            expected_tool_fact_key=_FACT_KEY_CMB_NIM,
+            hard_answer_contains=(_MARKER_CMB_NIM, _VALUE_CMB_NIM),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(_S4_OLD_FACT_MARKER,),
+            print_calls_by_key=True,
+        ),
+        _evidence_round(
+            "s4-baseline-answer-anchor",
+            f"当前已形成的回答结论标签是 {_S4_ANSWER_MARKER}：旧口径下毛利率为18.2%。",
+        ),
+        _evidence_round(
+            "s4-baseline-forward-intent",
+            f"尚未完成的后续动作标签是 {_S4_FORWARD_MARKER}：等待新口径复核。",
+        ),
+        _evidence_round(
+            "s4-baseline-reference",
+            f"后续短语“该指标”固定指向毛利率，引用连续性标签是 {_S4_REFERENCE_MARKER}。",
+        ),
+        _evidence_round("s4-baseline-gap-1", "记录基线间隔一，不新增或修改业务事实。"),
+        _evidence_round("s4-baseline-gap-2", "记录基线间隔二，不新增或修改业务事实。"),
+        _evidence_round("s4-baseline-gap-3", "记录基线间隔三，不新增或修改业务事实。"),
+        _evidence_round("s4-baseline-gap-4", "记录基线间隔四，不新增或修改业务事实。"),
+        _evidence_round(
+            "s4-baseline-compact-target",
+            (
+                f"{user_pressure_text}\n触发真实 compact；五类业务语义均仍有效，"
+                "请继续当前对话，不要调用工具。"
+            ),
+        ),
+    )
+
+
+def _real_boundary_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
+    """构造已有 baseline session 的单轮真实 compact 边界重试。
+
+    :param user_pressure_text: 由 Host 统一 estimator 生成的压力文本。
+    :returns: 保持五类既有语义并仅触发一次 boundary 的轮次。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _evidence_round(
+            "s4-real-boundary-retry",
+            (
+                f"{user_pressure_text}\n触发真实 compact；此前五类业务语义均仍有效，"
+                "请继续当前对话，不要调用工具。"
+            ),
+        ),
+    )
+
+
+def _real_replacement_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
+    """构造真实 provider rolling correction 与 cap replacement 场景。
+
+    :param user_pressure_text: 触发第二次 proactive compact 的自适应压力文本。
+    :returns: 当前口径纠正、旧结论失效、summary clear 与 compact 目标轮。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _evidence_round(
+            "s4-replacement-correction",
+            (
+                f"正式纠正：{_S4_OLD_FACT_MARKER} 已失效；唯一当前事实是 "
+                f"{_S4_CURRENT_FACT_MARKER}。旧回答结论不再有效，等待复核的任务已完成。"
+            ),
+        ),
+        _evidence_round(
+            "s4-replacement-summary-clear",
+            (
+                "当前没有需要保留的会话总览，compact 的 session_summary 应为 JSON null；"
+                f"仍需保留当前事实 {_S4_CURRENT_FACT_MARKER}。"
+            ),
+        ),
+        _evidence_round("s4-replacement-gap-1", "记录纠正间隔一，只沿用当前新口径。"),
+        _evidence_round("s4-replacement-gap-2", "记录纠正间隔二，只沿用当前新口径。"),
+        _evidence_round("s4-replacement-gap-3", "记录纠正间隔三，只沿用当前新口径。"),
+        _evidence_round("s4-replacement-gap-4", "记录纠正间隔四，只沿用当前新口径。"),
+        _evidence_round(
+            "s4-replacement-compact-target",
+            (
+                f"{user_pressure_text}\n触发真实 rolling compact；仅当前新口径有效，"
+                "不要恢复已失效的旧事实或旧结论。"
+            ),
+        ),
+    )
+
+
+def _reconnect_probe_round_specs() -> tuple[RoundSpec, ...]:
+    """构造跨进程 reconnect 后的单轮同源 probe。
+
+    :returns: 只查询当前口径且显式禁止旧口径的单轮场景。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _evidence_round(
+            "s4-reconnect-probe",
+            (
+                f"{_S4_RECONNECT_MARKER}：跨进程重连后，只回答当前毛利率口径；"
+                "不要调用工具，也不要恢复已失效旧结论。"
+            ),
+        ),
+    )
+
+
+def _real_repair_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
+    """构造 current-only session 的同边界 bounded repair 轮次。
+
+    :param user_pressure_text: Host estimator 生成的真实压力文本。
+    :returns: 只要求保留当前口径的单轮 compact 场景。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _evidence_round("s4-repair-gap-1", "记录 repair 间隔一，只沿用当前口径。"),
+        _evidence_round("s4-repair-gap-2", "记录 repair 间隔二，只沿用当前口径。"),
+        _evidence_round("s4-repair-gap-3", "记录 repair 间隔三，只沿用当前口径。"),
+        _evidence_round("s4-repair-gap-4", "记录 repair 间隔四，只沿用当前口径。"),
+        _evidence_round(
+            "s4-real-bounded-repair",
+            (
+                f"{user_pressure_text}\n在同一 compact boundary 内只保留当前事实 "
+                f"{_S4_CURRENT_FACT_MARKER}；不得恢复旧口径。"
+            ),
+        ),
+    )
+
+
+def _real_fallback_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
+    """构造真实 provider timeout/rejection fallback 的 bounded 场景。
+
+    具体 provider timeout 或 rejection 由显式 evidence profile 决定；本场景不
+    patch runner，也不伪造响应。
+
+    :param user_pressure_text: 触发 proactive compact 的自适应压力文本。
+    :returns: recent-floor 种子与单个压力目标轮。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _evidence_round("s4-fallback-seed-1", "真实 fallback 种子一。"),
+        _evidence_round("s4-fallback-seed-2", "真实 fallback 种子二。"),
+        _evidence_round("s4-fallback-seed-3", "真实 fallback 种子三。"),
+        _evidence_round("s4-fallback-seed-4", "真实 fallback 种子四。"),
+        _evidence_round("s4-fallback-seed-5", "真实 fallback 近期保护种子。"),
+        _evidence_round(
+            "s4-fallback-compact-target",
+            f"{user_pressure_text}\n触发真实 provider compact fallback 观察。",
+        ),
+    )
+
+
 def _fallback_old_marker_for_index(index: int) -> str:
     """返回 fallback 旧种子 marker。
 
@@ -3015,6 +3491,9 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     specs = _runtime_round_specs(args, assembly.options)
     _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
     smoke_run_id = _new_smoke_run_id()
+    compactor_captures: list[RealCompactorAttemptCapture] = []
+    run_ids: list[str] = []
+    session_id: str | None = None
 
     if args.pressure_mode is PressureMode.OFF:
         print(_STDOUT_PRESSURE_DISABLED)
@@ -3027,50 +3506,78 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     print("SMOKE CONTRACT open_host -> ensure_session -> submit_followup -> watch -> get_session")
     print(f"SMOKE LOG_LEVEL {args.log_level.name}")
 
-    async with (
-        open_host(assembly.options) as host,
-        AsyncExitStack() as attachment_stack,
-    ):
-        session = await host.ensure_session(_ensure_request(args, smoke_run_id))
-        attachment = await host.attach_session(session.session_id)
-        attachment_stack.push_async_callback(
-            _close_attachment_shielded, attachment
-        )
-        session_id = session.session_id
-        assembly.smoke_tool.track_session(session.session_id)
-        watcher = await host.watch_session_events(session.session_id)
-        print(f"SMOKE SESSION session_id={session.session_id}")
-        _assert_session_open(session, label="ensure-session")
-        _print_session_observation(session, label="ensure-session")
-
-        for index, spec in enumerate(specs, start=1):
-            tool_snapshot = assembly.smoke_tool.snapshot()
-            result = await _run_round(
-                host=host,
-                watcher=watcher,
-                session_id=session.session_id,
-                spec=spec,
-                client_request_id=_round_client_request_id(smoke_run_id, index),
-                scene_inputs=assembly.scene_inputs,
+    try:
+        async with (
+            open_host(assembly.options) as host,
+            AsyncExitStack() as attachment_stack,
+        ):
+            attachment_stack.enter_context(
+                _capturing_real_compactor_requests(compactor_captures)
             )
-            _print_round(result)
-            _assert_round_result(
-                result,
-                assembly.smoke_tool,
-                spec,
-                before_tools=tool_snapshot,
-                debug_smoke_output=args.debug_smoke_output,
+            session = await host.ensure_session(_ensure_request(args, smoke_run_id))
+            attachment = await host.attach_session(session.session_id)
+            attachment_stack.push_async_callback(
+                _close_attachment_shielded, attachment
             )
-            snapshot = await host.get_session(session.session_id)
-            _assert_session_open(snapshot, label=spec.label)
-            _print_session_observation(snapshot, label=spec.label)
-            if spec.print_calls_by_key:
-                print(calls_by_key_summary(assembly.smoke_tool.calls_by_key), flush=True)
+            session_id = session.session_id
+            assembly.smoke_tool.track_session(session.session_id)
+            watcher = await host.watch_session_events(session.session_id)
+            print(f"SMOKE SESSION session_id={session.session_id}")
+            _assert_session_open(session, label="ensure-session")
+            _print_session_observation(session, label="ensure-session")
 
-        final_session = await host.get_session(session.session_id)
-        _assert_session_open(final_session, label="final")
-        print(f"SMOKE SESSION_STATUS {final_session.status.value}")
+            for index, spec in enumerate(specs, start=1):
+                tool_snapshot = assembly.smoke_tool.snapshot()
+                result = await _run_round(
+                    host=host,
+                    watcher=watcher,
+                    session_id=session.session_id,
+                    spec=spec,
+                    client_request_id=_round_client_request_id(smoke_run_id, index),
+                    scene_inputs=assembly.scene_inputs,
+                )
+                run_ids.append(result.run_id)
+                _print_round(result)
+                _assert_round_result(
+                    result,
+                    assembly.smoke_tool,
+                    spec,
+                    before_tools=tool_snapshot,
+                    debug_smoke_output=args.debug_smoke_output,
+                )
+                snapshot = await host.get_session(session.session_id)
+                _assert_session_open(snapshot, label=spec.label)
+                _print_session_observation(snapshot, label=spec.label)
+                if spec.print_calls_by_key:
+                    print(
+                        calls_by_key_summary(assembly.smoke_tool.calls_by_key),
+                        flush=True,
+                    )
 
+            final_session = await host.get_session(session.session_id)
+            _assert_session_open(final_session, label="final")
+            print(f"SMOKE SESSION_STATUS {final_session.status.value}")
+    finally:
+        active_exception = sys.exception()
+        if args.evidence_output_dir is not None and session_id is not None:
+            try:
+                _export_s4_invocation_evidence(
+                    output_dir=args.evidence_output_dir,
+                    workspace_root=args.workspace_root,
+                    options=assembly.options,
+                    session_id=session_id,
+                    run_ids=tuple(run_ids),
+                    suite=args.suite,
+                    compactor_captures=tuple(compactor_captures),
+                )
+            except Exception as export_error:
+                _handle_s4_evidence_export_error(
+                    export_error=export_error,
+                    active_exception=active_exception,
+                )
+
+    if session_id is None:
+        raise RuntimeError("smoke Host lifecycle completed without a session id")
     print(calls_by_key_summary(assembly.smoke_tool.calls_by_key), flush=True)
     _print_compact_summary(assembly.options)
     compact_audit = _compact_audit_report(assembly.options, session_id=session_id)
@@ -3273,6 +3780,13 @@ def _smoke_options_for_suite(options: OpenHostOptions, suite: SuiteMode) -> Open
     :raises ValueError: reactive suite 的 recent floor 超出当前轮次布局能力时抛出。
     """
 
+    if suite is SuiteMode.MEMORY_REAL_REPAIR:
+        return replace(
+            options,
+            memory_projection_policy=_real_repair_memory_policy(
+                options.memory_projection_policy
+            ),
+        )
     if suite is not SuiteMode.MEMORY_REACTIVE_COMPACT:
         return options
     return replace(
@@ -3280,6 +3794,32 @@ def _smoke_options_for_suite(options: OpenHostOptions, suite: SuiteMode) -> Open
         memory_projection_policy=_reactive_compact_smoke_memory_policy(
             options.memory_projection_policy
         ),
+    )
+
+
+def _real_repair_memory_policy(
+    policy: MemoryProjectionPolicy,
+) -> MemoryProjectionPolicy:
+    """收紧 current-only repair suite 的四类 item 字符上限。
+
+    :param policy: assembly 提供的原始 Memory policy。
+    :returns: 保留相同 owner 字段、仅使用 S4 repair cap 的新 policy。
+    :raises ValueError: ``MemoryProjectionPolicy`` 自校验失败时抛出。
+    """
+
+    return replace(
+        policy,
+        evidence_fact_item_cap=1,
+        evidence_fact_char_cap=_S4_REPAIR_CHAR_CAP,
+        evidence_fact_floor=1,
+        answer_anchor_item_cap=1,
+        answer_anchor_char_cap=_S4_REPAIR_CHAR_CAP,
+        forward_intent_item_cap=1,
+        forward_intent_char_cap=_S4_REPAIR_CHAR_CAP,
+        reference_continuity_item_cap=1,
+        reference_continuity_char_cap=_S4_REPAIR_CHAR_CAP,
+        reference_continuity_item_floor=0,
+        policy_ref="s4-real-bounded-repair",
     )
 
 
@@ -3487,6 +4027,14 @@ def _runtime_round_specs(
 
     if args.suite is SuiteMode.MEMORY_COMPACT_FALLBACK and args.pressure_mode is PressureMode.AUTO:
         user_pressure_text = _fallback_compact_pressure_padding(options)
+    elif args.suite in (
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_REAL_FALLBACK,
+    ) and args.pressure_mode is PressureMode.AUTO:
+        user_pressure_text = _real_compact_pressure_padding(options)
     else:
         user_pressure_text = _runtime_user_pressure_text(args.pressure_mode, options)
     return _round_specs_for_suite(
@@ -3528,7 +4076,72 @@ def _fallback_compact_pressure_padding(options: OpenHostOptions) -> str:
     return _compact_pressure_padding_with_reserve(
         options,
         reserve_tokens=_COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS,
+        tool_pressure_tokens=_tool_pressure_estimated_tokens(),
     )
+
+
+def _real_compact_pressure_padding(options: OpenHostOptions) -> str:
+    """构造 fresh real-provider suite 的实际 proactive 压力文本。
+
+    fresh S4 场景没有旧 ``memory-compact`` 长套件的 575k 历史 token，不能把
+    那个历史 reserve 当成已存在输入。这里直接让本轮 prompt 自身跨过 soft
+    threshold，同时仍保留统一 hard margin。
+
+    :param options: Host opener options。
+    :returns: fresh real-provider 目标轮 pressure padding。
+    :raises RuntimeError: smoke 未启用 context budget policy 时抛出。
+    """
+
+    return _compact_pressure_padding_with_reserve(
+        options,
+        reserve_tokens=0,
+        tool_pressure_tokens=0,
+    )
+
+
+def _compact_pressure_padding_for_suite(
+    options: OpenHostOptions,
+    *,
+    suite: SuiteMode,
+) -> str:
+    """返回与 suite 实际输入组成一致的 pressure padding。
+
+    :param options: Host opener options。
+    :param suite: 当前 smoke suite。
+    :returns: suite-specific pressure padding。
+    :raises RuntimeError: context budget policy 缺失时抛出。
+    """
+
+    if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return _fallback_compact_pressure_padding(options)
+    if suite in (
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_REAL_FALLBACK,
+    ):
+        return _real_compact_pressure_padding(options)
+    return _compact_pressure_padding(options)
+
+
+def _pressure_tool_tokens_for_suite(suite: SuiteMode) -> int:
+    """返回 suite 实际会注入的 tool-result pressure token 数。
+
+    :param suite: 当前 smoke suite。
+    :returns: 无工具 S4 suite 为零，其余旧 pressure suite 使用 mock tool 估算。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if suite in (
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_REAL_FALLBACK,
+    ):
+        return 0
+    return _tool_pressure_estimated_tokens()
 
 
 def _compact_pressure_reserve_tokens(suite: SuiteMode) -> int:
@@ -3541,6 +4154,14 @@ def _compact_pressure_reserve_tokens(suite: SuiteMode) -> int:
 
     if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
         return _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS
+    if suite in (
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_REAL_FALLBACK,
+    ):
+        return 0
     return _COMPACT_PRESSURE_RESERVE_TOKENS
 
 
@@ -3565,8 +4186,8 @@ def _fallback_pressure_observation(
     policy = options.context_budget_policy
     if policy is None:
         raise RuntimeError("memory-compact-fallback requires context budget policy")
-    prompt_tokens = _estimate_chars_as_tokens(
-        len(_fallback_compact_pressure_padding(options))
+    prompt_tokens = estimate_budget_text_tokens(
+        _fallback_compact_pressure_padding(options)
     )
     pressure_tokens = (
         prompt_tokens
@@ -3810,14 +4431,23 @@ def _assert_memory_compact_pressure_bounds(
         soft / hard threshold 区间时抛出。
     """
 
-    if suite is not SuiteMode.MEMORY_COMPACT or pressure_mode is not PressureMode.AUTO:
+    if suite not in (
+        SuiteMode.MEMORY_COMPACT,
+        SuiteMode.MEMORY_REAL_BASELINE,
+        SuiteMode.MEMORY_REAL_BOUNDARY,
+        SuiteMode.MEMORY_REAL_REPLACEMENT,
+        SuiteMode.MEMORY_REAL_REPAIR,
+        SuiteMode.MEMORY_REAL_FALLBACK,
+    ) or pressure_mode is not PressureMode.AUTO:
         return
     policy = options.context_budget_policy
     if policy is None:
         raise RuntimeError("memory-compact auto pressure requires context budget policy")
     reserve_tokens = _compact_pressure_reserve_tokens(suite)
-    prompt_tokens = _estimate_chars_as_tokens(len(_compact_pressure_padding(options)))
-    tool_pressure_tokens = _tool_pressure_estimated_tokens()
+    prompt_tokens = estimate_budget_text_tokens(
+        _compact_pressure_padding_for_suite(options, suite=suite)
+    )
+    tool_pressure_tokens = _pressure_tool_tokens_for_suite(suite)
     pressure_tokens = prompt_tokens + tool_pressure_tokens + reserve_tokens
     soft_threshold_tokens = _threshold_tokens(
         policy.context_window_size,
@@ -4476,6 +5106,7 @@ def _compact_pressure_padding(options: OpenHostOptions) -> str:
     return _compact_pressure_padding_with_reserve(
         options,
         reserve_tokens=_COMPACT_PRESSURE_RESERVE_TOKENS,
+        tool_pressure_tokens=_tool_pressure_estimated_tokens(),
     )
 
 
@@ -4483,11 +5114,13 @@ def _compact_pressure_padding_with_reserve(
     options: OpenHostOptions,
     *,
     reserve_tokens: int,
+    tool_pressure_tokens: int,
 ) -> str:
     """按指定历史 reserve 构造预算压力 padding。
 
     :param options: 本次 smoke 使用的 Host opener options。
     :param reserve_tokens: 为既有历史与固定消息预留的估算 token。
+    :param tool_pressure_tokens: 本 suite 实际工具结果压力的估算 token。
     :returns: 用于用户 prompt 的 padding。
     :raises RuntimeError: smoke 未启用 context budget policy 时抛出。
     :raises ValueError: reserve token 为负数时抛出。
@@ -4510,14 +5143,13 @@ def _compact_pressure_padding_with_reserve(
         soft_threshold_tokens + _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS,
         hard_threshold_tokens - _COMPACT_PRESSURE_HARD_MARGIN_TOKENS,
     )
-    tool_pressure_tokens = _tool_pressure_estimated_tokens()
     prompt_tokens = max(
         _COMPACT_PRESSURE_MIN_PROMPT_TOKENS,
         target_tokens - reserve_tokens - tool_pressure_tokens,
     )
-    return _repeat_to_chars(
+    return _repeat_to_budget_tokens(
         token=_MOCK_PRESSURE_UNIT,
-        target_chars=prompt_tokens * DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
+        target_tokens=prompt_tokens,
     )
 
 
@@ -4540,32 +5172,37 @@ def _tool_pressure_estimated_tokens() -> int:
     :raises Exception: 不主动抛出异常。
     """
 
-    return _estimate_chars_as_tokens(len(_mock_pressure_blob(True, PressureMode.AUTO)))
+    return estimate_budget_text_tokens(
+        _mock_pressure_blob(True, PressureMode.AUTO)
+    )
 
 
-def _estimate_chars_as_tokens(char_count: int) -> int:
-    """按 Host conservative estimator 估算字符量对应的 token 数。
-
-    :param char_count: 字符数量。
-    :returns: 估算 token 数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return (char_count + DEFAULT_ESTIMATOR_CHARS_PER_TOKEN - 1) // DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
-
-
-def _repeat_to_chars(*, token: str, target_chars: int) -> str:
-    """把稳定 token 重复到目标字符量。
+def _repeat_to_budget_tokens(*, token: str, target_tokens: int) -> str:
+    """按 Host 统一 estimator 把稳定文本重复到目标 token 数。
 
     :param token: 重复使用的短文本。
-    :param target_chars: 目标字符数。
-    :returns: 至少达到目标字符数的文本。
-    :raises Exception: 不主动抛出异常。
+    :param target_tokens: 目标 conservative token 数。
+    :returns: estimator 结果刚好不少于目标的最短前缀。
+    :raises ValueError: token 或目标非法时抛出。
     """
 
+    if token == "":
+        raise ValueError("pressure token must be non-empty")
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be positive")
     line = f"{token} " * max(1, _PRESSURE_LINE_CHARS // len(token))
-    repeat_count = max(1, target_chars // len(line) + 1)
-    return (line * repeat_count)[:target_chars]
+    line_tokens = estimate_budget_text_tokens(line)
+    repeat_count = max(1, (target_tokens + line_tokens - 1) // line_tokens)
+    text = line * repeat_count
+    lower = 0
+    upper = len(text)
+    while lower < upper:
+        middle = (lower + upper) // 2
+        if estimate_budget_text_tokens(text[:middle]) >= target_tokens:
+            upper = middle
+        else:
+            lower = middle + 1
+    return text[:lower]
 
 
 def _new_smoke_run_id() -> str:
@@ -4673,15 +5310,11 @@ def _print_compact_pressure_plan(
         policy.context_window_size,
         policy.hard_threshold_context_ratio,
     )
-    prompt = (
-        _fallback_compact_pressure_padding(options)
-        if suite is SuiteMode.MEMORY_COMPACT_FALLBACK
-        else _compact_pressure_padding(options)
-    )
+    prompt = _compact_pressure_padding_for_suite(options, suite=suite)
     prompt_chars = len(prompt)
-    estimated_prompt_tokens = _estimate_chars_as_tokens(prompt_chars)
+    estimated_prompt_tokens = estimate_budget_text_tokens(prompt)
     reserve_tokens = _compact_pressure_reserve_tokens(suite)
-    tool_pressure_tokens = _tool_pressure_estimated_tokens()
+    tool_pressure_tokens = _pressure_tool_tokens_for_suite(suite)
     estimated_without_reserve_tokens = estimated_prompt_tokens + tool_pressure_tokens
     estimated_effective_pressure_tokens = estimated_without_reserve_tokens + reserve_tokens
     print(
@@ -5762,6 +6395,690 @@ def _compact_artifact_files(options: OpenHostOptions) -> tuple[pathlib.Path, ...
     if compact_root is None or not compact_root.exists():
         return ()
     return tuple(path for path in compact_root.rglob("*") if path.is_file())
+
+
+def _export_s4_invocation_evidence(
+    *,
+    output_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
+    options: OpenHostOptions,
+    session_id: str,
+    run_ids: tuple[str, ...],
+    suite: SuiteMode,
+    compactor_captures: tuple[RealCompactorAttemptCapture, ...],
+) -> None:
+    """导出单次真实 provider invocation 的不可覆盖证据集。
+
+    :param output_dir: 必须尚不存在的 invocation evidence 目录。
+    :param workspace_root: 本次真实 Host workspace root。
+    :param options: 实际 Host opener options。
+    :param session_id: 本次 public Session id。
+    :param run_ids: 本次 invocation 的 public Host Run ids。
+    :param suite: 本次真实场景套件。
+    :param compactor_captures: capture-only wrapper 记录的真实调用。
+    :returns: ``None``。
+    :raises FileExistsError: 输出目录已存在时抛出。
+    :raises OSError: evidence 写入或 artifact copy 失败时抛出。
+    :raises Exception: Tool Trace、EventLog 或 Memory owner 读取失败时透传。
+    """
+
+    if output_dir.exists():
+        raise FileExistsError(f"evidence output directory already exists: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=False)
+    durable_options = _durable_options_from_open_host_options(options)
+    compact_rows: tuple[EventLogRow, ...] | None = None
+    memory_value: JsonValue | None = None
+    runner_projections: JsonValue | None = None
+    with open_host_durable_store(durable_options) as store:
+        compact_rows = store.transaction_runner.run_read(
+            lambda transaction: _read_compact_event_rows(
+                transaction,
+                event_log_store=EventLogStore(),
+                session_id=session_id,
+            )
+        )
+        memory_value = store.transaction_runner.run_read(
+            lambda transaction: _memory_evidence_json(
+                transaction,
+                session_id=session_id,
+                policy=options.memory_projection_policy,
+            )
+        )
+        runner_projections = store.transaction_runner.run_read(
+            lambda transaction: _runner_projection_evidence_json(
+                transaction,
+                run_ids=run_ids,
+            )
+        )
+    if compact_rows is None or memory_value is None or runner_projections is None:
+        raise RuntimeError("durable evidence read context exited without a result")
+    _write_fresh_json(
+        output_dir / _S4_COMPACTOR_ATTEMPTS_FILE,
+        _compactor_capture_evidence_json(compactor_captures),
+    )
+    _write_fresh_json(
+        output_dir / _S4_COMPACT_EVENTS_FILE,
+        _compact_event_rows_json(compact_rows),
+    )
+    _write_fresh_json(output_dir / _S4_MEMORY_FILE, memory_value)
+    _write_fresh_json(
+        output_dir / _S4_RUNNER_PROJECTIONS_FILE,
+        runner_projections,
+    )
+    artifact_index = _copy_compact_artifacts(
+        options=options,
+        output_dir=output_dir / "compact-artifacts",
+    )
+    _write_fresh_json(
+        output_dir / _S4_ARTIFACT_INDEX_FILE,
+        artifact_index,
+    )
+    _write_fresh_json(
+        output_dir / _S4_PROVIDER_IDENTITY_FILE,
+        _provider_identity_json(
+            options=options,
+            suite=suite,
+            session_id=session_id,
+            run_ids=run_ids,
+            captures=compactor_captures,
+        ),
+    )
+    analysis = analyze_and_publish_tool_trace(
+        workspace_root,
+        output_dir / "public-tool-trace",
+    )
+    equality = _public_canonical_equality_json(
+        compact_rows=compact_rows,
+        responses=analysis.report.compactor_responses,
+    )
+    _write_fresh_json(
+        output_dir / "public-canonical-equality.json",
+        equality,
+    )
+    _write_fresh_json(
+        output_dir / "digest.json",
+        _evidence_digest_json(output_dir),
+    )
+    print(f"{_STDOUT_PREFIX_EVIDENCE_OUTPUT} {output_dir}", flush=True)
+
+
+def _handle_s4_evidence_export_error(
+    *,
+    export_error: Exception,
+    active_exception: BaseException | None,
+) -> None:
+    """保持业务异常优先，仅在无业务异常时抛出 evidence 导出错误。
+
+    :param export_error: ``finally`` 中 evidence 导出产生的异常。
+    :param active_exception: 进入 ``finally`` 时仍在传播的原业务异常；正常
+        路径为 ``None``。
+    :returns: ``None``。
+    :raises Exception: 无原业务异常时原样抛出 ``export_error``。
+    """
+
+    if active_exception is None:
+        raise export_error
+    print(
+        "SMOKE EVIDENCE_EXPORT_FAILED "
+        f"{type(export_error).__name__}: {export_error}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _memory_evidence_json(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    policy: MemoryProjectionPolicy,
+) -> JsonValue:
+    """读取同一 policy 下最新 typed Memory snapshot。
+
+    :param transaction: caller-owned read transaction。
+    :param session_id: 目标 Session id。
+    :param policy: 本次 Host 的 Memory policy。
+    :returns: 带 policy digest 的 snapshot JSON；尚无 snapshot 时 body 为
+        ``None``。
+    :raises Exception: durable owner 校验失败时透传。
+    """
+
+    policy_digest = digest_memory_projection_policy(policy)
+    row = read_latest_memory_snapshot(
+        transaction,
+        session_id=session_id,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy_digest=policy_digest,
+    )
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "session_id": session_id,
+        "policy_digest": policy_digest,
+        "snapshot": (
+            None
+            if row is None
+            else conversation_memory_snapshot_to_json_value(row.snapshot)
+        ),
+    }
+
+
+def _runner_projection_evidence_json(
+    transaction: HostTransaction,
+    *,
+    run_ids: tuple[str, ...],
+) -> JsonValue:
+    """经 public Tool Trace resolver 导出本次 RunInput/manifest projection。
+
+    :param transaction: caller-owned read transaction。
+    :param run_ids: 本次 invocation 的 Host Run ids。
+    :returns: 每个 Run 的完整 public resolved projection 列表。
+    :raises Exception: public resolver 发现 durable mismatch 时透传。
+    """
+
+    records: list[JsonValue] = []
+    for run_id in run_ids:
+        records.extend(
+            _resolved_runner_projections_for_run(
+                transaction,
+                run_id=run_id,
+            )
+        )
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "run_ids": list(run_ids),
+        "records": records,
+    }
+
+
+def _resolved_runner_projections_for_run(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+) -> tuple[JsonValue, ...]:
+    """完整 exhaustion 一个 Run 的 public runner-call signals。
+
+    :param transaction: caller-owned read transaction。
+    :param run_id: 目标 Host Run id。
+    :returns: 稳定顺序的 public resolved projections。
+    :raises RuntimeError: keyset cursor 不推进时抛出。
+    :raises Exception: Tool Trace owner 读取或解析失败时透传。
+    """
+
+    cursor = 0
+    projections: list[JsonValue] = []
+    while True:
+        page = read_runner_call_reconstruction_signals_by_run(
+            transaction,
+            run_id,
+            cursor,
+            _RUNNER_CALL_EVIDENCE_PAGE_SIZE,
+        )
+        for signal in page.signals:
+            projections.append(
+                _resolved_runner_projection_json(
+                    resolve_runner_call_projection_from_signal(
+                        transaction,
+                        signal,
+                    )
+                )
+            )
+        if not page.has_more:
+            break
+        if page.next_event_sequence <= cursor:
+            raise RuntimeError("runner-call Tool Trace cursor did not advance")
+        cursor = page.next_event_sequence
+    return tuple(projections)
+
+
+def _resolved_runner_projection_json(
+    projection: RunnerCallResolvedProjection,
+) -> JsonValue:
+    """序列化 public Tool Trace resolved projection，不读取私有 state。
+
+    :param projection: public resolver 已校验的 projection。
+    :returns: manifest、LLM-facing RunInput 与 response identity JSON。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    response = projection.compactor_response_identity
+    return {
+        "signal": {
+            "event_id": projection.signal.event_id,
+            "event_sequence": projection.signal.event_sequence,
+            "session_id": projection.signal.session_id,
+            "run_id": projection.signal.run_id,
+            "attempt_id": projection.signal.attempt_id,
+            "execution_id": projection.signal.execution_id,
+            "runner_call_index": projection.signal.runner_call_index,
+            "runner_call_kind": projection.signal.runner_call_kind,
+            "runner_call_trigger_reason": projection.signal.runner_call_trigger_reason,
+            "iteration_id": projection.signal.iteration_id,
+        },
+        "manifest": _resolved_payload_json(projection.manifest),
+        "runner_input_projection": _resolved_payload_json(
+            projection.runner_input_projection
+        ),
+        "compactor_response_identity": (
+            None
+            if response is None
+            else {
+                "disposition": response.disposition.value,
+                "terminal_event_id": response.terminal_event_id,
+                "terminal_event_sequence": response.terminal_event_sequence,
+                "compaction_operation_id": response.compaction_operation_id,
+                "compaction_attempt_number": response.compaction_attempt_number,
+                "proposal_manifest_ref": response.proposal_manifest_ref,
+                "proposal_manifest_digest": response.proposal_manifest_digest,
+                "successful_response_identity": _successful_response_identity_json(
+                    response.successful_response_identity
+                ),
+            }
+        ),
+    }
+
+
+def _resolved_payload_json(payload: ToolTraceResolvedJsonPayload) -> JsonValue:
+    """序列化 Tool Trace resolved payload descriptor 与 body。
+
+    ``ToolTraceResolvedJsonPayload`` 的字段在 public projection 上稳定；此处
+    使用显式属性访问，禁止 ``getattr`` fallback。
+
+    :param payload: public resolved payload instance。
+    :returns: descriptor metadata 与 JSON body。
+    :raises TypeError: 参数类型不符合 public payload contract 时抛出。
+    """
+
+    if not isinstance(payload, ToolTraceResolvedJsonPayload):
+        raise TypeError("payload must be ToolTraceResolvedJsonPayload")
+    return {
+        "payload_ref": payload.payload_ref,
+        "payload_digest": payload.payload_digest,
+        "payload_size_bytes": payload.payload_size_bytes,
+        "media_type": payload.media_type,
+        "payload": dict(payload.payload),
+    }
+
+
+def _compactor_capture_evidence_json(
+    captures: tuple[RealCompactorAttemptCapture, ...],
+) -> JsonValue:
+    """序列化真实 compactor typed request/transport/result captures。
+
+    :param captures: capture-only wrapper 观测列表。
+    :returns: 按真实调用顺序排列的 evidence JSON。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "capture_mode": "typed-request-mirror-then-real-runner",
+        "attempts": [
+            _compactor_capture_json(index, capture)
+            for index, capture in enumerate(captures, start=1)
+        ],
+    }
+
+
+def _compactor_capture_json(
+    index: int,
+    capture: RealCompactorAttemptCapture,
+) -> JsonValue:
+    """序列化单次真实 compactor capture。
+
+    :param index: invocation 内 1-based 调用序号。
+    :param capture: 单次 typed capture。
+    :returns: 不含 credential/header 的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    request = capture.request
+    return {
+        "index": index,
+        "engine_run_id": request.run_id,
+        "session_id": request.session_id,
+        "provider": request.runner_spec.provider,
+        "model": request.runner_spec.model,
+        "structured_output_capability": (
+            request.runner_spec.structured_output_capability.value
+        ),
+        "structured_output_request": _structured_output_request_name(
+            request
+        ),
+        "outbound_response_format_type": capture.response_format_type,
+        "runner_options": {
+            "temperature": request.runner_options.temperature,
+            "max_tokens": request.runner_options.max_tokens,
+            "top_p": request.runner_options.top_p,
+            "stream": request.runner_options.stream,
+        },
+        "messages": [
+            {"role": message.role.value, "content": message.content}
+            for message in request.messages
+        ],
+        "outcome_kind": capture.outcome_kind,
+        "output_content": capture.output_content,
+        "output_empty": capture.output_content == "",
+        "error_type": capture.error_type,
+    }
+
+
+def _structured_output_request_name(request: AgentRunRequest) -> str | None:
+    """返回 typed structured-output request variant 名称。
+
+    :param request: 实际 compactor request。
+    :returns: ``json_object``、``json_schema`` 或 ``None``。
+    :raises AssertionError: union 出现未知成员时抛出。
+    """
+
+    structured_output = request.structured_output
+    if structured_output is None:
+        return None
+    if isinstance(structured_output, JsonObjectStructuredOutputRequest):
+        return "json_object"
+    if isinstance(structured_output, JsonSchemaStructuredOutputRequest):
+        return "json_schema"
+    raise AssertionError("unsupported structured output request member")
+
+
+def _compact_event_rows_json(rows: tuple[EventLogRow, ...]) -> JsonValue:
+    """序列化 canonical compact EventLog rows。
+
+    :param rows: 本次 Session 的 compact canonical rows。
+    :returns: 保留 event identity 与 canonical payload 的 JSON object。
+    :raises ValueError: payload 不是 JSON object 时抛出。
+    """
+
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "rows": [
+            {
+                "event_id": row.event_id,
+                "event_sequence": row.event_sequence,
+                "event_class": row.event_class,
+                "event_type": row.event_type,
+                "session_id": row.session_id,
+                "run_id": row.run_id,
+                "attempt_id": row.attempt_id,
+                "execution_id": row.execution_id,
+                "occurred_at": row.occurred_at,
+                "payload": dict(_compact_row_payload(row)),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _copy_compact_artifacts(
+    *,
+    options: OpenHostOptions,
+    output_dir: pathlib.Path,
+) -> JsonValue:
+    """复制本 workspace 的真实 compact artifacts 并记录 digest。
+
+    :param options: 本次 Host opener options。
+    :param output_dir: evidence 内 artifact 副本目录。
+    :returns: artifact source/copy path、size 与 SHA-256 index。
+    :raises OSError: copy 或读取失败时抛出。
+    """
+
+    root = _compact_artifact_root(options)
+    entries: list[JsonValue] = []
+    if root is None:
+        return {"schema_version": _S4_EVIDENCE_SCHEMA_VERSION, "artifacts": entries}
+    files = _compact_artifact_files(options)
+    if files:
+        output_dir.mkdir(parents=True, exist_ok=False)
+    for source in files:
+        relative = source.relative_to(root)
+        destination = output_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        data = destination.read_bytes()
+        entries.append(
+            {
+                "source_path": str(source),
+                "evidence_path": str(destination),
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    return {"schema_version": _S4_EVIDENCE_SCHEMA_VERSION, "artifacts": entries}
+
+
+def _provider_identity_json(
+    *,
+    options: OpenHostOptions,
+    suite: SuiteMode,
+    session_id: str,
+    run_ids: tuple[str, ...],
+    captures: tuple[RealCompactorAttemptCapture, ...],
+) -> JsonValue:
+    """记录本仓库实际装配的 ordinary/compactor provider identity。
+
+    :param options: 实际 Host opener options。
+    :param suite: 本次 suite。
+    :param session_id: public Session id。
+    :param run_ids: public Host Run ids。
+    :param captures: 真实 compactor captures。
+    :returns: 不含 headers 与 credential value 的 identity JSON。
+    :raises RuntimeError: evidence suite 缺 compactor baseline 时抛出。
+    """
+
+    baseline = options.compactor_runner_baseline
+    if baseline is None:
+        raise RuntimeError("S4 evidence requires compactor runner baseline")
+    ordinary = options.ordinary_run_baseline.runner_spec
+    compactor = baseline.compactor_runner_spec
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "suite": suite.value,
+        "session_id": session_id,
+        "run_ids": list(run_ids),
+        "ordinary": {
+            "provider": ordinary.provider,
+            "model": ordinary.model,
+            "endpoint": ordinary.endpoint,
+            "structured_output_capability": ordinary.structured_output_capability.value,
+            "credential_source_name": ordinary.api_key_ref,
+        },
+        "compactor": {
+            "provider": compactor.provider,
+            "model": compactor.model,
+            "endpoint": compactor.endpoint,
+            "structured_output_capability": compactor.structured_output_capability.value,
+            "credential_source_name": compactor.api_key_ref,
+            "observed_response_format_types": [
+                item.response_format_type for item in captures
+            ],
+            "observed_outcome_kinds": [item.outcome_kind for item in captures],
+        },
+    }
+
+
+def _public_canonical_equality_json(
+    *,
+    compact_rows: tuple[EventLogRow, ...],
+    responses: Sequence[ToolTraceCompactorResponseSummary],
+) -> JsonValue:
+    """比较 public analysis response summaries 与 canonical terminal binding。
+
+    :param compact_rows: canonical compact EventLog rows。
+    :param responses: public Tool Trace analysis ``compactor_responses``。
+    :returns: 每个 public response 的 exact equality 与总 finding 数。
+    :raises TypeError: response 不是 public typed summary 时抛出。
+    :raises ValueError: canonical payload 损坏时由 parser 抛出。
+    """
+
+    terminal_rows = {
+        row.event_id: row
+        for row in compact_rows
+        if row.event_type in (
+            CONTEXT_COMPACTED,
+            CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        )
+    }
+    comparisons: list[JsonValue] = []
+    for response_value in responses:
+        if not isinstance(response_value, ToolTraceCompactorResponseSummary):
+            raise TypeError("response must be ToolTraceCompactorResponseSummary")
+        response = response_value
+        row = terminal_rows.get(response.terminal_event_id)
+        if row is None:
+            comparisons.append(
+                {
+                    "terminal_event_id": response.terminal_event_id,
+                    "equal": False,
+                    "reason": "canonical-terminal-missing",
+                }
+            )
+            continue
+        payload = _compact_row_payload(row)
+        binding = (
+            parse_context_compacted_terminal_binding(payload)
+            if row.event_type == CONTEXT_COMPACTED
+            else parse_context_compaction_attempt_rejected_terminal_binding(payload)
+        )
+        equal = (
+            response.terminal_event_sequence == row.event_sequence
+            and response.compaction_operation_id == binding.operation_id
+            and response.compaction_attempt_number == binding.attempt_number
+            and response.proposal_manifest_ref == binding.proposal_manifest_ref
+            and response.proposal_manifest_digest == binding.proposal_manifest_digest
+            and _response_summary_identity_equal(
+                response,
+                binding.successful_response_identity,
+            )
+        )
+        comparisons.append(
+            {
+                "terminal_event_id": response.terminal_event_id,
+                "disposition": response.disposition.value,
+                "equal": equal,
+                "reason": None if equal else "public-canonical-binding-mismatch",
+            }
+        )
+    finding_count = sum(
+        1
+        for comparison in comparisons
+        if isinstance(comparison, Mapping) and comparison.get("equal") is not True
+    )
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "public_response_count": len(responses),
+        "canonical_terminal_count": len(terminal_rows),
+        "finding_count": finding_count,
+        "comparisons": comparisons,
+    }
+
+
+def _response_summary_identity_equal(
+    response: ToolTraceCompactorResponseSummary,
+    identity: SuccessfulRunnerResponseIdentity | None,
+) -> bool:
+    """比较 public analysis 展平字段与 canonical typed response identity。
+
+    :param response: public Tool Trace response summary。
+    :param identity: canonical terminal typed identity。
+    :returns: nullable identity 所有字段是否同源相等。
+    :raises TypeError: response 类型非法时抛出。
+    """
+
+    if not isinstance(response, ToolTraceCompactorResponseSummary):
+        raise TypeError("response must be ToolTraceCompactorResponseSummary")
+    if identity is None:
+        return (
+            response.effective_provider is None
+            and response.effective_model is None
+            and response.runner_request_identity is None
+            and response.provider_request_id_availability is None
+            and response.provider_request_id is None
+        )
+    return (
+        response.effective_provider == identity.effective_provider
+        and response.effective_model == identity.effective_model
+        and response.runner_request_identity == identity.runner_request_identity
+        and response.provider_request_id_availability
+        == identity.provider_request_id_availability
+        and response.provider_request_id == identity.provider_request_id
+    )
+
+
+def _successful_response_identity_json(
+    identity: SuccessfulRunnerResponseIdentity | None,
+) -> JsonValue:
+    """序列化 typed successful response identity。
+
+    :param identity: 可选真实成功 response identity。
+    :returns: 完整 identity JSON；不存在时为 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if identity is None:
+        return None
+    request = identity.runner_request_identity
+    return {
+        "effective_provider": identity.effective_provider,
+        "effective_model": identity.effective_model,
+        "provider_request_id_availability": (
+            identity.provider_request_id_availability.value
+        ),
+        "provider_request_id": identity.provider_request_id,
+        "runner_request_identity": {
+            "run_id": request.run_id,
+            "attempt_id": request.attempt_id,
+            "execution_id": request.execution_id,
+            "iteration_id": request.iteration_id,
+            "iteration_index": request.iteration_index,
+            "runner_call_index": request.runner_call_index,
+            "client_correlation_id": request.client_correlation_id,
+        },
+    }
+
+
+def _write_fresh_json(path: pathlib.Path, value: JsonValue) -> None:
+    """以 UTF-8 写入新的 evidence JSON，禁止覆盖。
+
+    :param path: 必须尚不存在的输出文件。
+    :param value: 强类型 JSON 值。
+    :returns: ``None``。
+    :raises FileExistsError: 目标已存在时抛出。
+    :raises OSError: 目录创建或文件写入失败时抛出。
+    """
+
+    if path.exists():
+        raise FileExistsError(f"evidence file already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _evidence_digest_json(output_dir: pathlib.Path) -> JsonValue:
+    """计算 invocation evidence 的稳定文件 digest index。
+
+    :param output_dir: 已写入 evidence 文件的目录。
+    :returns: 排除 ``digest.json`` 自身的 path/size/SHA-256 列表。
+    :raises OSError: 文件读取失败时抛出。
+    """
+
+    digest_path = output_dir / "digest.json"
+    files = tuple(
+        path
+        for path in sorted(output_dir.rglob("*"))
+        if path.is_file() and path != digest_path
+    )
+    return {
+        "schema_version": _S4_EVIDENCE_SCHEMA_VERSION,
+        "file_count": len(files),
+        "files": [
+            {
+                "path": str(path.relative_to(output_dir)),
+                "size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in files
+        ],
+    }
 
 
 def _format_provider_report(

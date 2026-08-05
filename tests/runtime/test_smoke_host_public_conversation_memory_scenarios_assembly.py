@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
+import sys
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -30,8 +33,15 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    CompactorProposalManifestReference,
+    build_context_compaction_attempt_rejected_payload,
 )
+from dayu.host.context_budget import estimate_budget_text_tokens
 from dayu.host.durable.event_log import EventClass, EventLogRow
+from dayu.host.durable.tool_trace import CompactorResponseDisposition
+from dayu.host.tool_trace_analysis_contracts import (
+    ToolTraceCompactorResponseSummary,
+)
 from dayu.runtime.log import LogLevel
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
@@ -69,10 +79,13 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _compact_audit_report_from_rows,
     _compact_audit_summary_from_rows,
     _compact_pressure_padding,
+    _compact_pressure_reserve_tokens,
     _deterministic_dropped_old_marker,
-    _estimate_chars_as_tokens,
+    _evidence_digest_json,
+    _export_s4_invocation_evidence,
     _fake_compaction_proposal_from_material_json,
     _fallback_compact_pressure_padding,
+    _handle_s4_evidence_export_error,
     _print_compact_audit_report,
     DeterministicDispatchCapture,
     DeterministicSmokeObservation,
@@ -80,10 +93,16 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _mock_pressure_blob,
     _prepare_runtime_assembly,
     _print_compact_pressure_plan,
+    _real_compact_pressure_padding,
+    _public_canonical_equality_json,
+    _S4_CURRENT_FACT_MARKER,
+    _S4_OLD_FACT_MARKER,
+    _S4_RECONNECT_MARKER,
     _runtime_user_pressure_text,
     _select_long_templates,
     _threshold_tokens,
     _tool_pressure_estimated_tokens,
+    _write_fresh_json,
     assert_answer_contains,
     calls_by_key_summary,
     discover_smoke_tools,
@@ -99,6 +118,17 @@ _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
 _TOOL_NAME = "get_mock_finance_memory_fact"
 _TOOL_TAG = "manual-smoke"
+_REAL_PRESSURE_SUITE_NAMES = (
+    "memory-real-baseline",
+    "memory-real-boundary",
+    "memory-real-replacement",
+    "memory-real-repair",
+    "memory-real-fallback",
+)
+_REAL_PROVIDER_SUITE_NAMES = (
+    *_REAL_PRESSURE_SUITE_NAMES,
+    "memory-reconnect-probe",
+)
 
 
 def _runtime_assembly_env() -> dict[str, str]:
@@ -210,6 +240,33 @@ def test_reactive_runtime_assembly_bounds_selected_recent_window(
     assert policy.fallback_selected_recent_window_item_cap <= policy.selected_recent_window_item_cap
 
 
+def test_real_repair_runtime_assembly_applies_owner_caps(
+    tmp_path: pathlib.Path,
+) -> None:
+    """real repair suite 只在 harness options 边界收紧 Memory owner caps。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    """
+
+    assembly = _prepare_runtime_assembly(
+        _args(
+            tmp_path,
+            suite=SuiteMode.MEMORY_REAL_REPAIR,
+            pressure_mode=PressureMode.AUTO,
+        ),
+        env=_runtime_assembly_env(),
+    )
+    policy = assembly.options.memory_projection_policy
+
+    assert policy.policy_ref == "s4-real-bounded-repair"
+    assert policy.evidence_fact_item_cap == 1
+    assert policy.evidence_fact_char_cap == 30
+    assert policy.answer_anchor_char_cap == 30
+    assert policy.forward_intent_char_cap == 30
+    assert policy.reference_continuity_char_cap == 30
+
+
 def test_runtime_assembly_fails_closed_on_non_smoke_same_name_tool(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -238,6 +295,7 @@ def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
     default_args = parse_args(("--workspace-root", str(tmp_path)))
     assert default_args.suite is SuiteMode.MEMORY_CORE
     assert default_args.pressure_mode is PressureMode.OFF
+    assert default_args.evidence_output_dir is None
 
     for suite in ("memory-core", "memory-reactive-compact"):
         args = parse_args(
@@ -284,12 +342,267 @@ def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
     with pytest.raises(SystemExit):
         parse_args(("--workspace-root", str(tmp_path), "--suite", "memory-compact-fallback"))
 
+    evidence_dir = tmp_path / "real-provider-evidence"
+    for suite in _REAL_PRESSURE_SUITE_NAMES:
+        args = parse_args(
+            (
+                "--workspace-root",
+                str(tmp_path),
+                "--suite",
+                suite,
+                "--pressure-mode",
+                "auto",
+                "--evidence-output-dir",
+                str(evidence_dir),
+            )
+        )
+        assert args.suite is SuiteMode(suite)
+        assert args.evidence_output_dir == evidence_dir.resolve()
+
+    reconnect_args = parse_args(
+        (
+            "--workspace-root",
+            str(tmp_path),
+            "--suite",
+            "memory-reconnect-probe",
+            "--evidence-output-dir",
+            str(evidence_dir),
+        )
+    )
+    assert reconnect_args.suite is SuiteMode.MEMORY_RECONNECT_PROBE
+
+    for suite in ("memory-reactive-compact", "memory-compact-fallback"):
+        argv = [
+            "--workspace-root",
+            str(tmp_path),
+            "--suite",
+            suite,
+            "--evidence-output-dir",
+            str(evidence_dir),
+        ]
+        if suite == "memory-compact-fallback":
+            argv.extend(("--pressure-mode", "auto"))
+        with pytest.raises(SystemExit):
+            parse_args(tuple(argv))
+
     for value in ("20", "25"):
         assert parse_args(("--workspace-root", str(tmp_path), "--long-rounds", value)).long_rounds == int(value)
 
     for value in ("19", "26", "0", "-1"):
         with pytest.raises(SystemExit):
             parse_args(("--workspace-root", str(tmp_path), "--long-rounds", value))
+
+
+@pytest.mark.parametrize("suite", _REAL_PRESSURE_SUITE_NAMES)
+def test_real_provider_cli_requires_pressure_mode_independently(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    suite: str,
+) -> None:
+    """real pressure suite 即使已有 evidence dir，也必须显式启用 auto。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param capsys: pytest 标准错误捕获器。
+    :param suite: 需要 pressure mode 的真实 provider suite 名称。
+    :returns: ``None``。
+    :raises AssertionError: parser 未从 pressure-mode owner 分支 fail closed 时抛出。
+    """
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            (
+                "--workspace-root",
+                str(tmp_path),
+                "--suite",
+                suite,
+                "--evidence-output-dir",
+                str(tmp_path / "evidence"),
+            )
+        )
+
+    assert f"--suite {suite} requires --pressure-mode auto" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("suite", _REAL_PROVIDER_SUITE_NAMES)
+def test_real_provider_cli_requires_evidence_output_dir_independently(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    suite: str,
+) -> None:
+    """real provider suite 满足其它约束后仍必须提供 fresh evidence dir。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param capsys: pytest 标准错误捕获器。
+    :param suite: 真实 provider suite 名称。
+    :returns: ``None``。
+    :raises AssertionError: parser 未从 evidence-dir owner 分支 fail closed 时抛出。
+    """
+
+    argv = ["--workspace-root", str(tmp_path), "--suite", suite]
+    if suite != "memory-reconnect-probe":
+        argv.extend(("--pressure-mode", "auto"))
+
+    with pytest.raises(SystemExit):
+        parse_args(tuple(argv))
+
+    assert (
+        f"--suite {suite} requires --evidence-output-dir"
+        in capsys.readouterr().err
+    )
+
+
+def test_s4_evidence_fresh_file_and_directory_are_not_overwritten(
+    tmp_path: pathlib.Path,
+) -> None:
+    """evidence 文件与 invocation 目录均由 fresh-write owner 禁止覆盖。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 既有文件或目录被 evidence owner 覆盖时抛出。
+    """
+
+    evidence_file = tmp_path / "single" / "evidence.json"
+    _write_fresh_json(evidence_file, {"version": "first"})
+    original_bytes = evidence_file.read_bytes()
+
+    with pytest.raises(FileExistsError, match="evidence file already exists"):
+        _write_fresh_json(evidence_file, {"version": "second"})
+    assert evidence_file.read_bytes() == original_bytes
+
+    evidence_dir = tmp_path / "invocation"
+    evidence_dir.mkdir()
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path),
+        env=_runtime_assembly_env(),
+    )
+    with pytest.raises(FileExistsError, match="evidence output directory already exists"):
+        _export_s4_invocation_evidence(
+            output_dir=evidence_dir,
+            workspace_root=tmp_path,
+            options=assembly.options,
+            session_id="session-existing-evidence",
+            run_ids=(),
+            suite=SuiteMode.MEMORY_REAL_BASELINE,
+            compactor_captures=(),
+        )
+    assert tuple(evidence_dir.iterdir()) == ()
+
+
+def test_s4_evidence_digest_excludes_itself_and_hashes_file_contents(
+    tmp_path: pathlib.Path,
+) -> None:
+    """digest owner 排除自身，并按实际 bytes 记录 size 与 SHA-256。
+
+    :param tmp_path: pytest 临时 evidence root。
+    :returns: ``None``。
+    :raises AssertionError: digest 索引包含自身或内容校验不一致时抛出。
+    """
+
+    output_dir = tmp_path / "evidence"
+    nested_dir = output_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    first_content = b"alpha\n"
+    second_content = b"beta\x00gamma"
+    (output_dir / "first.txt").write_bytes(first_content)
+    (nested_dir / "second.bin").write_bytes(second_content)
+    (output_dir / "digest.json").write_text("stale-self", encoding="utf-8")
+
+    digest_value = _evidence_digest_json(output_dir)
+
+    assert isinstance(digest_value, Mapping)
+    assert digest_value["file_count"] == 2
+    files_value = digest_value["files"]
+    assert isinstance(files_value, list)
+    indexed: dict[str, Mapping[str, JsonValue]] = {}
+    for item in files_value:
+        assert isinstance(item, Mapping)
+        path_value = item["path"]
+        assert isinstance(path_value, str)
+        indexed[path_value] = item
+    assert set(indexed) == {"first.txt", "nested/second.bin"}
+    assert indexed["first.txt"]["size_bytes"] == len(first_content)
+    assert indexed["first.txt"]["sha256"] == hashlib.sha256(first_content).hexdigest()
+    assert indexed["nested/second.bin"]["size_bytes"] == len(second_content)
+    assert indexed["nested/second.bin"]["sha256"] == hashlib.sha256(
+        second_content
+    ).hexdigest()
+
+
+def test_s4_public_canonical_equality_reports_equal_and_mismatch() -> None:
+    """public/canonical owner 对同源 binding 通过，对字段漂移报告 mismatch。
+
+    :returns: ``None``。
+    :raises AssertionError: exact equality 或 mismatch finding contract 错误时抛出。
+    """
+
+    row, response = _s4_rejected_terminal_fixture()
+
+    equal_value = _public_canonical_equality_json(
+        compact_rows=(row,),
+        responses=(response,),
+    )
+    assert isinstance(equal_value, Mapping)
+    assert equal_value["finding_count"] == 0
+    equal_comparisons = equal_value["comparisons"]
+    assert isinstance(equal_comparisons, list)
+    assert len(equal_comparisons) == 1
+    equal_comparison = equal_comparisons[0]
+    assert isinstance(equal_comparison, Mapping)
+    assert equal_comparison["equal"] is True
+    assert equal_comparison["reason"] is None
+
+    mismatch_value = _public_canonical_equality_json(
+        compact_rows=(row,),
+        responses=(
+            replace(
+                response,
+                proposal_manifest_digest="sha256:" + "b" * 64,
+            ),
+        ),
+    )
+    assert isinstance(mismatch_value, Mapping)
+    assert mismatch_value["finding_count"] == 1
+    mismatch_comparisons = mismatch_value["comparisons"]
+    assert isinstance(mismatch_comparisons, list)
+    assert len(mismatch_comparisons) == 1
+    mismatch_comparison = mismatch_comparisons[0]
+    assert isinstance(mismatch_comparison, Mapping)
+    assert mismatch_comparison["equal"] is False
+    assert mismatch_comparison["reason"] == "public-canonical-binding-mismatch"
+
+
+def test_s4_failure_export_does_not_mask_active_business_exception(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """failure finally 中的 export 错误不得替换正在传播的业务异常。
+
+    :param capsys: pytest 标准错误捕获器。
+    :returns: ``None``。
+    :raises AssertionError: 业务异常 identity 被 export error 遮蔽时抛出。
+    """
+
+    business_error = RuntimeError("business failure")
+    export_error = OSError("evidence write failed")
+    with pytest.raises(RuntimeError) as raised:
+        try:
+            raise business_error
+        finally:
+            _handle_s4_evidence_export_error(
+                export_error=export_error,
+                active_exception=sys.exception(),
+            )
+
+    assert raised.value is business_error
+    assert (
+        "SMOKE EVIDENCE_EXPORT_FAILED OSError: evidence write failed"
+        in capsys.readouterr().err
+    )
+    with pytest.raises(OSError) as export_raised:
+        _handle_s4_evidence_export_error(
+            export_error=export_error,
+            active_exception=None,
+        )
+    assert export_raised.value is export_error
 
 
 def test_pure_spec_selection_tool_fact_requirements_and_long20_final_label(
@@ -306,6 +619,21 @@ def test_pure_spec_selection_tool_fact_requirements_and_long20_final_label(
     reactive_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_REACTIVE_COMPACT))
     fallback_specs = select_round_specs(
         _args(tmp_path, suite=SuiteMode.MEMORY_COMPACT_FALLBACK, pressure_mode=PressureMode.AUTO)
+    )
+    real_baseline_specs = select_round_specs(
+        _args(tmp_path, suite=SuiteMode.MEMORY_REAL_BASELINE, pressure_mode=PressureMode.AUTO)
+    )
+    real_replacement_specs = select_round_specs(
+        _args(tmp_path, suite=SuiteMode.MEMORY_REAL_REPLACEMENT, pressure_mode=PressureMode.AUTO)
+    )
+    real_boundary_specs = select_round_specs(
+        _args(tmp_path, suite=SuiteMode.MEMORY_REAL_BOUNDARY, pressure_mode=PressureMode.AUTO)
+    )
+    reconnect_specs = select_round_specs(
+        _args(tmp_path, suite=SuiteMode.MEMORY_RECONNECT_PROBE)
+    )
+    repair_specs = select_round_specs(
+        _args(tmp_path, suite=SuiteMode.MEMORY_REAL_REPAIR, pressure_mode=PressureMode.AUTO)
     )
     compact20_specs = select_round_specs(
         _args(
@@ -348,6 +676,29 @@ def test_pure_spec_selection_tool_fact_requirements_and_long20_final_label(
         "fallback-f6-selected-recent",
         "fallback-f7-pressure-target",
     )
+    real_baseline_by_label = {spec.label: spec for spec in real_baseline_specs}
+    assert real_baseline_by_label["s4-baseline-fact"].tool_names == frozenset(
+        (_TOOL_NAME,)
+    )
+    assert all(
+        not spec.tool_names
+        for spec in real_baseline_specs
+        if spec.label != "s4-baseline-fact"
+    )
+    assert tuple(spec.label for spec in real_boundary_specs) == (
+        "s4-real-boundary-retry",
+    )
+    assert _S4_OLD_FACT_MARKER in "\n".join(
+        spec.prompt for spec in real_baseline_specs
+    )
+    replacement_prompt = "\n".join(spec.prompt for spec in real_replacement_specs)
+    assert _S4_OLD_FACT_MARKER in replacement_prompt
+    assert _S4_CURRENT_FACT_MARKER in replacement_prompt
+    assert "session_summary 应为 JSON null" in replacement_prompt
+    assert len(reconnect_specs) == 1
+    assert _S4_RECONNECT_MARKER in reconnect_specs[0].prompt
+    assert len(repair_specs) == 5
+    assert repair_specs[-1].label == "s4-real-bounded-repair"
 
 
 def test_core_b1_tool_round_prompt_does_not_leak_cashflow_answer_values(
@@ -441,7 +792,9 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     print("SMOKE PRESSURE disabled")
     assert "SMOKE PRESSURE disabled" in capsys.readouterr().out
 
-    prompt_tokens = _estimate_chars_as_tokens(len(_compact_pressure_padding(assembly.options)))
+    prompt_tokens = estimate_budget_text_tokens(
+        _compact_pressure_padding(assembly.options)
+    )
     pressure_tokens = (
         prompt_tokens
         + _tool_pressure_estimated_tokens()
@@ -472,8 +825,15 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     assert f"estimated_effective_pressure_tokens={pressure_tokens}" in compact_output
     assert f"estimated_total_pressure_tokens={pressure_tokens}" in compact_output
 
-    fallback_prompt_tokens = _estimate_chars_as_tokens(
-        len(_fallback_compact_pressure_padding(assembly.options))
+    real_prompt_tokens = estimate_budget_text_tokens(
+        _real_compact_pressure_padding(assembly.options)
+    )
+    assert _compact_pressure_reserve_tokens(SuiteMode.MEMORY_REAL_BASELINE) == 0
+    assert real_prompt_tokens >= soft_threshold_tokens
+    assert real_prompt_tokens < hard_threshold_tokens
+
+    fallback_prompt_tokens = estimate_budget_text_tokens(
+        _fallback_compact_pressure_padding(assembly.options)
     )
     fallback_effective_tokens = (
         fallback_prompt_tokens
@@ -1214,6 +1574,69 @@ def _event_row(
     )
 
 
+def _s4_rejected_terminal_fixture(
+) -> tuple[EventLogRow, ToolTraceCompactorResponseSummary]:
+    """经 canonical event owner 构造 public/canonical equality 测试事实。
+
+    :returns: 同源 rejected terminal row 与 public typed response summary。
+    :raises ValueError: canonical manifest 或 rejected payload 不满足 owner contract
+        时抛出。
+    """
+
+    operation_id = "operation-s4-equality"
+    attempt_number = 1
+    terminal_event_id = "event-s4-attempt-rejected"
+    terminal_event_sequence = 21
+    manifest_ref = "payload-manifest-s4-equality"
+    manifest_digest = "sha256:" + "a" * 64
+    compactor_engine_run_id = "compactor-run-s4-equality"
+    manifest_reference = CompactorProposalManifestReference(
+        manifest_event_id="event-runner-call-s4-equality",
+        manifest_payload_ref=manifest_ref,
+        manifest_digest=manifest_digest,
+        compactor_input_projection_ref="payload-projection-s4-equality",
+        compactor_input_projection_digest="sha256:" + "c" * 64,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
+    payload = build_context_compaction_attempt_rejected_payload(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+        failure_category="cancellation_requested",
+        repairable=False,
+        runner_attempt_summary_refs=("runner-attempt-s4-equality",),
+        diagnostic_refs=("diagnostic-s4-equality",),
+        next_policy_decision="stop",
+        budget_after_attempted_compact=None,
+        successful_response_identity=None,
+        proposal_manifest_reference=manifest_reference,
+    )
+    row = _event_row(
+        sequence=terminal_event_sequence,
+        event_id=terminal_event_id,
+        event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        payload=payload,
+        run_id="parent-run-s4-equality",
+    )
+    response = ToolTraceCompactorResponseSummary(
+        parent_host_run_id="parent-run-s4-equality",
+        disposition=CompactorResponseDisposition.ATTEMPT_REJECTED,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        proposal_manifest_ref=manifest_ref,
+        proposal_manifest_digest=manifest_digest,
+        effective_provider=None,
+        effective_model=None,
+        runner_request_identity=None,
+        provider_request_id_availability=None,
+        provider_request_id=None,
+    )
+    return row, response
+
+
 def _raw_payload_event_row(
     *,
     sequence: int,
@@ -1286,6 +1709,7 @@ def _args(
         long_rounds=long_rounds,
         pressure_mode=pressure_mode,
         debug_smoke_output=False,
+        evidence_output_dir=None,
     )
 
 
