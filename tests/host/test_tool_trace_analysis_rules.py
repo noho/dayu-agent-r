@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,7 +27,10 @@ from dayu.host.durable.tool_trace import (
     ToolTraceResolvedJsonPayload,
     ToolTraceResolvedRowPayloads,
 )
-from dayu.host.tool_trace_analysis import render_tool_trace_analysis_markdown
+from dayu.host.tool_trace_analysis import (
+    render_tool_trace_analysis_markdown,
+    tool_trace_analysis_report_to_json,
+)
 from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceAnalysisLayer,
     ToolTraceAnalysisPolicy,
@@ -1556,3 +1561,110 @@ def test_compactor_response_summary_comes_only_from_typed_resolver_projection(
     successful = response.successful_response_identity
     assert successful is not None
     assert summary.runner_request_identity == successful.runner_request_identity
+
+
+def test_rejected_compactor_response_identity_projects_from_typed_owner_to_all_outputs(
+    tmp_path: Path,
+) -> None:
+    """post-success rejection 的实际 identity 同源进入 typed/JSON/Markdown。
+
+    邻近 event payload 刻意携带冲突的 config-like identity；analysis owner 只能
+    消费 resolver 的 ``successful_response_identity``，不得从邻近事实推断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: disposition、identity 同源或 renderer 投影漂移时抛出。
+    """
+
+    source = _workspace_source(tmp_path)
+    record = _record(
+        source,
+        sequence=1,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+    )
+    accepted_projection = _compactor_projection(record)
+    accepted_response = accepted_projection.compactor_response_identity
+    assert accepted_response is not None
+    successful = accepted_response.successful_response_identity
+    assert successful is not None
+    rejected_projection = replace(
+        accepted_projection,
+        compactor_response_identity=replace(
+            accepted_response,
+            disposition=CompactorResponseDisposition.ATTEMPT_REJECTED,
+            terminal_event_id="event-context-compaction-attempt-rejected-1",
+        ),
+    )
+    joined = _joined_record(
+        record,
+        source_event_payload={
+            "configured_provider": "provider-neighbor-poison",
+            "configured_model": "model-neighbor-poison",
+            "provider_request_id": "request-neighbor-poison",
+        },
+        runner_call_projection=rejected_projection,
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            (record,),
+            hot_store_available=True,
+            hot_rows=(_hot_row(record),),
+            joined_records=(joined,),
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+
+    assert len(report.compactor_responses) == 1
+    summary = report.compactor_responses[0]
+    assert summary.disposition is CompactorResponseDisposition.ATTEMPT_REJECTED
+    assert summary.effective_provider == successful.effective_provider
+    assert summary.effective_model == successful.effective_model
+    assert summary.runner_request_identity == successful.runner_request_identity
+    assert (
+        summary.provider_request_id_availability
+        is successful.provider_request_id_availability
+    )
+    assert summary.provider_request_id == successful.provider_request_id
+
+    serialized = json.loads(tool_trace_analysis_report_to_json(report))
+    projected = serialized["compactor_responses"][0]
+    assert projected["disposition"] == "attempt_rejected"
+    assert projected["effective_provider"] == successful.effective_provider
+    assert projected["effective_model"] == successful.effective_model
+    assert projected["runner_request_identity"] == {
+        "run_id": successful.runner_request_identity.run_id,
+        "attempt_id": successful.runner_request_identity.attempt_id,
+        "execution_id": successful.runner_request_identity.execution_id,
+        "iteration_id": successful.runner_request_identity.iteration_id,
+        "iteration_index": successful.runner_request_identity.iteration_index,
+        "runner_call_index": successful.runner_request_identity.runner_call_index,
+        "client_correlation_id": (
+            successful.runner_request_identity.client_correlation_id
+        ),
+    }
+    assert projected["provider_request_id_availability"] == (
+        successful.provider_request_id_availability.value
+    )
+    assert projected["provider_request_id"] == successful.provider_request_id
+
+    markdown = render_tool_trace_analysis_markdown(report)
+    for actual_value in (
+        successful.effective_provider,
+        successful.effective_model,
+        successful.runner_request_identity.run_id,
+        successful.runner_request_identity.iteration_id,
+        successful.provider_request_id_availability.value,
+        successful.provider_request_id,
+    ):
+        assert actual_value is not None
+        assert actual_value in markdown
+    rendered = tool_trace_analysis_report_to_json(report) + markdown
+    for poison in (
+        "provider-neighbor-poison",
+        "model-neighbor-poison",
+        "request-neighbor-poison",
+    ):
+        assert poison not in rendered

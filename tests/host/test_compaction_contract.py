@@ -47,6 +47,7 @@ from dayu.host.compaction import (
     validate_compact_represented_coverage_candidate_binding_v3,
 )
 from dayu.host.compact_structure import (
+    CompactStructureParseError,
     compact_output_json_schema_digest_v3,
     compact_output_json_schema_v3,
     compact_output_prompt_rules_v3,
@@ -151,6 +152,33 @@ def test_compact_structure_owner_projects_template_schema_rules_and_parser() -> 
         assert removed not in template
         assert removed not in schema_properties
         assert removed not in serialized_rules
+
+
+def test_compact_structure_parser_raises_typed_failure_with_owner_code_and_path() -> None:
+    """strict structure owner 直接产生稳定 issue code 与 JSON path。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 退化为仅含字符串语义的异常时抛出。
+    """
+
+    invalid = dict(compact_output_template_v3())
+    invalid["forward_intents"] = [
+        {
+            "intent_type": "next_step",
+            "text": "继续分析",
+            "status": "not-allowed",
+            "source_labels": ["S1"],
+        }
+    ]
+
+    with pytest.raises(CompactStructureParseError) as captured:
+        parse_compact_candidate_v3(json.dumps(invalid, ensure_ascii=False))
+
+    assert captured.value.code is CompactValidationIssueCodeV3.INVALID_ENUM_VALUE
+    assert captured.value.json_path == "$.forward_intents[0].status"
+    assert captured.value.message == (
+        "invalid_enum_value: $.forward_intents[0].status"
+    )
 
 
 def test_compact_structure_projections_are_fresh_and_digest_is_stable() -> None:

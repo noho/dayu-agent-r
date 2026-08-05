@@ -24,11 +24,53 @@ from dayu.host.compaction import (
     CompactForwardIntentV3,
     CompactReferenceContinuityV3,
     CompactSessionSummaryV3,
+    CompactValidationIssueCodeV3,
 )
 from dayu.host.durable.codec import sha256_digest_json
 
 COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3 = "dayu_context_compaction_output_v3"
 """Provider-neutral compact output v3 JSON Schema 名称。"""
+
+
+class CompactStructureParseError(ValueError):
+    """strict compact structure 的 typed parse failure。
+
+    :param code: structure owner 产生的稳定问题码。
+    :param json_path: 失败字段的自解释 JSON path。
+    :param message: 可经上层脱敏、截断后进入 repair report 的错误说明。
+    """
+
+    def __init__(
+        self,
+        *,
+        code: CompactValidationIssueCodeV3,
+        json_path: str,
+        message: str,
+    ) -> None:
+        """初始化 typed structure parse failure。
+
+        :param code: structure owner 产生的稳定问题码。
+        :param json_path: 以 ``$`` 开头的 JSON path。
+        :param message: 非空错误说明。
+        :returns: ``None``。
+        :raises TypeError: code、path 或 message 类型非法时抛出。
+        :raises ValueError: path 格式非法或 message 为空时抛出。
+        """
+
+        if not isinstance(code, CompactValidationIssueCodeV3):
+            raise TypeError("code must be CompactValidationIssueCodeV3")
+        if not isinstance(json_path, str):
+            raise TypeError("json_path must be str")
+        if not json_path.startswith("$"):
+            raise ValueError("json_path must start with $")
+        if not isinstance(message, str):
+            raise TypeError("message must be str")
+        if not message.strip():
+            raise ValueError("message must be non-empty")
+        self.code = code
+        self.json_path = json_path
+        self.message = message
+        super().__init__(message)
 
 
 class _FieldKind(StrEnum):
@@ -203,22 +245,35 @@ def parse_compact_candidate_v3(text: str) -> CompactCandidateV3:
     :param text: LLM 返回的完整 JSON object 文本。
     :returns: exact keys/types 均合法的 ``CompactCandidateV3``。
     :raises TypeError: ``text`` 不是字符串时抛出。
-    :raises ValueError: JSON、duplicate key、字段集合、类型或枚举非法时抛出。
+    :raises CompactStructureParseError: JSON、duplicate key、字段集合、类型或
+        枚举非法时抛出。
     """
 
     if not isinstance(text, str):
         raise TypeError("text must be str")
     raw = text.strip()
     if not raw:
-        raise ValueError("blank_required_text: candidate must be non-empty")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+            json_path="$",
+            message="blank_required_text: candidate must be non-empty",
+        )
     try:
         parsed: JsonValue = json.loads(raw, object_pairs_hook=_strict_object_pairs)
     except JSONDecodeError as exc:
-        raise ValueError(f"invalid_json: {exc.msg}") from exc
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.INVALID_JSON,
+            json_path="$",
+            message=f"invalid_json: {exc.msg}",
+        ) from exc
     root = _exact_object(parsed, _ROOT, path="$")
     schema = _required_text(root, "schema", path="$.schema")
     if schema != COMPACT_OUTPUT_SCHEMA_V3:
-        raise ValueError("invalid_enum_value: $.schema")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.INVALID_ENUM_VALUE,
+            json_path="$.schema",
+            message="invalid_enum_value: $.schema",
+        )
     return CompactCandidateV3(
         schema=COMPACT_OUTPUT_SCHEMA_V3,
         session_summary=_parse_summary(root["session_summary"]),
@@ -405,13 +460,17 @@ def _strict_object_pairs(
 
     :param pairs: JSON decoder 提供的原始 key/value pairs。
     :returns: 无重复 key 的 object。
-    :raises ValueError: 任一 key 重复时抛出。
+    :raises CompactStructureParseError: 任一 key 重复时抛出。
     """
 
     result: dict[str, JsonValue] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate_json_key: {key}")
+            raise CompactStructureParseError(
+                code=CompactValidationIssueCodeV3.DUPLICATE_JSON_KEY,
+                json_path="$",
+                message=f"duplicate_json_key: {key}",
+            )
         result[key] = value
     return result
 
@@ -428,19 +487,33 @@ def _exact_object(
     :param descriptor: 结构真源。
     :param path: 自解释 JSON path。
     :returns: 校验后的 mapping。
-    :raises ValueError: 类型、未知 key 或缺 key 时抛出。
+    :raises CompactStructureParseError: 类型、未知 key 或缺 key 时抛出。
     """
 
     if not isinstance(value, Mapping):
-        raise ValueError(f"invalid_field_type: {path}")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+            json_path=path,
+            message=f"invalid_field_type: {path}",
+        )
     expected = frozenset(field.name for field in descriptor.fields)
     actual = frozenset(value.keys())
     unknown = sorted(actual - expected)
     if unknown:
-        raise ValueError(f"unknown_json_key: {path}.{unknown[0]}")
+        unknown_path = f"{path}.{unknown[0]}"
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
+            json_path=unknown_path,
+            message=f"unknown_json_key: {unknown_path}",
+        )
     missing = sorted(expected - actual)
     if missing:
-        raise ValueError(f"missing_required_key: {path}.{missing[0]}")
+        missing_path = f"{path}.{missing[0]}"
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.MISSING_REQUIRED_KEY,
+            json_path=missing_path,
+            message=f"missing_required_key: {missing_path}",
+        )
     return value
 
 
@@ -456,14 +529,22 @@ def _required_text(
     :param key: 字段名。
     :param path: JSON path。
     :returns: 非空字符串。
-    :raises ValueError: 类型非法或文本为空时抛出。
+    :raises CompactStructureParseError: 类型非法或文本为空时抛出。
     """
 
     value = mapping[key]
     if not isinstance(value, str):
-        raise ValueError(f"invalid_field_type: {path}")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+            json_path=path,
+            message=f"invalid_field_type: {path}",
+        )
     if not value.strip():
-        raise ValueError(f"blank_required_text: {path}")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+            json_path=path,
+            message=f"blank_required_text: {path}",
+        )
     return value
 
 
@@ -479,12 +560,16 @@ def _required_array(
     :param key: 字段名。
     :param path: JSON path。
     :returns: JSON value list。
-    :raises ValueError: 字段不是 array 时抛出。
+    :raises CompactStructureParseError: 字段不是 array 时抛出。
     """
 
     value = mapping[key]
     if not isinstance(value, list):
-        raise ValueError(f"invalid_field_type: {path}")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+            json_path=path,
+            message=f"invalid_field_type: {path}",
+        )
     return value
 
 
@@ -502,21 +587,38 @@ def _required_text_tuple(
     :param path: JSON path。
     :param allow_empty: 是否允许空 array。
     :returns: 唯一字符串 tuple。
-    :raises ValueError: array、item 或唯一性不合法时抛出。
+    :raises CompactStructureParseError: array、item 或唯一性不合法时抛出。
     """
 
     values = _required_array(mapping, key, path=path)
     result: list[str] = []
     for index, item in enumerate(values):
+        item_path = f"{path}[{index}]"
         if not isinstance(item, str):
-            raise ValueError(f"invalid_field_type: {path}[{index}]")
+            raise CompactStructureParseError(
+                code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+                json_path=item_path,
+                message=f"invalid_field_type: {item_path}",
+            )
         if not item.strip():
-            raise ValueError(f"blank_required_text: {path}[{index}]")
+            raise CompactStructureParseError(
+                code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+                json_path=item_path,
+                message=f"blank_required_text: {item_path}",
+            )
         if item in result:
-            raise ValueError(f"duplicate_source_label: {path}[{index}]")
+            raise CompactStructureParseError(
+                code=CompactValidationIssueCodeV3.DUPLICATE_SOURCE_LABEL,
+                json_path=item_path,
+                message=f"duplicate_source_label: {item_path}",
+            )
         result.append(item)
     if not allow_empty and not result:
-        raise ValueError(f"blank_required_text: {path}")
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+            json_path=path,
+            message=f"blank_required_text: {path}",
+        )
     return tuple(result)
 
 
@@ -543,7 +645,7 @@ def _parse_summary(value: JsonValue) -> CompactSessionSummaryV3 | None:
 
     :param value: ``session_summary`` 字段值。
     :returns: typed summary 或 ``None``。
-    :raises ValueError: nested shape 非法时抛出。
+    :raises CompactStructureParseError: nested shape 非法时抛出。
     """
 
     if value is None:
@@ -569,7 +671,7 @@ def _parse_fact(value: JsonValue, index: int) -> CompactEvidenceFactV3:
     :param value: fact JSON 值。
     :param index: array index。
     :returns: typed fact。
-    :raises ValueError: nested shape 非法时抛出。
+    :raises CompactStructureParseError: nested shape 非法时抛出。
     """
 
     path = f"$.evidence_facts[{index}]"
@@ -603,7 +705,7 @@ def _parse_anchor(value: JsonValue, index: int) -> CompactAnswerAnchorV3:
     :param value: anchor JSON 值。
     :param index: array index。
     :returns: typed anchor。
-    :raises ValueError: nested shape 非法时抛出。
+    :raises CompactStructureParseError: nested shape 非法时抛出。
     """
 
     path = f"$.answer_anchors[{index}]"
@@ -629,7 +731,7 @@ def _parse_intent(value: JsonValue, index: int) -> CompactForwardIntentV3:
     :param value: intent JSON 值。
     :param index: array index。
     :returns: typed intent。
-    :raises ValueError: nested shape 或 status 非法时抛出。
+    :raises CompactStructureParseError: nested shape 或 status 非法时抛出。
     """
 
     path = f"$.forward_intents[{index}]"
@@ -638,7 +740,12 @@ def _parse_intent(value: JsonValue, index: int) -> CompactForwardIntentV3:
     try:
         status = CompactForwardIntentStatusV3(status_text)
     except ValueError as exc:
-        raise ValueError(f"invalid_enum_value: {path}.status") from exc
+        status_path = f"{path}.status"
+        raise CompactStructureParseError(
+            code=CompactValidationIssueCodeV3.INVALID_ENUM_VALUE,
+            json_path=status_path,
+            message=f"invalid_enum_value: {status_path}",
+        ) from exc
     return CompactForwardIntentV3(
         intent_type=_required_text(
             data,
@@ -668,7 +775,7 @@ def _parse_reference(
     :param value: reference JSON 值。
     :param index: array index。
     :returns: typed reference item。
-    :raises ValueError: nested shape 非法时抛出。
+    :raises CompactStructureParseError: nested shape 非法时抛出。
     """
 
     path = f"$.reference_continuity[{index}]"
@@ -690,6 +797,7 @@ def _parse_reference(
 
 __all__ = [
     "COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3",
+    "CompactStructureParseError",
     "compact_output_json_schema_digest_v3",
     "compact_output_json_schema_v3",
     "compact_output_prompt_rules_v3",

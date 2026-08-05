@@ -42,12 +42,14 @@ from dayu.host.context_governance import compact_output_caps_v3_from_memory_poli
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.compact_structure import (
     COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3,
+    CompactStructureParseError,
     compact_output_json_schema_v3,
 )
 from dayu.host.llm_compaction import (
     LLMContextCompactor,
     LLMCompactionValidationError,
     _repair_feedback_prompt_json_vnext,
+    _structure_validation_report,
     _structured_output_mode,
     _structured_output_request_v3,
     _user_prompt_vnext,
@@ -71,7 +73,6 @@ def test_strict_parser_accepts_exact_v3_candidate() -> None:
     """strict parser 接受字段、类型和闭集值都精确的 v3 candidate。"""
 
     candidate = parse_conversation_compact_output_vnext(
-        _compact_input(),
         json.dumps(_valid_candidate(), ensure_ascii=False),
     )
 
@@ -238,11 +239,8 @@ def test_llm_compactor_constructor_and_parser_reject_invalid_typed_inputs() -> N
             compaction_attempt_number=1,
             repair_feedback=None,
         )
-    with pytest.raises(TypeError, match="request must be CompactInputV3"):
-        parse_conversation_compact_output_vnext(
-            cast(CompactInputV3, "bad"),
-            _compact_json(),
-        )
+    with pytest.raises(TypeError, match="text must be str"):
+        parse_conversation_compact_output_vnext(cast(str, 1))
     with pytest.raises(TypeError, match="report must be CompactValidationReportV3"):
         LLMCompactionValidationError(
             cast(CompactValidationReportV3, "bad"),
@@ -289,7 +287,7 @@ def test_secret_bearing_duplicate_key_report_and_repair_feedback_are_safe() -> N
     raw = f"{{{encoded_key}:1,{encoded_key}:2}}"
 
     with pytest.raises(LLMCompactionValidationError) as captured:
-        parse_conversation_compact_output_vnext(_compact_input(), raw)
+        parse_conversation_compact_output_vnext(raw)
 
     report = captured.value.report
     issue = report.issues[0]
@@ -396,12 +394,40 @@ def test_strict_parser_report_is_typed_and_has_json_path() -> None:
     )
 
     with pytest.raises(LLMCompactionValidationError) as captured:
-        parse_conversation_compact_output_vnext(_compact_input(), raw)
+        parse_conversation_compact_output_vnext(raw)
 
     issue = captured.value.report.issues[0]
     assert issue.code is CompactValidationIssueCodeV3.INVALID_ENUM_VALUE
     assert issue.json_path == "$.forward_intents[0].status"
     assert "invalid_enum_value" in issue.message
+
+
+def test_structure_repair_report_projects_typed_failure_fields_without_message_inference() -> None:
+    """repair report 仅投影 typed code/path，并保持不可信文本脱敏有界。
+
+    :returns: ``None``。
+    :raises AssertionError: code/path 从 message 反推或脱敏边界失效时抛出。
+    """
+
+    error = CompactStructureParseError(
+        code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
+        json_path="$.api_key=sk-path-secret-123." + "x" * 500,
+        message=(
+            "invalid_enum_value: $.message-only-path token=message-secret-456 "
+            + "y" * 500
+        ),
+    )
+
+    issue = _structure_validation_report(error).issues[0]
+
+    assert issue.code is CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY
+    assert issue.json_path.startswith("$.api_key=<redacted>")
+    assert "message-only-path" not in issue.json_path
+    assert len(issue.json_path) <= MAX_COMPACT_REPAIR_ISSUE_MESSAGE_CHARS
+    assert len(issue.message) <= MAX_COMPACT_REPAIR_ISSUE_MESSAGE_CHARS
+    serialized = json.dumps(issue.to_json(), ensure_ascii=False, sort_keys=True)
+    assert "sk-path-secret-123" not in serialized
+    assert "message-secret-456" not in serialized
 
 
 def test_repair_feedback_is_separate_and_requires_whole_candidate() -> None:
@@ -773,7 +799,7 @@ def _assert_parser_issue(
     """
 
     with pytest.raises(LLMCompactionValidationError) as captured:
-        parse_conversation_compact_output_vnext(_compact_input(), raw)
+        parse_conversation_compact_output_vnext(raw)
     assert captured.value.report.issues[0].code is expected_code
 
 

@@ -46,6 +46,7 @@ from dayu.engine.contracts.structured_output import (
 )
 from dayu.host.compact_structure import (
     COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3,
+    CompactStructureParseError,
     compact_output_json_schema_v3,
     compact_output_prompt_rules_v3,
     compact_output_template_v3,
@@ -59,7 +60,6 @@ from dayu.host.compaction import (
     CompactCandidateV3,
     ContextCompactor,
     CompactRepairFeedbackV3,
-    CompactValidationIssueCodeV3,
     CompactValidationIssueV3,
     CompactValidationReportV3,
     compact_policy_usage_measurement_rules_v3,
@@ -372,7 +372,6 @@ class LLMContextCompactor(ContextCompactor):
             )
         try:
             candidate = parse_conversation_compact_output_vnext(
-                prepared_input.compact_input,
                 outcome.content,
             )
         except LLMCompactionValidationError as exc:
@@ -796,68 +795,38 @@ def _compaction_request_prompt_block_vnext(request: CompactInputV3) -> str:
 
 
 def parse_conversation_compact_output_vnext(
-    request: CompactInputV3,
     final_answer: str,
 ) -> CompactCandidateV3:
     """解析并校验 vNext strict JSON compact output。
 
-    :param request: vNext compactor input。
     :param final_answer: LLM 返回的 strict JSON 文本。
     :returns: vNext compact output candidate。
-    :raises TypeError: request 类型非法时抛出。
+    :raises TypeError: final answer 类型非法时抛出。
     :raises LLMCompactionProposalError: JSON 解析、schema 或 label contract 非法时抛出。
     """
 
-    if not isinstance(request, CompactInputV3):
-        raise TypeError("request must be CompactInputV3")
     try:
         return parse_compact_candidate_v3(final_answer)
-    except (TypeError, ValueError) as exc:
+    except CompactStructureParseError as exc:
         raise LLMCompactionValidationError(
             _structure_validation_report(exc),
             successful_response_identity=None,
         ) from exc
 
 
-def _structure_validation_report(error: TypeError | ValueError) -> CompactValidationReportV3:
+def _structure_validation_report(
+    error: CompactStructureParseError,
+) -> CompactValidationReportV3:
     """把 structure owner 的 strict error 投影为 bounded repair report。
 
     :param error: structure parser 抛出的类型或值错误。
     :returns: 单一、脱敏且稳定排序的 validation report。
     """
 
-    message = _safe_outcome_text(str(error))
-    prefix = message.partition(":")[0]
-    code_by_prefix = {
-        "blank_required_text": CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
-        "duplicate_json_key": CompactValidationIssueCodeV3.DUPLICATE_JSON_KEY,
-        "duplicate_source_label": CompactValidationIssueCodeV3.DUPLICATE_SOURCE_LABEL,
-        "invalid_enum_value": CompactValidationIssueCodeV3.INVALID_ENUM_VALUE,
-        "invalid_field_type": CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
-        "invalid_json": CompactValidationIssueCodeV3.INVALID_JSON,
-        "missing_required_key": CompactValidationIssueCodeV3.MISSING_REQUIRED_KEY,
-        "unknown_json_key": CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
-    }
-    code = code_by_prefix.get(
-        prefix,
-        CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
-    )
-    path = _structure_error_path(message)
     issue = CompactValidationIssueV3(
-        code=code,
-        json_path=path,
-        message=message,
+        code=error.code,
+        json_path=_safe_outcome_text(error.json_path),
+        message=_safe_outcome_text(error.message),
         source_labels=(),
     )
     return CompactValidationReportV3(issues=(issue,))
-
-
-def _structure_error_path(message: str) -> str:
-    """从 structure error 中提取安全 JSON path。
-
-    :param message: 已脱敏、截断的 structure error 文本。
-    :returns: 以 ``$`` 开头的 path；无法提取时返回 root。
-    """
-
-    suffix = message.partition(":")[2].strip()
-    return suffix if suffix.startswith("$") else "$"
