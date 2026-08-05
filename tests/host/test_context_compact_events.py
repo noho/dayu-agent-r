@@ -41,6 +41,9 @@ from dayu.host.context_events import (
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
+    parse_context_compacted_terminal_binding,
+    parse_context_compaction_attempt_rejected_terminal_binding,
+    parse_successful_runner_response_identity,
     validate_context_compaction_attempt_rejected_payload,
     validate_context_compacted_payload,
     validate_context_compaction_failed_payload,
@@ -75,6 +78,88 @@ def test_context_events_owner_exports_compactor_manifest_reference() -> None:
     """
 
     assert "CompactorProposalManifestReference" in context_events_module.__all__
+    assert "parse_successful_runner_response_identity" in (
+        context_events_module.__all__
+    )
+
+
+def test_successful_response_public_parser_roundtrips_canonical_identity() -> None:
+    """公开 strict parser 与 canonical compacted payload 使用同一 identity shape。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 与 terminal binding 不同源时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity_payload = cast(
+        Mapping[str, JsonValue],
+        payload["successful_response_identity"],
+    )
+
+    identity = parse_successful_runner_response_identity(identity_payload)
+    binding = parse_context_compacted_terminal_binding(payload)
+
+    assert binding.successful_response_identity == identity
+    assert identity.effective_provider == "test-compactor"
+    assert identity.effective_model == "test-compactor-model"
+    assert identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.UNAVAILABLE
+    )
+    assert identity.provider_request_id is None
+
+
+def test_successful_response_public_parser_rejects_secret_like_extra_field() -> None:
+    """canonical identity 白名单拒绝 header/credential/raw payload 扩展。
+
+    :returns: ``None``。
+    :raises AssertionError: secret-like extra field 未被拒绝时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity_payload = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    identity_payload["authorization"] = "Bearer must-not-leak"
+
+    with pytest.raises(ValueError, match="unexpected payload fields"):
+        parse_successful_runner_response_identity(identity_payload)
+
+
+def test_attempt_rejected_terminal_parser_preserves_no_success_null() -> None:
+    """no-success canonical rejection 由 event owner 解析为 typed null identity。
+
+    :returns: ``None``。
+    :raises AssertionError: no-success identity 或 manifest binding 错误时抛出。
+    """
+
+    manifest_reference = _proposal_manifest_reference(
+        operation_id="operation-no-success",
+        attempt_number=1,
+        compactor_engine_run_id="compactor-run-no-success",
+        manifest_payload_ref="payload-manifest-no-success",
+        manifest_digest=_DIGEST_A,
+    )
+    payload = build_context_compaction_attempt_rejected_payload(
+        operation_id="operation-no-success",
+        attempt_number=1,
+        failure_category="cancellation_requested",
+        repairable=False,
+        runner_attempt_summary_refs=("runner-attempt-1",),
+        diagnostic_refs=("diagnostic-1",),
+        next_policy_decision="stop",
+        budget_after_attempted_compact=None,
+        successful_response_identity=None,
+        proposal_manifest_reference=manifest_reference,
+    )
+
+    binding = parse_context_compaction_attempt_rejected_terminal_binding(payload)
+
+    assert binding.proposal_manifest_ref == "payload-manifest-no-success"
+    assert binding.proposal_manifest_digest == _DIGEST_A
+    assert binding.successful_response_identity is None
 
 
 def _successful_response_identity(

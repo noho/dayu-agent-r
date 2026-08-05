@@ -30,7 +30,18 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import TABLE_HOST_TOOL_TRACE_HOT
-from dayu.host.durable.transaction import HostTransactionRunner
+from dayu.host.durable.tool_trace import (
+    RunnerCallReconstructionConsumerBoundary,
+    RunnerCallReconstructionDiagnostic,
+    RunnerCallReconstructionSignal,
+    RunnerCallReconstructionStatus,
+    RunnerCallResolvedProjection,
+    ToolTraceHotRow,
+    ToolTraceQueryPage,
+    ToolTraceResolvedJsonPayload,
+    ToolTraceResolvedRowPayloads,
+)
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.tool_trace import (
     ToolTraceSinkOptions,
     _tool_trace_cold_lock_path,
@@ -481,6 +492,187 @@ def test_valid_workspace_projection_joins_and_resolves_source_payload(
     assert dataset.limitations == ()
     assert dataset.cold_snapshot is not None
     assert dataset.cold_snapshot.cold_lock_path == _tool_trace_cold_lock_path(dataset.source.cold_jsonl_path)
+
+
+def test_missing_compactor_terminal_adds_limitation_only_after_resolver_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """typed resolver 返回 None 时 input owner 添加唯一稳定 missing limitation。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: limitation reason 或 watermark 不符合 contract 时抛出。
+    """
+
+    digest = "sha256:" + "a" * 64
+    row = ToolTraceHotRow(
+        trace_id="event-compactor-runner-call",
+        event_id="event-compactor-runner-call",
+        event_sequence=1,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        event_class="canonical_fact",
+        session_id="session-analysis",
+        run_id="run-analysis",
+        attempt_id="attempt-analysis",
+        execution_id="execution-analysis",
+        tool_call_id=None,
+        tool_name=None,
+        provider_request_id=None,
+        diagnostic_ref=None,
+        normalized_arguments_digest=None,
+        semantic_input_digest=None,
+        result_digest=None,
+        payload_ref="payload-manifest",
+        payload_digest=digest,
+        policy_decision_json=None,
+        trace_summary={"event_type": "RUNNER_CALL_INPUT_ASSEMBLED"},
+        cold_trace_ref=None,
+        cold_trace_digest=None,
+        projected_at="2026-08-05T00:00:00+00:00",
+        updated_at="2026-08-05T00:00:00+00:00",
+    )
+    signal = RunnerCallReconstructionSignal(
+        event_id=row.event_id,
+        event_sequence=row.event_sequence,
+        session_id=row.session_id,
+        run_id=row.run_id,
+        attempt_id=row.attempt_id,
+        execution_id=row.execution_id,
+        runner_call_index=0,
+        runner_call_kind="compactor_proposal",
+        runner_call_trigger_reason="context_compaction_initial_proposal",
+        iteration_id=None,
+        manifest_ref="payload-manifest",
+        manifest_digest=digest,
+        message_count=0,
+        role_sequence_digest=digest,
+        input_projection_digest=digest,
+        projector_metadata_summary=(),
+        diagnostic=RunnerCallReconstructionDiagnostic(
+            status=RunnerCallReconstructionStatus.COMPLETE,
+            reason=None,
+            missing_atom_kind=None,
+            missing_ref_kind=None,
+            missing_ref=None,
+            observed_count=None,
+            expected_count=None,
+            observed_digest=None,
+            expected_digest=None,
+            consumer_boundary=(RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY),
+        ),
+    )
+    resolved_payload = ToolTraceResolvedJsonPayload(
+        payload_ref="payload-manifest",
+        payload_digest=digest,
+        payload_size_bytes=64,
+        media_type="application/json",
+        payload={},
+    )
+    projection = RunnerCallResolvedProjection(
+        signal=signal,
+        manifest=resolved_payload,
+        runner_input_projection=resolved_payload,
+        selected_tool_schema_snapshot=None,
+        compactor_response_identity=None,
+    )
+
+    def read_page(
+        transaction: HostTransaction,
+        after_event_sequence: int,
+        limit: int,
+    ) -> ToolTraceQueryPage:
+        """返回单页 synthetic runner-call hot row。
+
+        :param transaction: 未使用的 read transaction。
+        :param after_event_sequence: 未使用的 keyset cursor。
+        :param limit: 未使用的 page limit。
+        :returns: 只含一个 compactor runner-call row 的终页。
+        :raises: 无。
+        """
+
+        del transaction, after_event_sequence, limit
+        return ToolTraceQueryPage(
+            rows=(row,),
+            next_event_sequence=row.event_sequence,
+            has_more=False,
+        )
+
+    def read_signals(
+        transaction: HostTransaction,
+        rows: tuple[ToolTraceHotRow, ...],
+    ) -> dict[str, RunnerCallReconstructionSignal]:
+        """返回与 synthetic hot row 同源的 typed signal。
+
+        :param transaction: 未使用的 read transaction。
+        :param rows: 未使用的 hot rows。
+        :returns: 以 event id 索引的唯一 typed signal。
+        :raises: 无。
+        """
+
+        del transaction, rows
+        return {signal.event_id: signal}
+
+    def resolve_row(
+        transaction: HostTransaction,
+        hot_row: ToolTraceHotRow,
+    ) -> ToolTraceResolvedRowPayloads:
+        """返回已通过 source resolver 的 synthetic row。
+
+        :param transaction: 未使用的 read transaction。
+        :param hot_row: 待投影的 synthetic hot row。
+        :returns: 不含 descriptor body 的 typed resolved row。
+        :raises: 无。
+        """
+
+        del transaction
+        return ToolTraceResolvedRowPayloads(
+            row=hot_row,
+            source_event_payload={},
+            descriptor_payload=None,
+        )
+
+    def resolve_projection(
+        transaction: HostTransaction,
+        reconstruction_signal: RunnerCallReconstructionSignal,
+    ) -> RunnerCallResolvedProjection:
+        """模拟 production resolver 完整 exhaustion 后返回 response None。
+
+        :param transaction: 未使用的 read transaction。
+        :param reconstruction_signal: 未使用的同源 typed signal。
+        :returns: compactor response identity 为 ``None`` 的 typed projection。
+        :raises: 无。
+        """
+
+        del transaction, reconstruction_signal
+        return projection
+
+    monkeypatch.setattr(input_module, "read_tool_trace_page", read_page)
+    monkeypatch.setattr(input_module, "_read_runner_signals", read_signals)
+    monkeypatch.setattr(
+        input_module,
+        "resolve_tool_trace_hot_row_payloads",
+        resolve_row,
+    )
+    monkeypatch.setattr(
+        input_module,
+        "resolve_runner_call_projection_from_signal",
+        resolve_projection,
+    )
+    options = _store_options(tmp_path)
+    _, db_path, _, _ = _workspace_paths(tmp_path)
+    with open_host_durable_store(options) as store:
+        snapshot = store.transaction_runner.run_read(
+            lambda transaction: input_module._read_hot_snapshot_in_transaction(
+                transaction,
+                db_path,
+            )
+        )
+
+        assert tuple(item.reason_code for item in snapshot.limitations) == ("compactor-response-terminal-not-observed",)
+        assert all("scan-cap" not in item.reason_code for item in snapshot.limitations)
+        assert snapshot.limitations[0].hot_event_sequence_watermark == 1
 
 
 @pytest.mark.parametrize(

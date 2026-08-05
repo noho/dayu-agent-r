@@ -8,8 +8,21 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorResponseIdentity,
+    RunnerCallReconstructionConsumerBoundary,
+    RunnerCallReconstructionDiagnostic,
+    RunnerCallReconstructionSignal,
+    RunnerCallReconstructionStatus,
+    RunnerCallResolvedProjection,
     ToolTraceHotRow,
+    ToolTraceResolvedJsonPayload,
     ToolTraceResolvedRowPayloads,
 )
 from dayu.host.tool_trace_analysis import render_tool_trace_analysis_markdown
@@ -213,11 +226,13 @@ def _joined_record(
     record: ToolTraceColdRecord,
     *,
     source_event_payload: Mapping[str, JsonValue],
+    runner_call_projection: RunnerCallResolvedProjection | None = None,
 ) -> ToolTraceJoinedRecord:
     """构造 resolver 已证明 source EventLog payload 的 joined record。
 
     :param record: strict cold record。
     :param source_event_payload: 模拟 resolver 校验通过的 source payload。
+    :param runner_call_projection: 可选 typed runner-call resolver projection。
     :returns: hot/cold/resolver joined record。
     :raises: 无。
     """
@@ -231,7 +246,90 @@ def _joined_record(
             source_event_payload=source_event_payload,
             descriptor_payload=None,
         ),
-        runner_call_projection=None,
+        runner_call_projection=runner_call_projection,
+    )
+
+
+def _compactor_projection(
+    record: ToolTraceColdRecord,
+) -> RunnerCallResolvedProjection:
+    """构造 analysis rules 只读消费的 typed compactor projection。
+
+    :param record: 对应 ``RUNNER_CALL_INPUT_ASSEMBLED`` cold record。
+    :returns: 带 actual successful response identity 的 typed projection。
+    :raises ValueError: synthetic Runner request identity 非 canonical 时抛出。
+    """
+
+    request_identity = build_runner_request_identity(
+        run_id="compactor-engine-run-1",
+        attempt_id=None,
+        execution_id=None,
+        iteration_id="compactor-iteration-1",
+        iteration_index=0,
+        runner_call_index=1,
+    )
+    signal = RunnerCallReconstructionSignal(
+        event_id=record.event_id,
+        event_sequence=record.event_sequence,
+        session_id=record.session_id,
+        run_id=record.run_id,
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        runner_call_index=0,
+        runner_call_kind="compactor_proposal",
+        runner_call_trigger_reason="context_compaction_initial_proposal",
+        iteration_id=None,
+        manifest_ref="payload-manifest-1",
+        manifest_digest=_DIGEST,
+        message_count=0,
+        role_sequence_digest=_DIGEST,
+        input_projection_digest=_DIGEST,
+        projector_metadata_summary=(),
+        diagnostic=RunnerCallReconstructionDiagnostic(
+            status=RunnerCallReconstructionStatus.COMPLETE,
+            reason=None,
+            missing_atom_kind=None,
+            missing_ref_kind=None,
+            missing_ref=None,
+            observed_count=None,
+            expected_count=None,
+            observed_digest=None,
+            expected_digest=None,
+            consumer_boundary=(
+                RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY
+            ),
+        ),
+    )
+    resolved_payload = ToolTraceResolvedJsonPayload(
+        payload_ref="payload-manifest-1",
+        payload_digest=_DIGEST,
+        payload_size_bytes=128,
+        media_type="application/json",
+        payload={},
+    )
+    return RunnerCallResolvedProjection(
+        signal=signal,
+        manifest=resolved_payload,
+        runner_input_projection=resolved_payload,
+        selected_tool_schema_snapshot=None,
+        compactor_response_identity=ResolvedCompactorResponseIdentity(
+            disposition=CompactorResponseDisposition.ACCEPTED,
+            terminal_event_id="event-context-compacted-1",
+            terminal_event_sequence=record.event_sequence + 10,
+            compaction_operation_id="operation-1",
+            compaction_attempt_number=1,
+            proposal_manifest_ref="payload-manifest-1",
+            proposal_manifest_digest=_DIGEST,
+            successful_response_identity=SuccessfulRunnerResponseIdentity(
+                effective_provider="provider-actual",
+                effective_model="model-actual",
+                runner_request_identity=request_identity,
+                provider_request_id_availability=(
+                    ProviderRequestIdAvailability.PRESENT
+                ),
+                provider_request_id="provider-request-actual",
+            ),
+        ),
     )
 
 
@@ -1405,3 +1503,56 @@ def test_finding_order_and_ids_are_deterministic(
     assert first.findings[-1].finding_id == "TT-TOOL-0001"
     assert first.findings[0].severity is ToolTraceFindingSeverity.WARNING
     assert first.findings[0].priority is ToolTraceFindingPriority.MEDIUM
+
+
+def test_compactor_response_summary_comes_only_from_typed_resolver_projection(
+    tmp_path: Path,
+) -> None:
+    """schema v2 summary 从 typed resolver 投影 actual response 白名单字段。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: summary 脱离 typed projection 或字段错误时抛出。
+    """
+
+    source = _workspace_source(tmp_path)
+    record = _record(
+        source,
+        sequence=1,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+    )
+    projection = _compactor_projection(record)
+    joined = _joined_record(
+        record,
+        source_event_payload={"authorization": "must-not-be-consumed"},
+        runner_call_projection=projection,
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            (record,),
+            hot_store_available=True,
+            hot_rows=(_hot_row(record),),
+            joined_records=(joined,),
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+
+    assert report.schema_version == 2
+    assert len(report.compactor_responses) == 1
+    summary = report.compactor_responses[0]
+    assert summary.parent_host_run_id == "run-1"
+    assert summary.disposition is CompactorResponseDisposition.ACCEPTED
+    assert summary.effective_provider == "provider-actual"
+    assert summary.effective_model == "model-actual"
+    assert summary.provider_request_id_availability is (
+        ProviderRequestIdAvailability.PRESENT
+    )
+    assert summary.provider_request_id == "provider-request-actual"
+    response = projection.compactor_response_identity
+    assert response is not None
+    successful = response.successful_response_identity
+    assert successful is not None
+    assert summary.runner_request_identity == successful.runner_request_identity

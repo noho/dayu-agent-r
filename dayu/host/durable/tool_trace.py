@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
     RunnerCallHotDiagnostic,
@@ -30,12 +31,19 @@ from dayu.host.durable._validation import (
 )
 from dayu.host.durable.codec import canonical_json_dumps
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.event_log import EventLogRow, read_run_events_by_types_page
 from dayu.host.durable.payload_resolution import resolve_json_payload
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_HOST_TOOL_TRACE_HOT,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    parse_context_compacted_terminal_binding,
+    parse_context_compaction_attempt_rejected_terminal_binding,
+)
 
 TOOL_TRACE_QUERY_MAX_LIMIT = 500
 """Tool Trace 内部查询单页最大行数。"""
@@ -49,6 +57,13 @@ _RUNNER_CALL_PROJECTION_ARTIFACT_REF = "runner_call_projection_artifact_ref"
 _RUNNER_CALL_PROJECTION_ARTIFACT_DIGEST = "runner_call_projection_artifact_digest"
 _TOOL_SCHEMA_SNAPSHOT_REF_PREFIX = "tool_schema_snapshot_ref:"
 _TOOL_SCHEMA_SNAPSHOT_DIGEST_PREFIX = "tool_schema_snapshot_digest:"
+_COMPACTOR_TERMINAL_SCAN_PAGE_SIZE = 128
+"""仅界定单次 SQLite keyset read I/O；correctness 由完整 exhaustion 与 cursor
+不变量拥有，不得开放为 public config。"""
+_COMPACTOR_TERMINAL_EVENT_TYPES = (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+)
 
 
 class RunnerCallReconstructionStatus(StrEnum):
@@ -111,6 +126,17 @@ class ToolTraceHotRowWriteStatus(StrEnum):
 
     INSERTED = "inserted"
     DUPLICATE = "duplicate"
+
+
+class CompactorResponseDisposition(StrEnum):
+    """公开 compactor response terminal disposition。"""
+
+    ACCEPTED = "accepted"
+    ATTEMPT_REJECTED = "attempt_rejected"
+
+
+class CompactorResponseResolutionError(HostDurableError):
+    """compactor canonical terminal 解析或绑定失败。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,12 +350,90 @@ class RunnerCallResolvedProjection:
     :param runner_input_projection: LLM-facing runner input projection JSON payload。
     :param selected_tool_schema_snapshot: selected tool schema full JSON snapshot；
         本轮无工具 schema 时为 ``None``。
+    :param compactor_response_identity: compactor proposal 对应的 canonical
+        terminal response identity；普通 runner call 或完整扫描后未观察到 matching
+        terminal 时为 ``None``。
     """
 
     signal: RunnerCallReconstructionSignal
     manifest: ToolTraceResolvedJsonPayload
     runner_input_projection: ToolTraceResolvedJsonPayload
     selected_tool_schema_snapshot: ToolTraceResolvedJsonPayload | None
+    compactor_response_identity: ResolvedCompactorResponseIdentity | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedCompactorResponseIdentity:
+    """Tool Trace resolver 公开的 compactor terminal response identity。
+
+    :param disposition: accepted 或 attempt-rejected terminal。
+    :param terminal_event_id: canonical terminal event id。
+    :param terminal_event_sequence: canonical terminal event sequence。
+    :param compaction_operation_id: manifest 与 terminal 同源 operation id。
+    :param compaction_attempt_number: manifest 与 terminal 同源 attempt 序号。
+    :param proposal_manifest_ref: exact proposal manifest ref。
+    :param proposal_manifest_digest: exact proposal manifest digest。
+    :param successful_response_identity: 实际成功 Runner response identity；
+        no-success rejection 时为 ``None``。
+    """
+
+    disposition: CompactorResponseDisposition
+    terminal_event_id: str
+    terminal_event_sequence: int
+    compaction_operation_id: str
+    compaction_attempt_number: int
+    proposal_manifest_ref: str
+    proposal_manifest_digest: str
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None
+
+    def __post_init__(self) -> None:
+        """校验公开 response projection 的封闭 typed shape。
+
+        :returns: 无返回值。
+        :raises TypeError: disposition 或 response identity 类型非法时抛出。
+        :raises ValueError: identity 文本为空或 sequence/attempt 非正时抛出。
+        """
+
+        if not isinstance(self.disposition, CompactorResponseDisposition):
+            raise TypeError("disposition must be CompactorResponseDisposition")
+        for field_name, value in (
+            ("terminal_event_id", self.terminal_event_id),
+            ("compaction_operation_id", self.compaction_operation_id),
+            ("proposal_manifest_ref", self.proposal_manifest_ref),
+            ("proposal_manifest_digest", self.proposal_manifest_digest),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{field_name} must be str")
+            if value.strip() == "":
+                raise ValueError(f"{field_name} must be non-empty")
+        if isinstance(self.terminal_event_sequence, bool) or not isinstance(
+            self.terminal_event_sequence,
+            int,
+        ):
+            raise TypeError("terminal_event_sequence must be int")
+        if self.terminal_event_sequence <= 0:
+            raise ValueError("terminal_event_sequence must be positive")
+        if isinstance(self.compaction_attempt_number, bool) or not isinstance(
+            self.compaction_attempt_number,
+            int,
+        ):
+            raise TypeError("compaction_attempt_number must be int")
+        if self.compaction_attempt_number <= 0:
+            raise ValueError("compaction_attempt_number must be positive")
+        if self.successful_response_identity is not None and not isinstance(
+            self.successful_response_identity,
+            SuccessfulRunnerResponseIdentity,
+        ):
+            raise TypeError(
+                "successful_response_identity must be SuccessfulRunnerResponseIdentity or None"
+            )
+        if (
+            self.disposition is CompactorResponseDisposition.ACCEPTED
+            and self.successful_response_identity is None
+        ):
+            raise ValueError(
+                "accepted compactor response requires successful response identity"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +486,11 @@ def resolve_runner_call_projection_from_signal(
         signal.manifest_ref,
         expected_digest=signal.manifest_digest,
     )
+    typed_manifest = _typed_manifest_from_signal(
+        transaction,
+        signal=signal,
+        resolved_manifest=manifest,
+    )
     projection_ref = _json_optional_text(
         manifest.payload,
         _RUNNER_CALL_PROJECTION_ARTIFACT_REF,
@@ -407,6 +516,202 @@ def resolve_runner_call_projection_from_signal(
             transaction,
             manifest.payload,
         ),
+        compactor_response_identity=_resolve_compactor_response_identity(
+            transaction,
+            typed_manifest,
+            proposal_manifest_ref=manifest.payload_ref,
+            proposal_manifest_digest=manifest.payload_digest,
+        ),
+    )
+
+
+def _typed_manifest_from_signal(
+    transaction: HostTransaction,
+    *,
+    signal: RunnerCallReconstructionSignal,
+    resolved_manifest: ToolTraceResolvedJsonPayload,
+) -> RunnerCallInputManifest:
+    """从 signal 的 canonical event 与 descriptor 恢复 typed manifest。
+
+    :param transaction: 调用方持有的 Host read transaction。
+    :param signal: 待复核的 runner-call signal。
+    :param resolved_manifest: 已通过 ref/digest 校验的 manifest payload。
+    :returns: shared manifest owner 完整校验后的 typed manifest。
+    :raises HostDurableError: signal、hot atoms 或 manifest graph 任一不一致时抛出。
+    """
+
+    hot_payload = parse_runner_call_hot_payload(
+        _read_event_payload(transaction, signal.event_id)
+    )
+    if (
+        signal.session_id != hot_payload.session_id
+        or signal.run_id != hot_payload.host_run_id
+        or signal.attempt_id != hot_payload.attempt_id
+        or signal.execution_id != hot_payload.execution_id
+        or signal.runner_call_index != hot_payload.runner_call_index
+        or signal.runner_call_kind != hot_payload.runner_call_kind
+        or signal.runner_call_trigger_reason
+        != hot_payload.runner_call_trigger_reason
+        or signal.iteration_id != hot_payload.iteration_id
+        or signal.manifest_ref != hot_payload.manifest_payload_ref
+        or signal.manifest_digest != hot_payload.manifest_digest
+        or signal.message_count != hot_payload.message_count
+        or signal.role_sequence_digest != hot_payload.role_sequence_digest
+        or signal.input_projection_digest != hot_payload.input_projection_digest
+    ):
+        raise HostDurableError("runner-call signal and canonical hot identity mismatch")
+    return parse_runner_call_manifest(
+        resolved_manifest.payload,
+        hot_payload=hot_payload,
+    )
+
+
+def _resolve_compactor_response_identity(
+    transaction: HostTransaction,
+    manifest: RunnerCallInputManifest,
+    *,
+    proposal_manifest_ref: str,
+    proposal_manifest_digest: str,
+) -> ResolvedCompactorResponseIdentity | None:
+    """完整扫描 parent Host Run 并解析唯一 matching compactor terminal。
+
+    :param transaction: 调用方持有的同一个 Host read transaction。
+    :param manifest: shared owner 完整校验后的 runner-call manifest。
+    :param proposal_manifest_ref: signal/hot owner 校验过的 manifest descriptor ref。
+    :param proposal_manifest_digest: signal/hot owner 校验过的 manifest body digest。
+    :returns: matching terminal response identity；ordinary call 或完整 exhaustion 后
+        无 matching terminal 时为 ``None``。
+    :raises CompactorResponseResolutionError: page/cursor、canonical payload、binding
+        或唯一性不变量损坏时抛出。
+    """
+
+    compactor_identity = manifest.compactor_identity
+    if compactor_identity is None:
+        return None
+    cursor = 0
+    resolved: ResolvedCompactorResponseIdentity | None = None
+    while True:
+        try:
+            page = read_run_events_by_types_page(
+                transaction,
+                run_id=compactor_identity.parent_host_run_id,
+                event_types=_COMPACTOR_TERMINAL_EVENT_TYPES,
+                after_event_sequence=cursor,
+                limit=_COMPACTOR_TERMINAL_SCAN_PAGE_SIZE,
+            )
+        except HostDurableError as exc:
+            raise CompactorResponseResolutionError(
+                "compactor terminal page read failed"
+            ) from exc
+        if len(page) > _COMPACTOR_TERMINAL_SCAN_PAGE_SIZE:
+            raise CompactorResponseResolutionError(
+                "compactor terminal page exceeds requested size"
+            )
+        previous_sequence = cursor
+        for row in page:
+            if row.event_sequence <= previous_sequence:
+                raise CompactorResponseResolutionError(
+                    "compactor terminal keyset cursor did not advance"
+                )
+            previous_sequence = row.event_sequence
+            candidate = _resolved_compactor_response_from_row(
+                row,
+                manifest=manifest,
+                proposal_manifest_ref=proposal_manifest_ref,
+                proposal_manifest_digest=proposal_manifest_digest,
+            )
+            if candidate is None:
+                continue
+            if resolved is not None:
+                raise CompactorResponseResolutionError(
+                    "compactor manifest has duplicate canonical terminals"
+                )
+            resolved = candidate
+        if len(page) < _COMPACTOR_TERMINAL_SCAN_PAGE_SIZE:
+            return resolved
+        if previous_sequence <= cursor:
+            raise CompactorResponseResolutionError(
+                "compactor terminal full page cursor did not advance"
+            )
+        cursor = previous_sequence
+
+
+def _resolved_compactor_response_from_row(
+    row: EventLogRow,
+    *,
+    manifest: RunnerCallInputManifest,
+    proposal_manifest_ref: str,
+    proposal_manifest_digest: str,
+) -> ResolvedCompactorResponseIdentity | None:
+    """严格解析单条 canonical terminal 并判断其是否匹配 manifest。
+
+    :param row: parent Host Run 的 canonical terminal row。
+    :param manifest: 当前 compactor proposal typed manifest。
+    :param proposal_manifest_ref: 当前 manifest descriptor ref。
+    :param proposal_manifest_digest: 当前 manifest body digest。
+    :returns: exact matching response；无关联 sibling terminal 返回 ``None``。
+    :raises CompactorResponseResolutionError: payload、manifest binding 或 Engine
+        response identity 不一致时抛出。
+    """
+
+    compactor_identity = manifest.compactor_identity
+    if compactor_identity is None:
+        raise CompactorResponseResolutionError(
+            "ordinary runner manifest cannot resolve compactor terminal"
+        )
+    try:
+        payload = _json_object_from_text(row.payload_json)
+        if row.event_type == CONTEXT_COMPACTED:
+            binding = parse_context_compacted_terminal_binding(payload)
+            disposition = CompactorResponseDisposition.ACCEPTED
+        elif row.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+            binding = parse_context_compaction_attempt_rejected_terminal_binding(
+                payload
+            )
+            disposition = CompactorResponseDisposition.ATTEMPT_REJECTED
+        else:
+            raise ValueError("unsupported compactor terminal event type")
+    except (TypeError, ValueError, HostDurableError) as exc:
+        raise CompactorResponseResolutionError(
+            "compactor canonical terminal payload is malformed"
+        ) from exc
+    operation_matches = (
+        binding.operation_id == compactor_identity.compaction_operation_id
+        and binding.attempt_number
+        == compactor_identity.compaction_attempt_number
+    )
+    manifest_matches = (
+        binding.proposal_manifest_ref == proposal_manifest_ref
+        and binding.proposal_manifest_digest == proposal_manifest_digest
+    )
+    if operation_matches != manifest_matches:
+        raise CompactorResponseResolutionError(
+            "compactor terminal manifest/operation/attempt binding mismatch"
+        )
+    if not operation_matches:
+        return None
+    response_identity = binding.successful_response_identity
+    if (
+        response_identity is not None
+        and response_identity.runner_request_identity.run_id
+        != compactor_identity.compactor_engine_run_id
+    ):
+        raise CompactorResponseResolutionError(
+            "compactor terminal Engine run identity mismatch"
+        )
+    if binding.proposal_manifest_ref is None or binding.proposal_manifest_digest is None:
+        raise CompactorResponseResolutionError(
+            "matching compactor terminal has no proposal manifest binding"
+        )
+    return ResolvedCompactorResponseIdentity(
+        disposition=disposition,
+        terminal_event_id=row.event_id,
+        terminal_event_sequence=row.event_sequence,
+        compaction_operation_id=binding.operation_id,
+        compaction_attempt_number=binding.attempt_number,
+        proposal_manifest_ref=binding.proposal_manifest_ref,
+        proposal_manifest_digest=binding.proposal_manifest_digest,
+        successful_response_identity=response_identity,
     )
 
 
@@ -1417,6 +1722,7 @@ def _json_object_from_text(value: str) -> Mapping[str, JsonValue]:
 
 __all__ = [
     "TOOL_TRACE_QUERY_MAX_LIMIT",
+    "CompactorResponseDisposition",
     "ProjectorMetadataSummary",
     "RunnerCallReconstructionConsumerBoundary",
     "RunnerCallReconstructionDiagnostic",
@@ -1427,6 +1733,7 @@ __all__ = [
     "RunnerCallReconstructionSignalPage",
     "RunnerCallReconstructionStatus",
     "RunnerCallResolvedProjection",
+    "ResolvedCompactorResponseIdentity",
     "ToolTraceHotRow",
     "ToolTraceHotRowWriteResult",
     "ToolTraceHotRowWriteStatus",

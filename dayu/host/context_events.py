@@ -846,6 +846,63 @@ class CompactorProposalManifestReference:
             raise ValueError("compactor_engine_run_id must be non-empty")
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalCompactionTerminalBinding:
+    """canonical compact terminal 的严格 response binding。
+
+    :param operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param proposal_manifest_ref: proposal manifest ref；terminal 尚未形成
+        manifest 时为 ``None``。
+    :param proposal_manifest_digest: proposal manifest digest；与 ref 同时为空或
+        同时存在。
+    :param successful_response_identity: 实际成功 Runner response identity；未
+        取得 Engine success final 时为 ``None``。
+    """
+
+    operation_id: str
+    attempt_number: int
+    proposal_manifest_ref: str | None
+    proposal_manifest_digest: str | None
+    successful_response_identity: SuccessfulRunnerResponseIdentity | None
+
+    def __post_init__(self) -> None:
+        """校验 terminal binding 的 public typed 不变量。
+
+        :returns: 无返回值。
+        :raises ValueError: operation/attempt 或 manifest pair 非法时抛出。
+        """
+
+        if not isinstance(self.operation_id, str):
+            raise TypeError("operation_id must be str")
+        if self.operation_id.strip() == "":
+            raise ValueError("operation_id must be non-empty")
+        if isinstance(self.attempt_number, bool) or not isinstance(
+            self.attempt_number,
+            int,
+        ):
+            raise TypeError("attempt_number must be int")
+        if self.attempt_number <= 0:
+            raise ValueError("attempt_number must be positive")
+        if (self.proposal_manifest_ref is None) != (self.proposal_manifest_digest is None):
+            raise ValueError("proposal manifest ref/digest must pair")
+        if self.proposal_manifest_ref is not None:
+            if not isinstance(self.proposal_manifest_ref, str):
+                raise TypeError("proposal_manifest_ref must be str or None")
+            if self.proposal_manifest_ref.strip() == "":
+                raise ValueError("proposal_manifest_ref must be non-empty")
+        if self.proposal_manifest_digest is not None:
+            if not isinstance(self.proposal_manifest_digest, str):
+                raise TypeError("proposal_manifest_digest must be str or None")
+            if not is_sha256_digest(self.proposal_manifest_digest):
+                raise ValueError("proposal_manifest_digest must be sha256 digest")
+        if self.successful_response_identity is not None and not isinstance(
+            self.successful_response_identity,
+            SuccessfulRunnerResponseIdentity,
+        ):
+            raise TypeError("successful_response_identity must be " "SuccessfulRunnerResponseIdentity or None")
+
+
 _FIELD_TRIGGER_SOURCE = "trigger_source"
 _FIELD_BUDGET_REASON = "budget_reason"
 _FIELD_BUDGET_SNAPSHOT_REF = "budget_snapshot_ref"
@@ -1235,7 +1292,41 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _required_text(payload, _FIELD_PROJECTION_SIGNAL)
     _required_text(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF)
     _required_digest(payload, _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST)
-    _parse_successful_response_identity(_required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY))
+    parse_successful_runner_response_identity(_required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY))
+
+
+def parse_context_compacted_terminal_binding(
+    payload: Mapping[str, JsonValue],
+) -> CanonicalCompactionTerminalBinding:
+    """解析 accepted compact canonical terminal 的 response binding。
+
+    :param payload: ``CONTEXT_COMPACTED`` canonical payload。
+    :returns: 完整校验后的 typed terminal binding。
+    :raises TypeError: ``payload`` 不是 JSON mapping 时抛出。
+    :raises ValueError: canonical payload 或 response identity 非法时抛出。
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be Mapping")
+    validate_context_compacted_payload(payload)
+    return CanonicalCompactionTerminalBinding(
+        operation_id=_required_text(payload, _FIELD_OPERATION_ID),
+        attempt_number=_required_positive_int(
+            payload,
+            _FIELD_ACCEPTED_ATTEMPT_NUMBER,
+        ),
+        proposal_manifest_ref=_required_text(
+            payload,
+            _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF,
+        ),
+        proposal_manifest_digest=_required_digest(
+            payload,
+            _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST,
+        ),
+        successful_response_identity=parse_successful_runner_response_identity(
+            _required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY)
+        ),
+    )
 
 
 def build_context_compaction_failed_payload(
@@ -1531,13 +1622,50 @@ def validate_context_compaction_attempt_rejected_payload(
     if successful_response_identity is not None:
         if not isinstance(successful_response_identity, Mapping):
             raise ValueError("successful_response_identity must be mapping or null")
-        _parse_successful_response_identity(successful_response_identity)
+        parse_successful_runner_response_identity(successful_response_identity)
         if proposal_manifest_ref is None:
             raise ValueError("successful response identity requires proposal manifest reference")
     if failure_category in _POST_SUCCESS_REJECTION_CATEGORIES and successful_response_identity is None:
         raise ValueError(f"{failure_category} requires successful response identity")
     if failure_category in _NO_SUCCESS_REJECTION_CATEGORIES and successful_response_identity is not None:
         raise ValueError(f"{failure_category} forbids successful response identity")
+
+
+def parse_context_compaction_attempt_rejected_terminal_binding(
+    payload: Mapping[str, JsonValue],
+) -> CanonicalCompactionTerminalBinding:
+    """解析 rejected compact attempt canonical terminal 的 response binding。
+
+    :param payload: ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` canonical payload。
+    :returns: 完整校验后的 typed terminal binding；未取得成功 final 时 response
+        identity 为 ``None``。
+    :raises TypeError: ``payload`` 不是 JSON mapping 时抛出。
+    :raises ValueError: canonical payload、manifest pair 或 response identity 非法时
+        抛出。
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be Mapping")
+    validate_context_compaction_attempt_rejected_payload(payload)
+    response_payload = payload.get(_FIELD_SUCCESSFUL_RESPONSE_IDENTITY)
+    response_identity = (
+        None
+        if response_payload is None
+        else parse_successful_runner_response_identity(_required_mapping(payload, _FIELD_SUCCESSFUL_RESPONSE_IDENTITY))
+    )
+    return CanonicalCompactionTerminalBinding(
+        operation_id=_required_text(payload, _FIELD_OPERATION_ID),
+        attempt_number=_required_positive_int(payload, _FIELD_ATTEMPT_NUMBER),
+        proposal_manifest_ref=_optional_text(
+            payload,
+            _FIELD_PROPOSAL_MANIFEST_REF,
+        ),
+        proposal_manifest_digest=_optional_text(
+            payload,
+            _FIELD_PROPOSAL_MANIFEST_DIGEST,
+        ),
+        successful_response_identity=response_identity,
+    )
 
 
 def _validate_successful_response_manifest_binding(
@@ -1609,17 +1737,24 @@ def _successful_response_identity_json(
     }
 
 
-def _parse_successful_response_identity(
+def parse_successful_runner_response_identity(
     payload: Mapping[str, JsonValue],
 ) -> SuccessfulRunnerResponseIdentity:
-    """从 strict durable object 重建成功 Runner response identity。
+    """从 canonical Host payload 重建成功 Runner response identity。
 
-    :param payload: nested ``successful_response_identity`` JSON object。
+    该函数是 ``SuccessfulRunnerResponseIdentity`` durable JSON shape 的公开
+    strict parser。canonical compact event validator 与只读投影必须复用它，
+    禁止各自读取 nested identity 字段。
+
+    :param payload: ``successful_response_identity`` canonical JSON object。
     :returns: 完整校验过的 typed response identity。
+    :raises TypeError: ``payload`` 不是 JSON mapping 时抛出。
     :raises ValueError: 字段缺失、多余、类型非法、client correlation 非
         canonical，或 compactor identity 错用 ordinary attempt/execution 时抛出。
     """
 
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be Mapping")
     _require_exact_fields(payload, _SUCCESSFUL_RESPONSE_IDENTITY_FIELDS)
     runner_payload = _required_mapping(
         payload,
@@ -2002,6 +2137,7 @@ __all__ = [
     "CONTEXT_COMPACTION_FAILED",
     "CONTEXT_COMPACTION_REQUESTED",
     "CompactorProposalManifestReference",
+    "CanonicalCompactionTerminalBinding",
     "ContextBudgetEvaluatedPayload",
     "ContextBudgetEvaluationIdentity",
     "append_context_budget_evaluated_in_transaction",
@@ -2015,6 +2151,9 @@ __all__ = [
     "context_budget_evaluation_identity",
     "load_matching_context_budget_evaluation_in_transaction",
     "parse_context_budget_evaluated_payload",
+    "parse_context_compacted_terminal_binding",
+    "parse_context_compaction_attempt_rejected_terminal_binding",
+    "parse_successful_runner_response_identity",
     "validate_context_compaction_attempt_rejected_payload",
     "validate_context_compacted_payload",
     "validate_context_compaction_failed_payload",
