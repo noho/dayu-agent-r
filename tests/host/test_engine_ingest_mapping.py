@@ -140,6 +140,7 @@ from dayu.host.context_events import (
     build_context_compaction_failed_payload,
     parse_context_budget_evaluated_payload,
 )
+from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host.compaction_terminal import (
     COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
 )
@@ -181,7 +182,11 @@ from dayu.host.context_anchor import (
     ContextAnchorQuery,
     ContextAnchorResolution,
 )
-from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    format_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -1521,6 +1526,87 @@ async def test_reactive_reuses_source_frozen_tool_snapshot_and_mode(
         assert loaded.tool_schemas == (source_schema,)
         assert loaded.disable_tools is False
         assert loaded.tool_execution_mode is ToolExecutionMode.TOOL_ENABLED
+        assert len(wakeup.dispatches) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_oversized_accepted_terminal_uses_descriptor_truth(
+    tmp_path: Path,
+) -> None:
+    """reactive writer 对超限 accepted terminal 复用同一 durable payload owner。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: descriptor terminal、严格解析或 recovery dispatch
+        任一不符合 contract 时抛出。
+    """
+
+    payload_inline_threshold_bytes = 3500
+    with open_host_durable_store(
+        _options(
+            tmp_path,
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        )
+    ) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            display_text="current:" + ("c" * 900),
+            record_source_candidate=True,
+            compactable_history=True,
+        )
+        wakeup = _WakeupSpy()
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            terminal_post_commit_port=_RecordingTerminalPostCommitPort(),
+            transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
+            wakeup_port=wakeup,
+            context_budget_policy=context_budget_policy_from_threshold_tokens(
+                context_window_size=4096,
+                soft_threshold_tokens=45,
+                hard_threshold_tokens=3000,
+                max_reactive_compactions_per_run=2,
+                policy_ref=_REACTIVE_POLICY_REF,
+            ),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=replace(
+                default_memory_projection_policy(),
+                selected_recent_window_turn_floor=0,
+            ),
+        ).ingest_async(
+            _context_compaction_candidate(
+                seeded,
+                worker_event_index=152,
+            )
+        )
+
+        compacted = _latest_event(
+            store.transaction_runner,
+            CONTEXT_COMPACTED,
+        )
+        payload = store.transaction_runner.run_read(
+            lambda transaction: resolve_context_compacted_payload(
+                transaction,
+                compacted,
+            )
+        )
+        descriptor = store.transaction_runner.run_read(
+            lambda transaction: PayloadStore().read_payload_descriptor(
+                transaction,
+                cast(str, compacted.payload_ref),
+            )
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert len(canonical_json_dumps(payload).encode("utf-8")) > (
+            payload_inline_threshold_bytes
+        )
+        assert compacted.payload_json == "{}"
+        assert compacted.payload_ref is not None
+        assert compacted.payload_digest == sha256_digest_json(payload)
+        assert descriptor is not None
+        assert descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
         assert len(wakeup.dispatches) == 1
 
 

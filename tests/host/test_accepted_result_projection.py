@@ -583,7 +583,7 @@ def test_memory_consumer_rejects_canonical_result_without_llm_material(
             store.transaction_runner.run_read(
                 lambda transaction: _memory_projection_event_from_view(
                     transaction,
-                    projection_event_view_from_row(row),
+                    projection_event_view_from_row(transaction, row),
                 )
             )
 
@@ -996,7 +996,10 @@ def test_projection_resolves_hot_payload_cold_result_and_keeps_inline_direct(
                 },
                 source_refs=(),
             )
-            inline_payload = projection_event_view_from_row(inline_row).payload
+            inline_payload = projection_event_view_from_row(
+                transaction,
+                inline_row,
+            ).payload
             return (
                 descriptor_row,
                 descriptor_hot_payload,
@@ -1314,7 +1317,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
         store.transaction_runner.run_write(
             lambda transaction: consumer.apply_event(
                 transaction,
-                projection_event_view_from_row(result_row),
+                projection_event_view_from_row(transaction, result_row),
             )
         )
         tool_trace_row = store.transaction_runner.run_read(
@@ -1326,7 +1329,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
         memory_event = store.transaction_runner.run_read(
             lambda transaction: _memory_projection_event_from_view(
                 transaction,
-                projection_event_view_from_row(result_row),
+                projection_event_view_from_row(transaction, result_row),
             )
         )
         memory_snapshot = build_conversation_memory_snapshot_from_events(

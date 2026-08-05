@@ -22,6 +22,7 @@ from dayu.host._runner_call_manifest import (
     parse_runner_call_hot_payload,
     parse_runner_call_manifest,
 )
+from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host.durable._validation import (
     optional_text as _optional_text,
     require_int as _require_int,
@@ -615,6 +616,7 @@ def _resolve_compactor_response_identity(
                 )
             previous_sequence = row.event_sequence
             candidate = _resolved_compactor_response_from_row(
+                transaction,
                 row,
                 manifest=manifest,
                 proposal_manifest_ref=proposal_manifest_ref,
@@ -637,6 +639,7 @@ def _resolve_compactor_response_identity(
 
 
 def _resolved_compactor_response_from_row(
+    transaction: HostTransaction,
     row: EventLogRow,
     *,
     manifest: RunnerCallInputManifest,
@@ -645,6 +648,7 @@ def _resolved_compactor_response_from_row(
 ) -> ResolvedCompactorResponseIdentity | None:
     """严格解析单条 canonical terminal 并判断其是否匹配 manifest。
 
+    :param transaction: 当前 Host read transaction。
     :param row: parent Host Run 的 canonical terminal row。
     :param manifest: 当前 compactor proposal typed manifest。
     :param proposal_manifest_ref: 当前 manifest descriptor ref。
@@ -660,11 +664,12 @@ def _resolved_compactor_response_from_row(
             "ordinary runner manifest cannot resolve compactor terminal"
         )
     try:
-        payload = _json_object_from_text(row.payload_json)
         if row.event_type == CONTEXT_COMPACTED:
+            payload = resolve_context_compacted_payload(transaction, row)
             binding = parse_context_compacted_terminal_binding(payload)
             disposition = CompactorResponseDisposition.ACCEPTED
         elif row.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+            payload = _json_object_from_text(row.payload_json)
             binding = parse_context_compaction_attempt_rejected_terminal_binding(
                 payload
             )

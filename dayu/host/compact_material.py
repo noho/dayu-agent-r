@@ -43,7 +43,8 @@ from dayu.host.compaction import (
     validate_previous_compacted_view_pair,
 )
 from dayu.host.context_budget import BudgetTextFragment
-from dayu.host.context_events import CONTEXT_COMPACTED, validate_context_compacted_payload
+from dayu.host.context_event_payload import resolve_context_compacted_payload
+from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.accepted_result_projection import (
     project_accepted_tool_result,
@@ -2489,12 +2490,7 @@ def _validated_compacted_payload(transaction: HostTransaction, row: EventLogRow)
     :raises HostDurableError: payload 结构或 digest 非法时抛出。
     """
 
-    payload = event_payload_object(transaction, row, payload_label=CONTEXT_COMPACTED)
-    try:
-        validate_context_compacted_payload(payload)
-    except (TypeError, ValueError) as exc:
-        raise HostDurableError("CONTEXT_COMPACTED payload is invalid") from exc
-    return payload
+    return resolve_context_compacted_payload(transaction, row)
 
 
 def _post_compact_delta_start_sequence(

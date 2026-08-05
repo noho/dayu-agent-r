@@ -814,9 +814,10 @@ def test_tool_trace_excludes_internal_effective_execution_value(
             )
         )
 
-        assert not consumer.event_filter.matches(
-            projection_event_view_from_row(row)
+        event = store.transaction_runner.run_read(
+            lambda transaction: projection_event_view_from_row(transaction, row)
         )
+        assert not consumer.event_filter.matches(event)
         _run_trace_once(store.transaction_runner, cold_path)
 
         hot_row = store.transaction_runner.run_read(
@@ -936,7 +937,9 @@ def test_tool_trace_direct_request_row_corruption_fails_closed(
             store.transaction_runner,
             corruption=corruption,
         )
-        event = projection_event_view_from_row(row)
+        event = store.transaction_runner.run_read(
+            lambda transaction: projection_event_view_from_row(transaction, row)
+        )
         if corruption is _RequestedRowCorruption.WRONG_EVENT_TYPE:
             event = replace(event, event_type="TOOL_CALL_REQUESTED")
         if corruption is _RequestedRowCorruption.MISSING_ROW:
@@ -996,7 +999,7 @@ def test_tool_trace_canonical_result_without_llm_material_fails_closed(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(result),
+                    projection_event_view_from_row(transaction, result),
                 )
             )
         hot_row = store.transaction_runner.run_read(
@@ -1900,7 +1903,7 @@ def test_tool_trace_rejects_malformed_tool_timing_signal(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -1969,7 +1972,7 @@ def test_tool_trace_rejects_malformed_failure_metadata_signal(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2057,7 +2060,7 @@ def test_tool_trace_rejects_malformed_partial_tool_call_signal(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2301,7 +2304,7 @@ def test_tool_trace_rejects_non_object_summary_signal_fields(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2592,7 +2595,7 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2815,7 +2818,7 @@ def test_tool_trace_projection_rejects_non_text_client_correlation_id(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 

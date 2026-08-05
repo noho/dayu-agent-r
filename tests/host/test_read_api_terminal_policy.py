@@ -81,7 +81,7 @@ def test_failed_terminal_projection_appends_correlation_suffix(
         outbox_row = store.transaction_runner.run_read(
             lambda transaction: build_outbox_terminal_item_row(
                 transaction,
-                projection_event_view_from_row(row),
+                projection_event_view_from_row(transaction, row),
             )
         )
 

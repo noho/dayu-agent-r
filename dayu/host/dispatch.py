@@ -189,6 +189,7 @@ from dayu.host.compaction_operation import (
     run_compaction_attempt,
     write_compaction_rejected_attempt_diagnostic_artifact,
 )
+from dayu.host.context_event_payload import store_context_compacted_payload
 from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.compaction_terminal import (
     COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
@@ -3284,10 +3285,33 @@ class HostDispatchScheduler:
                 policy_digest=policy_digest,
             ),
         )
+        event_id = _new_event_id(_EVENT_ID_CONTEXT_COMPACTED_PREFIX)
+        compacted_payload = build_context_compacted_payload(
+            operation_id=operation_id,
+            accepted_attempt_number=accepted_attempt_number,
+            compact_artifact_ref=descriptor.payload_ref,
+            compact_artifact_digest=artifact_ref.artifact_digest,
+            accepted_truth=accepted_truth,
+            budget_after_compact=budget_after_compact,
+            prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
+            accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(
+                request,
+                accepted_truth.candidate,
+            ),
+            projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+            accepted_proposal_manifest_reference=(accepted_proposal_manifest_reference),
+            successful_response_identity=successful_response_identity,
+        )
+        payload_storage = store_context_compacted_payload(
+            transaction,
+            PayloadStore(),
+            event_id=event_id,
+            payload=compacted_payload,
+        )
         event = self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
-                event_id=_new_event_id(_EVENT_ID_CONTEXT_COMPACTED_PREFIX),
+                event_id=event_id,
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=run.session_id,
                 run_id=run.run_id,
@@ -3301,24 +3325,9 @@ class HostDispatchScheduler:
                 idempotency_key=None,
                 policy_decision=None,
                 reason={"decision": decision.value},
-                payload_json=build_context_compacted_payload(
-                    operation_id=operation_id,
-                    accepted_attempt_number=accepted_attempt_number,
-                    compact_artifact_ref=descriptor.payload_ref,
-                    compact_artifact_digest=artifact_ref.artifact_digest,
-                    accepted_truth=accepted_truth,
-                    budget_after_compact=budget_after_compact,
-                    prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
-                    accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(
-                        request,
-                        accepted_truth.candidate,
-                    ),
-                    projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
-                    accepted_proposal_manifest_reference=(accepted_proposal_manifest_reference),
-                    successful_response_identity=successful_response_identity,
-                ),
-                payload_ref=None,
-                payload_digest=None,
+                payload_json=payload_storage.event_payload,
+                payload_ref=payload_storage.payload_ref,
+                payload_digest=payload_storage.payload_digest,
             ),
         ).row
         return event.event_sequence

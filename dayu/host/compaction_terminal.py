@@ -13,11 +13,11 @@ from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._event_payload import payload_object
+from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
-    validate_context_compacted_payload,
     validate_context_compaction_failed_payload,
     validate_context_compaction_requested_payload,
 )
@@ -212,7 +212,7 @@ def _read_operation_terminal_rows(
                 raise HostDurableError(
                     "compaction terminal event class is not canonical fact"
                 )
-            payload = _strict_terminal_payload(row)
+            payload = _strict_terminal_payload(transaction, row)
             row_operation_id = _required_text(payload, "operation_id")
             if row_operation_id != operation_id:
                 continue
@@ -246,19 +246,23 @@ def _strict_request_payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     return payload
 
 
-def _strict_terminal_payload(row: EventLogRow) -> Mapping[str, JsonValue]:
+def _strict_terminal_payload(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> Mapping[str, JsonValue]:
     """解析并严格校验 compacted/failed terminal payload。
 
+    :param transaction: 当前 Host transaction。
     :param row: terminal EventLog row。
     :returns: 已严格校验的 terminal payload。
     :raises HostDurableError: event type 或 payload contract 非法时抛出。
     """
 
     try:
-        payload = payload_object(row)
         if row.event_type == CONTEXT_COMPACTED:
-            validate_context_compacted_payload(payload)
+            return resolve_context_compacted_payload(transaction, row)
         elif row.event_type == CONTEXT_COMPACTION_FAILED:
+            payload = payload_object(row)
             validate_context_compaction_failed_payload(payload)
         else:
             raise ValueError("unsupported compaction terminal event type")

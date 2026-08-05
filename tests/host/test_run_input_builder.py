@@ -152,6 +152,7 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
     context_budget_policy_from_threshold_tokens,
 )
+from dayu.host.context_event_payload import store_context_compacted_payload
 from dayu.host.context_events import build_context_compacted_payload
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
@@ -533,6 +534,76 @@ def test_current_user_message_resolves_descriptor_payload(
         assert "descriptor durable prompt" not in input_event.payload_json
         assert isinstance(request.messages[-1], UserMessage)
         assert request.messages[-1].content == "descriptor durable prompt"
+
+
+def test_durable_compact_artifact_provider_resolves_descriptor_payload_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Durable compact provider 严格读取 descriptor-backed terminal 并拒绝 digest 漂移。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: descriptor owner contract 或 fail-closed 行为漂移时抛出。
+    """
+
+    inline_threshold_bytes = 2048
+    policy = _memory_policy()
+    with open_host_durable_store(
+        _options(
+            tmp_path,
+            payload_inline_threshold_bytes=inline_threshold_bytes,
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("descriptor-backed compact artifact provider"),
+        )
+        compacted = _append_descriptor_backed_current_run_compacted_event(
+            store.transaction_runner,
+            seeded,
+            policy=policy,
+            summary_text="oversized compact summary " * 39,
+        )
+        recovery = _start_recovery_attempt(store.transaction_runner, seeded)
+        snapshot = _attempt_snapshot(recovery)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(snapshot)
+        provider = DurableCompactArtifactProvider(store.transaction_runner)
+
+        view = provider.load_compact_artifact(snapshot, current_facts)
+
+        assert compacted.payload_json == "{}"
+        payload_ref = compacted.payload_ref
+        assert payload_ref is not None
+        assert compacted.payload_digest is not None
+        descriptor = store.transaction_runner.run_read(
+            lambda transaction: PayloadStore().read_payload_descriptor(
+                transaction,
+                payload_ref,
+            )
+        )
+        assert descriptor is not None
+        assert descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+        assert descriptor.payload_size_bytes > inline_threshold_bytes
+        assert view.compaction_event_ref == compacted.event_id
+        assert view.compact_artifact_ref == "compact-artifact:test"
+        assert view.compact_artifact_digest == _DIGEST_A
+        assert view.represented_evidence_refs == ("evidence:memory-tool",)
+
+        store.transaction_runner.run_write(
+            lambda transaction: transaction.execute(
+                f"UPDATE {TABLE_EVENT_LOG} SET payload_digest = ? WHERE event_id = ?",
+                (_DIGEST_B, compacted.event_id),
+            )
+        )
+        with pytest.raises(
+            HostDurableError,
+            match="payload integrity validation failed",
+        ):
+            provider.load_compact_artifact(snapshot, current_facts)
 
 
 def test_recovery_attempt_rebuilds_current_prompt_from_same_run_eventlog_descriptor(
@@ -4451,6 +4522,95 @@ def _append_current_run_compacted_event(
         )
 
     transaction_runner.run_write(operation)
+
+
+def _append_descriptor_backed_current_run_compacted_event(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    policy: MemoryProjectionPolicy,
+    summary_text: str,
+) -> EventLogRow:
+    """为当前 Run 写入真实 descriptor-backed ``CONTEXT_COMPACTED`` fact。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: 当前 Run 引用。
+    :param policy: 与 compact event audit 同源的 Memory policy。
+    :param summary_text: 用于触发超限外置的 compact summary。
+    :returns: 已写入的 descriptor-backed EventLog row。
+    :raises HostDurableError: payload 外置、descriptor 或 EventLog 写入失败时抛出。
+    """
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """在同一 write transaction 内持久化完整 payload 与 terminal row。
+
+        :param transaction: Host transaction。
+        :returns: 已写入的 EventLog row。
+        :raises HostDurableError: durable payload 或 EventLog 写入失败时抛出。
+        """
+
+        request_event_id = f"event-{seeded.run_id}-compact-requested"
+        event_id = f"event-{seeded.run_id}-compacted"
+        event_log_store = EventLogStore()
+        event_log_store.append_event(
+            transaction,
+            _event_request(
+                event_id=request_event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                event_type="CONTEXT_COMPACTION_REQUESTED",
+                payload={
+                    "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                    "budget_reason": "test_descriptor_backed_compact_provider",
+                    "budget_snapshot_ref": _DIGEST_A,
+                    "input_snapshot_cursor": 1,
+                    "estimator_digest": _DIGEST_A,
+                    "policy_ref": "test-policy",
+                    "provider_request_id": None,
+                    "provider_error_ref": None,
+                    "attempt_id": seeded.attempt_id,
+                    "execution_id": seeded.execution_id,
+                },
+            ),
+        )
+        payload = _compact_payload(
+            operation_id=request_event_id,
+            summary_text=summary_text,
+            pinned_patch={"candidate_id": "patch-descriptor-backed-provider"},
+            policy=policy,
+            fact_candidates=[],
+        )
+        storage = store_context_compacted_payload(
+            transaction,
+            PayloadStore(),
+            event_id=event_id,
+            payload=payload,
+        )
+        return event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="CONTEXT_COMPACTED",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=storage.event_payload,
+                payload_ref=storage.payload_ref,
+                payload_digest=storage.payload_digest,
+            ),
+        ).row
+
+    return transaction_runner.run_write(operation)
 
 
 def _material_block(

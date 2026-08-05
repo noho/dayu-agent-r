@@ -14,6 +14,7 @@ from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._event_payload import payload_object
+from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host._runner_call_manifest import (
     parse_runner_call_hot_payload,
     parse_runner_call_manifest,
@@ -23,7 +24,6 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
-    validate_context_compacted_payload,
     validate_context_compaction_attempt_rejected_payload,
     validate_context_compaction_failed_payload,
     validate_context_compaction_requested_payload,
@@ -461,7 +461,11 @@ def _project_state(
     for row in rows:
         if row.event_type == CONTEXT_COMPACTION_REQUESTED:
             continue
-        payload = payload_object(row)
+        payload = (
+            resolve_context_compacted_payload(transaction, row)
+            if row.event_type == CONTEXT_COMPACTED
+            else payload_object(row)
+        )
         if row.event_type == _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED:
             hot = parse_runner_call_hot_payload(payload)
             if hot.runner_call_kind != _RUNNER_CALL_KIND_COMPACTOR_PROPOSAL:
@@ -581,7 +585,6 @@ def _project_state(
             )
             continue
         if row.event_type == CONTEXT_COMPACTED:
-            validate_context_compacted_payload(payload)
             row_operation_id = _required_text(payload, "operation_id")
             row_owner = _required_operation_owner(
                 operation_owners,

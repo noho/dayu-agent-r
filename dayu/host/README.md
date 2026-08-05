@@ -438,7 +438,7 @@ accepted compact 与 compaction failure fallback 之后的普通 runner-call man
 
 ### Conversation Memory
 
-Conversation Memory 是 Session-level projection / read model，只消费 committed canonical facts 与 accepted `CONTEXT_COMPACTED` payload。它维护 selected recent window、evidence-backed facts、session summary、answer anchor、forward intent、reference continuity 和 diagnostics。Memory 可以重建，不是 EventLog truth。
+Conversation Memory 是 Session-level projection / read model，只消费 committed canonical facts 与 accepted `CONTEXT_COMPACTED` payload。完整 accepted terminal payload 由统一 durable payload boundary 按 inline 阈值写入 EventLog 或 payload descriptor/blob，并由 terminal permit、Memory、compact material、RunInputBuilder、projection 与 Tool Trace 共用同一严格 resolver；ref、digest、descriptor、blob bytes 或 canonical contract 任一漂移都 fail closed。它维护 selected recent window、evidence-backed facts、session summary、answer anchor、forward intent、reference continuity 和 diagnostics。Memory 可以重建，不是 EventLog truth。
 
 ### Outbox、audit 与 tool trace
 

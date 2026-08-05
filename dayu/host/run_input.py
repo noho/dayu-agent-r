@@ -76,6 +76,7 @@ from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
+from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_REQUESTED
 from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
@@ -1812,6 +1813,7 @@ class _DurableProtectedRecentRawTailProvider:
                 selected_recent_window_turn_floor=0,
             )
         _validate_loaded_compact_view_matches_event(
+            transaction,
             compact=compact,
             compacted_event=compacted_event,
         )
@@ -1968,7 +1970,7 @@ class DurableCompactArtifactProvider:
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             )
-        payload = _payload_object(row)
+        payload = resolve_context_compacted_payload(transaction, row)
         try:
             semantic_payload = parse_context_compacted_semantic_payload(payload)
         except (TypeError, ValueError) as exc:
@@ -4243,7 +4245,7 @@ def _load_pre_start_compact_artifact(
             ),
             None,
         )
-    payload = _payload_object(compacted_event)
+    payload = resolve_context_compacted_payload(transaction, compacted_event)
     try:
         semantic_payload = parse_context_compacted_semantic_payload(payload)
     except (TypeError, ValueError) as exc:
@@ -4340,6 +4342,7 @@ def _pre_start_protected_recent_raw_tail(
     if compacted_event is None:
         raise HostDurableError("compact view source event is missing")
     _validate_loaded_compact_view_matches_event(
+        transaction,
         compact=compact,
         compacted_event=compacted_event,
     )
@@ -5485,9 +5488,9 @@ def _memory_projection_payload(
     :raises HostDurableError: terminal artifact descriptor 或工具 payload 损坏时抛出。
     """
 
-    payload = _payload_object(row)
-    del transaction
-    return payload
+    if row.event_type == CONTEXT_COMPACTED:
+        return resolve_context_compacted_payload(transaction, row)
+    return _payload_object(row)
 
 
 def _assistant_final_answer_text(
@@ -5551,17 +5554,21 @@ def _latest_compacted_event_before_attempt(
 
 
 def _validate_loaded_compact_view_matches_event(
-    *, compact: CompactPipelineCompactArtifactView, compacted_event: EventLogRow
+    transaction: HostTransaction,
+    *,
+    compact: CompactPipelineCompactArtifactView,
+    compacted_event: EventLogRow,
 ) -> None:
     """校验 compact provider view 来自同一个 session latest compact event。
 
+    :param transaction: 当前 Host transaction。
     :param compact: compact provider view。
     :param compacted_event: current Run / current Attempt 前的 compacted event。
     :returns: ``None``。
     :raises HostDurableError: artifact ref 或 digest 不一致时抛出。
     """
 
-    payload = _payload_object(compacted_event)
+    payload = resolve_context_compacted_payload(transaction, compacted_event)
     artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
     artifact_digest = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST)
     if compact.compact_artifact_ref != artifact_ref:
@@ -5583,7 +5590,10 @@ def _compaction_trigger_source_for_compacted_event(
     :raises HostDurableError: requested fact 缺失或 trigger source 非法时抛出。
     """
 
-    compacted_payload = _payload_object(compacted_event)
+    compacted_payload = resolve_context_compacted_payload(
+        transaction,
+        compacted_event,
+    )
     operation_id = _required_text_field(
         compacted_payload,
         _PAYLOAD_FIELD_OPERATION_ID,

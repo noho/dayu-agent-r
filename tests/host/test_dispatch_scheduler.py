@@ -118,6 +118,7 @@ from dayu.host.compaction_operation import (
     CompactorProposalRunInput,
     DurableCompactorProposalManifestRecorder,
 )
+from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_budget import (
     ContextBudgetDecision,
@@ -223,6 +224,7 @@ from dayu.host.proactive_compaction import (
     ProactiveCompactionProjection,
     read_proactive_compaction_projection,
 )
+from dayu.host.durable.artifact import LocalArtifactRef, read_artifact_bytes
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.errors import (
@@ -240,7 +242,8 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.payload import PayloadStore
+from dayu.host.durable.memory import read_latest_memory_snapshot
+from dayu.host.durable.payload import PayloadKind, PayloadStore
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
@@ -289,6 +292,7 @@ from dayu.host.durable.transaction import (
     HostTransactionRunner,
 )
 from dayu.host.durable.tool_trace import (
+    CompactorResponseResolutionError,
     read_runner_call_reconstruction_signals_by_run,
     resolve_runner_call_projection_from_signal,
 )
@@ -7285,6 +7289,197 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             await scheduler.close()
 
 
+@pytest.mark.asyncio
+async def test_oversized_accepted_compact_terminal_uses_descriptor_truth(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """超限 accepted compact terminal 以同源 descriptor/blob 完成全部投影。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    :raises AssertionError: terminal、Memory、artifact、Tool Trace identity、
+        fail-closed 或 scheduler 收敛任一不符合 owner contract 时抛出。
+    """
+
+    payload_inline_threshold_bytes = 8192
+    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    compactor = _MinimalSummaryCompactor()
+    memory_policy = _compact_no_floor_memory_policy()
+    with open_host_durable_store(
+        _options(
+            tmp_path,
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        for ordinal in range(3):
+            history_run_id = f"run-oversized-accepted-history-{ordinal}"
+            _append_user_input(
+                store.transaction_runner,
+                session_id=session_id,
+                run_id=history_run_id,
+                event_id=f"event-input-{history_run_id}",
+                display_text=f"history-{ordinal}:" + ("h" * 2600),
+                client_request_id=f"client-{history_run_id}",
+                idempotency_key=f"idem-{history_run_id}",
+            )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-oversized-accepted-terminal",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=16384,
+                soft_threshold_tokens=100,
+                hard_threshold_tokens=12000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=memory_policy,
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+            await _wait_for_event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTED,
+                expected_count=1,
+            )
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.RUNNING,
+            )
+            compacted = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTED,
+            )
+            compacted_payload = store.transaction_runner.run_read(
+                lambda transaction: resolve_context_compacted_payload(
+                    transaction,
+                    compacted,
+                )
+            )
+
+            assert len(canonical_json_dumps(compacted_payload).encode("utf-8")) > (
+                payload_inline_threshold_bytes
+            )
+            assert compacted.payload_json == "{}"
+            assert compacted.payload_ref is not None
+            assert compacted.payload_digest == sha256_digest_json(compacted_payload)
+            terminal_descriptor = store.transaction_runner.run_read(
+                lambda transaction: PayloadStore().read_payload_descriptor(
+                    transaction,
+                    cast(str, compacted.payload_ref),
+                )
+            )
+            assert terminal_descriptor is not None
+            assert terminal_descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+
+            compact_artifact_ref = _required_json_text(
+                compacted_payload["compact_artifact_ref"]
+            )
+            compact_artifact_digest = _required_json_text(
+                compacted_payload["compact_artifact_digest"]
+            )
+            assert compact_artifact_ref != compacted.payload_ref
+            compact_descriptor = store.transaction_runner.run_read(
+                lambda transaction: PayloadStore().read_payload_descriptor(
+                    transaction,
+                    compact_artifact_ref,
+                )
+            )
+            assert compact_descriptor is not None
+            assert compact_descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+            assert compact_descriptor.payload_digest == compact_artifact_digest
+            assert compact_descriptor.artifact_relative_path is not None
+            compact_artifact_bytes = read_artifact_bytes(
+                tmp_path / "compact-artifacts",
+                LocalArtifactRef(
+                    artifact_relative_path=compact_descriptor.artifact_relative_path,
+                    artifact_digest=compact_descriptor.payload_digest,
+                    artifact_size_bytes=compact_descriptor.payload_size_bytes,
+                ),
+            )
+            compact_artifact_json = cast(
+                JsonValue,
+                json.loads(compact_artifact_bytes),
+            )
+            assert isinstance(compact_artifact_json, Mapping)
+            assert compact_artifact_json["accepted_candidate"] == (
+                compacted_payload["accepted_candidate"]
+            )
+
+            memory_row = store.transaction_runner.run_read(
+                lambda transaction: read_latest_memory_snapshot(
+                    transaction,
+                    session_id=seeded.session_id,
+                    consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                    policy_digest=digest_memory_projection_policy(memory_policy),
+                )
+            )
+            assert memory_row is not None
+            assert memory_row.snapshot.latest_compaction_event_ref == compacted.event_id
+            assert memory_row.snapshot.session_summary_memory.summary_text == "rolled"
+
+            _resolve_and_assert_compactor_calls(
+                store.transaction_runner,
+                tmp_path=tmp_path,
+                run_id=seeded.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=(compacted_payload,),
+                accepted_attempt_number=1,
+            )
+            signal_page = store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                    transaction,
+                    seeded.run_id,
+                    after_event_sequence=0,
+                    limit=100,
+                )
+            )
+            compactor_signal = next(
+                signal
+                for signal in signal_page.signals
+                if signal.runner_call_kind == _COMPACTOR_RUNNER_CALL_KIND
+            )
+            store.transaction_runner.run_write(
+                lambda transaction: transaction.execute(
+                    f"UPDATE {TABLE_EVENT_LOG} SET payload_digest = ? WHERE event_id = ?",
+                    (_CALL_CONTEXT_DIGEST, compacted.event_id),
+                )
+            )
+            with pytest.raises(
+                CompactorResponseResolutionError,
+                match="canonical terminal payload is malformed",
+            ):
+                store.transaction_runner.run_read(
+                    lambda transaction: resolve_runner_call_projection_from_signal(
+                        transaction,
+                        compactor_signal,
+                    )
+                )
+
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.RUNNING
+            assert scheduler._promotion_drain_task is not None
+            assert scheduler._promotion_drain_task.done() is False
+            assert scheduler._health_gate.state is HostExecutionHealthState.READY
+            assert not any(
+                "critical_task.fatal" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            await scheduler.close()
+
+
 @pytest.mark.parametrize(
     ("crash_attempt_number", "expected_resume_stage"),
     (
@@ -9722,16 +9917,24 @@ async def test_no_budget_manifest_preserves_actual_dispatch_stage(
             await scheduler.close()
 
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+def _options(
+    tmp_path: Path,
+    *,
+    payload_inline_threshold_bytes: int = 65536,
+) -> HostDurableStoreOptions:
     """构造 Host durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: durable store options。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "host.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
