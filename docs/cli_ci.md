@@ -306,6 +306,12 @@ Oracle 状态只允许：
 
 Accepted oracle 后续仍可被新证据挑战。修改时必须创建新版本并把旧版本标记为 `superseded`；不得原地改写旧 oracle，使历史 CI verdict 失去解释基础。
 
+当前判定按稳定 `predicate_id` 解析版本，而不是把 scenario 冻结的 `accepted_oracle_refs` 当作永久 current owner。每个
+`oracle_predicate_refs` 必须恰好连接到一个 `status=accepted` 且未被 supersede 的当前 oracle version；零命中是 dangling
+ref，多于一个命中是 duplicate current owner，二者都必须 fail closed。`accepted_oracle_refs` 只记录 scenario 获裁决时
+所依据的 oracle version，oracle lifecycle replacement 不得批量改写这些历史引用。旧 oracle version 标为
+`superseded` 后只用于解释历史 verdict，不再执行其 predicate contract。
+
 ### 4.4 Oracle Record
 
 每条候选或已接受 oracle 至少记录：
@@ -443,6 +449,13 @@ readiness conditions。不得把“首个 run 允许为空”误写成“第一�
 
 `docs/cli_ci_oracles.json` 中每条 oracle 至少包含第 4.4 节要求的 identity、scope、predicate、authority、状态和版本字段；只有 `accepted` 记录参与正式 verdict。`rejected` / `superseded` 可以保留在 registry 用于历史解释，但不得参与当前判定。per-run candidate/adjudication artifact 不能伪装成跨 run 已冻结 registry。
 
+当 accepted oracle 发生 replacement 时，registry 顶层状态仍由完整 readiness proof 决定，不能因新 oracle version 已
+accepted 就手工切换为 `ready`。当前 registry 中 `cli.interactive.core-execution@2` 是稳定 predicate 的 current accepted
+owner；611 条历史 scenario records 的 768 个 `oracle_predicate_refs` 继续各自按 stable predicate id 解析到唯一 current
+accepted owner，其中 interactive predicates 解析到 `core-execution@2`，跨 command predicate 仍解析到其所属的 current
+accepted oracle。冻结的 `accepted_oracle_refs` 不迁移。该 current-resolution 规则不把 replacement scenario 的 evidence
+observation 自动裁决为 accepted scenario。
+
 第一轮 campaign 只有同时满足以下 readiness conditions 才能结束：
 
 1. parser 与 interactive branch inventories 已冻结，identity/version/digest 可复核，且没有未分类 leaf、parameter、
@@ -516,6 +529,12 @@ campaign 不得结束，当前 run 也不得形成 `full-real-pass`。
 只有用户已裁决并标记为 `accepted`、且 coverage/evidence/oracle refs 校验通过的 scenario 参与正式覆盖率。
 Calibration run 生成的新场景先写入 per-run candidates；用户裁决后通过正式 work unit 写入稳定 registry，不能由
 validation worktree 原地修改。
+
+Superseded scenario 只保留历史 invocation、evidence 与裁决解释，不得再作为 current formal scenario 执行。已有完整真实
+evidence、但尚待 Oracle controller 裁决的 replacement scenario 可以登记为 `unadjudicated` 并引用 immutable evidence；
+它们只作为后续裁决输入，不参与正式覆盖率、不得投影成 registry ready。F11/F12 replacement 使用
+`tool-trace-formal@2`、`rolling-correction-replacement@1` 与 `cap-constrained-memory-replacement@1`；在状态变为
+`accepted` 前不得把 S4 observation 写成 accepted Oracle verdict。
 
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终

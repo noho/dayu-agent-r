@@ -128,3 +128,15 @@ The repair must be made at those owners, not in Memory consumers, CLI rendering,
 ## Readiness decision after finding adjudication
 
 F08 and F10 have sufficient post-fix real evidence. Interactive command closure still has two confirmed blockers: incomplete F11 public response-identity projection and F12's compaction contract/ownership redesign. Consequently this artifact does not yet change accepted oracle/scenario registries and does not claim that `init/prompt/interactive` are ready for an unqualified second-round CI run. After implementation, #59 must be re-observed through only the public formal Tool Trace API, and the replacement compact contract must receive new real-provider observation and user adjudication before registry readiness is frozen.
+
+## Final implementation status appended on 2026-08-06
+
+The frozen finding text above remains the historical pre-implementation observation and has not been rewritten. The final implementation/evidence state is:
+
+- Implementation: **PASS**. F11 now exposes Host-owned compactor response identity through the public Tool Trace resolver and analysis projection; F12 now uses the fresh v3 semantic candidate with Host-owned provenance partition, omitted complement, caps, usage audit, bounded repair/fallback and one accepted durable truth.
+- Real observation: **complete**. The accepted immutable S4 root is `/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY`; its human-readable report is `observed-report.md` with SHA-256 `bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411`; root `digest.json` SHA-256 is `38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d`. S4 acceptance is recorded in `docs/reviews/pr-190-f11-f12-s4-evidence-acceptance-20260806.md`.
+- Oracle: **pending**. `cli.interactive.core-execution@1` and the three legacy scenarios are superseded; current `core-execution@2` is accepted from the user's explicit 2026-08-05 F11/F12 replacement-contract decision. `tool-trace-formal@2`, `rolling-correction-replacement@1` and `cap-constrained-memory-replacement@1` remain `unadjudicated` despite complete S4 evidence.
+- F11 status: implementation and real public/canonical equality observation complete; replacement scenario adjudication remains owned by the Oracle controller.
+- F12 status: fresh v3 implementation and real provenance/omitted/cap/repair/reconnect observation complete; replacement scenario adjudication remains owned by the Oracle controller.
+- Registry/readiness: both registries remain `calibration`; this artifact does **not** mark interactive, Oracle or registry readiness as ready.
+- Immediate Gateflow entry point: controller dual code review of the S5 registry/docs implementation slice. After that review loop, the next unresolved product-validation owner remains the Oracle controller.

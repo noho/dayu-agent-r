@@ -112641,7 +112641,7 @@
       "scenario_id": "interactive.interactive.g06.tool-trace-formal",
       "source_scenario_id": "interactive.MC32-intent-resolution-rolling-compact",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "interactive",
       "path_kind": "state-chain",
       "coverage_claims": {
@@ -112738,7 +112738,7 @@
       "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
       "applicable_from": "next-interactive-conformance-run-after-F08-F10",
       "supersedes": null,
-      "superseded_by": null
+      "superseded_by": "interactive.interactive.g06.tool-trace-formal@2"
     },
     {
       "scenario_id": "interactive.interactive.g06.turn-group-atomicity",
@@ -112856,7 +112856,7 @@
       "scenario_id": "interactive.interactive.g06.drop-superseded",
       "source_scenario_id": null,
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "interactive",
       "path_kind": "state-chain",
       "coverage_claims": {
@@ -112944,13 +112944,13 @@
       "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
       "applicable_from": "next-interactive-conformance-run-after-F08-F10",
       "supersedes": null,
-      "superseded_by": null
+      "superseded_by": "interactive.interactive.g06.rolling-correction-replacement@1"
     },
     {
       "scenario_id": "interactive.interactive.g06.drop-policy-limit",
       "source_scenario_id": null,
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "interactive",
       "path_kind": "state-chain",
       "coverage_claims": {
@@ -113038,6 +113038,327 @@
       "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
       "applicable_from": "next-interactive-conformance-run-after-F08-F10",
       "supersedes": null,
+      "superseded_by": "interactive.interactive.g06.cap-constrained-memory-replacement@1"
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.tool-trace-formal",
+      "source_scenario_id": "interactive.MC32-intent-resolution-rolling-compact",
+      "version": 2,
+      "status": "unadjudicated",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "successful-or-failed-real-compactor-call"
+        ],
+        "interactive_branch_option_ids": [
+          "formal-compactor-tool-trace-query"
+        ],
+        "input_class_ids": [
+          "runner-call-public-read"
+        ],
+        "combination_high_risk_ids": [
+          "eventlog-hot-projection-manifest-identity"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "interactive.g06.tool-trace-formal"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<tool-trace-formal>",
+          "--label",
+          "memory-tool-trace-formal",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "分别观察successful compact与successful-response-then-rejected attempt，只经public Host Tool Trace resolver及analysis JSON/Markdown读取response identity并与canonical terminal逐字段比对"
+        ]
+      },
+      "precondition": {
+        "state_id": "real-compactor-call-observed",
+        "workspace": "<run-root>/workspaces/chains/<tool-trace-formal>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@2"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-formal-compactor-tool-trace"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "public-host-tool-trace-resolver-and-analysis-response-identity",
+        "canonical-terminal-response-identity-equality",
+        "secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [
+          "interactive-memory-v3-20260805T-s4-restart-uOZytY"
+        ],
+        "report_ids": [
+          "/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY/observed-report.md"
+        ],
+        "report_sha256": [
+          "bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411"
+        ],
+        "relative_refs": [
+          "evidence/01-mimo-baseline/public-runner-projections.json",
+          "evidence/01-mimo-baseline/public-canonical-equality.json",
+          "evidence/03-mimo-exhausted-fallback/public-runner-projections.json",
+          "evidence/03-mimo-exhausted-fallback/public-canonical-equality.json",
+          "evidence/04-deepseek-baseline/public-runner-projections.json",
+          "evidence/04-deepseek-baseline/public-canonical-equality.json",
+          "evidence/06-deepseek-bounded-repair/public-runner-projections.json",
+          "evidence/06-deepseek-bounded-repair/public-canonical-equality.json",
+          "evidence/08-deepseek-exhausted-fallback/public-runner-projections.json",
+          "evidence/08-deepseek-exhausted-fallback/public-canonical-equality.json",
+          "metadata/secret-scan.json",
+          "digest.json#sha256=38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d"
+        ],
+        "execution_outcome": "success",
+        "exit_codes": [
+          0
+        ],
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "oracle-review-pending"
+      },
+      "user_adjudication_identity": "pending-oracle-controller-adjudication",
+      "applicable_from": "after-oracle-controller-adjudication",
+      "supersedes": "interactive.interactive.g06.tool-trace-formal@1",
+      "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.rolling-correction-replacement",
+      "source_scenario_id": null,
+      "version": 1,
+      "status": "unadjudicated",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "accepted-old-business-state-plus-evidence-backed-current-correction"
+        ],
+        "interactive_branch_option_ids": [
+          "rolling-correction-replacement"
+        ],
+        "input_class_ids": [
+          "temporal-correction"
+        ],
+        "combination_high_risk_ids": [
+          "current-replacement-provenance-and-old-omission"
+        ],
+        "cross_command_assertion_ids": [
+          "interactive.memory.rolling-correction-replacement-reconnect"
+        ],
+        "raw_stable_claims": [
+          "interactive.g06.rolling-correction-replacement"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<rolling-correction-replacement>",
+          "--label",
+          "memory-rolling-correction-replacement",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "建立旧事实与明确有来源的新口径，触发rolling compact；验证current replacement provenance被retained、旧labels由Host记为omitted，随后验证artifact/Memory/RunInput/reconnect均无旧结论"
+        ]
+      },
+      "precondition": {
+        "state_id": "accepted-old-business-state-plus-evidence-backed-current-correction",
+        "workspace": "<run-root>/workspaces/chains/<rolling-correction-replacement>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@2"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.30-rolling-correction-replacement"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "retained-current-replacement-provenance",
+        "host-derived-omitted-old-labels",
+        "compact-artifact-memory-post-compact-runinput-without-old-conclusion",
+        "cross-process-reconnect-without-old-conclusion"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [
+          "interactive-memory-v3-20260805T-s4-restart-uOZytY"
+        ],
+        "report_ids": [
+          "/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY/observed-report.md"
+        ],
+        "report_sha256": [
+          "bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411"
+        ],
+        "relative_refs": [
+          "evidence/05-deepseek-replacement-constrained",
+          "evidence/07-deepseek-reconnect",
+          "digest.json#sha256=38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d"
+        ],
+        "execution_outcome": "success",
+        "exit_codes": [
+          0
+        ],
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "oracle-review-pending"
+      },
+      "user_adjudication_identity": "pending-oracle-controller-adjudication",
+      "applicable_from": "after-oracle-controller-adjudication",
+      "supersedes": "interactive.interactive.g06.drop-superseded@1",
+      "superseded_by": null
+    },
+    {
+      "scenario_id": "interactive.interactive.g06.cap-constrained-memory-replacement",
+      "source_scenario_id": null,
+      "version": 1,
+      "status": "unadjudicated",
+      "command": "interactive",
+      "path_kind": "state-chain",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "interactive.label"
+        ],
+        "precondition_state_ids": [
+          "relevant-material-over-initial-output-caps"
+        ],
+        "interactive_branch_option_ids": [
+          "cap-constrained-memory-replacement"
+        ],
+        "input_class_ids": [
+          "initial-request-with-real-caps"
+        ],
+        "combination_high_risk_ids": [
+          "host-cap-audit-repair-fallback"
+        ],
+        "cross_command_assertion_ids": [
+          "interactive.memory.cap-constrained-replacement-reconnect"
+        ],
+        "raw_stable_claims": [
+          "interactive.g06.cap-constrained-memory-replacement"
+        ]
+      },
+      "invocation": {
+        "cwd": "<run-root>/repo",
+        "argv": [
+          "dayu-cli",
+          "interactive",
+          "--base",
+          "<run-root>/workspaces/chains/<cap-constrained-memory-replacement>",
+          "--label",
+          "memory-cap-constrained-replacement",
+          "--detail",
+          "--no-thinking"
+        ],
+        "stdin": "PTY",
+        "input_description": [
+          "向initial compactor input提供真实caps；验证Host cap/usage audit、accepted provenance/omitted精确补集、same-boundary bounded repair、budget-exhausted fallback及reconnect同源"
+        ]
+      },
+      "precondition": {
+        "state_id": "relevant-material-over-initial-output-caps",
+        "workspace": "<run-root>/workspaces/chains/<cap-constrained-memory-replacement>"
+      },
+      "accepted_oracle_refs": [
+        "cli.interactive.core-execution@2"
+      ],
+      "oracle_predicate_refs": [
+        "interactive.29-compactor-output-accept-repair-fallback",
+        "interactive.30-compaction-semantic-memory-closure"
+      ],
+      "correctness_surfaces": [
+        "interactive.29-host-cap-repair-fallback",
+        "interactive.30-cap-constrained-memory-replacement"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "real-provider-and-tool-use-when-runtime-is-reached",
+        "mock-fake-forbidden"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "real-output-caps-in-initial-input",
+        "host-cap-and-usage-audit",
+        "accepted-provenance-and-omitted-exact-complement",
+        "same-boundary-bounded-repair-and-budget-exhausted-fallback",
+        "compact-artifact-memory-runinput-and-reconnect-same-truth"
+      ],
+      "observed_evidence": {
+        "bundle_ids": [
+          "interactive-memory-v3-20260805T-s4-restart-uOZytY"
+        ],
+        "report_ids": [
+          "/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY/observed-report.md"
+        ],
+        "report_sha256": [
+          "bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411"
+        ],
+        "relative_refs": [
+          "evidence/05-deepseek-replacement-constrained",
+          "evidence/06-deepseek-bounded-repair",
+          "evidence/07-deepseek-reconnect",
+          "evidence/03-mimo-exhausted-fallback",
+          "evidence/08-deepseek-exhausted-fallback",
+          "digest.json#sha256=38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d"
+        ],
+        "execution_outcome": "success",
+        "exit_codes": [
+          0
+        ],
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "oracle-review-pending"
+      },
+      "user_adjudication_identity": "pending-oracle-controller-adjudication",
+      "applicable_from": "after-oracle-controller-adjudication",
+      "supersedes": "interactive.interactive.g06.drop-policy-limit@1",
       "superseded_by": null
     }
   ],

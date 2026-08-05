@@ -882,7 +882,7 @@
     {
       "oracle_id": "cli.interactive.core-execution",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "category": "cli-interactive-core-execution",
       "scope": {
         "command": "interactive",
@@ -1453,6 +1453,589 @@
         "target": "next-interactive-conformance-run-after-memory-closure-findings"
       },
       "supersedes": null,
+      "superseded_by": "cli.interactive.core-execution@2"
+    },
+    {
+      "oracle_id": "cli.interactive.core-execution",
+      "version": 2,
+      "status": "accepted",
+      "category": "cli-interactive-core-execution",
+      "scope": {
+        "command": "interactive",
+        "scenes": [
+          "interactive"
+        ],
+        "surfaces": [
+          "public-parameter-surface",
+          "workspace-model-consumption",
+          "provider-failure-repl-continuation",
+          "cross-entry-label-conversation",
+          "shared-run-options",
+          "logging",
+          "tty-composer-editing",
+          "non-tty-whole-stdin-batch",
+          "history-search",
+          "external-editor",
+          "idle-ctrl-c",
+          "ctrl-d-and-eof",
+          "idle-escape-and-sequences",
+          "running-escape-cancellation",
+          "running-escape-sequence-disambiguation",
+          "running-ctrl-c-graceful-closeout",
+          "running-typeahead-queue",
+          "activity-toggle",
+          "terminal-restoration",
+          "startup-sigint-and-lost",
+          "session-reconnect-and-cursor",
+          "unfinished-run-recovery",
+          "cancelled-run-non-resurrection",
+          "memory-and-grounded-tool-evidence",
+          "run-failure-isolation-and-next-turn",
+          "context-compaction-single-flight-and-success",
+          "context-compaction-semantic-memory-closure",
+          "session-attachment-access"
+        ]
+      },
+      "predicates": [
+        {
+          "predicate_id": "interactive.01-public-parameter-surface",
+          "expected": [
+            "裸 dayu-cli interactive 是无 positional prompt 的合法 REPL invocation；多余 positional、unknown option、缺失 option value 与非法 UTF-8 argv 在 primary operation 前按 parser usage exit 2。",
+            "interactive 只通过 --base/-b/--workspace 选择 workspace；公开参数中不存在 --config 或 --ticker。",
+            "prompt 与 interactive 的公开参数中都不存在 --config；Agent、help、handbook、oracle 与 scenario registry 均不得把它当作产品能力。"
+          ],
+          "forbidden": [
+            "为 prompt/interactive --config 或 interactive --ticker 建立 accepted scenario、兼容别名、隐藏入口或 runtime fallback。",
+            "因当前 legacy parser leaf 存在就把它升级为 oracle。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.02-workspace-model-and-provider-failure",
+          "expected": [
+            "未运行 init 或 workspace 没有可用 config 时，interactive 使用 dayu/config 包内默认配置；存在可用 workspace config 时使用 workspace scene/model/provider 配置。",
+            "--model/-m 只覆盖当前 invocation 的主 Run，不修改 workspace 默认配置。",
+            "已经进入 REPL 后发生真实 provider rejection 或 network unreachable，只令当前 Run failed并恢复 dayu>；provider failure 本身不退出 interactive。",
+            "测试在恢复 dayu> 后另行发送 EOF所产生的 exit 0，只表达正常 EOF 收尾，不得归因于 provider failure。",
+            "未知 model、credential 缺失或 runtime/config assembly 在 REPL 建立前失败时，可以明确 exit 1；该 startup surface 不与 Run 中 provider failure 混为一类。"
+          ],
+          "forbidden": [
+            "单轮 provider failure 自动关闭仍可继续使用的 interactive REPL。",
+            "把 harness EOF 伪报成模型失败导致的 process exit。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.03-label-is-cross-entry-conversation-alias",
+          "expected": [
+            "--label 是 durable conversation/Session 的用户可读 alias，不是 prompt 与 interactive 各自独立的 namespace。",
+            "prompt 无 label 时保持 fresh one-shot；interactive 无 label 时每次 invocation 创建 fresh Session。",
+            "同一 workspace 中的相同 label 必须能在 prompt --label 与 interactive --label 之间双向续问，并解析到同一个 durable conversation/Session。",
+            "跨入口连续性必须由 Session identity、prior-turn runner input、memory 和 EventLog 证明，不能只依据最终回答猜测。"
+          ],
+          "forbidden": [
+            "把相同 label 映射成互不相通的 cli.prompt.* 与 cli.interactive.* conversation。",
+            "无 label invocation 隐式复用上一进程的匿名 Session。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.04-shared-run-options",
+          "expected": [
+            "--detail/--no-detail 与 --thinking/--no-thinking 分别是互斥布尔选择；temperature、tool timeout、max iterations、fallback mode/prompt 与 failed-tool-batch threshold 复用 prompt 已接受的 validator、owner 和 forwarding contract。",
+            "合法 option override 对当前 interactive invocation 的各 turn 生效；parser contract 错误在 primary operation 前 exit 2。"
+          ],
+          "forbidden": [
+            "interactive 为相同公开参数另建语义不一致的 validator或静默改写 override。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.05-logging",
+          "expected": [
+            "interactive 复用 prompt 已接受的 debug/verbose/info/warning/error/critical/quiet 唯一普通日志等级、warn/ warning 等价拼写、全部快捷入口及 selector 互斥 contract。",
+            "--debug-stream 位于普通日志 selector 之外，可与非 quiet 等级组合；--log-file 独立并采用 append 语义。",
+            "interactive 长进程中跨 turn 与跨进程的日志写入不得截断既有内容。"
+          ],
+          "forbidden": [
+            "同一 invocation 接受两个普通日志 selector。",
+            "--debug-stream 改写普通日志等级或与 quiet 组合。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.06-tty-composer-editing",
+          "expected": [
+            "空或纯空白 draft 按 Enter 不创建 Run；非空 draft 按 Enter 提交屏幕编辑后的完整文本并创建一个 Run。",
+            "Unicode、宽字符、组合字符、长行、paste、光标移动、Backspace/Delete 与内部多行内容必须保持 exact-buffer 语义。",
+            "Ctrl+J 插入换行而不提交；终端能够提供可区分 key sequence 时，Shift+Enter 也插入换行而不提交。",
+            "若终端无法区分 Shift+Enter 与普通 Enter，CLI/CI 必须记录 terminal capability 与 exact bytes，不得伪报已支持。"
+          ],
+          "forbidden": [
+            "把 Ctrl+J 或可区分的 Shift+Enter 当成提交。",
+            "只根据最终回答反推未记录的 composer buffer。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.07-non-tty-whole-stdin-batch",
+          "expected": [
+            "non-TTY stdin 从首 byte 到真实 EOF 的全部输入构成一个 draft；内部 LF、CRLF 或 CR 是用户内容，真实 EOF 是唯一提交边界。",
+            "CRLF/CR 规范化为 LF，沿用 TTY 的首尾空白规则并保留内部换行。",
+            "空或纯空白 batch 不创建 Run并 exit 0；非空 batch 在 EOF 后整体提交且只创建一个 Run，Run terminal 后结束进程，不进入第二轮 REPL。",
+            "流中的 literal 0x04 是普通数据；只有 input stream exhaustion 表达 EOF。",
+            "non-TTY 输出不显示 dayu> 等 TTY composer prompt；非法 UTF-8 使用稳定、脱敏的输入错误，不暴露 Python codec exception 或 surrogate 文本。"
+          ],
+          "forbidden": [
+            "把普通换行当作 turn delimiter并将一个 batch 拆成多个 Run。",
+            "在未定义显式 framing contract 时通过一个 pipe 猜测多轮边界。",
+            "用 literal 0x04、PTY master close 或 harness kill 冒充真实 pipe EOF。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.08-history-and-search",
+          "expected": [
+            "同一 interactive 进程内的 Up/Down、Ctrl+R 无匹配/唯一匹配/多匹配及取回后编辑提交保持当前 InMemoryHistory 行为。",
+            "业务 conversation memory 可以按 label 跨进程持久化，但 composer history 不因此跨进程持久化。"
+          ],
+          "forbidden": [
+            "把 composer history 当作 Host conversation memory 或跨进程 durable truth。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.09-external-editor",
+          "expected": [
+            "Ctrl+X Ctrl+E 打开外部 editor；editor 成功修改后的 draft 由用户后续提交并形成对应 Run。",
+            "editor 取消或非零返回时不伪造 Run并恢复原 composer；依赖库拥有 editor/tempfile 子进程机制，Dayu 拥有公开 binding 与失败投影。",
+            "EDITOR或VISUAL未配置时可以使用系统 editor fallback；环境显式配置但目标不存在、不可执行或无法启动时，必须显示清晰错误并返回原 composer。"
+          ],
+          "forbidden": [
+            "editor 未产生已接受 draft 时创建 Host Run。",
+            "把 prompt_toolkit 内部 editor 机制误记为 Host或Engine能力。",
+            "显式无效的EDITOR/VISUAL被静默忽略并回退到另一系统editor。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.10-idle-ctrl-c",
+          "expected": [
+            "非空或纯空白 draft 的第一次 Ctrl+C 清空 draft并留在 composer。",
+            "空 composer 第一次 Ctrl+C 登记退出意图，连续第二次 Ctrl+C 清理后 exit 130。",
+            "中间经过 blank Enter 或已完成 Run 时，pending exit 状态重置。"
+          ],
+          "forbidden": [
+            "非空 draft 一次 Ctrl+C 直接退出进程。",
+            "pending exit 跨正常提交或已完成 turn 意外保留。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.11-running-escape-cancels-without-exit",
+          "expected": [
+            "standalone Escape 在 pre-accept、provider wait、tool loop及其它 active-turn 可取消阶段都表达取消当前 Run。",
+            "Run 尚未返回 id 时，取消必须跨 acceptance barrier 收口，不能遗留 orphan Run。",
+            "Host canonical cancel terminal 完成后恢复 composer；Escape 本身不退出 interactive。"
+          ],
+          "forbidden": [
+            "very-early pre-accept Escape 被丢弃并允许 Run继续成功。",
+            "把测试为收尾另行发送的 EOF归因成 Escape 导致 process exit。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.12-running-ctrl-c-graceful-closeout",
+          "expected": [
+            "用户已提交 turn 后，任何阶段第一次 Ctrl+C 都合并为一次 graceful cancel intent。",
+            "Run 尚未返回 id 时也必须跨 acceptance barrier 收口；连续 Ctrl+C 表达取消完成后退出，不升级为 OS 级强制终止。",
+            "CLI 等待 Host 将 Run/Attempt 持久化为 terminal cancelled，并完成 watcher、attachment、display、key monitor、runtime、日志和锁清理后 exit 130。",
+            "重复 Ctrl+C 不产生第二个竞争的 cancel owner，也不取消 canonical cancel waiter。"
+          ],
+          "forbidden": [
+            "第二次 Ctrl+C 先关闭进程而留下 running Run/Attempt或缺失 RUN_CANCELLED。",
+            "以 cancel waiter task cancellation 冒充优雅退出。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.13-activity-toggle",
+          "expected": [
+            "active Run 中 Ctrl+T 隐藏 activity，再次 Ctrl+T 恢复当前 activity显示；切换不创建、取消或修改 Run。",
+            "恢复显示不要求重放隐藏期间的全部历史 delta。"
+          ],
+          "forbidden": [
+            "Ctrl+T 触发额外 Run、cancel或terminal状态变化。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.14-terminal-restoration",
+          "expected": [
+            "Run 中 Ctrl+Z/SIGCONT、SIGWINCH、窄终端和长 activity 不改变 Host Run 语义；恢复后 terminal canonical mode、echo、screen 和 composer 可继续使用。",
+            "测试 PTY 的 CPR capability warning 不是 Dayu 产品 oracle。"
+          ],
+          "forbidden": [
+            "resize或 suspend/resume 导致 terminal mode 泄漏、重复 Run或伪终态。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.15-session-attachment-access",
+          "expected": [
+            "同一 Session 同时只有一个 READ_WRITE attachment，其余 attachment 是生命周期内不可变的 READ_ONLY observer。",
+            "READ_ONLY 客户端可以订阅并展示 durable/live事件；提交follow-up、cancel或其它mutation时显示明确只读失败，但保留REPL且不exit 1、不创建第二个Run、不改变composer可编辑状态。",
+            "原writer释放后，CLI可在下一次mutation时关闭旧READ_ONLY attachment并fresh attach重新竞争READ_WRITE；若仍被占用则再次明确失败。attachment不得原地升级。",
+            "fresh reattach后的同一次用户提交复用稳定client_request_id，不能因UI重试重复创建Run。"
+          ],
+          "forbidden": [
+            "为改善CLI提交体验而授予第二个并发客户端mutation权限，或在同一attachment生命周期内静默升级mode。",
+            "B的被拒绝输入创建第二个Run。",
+            "READ_ONLY rejection作为未捕获HostApiError终止整个interactive进程或返回exit 1。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.16-ctrl-d-and-eof",
+          "expected": [
+            "TTY 空 composer 在首次进入及 succeeded/failed/cancelled 后按 Ctrl+D 都按 EOF 正常清理并 exit 0。",
+            "TTY 非空 draft 中，光标下有字符时 Ctrl+D 删除该字符；光标位于末尾时 no-op并保留draft，不提交也不退出。",
+            "active Run 的 pre-accept、provider wait、tool execution和cancel closeout阶段，一次或连续Ctrl+D都不取消Run、不登记退出；Run terminal并恢复空composer后，新的Ctrl+D才exit 0。",
+            "TTY Ctrl+D、non-TTY stream exhaustion、流中的literal 0x04、canonical-mode EOF和PTY master close是不同input class，必须按真实owner分别记录。"
+          ],
+          "forbidden": [
+            "把active Run中的Ctrl+D解释成cancel或exit-after-run。",
+            "把PTY master close、harness kill或literal 0x04伪报成用户在空composer按Ctrl+D。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.17-idle-escape-and-sequences",
+          "expected": [
+            "idle composer中的standalone Escape、完整CSI和Alt sequence不创建Run、不退出；它们只按composer的completion、navigation、editing或no-op语义处理。",
+            "idle bracketed paste进入draft，随后由用户显式Enter提交。",
+            "idle Ctrl+Z/SIGCONT保留draft并恢复screen、canonical mode、echo和可继续使用的composer。",
+            "测试PTY的CPR capability warning不是Dayu产品oracle。"
+          ],
+          "forbidden": [
+            "idle Escape、CSI、Alt或paste意外创建、取消Run或关闭interactive。",
+            "suspend/resume后丢失draft或泄漏terminal mode。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.18-running-escape-sequence-disambiguation",
+          "expected": [
+            "active Run期间只有standalone Escape表达取消；input owner必须等待并解析足以区分standalone chord与完整ESC-prefixed sequence的输入。",
+            "完整CSI、Alt与bracketed-paste sequence进入composer navigation/editing/draft语义，不因首byte为ESC而取消Run。",
+            "完整sequence产生的draft遵循active Run type-ahead与QUEUE contract。"
+          ],
+          "forbidden": [
+            "看到ESC prefix便立即取消Run，导致方向键、Alt或bracketed paste误触发cancel。",
+            "用固定单字节监听绕过终端输入序列owner。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.19-running-typeahead-queues-followup",
+          "expected": [
+            "READ_WRITE interactive在active Run期间继续提供composer；未按Enter的printable、Unicode、paste和编辑结果保留为draft，当前Run terminal后仍可见且可继续编辑。",
+            "active Run期间按Enter把当前非空draft提交为一个queued follow-up，不steer当前Run，也不丢弃输入。",
+            "当前Run terminal后，queued follow-up按Host queue contract执行且恰好一次；terminal handoff race不得重复提交或丢失。",
+            "STEER不是Enter的隐式时序分支，只能由未来显式UI action选择。"
+          ],
+          "forbidden": [
+            "Run中未提交draft在terminal handoff时被清空。",
+            "Run中Enter被忽略、静默丢弃，或根据按键时序隐式steer active Run。",
+            "同一个Enter同时通过queue与恢复后的普通submit创建两个Run。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.20-startup-sigint-and-lost",
+          "expected": [
+            "startup尚无Run且composer尚未建立时，一次SIGINT完成已取得资源的清理后exit 130，不要求连续第二次。",
+            "startup SIGINT不显示traceback，不创建orphan Run，不留下attachment、runtime或terminal资源泄漏。",
+            "Host terminal lost表示durable execution已无法安全继续；CLI显示明确错误并exit 1，不恢复成可写composer。"
+          ],
+          "forbidden": [
+            "startup要求双Ctrl+C或把SIGINT映射为exit 1。",
+            "Host lost后假装当前attachment仍能安全提交下一turn。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.21-session-reconnect-and-cursor",
+          "expected": [
+            "同一无label interactive进程支持连续多turn；两个独立无label invocation创建不同fresh Session。",
+            "带label invocation按共享alias contract跨turn、跨进程及prompt/interactive入口复用同一durable Session与memory。",
+            "重连不重复投影已经展示的succeeded、failed或cancelled terminal；cursor与EventLog terminal sequence一致。",
+            "cursor文件缺失可安全创建；cursor内容损坏、路径为目录、runtime lock冲突或其它无法建立可靠cursor owner的情况明确exit 1。",
+            "新invocation的显式model等Run override只作用于本invocation，不改写durable Session/memory identity。"
+          ],
+          "forbidden": [
+            "无label invocation隐式接续上一次匿名Session。",
+            "重连重复展示同一terminal或从损坏cursor猜测offset。",
+            "用当前invocation override创建新的label Session或改写历史Run identity。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.22-unfinished-run-recovery",
+          "expected": [
+            "恢复必须由fresh READ_WRITE attachment重新绑定同一个durable Session触发；当前CLI使用同一--label定位，两个无label invocation按fresh Session语义不构成恢复。",
+            "只有已经durable accepted的用户输入及必要canonical facts具备恢复语义；acceptance前丢失的键盘输入不得猜测恢复。",
+            "RUNNING的owner在正常opener/process close、crash或SIGKILL后不写伪造cancel facts；positive orphan proof成立时，旧Attempt进入LOST，同一Run进入RECOVERING并以new Attempt/new execution_id恢复。",
+            "fresh writer若在heartbeat stale threshold到达前立即attach，必须在同一invocation中保守等待并于proof可成立时重新reconcile；不得永久停留running或要求用户再次手工重启interactive。",
+            "QUEUED Run在正常关闭、crash或SIGKILL后保持同一run identity；fresh writer唤醒ordinary governance，按accepted event_sequence FIFO promotion并恰好执行一次。",
+            "durable accepted steer在正常关闭、crash或SIGKILL后保持同一Run，并从最新accepted steer candidate重建完整输入，以new Attempt/new execution_id继续且恰好一次。",
+            "恢复不接管或复活旧Engine、Agent、Runner、provider request或Attempt；超过recovery policy、必要facts缺失或新Attempt失败时进入明确FAILED/LOST，不无限停留running。"
+          ],
+          "forbidden": [
+            "CLI重发原prompt、harness重发queued/steer文本、修改private SQLite或takeover旧Attempt来伪造恢复。",
+            "只因heartbeat stale、mutex可获取或新进程无法控制旧worker就认定positive orphan并并发执行第二个Attempt。",
+            "恢复为新的Run identity、重复执行多个follow-up或无限创建recovery Attempt。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.23-cancelled-run-non-resurrection",
+          "expected": [
+            "存在durable accepted cancel facts的CANCELLING Run在fresh writer attach时先由accepted-cancel watchdog/closeout推进到CANCELLED，不进入execution recovery。",
+            "QUEUED或尚未派发的Run被cancel后直接CANCELLED且不创建Attempt；已接受steer continuation随后被cancel时按canonical commit order收口，取消后的continuation不恢复。",
+            "terminal CANCELLED是不可改写事实；正常关闭、crash或SIGKILL后同Session重连都不创建recovery Attempt、不调用provider、不再次执行input。",
+            "cancelled terminal可以按cursor/outbox contract去重展示，但不得因重连重复投影或改变Run terminal。",
+            "interactive active Run中的双Ctrl+C已经表达显式cancel intent；CLI必须先优雅完成CANCELLED和本地清理再exit 130，后续重连不恢复该Run。"
+          ],
+          "forbidden": [
+            "把accepted cancel的CANCELLING Run按普通orphan推进为RUN_RECOVERING。",
+            "把process exit/crash/kill本身伪造成cancel；没有durable cancel facts的未终结Run仍适用unfinished recovery contract。",
+            "重连后复活CANCELLED Run、重新发送provider请求或再次执行已取消的queued/steer input。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.24-memory-and-grounded-tool-evidence",
+          "expected": [
+            "同一durable Session中的后续问题可以通过Host canonical facts与Conversation Memory理解刚才、第二点等局部指代；composer history不作为该连续性的真源。",
+            "用户纠正事实、切换ticker、期间或口径后，后续Run采用最新用户输入并按新主体/口径重新grounding；不得把旧document_id、ref或旧结论当成新主体事实。",
+            "真实AAPL 2025 10-K路径从用户prompt取得AAPL，经list_documents、get_financial_statement的partial结果、get_document_sections/search_document和read_section取得可靠证据；read_section(s_0013_c03)支持2025 Total net sales 416,161 million。",
+            "Tool Trace必须同时提供实际tool call request与response，并与accepted tool EventLog、memory、runner input、Host SQLite及最终回答同源一致。",
+            "dayu-cli download与dayu-cli preprocess/process是独立command campaign；它们的UI、生成物、退出码与正确性不由interactive oracle裁决。"
+          ],
+          "forbidden": [
+            "通过已移除的interactive --ticker给模型或工具偷偷注入主体；ticker必须来自当前用户输入或已接受的Session业务上下文。",
+            "只用CLI自报tool count、最终回答猜测或Tool Trace中的单侧request代替真实response与canonical evidence检查。",
+            "把get_financial_statement的partial空值当成416,161的来源，或把不存在的read_document写成实际调用。",
+            "用interactive中的工具观察提前裁决独立download/preprocess/process命令。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.25-run-failure-isolation-and-next-turn",
+          "expected": [
+            "tool not_found/error、tool handshake timeout、failed-tool-batch raise_error/force_answer、provider failure与单轮cancel只按各自contract收口当前Run；只要Session仍可写，interactive恢复composer并允许提交下一Run。",
+            "max_consecutive_failed_tool_batches及其它per-Run失败预算在新Run重新开始，不因前一Run失败而毒化后续Run。",
+            "已经accepted的not_found tool response可以作为上一轮可读结果支持后续解释；没有accepted tool response或final answer的timeout/provider failure/cancel不得被投影成成功工具事实或业务结论。",
+            "raise_error后的下一Run可以成功；force_answer完成后下一Run可以继续；失败或取消terminal本身不强迫interactive进程退出。",
+            "跨进程继续必须通过同label恢复同一Session；harness重启无label进程不得冒充同一REPL或memory连续性。"
+          ],
+          "forbidden": [
+            "一次tool/provider失败或cancel永久关闭可继续使用的Session或污染后续Run的failed-batch计数。",
+            "把timeout、provider failure或cancel中未accepted的内容写成evidence-backed fact、assistant final answer或工具成功结果。",
+            "为了展示连续性而由harness重新注入上一轮失败内容。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.26-context-compaction-single-flight-and-success",
+          "expected": [
+            "interactive必须用同一真实REPL/Session中的真实用户输入、真实provider和真实工具结果触发proactive compaction；CI-owned较低soft threshold可以降低成本，但必须经production config loader和Service assembly生效，不能注入memory、伪造assistant/tool result、直接写EventLog/SQLite或调用内部compactor API。",
+            "正常promotion wake与periodic owned-session reconciliation只是同一Session需要治理的signal source；同一live READ_WRITE owner内每个Session任一时刻只有一个pre-start governance invocation，in-flight期间到达的signal必须coalesce，不能并发resume、重建或终结同一Run的compaction operation。",
+            "每个Run/input snapshot最多一个proactive durable compaction operation；live owner执行中的incomplete operation不属于crash recovery，只有owner停止或crash后的fresh READ_WRITE attachment才可按原operation id、冻结snapshot与剩余attempt budget恢复。",
+            "成功路径必须观察同源CONTEXT_COMPACTION_REQUESTED、compactor_proposal runner manifest、CONTEXT_COMPACTED和可校验compact artifact，并证明Conversation Memory projection与post-compact RunInputBuilder实际消费同一accepted compact truth。",
+            "同一compaction operation精确一个canonical terminal；迟到或stale compactor result只能被拒绝或记为不改变业务状态的diagnostic，不能追加第二个CONTEXT_COMPACTION_FAILED或改写已提交outcome。",
+            "真实compaction失败后可以按policy使用deterministic recent-window fallback继续普通dispatch；runner_call_trigger_reason=context_governance_resolved表示context governance已经收口并允许下一次dispatch，不单独宣称compact成功，真实成功或失败仍以CONTEXT_COMPACTED/CONTEXT_COMPACTION_FAILED及其artifact/fallback refs为准。",
+            "成功compact后至少两个真实follow-up必须分别证明compact前财报事实的数值、单位、期间、来源连续性，以及新口径下按需调用真实财报工具取得新证据；failed compaction fallback后的连续性不能替代该成功路径。"
+          ],
+          "forbidden": [
+            "wake-driven promotion与periodic reconciliation并发执行同一Session/Run的pre-start governance，或把live in-flight operation误判为需要恢复的invalid/exhausted operation。",
+            "仅执行一次proposal attempt就在冻结上限尚有余额时因并发重入提交proactive_operation_invalid_or_exhausted。",
+            "同一operation先写proactive_operation_invalid_or_exhausted、随后再写stale_compaction_result等多个canonical terminal。",
+            "用CONTEXT_COMPACTION_REQUESTED、配置中的compactor identity、失败fallback、最终回答仍正确或CLI自报summary冒充成功CONTEXT_COMPACTED/artifact/projection覆盖。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.27-success-requires-final-answer",
+          "expected": [
+            "Engine成功终态必须携带非空final answer；空或纯空白final content按runner_empty_final_content fail closed，不得产生final_answer成功终态。",
+            "Host只能把Engine final_answer映射为RUN_SUCCEEDED，runner_empty_final_content必须映射为RUN_FAILED；Host public SUCCEEDED event必须携带final_answer。",
+            "CLI收到合法public contract时不存在succeeded但没有final answer的状态；其succeeded/no-final显示错误并exit 1只作为最后防御，不扩大为可接受产品状态。",
+            "该分支因public owner chain不可构造，允许用Engine空final、Host ingest失败映射与Host public terminal构造校验的owner-level tests完成static scenario closure。"
+          ],
+          "forbidden": [
+            "把没有final answer的Run标记为SUCCEEDED，或用空字符串、纯空白、日志、preview、tool summary替代final answer。",
+            "为了动态命中CLI防御分支而伪造Host response、直接写private SQLite/EventLog、调用private API或绕过Engine/Host owner contract。",
+            "把CLI succeeded/no-final防御文案当作正常用户流程、accepted variant或真实运行mandatory branch。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.28-tool-registration-boundary",
+          "expected": [
+            "interactive可以注册财报读取与下载工具，但effective tool set不向Host注册start_fins_preprocess。",
+            "start_fins_preprocess实现代码可以保留；独立process/preprocess命令的正确性仍由其command campaign裁决。"
+          ],
+          "forbidden": [
+            "interactive scene、tool tag或Service assembly把start_fins_preprocess注册进本次Host Run。",
+            "为满足interactive边界而删除独立preprocess工具实现。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.29-compactor-output-accept-repair-fallback",
+          "expected": [
+            "Host Context Governance accept barrier是compact candidate有效性、provenance分区、output cap与usage audit的唯一owner；模型只产出五类业务语义及其必要provenance，Host从immutable source boundary与accepted provenance派生represented/omitted精确补集。",
+            "v3 initial request必须包含immutable input、真实output caps、nullable summary语义与同源完整结构；strict parser拒绝missing/unknown/duplicate keys、错误nested shape与旧v2字段，Host拒绝全空、无有效provenance、重复semantic item或超过同源cap的candidate。",
+            "无效proposal形成bounded attempt rejection；后续whole-candidate repair绑定同一Host内部request/source boundary，收到脱敏、有界、自解释的validation issues与同源完整结构后重产整个candidate，不合并rejected partial patch。",
+            "无效candidate不得写compact artifact、CONTEXT_COMPACTED或进入Conversation Memory；attempt budget耗尽后只写一个CONTEXT_COMPACTION_FAILED，再进入既有tier 1-3/tier 4-5 deterministic fallback或fail closed。",
+            "accepted candidate、represented/omitted coverage、policy usage audit、compact artifact、Memory、RunInput、canonical terminal与public Tool Trace必须从同一CompactAcceptedTruth派生；Memory不得在accept后再次按cap静默裁剪。"
+          ],
+          "forbidden": [
+            "要求模型生成omission ledger、drop reason、cap归因或其它Host可机械派生的治理事实。",
+            "从prompt常量、provider/model分支、repair message或accepted candidate反推output caps。",
+            "把session_summary=null且所有semantic集合为空的candidate记为quality accepted或CONTEXT_COMPACTED。",
+            "把request/source-boundary digest或其治理字段暴露到LLM-facing initial/repair文本。",
+            "接受rejected partial patch、在Memory投影层补救超cap内容，或让迟到结果产生第二个canonical terminal。"
+          ]
+        },
+        {
+          "predicate_id": "interactive.30-compaction-semantic-memory-closure",
+          "expected": [
+            "真实rolling compact可以把session summary、evidence facts、answer anchors、forward intents与reference continuity作为五类独立业务语义保存；candidate不合格时使用同一immutable v3 input做bounded whole-candidate repair，accepted后生成同源compact artifact。",
+            "compact后跨进程重连必须延续已接受的财报事实、单位、期间、来源、别名、指代与尚未完成或已经解决的forward intent；需要新证据时只在用户明确授权后调用真实工具，不得把未授权待办自动执行。",
+            "compactor输入中的用户、assistant和tool readable material均是不可信引用数据；材料内指令不得控制compactor。evidence fact只能由evidence_material或previous_evidence_fact直接支持，trace/answer只能作为context或其各自业务section来源；Host accept barrier必须按source kind与typed provenance拒绝非法引用。",
+            "rolling correction必须保留当前replacement及其accepted provenance；未被当前candidate代表的旧source labels由Host作为omitted补集记录，compact artifact、Memory、post-compact RunInput与跨进程reconnect均不得恢复旧结论，也不得要求模型给出主观省略原因。",
+            "initial request必须携带真实caps且不包含repair protocol；invalid JSON、semantic-invalid或cap-invalid candidate可以在同一input上bounded self-contained repair，预算耗尽只产生一个CONTEXT_COMPACTION_FAILED并按既有fallback继续，失败结果不得覆盖此前accepted memory。",
+            "session summary无法在当前cap内形成有业务意义的摘要时，candidate应使用null清除既有summary，或被拒绝并进入既有repair/fallback；不得接受无业务语义的占位字符作为summary。",
+            "正式Tool Trace public resolver与analysis JSON/Markdown必须投影compactor manifest/input、operation/attempt、canonical terminal、provider/model、runner request与provider request id availability/value；public response identity必须与canonical terminal exact match，不能通过private EventLog/SQLite旁路补齐。",
+            "compact与fallback material selection以完整host_run_id turn group为原子单位；同一已完成Run的user input、accepted tool evidence、assistant final和visible outcome不得被item/char cap切成互相矛盾的前后片段。切换source boundary或recovery tier后不得复用上一boundary的repair feedback。"
+          ],
+          "forbidden": [
+            "要求模型为每个omitted source生成ledger、自然语言reason、cap attribution或主观新旧关系。",
+            "把形式上非空但没有业务语义的单字符或占位文本接受为session summary。",
+            "把raw history中保留的旧文本重新投影成active Semantic Memory或当前RunInput结论。",
+            "用private SQLite/EventLog旁路、workspace配置或相邻事件推断public Tool Trace缺失的response/provider/model identity。",
+            "fallback cap按单个material block截断一个已完成Host Run，或在不同compact input/source boundary之间携带repair feedback。",
+            "把prompt约束或source kind allowlist误报为自然语言事实校验器；claim与support material是否语义相符仍须由真实模型表现与Agent-in-the-loop CI观察。"
+          ]
+        }
+      ],
+      "allowed_variants": [
+        "不改变按键语义、Run数量、durable terminal、退出码和输出通道的终端文案微调。",
+        "真实 provider 的回答文本、延迟、request id 和外部错误措辞可以变化，但当前 Run failure、REPL continuity和effective identity必须一致。",
+        "不同终端可以无法区分 Shift+Enter与Enter，但必须按真实 capability 记录且不得声称支持不可区分按键。",
+        "activity恢复显示可以不重放隐藏期间历史 delta。"
+      ],
+      "authority_basis": [
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户确认行为项 #1 正确，并裁决 prompt/interactive --config 与 interactive --ticker 在产品语义上不存在、不得进入 scenarios。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户冻结 label 为 Session/conversation alias：无 label 的 prompt one-shot与interactive fresh Session；同一 label在prompt与interactive之间双向互通。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户确认 Run 中 provider不可达只使当前 Run failed并恢复interactive，测试EOF收尾不属于provider failure。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户确认共用运行参数、日志、现有composer编辑、history、external editor、idle Ctrl+C、Ctrl+T和terminal恢复行为，并要求Shift+Enter与Ctrl+J同为换行。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户裁决non-TTY pipe采用whole-stdin batch：内部换行是内容，真实EOF提交整个draft且只产生一个Run。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户拒绝pre-accept Escape丢失、完整ESC-prefixed sequence误取消、任意阶段Ctrl+C不取消、重复Ctrl+C强退和Run中type-ahead丢失；Enter正式冻结为QUEUE，STEER只由未来显式UI action选择。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户接受建议并冻结Ctrl+D/EOF、idle Escape/CSI/Alt/paste、startup单次SIGINT exit 130、Host lost exit 1以及label reconnect/cursor语义；行为项#1至#22至此全部完成裁决。"
+        },
+        {
+          "kind": "design-truth",
+          "date": "2026-08-01",
+          "summary": "经 docs/host/design.md 核实，同一Session单一READ_WRITE attachment、其余READ_ONLY observer与本轮并发观察一致。"
+        },
+        {
+          "kind": "design-truth",
+          "date": "2026-08-01",
+          "summary": "docs/host/design.md第27节及durable queued/cancel治理冻结：fresh READ_WRITE attachment执行目标Session recovery；RUNNING基于positive orphan proof以新Attempt恢复，QUEUED由ordinary governance推进，accepted cancel/CANCELLED不得进入execution recovery。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户裁决行为项#23/#24：durable running/queue/steer在正常退出、crash、kill后重新运行必须恢复；accepted cancel与terminal cancelled在这些路径后不得恢复。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户裁决行为项#25/#26正确：接受interactive跨轮memory、真实财报与request/response Tool Trace；独立download/preprocess命令排除在interactive裁决之外。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户裁决行为项#27工具失败后的跨轮隔离正确；行为项#28只接受真实compaction触发、失败fallback及fallback后连续性的观察，不把它当作成功compact，并确认并发pre-start治理、重复compaction terminal是修改项，真实CONTEXT_COMPACTED/artifact/projection/跨轮连续性是coverage gap。"
+        },
+        {
+          "kind": "design-truth",
+          "date": "2026-08-01",
+          "summary": "docs/engine/design.md冻结Engine terminal为封闭终态，成功以final_answer表达；空白final由Engine fail closed，Host public SUCCEEDED同时要求final_answer。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-01",
+          "summary": "用户裁决行为项#30：成功必须有final answer，接受I0554的Engine/Host owner-level static proof关闭public-contract不可达分支，不要求伪造动态succeeded/no-final。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-04",
+          "summary": "用户裁决行为项#48至#56：接受真实五类memory、compact后连续性、材料/指令边界、rolling修正与repair/fallback；拒绝无意义单字符summary、compactor Tool Trace hot identity缺失和completed Run非原子截断；要求补跑session_summary null及四类drop中的superseded/policy_limit。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-05",
+          "summary": "用户明确确认F11/F12 replacement contract：F11使用public Host Tool Trace response identity，F12使用fresh compact v3；模型只负责业务语义及必要provenance，Host拥有omitted补集、caps、usage audit、repair/fallback与canonical/public trace同源治理。"
+        }
+      ],
+      "observed_behavior": {
+        "run_id": "interactive-20260731T142441Z-ae6bb96f",
+        "report_id": "interactive-20260731T142441Z-ae6bb96f/observed-behavior",
+        "report_digest_sha256": "72f91665365ace75e6328409ef66450fae9470c75e3d3854c683f5dbe38c103a",
+        "report_frozen": true,
+        "supplemental_evidence": [
+          {
+            "report_id": "pr190-closure/observed-behavior-pr190-closeout",
+            "sha256": "6aa8c8c7430e979b95f3bd8551f44ae34432e5e55172231c296d634932aa712f"
+          },
+          {
+            "report_id": "pr190-closure/compaction-invalid-response-audit",
+            "sha256": "fed1a2ae29baf2b59b3d16d90460661c563ae18233f93530b241645ada38fb61"
+          },
+          {
+            "report_id": "pr190-closure/interactive-coverage-reconciliation",
+            "sha256": "e2e3361dff7de1d8af26824d164fc47b39218dbdb5869d8ef0186268a47c0cb6"
+          },
+          {
+            "report_id": "interactive-memory-closure-20260804T5X59S8/observed-behavior",
+            "sha256": "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
+          }
+        ],
+        "scenario_refs": [
+          "docs/cli_ci_scenarios.json#command=interactive"
+        ],
+        "summary": [
+          "原始635条运行与PR190收口补跑共同覆盖700个mandatory obligations：604条正式scenario，96条parser/dynamic inventory、shared-owner或static closure。",
+          "用户已裁决行为项#1至#47；当前实现偏差作为F01-F07 findings保留，不改变accepted oracle。",
+          "真实running/queue/steer恢复、cancel non-resurrection、cross-entry label、财报grounding、compaction失败fallback、真实CONTEXT_COMPACTED/provider identity及compact后follow-up均已观察。",
+          "用户已裁决#48至#52的五类Semantic Memory、成功compact连续性、材料指令边界、rolling修正/drop及repair/fallback为正确行为。",
+          "#53至#55分别登记为无意义summary、compactor Tool Trace identity与completed Run原子性实现finding；#56的null、superseded和policy_limit分支在修复后补跑。修复本身不能替代conformance observation。"
+        ]
+      },
+      "user_adjudication": {
+        "decision": "accepted",
+        "date": "2026-08-05",
+        "notes": "用户明确接受F11/F12 replacement design contract并授权core-execution@2作为current accepted oracle；S4真实观察完整，但三个replacement scenarios仍由后续Oracle controller裁决，当前不得标accepted或ready。"
+      },
+      "applicable_from": {
+        "date": "2026-08-05",
+        "target": "f11-f12-fresh-v3-contract"
+      },
+      "supersedes": "cli.interactive.core-execution@1",
       "superseded_by": null
     }
   ]
