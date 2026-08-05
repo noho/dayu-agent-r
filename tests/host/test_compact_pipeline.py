@@ -844,7 +844,11 @@ def _successful_response_identity(
 def test_fallback_decision_input_dispatch_and_fail_closed() -> None:
     """fallback decision helper 统一 selection、budget payload 与 action hint。"""
 
-    snapshot = _source_snapshot(ContextCompactionTriggerSource.REACTIVE)
+    current_input_text = "  current   user input\n\nwith   preserved line  "
+    snapshot = replace(
+        _source_snapshot(ContextCompactionTriggerSource.REACTIVE),
+        current_input_text=current_input_text,
+    )
     memory_policy = default_memory_projection_policy(context_window_size=8192)
     dispatch_decision = build_fallback_decision_input(
         source_snapshot=snapshot,
@@ -866,6 +870,18 @@ def test_fallback_decision_input_dispatch_and_fail_closed() -> None:
     assert dispatch_decision.fallback_handoff is not None
     assert dispatch_decision.failed_payload_input.fallback_action == (FALLBACK_ACTION_DISPATCH)
     assert "fallback_tier" not in (dispatch_decision.failed_payload_input.fallback_input_window or {})
+    selection = dispatch_decision.selection
+    assert selection is not None
+    expected_current = run_input_material_block(
+        block_id=f"current:{snapshot.current_input_ref}",
+        section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        text=current_input_text,
+        canonical_source_refs=(snapshot.current_input_ref,),
+        event_sequence=snapshot.input_event_sequence,
+    )
+    selected_current = selection.selected_blocks[-1]
+    assert selected_current == expected_current
 
     fail_closed_decision = build_fallback_decision_input(
         source_snapshot=snapshot,

@@ -29,6 +29,7 @@ from dayu.host.compact_material import (
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
     retained_previous_compacted_view_labels_for_recovery,
+    run_input_material_block,
     select_compact_segment,
     selected_material_source_refs,
     selected_material_view_digest,
@@ -1119,14 +1120,12 @@ def _fallback_material_blocks(
     :returns: material blocks，包含 current input anchor block。
     """
 
-    current = RunInputMaterialBlock(
+    current = run_input_material_block(
         block_id=f"current:{source_snapshot.current_input_ref}",
         section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
         kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
         text=source_snapshot.current_input_text,
-        size_units=len(source_snapshot.current_input_text),
         canonical_source_refs=(source_snapshot.current_input_ref,),
-        content_digest=sha256_digest_json({"text": source_snapshot.current_input_text}),
         event_sequence=source_snapshot.input_event_sequence,
     )
     return (*source_snapshot.material_blocks, current)

@@ -107,6 +107,7 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     build_pre_dispatch_compact_material_view,
     run_input_material_block,
+    selected_material_view_digest,
 )
 from dayu.host.compact_pipeline import (
     CompactPipelineSourceSnapshot,
@@ -8273,17 +8274,24 @@ async def test_defensive_feedback_mismatch_stops_schedule_with_single_terminal(
 
 
 @pytest.mark.asyncio
-async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
+async def test_proactive_exhausted_fallback_normalizes_current_input_for_replay(
     tmp_path: Path,
 ) -> None:
-    """semantic proposal failure 写 rejected facts 后通过 fallback dispatch。"""
+    """连续空白输入耗尽两次 proposal 后同源 replay 并完整收口。
 
-    factory = _FakeWorkerFactory()
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: rejection、fallback digest、manifest 或 cleanup 漂移时抛出。
+    """
+
+    current_input = f"{_soft_threshold_prompt()}   collapsible\n\n whitespace   input"
+    factory = _FinalAnswerWorkerFactory()
+    compactor = _AlwaysQualityRejectingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-proactive-attempt-rejected",
-            display_text=_soft_threshold_prompt(),
+            display_text=current_input,
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -8292,25 +8300,21 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
             context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
             ),
-            context_compactor=_RaisingCompactor(),
+            context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
-            memory_projection_policy=_compact_no_floor_memory_policy(),
+            memory_projection_policy=_fallback_cap_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            await _wait_for_event_count(
+            await _wait_for_run_status(
                 store.transaction_runner,
-                "ATTEMPT_RUNNING",
-                expected_count=1,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
             )
+            await _wait_for_active_tasks_to_finish(scheduler)
 
-            assert (
-                _event_count(
-                    store.transaction_runner,
-                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-                )
-                == 2
-            )
+            assert compactor.calls == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_ATTEMPT_REJECTED) == 2
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
             requested = _latest_event_for_run(
                 store.transaction_runner,
@@ -8339,14 +8343,58 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 2,
             )
             for rejected_row in rejected_rows:
-                _assert_rejected_payload_has_proposal_manifest(_event_payload(rejected_row))
+                rejected_payload = _event_payload(rejected_row)
+                assert rejected_payload["failure_category"] == "quality_check_rejected"
+                _assert_rejected_payload_has_proposal_manifest(rejected_payload)
             payload = _event_payload(failed)
             assert payload["operation_id"] == requested.event_id
             assert payload["attempt_count"] == 2
             assert payload["retry_repair_budget_exhausted"] is True
             assert payload["fallback_action"] == "dispatch"
+            window = payload["fallback_input_window"]
+            assert isinstance(window, Mapping)
+            current_input_ref = f"event-input-{seeded.run_id}"
+            assert window["selected_block_ids"] == [f"current:{current_input_ref}"]
+            expected_current_block = run_input_material_block(
+                block_id=f"current:{current_input_ref}",
+                section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                text=current_input,
+                canonical_source_refs=(current_input_ref,),
+                event_sequence=_run_input_sequence(store.transaction_runner, seeded.run_id),
+            )
+            assert expected_current_block.text != current_input
+            assert window["selected_material_view_digest"] == selected_material_view_digest(
+                (expected_current_block,)
+            )
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
             assert len(factory.accepted_requests) == 1
+            fallback_snapshot = factory.accepted_snapshots[0]
+            fallback_source = store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=fallback_snapshot.attempt_id,
+                    execution_id=fallback_snapshot.execution_id,
+                )
+            )
+            expected_fallback_ref = f"context_fallback:{payload['fallback_input_digest']}"
+            assert fallback_source.candidate.context_fallback_decision_ref == expected_fallback_ref
+            assert fallback_source.manifest.source_refs.context_fallback_decision_ref == expected_fallback_ref
+            assert fallback_source.manifest.sizing_snapshot.sizing_stage is ContextSizingStage.DISPATCH_FALLBACK
+            projection = _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            )
+            assert projection.state.phase is ProactiveCompactionPhase.FAILED
+            assert projection.state.prepared_attempt_numbers == (1, 2)
+            assert projection.state.rejected_attempt_numbers == (1, 2)
+            assert projection.decision is ProactiveCompactionDecision.USE_FAILED_FALLBACK
+            assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 1
+            assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+            assert scheduler._active_tasks == set()
         finally:
             await scheduler.close()
 
@@ -9004,10 +9052,30 @@ async def test_reactive_root_compact_selection_passes_protected_recent_floor(
 async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
     tmp_path: Path,
 ) -> None:
-    """reactive compact failure fallback 创建新 Attempt 且不依赖 compact artifact。"""
+    """reactive recovery 对空白输入与 protected recent view 同源 replay。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: recovery、protected recent 或 fallback digest 漂移时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-fallback-recent",
+            event_id="event-reactive-fallback-recent-input",
+            display_text="recent   protected\n replay material",
+            client_request_id="client-reactive-fallback-recent",
+            idempotency_key="idem-reactive-fallback-recent",
+        )
+        current_input = "dispatch   prompt\n\n with   collapsible whitespace"
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            display_text=current_input,
+        )
         factory = _ReactiveRecoveryWorkerFactory()
         scheduler = await _open_scheduler(
             tmp_path,
@@ -9015,6 +9083,7 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             factory,
             context_budget_policy=_soft_compact_policy(),
             lane_default_timeout_seconds=1.0,
+            memory_projection_policy=_compact_floor_one_memory_policy(),
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -9040,13 +9109,66 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             payload = _event_payload(failed)
             assert payload["fallback_action"] == "dispatch"
             assert payload["fallback_policy_decision"] == ("deterministic_recent_window")
+            window = payload["fallback_input_window"]
+            assert isinstance(window, Mapping)
+            selected_block_ids = _required_json_text_tuple(window["selected_block_ids"])
+            assert "eventlog:user:event-reactive-fallback-recent-input" in selected_block_ids
+            assert "current:event-input-dispatch" in selected_block_ids
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            material_view = store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    EventLogStore(),
+                    run=run,
+                    current_display_text=current_input,
+                )
+            )
+            expected_current_block = run_input_material_block(
+                block_id="current:event-input-dispatch",
+                section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                text=current_input,
+                canonical_source_refs=("event-input-dispatch",),
+                event_sequence=run.input_event_sequence,
+            )
+            expected_blocks = (*material_view.material_blocks, expected_current_block)
+            selected_ids = frozenset(selected_block_ids)
+            expected_selected = tuple(block for block in expected_blocks if block.block_id in selected_ids)
+            assert expected_current_block.text != current_input
+            assert window["selected_material_view_digest"] == selected_material_view_digest(expected_selected)
             second_contents = tuple(
                 content
                 for content in (_message_text(message) for message in factory.accepted_requests[1].messages)
                 if content is not None
             )
             assert "Accepted compact artifact is available for this run." not in ("\n".join(second_contents))
-            assert second_contents[-1] == "dispatch prompt"
+            assert second_contents[-1] == current_input
+            assert "recent protected\nreplay material" in second_contents
+            recovery_snapshot = factory.accepted_snapshots[1]
+            recovery_source = store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=recovery_snapshot.attempt_id,
+                    execution_id=recovery_snapshot.execution_id,
+                )
+            )
+            expected_fallback_ref = f"context_fallback:{payload['fallback_input_digest']}"
+            assert recovery_source.candidate.context_fallback_decision_ref == expected_fallback_ref
+            assert recovery_source.manifest.source_refs.context_fallback_decision_ref == expected_fallback_ref
+            first_attempt = store.transaction_runner.run_read(
+                lambda transaction: read_attempt_by_id(transaction, seeded.attempt_id)
+            )
+            recovery_attempt = store.transaction_runner.run_read(
+                lambda transaction: read_attempt_by_id(transaction, recovery_snapshot.attempt_id)
+            )
+            assert first_attempt is not None
+            assert recovery_attempt is not None
+            assert first_attempt.status is AttemptStatus.FAILED
+            assert recovery_attempt.status is AttemptStatus.SUCCEEDED
+            assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.SUCCEEDED
+            assert scheduler._active_tasks == set()
         finally:
             await scheduler.close()
 
@@ -9968,6 +10090,7 @@ def _seed_current_run(
     agent_policy: AgentPolicy | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
     tooling_options: HostToolingOptions | None = None,
+    display_text: str = "dispatch prompt",
 ) -> _SeededRun:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
 
@@ -9976,6 +10099,7 @@ def _seed_current_run(
     :param agent_policy: frozen Agent policy；缺失时使用默认no-tool policy。
     :param tool_schemas: frozen selected tool schemas。
     :param tooling_options: admission 与 dispatch 共用的 construction-time 工具真源。
+    :param display_text: 当前 Run 的用户展示文本。
     :returns: seeded run 摘要。
     """
 
@@ -10008,6 +10132,7 @@ def _seed_current_run(
         session_id=actual_session_id,
         run_id=seeded.run_id,
         event_id="event-input-dispatch",
+        display_text=display_text,
         effective_execution_config=effective_execution_config,
         effective_tool_set=effective_tool_facts_json(
             None,
