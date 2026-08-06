@@ -341,7 +341,9 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert "<<compaction_request>>" in compactor_baseline.compactor_user_prompt_template
     assert "<<compact_output_rules>>" in compactor_baseline.compactor_user_prompt_template
     assert "<<compact_output_template>>" in compactor_baseline.compactor_user_prompt_template
-    assert "五类业务内容" in compactor_baseline.compactor_user_prompt_template
+    assert "最终五类业务语义不能全部为空" in (
+        compactor_baseline.compactor_user_prompt_template
+    )
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
