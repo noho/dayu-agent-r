@@ -287,6 +287,14 @@ Allowed tests/helpers：
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_engine_ingest_mapping.py`
 - `tests/host/test_public_compact_smoke.py`
+- `tests/host/memory_snapshot_factories.py`
+- `tests/host/test_accepted_result_projection.py`
+- `tests/host/test_compaction_cancellation_scope.py`
+- `tests/host/test_compaction_operation.py`
+- `tests/host/test_proactive_compaction_operation.py`
+- `tests/host/test_tool_trace_queries.py`（S1只迁移被删除v3 symbol与schema-5 fixture；S2仍拥有public Tool Trace新语义与断言）
+- `utils/smoke_host_public_conversation_memory_scenarios.py`（只迁移v4/schema-5 call site）
+- `utils/smoke_host_public_r03_semantic_ownership.py`（只迁移v4 call site）
 
 Required migration order inside the slice：
 
@@ -295,23 +303,26 @@ Required migration order inside the slice：
 3. 把 provenance refs 写入 material provenance -> source boundary；实现 governance atomic expansion/binding/caps。
 4. 切换 artifact/terminal strict payload 与 aggregate union validation，artifact schema=5。
 5. 切换 rolling、multi-pass、Memory、RunInput/reconnect consumers到 replacement。
-6. 同步所有 production call sites、fake 与 owner tests；全仓 `rg` 不得残留 v3 compact contract、旧 durable key或 `PromptLocalProvenanceEntry.accepted_evidence_id` 的定义/构造/读取。若其它上游 typed accepted-evidence atom仍合法使用 singular `accepted_evidence_id`，必须逐处确认其不是 material-pack 下游读路径并在checkpoint artifact记录；历史 evidence 文档除外。
+6. 同步所有 production call sites、fake、owner tests与仍可执行的Host smoke helper；`dayu/**/*.py`、`tests/**/*.py`与`utils/**/*.py`不得残留 v3 compact contract、旧 durable key或 `PromptLocalProvenanceEntry.accepted_evidence_id` 的定义/构造/读取。S2明确拥有的README/public Tool Trace新projection文字在S2完成最终全文扫描，不能成为S1保留已删除Python symbol或旧fixture的理由。若其它上游 typed accepted-evidence atom仍合法使用 singular `accepted_evidence_id`，必须逐处确认其不是 material-pack下游读路径并在checkpoint artifact记录；历史 evidence文档除外。
 
 S1 保持一个 accepted commit，因为删掉 v3 后，core 与 durable/read-model consumers 必须在同一
 checkpoint 完整切换；把 S1a/S1b 分成可提交 slices 会制造编译不完整 checkpoint或短暂 v3/v4 双
-owner，违反本任务 fresh-schema 边界。为控制大 diff，S1 内增加三个**不提交**的强制验证/审查
-checkpoint：
+owner，违反本任务 fresh-schema 边界。步骤1删除v3 symbol会立即影响`compaction_operation`与
+`context_governance`等调用方，因此C1-C3是**完整、可收集的最终S1 worktree上的审查cluster**，不是
+要求中途停在不可导入状态运行测试的时间截面。实现仍按1-6顺序迁移，但可在第一次focused test前完成
+全部必要call-site切换；不得为制造中间可运行态保留alias、双DTO或兼容分支。为控制大diff，S1内增加
+三个**不提交**的强制验证/审查checkpoint：
 
-- C1（步骤1-2）：只审 v4 dataclass不变量、descriptor/template/schema/parser exact同源与prompt；运行 contract/LLM focused tests。
-- C2（步骤3-4）：只审 material->boundary->governance->replacement->payload binding；运行 provenance、artifact、terminal focused tests，并手工复算一个 retained+two-source-new 例子的逐 fact refs。
-- C3（步骤5-6）：只审 rolling/multi-pass/Memory/reconnect/RunInput与所有call sites；运行 projection/integration tests和 residue scan。
+- C1（步骤1-2 cluster）：在完整S1 worktree上只审 v4 dataclass不变量、descriptor/template/schema/parser exact同源与prompt；运行 contract/LLM focused tests。
+- C2（步骤3-4 cluster）：在同一完整S1 worktree上只审 material->boundary->governance->replacement->payload binding；运行 provenance、artifact、terminal focused tests，并手工复算一个 retained+two-source-new 例子的逐 fact refs。
+- C3（步骤5-6 cluster）：在同一完整S1 worktree上只审 rolling/multi-pass/Memory/reconnect/RunInput与所有call sites；运行 projection/integration tests和 residue scan。
 
 每个checkpoint由Controller在 `docs/gateflow/pr-190-f13-s1-cN-checkpoint-<timestamp>.md`
 持久化审阅范围、base/worktree diff identity、两路reviewer结论、命令与关键验证结果，并让两路reviewer
 按该cluster做增量检查。checkpoint通过后，若后续步骤修改其覆盖文件或owner contract，该checkpoint
 立即失效，必须基于新diff重跑相同focused validation与两路增量review并写新artifact；旧artifact保留为
 superseded evidence，不能覆盖。C1-C3当前版本全部通过后才进入S1正式两路code review与单一accepted
-commit。任一中间态不声称可部署或可提交。
+commit。任何迁移中的中间态不声称可运行、可部署或可提交；只有完整S1 worktree才进入C1-C3验证。
 
 Mandatory S1 owner tests：
 
