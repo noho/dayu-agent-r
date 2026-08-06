@@ -1646,6 +1646,7 @@ def _s4_rejected_terminal_fixture(
         runner_request_identity=None,
         provider_request_id_availability=None,
         provider_request_id=None,
+        accepted_evidence_facts=(),
     )
     return row, response
 

@@ -17,6 +17,7 @@ from dayu.engine.contracts.runner_identity import (
 )
 from dayu.host.durable.tool_trace import (
     CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
     ResolvedCompactorResponseIdentity,
     RunnerCallReconstructionConsumerBoundary,
     RunnerCallReconstructionDiagnostic,
@@ -333,6 +334,12 @@ def _compactor_projection(
                     ProviderRequestIdAvailability.PRESENT
                 ),
                 provider_request_id="provider-request-actual",
+            ),
+            accepted_evidence_facts=(
+                ResolvedCompactorEvidenceFact(
+                    claim="Accepted evidence-backed claim.",
+                    canonical_evidence_refs=("evidence:canonical-1",),
+                ),
             ),
         ),
     )
@@ -1529,7 +1536,12 @@ def test_compactor_response_summary_comes_only_from_typed_resolver_projection(
     projection = _compactor_projection(record)
     joined = _joined_record(
         record,
-        source_event_payload={"authorization": "must-not-be-consumed"},
+        source_event_payload={
+            "authorization": "credential-secret",
+            "selection_label": "selection-label-secret",
+            "raw_payload": "raw-payload-secret",
+            "prompt": "prompt-secret",
+        },
         runner_call_projection=projection,
     )
 
@@ -1561,6 +1573,28 @@ def test_compactor_response_summary_comes_only_from_typed_resolver_projection(
     successful = response.successful_response_identity
     assert successful is not None
     assert summary.runner_request_identity == successful.runner_request_identity
+    assert summary.accepted_evidence_facts is response.accepted_evidence_facts
+    serialized = json.loads(tool_trace_analysis_report_to_json(report))
+    projected_facts = serialized["compactor_responses"][0][
+        "accepted_evidence_facts"
+    ]
+    assert projected_facts == [
+        {
+            "claim": "Accepted evidence-backed claim.",
+            "canonical_evidence_refs": ["evidence:canonical-1"],
+        }
+    ]
+    assert set(projected_facts[0]) == {"claim", "canonical_evidence_refs"}
+    rendered = tool_trace_analysis_report_to_json(report) + (
+        render_tool_trace_analysis_markdown(report)
+    )
+    for forbidden in (
+        "credential-secret",
+        "selection-label-secret",
+        "raw-payload-secret",
+        "prompt-secret",
+    ):
+        assert forbidden not in rendered
 
 
 def test_rejected_compactor_response_identity_projects_from_typed_owner_to_all_outputs(
@@ -1593,6 +1627,7 @@ def test_rejected_compactor_response_identity_projects_from_typed_owner_to_all_o
             accepted_response,
             disposition=CompactorResponseDisposition.ATTEMPT_REJECTED,
             terminal_event_id="event-context-compaction-attempt-rejected-1",
+            accepted_evidence_facts=(),
         ),
     )
     joined = _joined_record(
@@ -1628,6 +1663,7 @@ def test_rejected_compactor_response_identity_projects_from_typed_owner_to_all_o
         is successful.provider_request_id_availability
     )
     assert summary.provider_request_id == successful.provider_request_id
+    assert summary.accepted_evidence_facts == ()
 
     serialized = json.loads(tool_trace_analysis_report_to_json(report))
     projected = serialized["compactor_responses"][0]
@@ -1649,6 +1685,7 @@ def test_rejected_compactor_response_identity_projects_from_typed_owner_to_all_o
         successful.provider_request_id_availability.value
     )
     assert projected["provider_request_id"] == successful.provider_request_id
+    assert projected["accepted_evidence_facts"] == []
 
     markdown = render_tool_trace_analysis_markdown(report)
     for actual_value in (

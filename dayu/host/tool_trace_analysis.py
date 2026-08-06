@@ -223,6 +223,13 @@ def _compactor_response_json(
             else item.provider_request_id_availability.value
         ),
         "provider_request_id": item.provider_request_id,
+        "accepted_evidence_facts": [
+            {
+                "claim": fact.claim,
+                "canonical_evidence_refs": list(fact.canonical_evidence_refs),
+            }
+            for fact in item.accepted_evidence_facts
+        ],
     }
 
 
@@ -696,6 +703,17 @@ def _render_compactor_responses(
             f"manifest_ref=`{_markdown_escape(item.proposal_manifest_ref)}`, "
             f"manifest_digest=`{_markdown_escape(item.proposal_manifest_digest)}`"
         )
+        for fact in item.accepted_evidence_facts:
+            refs_text = json.dumps(
+                fact.canonical_evidence_refs,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            lines.append(
+                "  - accepted_evidence_fact："
+                f"claim=`{_markdown_escape(fact.claim)}`, "
+                f"canonical_evidence_refs=`{_markdown_escape(refs_text)}`"
+            )
     return "\n".join(lines)
 
 

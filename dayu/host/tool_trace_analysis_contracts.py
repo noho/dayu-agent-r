@@ -20,7 +20,10 @@ from dayu.engine.contracts.runner_identity import (
     ProviderRequestIdAvailability,
     RunnerRequestIdentity,
 )
-from dayu.host.durable.tool_trace import CompactorResponseDisposition
+from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
+)
 
 DEFAULT_TOOL_TRACE_LARGE_PAYLOAD_THRESHOLD_BYTES = 131_072
 """默认 large payload 诊断阈值。"""
@@ -461,6 +464,8 @@ class ToolTraceCompactorResponseSummary:
         no-success rejection 时为 ``None``。
     :param provider_request_id: provider-native request id；不可用或 no-success
         rejection 时为 ``None``。
+    :param accepted_evidence_facts: resolver 公开 tuple 的 exact pass-through；
+        每项只含 accepted claim 与该事实的 canonical evidence refs。
     """
 
     parent_host_run_id: str
@@ -476,6 +481,7 @@ class ToolTraceCompactorResponseSummary:
     runner_request_identity: RunnerRequestIdentity | None
     provider_request_id_availability: ProviderRequestIdAvailability | None
     provider_request_id: str | None
+    accepted_evidence_facts: tuple[ResolvedCompactorEvidenceFact, ...]
 
     def __post_init__(self) -> None:
         """校验 response summary 的 binding 与 nullable identity cohesion。
@@ -503,6 +509,16 @@ class ToolTraceCompactorResponseSummary:
             self.compaction_attempt_number,
             field_name="compaction_attempt_number",
         )
+        _require_contract_tuple(
+            self.accepted_evidence_facts,
+            ResolvedCompactorEvidenceFact,
+            field_name="accepted_evidence_facts",
+        )
+        if (
+            self.disposition is CompactorResponseDisposition.ATTEMPT_REJECTED
+            and self.accepted_evidence_facts
+        ):
+            raise ValueError("attempt-rejected compactor response facts must be empty")
         identity_values = (
             self.effective_provider,
             self.effective_model,

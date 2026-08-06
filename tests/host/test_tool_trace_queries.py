@@ -59,6 +59,7 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.tool_trace import (
     CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
     ResolvedCompactorResponseIdentity,
     RunnerCallReconstructionConsumerBoundary,
     RunnerCallReconstructionDiagnosticReason,
@@ -84,6 +85,7 @@ from dayu.host.context_events import (
 from dayu.host.compaction import (
     COMPACT_OUTPUT_SCHEMA_V4,
     CompactCandidateV4,
+    CompactEvidenceFactV4,
     CompactSessionSummaryV4,
 )
 from dayu.host.durable.state import (
@@ -955,7 +957,13 @@ def _accepted_compactor_payload(
             source_labels=("T1",),
         ),
         retained_previous_evidence_fact_labels=(),
-        evidence_facts=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="Accepted evidence-backed claim.",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
         answer_anchors=(),
         forward_intents=(),
         reference_continuity=(),
@@ -970,7 +978,10 @@ def _accepted_compactor_payload(
         accepted_truth=accepted_truth_for_candidate(
             candidate,
             current_input_ref="event-current-input",
-            source_refs_by_label={"T1": ("event-trace-source",)},
+            source_refs_by_label={
+                "T1": ("event-trace-source",),
+                "E1": ("event-evidence-source",),
+            },
         ),
         budget_after_compact=128,
         prompt_local_label_mapping_refs=("prompt-label:T1",),
@@ -2422,6 +2433,12 @@ def test_compactor_response_resolver_projects_accepted_actual_identity(
         assert response.successful_response_identity.provider_request_id == (
             "provider-request-actual"
         )
+        assert response.accepted_evidence_facts == (
+            ResolvedCompactorEvidenceFact(
+                claim="Accepted evidence-backed claim.",
+                canonical_evidence_refs=("evidence:E1",),
+            ),
+        )
         with pytest.raises(ValueError, match="accepted.*requires successful"):
             ResolvedCompactorResponseIdentity(
                 disposition=CompactorResponseDisposition.ACCEPTED,
@@ -2432,6 +2449,7 @@ def test_compactor_response_resolver_projects_accepted_actual_identity(
                 proposal_manifest_ref="payload-invalid",
                 proposal_manifest_digest="sha256:" + "f" * 64,
                 successful_response_identity=None,
+                accepted_evidence_facts=(),
             )
 
 
@@ -2503,6 +2521,80 @@ def test_compactor_response_resolver_projects_rejected_nullable_identity(
             CompactorResponseDisposition.ATTEMPT_REJECTED
         )
         assert (response.successful_response_identity is not None) is with_success
+        assert response.accepted_evidence_facts == ()
+
+
+@pytest.mark.parametrize(
+    "tamper_field",
+    (
+        "accepted_replacement",
+        "accepted_aggregate",
+        "source_boundary",
+    ),
+)
+def test_compactor_response_resolver_fails_closed_for_malformed_accepted_semantics(
+    tmp_path: Path,
+    tamper_field: str,
+) -> None:
+    """accepted replacement/aggregate/boundary 任一损坏都不产生公开事实。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_field: 本次损坏的 semantic binding 字段。
+    :returns: ``None``。
+    :raises AssertionError: strict semantic parser 未 fail closed 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        payload = dict(
+            _accepted_compactor_payload(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-engine-run-1",
+                manifest_ref=manifest_ref,
+                manifest_digest=manifest_digest,
+            )
+        )
+        if tamper_field == "accepted_replacement":
+            replacement = dict(_json_object(payload["accepted_replacement"]))
+            facts = [
+                dict(item)
+                for item in _json_object_sequence(replacement["evidence_facts"])
+            ]
+            facts[0]["canonical_evidence_refs"] = ["evidence:replacement-poison"]
+            facts_json: list[JsonValue] = [item for item in facts]
+            replacement["evidence_facts"] = facts_json
+            payload["accepted_replacement"] = replacement
+        elif tamper_field == "accepted_aggregate":
+            payload["accepted_evidence_mapping_refs"] = ["evidence:aggregate-poison"]
+        else:
+            boundary = [
+                dict(item)
+                for item in _json_object_sequence(payload["source_boundary"])
+            ]
+            evidence_entry = next(
+                item for item in boundary if item["source_label"] == "E1"
+            )
+            evidence_entry["canonical_evidence_refs"] = []
+            boundary_json: list[JsonValue] = [item for item in boundary]
+            payload["source_boundary"] = boundary_json
+        _append_event(
+            store.transaction_runner,
+            event_id=f"event-malformed-accepted-{tamper_field}",
+            event_type=CONTEXT_COMPACTED,
+            payload=payload,
+        )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction,
+                    signal,
+                )
+            )
 
 
 def test_compactor_response_resolver_exhausts_multiple_full_pages_without_cap(

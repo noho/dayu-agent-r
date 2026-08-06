@@ -126,6 +126,7 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
 
 ```bash
 pytest -q tests/host/test_tool_trace_analysis_input.py \
+  tests/host/test_tool_trace_queries.py \
   tests/host/test_tool_trace_analysis_rules.py \
   tests/host/test_tool_trace_analysis.py \
   tests/service/test_tool_trace_analysis.py \
@@ -133,6 +134,12 @@ pytest -q tests/host/test_tool_trace_analysis_input.py \
   tests/cli/test_arg_parsing.py \
   tests/cli/test_import_boundary.py
 ```
+
+该 focused 回归同时覆盖 compactor canonical terminal resolver 的完整 keyset
+exhaustion、provider/model/response identity binding，以及 accepted replacement 逐 fact
+`claim + canonical_evidence_refs` 到 Analyzer JSON/Markdown 的同源投影；malformed
+replacement / aggregate / source boundary 必须 fail closed，attempt-rejected 不得投影
+accepted facts。
 
 仓库当前不配置 GitHub Actions workflow；跨平台 CI 重建由
 [GitHub Issue #184](https://github.com/noho/dayu-agent-r/issues/184) 跟踪。以下真实 Windows nodes 保留为

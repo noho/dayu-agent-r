@@ -333,6 +333,7 @@ def _compactor_response_summaries(
             provider_request_id=(
                 None if successful is None else successful.provider_request_id
             ),
+            accepted_evidence_facts=response.accepted_evidence_facts,
         )
         key = (
             summary.parent_host_run_id,

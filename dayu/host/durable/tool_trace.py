@@ -23,6 +23,7 @@ from dayu.host._runner_call_manifest import (
     parse_runner_call_manifest,
 )
 from dayu.host.context_event_payload import resolve_context_compacted_payload
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.durable._validation import (
     optional_text as _optional_text,
     require_int as _require_int,
@@ -138,6 +139,44 @@ class CompactorResponseDisposition(StrEnum):
 
 class CompactorResponseResolutionError(HostDurableError):
     """compactor canonical terminal 解析或绑定失败。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedCompactorEvidenceFact:
+    """Tool Trace resolver 公开的 accepted EvidenceFact 投影。
+
+    :param claim: Host accepted replacement 中的业务事实文本。
+    :param canonical_evidence_refs: 该事实自身的非空 canonical evidence refs。
+    """
+
+    claim: str
+    canonical_evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """校验公开 EvidenceFact 投影的封闭 typed shape。
+
+        :returns: 无返回值。
+        :raises TypeError: claim、refs tuple 或 ref 元素类型非法时抛出。
+        :raises ValueError: claim 或 ref 为空、refs 为空或重复时抛出。
+        """
+
+        if not isinstance(self.claim, str):
+            raise TypeError("claim must be str")
+        if self.claim.strip() == "":
+            raise ValueError("claim must be non-empty")
+        if not isinstance(self.canonical_evidence_refs, tuple):
+            raise TypeError("canonical_evidence_refs must be tuple")
+        if not self.canonical_evidence_refs:
+            raise ValueError("canonical_evidence_refs must be non-empty")
+        for ref in self.canonical_evidence_refs:
+            if not isinstance(ref, str):
+                raise TypeError("canonical_evidence_refs must contain str")
+            if ref.strip() == "":
+                raise ValueError("canonical_evidence_refs must contain non-empty text")
+        if len(set(self.canonical_evidence_refs)) != len(
+            self.canonical_evidence_refs
+        ):
+            raise ValueError("canonical_evidence_refs must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +415,8 @@ class ResolvedCompactorResponseIdentity:
     :param proposal_manifest_digest: exact proposal manifest digest。
     :param successful_response_identity: 实际成功 Runner response identity；
         no-success rejection 时为 ``None``。
+    :param accepted_evidence_facts: accepted terminal 从严格 semantic payload
+        机械投影的逐事实 claim/refs；attempt-rejected 固定为空。
     """
 
     disposition: CompactorResponseDisposition
@@ -386,6 +427,7 @@ class ResolvedCompactorResponseIdentity:
     proposal_manifest_ref: str
     proposal_manifest_digest: str
     successful_response_identity: SuccessfulRunnerResponseIdentity | None
+    accepted_evidence_facts: tuple[ResolvedCompactorEvidenceFact, ...]
 
     def __post_init__(self) -> None:
         """校验公开 response projection 的封闭 typed shape。
@@ -435,6 +477,18 @@ class ResolvedCompactorResponseIdentity:
             raise ValueError(
                 "accepted compactor response requires successful response identity"
             )
+        if not isinstance(self.accepted_evidence_facts, tuple):
+            raise TypeError("accepted_evidence_facts must be tuple")
+        for fact in self.accepted_evidence_facts:
+            if not isinstance(fact, ResolvedCompactorEvidenceFact):
+                raise TypeError(
+                    "accepted_evidence_facts must contain ResolvedCompactorEvidenceFact"
+                )
+        if (
+            self.disposition is CompactorResponseDisposition.ATTEMPT_REJECTED
+            and self.accepted_evidence_facts
+        ):
+            raise ValueError("attempt-rejected compactor response facts must be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -666,14 +720,23 @@ def _resolved_compactor_response_from_row(
     try:
         if row.event_type == CONTEXT_COMPACTED:
             payload = resolve_context_compacted_payload(transaction, row)
+            semantic_payload = parse_context_compacted_semantic_payload(payload)
             binding = parse_context_compacted_terminal_binding(payload)
             disposition = CompactorResponseDisposition.ACCEPTED
+            accepted_evidence_facts = tuple(
+                ResolvedCompactorEvidenceFact(
+                    claim=fact.claim,
+                    canonical_evidence_refs=fact.canonical_evidence_refs,
+                )
+                for fact in semantic_payload.accepted_replacement.evidence_facts
+            )
         elif row.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED:
             payload = _json_object_from_text(row.payload_json)
             binding = parse_context_compaction_attempt_rejected_terminal_binding(
                 payload
             )
             disposition = CompactorResponseDisposition.ATTEMPT_REJECTED
+            accepted_evidence_facts = ()
         else:
             raise ValueError("unsupported compactor terminal event type")
     except (TypeError, ValueError, HostDurableError) as exc:
@@ -717,6 +780,7 @@ def _resolved_compactor_response_from_row(
         proposal_manifest_ref=binding.proposal_manifest_ref,
         proposal_manifest_digest=binding.proposal_manifest_digest,
         successful_response_identity=response_identity,
+        accepted_evidence_facts=accepted_evidence_facts,
     )
 
 
@@ -1739,6 +1803,7 @@ __all__ = [
     "RunnerCallReconstructionStatus",
     "RunnerCallResolvedProjection",
     "ResolvedCompactorResponseIdentity",
+    "ResolvedCompactorEvidenceFact",
     "ToolTraceHotRow",
     "ToolTraceHotRowWriteResult",
     "ToolTraceHotRowWriteStatus",

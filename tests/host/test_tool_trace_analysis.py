@@ -43,7 +43,10 @@ from dayu.engine.contracts.runner_identity import (
     ProviderRequestIdAvailability,
     build_runner_request_identity,
 )
-from dayu.host.durable.tool_trace import CompactorResponseDisposition
+from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
+)
 
 
 def _source(tmp_path: Path) -> ToolTraceAnalysisSource:
@@ -330,6 +333,15 @@ def test_compactor_response_summary_json_markdown_share_safe_typed_source(
         runner_request_identity=request_identity,
         provider_request_id_availability=ProviderRequestIdAvailability.PRESENT,
         provider_request_id="provider-request-actual",
+        accepted_evidence_facts=(
+            ResolvedCompactorEvidenceFact(
+                claim="Revenue increased by 21.7%.",
+                canonical_evidence_refs=(
+                    "evidence:canonical-1",
+                    "evidence:canonical-2",
+                ),
+            ),
+        ),
     )
     with_response = replace(report, compactor_responses=(response,))
 
@@ -344,11 +356,27 @@ def test_compactor_response_summary_json_markdown_share_safe_typed_source(
     assert projected["runner_request_identity"]["client_correlation_id"] == (
         request_identity.client_correlation_id
     )
+    assert projected["accepted_evidence_facts"] == [
+        {
+            "claim": "Revenue increased by 21.7%.",
+            "canonical_evidence_refs": [
+                "evidence:canonical-1",
+                "evidence:canonical-2",
+            ],
+        }
+    ]
+    assert set(projected["accepted_evidence_facts"][0]) == {
+        "claim",
+        "canonical_evidence_refs",
+    }
     for expected in (
         "provider-actual",
         "model-actual",
         "provider-request-actual",
         request_identity.client_correlation_id,
+        "Revenue increased by 21.7%.",
+        "evidence:canonical-1",
+        "evidence:canonical-2",
     ):
         assert expected in markdown
     rendered_text = tool_trace_analysis_report_to_json(with_response) + markdown
@@ -358,6 +386,10 @@ def test_compactor_response_summary_json_markdown_share_safe_typed_source(
         "api_key",
         "raw_request",
         "raw_response",
+        "selection-label-secret",
+        "raw-payload-secret",
+        "credential-secret",
+        "prompt-secret",
     ):
         assert forbidden not in rendered_text
 
@@ -387,6 +419,7 @@ def test_no_success_compactor_response_requires_typed_null_identity(
         runner_request_identity=None,
         provider_request_id_availability=None,
         provider_request_id=None,
+        accepted_evidence_facts=(),
     )
     payload = json.loads(
         tool_trace_analysis_report_to_json(
