@@ -1093,7 +1093,7 @@ def test_fake_compactor_proposal_does_not_echo_material_markers() -> None:
 
     proposal = _fake_compaction_proposal_from_material_json(
         {
-            "schema": "dayu.context_compaction.input.v3",
+            "schema": "dayu.context_compaction.input.v4",
             "current_input": {"readable_text": "继续分析"},
             "source_boundary": [
                 {
@@ -1112,18 +1112,31 @@ def test_fake_compactor_proposal_does_not_echo_material_markers() -> None:
                     "readable_text": _SMOKE_REACTIVE_OLD_MARKER,
                 },
             ],
+            "output_caps": {
+                "session_summary_char_cap": 1024,
+                "evidence_fact_item_cap": 8,
+                "evidence_fact_char_cap": 2048,
+                "answer_anchor_item_cap": 8,
+                "answer_anchor_char_cap": 2048,
+                "forward_intent_item_cap": 8,
+                "forward_intent_char_cap": 2048,
+                "reference_continuity_item_cap": 8,
+                "reference_continuity_char_cap": 2048,
+            },
         }
     )
     parsed = json.loads(proposal)
 
     assert _SMOKE_REACTIVE_OLD_MARKER not in proposal
-    assert parsed["schema"] == "dayu.context_compaction.output.v3"
+    assert parsed["schema"] == "dayu.context_compaction.output.v4"
     assert parsed["session_summary"]["source_labels"] == ["T1"]
+    assert parsed["retained_previous_evidence_fact_labels"] == []
     assert parsed["evidence_facts"][0]["support_labels"] == ["E1"]
     assert parsed["answer_anchors"][0]["source_labels"] == ["A1"]
     assert set(parsed) == {
         "schema",
         "session_summary",
+        "retained_previous_evidence_fact_labels",
         "evidence_facts",
         "answer_anchors",
         "forward_intents",

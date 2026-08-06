@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from dayu.host.compaction import (
-    CompactForwardIntentStatusV3,
+    CompactForwardIntentStatusV4,
 )
 from dayu.host.memory import (
     AnswerAnchor,
@@ -240,7 +240,7 @@ def rich_memory_snapshot(
                     item_id="memory-item:forward-intent:test",
                     intent_type="next_step_note",
                     text="what changed in margin?",
-                    status=CompactForwardIntentStatusV3.OPEN,
+                    status=CompactForwardIntentStatusV4.OPEN,
                     source_refs=("event-memory-episode",),
                     event_id="event-memory-episode",
                     event_sequence=5,

@@ -86,21 +86,21 @@ from dayu.host.api import (
     RunStatus,
 )
 from dayu.host.compaction import (
-    CompactAnswerAnchorV3,
+    CompactAnswerAnchorV4,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactRepairFeedbackV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactRepairFeedbackV4,
     CompactionRequest,
     CompactorProposal,
     ContextCompactor,
-    CompactCandidateV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentV3,
-    CompactForwardIntentStatusV3,
-    CompactReferenceContinuityV3,
-    CompactSessionSummaryV3,
-    CompactValidationIssueCodeV3,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactSessionSummaryV4,
+    CompactValidationIssueCodeV4,
 )
 from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
@@ -735,7 +735,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposalRunInput:
         """构造可持久化 manifest 的 deterministic proposal runner input。
 
@@ -868,7 +868,7 @@ class _StaleMutatingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """先把源 Run 失败收口，再返回 candidate。
 
@@ -923,7 +923,7 @@ class _TerminalWinningProactiveCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """先提交 failed first truth，再返回 late accepted candidate。
 
@@ -1026,6 +1026,7 @@ class _QualityRejectOnceCompactor(_PreparedManifestProactiveCompactor):
                 candidate=replace(
                     proposal.candidate,
                     session_summary=None,
+                    retained_previous_evidence_fact_labels=(),
                     evidence_facts=(),
                     answer_anchors=(),
                     forward_intents=(),
@@ -1055,6 +1056,7 @@ class _AlwaysQualityRejectingCompactor(_PreparedManifestProactiveCompactor):
             candidate=replace(
                 proposal.candidate,
                 session_summary=None,
+                retained_previous_evidence_fact_labels=(),
                 evidence_facts=(),
                 answer_anchors=(),
                 forward_intents=(),
@@ -1065,9 +1067,9 @@ class _AlwaysQualityRejectingCompactor(_PreparedManifestProactiveCompactor):
 
 
 def _retain_feedback_without_binding_for_defensive_test(
-    feedback: CompactRepairFeedbackV3 | None,
+    feedback: CompactRepairFeedbackV4 | None,
     request: CompactionRequest,
-) -> CompactRepairFeedbackV3 | None:
+) -> CompactRepairFeedbackV4 | None:
     """绕过 dispatcher 正常清理，仅用于验证 operation defensive guard。
 
     :param feedback: 前一 attempt feedback。
@@ -1175,12 +1177,13 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
         if len(source_labels) == 0:
             raise AssertionError("compact input has no citable label")
         return CompactorProposal(
-            candidate=CompactCandidateV3(
-                schema=COMPACT_OUTPUT_SCHEMA_V3,
-                session_summary=CompactSessionSummaryV3(
+            candidate=CompactCandidateV4(
+                schema=COMPACT_OUTPUT_SCHEMA_V4,
+                session_summary=CompactSessionSummaryV4(
                     text="rolled",
                     source_labels=source_labels,
                 ),
+                retained_previous_evidence_fact_labels=(),
                 evidence_facts=(),
                 answer_anchors=(),
                 forward_intents=(),
@@ -1238,12 +1241,13 @@ class _RecoveryScenarioCompactor(_PreparedManifestProactiveCompactor):
         if len(source_labels) == 0:
             raise AssertionError("compact input has no citable label")
         return CompactorProposal(
-            candidate=CompactCandidateV3(
-                schema=COMPACT_OUTPUT_SCHEMA_V3,
-                session_summary=CompactSessionSummaryV3(
+            candidate=CompactCandidateV4(
+                schema=COMPACT_OUTPUT_SCHEMA_V4,
+                session_summary=CompactSessionSummaryV4(
                     text=f"recovery summary {self.calls}",
                     source_labels=source_labels,
                 ),
+                retained_previous_evidence_fact_labels=(),
                 evidence_facts=(),
                 answer_anchors=(),
                 forward_intents=(),
@@ -7000,7 +7004,7 @@ async def test_proactive_same_operation_terminal_contenders_preserve_first_truth
                 compaction_operation_id: str | None = None,
                 proposal_manifest_recorder: (DurableCompactorProposalManifestRecorder | None) = None,
                 memory_policy: MemoryProjectionPolicy,
-                repair_feedback: CompactRepairFeedbackV3 | None,
+                repair_feedback: CompactRepairFeedbackV4 | None,
             ) -> CompactionOperationResult:
                 """在 provider/manifest 完成后 barrier 两个相反 outcome。
 
@@ -7247,7 +7251,7 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             assert repair_feedback.issues[0].json_path == "$"
             assert (
                 repair_feedback.issues[0].code
-                is CompactValidationIssueCodeV3.EMPTY_SEMANTIC_OUTPUT
+                is CompactValidationIssueCodeV4.EMPTY_SEMANTIC_OUTPUT
             )
             assert compactor.prepared_inputs[1].compact_input == compactor.prepared_inputs[0].compact_input
             assert (
@@ -7413,8 +7417,8 @@ async def test_oversized_accepted_compact_terminal_uses_descriptor_truth(
                 json.loads(compact_artifact_bytes),
             )
             assert isinstance(compact_artifact_json, Mapping)
-            assert compact_artifact_json["accepted_candidate"] == (
-                compacted_payload["accepted_candidate"]
+            assert compact_artifact_json["accepted_proposal"] == (
+                compacted_payload["accepted_proposal"]
             )
 
             memory_row = store.transaction_runner.run_read(
@@ -9007,7 +9011,7 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
             assert compacted_payload["operation_id"] != ""
             assert compacted_payload["accepted_attempt_number"] == 1
             assert compacted_payload["compact_artifact_ref"] != ""
-            assert compacted_payload["accepted_candidate_digest"] != ""
+            assert compacted_payload["accepted_proposal_digest"] != ""
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
         finally:
             await scheduler.close()
@@ -11225,7 +11229,6 @@ def _append_previous_compacted_event(
                     ),
                     budget_after_compact=16,
                     prompt_local_label_mapping_refs=("label-map:previous",),
-                    accepted_evidence_mapping_refs=("evidence:previous",),
                     projection_signal="project_memory",
                     successful_response_identity=(
                         _successful_response_identity_for_agent_request(compactor_agent_request)
@@ -11246,41 +11249,43 @@ def _append_previous_compacted_event(
     transaction_runner.run_write(_operation)
 
 
-def _previous_compacted_candidate() -> CompactCandidateV3:
+def _previous_compacted_candidate() -> CompactCandidateV4:
     """构造含全 section 的 latest accepted compact candidate。
 
-    :returns: CompactCandidateV3。
+    :returns: CompactCandidateV4。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="previous session summary must drop whole",
             source_labels=("T1",),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim="previous evidence fact must stay exact",
                 support_labels=("E1",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="previous answer anchor must drop whole",
                 detail="previous answer item",
                 source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step_note",
                 text="previous forward intent must drop whole",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("T1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text="previous reference must drop whole",
                 reason="local_reference",
                 source_labels=("T1",),

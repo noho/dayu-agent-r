@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
-    CompactCandidateV3,
-    CompactForwardIntentStatusV3,
-    compact_text_size_units_v3,
-    validate_compact_policy_usage_audit_candidate_binding_v3,
+    CompactAcceptedReplacementV4,
+    CompactForwardIntentStatusV4,
+    compact_text_size_units_v4,
+    validate_compact_policy_usage_audit_replacement_binding_v4,
 )
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
@@ -598,7 +598,7 @@ class ForwardIntent:
     item_id: str
     intent_type: str
     text: str
-    status: CompactForwardIntentStatusV3
+    status: CompactForwardIntentStatusV4
     source_refs: tuple[str, ...]
     event_id: str
     event_sequence: int
@@ -614,8 +614,8 @@ class ForwardIntent:
         _require_non_empty(self.item_id, "item_id")
         _require_non_empty(self.intent_type, "intent_type")
         _require_non_empty(self.text, "text")
-        if not isinstance(self.status, CompactForwardIntentStatusV3):
-            raise ValueError("status must be CompactForwardIntentStatusV3")
+        if not isinstance(self.status, CompactForwardIntentStatusV4):
+            raise ValueError("status must be CompactForwardIntentStatusV4")
         _require_non_empty_items(self.source_refs, "source_refs")
         _require_non_empty(self.event_id, "event_id")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -1032,7 +1032,7 @@ def estimate_memory_size_units(text: str) -> MemorySizeUnits:
 
     if not isinstance(text, str):
         raise ValueError("text must be str")
-    return MemorySizeUnits(units=compact_text_size_units_v3(text))
+    return MemorySizeUnits(units=compact_text_size_units_v4(text))
 
 
 def digest_memory_projection_policy(policy: MemoryProjectionPolicy) -> MemoryPolicyDigest:
@@ -1234,7 +1234,7 @@ def project_conversation_memory_event(
         compacted_semantics = event.compacted_semantics
         if compacted_semantics is None:
             raise ValueError("CONTEXT_COMPACTED requires compacted_semantics")
-        accepted_candidate = compacted_semantics.accepted_candidate
+        accepted_replacement = compacted_semantics.accepted_replacement
         _validate_committed_policy_usage(compacted_semantics, policy)
         committed_compact_applied = True
         selected = _selected_recent_after_compaction(
@@ -1245,17 +1245,17 @@ def project_conversation_memory_event(
         latest_compaction_event_ref = event.event_id
         session_summary = _session_summary_from_accepted_event(
             event,
-            accepted_candidate,
+            accepted_replacement,
         )
         facts = _facts_from_accepted_event(
             event,
             compacted_semantics,
         )
-        anchors = _answer_anchors_from_accepted_event(event, accepted_candidate)
-        intents = _forward_intents_from_accepted_event(event, accepted_candidate)
+        anchors = _answer_anchors_from_accepted_event(event, accepted_replacement)
+        intents = _forward_intents_from_accepted_event(event, accepted_replacement)
         reference_items = _reference_continuity_from_accepted_event(
             event,
-            accepted_candidate,
+            accepted_replacement,
         )
     else:
         diagnostics = diagnostics + (_unsupported_event_type_diagnostic(event, policy_digest=policy_digest),)
@@ -1660,7 +1660,7 @@ def _validate_committed_policy_usage(
     """验证 committed audit 绑定当前 Memory policy 且 actual 未超 cap。
 
     Memory 只消费 durable accepted truth 中的 Host-derived audit；本函数不从
-    candidate 文本重新计算 caps 或用量，也不做 truncate、merge 或默认补偿。
+    proposal 文本重新计算 caps 或用量，也不做 truncate、merge 或默认补偿。
 
     :param semantics: canonical event strict parser 恢复的 accepted truth view。
     :param policy: 与 Context Governance 共用的 policy instance。
@@ -1669,8 +1669,11 @@ def _validate_committed_policy_usage(
     """
 
     audit = semantics.policy_usage_audit
-    candidate = semantics.accepted_candidate
-    validate_compact_policy_usage_audit_candidate_binding_v3(candidate, audit)
+    replacement = semantics.accepted_replacement
+    validate_compact_policy_usage_audit_replacement_binding_v4(
+        replacement,
+        audit,
+    )
     if audit.policy_ref != policy.policy_ref:
         raise ValueError("committed policy audit ref mismatch")
     if audit.policy_digest != digest_memory_projection_policy(policy):
@@ -1700,16 +1703,16 @@ def _validate_committed_policy_usage(
 
 def _session_summary_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV3,
+    replacement: CompactAcceptedReplacementV4,
 ) -> SessionSummaryMemoryView:
     """从 accepted compact event 物化 Session Summary Memory。
 
     :param event: CONTEXT_COMPACTED event。
-    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
+    :param replacement: 已由 persisted semantic owner 恢复的 typed replacement。
     :returns: replacement session summary view。
     """
 
-    summary = candidate.session_summary
+    summary = replacement.session_summary
     if summary is None:
         return _empty_session_summary_memory()
     text = summary.text
@@ -1734,11 +1737,7 @@ def _facts_from_accepted_event(
     :raises ValueError: typed semantics 与 memory contract 不一致时抛出。
     """
 
-    candidate = compacted_semantics.accepted_candidate
-    evidence_refs = compacted_semantics.accepted_evidence_mapping_refs
-    fact_values = candidate.evidence_facts
-    if len(evidence_refs) > 0 and len(fact_values) == 0:
-        raise ValueError("committed compact evidence refs require evidence fact projection")
+    fact_values = compacted_semantics.accepted_replacement.evidence_facts
     provenance = MemoryProvenanceRef(
         producer_kind=MemoryProducerKind.HOST_PROJECTION,
         producer_name="host_projection",
@@ -1762,7 +1761,7 @@ def _facts_from_accepted_event(
                 item_id=item_id,
                 claim_text=claim_text,
                 evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
-                evidence_refs=evidence_refs,
+                evidence_refs=fact.canonical_evidence_refs,
                 provenance=provenance,
                 extraction_operation_ref=f"event:{event.event_id}",
                 compact_artifact_ref=compact_artifact_ref,
@@ -1792,18 +1791,18 @@ def _empty_session_summary_memory() -> SessionSummaryMemoryView:
 
 def _answer_anchors_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV3,
+    replacement: CompactAcceptedReplacementV4,
 ) -> tuple[AnswerAnchor, ...]:
     """从 accepted compact event 物化 answer anchors。
 
     :param event: CONTEXT_COMPACTED event。
-    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
+    :param replacement: 已由 persisted semantic owner 恢复的 typed replacement。
     :returns: answer anchors。
-    :raises ValueError: typed candidate 与 memory contract 不一致时抛出。
+    :raises ValueError: typed replacement 与 memory contract 不一致时抛出。
     """
 
     result: list[AnswerAnchor] = []
-    for index, item in enumerate(candidate.answer_anchors):
+    for index, item in enumerate(replacement.answer_anchors):
         children = (AnswerAnchorChild(display_text=item.detail, ordinal=None),)
         text = f"{item.title}\n{item.detail}"
         result.append(
@@ -1822,18 +1821,18 @@ def _answer_anchors_from_accepted_event(
 
 def _forward_intents_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV3,
+    replacement: CompactAcceptedReplacementV4,
 ) -> tuple[ForwardIntent, ...]:
     """从 accepted compact event 物化 forward intents。
 
     :param event: CONTEXT_COMPACTED event。
-    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
+    :param replacement: 已由 persisted semantic owner 恢复的 typed replacement。
     :returns: forward intents。
-    :raises ValueError: typed candidate 与 memory contract 不一致时抛出。
+    :raises ValueError: typed replacement 与 memory contract 不一致时抛出。
     """
 
     result: list[ForwardIntent] = []
-    for index, item in enumerate(candidate.forward_intents):
+    for index, item in enumerate(replacement.forward_intents):
         text = item.text
         result.append(
             ForwardIntent(
@@ -1852,18 +1851,18 @@ def _forward_intents_from_accepted_event(
 
 def _reference_continuity_from_accepted_event(
     event: MemoryProjectionEvent,
-    candidate: CompactCandidateV3,
+    replacement: CompactAcceptedReplacementV4,
 ) -> tuple[ReferenceContinuityItem, ...]:
     """从 accepted compact event 物化 reference continuity items。
 
     :param event: CONTEXT_COMPACTED event。
-    :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
+    :param replacement: 已由 persisted semantic owner 恢复的 typed replacement。
     :returns: reference continuity items。
-    :raises ValueError: typed candidate 与 memory contract 不一致时抛出。
+    :raises ValueError: typed replacement 与 memory contract 不一致时抛出。
     """
 
     result: list[ReferenceContinuityItem] = []
-    for index, item in enumerate(candidate.reference_continuity):
+    for index, item in enumerate(replacement.reference_continuity):
         text = item.text
         result.append(
             ReferenceContinuityItem(
@@ -2628,7 +2627,7 @@ def _forward_intent_from_json_value(value: JsonValue) -> ForwardIntent:
         item_id=_required_str(mapping, "item_id"),
         intent_type=_required_str(mapping, "intent_type"),
         text=_required_str(mapping, "text"),
-        status=CompactForwardIntentStatusV3(_required_str(mapping, "status")),
+        status=CompactForwardIntentStatusV4(_required_str(mapping, "status")),
         source_refs=_required_text_tuple(mapping, "source_refs"),
         event_id=_required_str(mapping, "event_id"),
         event_sequence=_required_int(mapping, "event_sequence"),

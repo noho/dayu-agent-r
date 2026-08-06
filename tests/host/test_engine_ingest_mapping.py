@@ -150,8 +150,8 @@ from dayu.host.compact_payload import (
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactRepairFeedbackV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactRepairFeedbackV4,
     CompactionRequest,
     CompactorProposal,
     ContextCompactor,
@@ -534,7 +534,7 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """执行 vNext compact 并验证当前不在外层 write transaction 内。
 
@@ -572,7 +572,7 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """推进 durable input sequence 后返回旧 snapshot 的 vNext candidate。
 
@@ -609,7 +609,7 @@ class _InvalidMultipleReactiveCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """提交两个同 operation failed terminal 后返回 accepted candidate。
 
@@ -682,7 +682,7 @@ class _RaisingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """抛出 vNext proposal 失败。
 
@@ -734,7 +734,7 @@ class _PreparedManifestReactiveCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposalRunInput:
         """构造测试用 prepared compactor proposal input。
 
@@ -1404,9 +1404,9 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert compacted_payload["operation_id"] == result.events[0].event_id
         assert compacted_payload["accepted_attempt_number"] == 1
         assert compacted_payload["projection_signal"] == (COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP)
-        accepted_candidate = compacted_payload["accepted_candidate"]
-        assert isinstance(accepted_candidate, Mapping)
-        assert accepted_candidate["schema"] == (COMPACT_OUTPUT_SCHEMA_V3)
+        accepted_proposal = compacted_payload["accepted_proposal"]
+        assert isinstance(accepted_proposal, Mapping)
+        assert accepted_proposal["schema"] == (COMPACT_OUTPUT_SCHEMA_V4)
         assert "preserved_fact_refs" not in compacted_payload
         artifact_ref = compacted_payload["compact_artifact_ref"]
         assert isinstance(artifact_ref, str)
@@ -1422,7 +1422,7 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert isinstance(artifact_raw, Mapping)
         artifact_json = cast(Mapping[str, JsonValue], artifact_raw)
         assert artifact_json["schema_version"] == (COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT)
-        assert artifact_json["accepted_candidate_digest"] == (compacted_payload["accepted_candidate_digest"])
+        assert artifact_json["accepted_proposal_digest"] == (compacted_payload["accepted_proposal_digest"])
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.FAILED

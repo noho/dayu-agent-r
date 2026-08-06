@@ -20,20 +20,24 @@ from dayu.engine.contracts.runner_identity import (
 )
 from dayu.host.api import HostEventClass, HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
-    CompactAnswerAnchorV3,
-    CompactAcceptedTruthV3,
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactCandidateV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentV3,
-    CompactForwardIntentStatusV3,
-    CompactReferenceContinuityV3,
-    CompactRepresentedCoverageV3,
-    CompactSessionSummaryV3,
-    CompactSourceBoundaryEntryV3,
+    COMPACT_INPUT_SCHEMA_V4,
+    CompactAnswerAnchorV4,
+    CompactAcceptedTruthV4,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAcceptedReplacementV4,
+    CompactCandidateV4,
+    CompactCurrentInputV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactRepresentedCoverageV4,
+    CompactSessionSummaryV4,
+    CompactInputV4,
+    CompactSourceBoundaryEntryV4,
+    CompactSourceKindV4,
 )
 from dayu.host.compact_payload import (
-    accepted_candidate_fact_evidence_labels,
     accepted_compact_business_texts,
     accepted_evidence_mapping_refs,
     compact_artifact_payload_ref,
@@ -55,6 +59,10 @@ from dayu.host.context_events import (
     validate_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_governance import (
+    accept_compact_candidate_v4,
+    compact_output_caps_v4_from_memory_policy,
+)
 from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import EventClass, EventLogRow
@@ -65,6 +73,7 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.read_api import _host_event_from_row
+from dayu.host.memory import default_memory_projection_policy
 from tests.host.fake_compaction import accepted_truth_for_candidate
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -311,7 +320,7 @@ def test_compacted_payload_builder_emits_required_accepted_output() -> None:
     validate_context_compacted_payload(payload)
     assert payload["compact_artifact_ref"] == "compact-artifact:abc"
     assert payload["accepted_attempt_number"] == 2
-    assert payload["accepted_candidate_digest"] == _candidate().digest()
+    assert payload["accepted_proposal_digest"] == _candidate().digest()
     assert payload["budget_after_compact"] == 512
 
 
@@ -322,16 +331,18 @@ def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
 
     semantic = parse_context_compacted_semantic_payload(payload)
 
-    assert semantic.accepted_candidate == _candidate()
-    assert semantic.accepted_candidate_digest == _candidate().digest()
-    assert semantic.accepted_evidence_mapping_refs == ("evidence:accepted-1",)
+    assert semantic.accepted_proposal == _candidate()
+    assert semantic.accepted_proposal_digest == _candidate().digest()
+    assert semantic.accepted_evidence_mapping_refs == ("evidence:E1",)
     assert semantic.compact_artifact_ref == "compact-artifact:abc"
     assert semantic.current_input_ref == "event-user-1"
     assert semantic.compacted_source_refs == ("evidence:accepted-1",)
-    assert semantic.accepted_candidate.answer_anchors[0].detail == ("Revenue increased.\nMargin also expanded.")
-    assert accepted_evidence_mapping_refs(payload) == ("evidence:accepted-1",)
-    assert accepted_candidate_fact_evidence_labels(payload) == ("E1",)
-    assert accepted_compact_business_texts(semantic.accepted_candidate) == (
+    assert semantic.accepted_proposal.answer_anchors[0].detail == ("Revenue increased.\nMargin also expanded.")
+    assert semantic.accepted_replacement.answer_anchors[0].detail == (
+        "Revenue increased.\nMargin also expanded."
+    )
+    assert accepted_evidence_mapping_refs(payload) == ("evidence:E1",)
+    assert accepted_compact_business_texts(semantic.accepted_replacement) == (
         "Q1 review focused on revenue.",
         "Revenue increased.",
         "Revenue answer",
@@ -342,10 +353,15 @@ def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
 
 
 def test_compact_payload_public_helpers_reject_invalid_inputs() -> None:
-    """compact payload public helper 对弱类型 candidate 与非法 digest fail closed。"""
+    """compact payload public helper 对弱类型 replacement 与非法 digest fail closed。"""
 
-    with pytest.raises(TypeError, match="candidate must be CompactCandidateV3"):
-        accepted_compact_business_texts(cast(CompactCandidateV3, "bad"))
+    with pytest.raises(
+        TypeError,
+        match="replacement must be CompactAcceptedReplacementV4",
+    ):
+        accepted_compact_business_texts(
+            cast(CompactAcceptedReplacementV4, "bad")
+        )
     with pytest.raises(ValueError, match="artifact_digest must be sha256 digest"):
         compact_artifact_payload_ref("bad")
 
@@ -401,22 +417,25 @@ def test_compacted_semantic_parser_accepts_nonempty_intent_type() -> None:
     """intent_type 是业务可读文本，不得被下游伪造成枚举。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     intents = _mapping_list(candidate["forward_intents"])
     intents[0]["intent_type"] = "custom_follow_up"
     candidate["forward_intents"] = cast(list[JsonValue], intents)
     _replace_candidate_and_digest(payload, candidate)
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    replacement["forward_intents"] = cast(list[JsonValue], intents)
+    payload["accepted_replacement"] = replacement
 
     semantic = parse_context_compacted_semantic_payload(payload)
 
-    assert semantic.accepted_candidate.forward_intents[0].intent_type == ("custom_follow_up")
+    assert semantic.accepted_proposal.forward_intents[0].intent_type == ("custom_follow_up")
 
 
 def test_compacted_semantic_parser_rejects_invalid_forward_intent_status() -> None:
     """persisted parser 对非法 forward intent status fail closed。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     intents = _mapping_list(candidate["forward_intents"])
     intents[0]["status"] = "unknown_status"
     candidate["forward_intents"] = cast(list[JsonValue], intents)
@@ -430,15 +449,18 @@ def test_compacted_semantic_parser_accepts_nonempty_reference_reason() -> None:
     """reference reason 是业务可读文本，不得被下游伪造成枚举。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     references = _mapping_list(candidate["reference_continuity"])
     references[0]["reason"] = "retain_for_next_comparison"
     candidate["reference_continuity"] = cast(list[JsonValue], references)
     _replace_candidate_and_digest(payload, candidate)
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    replacement["reference_continuity"] = cast(list[JsonValue], references)
+    payload["accepted_replacement"] = replacement
 
     semantic = parse_context_compacted_semantic_payload(payload)
 
-    assert semantic.accepted_candidate.reference_continuity[0].reason == ("retain_for_next_comparison")
+    assert semantic.accepted_proposal.reference_continuity[0].reason == ("retain_for_next_comparison")
 
 
 def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> None:
@@ -449,7 +471,7 @@ def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> 
     """
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     facts = _mapping_list(candidate["evidence_facts"])
     facts[0]["evidence_kind"] = "accepted_evidence_material"
     candidate["evidence_facts"] = cast(list[JsonValue], facts)
@@ -466,7 +488,7 @@ def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path
     """persisted parser 在 owner boundary 拒绝空 summary source labels。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     summary = _payload_mapping(candidate["session_summary"])
     summary["source_labels"] = []
     candidate["session_summary"] = summary
@@ -503,7 +525,7 @@ def test_compacted_semantic_parser_rejects_duplicate_fact_labels_with_indexed_pa
     """
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     facts = _mapping_list(candidate["evidence_facts"])
     facts[0][label_field] = ["E1", "E1"]
     candidate["evidence_facts"] = cast(list[JsonValue], facts)
@@ -517,7 +539,7 @@ def test_compacted_semantic_parser_rejects_duplicate_intent_source_labels_with_i
     """persisted parser 拒绝重复 intent source labels 并保留 indexed JSON path。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     intents = _mapping_list(candidate["forward_intents"])
     intents[0]["source_labels"] = ["A1", "A1"]
     candidate["forward_intents"] = cast(list[JsonValue], intents)
@@ -537,7 +559,7 @@ def test_compacted_semantic_parser_rejects_wrong_nested_shape() -> None:
     """persisted parser 拒绝错误 nested list/object shape。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     candidate["answer_anchors"] = "not-a-list"
     _replace_candidate_and_digest(payload, candidate)
 
@@ -546,10 +568,10 @@ def test_compacted_semantic_parser_rejects_wrong_nested_shape() -> None:
 
 
 def test_compacted_semantic_parser_rejects_removed_anchor_children_field() -> None:
-    """fresh v3 anchor 不接受旧 child/ordinal 结构。"""
+    """fresh v4 anchor 不接受旧 child/ordinal 结构。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     anchors = _mapping_list(candidate["answer_anchors"])
     anchors[0]["anchor_items"] = [{"text": "legacy", "detail": "legacy", "ordinal": -1}]
     candidate["answer_anchors"] = cast(list[JsonValue], anchors)
@@ -566,7 +588,7 @@ def test_compacted_semantic_parser_rejects_unknown_old_candidate_field() -> None
     """persisted parser 不接受 current schema 之外的旧字段 alias。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     candidate["episode_summary"] = "legacy"
     _replace_candidate_and_digest(payload, candidate)
 
@@ -578,9 +600,265 @@ def test_compacted_semantic_parser_rejects_candidate_digest_mismatch() -> None:
     """persisted parser 不接受 candidate 与 persisted digest 不一致。"""
 
     payload = _valid_compacted_payload()
-    payload["accepted_candidate_digest"] = _DIGEST_A
+    payload["accepted_proposal_digest"] = _DIGEST_A
 
-    with pytest.raises(ValueError, match="accepted_candidate_digest mismatch"):
+    with pytest.raises(ValueError, match="accepted_proposal_digest mismatch"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "tampered_value", "expected_message"),
+    (
+        (
+            "claim",
+            "Tampered durable claim.",
+            "accepted_replacement must exactly bind",
+        ),
+        (
+            "selection_labels",
+            ["UNKNOWN"],
+            "accepted_replacement must exactly bind",
+        ),
+        (
+            "selection_labels",
+            [],
+            "selection_labels must be non-empty",
+        ),
+        (
+            "canonical_evidence_refs",
+            ["evidence:unrelated"],
+            "accepted_replacement must exactly bind",
+        ),
+        (
+            "canonical_evidence_refs",
+            [],
+            "canonical_evidence_refs must be non-empty",
+        ),
+    ),
+)
+def test_compacted_semantic_parser_rejects_tampered_replacement_fact_binding(
+    field_name: str,
+    tampered_value: JsonValue,
+    expected_message: str,
+) -> None:
+    """strict payload parser 重验 replacement atom 的 claim/selection/refs exact binding。
+
+    :param field_name: 被篡改的 accepted fact 字段。
+    :param tampered_value: 写入 durable payload 的非法值。
+    :param expected_message: owner fail-closed 错误片段。
+    :returns: ``None``。
+    """
+
+    payload = _valid_compacted_payload()
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    facts = _mapping_list(replacement["evidence_facts"])
+    facts[0][field_name] = tampered_value
+    replacement["evidence_facts"] = cast(list[JsonValue], facts)
+    payload["accepted_replacement"] = replacement
+
+    with pytest.raises(ValueError, match=expected_message):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_accepts_reverse_cross_fact_boundary_order() -> None:
+    """fact 顺序可与 boundary 相反，aggregate 保持 replacement fact/entry 顺序。
+
+    :returns: ``None``。
+    :raises AssertionError: durable parser 错把跨 fact 顺序当作 boundary ordinal 时抛出。
+    """
+
+    accepted = _accepted_truth_for_ordered_evidence_boundary(
+        boundary_refs=(
+            ("E1", ("evidence:first",)),
+            ("E2", ("evidence:second",)),
+        ),
+        facts=(
+            CompactEvidenceFactV4(
+                claim="第二项事实先出现",
+                support_labels=("E2",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="第一项事实后出现",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+    )
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == (
+        "evidence:second",
+        "evidence:first",
+    )
+
+
+def test_compacted_semantic_parser_accepts_three_fact_shared_ref_ordered_dedup() -> None:
+    """三 fact aggregate 按 fact/entry 顺序 unique union，并跨 fact 去重 shared ref。
+
+    :returns: ``None``。
+    """
+
+    accepted = _accepted_truth_for_ordered_evidence_boundary(
+        boundary_refs=(
+            ("E1", ("evidence:first", "evidence:shared")),
+            ("E2", ("evidence:shared", "evidence:second")),
+            ("E3", ("evidence:third",)),
+        ),
+        facts=(
+            CompactEvidenceFactV4(
+                claim="第三项事实",
+                support_labels=("E3",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="第二项事实",
+                support_labels=("E2",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="第一项事实",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+    )
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == (
+        "evidence:third",
+        "evidence:shared",
+        "evidence:second",
+        "evidence:first",
+    )
+
+
+def test_compacted_semantic_parser_accepts_retained_then_new_aggregate() -> None:
+    """retained atom 在前、new atom 在后时 aggregate 精确反映 combined replacement。
+
+    :returns: ``None``。
+    """
+
+    policy = default_memory_projection_policy()
+    compact_input = CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-retained-new",
+            readable_text="继续分析",
+        ),
+        source_boundary=(
+            CompactSourceBoundaryEntryV4(
+                source_label="P1",
+                source_kind=CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+                source_refs=("event:previous",),
+                canonical_evidence_refs=("evidence:previous",),
+                readable_text="旧事实",
+            ),
+            CompactSourceBoundaryEntryV4(
+                source_label="E1",
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
+                source_refs=("event:current-evidence",),
+                canonical_evidence_refs=("evidence:current",),
+                readable_text="当前证据",
+            ),
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
+    )
+    proposal = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=None,
+        retained_previous_evidence_fact_labels=("P1",),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="新事实",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    accepted = accept_compact_candidate_v4(compact_input, proposal, policy)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == (
+        "evidence:previous",
+        "evidence:current",
+    )
+
+
+def test_compacted_semantic_parser_accepts_empty_evidence_aggregate() -> None:
+    """无 evidence facts 的合法 replacement 允许空 aggregate。
+
+    :returns: ``None``。
+    """
+
+    accepted = accepted_truth_for_candidate(
+        CompactCandidateV4(
+            schema=COMPACT_OUTPUT_SCHEMA_V4,
+            session_summary=CompactSessionSummaryV4(
+                text="只保留会话摘要",
+                source_labels=("T1",),
+            ),
+            retained_previous_evidence_fact_labels=(),
+            evidence_facts=(),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity=(),
+        ),
+        current_input_ref="event:current-empty-aggregate",
+    )
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == ()
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "expected_message"),
+    (
+        (
+            ["evidence:outside"],
+            "accepted_evidence_mapping_refs must be boundary evidence subset",
+        ),
+        (
+            ["evidence:E1", "evidence:E1"],
+            "accepted_evidence_mapping_refs must contain unique refs",
+        ),
+        (
+            [],
+            "accepted_evidence_mapping_refs must equal replacement refs union",
+        ),
+    ),
+)
+def test_compacted_semantic_parser_rejects_invalid_aggregate_membership_or_binding(
+    aggregate: list[JsonValue],
+    expected_message: str,
+) -> None:
+    """aggregate 对越界、重复和 replacement mismatch 分别 fail closed。
+
+    :param aggregate: 篡改后的 durable aggregate。
+    :param expected_message: owner 错误消息。
+    :returns: ``None``。
+    """
+
+    payload = _valid_compacted_payload()
+    payload["accepted_evidence_mapping_refs"] = aggregate
+
+    with pytest.raises(ValueError, match=expected_message):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -699,16 +977,16 @@ def test_compacted_semantic_view_rejects_invalid_source_boundary_types() -> None
     with pytest.raises(TypeError, match="source_boundary must be tuple"):
         replace(
             semantics,
-            source_boundary=cast(tuple[CompactSourceBoundaryEntryV3, ...], []),
+            source_boundary=cast(tuple[CompactSourceBoundaryEntryV4, ...], []),
         )
     with pytest.raises(
         TypeError,
-        match="source_boundary item must be CompactSourceBoundaryEntryV3",
+        match="source_boundary item must be CompactSourceBoundaryEntryV4",
     ):
         replace(
             semantics,
             source_boundary=cast(
-                tuple[CompactSourceBoundaryEntryV3, ...],
+                tuple[CompactSourceBoundaryEntryV4, ...],
                 ("invalid",),
             ),
         )
@@ -725,11 +1003,11 @@ def test_compacted_semantic_view_rejects_invalid_represented_coverage_type() -> 
 
     with pytest.raises(
         TypeError,
-        match="represented_coverage must be CompactRepresentedCoverageV3",
+        match="represented_coverage must be CompactRepresentedCoverageV4",
     ):
         replace(
             semantics,
-            represented_coverage=cast(CompactRepresentedCoverageV3, "invalid"),
+            represented_coverage=cast(CompactRepresentedCoverageV4, "invalid"),
         )
 
 
@@ -747,7 +1025,7 @@ def test_compacted_semantic_view_rejects_invalid_represented_coverage_type() -> 
         "reference_continuity_char_actual",
     ),
 )
-def test_compacted_payload_rejects_candidate_audit_actual_mismatch(
+def test_compacted_payload_rejects_replacement_audit_actual_mismatch(
     actual_field: str,
 ) -> None:
     """九项 actual 被向下篡改时 strict reader fail closed。
@@ -765,7 +1043,7 @@ def test_compacted_payload_rejects_candidate_audit_actual_mismatch(
 
     with pytest.raises(
         ValueError,
-        match="policy_usage_audit actuals must equal candidate-derived usage",
+        match="policy_usage_audit actuals must equal replacement-derived usage",
     ):
         validate_context_compacted_payload(payload)
 
@@ -834,7 +1112,6 @@ def test_compacted_payload_records_accepted_proposal_manifest_reference(
             accepted_truth=_accepted_truth(),
             budget_after_compact=512,
             prompt_local_label_mapping_refs=("prompt-label:E1",),
-            accepted_evidence_mapping_refs=("evidence:accepted-1",),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=identity,
             accepted_proposal_manifest_reference=manifest_reference,
@@ -1656,15 +1933,28 @@ def _valid_compacted_payload() -> dict[str, JsonValue]:
     """
 
     return dict(
+        _compacted_payload_for_truth(_accepted_truth())
+    )
+
+
+def _compacted_payload_for_truth(
+    accepted_truth: CompactAcceptedTruthV4,
+) -> dict[str, JsonValue]:
+    """把任意 production-accepted truth 包装为 strict schema-5 payload。
+
+    :param accepted_truth: Context Governance 产生的 accepted truth。
+    :returns: 可变的 canonical compacted payload。
+    """
+
+    return dict(
         build_context_compacted_payload(
             operation_id="event-context-compaction-requested-accepted",
             accepted_attempt_number=2,
             compact_artifact_ref="compact-artifact:abc",
             compact_artifact_digest=_DIGEST_B,
-            accepted_truth=_accepted_truth(),
+            accepted_truth=accepted_truth,
             budget_after_compact=512,
             prompt_local_label_mapping_refs=("prompt-label:E1", "prompt-label:A1"),
-            accepted_evidence_mapping_refs=("evidence:accepted-1",),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(
                 operation_id="event-context-compaction-requested-accepted",
@@ -1682,41 +1972,89 @@ def _valid_compacted_payload() -> dict[str, JsonValue]:
     )
 
 
-def _candidate() -> CompactCandidateV3:
+def _accepted_truth_for_ordered_evidence_boundary(
+    *,
+    boundary_refs: tuple[tuple[str, tuple[str, ...]], ...],
+    facts: tuple[CompactEvidenceFactV4, ...],
+) -> CompactAcceptedTruthV4:
+    """用显式 boundary 顺序验收可独立排列的 evidence facts。
+
+    :param boundary_refs: 按 immutable boundary 顺序给出的 label/refs。
+    :param facts: 按 proposal 顺序给出的 new facts。
+    :returns: production Context Governance 产生的 accepted truth。
+    :raises AssertionError: fixture proposal 未满足 production contract 时抛出。
+    """
+
+    policy = default_memory_projection_policy()
+    compact_input = CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-aggregate-order",
+            readable_text="继续分析 aggregate 顺序",
+        ),
+        source_boundary=tuple(
+            CompactSourceBoundaryEntryV4(
+                source_label=label,
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
+                source_refs=(f"event:{label}",),
+                canonical_evidence_refs=refs,
+                readable_text=f"{label} evidence material",
+            )
+            for label, refs in boundary_refs
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
+    )
+    proposal = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=None,
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=facts,
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    accepted = accept_compact_candidate_v4(compact_input, proposal, policy)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    return accepted
+
+
+def _candidate() -> CompactCandidateV4:
     """构造测试用 accepted vNext compaction candidate。
 
     :returns: vNext compaction candidate。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="Q1 review focused on revenue.",
             source_labels=("E1", "A1"),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim="Revenue increased.",
                 support_labels=("E1",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="Revenue answer",
                 detail="Revenue increased.\nMargin also expanded.",
                 source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step_note",
                 text="Compare quarters next.",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("A1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text="Keep revenue comparison context.",
                 reason="local_reference",
                 source_labels=("A1",),
@@ -1725,7 +2063,7 @@ def _candidate() -> CompactCandidateV3:
     )
 
 
-def _accepted_truth() -> CompactAcceptedTruthV3:
+def _accepted_truth() -> CompactAcceptedTruthV4:
     """构造与 valid event fixture 同源的 accepted truth。
 
     :returns: production governance owner 生成的 accepted truth。
@@ -1776,5 +2114,5 @@ def _replace_candidate_and_digest(
     :returns: ``None``。
     """
 
-    payload["accepted_candidate"] = candidate
-    payload["accepted_candidate_digest"] = sha256_digest_json(candidate)
+    payload["accepted_proposal"] = candidate
+    payload["accepted_proposal_digest"] = sha256_digest_json(candidate)

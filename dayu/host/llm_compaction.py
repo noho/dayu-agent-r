@@ -2,7 +2,7 @@
 
 本模块把 Host ``CompactionRequest`` 映射为一次禁用工具的 Engine public
 runner 调用，并把 LLM final answer 的 strict JSON proposal 转换为
-``CompactCandidateV3``。它不写 EventLog、不写 artifact、不做
+``CompactCandidateV4``。它不写 EventLog、不写 artifact、不做
 semantic repair loop，也不向 Service 暴露 prompt、candidate builder 或
 policy seam。
 """
@@ -45,24 +45,24 @@ from dayu.engine.contracts.structured_output import (
     StructuredOutputRequest,
 )
 from dayu.host.compact_structure import (
-    COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3,
+    COMPACT_OUTPUT_JSON_SCHEMA_NAME_V4,
     CompactStructureParseError,
-    compact_output_json_schema_v3,
-    compact_output_prompt_rules_v3,
-    compact_output_template_v3,
-    parse_compact_candidate_v3,
+    compact_output_json_schema_v4,
+    compact_output_prompt_rules_v4,
+    compact_output_template_v4,
+    parse_compact_candidate_v4,
 )
 from dayu.host.compaction import (
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
-    CompactInputV3,
-    CompactCandidateV3,
+    CompactInputV4,
+    CompactCandidateV4,
     ContextCompactor,
-    CompactRepairFeedbackV3,
-    CompactValidationIssueV3,
-    CompactValidationReportV3,
-    compact_policy_usage_measurement_rules_v3,
+    CompactRepairFeedbackV4,
+    CompactValidationIssueV4,
+    CompactValidationReportV4,
+    compact_policy_usage_measurement_rules_v4,
 )
 from dayu.host.compaction_operation import CompactorProposalRunInput
 from dayu.host.durable.codec import sha256_digest_json
@@ -113,7 +113,7 @@ class LLMCompactionProposalError(CompactorProposalError):
 
 
 class LLMCompactionValidationError(LLMCompactionProposalError):
-    """raw LLM JSON 未通过 strict v3 contract。
+    """raw LLM JSON 未通过 strict v4 contract。
 
     :param report: 可直接进入 semantic repair 的脱敏 validation report。
     :param successful_response_identity: 已取得成功 Engine final 时的响应身份；
@@ -122,7 +122,7 @@ class LLMCompactionValidationError(LLMCompactionProposalError):
 
     def __init__(
         self,
-        report: CompactValidationReportV3,
+        report: CompactValidationReportV4,
         *,
         successful_response_identity: SuccessfulRunnerResponseIdentity | None,
     ) -> None:
@@ -134,8 +134,8 @@ class LLMCompactionValidationError(LLMCompactionProposalError):
         :raises TypeError: report 类型非法时抛出。
         """
 
-        if not isinstance(report, CompactValidationReportV3):
-            raise TypeError("report must be CompactValidationReportV3")
+        if not isinstance(report, CompactValidationReportV4):
+            raise TypeError("report must be CompactValidationReportV4")
         self.report = report
         super().__init__(
             report.issues[0].message,
@@ -233,7 +233,7 @@ class LLMContextCompactor(ContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """执行一次 vNext LLM compaction proposal。
 
@@ -262,7 +262,7 @@ class LLMContextCompactor(ContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposalRunInput:
         """构造一次 compactor proposal 的真实 Engine runner call 输入。
 
@@ -282,8 +282,8 @@ class LLMContextCompactor(ContextCompactor):
         if compaction_attempt_number <= 0:
             raise ValueError("compaction_attempt_number must be positive")
         compact_input = request.compact_input
-        output_schema = compact_output_json_schema_v3()
-        structured_output = _structured_output_request_v3(
+        output_schema = compact_output_json_schema_v4()
+        structured_output = _structured_output_request_v4(
             capability=self._runner_spec.structured_output_capability,
             output_schema=output_schema,
         )
@@ -505,7 +505,7 @@ def _safe_outcome_text(text: str) -> str:
 
 
 def _agent_request_vnext(
-    request: CompactInputV3,
+    request: CompactInputV4,
     runner_spec: RunnerSpec,
     runner_options: RunnerCallOptions,
     agent_policy: AgentPolicy,
@@ -514,7 +514,7 @@ def _agent_request_vnext(
     cancellation_token: CancellationToken,
     *,
     compactor_engine_run_id: str,
-    repair_feedback: CompactRepairFeedbackV3 | None,
+    repair_feedback: CompactRepairFeedbackV4 | None,
     structured_output: StructuredOutputRequest | None,
 ) -> AgentRunRequest:
     """构造 vNext 禁用工具的 Engine public run request。
@@ -559,7 +559,7 @@ def _agent_request_vnext(
     )
 
 
-def _structured_output_request_v3(
+def _structured_output_request_v4(
     *,
     capability: StructuredOutputCapability,
     output_schema: Mapping[str, JsonValue],
@@ -579,7 +579,7 @@ def _structured_output_request_v3(
         return JsonObjectStructuredOutputRequest()
     if capability is StructuredOutputCapability.JSON_SCHEMA:
         return JsonSchemaStructuredOutputRequest(
-            name=COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3,
+            name=COMPACT_OUTPUT_JSON_SCHEMA_NAME_V4,
             schema=output_schema,
             strict=True,
         )
@@ -614,8 +614,8 @@ def _compactor_engine_run_id(
 def _compactor_input_projection_json(
     *,
     request: CompactionRequest,
-    compact_input: CompactInputV3,
-    repair_feedback: CompactRepairFeedbackV3 | None,
+    compact_input: CompactInputV4,
+    repair_feedback: CompactRepairFeedbackV4 | None,
     output_schema: Mapping[str, JsonValue],
     structured_output: StructuredOutputRequest | None,
 ) -> Mapping[str, JsonValue]:
@@ -637,7 +637,7 @@ def _compactor_input_projection_json(
         "compact_input": compact_input.to_json(),
         "repair_feedback": (None if repair_feedback is None else repair_feedback.to_json()),
         "structured_output_mode": _structured_output_mode(structured_output),
-        "structured_output_schema_name": COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3,
+        "structured_output_schema_name": COMPACT_OUTPUT_JSON_SCHEMA_NAME_V4,
         "structured_output_schema_digest": sha256_digest_json(output_schema),
     }
 
@@ -676,10 +676,10 @@ def _compactor_source_boundary_refs(request: CompactionRequest) -> tuple[str, ..
 
 
 def _user_prompt_vnext(
-    request: CompactInputV3,
+    request: CompactInputV4,
     user_prompt_template: str,
     *,
-    repair_feedback: CompactRepairFeedbackV3 | None,
+    repair_feedback: CompactRepairFeedbackV4 | None,
 ) -> str:
     """渲染 vNext compactor user prompt。
 
@@ -696,7 +696,7 @@ def _user_prompt_vnext(
     rendered = rendered.replace(
         _COMPACT_OUTPUT_TEMPLATE_PLACEHOLDER,
         json.dumps(
-            compact_output_template_v3(),
+            compact_output_template_v4(),
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -734,13 +734,13 @@ def _compact_output_rules_prompt_block_vnext() -> str:
     """
 
     structure_rules = json.dumps(
-        compact_output_prompt_rules_v3(),
+        compact_output_prompt_rules_v4(),
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
     )
     measurement_rules = json.dumps(
-        dict(compact_policy_usage_measurement_rules_v3()),
+        dict(compact_policy_usage_measurement_rules_v4()),
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
@@ -753,7 +753,7 @@ def _compact_output_rules_prompt_block_vnext() -> str:
 
 
 def _repair_feedback_prompt_json_vnext(
-    feedback: CompactRepairFeedbackV3,
+    feedback: CompactRepairFeedbackV4,
 ) -> dict[str, JsonValue]:
     """把 typed internal feedback 投影为最小 LLM-facing repair JSON。
 
@@ -762,8 +762,8 @@ def _repair_feedback_prompt_json_vnext(
     :raises TypeError: ``feedback`` 类型非法时抛出。
     """
 
-    if not isinstance(feedback, CompactRepairFeedbackV3):
-        raise TypeError("feedback must be CompactRepairFeedbackV3")
+    if not isinstance(feedback, CompactRepairFeedbackV4):
+        raise TypeError("feedback must be CompactRepairFeedbackV4")
     return {
         "required_action": feedback.required_action,
         "issues": [
@@ -778,7 +778,7 @@ def _repair_feedback_prompt_json_vnext(
     }
 
 
-def _compaction_request_prompt_block_vnext(request: CompactInputV3) -> str:
+def _compaction_request_prompt_block_vnext(request: CompactInputV4) -> str:
     """构造 vNext compactor request 数据块。
 
     :param request: vNext compactor input。
@@ -796,7 +796,7 @@ def _compaction_request_prompt_block_vnext(request: CompactInputV3) -> str:
 
 def parse_conversation_compact_output_vnext(
     final_answer: str,
-) -> CompactCandidateV3:
+) -> CompactCandidateV4:
     """解析并校验 vNext strict JSON compact output。
 
     :param final_answer: LLM 返回的 strict JSON 文本。
@@ -806,7 +806,7 @@ def parse_conversation_compact_output_vnext(
     """
 
     try:
-        return parse_compact_candidate_v3(final_answer)
+        return parse_compact_candidate_v4(final_answer)
     except CompactStructureParseError as exc:
         raise LLMCompactionValidationError(
             _structure_validation_report(exc),
@@ -816,17 +816,17 @@ def parse_conversation_compact_output_vnext(
 
 def _structure_validation_report(
     error: CompactStructureParseError,
-) -> CompactValidationReportV3:
+) -> CompactValidationReportV4:
     """把 structure owner 的 strict error 投影为 bounded repair report。
 
     :param error: structure parser 抛出的类型或值错误。
     :returns: 单一、脱敏且稳定排序的 validation report。
     """
 
-    issue = CompactValidationIssueV3(
+    issue = CompactValidationIssueV4(
         code=error.code,
         json_path=_safe_outcome_text(error.json_path),
         message=_safe_outcome_text(error.message),
         source_labels=(),
     )
-    return CompactValidationReportV3(issues=(issue,))
+    return CompactValidationReportV4(issues=(issue,))

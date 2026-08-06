@@ -35,7 +35,7 @@ from dayu.host.compact_material import (
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
-    CompactSourceKindV3,
+    CompactSourceKindV4,
     CompactionRequest,
 )
 from dayu.host.context_budget import BudgetEstimate
@@ -55,7 +55,7 @@ from dayu.host.evidence import (
     AcceptedToolEvidenceLLMMaterial,
     render_accepted_tool_evidence_for_llm,
 )
-from dayu.host.context_governance import compact_output_caps_v3_from_memory_policy
+from dayu.host.context_governance import compact_output_caps_v4_from_memory_policy
 from dayu.host.durable.memory import _memory_projection_event_from_view
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -169,7 +169,7 @@ def _compaction_request_for_material_pack(
             estimator_digest=_DIGEST,
             overage_reason=None,
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(
+        output_caps=compact_output_caps_v4_from_memory_policy(
             default_memory_projection_policy()
         ),
     )
@@ -1379,7 +1379,7 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     evidence_sources = tuple(
         source
         for source in compact_input.source_boundary
-        if source.source_kind is CompactSourceKindV3.EVIDENCE_MATERIAL
+        if source.source_kind is CompactSourceKindV4.EVIDENCE_MATERIAL
     )
     assert len(evidence_sources) == 1
     compact_evidence = evidence_sources[0]

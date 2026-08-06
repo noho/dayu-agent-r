@@ -32,30 +32,31 @@ from dayu.engine.contracts.runner_spec import (
     RunnerSpec,
 )
 from dayu.host.compaction import (
-    CompactAnswerAnchorV3,
-    COMPACT_OUTPUT_SCHEMA_V3,
+    CompactAnswerAnchorV4,
+    COMPACT_OUTPUT_SCHEMA_V4,
     CompactorProposal,
     CompactionRequest,
-    CompactInputV3,
-    CompactCandidateV3,
+    CompactInputV4,
+    CompactCandidateV4,
     ContextCompactor,
-    CompactEvidenceFactV3,
-    CompactForwardIntentV3,
-    CompactRepairFeedbackV3,
-    CompactReferenceContinuityV3,
-    CompactSessionSummaryV3,
-    CompactSourceKindV3,
-    CompactCurrentInputV3,
-    CompactSourceBoundaryEntryV3,
-    CompactAcceptedTruthV3,
-    CompactValidationReportV3,
-    COMPACT_INPUT_SCHEMA_V3,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactRepairFeedbackV4,
+    CompactReferenceContinuityV4,
+    CompactSessionSummaryV4,
+    CompactSourceKindV4,
+    CompactCurrentInputV4,
+    CompactSourceBoundaryEntryV4,
+    CompactAcceptedTruthV4,
+    CompactValidationIssueCodeV4,
+    CompactValidationReportV4,
+    COMPACT_INPUT_SCHEMA_V4,
 )
 from dayu.host.compaction_operation import CompactorProposalRunInput
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.context_governance import (
-    accept_compact_candidate_v3,
-    compact_output_caps_v3_from_memory_policy,
+    accept_compact_candidate_v4,
+    compact_output_caps_v4_from_memory_policy,
 )
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.run_input import NoToolExecutor
@@ -63,18 +64,20 @@ from dayu.host.run_input import NoToolExecutor
 _FAKE_COMPACTION_SYSTEM_PROMPT = "Deterministic fake context compactor."
 _FAKE_COMPACTION_PROVIDER = "test-fake-compactor"
 _FAKE_COMPACTION_MODEL = "test-fake-compactor-model"
+_REPAIR_FEEDBACK_BEGIN = "REPAIR_FEEDBACK_JSON_BEGIN"
+_REPAIR_FEEDBACK_END = "REPAIR_FEEDBACK_JSON_END"
 
 
 def accepted_truth_for_candidate(
-    candidate: CompactCandidateV3,
+    candidate: CompactCandidateV4,
     *,
     current_input_ref: str,
     source_refs_by_label: Mapping[str, tuple[str, ...]] | None = None,
     memory_policy: MemoryProjectionPolicy | None = None,
-) -> CompactAcceptedTruthV3:
+) -> CompactAcceptedTruthV4:
     """通过 production governance owner 构造测试用 accepted truth。
 
-    :param candidate: strict v3 candidate。
+    :param candidate: strict v4 candidate。
     :param current_input_ref: 不进入 coverage 的 current input ref。
     :param source_refs_by_label: 可选 label→canonical refs 映射。
     :param memory_policy: 与后续 consumer 同源的 Memory policy。
@@ -89,102 +92,117 @@ def accepted_truth_for_candidate(
         source_refs_by_label=source_refs_by_label,
         memory_policy=effective_policy,
     )
-    result = accept_compact_candidate_v3(
+    result = accept_compact_candidate_v4(
         compact_input,
         candidate,
         effective_policy,
     )
-    if isinstance(result, CompactValidationReportV3):
+    if isinstance(result, CompactValidationReportV4):
         raise RuntimeError(f"test candidate is not acceptable: {result.to_json()}")
     return result
 
 
 def compact_input_for_candidate(
-    candidate: CompactCandidateV3,
+    candidate: CompactCandidateV4,
     *,
     current_input_ref: str,
     source_refs_by_label: Mapping[str, tuple[str, ...]] | None = None,
     memory_policy: MemoryProjectionPolicy | None = None,
-) -> CompactInputV3:
+) -> CompactInputV4:
     """从 candidate 业务引用构造严格测试 input boundary。
 
-    :param candidate: strict v3 candidate。
+    :param candidate: strict v4 candidate。
     :param current_input_ref: current input canonical ref。
     :param source_refs_by_label: 可选 label→canonical refs 映射。
     :param memory_policy: output caps 的同源 Memory policy。
-    :returns: 与 candidate source-kind contract 一致的 v3 input。
+    :returns: 与 candidate source-kind contract 一致的 v4 input。
     :raises ValueError: 同一 label 被用于不兼容 source kind 时抛出。
     """
 
-    kinds: dict[str, CompactSourceKindV3] = {}
+    kinds: dict[str, CompactSourceKindV4] = {}
     order: list[str] = []
+    _record_candidate_labels(
+        kinds,
+        order,
+        candidate.retained_previous_evidence_fact_labels,
+        CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+    )
     for fact in candidate.evidence_facts:
         _record_candidate_labels(
             kinds,
             order,
             fact.support_labels,
-            CompactSourceKindV3.EVIDENCE_MATERIAL,
+            CompactSourceKindV4.EVIDENCE_MATERIAL,
         )
         _record_candidate_labels(
             kinds,
             order,
             fact.context_labels,
-            CompactSourceKindV3.TRACE_MATERIAL,
+            CompactSourceKindV4.TRACE_MATERIAL,
         )
     for anchor in candidate.answer_anchors:
         _record_candidate_labels(
             kinds,
             order,
             anchor.source_labels,
-            CompactSourceKindV3.ANSWER_MATERIAL,
+            CompactSourceKindV4.ANSWER_MATERIAL,
         )
     for intent in candidate.forward_intents:
         _record_flexible_candidate_labels(
             kinds,
             order,
             intent.source_labels,
-            default_kind=CompactSourceKindV3.TRACE_MATERIAL,
+            default_kind=CompactSourceKindV4.TRACE_MATERIAL,
         )
     for item in candidate.reference_continuity:
         _record_flexible_candidate_labels(
             kinds,
             order,
             item.source_labels,
-            default_kind=CompactSourceKindV3.TRACE_MATERIAL,
+            default_kind=CompactSourceKindV4.TRACE_MATERIAL,
         )
     if candidate.session_summary is not None:
         _record_flexible_candidate_labels(
             kinds,
             order,
             candidate.session_summary.source_labels,
-            default_kind=CompactSourceKindV3.TRACE_MATERIAL,
+            default_kind=CompactSourceKindV4.TRACE_MATERIAL,
         )
     refs = {} if source_refs_by_label is None else source_refs_by_label
     effective_policy = _fake_memory_policy() if memory_policy is None else memory_policy
-    return CompactInputV3(
-        schema=COMPACT_INPUT_SCHEMA_V3,
-        current_input=CompactCurrentInputV3(
+    return CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
             source_ref=current_input_ref,
             readable_text="测试当前输入",
         ),
         source_boundary=tuple(
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label=label,
                 source_kind=kinds[label],
                 source_refs=refs.get(label, (f"source:{label}",)),
+                canonical_evidence_refs=(
+                    (f"evidence:{label}",)
+                    if kinds[label]
+                    in (
+                        CompactSourceKindV4.EVIDENCE_MATERIAL,
+                        CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+                    )
+                    else ()
+                ),
                 readable_text=f"{label} 的测试业务内容",
             )
             for label in order
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(effective_policy),
+        output_caps=compact_output_caps_v4_from_memory_policy(effective_policy),
     )
 
 
 def _record_candidate_labels(
-    kinds: dict[str, CompactSourceKindV3],
+    kinds: dict[str, CompactSourceKindV4],
     order: list[str],
     labels: tuple[str, ...],
-    kind: CompactSourceKindV3,
+    kind: CompactSourceKindV4,
 ) -> None:
     """记录必须使用单一 kind 的 candidate labels。
 
@@ -206,11 +224,11 @@ def _record_candidate_labels(
 
 
 def _record_flexible_candidate_labels(
-    kinds: dict[str, CompactSourceKindV3],
+    kinds: dict[str, CompactSourceKindV4],
     order: list[str],
     labels: tuple[str, ...],
     *,
-    default_kind: CompactSourceKindV3,
+    default_kind: CompactSourceKindV4,
 ) -> None:
     """记录允许沿用已确定 kind 的 candidate labels。
 
@@ -253,7 +271,7 @@ def _fake_memory_policy() -> MemoryProjectionPolicy:
         reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=128,
         max_delta_repair_events=128,
-        policy_ref="test-fake-compaction-v3",
+        policy_ref="test-fake-compaction-v4",
     )
 
 
@@ -281,7 +299,7 @@ class FakeContextCompactor(ContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposalRunInput:
         """构造 synthetic compactor invocation 的同源 Engine request。
 
@@ -362,7 +380,7 @@ class FakeContextCompactor(ContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """生成 deterministic vNext compaction output。
 
@@ -377,12 +395,11 @@ class FakeContextCompactor(ContextCompactor):
 
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
-        del repair_feedback
         compact_input = request.compact_input
         candidate = await FakeConversationCompactorVNext().compact(
             compact_input,
             cancellation_token,
-            repair_feedback=None,
+            repair_feedback=repair_feedback,
         )
         self._invocation_index += 1
         return CompactorProposal(
@@ -525,11 +542,11 @@ class FakeConversationCompactorVNext:
 
     async def compact(
         self,
-        request: CompactInputV3,
+        request: CompactInputV4,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
-    ) -> CompactCandidateV3:
+        repair_feedback: CompactRepairFeedbackV4 | None,
+    ) -> CompactCandidateV4:
         """生成 deterministic vNext compact output。
 
         :param request: vNext compactor input。
@@ -540,30 +557,47 @@ class FakeConversationCompactorVNext:
         :raises RuntimeError: token 已取消时抛出。
         """
 
-        if not isinstance(request, CompactInputV3):
-            raise TypeError("request must be CompactInputV3")
+        if not isinstance(request, CompactInputV4):
+            raise TypeError("request must be CompactInputV4")
         if cancellation_token.is_cancelled():
             raise RuntimeError("compaction cancelled")
-        del repair_feedback
-        return CompactCandidateV3(
-            schema=COMPACT_OUTPUT_SCHEMA_V3,
+        return CompactCandidateV4(
+            schema=COMPACT_OUTPUT_SCHEMA_V4,
             session_summary=_fake_session_summary_vnext(request),
-            evidence_facts=_fake_fact_candidates_vnext(request),
+            retained_previous_evidence_fact_labels=(
+                _fake_retained_previous_evidence_fact_labels_vnext(request)
+            ),
+            evidence_facts=(
+                ()
+                if _typed_repair_omits_evidence_facts(repair_feedback)
+                else _fake_fact_candidates_vnext(request)
+            ),
             answer_anchors=_fake_answer_anchors_vnext(request),
             forward_intents=_fake_forward_intents_vnext(request),
             reference_continuity=_fake_reference_items_vnext(request),
         )
 
 
-def fake_compaction_proposal_from_material_json(material_json: Mapping[str, JsonValue]) -> str:
+def fake_compaction_proposal_from_material_json(
+    material_json: Mapping[str, JsonValue],
+    *,
+    omit_evidence_facts: bool = False,
+    repair_prompt: str | None = None,
+) -> str:
     """从 vNext material JSON 生成 deterministic LLM strict JSON proposal。
 
     :param material_json: vNext compact input JSON。
+    :param omit_evidence_facts: typed repair 要求本 pass 省略重复 facts 时为 ``True``。
+    :param repair_prompt: 可选真实 LLM-facing prompt；存在时严格读取 typed repair JSON。
     :returns: vNext compact output strict JSON 文本。
     :raises TypeError: material_json 结构非法时抛出。
     """
 
     boundary = _boundary_items(material_json)
+    effective_omit_evidence_facts = omit_evidence_facts or (
+        repair_prompt is not None
+        and _prompt_repair_omits_evidence_facts(repair_prompt)
+    )
     summary_labels = tuple(item.source_label for item in boundary)
     if len(summary_labels) == 0:
         summary_json: JsonValue = None
@@ -573,41 +607,153 @@ def fake_compaction_proposal_from_material_json(material_json: Mapping[str, Json
             "source_labels": list(summary_labels),
         }
     proposal = {
-        "schema": COMPACT_OUTPUT_SCHEMA_V3,
+        "schema": COMPACT_OUTPUT_SCHEMA_V4,
         "session_summary": summary_json,
-        "evidence_facts": [
-            {
-                "claim": f"Canonical evidence material: {item.readable_text}",
-                "support_labels": [item.source_label],
-                "context_labels": [],
-            }
+        "retained_previous_evidence_fact_labels": [
+            item.source_label
             for item in boundary
             if item.source_kind
-            in (
-                CompactSourceKindV3.EVIDENCE_MATERIAL,
-                CompactSourceKindV3.PREVIOUS_EVIDENCE_FACT,
-            )
+            is CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT
         ],
-        "answer_anchors": [
-            {
-                "title": "Previous answer",
-                "detail": item.readable_text,
-                "source_labels": [item.source_label],
-            }
-            for item in boundary
-            if item.source_kind
-            in (
-                CompactSourceKindV3.ANSWER_MATERIAL,
-                CompactSourceKindV3.PREVIOUS_ANSWER_ANCHOR,
-            )
-        ],
+        "evidence_facts": (
+            []
+            if effective_omit_evidence_facts
+            else _fake_evidence_fact_json_items_v4(boundary)
+        ),
+        "answer_anchors": _fake_answer_anchor_json_items_v4(boundary),
         "forward_intents": [],
         "reference_continuity": [],
     }
     return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
 
 
-def _fake_session_summary_vnext(request: CompactInputV3) -> CompactSessionSummaryV3 | None:
+def _typed_repair_omits_evidence_facts(
+    repair_feedback: CompactRepairFeedbackV4 | None,
+) -> bool:
+    """判断 typed repair 是否要求省略本 pass 的重复 evidence facts。
+
+    :param repair_feedback: operation 直接传入的 typed repair feedback。
+    :returns: 存在 evidence_facts duplicate issue 时返回 ``True``。
+    """
+
+    if repair_feedback is None:
+        return False
+    return any(
+        issue.code is CompactValidationIssueCodeV4.DUPLICATE_SEMANTIC_ITEM
+        and issue.json_path.startswith('$["evidence_facts"]')
+        for issue in repair_feedback.issues
+    )
+
+
+def _prompt_repair_omits_evidence_facts(prompt: str) -> bool:
+    """从真实 repair prompt 的 typed JSON block 读取 evidence-fact 修复动作。
+
+    :param prompt: LLM-facing compactor user prompt。
+    :returns: typed issue 为 evidence_facts duplicate 时返回 ``True``。
+    :raises ValueError: repair markers 存在但 JSON block 非法时抛出。
+    """
+
+    begin_marker = f"{_REPAIR_FEEDBACK_BEGIN}\n"
+    end_marker = f"\n{_REPAIR_FEEDBACK_END}"
+    if begin_marker not in prompt:
+        return False
+    json_start = prompt.index(begin_marker) + len(begin_marker)
+    json_end = prompt.index(end_marker, json_start)
+    parsed: JsonValue = json.loads(prompt[json_start:json_end])
+    if not isinstance(parsed, Mapping):
+        raise ValueError("repair feedback JSON must be object")
+    issues = parsed.get("issues")
+    if not isinstance(issues, list):
+        raise ValueError("repair feedback issues must be list")
+    for issue in issues:
+        if not isinstance(issue, Mapping):
+            raise ValueError("repair feedback issue must be object")
+        code = issue.get("code")
+        json_path = issue.get("json_path")
+        if (
+            code
+            == CompactValidationIssueCodeV4.DUPLICATE_SEMANTIC_ITEM.value
+            and isinstance(json_path, str)
+            and json_path.startswith('$["evidence_facts"]')
+        ):
+            return True
+    return False
+
+
+def _fake_evidence_fact_json_items_v4(
+    boundary: tuple[_BoundaryProposalItem, ...],
+) -> list[dict[str, JsonValue]]:
+    """按业务 claim 合并 fake evidence material，避免制造重复事实。
+
+    :param boundary: 已解析的 v4 source boundary。
+    :returns: 按 boundary 首次出现顺序排列的 strict evidence fact JSON。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    claims: list[str] = []
+    support_labels_by_claim: dict[str, list[str]] = {}
+    for item in boundary:
+        if item.source_kind is not CompactSourceKindV4.EVIDENCE_MATERIAL:
+            continue
+        claim = f"Canonical evidence material: {item.readable_text}"
+        if claim not in support_labels_by_claim:
+            claims.append(claim)
+            support_labels_by_claim[claim] = []
+        support_labels_by_claim[claim].append(item.source_label)
+    result: list[dict[str, JsonValue]] = []
+    for claim in claims:
+        support_labels: list[JsonValue] = list(
+            support_labels_by_claim[claim]
+        )
+        context_labels: list[JsonValue] = []
+        result.append(
+            {
+                "claim": claim,
+                "support_labels": support_labels,
+                "context_labels": context_labels,
+            }
+        )
+    return result
+
+
+def _fake_answer_anchor_json_items_v4(
+    boundary: tuple[_BoundaryProposalItem, ...],
+) -> list[dict[str, JsonValue]]:
+    """按业务内容合并 fake answer material，避免制造重复锚点。
+
+    :param boundary: 已解析的 v4 source boundary。
+    :returns: 按 boundary 首次出现顺序排列的 strict answer anchor JSON。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    details: list[str] = []
+    source_labels_by_detail: dict[str, list[str]] = {}
+    for item in boundary:
+        if item.source_kind not in (
+            CompactSourceKindV4.ANSWER_MATERIAL,
+            CompactSourceKindV4.PREVIOUS_ANSWER_ANCHOR,
+        ):
+            continue
+        if item.readable_text not in source_labels_by_detail:
+            details.append(item.readable_text)
+            source_labels_by_detail[item.readable_text] = []
+        source_labels_by_detail[item.readable_text].append(item.source_label)
+    result: list[dict[str, JsonValue]] = []
+    for detail in details:
+        source_labels: list[JsonValue] = list(
+            source_labels_by_detail[detail]
+        )
+        result.append(
+            {
+                "title": "Previous answer",
+                "detail": detail,
+                "source_labels": source_labels,
+            }
+        )
+    return result
+
+
+def _fake_session_summary_vnext(request: CompactInputV4) -> CompactSessionSummaryV4 | None:
     """构造 fake vNext session summary。
 
     :param request: vNext compactor input。
@@ -617,31 +763,29 @@ def _fake_session_summary_vnext(request: CompactInputV3) -> CompactSessionSummar
     labels = _summary_labels_vnext(request)
     if len(labels) == 0:
         return None
-    return CompactSessionSummaryV3(
+    return CompactSessionSummaryV4(
         text=f"Deterministic compact summary for {request.current_input.readable_text}",
         source_labels=labels,
     )
 
 
 def _fake_fact_candidates_vnext(
-    request: CompactInputV3,
-) -> tuple[CompactEvidenceFactV3, ...]:
+    request: CompactInputV4,
+) -> tuple[CompactEvidenceFactV4, ...]:
     """构造 fake vNext fact candidates。
 
     :param request: vNext compactor input。
     :returns: fact candidate tuple。
     """
 
-    candidates: list[CompactEvidenceFactV3] = []
+    candidates: list[CompactEvidenceFactV4] = []
     for item in request.source_boundary:
-        if item.source_kind not in (
-            CompactSourceKindV3.EVIDENCE_MATERIAL,
-            CompactSourceKindV3.PREVIOUS_EVIDENCE_FACT,
-        ):
+        if item.source_kind is not CompactSourceKindV4.EVIDENCE_MATERIAL:
             continue
+        claim = f"Canonical evidence material: {item.readable_text}"
         candidates.append(
-            CompactEvidenceFactV3(
-                claim=f"Canonical evidence material: {item.readable_text}",
+            CompactEvidenceFactV4(
+                claim=claim,
                 support_labels=(item.source_label,),
                 context_labels=(),
             )
@@ -649,24 +793,41 @@ def _fake_fact_candidates_vnext(
     return tuple(candidates)
 
 
+def _fake_retained_previous_evidence_fact_labels_vnext(
+    request: CompactInputV4,
+) -> tuple[str, ...]:
+    """构造 fake retain selector。
+
+    :param request: vNext compactor input。
+    :returns: 按 boundary 顺序排列的 previous evidence fact labels。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return tuple(
+        item.source_label
+        for item in request.source_boundary
+        if item.source_kind is CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT
+    )
+
+
 def _fake_answer_anchors_vnext(
-    request: CompactInputV3,
-) -> tuple[CompactAnswerAnchorV3, ...]:
+    request: CompactInputV4,
+) -> tuple[CompactAnswerAnchorV4, ...]:
     """构造 fake vNext answer anchors。
 
     :param request: vNext compactor input。
     :returns: answer anchor tuple。
     """
 
-    anchors: list[CompactAnswerAnchorV3] = []
+    anchors: list[CompactAnswerAnchorV4] = []
     for item in request.source_boundary:
         if item.source_kind not in (
-            CompactSourceKindV3.ANSWER_MATERIAL,
-            CompactSourceKindV3.PREVIOUS_ANSWER_ANCHOR,
+            CompactSourceKindV4.ANSWER_MATERIAL,
+            CompactSourceKindV4.PREVIOUS_ANSWER_ANCHOR,
         ):
             continue
         anchors.append(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="Previous answer",
                 detail=item.readable_text,
                 source_labels=(item.source_label,),
@@ -676,8 +837,8 @@ def _fake_answer_anchors_vnext(
 
 
 def _fake_forward_intents_vnext(
-    request: CompactInputV3,
-) -> tuple[CompactForwardIntentV3, ...]:
+    request: CompactInputV4,
+) -> tuple[CompactForwardIntentV4, ...]:
     """构造 fake vNext forward intents。
 
     :param request: vNext compactor input。
@@ -689,8 +850,8 @@ def _fake_forward_intents_vnext(
 
 
 def _fake_reference_items_vnext(
-    request: CompactInputV3,
-) -> tuple[CompactReferenceContinuityV3, ...]:
+    request: CompactInputV4,
+) -> tuple[CompactReferenceContinuityV4, ...]:
     """构造 fake vNext reference continuity items。
 
     :param request: vNext compactor input。
@@ -701,7 +862,7 @@ def _fake_reference_items_vnext(
     return ()
 
 
-def _summary_labels_vnext(request: CompactInputV3) -> tuple[str, ...]:
+def _summary_labels_vnext(request: CompactInputV4) -> tuple[str, ...]:
     """返回 fake vNext 可用于 summary 的 labels。
 
     :param request: vNext compactor input。
@@ -711,7 +872,7 @@ def _summary_labels_vnext(request: CompactInputV3) -> tuple[str, ...]:
     return request.source_labels
 
 
-def _continuity_labels_vnext(request: CompactInputV3) -> tuple[str, ...]:
+def _continuity_labels_vnext(request: CompactInputV4) -> tuple[str, ...]:
     """返回 fake vNext 可用于 forward / reference continuity 的 labels。
 
     :param request: vNext compactor input。
@@ -723,9 +884,9 @@ def _continuity_labels_vnext(request: CompactInputV3) -> tuple[str, ...]:
         for item in request.source_boundary
         if item.source_kind
         in (
-            CompactSourceKindV3.PREVIOUS_FORWARD_INTENT,
-            CompactSourceKindV3.TRACE_MATERIAL,
-            CompactSourceKindV3.ANSWER_MATERIAL,
+            CompactSourceKindV4.PREVIOUS_FORWARD_INTENT,
+            CompactSourceKindV4.TRACE_MATERIAL,
+            CompactSourceKindV4.ANSWER_MATERIAL,
         )
     )
 
@@ -733,7 +894,7 @@ def _continuity_labels_vnext(request: CompactInputV3) -> tuple[str, ...]:
 class _BoundaryProposalItem:
     """fake JSON proposal 使用的 typed boundary item。"""
 
-    def __init__(self, *, source_label: str, source_kind: CompactSourceKindV3, readable_text: str) -> None:
+    def __init__(self, *, source_label: str, source_kind: CompactSourceKindV4, readable_text: str) -> None:
         """初始化 boundary item。
 
         :param source_label: prompt-local source label。
@@ -748,9 +909,9 @@ class _BoundaryProposalItem:
 
 
 def _boundary_items(material_json: Mapping[str, JsonValue]) -> tuple[_BoundaryProposalItem, ...]:
-    """严格读取 v3 source boundary。
+    """严格读取 v4 source boundary。
 
-    :param material_json: strict v3 compact input JSON。
+    :param material_json: strict v4 compact input JSON。
     :returns: typed boundary items。
     :raises TypeError: 字段结构非法时抛出。
     :raises ValueError: source kind 非闭集值时抛出。
@@ -762,7 +923,7 @@ def _boundary_items(material_json: Mapping[str, JsonValue]) -> tuple[_BoundaryPr
         items.append(
             _BoundaryProposalItem(
                 source_label=_json_string(data, "source_label"),
-                source_kind=CompactSourceKindV3(_json_string(data, "source_kind")),
+                source_kind=CompactSourceKindV4(_json_string(data, "source_kind")),
                 readable_text=_json_string(data, "readable_text"),
             )
         )

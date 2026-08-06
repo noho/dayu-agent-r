@@ -54,7 +54,7 @@ from dayu.host.context_events import (
     build_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.context_governance import compact_output_caps_v3_from_memory_policy
+from dayu.host.context_governance import compact_output_caps_v4_from_memory_policy
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.durable.codec import sha256_digest_json
@@ -168,7 +168,7 @@ def _schedule_request(label: str) -> CompactionRequest:
             estimator_digest=_DIGEST,
             overage_reason=None,
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(
+        output_caps=compact_output_caps_v4_from_memory_policy(
             default_memory_projection_policy()
         ),
     )

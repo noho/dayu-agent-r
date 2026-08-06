@@ -20,7 +20,7 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV3,
+    CompactAcceptedTruthV4,
 )
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_budget import (
@@ -918,8 +918,9 @@ _FIELD_FROZEN_MATERIAL_REFS = "frozen_material_refs"
 _FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _FIELD_ACCEPTED_ATTEMPT_NUMBER = "accepted_attempt_number"
-_FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
-_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_FIELD_ACCEPTED_PROPOSAL_DIGEST = "accepted_proposal_digest"
+_FIELD_ACCEPTED_PROPOSAL = "accepted_proposal"
+_FIELD_ACCEPTED_REPLACEMENT = "accepted_replacement"
 _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS = "prompt_local_label_mapping_refs"
 _FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
 _FIELD_SOURCE_BOUNDARY = "source_boundary"
@@ -1021,10 +1022,11 @@ _REQUESTED_REQUIRED_FIELDS = (
 _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_OPERATION_ID,
     _FIELD_ACCEPTED_ATTEMPT_NUMBER,
-    _FIELD_ACCEPTED_CANDIDATE_DIGEST,
+    _FIELD_ACCEPTED_PROPOSAL_DIGEST,
     _FIELD_COMPACT_ARTIFACT_REF,
     _FIELD_COMPACT_ARTIFACT_DIGEST,
-    _FIELD_ACCEPTED_CANDIDATE,
+    _FIELD_ACCEPTED_PROPOSAL,
+    _FIELD_ACCEPTED_REPLACEMENT,
     _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS,
     _FIELD_SOURCE_BOUNDARY_REFS,
     _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
@@ -1198,10 +1200,9 @@ def build_context_compacted_payload(
     accepted_attempt_number: int,
     compact_artifact_ref: str,
     compact_artifact_digest: str,
-    accepted_truth: CompactAcceptedTruthV3,
+    accepted_truth: CompactAcceptedTruthV4,
     budget_after_compact: int,
     prompt_local_label_mapping_refs: tuple[str, ...],
-    accepted_evidence_mapping_refs: tuple[str, ...],
     projection_signal: str,
     successful_response_identity: SuccessfulRunnerResponseIdentity,
     accepted_proposal_manifest_reference: CompactorProposalManifestReference,
@@ -1215,9 +1216,8 @@ def build_context_compacted_payload(
     :param accepted_truth: Context Governance 唯一验收成功 truth。
     :param budget_after_compact: Host 估算的 compact 后预算。
     :param prompt_local_label_mapping_refs: prompt-local label mapping refs。
-    :param accepted_evidence_mapping_refs: accepted evidence mapping refs。
     :param projection_signal: memory projection signal。
-    :param successful_response_identity: accepted candidate 对应的实际成功
+    :param successful_response_identity: accepted proposal 对应的实际成功
         Runner call 身份。
     :param accepted_proposal_manifest_reference: 与 operation、attempt 和
         compactor Engine run 同源的 typed manifest reference。
@@ -1226,9 +1226,10 @@ def build_context_compacted_payload(
     :raises ValueError: payload 结构非法时抛出。
     """
 
-    if not isinstance(accepted_truth, CompactAcceptedTruthV3):
-        raise TypeError("accepted_truth must be CompactAcceptedTruthV3")
-    accepted_candidate = accepted_truth.candidate
+    if not isinstance(accepted_truth, CompactAcceptedTruthV4):
+        raise TypeError("accepted_truth must be CompactAcceptedTruthV4")
+    accepted_proposal = accepted_truth.proposal
+    accepted_replacement = accepted_truth.replacement
     _validate_successful_response_manifest_binding(
         operation_id=operation_id,
         attempt_number=accepted_attempt_number,
@@ -1238,27 +1239,24 @@ def build_context_compacted_payload(
     payload: Mapping[str, JsonValue] = {
         _FIELD_OPERATION_ID: operation_id,
         _FIELD_ACCEPTED_ATTEMPT_NUMBER: accepted_attempt_number,
-        _FIELD_ACCEPTED_CANDIDATE_DIGEST: accepted_candidate.digest(),
+        _FIELD_ACCEPTED_PROPOSAL_DIGEST: accepted_proposal.digest(),
         _FIELD_COMPACT_ARTIFACT_REF: compact_artifact_ref,
         _FIELD_COMPACT_ARTIFACT_DIGEST: compact_artifact_digest,
-        _FIELD_ACCEPTED_CANDIDATE: accepted_candidate.to_json(),
+        _FIELD_ACCEPTED_PROPOSAL: accepted_proposal.to_json(),
+        _FIELD_ACCEPTED_REPLACEMENT: accepted_replacement.to_json(),
         _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS: _string_list_json(prompt_local_label_mapping_refs),
         _FIELD_SOURCE_BOUNDARY_REFS: _string_list_json(
             (accepted_truth.current_input_ref, *accepted_truth.covered_source_refs)
         ),
         _FIELD_SOURCE_BOUNDARY: [
-            {
-                "source_label": entry.source_label,
-                "source_kind": entry.source_kind.value,
-                "source_refs": list(entry.source_refs),
-                "readable_text": entry.readable_text,
-            }
-            for entry in accepted_truth.source_boundary
+            entry.to_internal_json() for entry in accepted_truth.source_boundary
         ],
         _FIELD_REPRESENTED_COVERAGE: accepted_truth.represented_coverage.to_json(),
         _FIELD_OMITTED_COVERAGE: accepted_truth.omitted_coverage.to_json(),
         _FIELD_POLICY_USAGE_AUDIT: accepted_truth.policy_usage_audit.to_json(),
-        _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS: _string_list_json(accepted_evidence_mapping_refs),
+        _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS: _string_list_json(
+            accepted_replacement.canonical_evidence_refs
+        ),
         _FIELD_BUDGET_AFTER_COMPACT: budget_after_compact,
         _FIELD_PROJECTION_SIGNAL: projection_signal,
         _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF: (accepted_proposal_manifest_reference.manifest_payload_ref),
@@ -1281,7 +1279,7 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _require_exact_fields(payload, _COMPACTED_REQUIRED_FIELDS)
     _required_text(payload, _FIELD_OPERATION_ID)
     _required_positive_int(payload, _FIELD_ACCEPTED_ATTEMPT_NUMBER)
-    _required_digest(payload, _FIELD_ACCEPTED_CANDIDATE_DIGEST)
+    _required_digest(payload, _FIELD_ACCEPTED_PROPOSAL_DIGEST)
     _required_text(payload, _FIELD_COMPACT_ARTIFACT_REF)
     _required_digest(payload, _FIELD_COMPACT_ARTIFACT_DIGEST)
     parse_context_compacted_semantic_payload(payload)

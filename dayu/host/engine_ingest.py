@@ -88,7 +88,6 @@ from dayu.host.api import (
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
-    accepted_evidence_mapping_refs_for_candidate,
     compact_artifact_descriptor_metadata_vnext,
     compact_artifact_json_vnext,
     compact_artifact_payload_ref,
@@ -108,7 +107,7 @@ from dayu.host.compact_pipeline import (
     compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV3,
+    CompactAcceptedTruthV4,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactionRequest,
@@ -3030,7 +3029,7 @@ class EngineEventIngestor:
         decision: ContextBudgetDecision,
         operation_id: str,
         accepted_attempt_number: int,
-        accepted_truth: CompactAcceptedTruthV3,
+        accepted_truth: CompactAcceptedTruthV4,
         budget_after_compact: int,
         accepted_proposal_manifest_reference: CompactorProposalManifestReference,
         successful_response_identity: SuccessfulRunnerResponseIdentity,
@@ -3101,10 +3100,6 @@ class EngineEventIngestor:
             accepted_truth=accepted_truth,
             budget_after_compact=budget_after_compact,
             prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
-            accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(
-                request,
-                accepted_truth.candidate,
-            ),
             projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
             accepted_proposal_manifest_reference=(accepted_proposal_manifest_reference),
             successful_response_identity=successful_response_identity,

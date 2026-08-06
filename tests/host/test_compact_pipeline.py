@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import pytest
 
@@ -36,25 +36,25 @@ from dayu.host.compact_pipeline import (
     select_ordinary_protected_raw_tail,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
+    COMPACT_OUTPUT_SCHEMA_V4,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     PreviousCompactReadableView,
     CompactMaterialSection,
     CompactSegmentSelectionScope,
-    CompactCandidateV3,
-    CompactAcceptedTruthV3,
-    CompactEvidenceFactV3,
-    CompactReferenceContinuityV3,
-    CompactRepairFeedbackV3,
-    CompactSourceKindV3,
+    CompactCandidateV4,
+    CompactAcceptedTruthV4,
+    CompactEvidenceFactV4,
+    CompactReferenceContinuityV4,
+    CompactRepairFeedbackV4,
+    CompactSourceKindV4,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
     ReadableFactItemVNext,
 )
 from dayu.host.compaction_operation import run_compaction_operation
-from dayu.host.context_governance import accept_compact_candidate_v3
+from dayu.host.context_governance import accept_compact_candidate_v4
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
@@ -101,14 +101,14 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
         """
 
         super().__init__()
-        self.observed_feedback: list[CompactRepairFeedbackV3 | None] = []
+        self.observed_feedback: list[CompactRepairFeedbackV4 | None] = []
 
     async def compact(
         self,
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """保留完整 pass candidate，但注入可由 root 证明的跨 pass duplicate。
 
@@ -134,9 +134,9 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
                 for entry in compact_input.source_boundary
                 if entry.source_kind
                 in (
-                    CompactSourceKindV3.TRACE_MATERIAL,
-                    CompactSourceKindV3.EVIDENCE_MATERIAL,
-                    CompactSourceKindV3.ANSWER_MATERIAL,
+                    CompactSourceKindV4.TRACE_MATERIAL,
+                    CompactSourceKindV4.EVIDENCE_MATERIAL,
+                    CompactSourceKindV4.ANSWER_MATERIAL,
                 )
             ),
             None,
@@ -147,7 +147,7 @@ class _CrossPassDuplicateCompactor(FakeContextCompactor):
             candidate=replace(
                 proposal.candidate,
                 reference_continuity=(
-                    CompactReferenceContinuityV3(
+                    CompactReferenceContinuityV4(
                         text="cross-pass duplicate",
                         reason="recent_state",
                         source_labels=(reference_entry.source_label,),
@@ -174,7 +174,7 @@ class _LaterPassFailingCompactor(FakeContextCompactor):
         request: CompactionRequest,
         cancellation_token: CancellationToken,
         *,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposal:
         """只允许第一个 pass 成功。
 
@@ -785,12 +785,12 @@ def test_compacted_payload_input_derives_semantic_refs() -> None:
     )
     compact_input = plan.request.compact_input
     candidate = _candidate_with_evidence_fact()
-    accepted_truth = accept_compact_candidate_v3(
+    accepted_truth = accept_compact_candidate_v4(
         compact_input,
         candidate,
         default_memory_projection_policy(),
     )
-    assert isinstance(accepted_truth, CompactAcceptedTruthV3)
+    assert isinstance(accepted_truth, CompactAcceptedTruthV4)
 
     payload_input = build_compacted_payload_input(
         request=plan.request,
@@ -807,6 +807,9 @@ def test_compacted_payload_input_derives_semantic_refs() -> None:
 
     assert "prompt-label:E1" in payload_input.prompt_local_label_mapping_refs
     assert "prompt-label:C1" in payload_input.prompt_local_label_mapping_refs
+    assert "accepted_evidence_mapping_refs" not in tuple(
+        field.name for field in fields(payload_input)
+    )
     assert payload_input.accepted_evidence_mapping_refs == ("evidence:old",)
     assert payload_input.source_boundary_refs[0] == plan.request.current_input_ref
     assert payload_input.accepted_attempt_number == 2
@@ -1139,6 +1142,11 @@ def _previous_block(*, label: str, kind: CompactMaterialBlockKind, text: str) ->
         size_units=len(text),
         source_labels=(),
         canonical_source_refs=(f"previous:{label}",),
+        canonical_evidence_refs=(
+            (f"evidence:{label}",)
+            if kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT
+            else ()
+        ),
         content_digest=sha256_digest_json({"text": text}),
     )
 
@@ -1194,19 +1202,21 @@ def _budget() -> BudgetEstimate:
     )
 
 
-def _candidate_with_evidence_fact() -> CompactCandidateV3:
+def _candidate_with_evidence_fact() -> CompactCandidateV4:
     """构造引用 E1 evidence label 的 accepted candidate。
 
-    :returns: CompactCandidateV3。
+    :returns: CompactCandidateV4。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
         session_summary=None,
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim="accepted fact",
                 support_labels=("E1",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(),

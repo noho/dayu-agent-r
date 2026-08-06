@@ -19,10 +19,10 @@ from dayu.host.compact_payload import (
     compact_artifact_payload_ref,
 )
 from dayu.host.compaction import (
-    CompactAcceptedTruthV3,
+    CompactAcceptedTruthV4,
     CompactionRequest,
-    validate_compact_policy_usage_audit_candidate_binding_v3,
-    validate_compact_represented_coverage_candidate_binding_v3,
+    validate_compact_policy_usage_audit_replacement_binding_v4,
+    validate_compact_represented_coverage_replacement_binding_v4,
 )
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
@@ -43,7 +43,7 @@ class CompactArtifactWriteRequest:
     """
 
     compaction_request: CompactionRequest
-    accepted_truth: CompactAcceptedTruthV3
+    accepted_truth: CompactAcceptedTruthV4
     policy_digest: str
     budget_after_compact: int
     payload_ref: str | None = None
@@ -59,17 +59,17 @@ class CompactArtifactWriteRequest:
 
         if not isinstance(self.compaction_request, CompactionRequest):
             raise TypeError("CompactArtifactWriteRequest.compaction_request must be CompactionRequest")
-        if not isinstance(self.accepted_truth, CompactAcceptedTruthV3):
-            raise TypeError("CompactArtifactWriteRequest.accepted_truth must be CompactAcceptedTruthV3")
+        if not isinstance(self.accepted_truth, CompactAcceptedTruthV4):
+            raise TypeError("CompactArtifactWriteRequest.accepted_truth must be CompactAcceptedTruthV4")
         self.accepted_truth.validate_input_binding(
             self.compaction_request.compact_input
         )
-        validate_compact_policy_usage_audit_candidate_binding_v3(
-            self.accepted_truth.candidate,
+        validate_compact_policy_usage_audit_replacement_binding_v4(
+            self.accepted_truth.replacement,
             self.accepted_truth.policy_usage_audit,
         )
-        validate_compact_represented_coverage_candidate_binding_v3(
-            self.accepted_truth.candidate,
+        validate_compact_represented_coverage_replacement_binding_v4(
+            self.accepted_truth.replacement,
             self.accepted_truth.represented_coverage,
         )
         if not is_sha256_digest(self.policy_digest):
@@ -88,13 +88,13 @@ class CompactArtifactWriteResult:
     :param payload_descriptor: 已持久化 descriptor。
     :param artifact_ref: 已发布 artifact ref。
     :param compaction_request_digest: compaction request digest。
-    :param accepted_candidate_digest: accepted candidate digest。
+    :param accepted_proposal_digest: accepted proposal digest。
     """
 
     payload_descriptor: PayloadDescriptor
     artifact_ref: LocalArtifactRef
     compaction_request_digest: str
-    accepted_candidate_digest: str
+    accepted_proposal_digest: str
 
 
 class CompactArtifactStore:
@@ -157,7 +157,7 @@ class CompactArtifactStore:
             payload_descriptor=descriptor,
             artifact_ref=artifact_ref,
             compaction_request_digest=request.compaction_request.digest(),
-            accepted_candidate_digest=request.accepted_truth.candidate.digest(),
+            accepted_proposal_digest=request.accepted_truth.proposal.digest(),
         )
 
 

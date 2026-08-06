@@ -58,24 +58,25 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.compaction import (
-    COMPACT_INPUT_SCHEMA_V3,
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactAcceptedTruthV3,
-    CompactAnswerAnchorV3,
-    CompactCandidateV3,
-    CompactCurrentInputV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentStatusV3,
-    CompactForwardIntentV3,
-    CompactInputV3,
+    COMPACT_INPUT_SCHEMA_V4,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAcceptedReplacementV4,
+    CompactAcceptedTruthV4,
+    CompactAnswerAnchorV4,
+    CompactCandidateV4,
+    CompactCurrentInputV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentStatusV4,
+    CompactForwardIntentV4,
+    CompactInputV4,
     CompactMaterialBlockKind,
-    CompactRepairFeedbackV3,
+    CompactRepairFeedbackV4,
     CompactSegmentTrigger,
-    CompactSessionSummaryV3,
-    CompactSourceBoundaryEntryV3,
-    CompactSourceKindV3,
-    CompactValidationIssueCodeV3,
-    CompactValidationReportV3,
+    CompactSessionSummaryV4,
+    CompactSourceBoundaryEntryV4,
+    CompactSourceKindV4,
+    CompactValidationIssueCodeV4,
+    CompactValidationReportV4,
     CompactionRequest,
     CompactorProposal,
 )
@@ -88,9 +89,9 @@ from dayu.host.compact_material import (
 from dayu.host.compact_payload import COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import (
-    accept_compact_candidate_v3,
-    build_compact_repair_feedback_v3,
-    compact_output_caps_v3_from_memory_policy,
+    accept_compact_candidate_v4,
+    build_compact_repair_feedback_v4,
+    compact_output_caps_v4_from_memory_policy,
 )
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
 from dayu.host.context_policy import ContextCompactionTriggerSource
@@ -138,9 +139,9 @@ _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT = 7
 _SOFT_THRESHOLD_PROMPT_SENTENCE = "请保留标记 DAYU_COMPACT_OK，并继续等待下一步。"
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
-_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "dayu.context_compaction.output.v3"
-_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "CompactCandidateV3"
-_INTERNAL_COMPACT_INPUT_TYPE_NAME = "CompactInputV3"
+_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "dayu.context_compaction.output.v4"
+_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "CompactCandidateV4"
+_INTERNAL_COMPACT_INPUT_TYPE_NAME = "CompactInputV4"
 _COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
 _SCHEMA_VERSION_FIELD = "schema_version"
@@ -150,7 +151,7 @@ _COMPACTOR_PROPOSAL_RUNNER_CALL_KIND = "compactor_proposal"
 _COMPACTOR_IDENTITY_FIELD = "compactor_identity"
 _PARENT_HOST_RUN_ID_FIELD = "parent_host_run_id"
 _COMPACTION_REQUEST_DIGEST_FIELD = "compaction_request_digest"
-_ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
+_ACCEPTED_PROPOSAL_FIELD = "accepted_proposal"
 _INPUT_SNAPSHOT_REFS_FIELD = "input_snapshot_refs"
 _CURRENT_INPUT_REF_FIELD = "current_input_ref"
 _TEST_COMPACTION_REQUEST_DIGEST = "sha256:" + ("a" * 64)
@@ -220,9 +221,9 @@ _FORBIDDEN_COMPACTOR_PROMPT_TERMS = (
     "payload_refs",
     "digest",
     "cursor",
-    "CompactValidationReportV3",
-    "CompactValidationIssueV3",
-    "CompactRepairFeedbackV3",
+    "CompactValidationReportV4",
+    "CompactValidationIssueV4",
+    "CompactRepairFeedbackV4",
     "previous_attempt_number",
     "additional_issue_count",
     "Memory policy",
@@ -284,15 +285,16 @@ def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
     for required in (
         "current_input",
         "source_boundary",
-        "output_caps",
-        "session_summary",
-        "evidence_facts",
+            "output_caps",
+            "session_summary",
+            "retained_previous_evidence_fact_labels",
+            "evidence_facts",
         "answer_anchors",
         "forward_intents",
         "reference_continuity",
-        "真实来源引用",
-        "未引用材料无需单列",
-        "可以输出 `null`",
+            "所有 label 必须来自当前 `source_boundary`",
+            "未选择表示从最终 replacement 省略该旧事实",
+            "object 或 `null`",
     ):
         assert required in user_prompt_template
     for forbidden in (
@@ -321,18 +323,18 @@ def test_real_compactor_owner_setup_produces_exact_cap_feedback() -> None:
     compaction_request = _real_compactor_adversarial_request()
     compact_input = compaction_request.compact_input
     policy = _real_compactor_memory_policy()
-    result = accept_compact_candidate_v3(
+    result = accept_compact_candidate_v4(
         compact_input,
         _deterministic_over_cap_candidate(),
         policy,
     )
 
-    assert isinstance(result, CompactValidationReportV3)
+    assert isinstance(result, CompactValidationReportV4)
     assert tuple(issue.code for issue in result.issues) == (
-        CompactValidationIssueCodeV3.POLICY_ITEM_CAP_EXCEEDED,
-        CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED,
+        CompactValidationIssueCodeV4.POLICY_ITEM_CAP_EXCEEDED,
+        CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED,
     )
-    feedback = build_compact_repair_feedback_v3(
+    feedback = build_compact_repair_feedback_v4(
         result,
         request_digest=compaction_request.digest(),
         source_boundary_digest=compaction_request.source_boundary_digest(),
@@ -1154,17 +1156,17 @@ async def test_real_compactor_resists_injection_and_repairs_policy_caps(
     compaction_request = _real_compactor_adversarial_request()
     compact_input = compaction_request.compact_input
     policy = _real_compactor_memory_policy()
-    rejected = accept_compact_candidate_v3(
+    rejected = accept_compact_candidate_v4(
         compact_input,
         _deterministic_over_cap_candidate(),
         policy,
     )
-    assert isinstance(rejected, CompactValidationReportV3)
+    assert isinstance(rejected, CompactValidationReportV4)
     assert tuple(issue.code for issue in rejected.issues) == (
-        CompactValidationIssueCodeV3.POLICY_ITEM_CAP_EXCEEDED,
-        CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED,
+        CompactValidationIssueCodeV4.POLICY_ITEM_CAP_EXCEEDED,
+        CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED,
     )
-    feedback = build_compact_repair_feedback_v3(
+    feedback = build_compact_repair_feedback_v4(
         rejected,
         request_digest=compaction_request.digest(),
         source_boundary_digest=compaction_request.source_boundary_digest(),
@@ -1196,21 +1198,24 @@ async def test_real_compactor_resists_injection_and_repairs_policy_caps(
         )
     )
     assert observation.proposal.successful_response_identity.effective_provider == observation.case.provider
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         compact_input,
         observation.proposal.candidate,
         policy,
     )
 
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    assert accepted.candidate.schema == COMPACT_OUTPUT_SCHEMA_V3
-    assert len(accepted.candidate.evidence_facts) <= policy.evidence_fact_item_cap
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert accepted.proposal.schema == COMPACT_OUTPUT_SCHEMA_V4
+    assert (
+        len(accepted.replacement.evidence_facts)
+        <= policy.evidence_fact_item_cap
+    )
     evidence_chars = sum(
         estimate_memory_size_units(item.claim).units
-        for item in accepted.candidate.evidence_facts
+        for item in accepted.replacement.evidence_facts
     )
     assert evidence_chars <= policy.evidence_fact_char_cap
-    business_text = _candidate_business_text(accepted.candidate)
+    business_text = _replacement_business_text(accepted.replacement)
     for forbidden_attack_result in _INJECTION_BEHAVIOR_FORBIDDEN_FRAGMENTS:
         assert forbidden_attack_result not in business_text
 
@@ -1223,7 +1228,9 @@ async def test_real_compactor_resists_injection_and_repairs_policy_caps(
                     "fallback_classifications": list(fallback_summary),
                     "raw_final": "received_and_strict_parser_passed",
                     "governance": "accepted",
-                    "evidence_fact_items": len(accepted.candidate.evidence_facts),
+                    "evidence_fact_items": len(
+                        accepted.replacement.evidence_facts
+                    ),
                     "evidence_fact_chars": evidence_chars,
                     "evidence_fact_item_cap": policy.evidence_fact_item_cap,
                     "evidence_fact_char_cap": policy.evidence_fact_char_cap,
@@ -1237,7 +1244,7 @@ async def test_real_compactor_resists_injection_and_repairs_policy_caps(
 async def _real_compactor_proposal_mimo_first(
     compaction_request: CompactionRequest,
     *,
-    feedback: CompactRepairFeedbackV3,
+    feedback: CompactRepairFeedbackV4,
     capsys: pytest.CaptureFixture[str],
 ) -> _RealCompactorObservation:
     """严格按 Mimo、DeepSeek 顺序执行一次真实 repair proposal。
@@ -1428,7 +1435,7 @@ def _real_compactor_adversarial_request() -> CompactionRequest:
             estimator_digest=_REAL_COMPACTOR_ESTIMATOR_DIGEST,
             overage_reason=None,
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(policy),
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
     )
 
 
@@ -1454,7 +1461,7 @@ def _real_compactor_memory_policy() -> MemoryProjectionPolicy:
     )
 
 
-def _deterministic_over_cap_candidate() -> CompactCandidateV3:
+def _deterministic_over_cap_candidate() -> CompactCandidateV4:
     """构造只违反 evidence item/char cap 的 deterministic candidate。
 
     :returns: coverage 与语义合法、但 evidence item/char 同时超限的 candidate。
@@ -1463,36 +1470,37 @@ def _deterministic_over_cap_candidate() -> CompactCandidateV3:
 
     revenue_claim = "甲公司2025年收入100亿元，同比增长10%。" + ("收入增长证据。" * 12)
     cash_flow_claim = "甲公司2025年经营现金流20亿元。" + ("现金流证据。" * 12)
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="正在比较甲公司收入增长、经营现金流和毛利率。",
             source_labels=("T1", "E1", "A1"),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim=revenue_claim,
                 support_labels=("E1",),
                 context_labels=(),
             ),
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim=cash_flow_claim,
                 support_labels=("E1",),
                 context_labels=(),
             ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="当前结论",
                 detail="收入增长，经营现金流和毛利率仍需核对。",
                 source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_analysis_step",
                 text="核对甲公司毛利率。",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("T1",),
             ),
         ),
@@ -1500,24 +1508,26 @@ def _deterministic_over_cap_candidate() -> CompactCandidateV3:
     )
 
 
-def _candidate_business_text(candidate: CompactCandidateV3) -> str:
-    """投影不含 diagnostics 的候选业务文本供行为 oracle 检查。
+def _replacement_business_text(
+    replacement: CompactAcceptedReplacementV4,
+) -> str:
+    """投影不含 diagnostics 的 replacement 业务文本供行为 oracle 检查。
 
     diagnostics 可用业务可读方式提及材料风险，因此有意不纳入禁止命中范围。
 
-    :param candidate: production strict parser 产出的 candidate。
+    :param replacement: production governance 产出的 accepted replacement。
     :returns: summary、fact、answer、intent 与 reference 文本拼接结果。
     :raises Exception: 不主动抛出异常。
     """
 
     values: list[str] = []
-    if candidate.session_summary is not None:
-        values.append(candidate.session_summary.text)
-    values.extend(item.claim for item in candidate.evidence_facts)
-    for item in candidate.answer_anchors:
+    if replacement.session_summary is not None:
+        values.append(replacement.session_summary.text)
+    values.extend(item.claim for item in replacement.evidence_facts)
+    for item in replacement.answer_anchors:
         values.extend((item.title, item.detail))
-    values.extend(item.text for item in candidate.forward_intents)
-    for item in candidate.reference_continuity:
+    values.extend(item.text for item in replacement.forward_intents)
+    for item in replacement.reference_continuity:
         values.extend((item.text, item.reason))
     return "\n".join(values)
 
@@ -1555,7 +1565,10 @@ class FakeCompactorRunAgent:
         return EngineRunOutcomeFinalAnswer(
             session_id=request.session_id,
             run_id=request.run_id,
-            content=fake_compaction_proposal_from_material_json(material_json),
+            content=fake_compaction_proposal_from_material_json(
+                material_json,
+                repair_prompt=user_prompt,
+            ),
             filtered=False,
             degraded=False,
             finish_reason=FinishReason.STOP,
@@ -1967,7 +1980,7 @@ def _assert_compactor_material_instruction_contract(
 
     _assert_compactor_material_section_shape(material_json)
     _assert_no_forbidden_compactor_material_terms(material_json)
-    assert material_json["schema"] == "dayu.context_compaction.input.v3"
+    assert material_json["schema"] == "dayu.context_compaction.input.v4"
 
 
 def _assert_compactor_material_section_shape(
@@ -2123,7 +2136,7 @@ def _prompt_json_example(prompt: str, *, heading: str) -> dict[str, JsonValue]:
 
 def _compact_input_from_prompt_example(
     example: Mapping[str, JsonValue],
-) -> CompactInputV3:
+) -> CompactInputV4:
     """把 LLM-facing example input 构造成 production typed input。
 
     canonical refs 仅用于满足不可见的输入真值，不从示例反推业务语义。
@@ -2134,7 +2147,7 @@ def _compact_input_from_prompt_example(
     :raises ValueError: schema、source kind 或非空约束非法时抛出。
     """
 
-    assert example["schema"] == COMPACT_INPUT_SCHEMA_V3
+    assert example["schema"] == COMPACT_INPUT_SCHEMA_V4
     current_input_json = _required_mapping(
         example["current_input"],
         field_name="prompt example current_input",
@@ -2143,7 +2156,7 @@ def _compact_input_from_prompt_example(
     assert isinstance(current_text, str)
     source_boundary_json = example["source_boundary"]
     assert isinstance(source_boundary_json, list)
-    entries: list[CompactSourceBoundaryEntryV3] = []
+    entries: list[CompactSourceBoundaryEntryV4] = []
     for index, item in enumerate(source_boundary_json):
         boundary_item = _required_mapping(
             item,
@@ -2156,21 +2169,30 @@ def _compact_input_from_prompt_example(
         assert isinstance(source_kind, str)
         assert isinstance(readable_text, str)
         entries.append(
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label=source_label,
-                source_kind=CompactSourceKindV3(source_kind),
+                source_kind=CompactSourceKindV4(source_kind),
                 source_refs=(f"prompt-example:{source_label}",),
+                canonical_evidence_refs=(
+                    (f"evidence:{source_label}",)
+                    if source_kind
+                    in (
+                        CompactSourceKindV4.EVIDENCE_MATERIAL.value,
+                        CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT.value,
+                    )
+                    else ()
+                ),
                 readable_text=readable_text,
             )
         )
-    return CompactInputV3(
-        schema=COMPACT_INPUT_SCHEMA_V3,
-        current_input=CompactCurrentInputV3(
+    return CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
             source_ref="prompt-example:current-input",
             readable_text=current_text,
         ),
         source_boundary=tuple(entries),
-        output_caps=compact_output_caps_v3_from_memory_policy(
+        output_caps=compact_output_caps_v4_from_memory_policy(
             default_memory_projection_policy()
         ),
     )
@@ -2228,7 +2250,7 @@ def _valid_compactor_material_json(*, include_marker: bool = True) -> dict[str, 
         "readable_text": "复用 raw evidence fact。",
     }
     return {
-        "schema": "dayu.context_compaction.input.v3",
+        "schema": "dayu.context_compaction.input.v4",
         "current_input": current_input,
         "source_boundary": [evidence_item],
     }

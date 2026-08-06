@@ -26,7 +26,7 @@ from dayu.host.compaction import (
     CompactSegmentSelectionScope,
     CompactSegmentTrigger,
     CurrentInputAnchor,
-    CompactCandidateV3,
+    CompactAcceptedReplacementV4,
     PromptLocalEvidenceMap,
     PromptLocalMaterialLabel,
     PromptLocalProvenanceEntry,
@@ -217,6 +217,7 @@ class RunInputMaterialBlock:
     already_represented: bool = False
     protected_recent_raw_turn: bool = False
     accepted_evidence_id: str | None = None
+    canonical_evidence_refs: tuple[str, ...] = ()
     tool_result_event_ref: str | None = None
     tool_call_event_ref: str | None = None
     payload_refs: tuple[str, ...] = ()
@@ -254,6 +255,10 @@ class RunInputMaterialBlock:
             self.accepted_evidence_id,
             "RunInputMaterialBlock.accepted_evidence_id",
         )
+        _require_unique_string_tuple(
+            self.canonical_evidence_refs,
+            "RunInputMaterialBlock.canonical_evidence_refs",
+        )
         _require_optional_text(
             self.tool_result_event_ref,
             "RunInputMaterialBlock.tool_result_event_ref",
@@ -282,6 +287,11 @@ class RunInputMaterialBlock:
                 self.accepted_evidence_id,
                 "RunInputMaterialBlock.accepted_evidence_id",
             )
+            if self.canonical_evidence_refs != (self.accepted_evidence_id,):
+                raise ValueError(
+                    "accepted evidence block canonical_evidence_refs must equal "
+                    "its accepted evidence id"
+                )
             _require_non_empty_text(
                 self.tool_result_event_ref,
                 "RunInputMaterialBlock.tool_result_event_ref",
@@ -296,9 +306,17 @@ class RunInputMaterialBlock:
                 raise ValueError("accepted evidence block requires typed LLM material")
             if self.text != render_accepted_tool_evidence_for_llm(self.accepted_tool_evidence):
                 raise ValueError("accepted evidence block text must use shared renderer")
+        elif self.kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
+            if self.section is not CompactMaterialSection.PREVIOUS_COMPACTED_VIEW:
+                raise ValueError("evidence fact block section is invalid")
+            _require_non_empty_unique_string_tuple(
+                self.canonical_evidence_refs,
+                "RunInputMaterialBlock.canonical_evidence_refs",
+            )
         else:
             if (
                 self.accepted_evidence_id is not None
+                or self.canonical_evidence_refs
                 or self.tool_result_event_ref is not None
                 or self.tool_call_event_ref is not None
                 or len(self.payload_refs) > 0
@@ -746,6 +764,7 @@ def run_input_material_block(
     already_represented: bool = False,
     protected_recent_raw_turn: bool = False,
     accepted_evidence_id: str | None = None,
+    canonical_evidence_refs: tuple[str, ...] = (),
     tool_result_event_ref: str | None = None,
     tool_call_event_ref: str | None = None,
     payload_refs: tuple[str, ...] = (),
@@ -767,6 +786,7 @@ def run_input_material_block(
     :param already_represented: 是否已被 compact output / stable fact 代表。
     :param protected_recent_raw_turn: 是否属于 recent raw floor。
     :param accepted_evidence_id: evidence block 的 canonical evidence id。
+    :param canonical_evidence_refs: previous fact 或 current evidence 的证据 refs。
     :param tool_result_event_ref: evidence block 的 TOOL_RESULT_ACCEPTED ref。
     :param tool_call_event_ref: evidence block 的 TOOL_CALL_REQUESTED ref。
     :param payload_refs: payload / artifact refs。
@@ -778,6 +798,11 @@ def run_input_material_block(
     """
 
     material_text = text if accepted_tool_evidence is not None else normalized_material_text(text)
+    evidence_refs = (
+        (accepted_evidence_id,)
+        if accepted_evidence_id is not None and not canonical_evidence_refs
+        else canonical_evidence_refs
+    )
     return RunInputMaterialBlock(
         block_id=block_id,
         section=section,
@@ -793,6 +818,7 @@ def run_input_material_block(
         already_represented=already_represented,
         protected_recent_raw_turn=protected_recent_raw_turn,
         accepted_evidence_id=accepted_evidence_id,
+        canonical_evidence_refs=evidence_refs,
         tool_result_event_ref=tool_result_event_ref,
         tool_call_event_ref=tool_call_event_ref,
         payload_refs=payload_refs,
@@ -1213,9 +1239,9 @@ def prompt_local_evidence_map(
         validate_material_label(label, CompactMaterialSection.EVIDENCE_MATERIAL)
         if entry.section is not CompactMaterialSection.EVIDENCE_MATERIAL:
             raise ValueError("evidence map contains non-evidence entry")
-        _require_non_empty_text(
-            entry.accepted_evidence_id,
-            "PromptLocalEvidenceMap.accepted_evidence_id",
+        _require_non_empty_unique_string_tuple(
+            entry.canonical_evidence_refs,
+            "PromptLocalEvidenceMap.canonical_evidence_refs",
         )
         _require_non_empty_text(
             entry.tool_result_event_ref,
@@ -1499,6 +1525,7 @@ def _history_blocks(materials: tuple[InitialHistoryMaterial, ...]) -> tuple[Comp
                 size_units=len(material.text),
                 source_labels=(),
                 canonical_source_refs=(material.canonical_source_ref,),
+                canonical_evidence_refs=(),
                 content_digest=_text_digest(material.text),
             )
         )
@@ -1561,12 +1588,14 @@ def _current_anchor_provenance(
         canonical_source_refs=anchor.canonical_source_refs,
         source_event_refs=anchor.canonical_source_refs,
         content_digest=anchor.content_digest,
-        accepted_evidence_id=None,
+        canonical_evidence_refs=(),
         tool_result_event_ref=None,
         tool_call_event_ref=None,
         payload_refs=(),
         artifact_refs=(),
         source_locator_refs=(),
+        chunk_parent_label=None,
+        chunk_ordinal=None,
     )
 
 
@@ -1587,12 +1616,14 @@ def _history_provenance(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[Promp
                 canonical_source_refs=block.canonical_source_refs,
                 source_event_refs=block.canonical_source_refs,
                 content_digest=block.content_digest,
-                accepted_evidence_id=None,
+                canonical_evidence_refs=block.canonical_evidence_refs,
                 tool_result_event_ref=None,
                 tool_call_event_ref=None,
                 payload_refs=(),
                 artifact_refs=(),
                 source_locator_refs=(),
+                chunk_parent_label=None,
+                chunk_ordinal=None,
             )
         )
     return tuple(entries)
@@ -1618,12 +1649,14 @@ def _evidence_provenance(
                 canonical_source_refs=(material.canonical_source_ref,),
                 source_event_refs=(material.tool_result_event_ref,),
                 content_digest=_text_digest(material.raw_result_text),
-                accepted_evidence_id=material.accepted_evidence_id,
+                canonical_evidence_refs=(material.accepted_evidence_id,),
                 tool_result_event_ref=material.tool_result_event_ref,
                 tool_call_event_ref=material.tool_call_event_ref,
                 payload_refs=material.payload_refs,
                 artifact_refs=material.artifact_refs,
                 source_locator_refs=(),
+                chunk_parent_label=None,
+                chunk_ordinal=None,
             )
         )
     return tuple(entries)
@@ -2233,55 +2266,57 @@ def _previous_compacted_view_pair_from_compacted_event(
     transaction: HostTransaction,
     row: EventLogRow,
 ) -> tuple[tuple[CompactMaterialBlock, ...], PreviousCompactReadableView | None]:
-    """把 latest accepted compact candidate 映射为 previous compacted pair。
+    """把 latest accepted compact replacement 映射为 previous compacted pair。
 
     :param transaction: 当前 Host transaction。
     :param row: ``CONTEXT_COMPACTED`` EventLog row。
     :returns: prompt-local previous compacted blocks 与 typed view。
-    :raises HostDurableError: accepted candidate JSON 损坏或 digest 不匹配时抛出。
+    :raises HostDurableError: accepted replacement JSON 或 binding 损坏时抛出。
     """
 
     payload = _validated_compacted_payload(transaction, row)
     try:
-        candidate = parse_context_compacted_semantic_payload(payload).accepted_candidate
+        replacement = (
+            parse_context_compacted_semantic_payload(payload).accepted_replacement
+        )
     except (TypeError, ValueError) as exc:
         raise HostDurableError("compact semantic payload is invalid") from exc
-    return _previous_compacted_view_pair_from_candidate(
+    return _previous_compacted_view_pair_from_replacement(
         event_id=row.event_id,
         event_sequence=row.event_sequence,
-        candidate=candidate,
+        replacement=replacement,
     )
 
 
-def _previous_compacted_view_pair_from_candidate(
+def _previous_compacted_view_pair_from_replacement(
     *,
     event_id: str,
     event_sequence: int,
-    candidate: CompactCandidateV3,
+    replacement: CompactAcceptedReplacementV4,
 ) -> tuple[tuple[CompactMaterialBlock, ...], PreviousCompactReadableView | None]:
-    """从 typed accepted candidate 原子生成 previous blocks 与 typed view。
+    """从 typed accepted replacement 原子生成 previous blocks 与 typed view。
 
     :param event_id: compacted EventLog id。
     :param event_sequence: compacted EventLog sequence。
-    :param candidate: typed accepted candidate。
+    :param replacement: typed accepted replacement。
     :returns: 已通过 exact invariant 的 blocks / readable view pair。
     :raises HostDurableError: pair invariant 不成立时抛出。
     """
 
     blocks: list[RunInputMaterialBlock] = []
-    if candidate.session_summary is not None:
+    if replacement.session_summary is not None:
         blocks.append(
             run_input_material_block(
                 block_id=f"previous:{event_id}:session_summary",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=candidate.session_summary.text,
+                text=replacement.session_summary.text,
                 canonical_source_refs=(event_id,),
                 event_sequence=event_sequence,
                 event_sub_index=0,
             )
         )
-    for index, fact in enumerate(candidate.evidence_facts, start=1):
+    for index, fact in enumerate(replacement.evidence_facts, start=1):
         blocks.append(
             run_input_material_block(
                 block_id=f"previous:{event_id}:evidence_backed_fact:{index}",
@@ -2289,11 +2324,12 @@ def _previous_compacted_view_pair_from_candidate(
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
                 text=fact.claim,
                 canonical_source_refs=(event_id,),
+                canonical_evidence_refs=fact.canonical_evidence_refs,
                 event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    readable_anchors = _readable_answer_anchors_from_candidate(candidate)
+    readable_anchors = _readable_answer_anchors_from_replacement(replacement)
     for index, anchor in enumerate(readable_anchors, start=1):
         blocks.append(
             run_input_material_block(
@@ -2306,7 +2342,7 @@ def _previous_compacted_view_pair_from_candidate(
                 event_sub_index=len(blocks),
             )
         )
-    for index, intent in enumerate(candidate.forward_intents, start=1):
+    for index, intent in enumerate(replacement.forward_intents, start=1):
         blocks.append(
             run_input_material_block(
                 block_id=f"previous:{event_id}:forward_intent:{index}",
@@ -2318,7 +2354,7 @@ def _previous_compacted_view_pair_from_candidate(
                 event_sub_index=len(blocks),
             )
         )
-    for index, reference in enumerate(candidate.reference_continuity, start=1):
+    for index, reference in enumerate(replacement.reference_continuity, start=1):
         blocks.append(
             run_input_material_block(
                 block_id=f"previous:{event_id}:reference_continuity:{index}",
@@ -2331,8 +2367,8 @@ def _previous_compacted_view_pair_from_candidate(
             )
         )
     packed_blocks = _pack_previous_blocks(tuple(blocks))
-    readable_view = _readable_previous_view_from_candidate(
-        candidate,
+    readable_view = _readable_previous_view_from_replacement(
+        replacement,
         packed_blocks,
         readable_anchors=readable_anchors,
     )
@@ -2343,17 +2379,17 @@ def _previous_compacted_view_pair_from_candidate(
     return packed_blocks, readable_view
 
 
-def _readable_answer_anchors_from_candidate(
-    candidate: CompactCandidateV3,
+def _readable_answer_anchors_from_replacement(
+    replacement: CompactAcceptedReplacementV4,
 ) -> tuple[ReadableAnswerAnchorVNext, ...]:
-    """把 accepted candidate answer anchors 映射为无 label readable anchors。
+    """把 accepted replacement answer anchors 映射为无 label readable anchors。
 
-    :param candidate: typed accepted candidate。
+    :param replacement: typed accepted replacement。
     :returns: 临时 label anchors；最终 label 由 packed blocks 覆盖。
     """
 
     anchors: list[ReadableAnswerAnchorVNext] = []
-    for index, anchor in enumerate(candidate.answer_anchors, start=_FIRST_ORDINAL):
+    for index, anchor in enumerate(replacement.answer_anchors, start=_FIRST_ORDINAL):
         anchors.append(
             ReadableAnswerAnchorVNext(
                 source_label=material_label(
@@ -2372,19 +2408,19 @@ def _readable_answer_anchors_from_candidate(
     return tuple(anchors)
 
 
-def _readable_previous_view_from_candidate(
-    candidate: CompactCandidateV3,
+def _readable_previous_view_from_replacement(
+    replacement: CompactAcceptedReplacementV4,
     blocks: tuple[CompactMaterialBlock, ...],
     *,
     readable_anchors: tuple[ReadableAnswerAnchorVNext, ...],
 ) -> PreviousCompactReadableView | None:
-    """从 typed candidate 和 packed blocks 生成 typed previous view。
+    """从 typed replacement 和 packed blocks 生成 typed previous view。
 
-    :param candidate: typed accepted candidate。
+    :param replacement: typed accepted replacement。
     :param blocks: 已生成的 previous compacted blocks。
-    :param readable_anchors: candidate answer anchors 的 typed value。
-    :returns: typed previous view；candidate 无内容时返回 ``None``。
-    :raises HostDurableError: block label 数量与 typed candidate 不一致时抛出。
+    :param readable_anchors: replacement answer anchors 的 typed value。
+    :returns: typed previous view；replacement 无内容时返回 ``None``。
+    :raises HostDurableError: block label 数量与 typed replacement 不一致时抛出。
     """
 
     fact_labels = _labels_for_previous_kind(
@@ -2404,22 +2440,22 @@ def _readable_previous_view_from_candidate(
         CompactMaterialBlockKind.REFERENCE_CONTINUITY,
     )
     if (
-        len(fact_labels) != len(candidate.evidence_facts)
+        len(fact_labels) != len(replacement.evidence_facts)
         or len(anchor_labels) != len(readable_anchors)
-        or len(intent_labels) != len(candidate.forward_intents)
-        or len(reference_labels) != len(candidate.reference_continuity)
+        or len(intent_labels) != len(replacement.forward_intents)
+        or len(reference_labels) != len(replacement.reference_continuity)
     ):
         raise HostDurableError("previous compacted view label count mismatch")
     if (
-        candidate.session_summary is None
-        and len(candidate.evidence_facts) == 0
-        and len(candidate.answer_anchors) == 0
-        and len(candidate.forward_intents) == 0
-        and len(candidate.reference_continuity) == 0
+        replacement.session_summary is None
+        and len(replacement.evidence_facts) == 0
+        and len(replacement.answer_anchors) == 0
+        and len(replacement.forward_intents) == 0
+        and len(replacement.reference_continuity) == 0
     ):
         return None
     return PreviousCompactReadableView(
-        session_summary=(None if candidate.session_summary is None else candidate.session_summary.text),
+        session_summary=(None if replacement.session_summary is None else replacement.session_summary.text),
         evidence_backed_facts=tuple(
             ReadableFactItemVNext(
                 source_label=label,
@@ -2427,7 +2463,7 @@ def _readable_previous_view_from_candidate(
             )
             for label, fact in zip(
                 fact_labels,
-                candidate.evidence_facts,
+                replacement.evidence_facts,
                 strict=True,
             )
         ),
@@ -2448,7 +2484,7 @@ def _readable_previous_view_from_candidate(
             )
             for label, intent in zip(
                 intent_labels,
-                candidate.forward_intents,
+                replacement.forward_intents,
                 strict=True,
             )
         ),
@@ -2460,7 +2496,7 @@ def _readable_previous_view_from_candidate(
             )
             for label, item in zip(
                 reference_labels,
-                candidate.reference_continuity,
+                replacement.reference_continuity,
                 strict=True,
             )
         ),
@@ -2881,6 +2917,7 @@ def _compact_material_block(block: RunInputMaterialBlock, ordinal: int) -> Compa
         size_units=block.size_units,
         source_labels=block.source_labels,
         canonical_source_refs=block.canonical_source_refs,
+        canonical_evidence_refs=block.canonical_evidence_refs,
         content_digest=_packed_content_digest(block),
     )
 
@@ -2929,12 +2966,14 @@ def _provenance_from_blocks(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[P
             canonical_source_refs=block.canonical_source_refs,
             source_event_refs=block.canonical_source_refs,
             content_digest=block.content_digest,
-            accepted_evidence_id=None,
+            canonical_evidence_refs=block.canonical_evidence_refs,
             tool_result_event_ref=None,
             tool_call_event_ref=None,
             payload_refs=(),
             artifact_refs=(),
             source_locator_refs=(),
+            chunk_parent_label=None,
+            chunk_ordinal=None,
         )
         for block in blocks
     )
@@ -2969,12 +3008,14 @@ def _provenance_from_evidence_blocks(
                 canonical_source_refs=source.canonical_source_refs,
                 source_event_refs=(source.tool_result_event_ref,),
                 content_digest=_packed_content_digest(source),
-                accepted_evidence_id=source.accepted_evidence_id,
+                canonical_evidence_refs=source.canonical_evidence_refs,
                 tool_result_event_ref=source.tool_result_event_ref,
                 tool_call_event_ref=source.tool_call_event_ref,
                 payload_refs=source.payload_refs,
                 artifact_refs=source.artifact_refs,
                 source_locator_refs=(),
+                chunk_parent_label=None,
+                chunk_ordinal=None,
             )
         )
     return tuple(entries)
@@ -3338,6 +3379,39 @@ def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
         raise TypeError(f"{field_name} must be tuple")
     for item in value:
         _require_non_empty_text(item, field_name)
+
+
+def _require_unique_string_tuple(value: tuple[str, ...], field_name: str) -> None:
+    """校验唯一字符串 tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 元素为空或重复时抛出。
+    """
+
+    _require_string_tuple(value, field_name)
+    if len(value) != len(set(value)):
+        raise ValueError(f"{field_name} must be unique")
+
+
+def _require_non_empty_unique_string_tuple(
+    value: tuple[str, ...],
+    field_name: str,
+) -> None:
+    """校验非空唯一字符串 tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: tuple 为空、元素为空或重复时抛出。
+    """
+
+    _require_unique_string_tuple(value, field_name)
+    if not value:
+        raise ValueError(f"{field_name} must be non-empty")
 
 
 def _require_optional_text(value: str | None, field_name: str) -> None:

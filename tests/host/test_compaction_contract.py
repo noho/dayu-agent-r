@@ -1,9 +1,9 @@
-"""Host Context Governance fresh compact v3 contract owner tests。"""
+"""Host Context Governance fresh compact v4 contract owner tests。"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import MISSING, fields, replace
+from dataclasses import MISSING, FrozenInstanceError, fields, replace
 from collections.abc import Callable
 from typing import Literal, cast
 
@@ -16,43 +16,47 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    COMPACT_INPUT_SCHEMA_V3,
-    COMPACT_OUTPUT_SCHEMA_V3,
+    COMPACT_INPUT_SCHEMA_V4,
+    COMPACT_OUTPUT_SCHEMA_V4,
     MAX_COMPACT_REPAIR_FEEDBACK_CHARS,
-    CompactAcceptedTruthV3,
-    CompactAnswerAnchorV3,
-    CompactCandidateV3,
-    CompactCurrentInputV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentStatusV3,
-    CompactForwardIntentV3,
-    CompactInputV3,
-    CompactOmittedCoverageV3,
-    CompactOutputCapsV3,
-    CompactPolicyUsageAuditV3,
-    CompactReferenceContinuityV3,
-    CompactRepresentedCoverageV3,
-    CompactRepresentedSourceV3,
-    CompactSemanticSectionV3,
-    CompactSessionSummaryV3,
-    CompactSourceBoundaryEntryV3,
-    CompactSourceKindV3,
-    CompactValidationIssueCodeV3,
-    CompactValidationReportV3,
-    compact_policy_usage_measurement_rules_v3,
-    compact_text_size_units_v3,
-    derive_compact_policy_usage_actuals_v3,
-    derive_compact_represented_sections_v3,
-    validate_compact_policy_usage_audit_candidate_binding_v3,
-    validate_compact_represented_coverage_candidate_binding_v3,
+    CompactAcceptedTruthV4,
+    CompactAcceptedReplacementV4,
+    CompactAnswerAnchorV4,
+    CompactCandidateV4,
+    CompactCurrentInputV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentStatusV4,
+    CompactForwardIntentV4,
+    CompactInputV4,
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
+    CompactOmittedCoverageV4,
+    CompactOutputCapsV4,
+    CompactPolicyUsageAuditV4,
+    PromptLocalProvenanceEntry,
+    CompactReferenceContinuityV4,
+    CompactRepresentedCoverageV4,
+    CompactRepresentedSourceV4,
+    CompactSemanticSectionV4,
+    CompactSessionSummaryV4,
+    CompactSourceBoundaryEntryV4,
+    CompactSourceKindV4,
+    CompactValidationIssueCodeV4,
+    CompactValidationReportV4,
+    compact_policy_usage_measurement_rules_v4,
+    compact_text_size_units_v4,
+    derive_compact_replacement_policy_usage_actuals_v4,
+    derive_compact_replacement_represented_sections_v4,
+    validate_compact_policy_usage_audit_replacement_binding_v4,
+    validate_compact_represented_coverage_replacement_binding_v4,
 )
 from dayu.host.compact_structure import (
     CompactStructureParseError,
-    compact_output_json_schema_digest_v3,
-    compact_output_json_schema_v3,
-    compact_output_prompt_rules_v3,
-    compact_output_template_v3,
-    parse_compact_candidate_v3,
+    compact_output_json_schema_digest_v4,
+    compact_output_json_schema_v4,
+    compact_output_prompt_rules_v4,
+    compact_output_template_v4,
+    parse_compact_candidate_v4,
 )
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_events import (
@@ -60,9 +64,9 @@ from dayu.host.context_events import (
     build_context_compacted_payload,
 )
 from dayu.host.context_governance import (
-    accept_compact_candidate_v3,
-    build_compact_repair_feedback_v3,
-    compact_output_caps_v3_from_memory_policy,
+    accept_compact_candidate_v4,
+    build_compact_repair_feedback_v4,
+    compact_output_caps_v4_from_memory_policy,
 )
 from dayu.host.llm_compaction import _repair_feedback_prompt_json_vnext
 from dayu.host.memory import (
@@ -75,14 +79,14 @@ _REQUEST_DIGEST = "sha256:" + ("d" * 64)
 _SOURCE_BOUNDARY_DIGEST = "sha256:" + ("e" * 64)
 
 
-def test_fresh_v3_contract_uses_exact_schema_literals() -> None:
+def test_fresh_v4_contract_uses_exact_schema_literals() -> None:
     """fresh contract 只接受当前 strict schema literal。
 
     :returns: ``None``。
     """
 
-    assert COMPACT_INPUT_SCHEMA_V3 == "dayu.context_compaction.input.v3"
-    assert COMPACT_OUTPUT_SCHEMA_V3 == "dayu.context_compaction.output.v3"
+    assert COMPACT_INPUT_SCHEMA_V4 == "dayu.context_compaction.input.v4"
+    assert COMPACT_OUTPUT_SCHEMA_V4 == "dayu.context_compaction.output.v4"
 
 
 def test_cross_module_coverage_validator_is_in_public_surface() -> None:
@@ -92,18 +96,18 @@ def test_cross_module_coverage_validator_is_in_public_surface() -> None:
     """
 
     assert (
-        "validate_compact_represented_coverage_candidate_binding_v3"
+        "validate_compact_represented_coverage_replacement_binding_v4"
         in compaction_module.__all__
     )
 
 
-def test_output_caps_v3_has_exact_required_fields_without_defaults() -> None:
+def test_output_caps_v4_has_exact_required_fields_without_defaults() -> None:
     """output caps DTO 只镜像 Memory policy 的九个必填字段。
 
     :returns: ``None``。
     """
 
-    cap_fields = fields(CompactOutputCapsV3)
+    cap_fields = fields(CompactOutputCapsV4)
     assert tuple(field.name for field in cap_fields) == (
         "session_summary_char_cap",
         "evidence_fact_item_cap",
@@ -119,8 +123,74 @@ def test_output_caps_v3_has_exact_required_fields_without_defaults() -> None:
     assert all(field.default_factory is MISSING for field in cap_fields)
 
 
+def test_prompt_local_provenance_entry_has_exact_required_fields_without_defaults() -> None:
+    """PromptLocal provenance DTO 必须 frozen/slots 且所有字段显式必填。
+
+    :returns: ``None``。
+    """
+
+    provenance_fields = fields(PromptLocalProvenanceEntry)
+    assert tuple(field.name for field in provenance_fields) == (
+        "label",
+        "section",
+        "kind",
+        "canonical_source_refs",
+        "source_event_refs",
+        "content_digest",
+        "canonical_evidence_refs",
+        "tool_result_event_ref",
+        "tool_call_event_ref",
+        "payload_refs",
+        "artifact_refs",
+        "source_locator_refs",
+        "chunk_parent_label",
+        "chunk_ordinal",
+    )
+    assert all(field.default is MISSING for field in provenance_fields)
+    assert all(field.default_factory is MISSING for field in provenance_fields)
+    assert "__slots__" in PromptLocalProvenanceEntry.__dict__
+    entry = PromptLocalProvenanceEntry(
+        label="T1",
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
+        canonical_source_refs=("event:user-1",),
+        source_event_refs=("event:user-1",),
+        content_digest="sha256:prompt-local-provenance-entry",
+        canonical_evidence_refs=(),
+        tool_result_event_ref=None,
+        tool_call_event_ref=None,
+        payload_refs=(),
+        artifact_refs=(),
+        source_locator_refs=(),
+        chunk_parent_label=None,
+        chunk_ordinal=None,
+    )
+    with pytest.raises(FrozenInstanceError):
+        entry.__setattr__("label", "T2")
+
+
+def test_compact_candidate_v4_has_exact_required_seven_fields_without_defaults() -> None:
+    """七字段 proposal DTO 不得用 selector 默认值隐藏构造遗漏。
+
+    :returns: ``None``。
+    """
+
+    proposal_fields = fields(CompactCandidateV4)
+    assert tuple(field.name for field in proposal_fields) == (
+        "schema",
+        "session_summary",
+        "retained_previous_evidence_fact_labels",
+        "evidence_facts",
+        "answer_anchors",
+        "forward_intents",
+        "reference_continuity",
+    )
+    assert all(field.default is MISSING for field in proposal_fields)
+    assert all(field.default_factory is MISSING for field in proposal_fields)
+
+
 def test_compact_structure_owner_projects_template_schema_rules_and_parser() -> None:
-    """template、简明规则、formal schema 与 parser 共用 exact v3 shape。
+    """template、简明规则、formal schema 与 parser 共用 exact v4 shape。
 
     :returns: ``None``。
     """
@@ -128,19 +198,26 @@ def test_compact_structure_owner_projects_template_schema_rules_and_parser() -> 
     root_keys = (
         "schema",
         "session_summary",
+        "retained_previous_evidence_fact_labels",
         "evidence_facts",
         "answer_anchors",
         "forward_intents",
         "reference_continuity",
     )
-    template = compact_output_template_v3()
-    schema = compact_output_json_schema_v3()
-    rules = compact_output_prompt_rules_v3()
+    template = compact_output_template_v4()
+    schema = compact_output_json_schema_v4()
+    rules = compact_output_prompt_rules_v4()
     assert tuple(template) == root_keys
-    assert tuple(item.value for item in CompactSemanticSectionV3) == tuple(template)[1:]
+    assert tuple(item.value for item in CompactSemanticSectionV4) == (
+        "session_summary",
+        "evidence_facts",
+        "answer_anchors",
+        "forward_intents",
+        "reference_continuity",
+    )
     assert schema["required"] == list(root_keys)
     assert rules["required_fields"] == list(root_keys)
-    assert parse_compact_candidate_v3(
+    assert parse_compact_candidate_v4(
         json.dumps(template, ensure_ascii=False)
     ).to_json() == template
     serialized_rules = json.dumps(rules, ensure_ascii=False, sort_keys=True)
@@ -161,7 +238,7 @@ def test_compact_structure_parser_raises_typed_failure_with_owner_code_and_path(
     :raises AssertionError: parser 退化为仅含字符串语义的异常时抛出。
     """
 
-    invalid = dict(compact_output_template_v3())
+    invalid = dict(compact_output_template_v4())
     invalid["forward_intents"] = [
         {
             "intent_type": "next_step",
@@ -172,9 +249,9 @@ def test_compact_structure_parser_raises_typed_failure_with_owner_code_and_path(
     ]
 
     with pytest.raises(CompactStructureParseError) as captured:
-        parse_compact_candidate_v3(json.dumps(invalid, ensure_ascii=False))
+        parse_compact_candidate_v4(json.dumps(invalid, ensure_ascii=False))
 
-    assert captured.value.code is CompactValidationIssueCodeV3.INVALID_ENUM_VALUE
+    assert captured.value.code is CompactValidationIssueCodeV4.INVALID_ENUM_VALUE
     assert captured.value.json_path == "$.forward_intents[0].status"
     assert captured.value.message == (
         "invalid_enum_value: $.forward_intents[0].status"
@@ -187,20 +264,20 @@ def test_compact_structure_projections_are_fresh_and_digest_is_stable() -> None:
     :returns: ``None``。
     """
 
-    digest = compact_output_json_schema_digest_v3()
-    schema = compact_output_json_schema_v3()
+    digest = compact_output_json_schema_digest_v4()
+    schema = compact_output_json_schema_v4()
     properties = schema["properties"]
     assert isinstance(properties, dict)
     properties["tampered"] = {"type": "string"}
-    template = compact_output_template_v3()
+    template = compact_output_template_v4()
     assert isinstance(template, dict)
     template["tampered"] = "value"
 
-    fresh_properties = compact_output_json_schema_v3()["properties"]
+    fresh_properties = compact_output_json_schema_v4()["properties"]
     assert isinstance(fresh_properties, dict)
     assert "tampered" not in fresh_properties
-    assert "tampered" not in compact_output_template_v3()
-    assert compact_output_json_schema_digest_v3() == digest
+    assert "tampered" not in compact_output_template_v4()
+    assert compact_output_json_schema_digest_v4() == digest
 
 
 def test_input_json_separates_current_input_and_source_boundary() -> None:
@@ -211,10 +288,10 @@ def test_input_json_separates_current_input_and_source_boundary() -> None:
 
     compact_input = _input()
     assert compact_input.source_labels == ("S1", "E1", "T1")
-    assert compact_input.source_kind("E1") is CompactSourceKindV3.EVIDENCE_MATERIAL
+    assert compact_input.source_kind("E1") is CompactSourceKindV4.EVIDENCE_MATERIAL
     assert compact_input.source_kind("missing") is None
     assert compact_input.to_json() == {
-        "schema": COMPACT_INPUT_SCHEMA_V3,
+        "schema": COMPACT_INPUT_SCHEMA_V4,
         "current_input": {"readable_text": "分析本期结果"},
         "source_boundary": [
             {
@@ -233,26 +310,35 @@ def test_input_json_separates_current_input_and_source_boundary() -> None:
                 "readable_text": "用户追问利润率",
             },
         ],
-        "output_caps": compact_output_caps_v3_from_memory_policy(
+        "output_caps": compact_output_caps_v4_from_memory_policy(
             default_memory_projection_policy()
         ).to_json(),
     }
 
 
-def test_accept_owner_derives_exact_coverage_and_canonical_label_order() -> None:
-    """Host 从业务区派生 coverage，并按 boundary 顺序 canonicalize labels。
+def test_accept_owner_rejects_noncanonical_labels_and_derives_exact_coverage() -> None:
+    """Host 拒绝非 boundary 顺序 labels，并从 canonical proposal 派生 coverage。
 
     :returns: ``None``。
     """
 
-    result = accept_compact_candidate_v3(
+    rejected = accept_compact_candidate_v4(
         _input(),
         _candidate(summary_labels=("T1", "S1"), fact_labels=("E1",)),
         default_memory_projection_policy(),
     )
-    assert isinstance(result, CompactAcceptedTruthV3)
-    assert result.candidate.session_summary is not None
-    assert result.candidate.session_summary.source_labels == ("S1", "T1")
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert rejected.issues[0].code is (
+        CompactValidationIssueCodeV4.NON_CANONICAL_SOURCE_LABEL_ORDER
+    )
+    result = accept_compact_candidate_v4(
+        _input(),
+        _candidate(summary_labels=("S1", "T1"), fact_labels=("E1",)),
+        default_memory_projection_policy(),
+    )
+    assert isinstance(result, CompactAcceptedTruthV4)
+    assert result.proposal.session_summary is not None
+    assert result.proposal.session_summary.source_labels == ("S1", "T1")
     assert result.represented_coverage.source_labels == ("S1", "E1", "T1")
     assert result.omitted_coverage.source_labels == ()
     assert result.covered_source_refs == (
@@ -270,13 +356,13 @@ def test_accepted_truth_rejects_represented_coverage_out_of_boundary_order() -> 
     :raises AssertionError: 乱序 represented coverage 未在 accepted truth 边界失败时抛出。
     """
 
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _input(),
         _candidate(summary_labels=("S1", "T1"), fact_labels=("E1",)),
         default_memory_projection_policy(),
     )
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    reordered = CompactRepresentedCoverageV3(
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    reordered = CompactRepresentedCoverageV4(
         sources=tuple(reversed(accepted.represented_coverage.sources)),
     )
 
@@ -301,13 +387,13 @@ def test_accept_owner_derives_omitted_complement_for_committed_round_trip() -> N
         evidence_facts=(),
     )
 
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _input(),
         candidate,
         default_memory_projection_policy(),
     )
 
-    assert isinstance(accepted, CompactAcceptedTruthV3)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
     expected_omitted_labels = ("E1", "T1")
     assert accepted.omitted_coverage.source_labels == expected_omitted_labels
     payload = build_context_compacted_payload(
@@ -320,7 +406,6 @@ def test_accept_owner_derives_omitted_complement_for_committed_round_trip() -> N
         accepted_truth=accepted,
         budget_after_compact=64,
         prompt_local_label_mapping_refs=("prompt-label:S1",),
-        accepted_evidence_mapping_refs=(),
         projection_signal="conversation_memory_projection_catchup",
         successful_response_identity=SuccessfulRunnerResponseIdentity(
             effective_provider="test-compactor",
@@ -359,26 +444,339 @@ def test_accept_owner_derives_omitted_complement_for_committed_round_trip() -> N
     assert parsed.omitted_coverage.source_labels == expected_omitted_labels
 
 
+def test_retain_only_copies_previous_fact_atom_and_omits_unselected_sources() -> None:
+    """retain-only 必须复制旧 claim/refs，且 coverage 只表示被选择的旧 atom。
+
+    :returns: ``None``。
+    :raises AssertionError: combined replacement、coverage 或 audit 仍按 new facts 派生时抛出。
+    """
+
+    compact_input = _evidence_provenance_input()
+    proposal = replace(
+        _empty_candidate(),
+        retained_previous_evidence_fact_labels=("P1",),
+    )
+
+    accepted = accept_compact_candidate_v4(
+        compact_input,
+        proposal,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert tuple(fact.to_json() for fact in accepted.replacement.evidence_facts) == (
+        {
+            "claim": "上一轮已核验毛利率为 20%",
+            "selection_labels": ["P1"],
+            "context_labels": [],
+            "canonical_evidence_refs": ["evidence:previous-a", "evidence:previous-b"],
+        },
+    )
+    assert accepted.represented_coverage.source_labels == ("P1",)
+    assert accepted.omitted_coverage.source_labels == ("E1", "E2", "T1")
+    assert accepted.policy_usage_audit.evidence_fact_item_actual == 1
+    assert accepted.policy_usage_audit.evidence_fact_char_actual == len(
+        "上一轮已核验毛利率为 20%"
+    )
+
+
+def test_previous_fact_label_cannot_support_a_new_fact_claim() -> None:
+    """previous fact 只能走 retain selector，不能借旧 provenance 改写 claim。
+
+    :returns: ``None``。
+    """
+
+    proposal = replace(
+        _empty_candidate(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="把旧事实改写成不相关结论",
+                support_labels=("P1",),
+                context_labels=(),
+            ),
+        ),
+    )
+
+    rejected = accept_compact_candidate_v4(
+        _evidence_provenance_input(),
+        proposal,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert rejected.issues[0].code is CompactValidationIssueCodeV4.SOURCE_KIND_MISMATCH
+    assert rejected.issues[0].json_path == '$["evidence_facts"][0]["support_labels"]'
+
+
+def test_current_evidence_fact_uses_boundary_ordered_per_entry_refs_union() -> None:
+    """多 source 新事实按 support entry 顺序完整合并自身 evidence refs。
+
+    :returns: ``None``。
+    :raises AssertionError: refs 丢项、共享无关 aggregate 或顺序漂移时抛出。
+    """
+
+    proposal = replace(
+        _empty_candidate(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="收入和利润率均改善",
+                support_labels=("E1", "E2"),
+                context_labels=("T1",),
+            ),
+        ),
+    )
+
+    accepted = accept_compact_candidate_v4(
+        _evidence_provenance_input(),
+        proposal,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    fact = accepted.replacement.evidence_facts[0]
+    assert fact.selection_labels == ("E1", "E2")
+    assert fact.context_labels == ("T1",)
+    assert fact.canonical_evidence_refs == (
+        "evidence:current-a",
+        "evidence:shared",
+        "evidence:current-b",
+    )
+    assert accepted.replacement.canonical_evidence_refs == fact.canonical_evidence_refs
+
+
+def test_retained_plus_two_source_new_fact_has_exact_per_fact_and_aggregate_refs() -> None:
+    """手工复算 retained atom 与 two-source new atom 的逐 fact/aggregate refs。
+
+    :returns: ``None``。
+    :raises AssertionError: retained/new provenance 串线或 aggregate union 漂移时抛出。
+    """
+
+    proposal = replace(
+        _empty_candidate(),
+        retained_previous_evidence_fact_labels=("P1",),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="收入和利润率均改善",
+                support_labels=("E1", "E2"),
+                context_labels=("T1",),
+            ),
+        ),
+    )
+
+    accepted = accept_compact_candidate_v4(
+        _evidence_provenance_input(),
+        proposal,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    retained, current = accepted.replacement.evidence_facts
+    assert retained.canonical_evidence_refs == (
+        "evidence:previous-a",
+        "evidence:previous-b",
+    )
+    assert current.canonical_evidence_refs == (
+        "evidence:current-a",
+        "evidence:shared",
+        "evidence:current-b",
+    )
+    assert accepted.replacement.canonical_evidence_refs == (
+        "evidence:previous-a",
+        "evidence:previous-b",
+        "evidence:current-a",
+        "evidence:shared",
+        "evidence:current-b",
+    )
+
+
+def test_non_evidence_sources_cannot_create_evidence_fact() -> None:
+    """只有 user/assistant/trace material 时不得伪造新 EvidenceFact。
+
+    :returns: ``None``。
+    """
+
+    compact_input = CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-no-evidence",
+            readable_text="纠正上一条回答",
+        ),
+        source_boundary=(
+            CompactSourceBoundaryEntryV4(
+                source_label="T1",
+                source_kind=CompactSourceKindV4.TRACE_MATERIAL,
+                source_refs=("event:user-correction",),
+                canonical_evidence_refs=(),
+                readable_text="用户指出年份写错",
+            ),
+            CompactSourceBoundaryEntryV4(
+                source_label="A1",
+                source_kind=CompactSourceKindV4.ANSWER_MATERIAL,
+                source_refs=("event:assistant-answer",),
+                canonical_evidence_refs=(),
+                readable_text="此前回答",
+            ),
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(
+            default_memory_projection_policy()
+        ),
+    )
+    proposal = replace(
+        _empty_candidate(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="伪造的核验事实",
+                support_labels=("T1",),
+                context_labels=("A1",),
+            ),
+        ),
+    )
+
+    rejected = accept_compact_candidate_v4(
+        compact_input,
+        proposal,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert CompactValidationIssueCodeV4.SOURCE_KIND_MISMATCH in tuple(
+        issue.code for issue in rejected.issues
+    )
+
+
+def test_combined_retained_and_new_facts_enforce_duplicate_and_caps() -> None:
+    """duplicate、item cap 与 char cap 必须对 retained+new combined facts 生效。
+
+    :returns: ``None``。
+    """
+
+    duplicate_proposal = replace(
+        _empty_candidate(),
+        retained_previous_evidence_fact_labels=("P1",),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="上一轮已核验毛利率为 20%",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+    )
+    duplicate = accept_compact_candidate_v4(
+        _evidence_provenance_input(),
+        duplicate_proposal,
+        default_memory_projection_policy(),
+    )
+    assert isinstance(duplicate, CompactValidationReportV4)
+    assert CompactValidationIssueCodeV4.DUPLICATE_SEMANTIC_ITEM in tuple(
+        issue.code for issue in duplicate.issues
+    )
+
+    cap_policy = replace(
+        default_memory_projection_policy(),
+        evidence_fact_item_cap=1,
+        evidence_fact_char_cap=len("上一轮已核验毛利率为 20%") + len("收入增长 10%") - 1,
+    )
+    cap_proposal = replace(
+        duplicate_proposal,
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="收入增长 10%",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+    )
+    capped = accept_compact_candidate_v4(
+        _evidence_provenance_input(cap_policy),
+        cap_proposal,
+        cap_policy,
+    )
+    assert isinstance(capped, CompactValidationReportV4)
+    cap_codes = tuple(issue.code for issue in capped.issues)
+    assert CompactValidationIssueCodeV4.POLICY_ITEM_CAP_EXCEEDED in cap_codes
+    assert CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED in cap_codes
+
+
+def test_omitted_previous_claim_can_be_recreated_from_current_evidence() -> None:
+    """omit 旧 fact 后，相同 claim 可由 current evidence 以新 provenance 接受。
+
+    :returns: ``None``。
+    """
+
+    proposal = replace(
+        _empty_candidate(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="上一轮已核验毛利率为 20%",
+                support_labels=("E2",),
+                context_labels=(),
+            ),
+        ),
+    )
+
+    accepted = accept_compact_candidate_v4(
+        _evidence_provenance_input(),
+        proposal,
+        default_memory_projection_policy(),
+    )
+
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert accepted.replacement.evidence_facts[0].canonical_evidence_refs == (
+        "evidence:shared",
+        "evidence:current-b",
+    )
+    assert "P1" in accepted.omitted_coverage.source_labels
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    (
+        CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+        CompactSourceKindV4.EVIDENCE_MATERIAL,
+    ),
+)
+def test_evidence_boundary_entry_rejects_empty_canonical_refs(
+    source_kind: CompactSourceKindV4,
+) -> None:
+    """previous/current evidence boundary 缺 canonical refs 时 typed fail closed。
+
+    :param source_kind: 被测 evidence source kind。
+    :returns: ``None``。
+    """
+
+    with pytest.raises(
+        ValueError,
+        match="canonical_evidence_refs must be non-empty",
+    ):
+        CompactSourceBoundaryEntryV4(
+            source_label="E-empty",
+            source_kind=source_kind,
+            source_refs=("event:evidence-empty",),
+            canonical_evidence_refs=(),
+            readable_text="缺 provenance 的事实",
+        )
+
+
 @pytest.mark.parametrize(
     ("candidate_factory", "expected_code"),
     (
         (
             lambda: _candidate(summary_labels=("UNKNOWN",), fact_labels=("E1",)),
-            CompactValidationIssueCodeV3.UNKNOWN_SOURCE_LABEL,
+            CompactValidationIssueCodeV4.UNKNOWN_SOURCE_LABEL,
         ),
         (
             lambda: _candidate(summary_labels=("S1",), fact_labels=("T1",)),
-            CompactValidationIssueCodeV3.SOURCE_KIND_MISMATCH,
+            CompactValidationIssueCodeV4.SOURCE_KIND_MISMATCH,
         ),
         (
             lambda: _empty_candidate(),
-            CompactValidationIssueCodeV3.EMPTY_SEMANTIC_OUTPUT,
+            CompactValidationIssueCodeV4.EMPTY_SEMANTIC_OUTPUT,
         ),
     ),
 )
 def test_accept_owner_rejects_deterministic_invalid_matrix(
-    candidate_factory: Callable[[], CompactCandidateV3],
-    expected_code: CompactValidationIssueCodeV3,
+    candidate_factory: Callable[[], CompactCandidateV4],
+    expected_code: CompactValidationIssueCodeV4,
 ) -> None:
     """label、kind 与 information floor 的 invalid matrix 均由同一 owner 拒绝。
 
@@ -387,12 +785,12 @@ def test_accept_owner_rejects_deterministic_invalid_matrix(
     :returns: ``None``。
     """
 
-    result = accept_compact_candidate_v3(
+    result = accept_compact_candidate_v4(
         _input(),
         candidate_factory(),
         default_memory_projection_policy(),
     )
-    assert isinstance(result, CompactValidationReportV3)
+    assert isinstance(result, CompactValidationReportV4)
     assert expected_code in tuple(issue.code for issue in result.issues)
 
 
@@ -406,25 +804,25 @@ def test_duplicate_and_schema_provable_contradiction_are_rejected() -> None:
     candidate = replace(
         candidate,
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step_note",
                 text="继续 分析",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("T1",),
             ),
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step_note",
                 text="继续  分析",
-                status=CompactForwardIntentStatusV3.BLOCKED,
+                status=CompactForwardIntentStatusV4.BLOCKED,
                 source_labels=("T1",),
             ),
         ),
     )
-    result = accept_compact_candidate_v3(_input(), candidate, default_memory_projection_policy())
-    assert isinstance(result, CompactValidationReportV3)
+    result = accept_compact_candidate_v4(_input(), candidate, default_memory_projection_policy())
+    assert isinstance(result, CompactValidationReportV4)
     codes = tuple(issue.code for issue in result.issues)
-    assert CompactValidationIssueCodeV3.DUPLICATE_SEMANTIC_ITEM in codes
-    assert CompactValidationIssueCodeV3.CONTRADICTORY_SEMANTIC_ITEM in codes
+    assert CompactValidationIssueCodeV4.DUPLICATE_SEMANTIC_ITEM in codes
+    assert CompactValidationIssueCodeV4.CONTRADICTORY_SEMANTIC_ITEM in codes
 
 
 def test_similar_but_not_equal_text_is_not_fuzzy_deduplicated() -> None:
@@ -437,12 +835,12 @@ def test_similar_but_not_equal_text_is_not_fuzzy_deduplicated() -> None:
     candidate = replace(
         candidate,
         reference_continuity=(
-            CompactReferenceContinuityV3(text="第一家公司", reason="local_reference", source_labels=("T1",)),
-            CompactReferenceContinuityV3(text="首家公司", reason="local_reference", source_labels=("T1",)),
+            CompactReferenceContinuityV4(text="第一家公司", reason="local_reference", source_labels=("T1",)),
+            CompactReferenceContinuityV4(text="首家公司", reason="local_reference", source_labels=("T1",)),
         ),
     )
-    result = accept_compact_candidate_v3(_input(), candidate, default_memory_projection_policy())
-    assert isinstance(result, CompactAcceptedTruthV3)
+    result = accept_compact_candidate_v4(_input(), candidate, default_memory_projection_policy())
+    assert isinstance(result, CompactAcceptedTruthV4)
 
 
 def test_memory_policy_item_and_size_caps_use_same_policy_owner() -> None:
@@ -456,25 +854,25 @@ def test_memory_policy_item_and_size_caps_use_same_policy_owner() -> None:
         evidence_fact_item_cap=1,
         evidence_fact_char_cap=len("收入增长 10%"),
     )
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _input(policy),
         _candidate(summary_labels=("S1", "T1"), fact_labels=("E1",)),
         policy,
     )
-    assert isinstance(accepted, CompactAcceptedTruthV3)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
     too_large = replace(
         _candidate(summary_labels=("S1", "T1"), fact_labels=("E1",)),
         evidence_facts=(
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim="收入增长 10%+",
                 support_labels=("E1",),
                 context_labels=(),
             ),
         ),
     )
-    rejected = accept_compact_candidate_v3(_input(policy), too_large, policy)
-    assert isinstance(rejected, CompactValidationReportV3)
-    assert CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
+    rejected = accept_compact_candidate_v4(_input(policy), too_large, policy)
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
 
 
 def test_policy_usage_audit_derivation_and_validation_fail_closed() -> None:
@@ -483,35 +881,45 @@ def test_policy_usage_audit_derivation_and_validation_fail_closed() -> None:
     :returns: ``None``。
     """
 
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _input(),
         _candidate(summary_labels=("S1", "T1"), fact_labels=("E1",)),
         default_memory_projection_policy(),
     )
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    candidate = accepted.candidate
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    replacement = accepted.replacement
     audit = accepted.policy_usage_audit
-    actuals = derive_compact_policy_usage_actuals_v3(candidate)
+    actuals = derive_compact_replacement_policy_usage_actuals_v4(replacement)
     assert actuals.session_summary_char_actual == estimate_memory_size_units(
-        candidate.session_summary.text if candidate.session_summary is not None else ""
+        replacement.session_summary.text
+        if replacement.session_summary is not None
+        else ""
     ).units
-    validate_compact_policy_usage_audit_candidate_binding_v3(candidate, audit)
+    validate_compact_policy_usage_audit_replacement_binding_v4(
+        replacement,
+        audit,
+    )
 
     with pytest.raises(ValueError, match="text must be str"):
-        compact_text_size_units_v3(cast(str, 1))
-    with pytest.raises(TypeError, match="candidate must be CompactCandidateV3"):
-        derive_compact_policy_usage_actuals_v3(cast(CompactCandidateV3, "bad"))
-    with pytest.raises(TypeError, match="audit must be CompactPolicyUsageAuditV3"):
-        validate_compact_policy_usage_audit_candidate_binding_v3(
-            candidate,
-            cast(CompactPolicyUsageAuditV3, "bad"),
+        compact_text_size_units_v4(cast(str, 1))
+    with pytest.raises(
+        TypeError,
+        match="replacement must be CompactAcceptedReplacementV4",
+    ):
+        derive_compact_replacement_policy_usage_actuals_v4(
+            cast(CompactAcceptedReplacementV4, "bad")
+        )
+    with pytest.raises(TypeError, match="audit must be CompactPolicyUsageAuditV4"):
+        validate_compact_policy_usage_audit_replacement_binding_v4(
+            replacement,
+            cast(CompactPolicyUsageAuditV4, "bad"),
         )
     with pytest.raises(
         ValueError,
-        match="policy_usage_audit actuals must equal candidate-derived usage",
+        match="policy_usage_audit actuals must equal replacement-derived usage",
     ):
-        validate_compact_policy_usage_audit_candidate_binding_v3(
-            candidate,
+        validate_compact_policy_usage_audit_replacement_binding_v4(
+            replacement,
             replace(
                 audit,
                 evidence_fact_char_actual=audit.evidence_fact_char_actual - 1,
@@ -521,8 +929,8 @@ def test_policy_usage_audit_derivation_and_validation_fail_closed() -> None:
         ValueError,
         match="policy_usage_audit actual must not exceed cap",
     ):
-        validate_compact_policy_usage_audit_candidate_binding_v3(
-            candidate,
+        validate_compact_policy_usage_audit_replacement_binding_v4(
+            replacement,
             replace(
                 audit,
                 evidence_fact_char_cap=audit.evidence_fact_char_actual - 1,
@@ -530,13 +938,13 @@ def test_policy_usage_audit_derivation_and_validation_fail_closed() -> None:
         )
 
 
-def test_policy_usage_measurement_rules_match_exact_candidate_derivation() -> None:
-    """业务可读计量规则与唯一 candidate actual 派生保持精确一致。
+def test_policy_usage_measurement_rules_match_exact_replacement_derivation() -> None:
+    """业务可读计量规则与唯一 replacement actual 派生保持精确一致。
 
     :returns: ``None``。
     """
 
-    rules = compact_policy_usage_measurement_rules_v3()
+    rules = compact_policy_usage_measurement_rules_v4()
     assert dict(rules) == {
         "session_summary": "text 的字符数",
         "evidence_facts": "各项 claim 的字符数之和",
@@ -544,113 +952,130 @@ def test_policy_usage_measurement_rules_match_exact_candidate_derivation() -> No
         "forward_intents": "各项 text 的字符数之和",
         "reference_continuity": "各项 text 的字符数之和；reason 不计入",
     }
-    candidate = _all_section_cap_candidate()
-    actuals = derive_compact_policy_usage_actuals_v3(candidate)
-    assert candidate.session_summary is not None
-    assert actuals.session_summary_char_actual == len(candidate.session_summary.text)
+    proposal = _all_section_cap_candidate()
+    accepted = accept_compact_candidate_v4(
+        _cap_input(default_memory_projection_policy()),
+        proposal,
+        default_memory_projection_policy(),
+    )
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    replacement = accepted.replacement
+    actuals = derive_compact_replacement_policy_usage_actuals_v4(replacement)
+    assert replacement.session_summary is not None
+    assert actuals.session_summary_char_actual == len(
+        replacement.session_summary.text
+    )
     assert actuals.evidence_fact_char_actual == sum(
-        len(item.claim) for item in candidate.evidence_facts
+        len(item.claim) for item in replacement.evidence_facts
     )
     assert actuals.answer_anchor_char_actual == sum(
-        len(f"{item.title}\n{item.detail}") for item in candidate.answer_anchors
+        len(f"{item.title}\n{item.detail}")
+        for item in replacement.answer_anchors
     )
     assert actuals.forward_intent_char_actual == sum(
-        len(item.text) for item in candidate.forward_intents
+        len(item.text) for item in replacement.forward_intents
     )
     assert actuals.reference_continuity_char_actual == sum(
-        len(item.text) for item in candidate.reference_continuity
+        len(item.text) for item in replacement.reference_continuity
     )
 
 
-def test_v3_typed_contract_rejects_invalid_nested_types_and_bindings() -> None:
-    """fresh v3 typed owner 对非法 nested type、partition 与 input binding fail closed。
+def test_v4_typed_contract_rejects_invalid_nested_types_and_bindings() -> None:
+    """fresh v4 typed owner 对非法 nested type、partition 与 input binding fail closed。
 
     :returns: ``None``。
     """
 
     compact_input = _input()
     caps = compact_input.output_caps
-    with pytest.raises(ValueError, match="CompactInputV3.schema is invalid"):
-        replace(compact_input, schema=cast(Literal["dayu.context_compaction.input.v3"], "bad"))
-    with pytest.raises(TypeError, match="CompactInputV3.current_input is invalid"):
-        replace(compact_input, current_input=cast(CompactCurrentInputV3, "bad"))
-    with pytest.raises(TypeError, match="CompactInputV3.source_boundary item is invalid"):
+    with pytest.raises(ValueError, match="CompactInputV4.schema is invalid"):
+        replace(compact_input, schema=cast(Literal["dayu.context_compaction.input.v4"], "bad"))
+    with pytest.raises(TypeError, match="CompactInputV4.current_input is invalid"):
+        replace(compact_input, current_input=cast(CompactCurrentInputV4, "bad"))
+    with pytest.raises(TypeError, match="CompactInputV4.source_boundary item is invalid"):
         replace(
             compact_input,
-            source_boundary=cast(tuple[CompactSourceBoundaryEntryV3, ...], ("bad",)),
+            source_boundary=cast(tuple[CompactSourceBoundaryEntryV4, ...], ("bad",)),
         )
-    with pytest.raises(TypeError, match="CompactInputV3.output_caps is invalid"):
-        replace(compact_input, output_caps=cast(CompactOutputCapsV3, "bad"))
+    with pytest.raises(TypeError, match="CompactInputV4.output_caps is invalid"):
+        replace(compact_input, output_caps=cast(CompactOutputCapsV4, "bad"))
 
     candidate = _candidate(summary_labels=("S1", "T1"), fact_labels=("E1",))
-    with pytest.raises(ValueError, match="CompactCandidateV3.schema is invalid"):
-        replace(candidate, schema=cast(Literal["dayu.context_compaction.output.v3"], "bad"))
-    with pytest.raises(TypeError, match="CompactCandidateV3.session_summary is invalid"):
-        replace(candidate, session_summary=cast(CompactSessionSummaryV3, "bad"))
+    with pytest.raises(ValueError, match="CompactCandidateV4.schema is invalid"):
+        replace(candidate, schema=cast(Literal["dayu.context_compaction.output.v4"], "bad"))
+    with pytest.raises(TypeError, match="CompactCandidateV4.session_summary is invalid"):
+        replace(candidate, session_summary=cast(CompactSessionSummaryV4, "bad"))
     with pytest.raises(TypeError, match="evidence_facts items are invalid"):
-        replace(candidate, evidence_facts=cast(tuple[CompactEvidenceFactV3, ...], ("bad",)))
-    with pytest.raises(TypeError, match="CompactForwardIntentV3.status is invalid"):
-        CompactForwardIntentV3(
+        replace(candidate, evidence_facts=cast(tuple[CompactEvidenceFactV4, ...], ("bad",)))
+    with pytest.raises(TypeError, match="CompactForwardIntentV4.status is invalid"):
+        CompactForwardIntentV4(
             intent_type="next_step",
             text="继续分析",
-            status=cast(CompactForwardIntentStatusV3, "bad"),
+            status=cast(CompactForwardIntentStatusV4, "bad"),
             source_labels=("T1",),
         )
 
     with pytest.raises(TypeError, match="sections item is invalid"):
-        CompactRepresentedSourceV3(
+        CompactRepresentedSourceV4(
             source_label="S1",
-            sections=cast(tuple[CompactSemanticSectionV3, ...], ("bad",)),
+            sections=cast(tuple[CompactSemanticSectionV4, ...], ("bad",)),
         )
     with pytest.raises(ValueError, match="sections must not be empty"):
-        CompactRepresentedSourceV3(source_label="S1", sections=())
+        CompactRepresentedSourceV4(source_label="S1", sections=())
     with pytest.raises(ValueError, match="sections must be unique and ordered"):
-        CompactRepresentedSourceV3(
+        CompactRepresentedSourceV4(
             source_label="S1",
             sections=(
-                CompactSemanticSectionV3.EVIDENCE_FACTS,
-                CompactSemanticSectionV3.SESSION_SUMMARY,
+                CompactSemanticSectionV4.EVIDENCE_FACTS,
+                CompactSemanticSectionV4.SESSION_SUMMARY,
             ),
         )
 
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         compact_input,
         candidate,
         default_memory_projection_policy(),
     )
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    assert dict(derive_compact_represented_sections_v3(accepted.candidate)) == {
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert dict(
+        derive_compact_replacement_represented_sections_v4(
+            accepted.replacement
+        )
+    ) == {
         source.source_label: source.sections
         for source in accepted.represented_coverage.sources
     }
-    validate_compact_represented_coverage_candidate_binding_v3(
-        accepted.candidate,
+    validate_compact_represented_coverage_replacement_binding_v4(
+        accepted.replacement,
         accepted.represented_coverage,
     )
-    with pytest.raises(TypeError, match="candidate must be CompactCandidateV3"):
-        derive_compact_represented_sections_v3(
-            cast(CompactCandidateV3, "bad")
+    with pytest.raises(
+        TypeError,
+        match="replacement must be CompactAcceptedReplacementV4",
+    ):
+        derive_compact_replacement_represented_sections_v4(
+            cast(CompactAcceptedReplacementV4, "bad")
         )
     with pytest.raises(TypeError, match="represented_coverage must be"):
-        validate_compact_represented_coverage_candidate_binding_v3(
-            accepted.candidate,
-            cast(CompactRepresentedCoverageV3, "bad"),
+        validate_compact_represented_coverage_replacement_binding_v4(
+            accepted.replacement,
+            cast(CompactRepresentedCoverageV4, "bad"),
         )
     with pytest.raises(ValueError, match="represented and omitted coverage must be disjoint"):
         replace(
             accepted,
-            omitted_coverage=CompactOmittedCoverageV3(
+            omitted_coverage=CompactOmittedCoverageV4(
                 source_labels=(accepted.represented_coverage.source_labels[0],)
             ),
         )
     with pytest.raises(ValueError, match="accepted coverage must exactly partition"):
         replace(
             accepted,
-            represented_coverage=CompactRepresentedCoverageV3(sources=()),
-            omitted_coverage=CompactOmittedCoverageV3(source_labels=()),
+            represented_coverage=CompactRepresentedCoverageV4(sources=()),
+            omitted_coverage=CompactOmittedCoverageV4(source_labels=()),
         )
-    with pytest.raises(TypeError, match="compact_input must be CompactInputV3"):
-        accepted.validate_input_binding(cast(CompactInputV3, "bad"))
+    with pytest.raises(TypeError, match="compact_input must be CompactInputV4"):
+        accepted.validate_input_binding(cast(CompactInputV4, "bad"))
     with pytest.raises(ValueError, match="current input binding mismatch"):
         replace(accepted, current_input_ref="event:other").validate_input_binding(
             compact_input
@@ -699,20 +1124,20 @@ def test_each_memory_section_item_cap_accepts_equal_and_rejects_plus_one(
     """
 
     policy = _cap_policy(section, item_cap=1, char_cap=65536)
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _cap_input(policy),
         _cap_candidate(section, ("first",)),
         policy,
     )
-    rejected = accept_compact_candidate_v3(
+    rejected = accept_compact_candidate_v4(
         _cap_input(policy),
         _cap_candidate(section, ("first", "second")),
         policy,
     )
 
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    assert isinstance(rejected, CompactValidationReportV3)
-    assert CompactValidationIssueCodeV3.POLICY_ITEM_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert CompactValidationIssueCodeV4.POLICY_ITEM_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
 
 
 @pytest.mark.parametrize(
@@ -732,33 +1157,33 @@ def test_each_memory_section_size_cap_accepts_equal_and_rejects_plus_one(
     :param section: 待验证 candidate section。
     """
 
-    accepted_candidate = _cap_candidate(section, ("abcd",))
+    accepted_proposal = _cap_candidate(section, ("abcd",))
     accepted_text = _cap_projection_text(section, "abcd")
     size_cap = estimate_memory_size_units(accepted_text).units
     policy = _cap_policy(section, item_cap=8, char_cap=size_cap)
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _cap_input(policy),
-        accepted_candidate,
+        accepted_proposal,
         policy,
     )
-    rejected = accept_compact_candidate_v3(
+    rejected = accept_compact_candidate_v4(
         _cap_input(policy),
         _cap_candidate(section, ("abcde",)),
         policy,
     )
 
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    assert isinstance(rejected, CompactValidationReportV3)
-    assert CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
 
 
 def test_session_summary_size_cap_accepts_equal_and_rejects_plus_one() -> None:
     """session summary 使用同一 estimator 验证 == cap 与 +1。"""
 
     candidate = _cap_candidate("evidence_facts", ("fact",))
-    accepted_candidate = replace(
+    accepted_proposal = replace(
         candidate,
-        session_summary=CompactSessionSummaryV3(
+        session_summary=CompactSessionSummaryV4(
             text="abcd",
             source_labels=("E1", "A1", "T1"),
         ),
@@ -767,16 +1192,16 @@ def test_session_summary_size_cap_accepts_equal_and_rejects_plus_one() -> None:
         default_memory_projection_policy(),
         session_summary_char_cap=estimate_memory_size_units("abcd").units,
     )
-    accepted = accept_compact_candidate_v3(
+    accepted = accept_compact_candidate_v4(
         _cap_input(policy),
-        accepted_candidate,
+        accepted_proposal,
         policy,
     )
-    rejected = accept_compact_candidate_v3(
+    rejected = accept_compact_candidate_v4(
         _cap_input(policy),
         replace(
-            accepted_candidate,
-            session_summary=CompactSessionSummaryV3(
+            accepted_proposal,
+            session_summary=CompactSessionSummaryV4(
                 text="abcde",
                 source_labels=("E1", "A1", "T1"),
             ),
@@ -784,9 +1209,9 @@ def test_session_summary_size_cap_accepts_equal_and_rejects_plus_one() -> None:
         policy,
     )
 
-    assert isinstance(accepted, CompactAcceptedTruthV3)
-    assert isinstance(rejected, CompactValidationReportV3)
-    assert CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    assert isinstance(rejected, CompactValidationReportV4)
+    assert CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED in tuple(issue.code for issue in rejected.issues)
 
 
 def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> None:
@@ -812,11 +1237,11 @@ def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> N
         reference_continuity_char_cap=char_cap,
     )
 
-    rejected = accept_compact_candidate_v3(_cap_input(policy), candidate, policy)
+    rejected = accept_compact_candidate_v4(_cap_input(policy), candidate, policy)
 
-    assert isinstance(rejected, CompactValidationReportV3)
+    assert isinstance(rejected, CompactValidationReportV4)
     assert len(rejected.issues) == 9
-    feedback = build_compact_repair_feedback_v3(
+    feedback = build_compact_repair_feedback_v4(
         rejected,
         request_digest=_REQUEST_DIGEST,
         source_boundary_digest=_SOURCE_BOUNDARY_DIGEST,
@@ -850,11 +1275,11 @@ def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> N
         ),
     )
     expected_messages: dict[
-        tuple[CompactValidationIssueCodeV3, str],
+        tuple[CompactValidationIssueCodeV4, str],
         str,
     ] = {
         (
-            CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED,
+            CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED,
             '$["session_summary"]["text"]',
         ): (
             f"session_summary.text 当前为 {summary_size} 个字符，上限 {char_cap} 个字符；"
@@ -865,13 +1290,13 @@ def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> N
         path = f'$["{section}"]'
         total = sum(estimate_memory_size_units(text).units for text in texts)
         expected_messages[
-            (CompactValidationIssueCodeV3.POLICY_ITEM_CAP_EXCEEDED, path)
+            (CompactValidationIssueCodeV4.POLICY_ITEM_CAP_EXCEEDED, path)
         ] = (
             f"{section} 当前为 {len(texts)} 项，上限 {item_cap} 项；"
             f"请删减或合并 {section}，只保留不超过 {item_cap} 项。"
         )
         expected_messages[
-            (CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED, path)
+            (CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED, path)
         ] = (
             f"{section} 的{measurement}当前为 {total} 个字符，上限 {char_cap} 个字符；"
             f"请缩减 {section} 的文本总量到不超过 {char_cap} 个字符。"
@@ -904,47 +1329,50 @@ def test_all_section_cap_violations_preserve_nine_exact_actionable_issues() -> N
     )
 
 
-def _cap_input(policy: MemoryProjectionPolicy) -> CompactInputV3:
+def _cap_input(policy: MemoryProjectionPolicy) -> CompactInputV4:
     """构造覆盖四个 Memory section source-kind 的 input。
 
     :param policy: 与验收调用同源的 Memory policy。
     :returns: deterministic cap test input。
     """
 
-    return CompactInputV3(
-        schema=COMPACT_INPUT_SCHEMA_V3,
-        current_input=CompactCurrentInputV3(
+    return CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
             source_ref="event:current-cap",
             readable_text="继续分析",
         ),
         source_boundary=(
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label="E1",
-                source_kind=CompactSourceKindV3.EVIDENCE_MATERIAL,
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
                 source_refs=("event:evidence-cap",),
+                canonical_evidence_refs=("evidence:evidence-cap",),
                 readable_text="evidence",
             ),
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label="A1",
-                source_kind=CompactSourceKindV3.ANSWER_MATERIAL,
+                source_kind=CompactSourceKindV4.ANSWER_MATERIAL,
                 source_refs=("event:answer-cap",),
+                canonical_evidence_refs=(),
                 readable_text="answer",
             ),
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label="T1",
-                source_kind=CompactSourceKindV3.TRACE_MATERIAL,
+                source_kind=CompactSourceKindV4.TRACE_MATERIAL,
                 source_refs=("event:trace-cap",),
+                canonical_evidence_refs=(),
                 readable_text="trace",
             ),
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(policy),
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
     )
 
 
 def _cap_candidate(
     section: _CapSection,
     texts: tuple[str, ...],
-) -> CompactCandidateV3:
+) -> CompactCandidateV4:
     """构造仅改变一个被测 section item 数量/文本的完整 candidate。
 
     :param section: 被测 semantic section。
@@ -952,17 +1380,19 @@ def _cap_candidate(
     :returns: exact coverage candidate。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="baseline",
             source_labels=("E1", "A1", "T1"),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
             tuple(
-                CompactEvidenceFactV3(
+                CompactEvidenceFactV4(
                     claim=text,
                     support_labels=("E1",),
+                    context_labels=(),
                 )
                 for text in texts
             )
@@ -971,7 +1401,7 @@ def _cap_candidate(
         ),
         answer_anchors=(
             tuple(
-                CompactAnswerAnchorV3(
+                CompactAnswerAnchorV4(
                     title="title",
                     detail=text,
                     source_labels=("A1",),
@@ -983,10 +1413,10 @@ def _cap_candidate(
         ),
         forward_intents=(
             tuple(
-                CompactForwardIntentV3(
+                CompactForwardIntentV4(
                     intent_type="next_step_note",
                     text=text,
-                    status=CompactForwardIntentStatusV3.OPEN,
+                    status=CompactForwardIntentStatusV4.OPEN,
                     source_labels=("T1",),
                 )
                 for text in texts
@@ -996,7 +1426,7 @@ def _cap_candidate(
         ),
         reference_continuity=(
             tuple(
-                CompactReferenceContinuityV3(
+                CompactReferenceContinuityV4(
                     text=text,
                     reason="recent_state",
                     source_labels=("T1",),
@@ -1009,56 +1439,65 @@ def _cap_candidate(
     )
 
 
-def _all_section_cap_candidate() -> CompactCandidateV3:
+def _all_section_cap_candidate() -> CompactCandidateV4:
     """构造 summary 与四个可计量 section 同时超过最小 cap 的 candidate。
 
     :returns: exact coverage 且只产生九条 policy cap issues 的 candidate。
     :raises Exception: 不主动抛出异常。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="summary-over-cap",
             source_labels=("E1", "A1", "T1"),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
-            CompactEvidenceFactV3(claim="evidence-one", support_labels=("E1",)),
-            CompactEvidenceFactV3(claim="evidence-two", support_labels=("E1",)),
+            CompactEvidenceFactV4(
+                claim="evidence-one",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="evidence-two",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
         ),
         answer_anchors=(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="title-one",
                 detail="detail-one",
                 source_labels=("A1",),
             ),
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="title-two",
                 detail="detail-two",
                 source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step",
                 text="forward-one",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("T1",),
             ),
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step",
                 text="forward-two",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("T1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text="reference-one",
                 reason="继续保留第一个指代",
                 source_labels=("T1",),
             ),
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text="reference-two",
                 reason="继续保留第二个指代",
                 source_labels=("T1",),
@@ -1122,43 +1561,107 @@ def _cap_policy(
 
 def _input(
     policy: MemoryProjectionPolicy | None = None,
-) -> CompactInputV3:
-    """构造 deterministic v3 input。
+) -> CompactInputV4:
+    """构造 deterministic v4 input。
 
     :param policy: 与验收调用同源的 Memory policy；省略时使用默认 policy。
-    :returns: v3 input。
+    :returns: v4 input。
     """
 
     effective_policy = (
         default_memory_projection_policy() if policy is None else policy
     )
-    return CompactInputV3(
-        schema=COMPACT_INPUT_SCHEMA_V3,
-        current_input=CompactCurrentInputV3(
+    return CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
             source_ref="event:current",
             readable_text="分析本期结果",
         ),
         source_boundary=(
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label="S1",
-                source_kind=CompactSourceKindV3.PREVIOUS_SESSION_SUMMARY,
+                source_kind=CompactSourceKindV4.PREVIOUS_SESSION_SUMMARY,
                 source_refs=("event:compact-1",),
+                canonical_evidence_refs=(),
                 readable_text="上一轮摘要",
             ),
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label="E1",
-                source_kind=CompactSourceKindV3.EVIDENCE_MATERIAL,
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
                 source_refs=("event:tool-result-1",),
+                canonical_evidence_refs=("evidence:tool-result-1",),
                 readable_text="收入增长 10%",
             ),
-            CompactSourceBoundaryEntryV3(
+            CompactSourceBoundaryEntryV4(
                 source_label="T1",
-                source_kind=CompactSourceKindV3.TRACE_MATERIAL,
+                source_kind=CompactSourceKindV4.TRACE_MATERIAL,
                 source_refs=("event:user-1",),
+                canonical_evidence_refs=(),
                 readable_text="用户追问利润率",
             ),
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(effective_policy),
+        output_caps=compact_output_caps_v4_from_memory_policy(effective_policy),
+    )
+
+
+def _evidence_provenance_input(
+    policy: MemoryProjectionPolicy | None = None,
+) -> CompactInputV4:
+    """构造同时含 previous/current evidence 与非 evidence context 的输入。
+
+    :param policy: 与验收调用同源的 Memory policy；省略时使用默认 policy。
+    :returns: 可覆盖 retain、union、omit 与 combined caps 的 v4 input。
+    """
+
+    effective_policy = (
+        default_memory_projection_policy() if policy is None else policy
+    )
+    return CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-provenance",
+            readable_text="继续核验收入与利润率",
+        ),
+        source_boundary=(
+            CompactSourceBoundaryEntryV4(
+                source_label="P1",
+                source_kind=CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+                source_refs=("event:previous-compact",),
+                canonical_evidence_refs=(
+                    "evidence:previous-a",
+                    "evidence:previous-b",
+                ),
+                readable_text="上一轮已核验毛利率为 20%",
+            ),
+            CompactSourceBoundaryEntryV4(
+                source_label="E1",
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
+                source_refs=("event:tool-current-a",),
+                canonical_evidence_refs=(
+                    "evidence:current-a",
+                    "evidence:shared",
+                ),
+                readable_text="本期收入增长 10%",
+            ),
+            CompactSourceBoundaryEntryV4(
+                source_label="E2",
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
+                source_refs=("event:tool-current-b",),
+                canonical_evidence_refs=(
+                    "evidence:shared",
+                    "evidence:current-b",
+                ),
+                readable_text="本期毛利率改善",
+            ),
+            CompactSourceBoundaryEntryV4(
+                source_label="T1",
+                source_kind=CompactSourceKindV4.TRACE_MATERIAL,
+                source_refs=("event:user-context",),
+                canonical_evidence_refs=(),
+                readable_text="用户要求对比两个指标",
+            ),
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(effective_policy),
     )
 
 
@@ -1166,22 +1669,23 @@ def _candidate(
     *,
     summary_labels: tuple[str, ...],
     fact_labels: tuple[str, ...],
-) -> CompactCandidateV3:
+) -> CompactCandidateV4:
     """构造可定制 coverage 的 candidate。
 
     :param summary_labels: summary labels。
     :param fact_labels: fact support labels。
-    :returns: v3 candidate。
+    :returns: v4 candidate。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="保留会话背景",
             source_labels=summary_labels,
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim="收入增长 10%",
                 support_labels=fact_labels,
                 context_labels=(),
@@ -1193,15 +1697,16 @@ def _candidate(
     )
 
 
-def _empty_candidate() -> CompactCandidateV3:
+def _empty_candidate() -> CompactCandidateV4:
     """构造无业务语义 candidate。
 
-    :returns: v3 candidate。
+    :returns: v4 candidate。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
         session_summary=None,
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(),
         answer_anchors=(),
         forward_intents=(),

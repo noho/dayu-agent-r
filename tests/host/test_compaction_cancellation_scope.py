@@ -50,7 +50,7 @@ from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.memory import default_memory_projection_policy
-from dayu.host.context_governance import compact_output_caps_v3_from_memory_policy
+from dayu.host.context_governance import compact_output_caps_v4_from_memory_policy
 from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import fake_compaction_proposal_from_material_json
 
@@ -499,7 +499,7 @@ def _request() -> CompactionRequest:
             estimator_digest="estimate-digest",
             overage_reason=None,
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(
+        output_caps=compact_output_caps_v4_from_memory_policy(
             default_memory_projection_policy()
         ),
     )

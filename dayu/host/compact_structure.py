@@ -1,4 +1,4 @@
-"""Compact output v3 的唯一 JSON 结构 owner。
+"""Compact output v4 的唯一 JSON 结构 owner。
 
 本模块只拥有 immutable exact descriptors，并由它们投影 concrete template、
 JSON Schema 与 parser 的 exact-key contract。业务 dataclass 仍由
@@ -16,20 +16,20 @@ from json import JSONDecodeError
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactAnswerAnchorV3,
-    CompactCandidateV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentStatusV3,
-    CompactForwardIntentV3,
-    CompactReferenceContinuityV3,
-    CompactSessionSummaryV3,
-    CompactValidationIssueCodeV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAnswerAnchorV4,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentStatusV4,
+    CompactForwardIntentV4,
+    CompactReferenceContinuityV4,
+    CompactSessionSummaryV4,
+    CompactValidationIssueCodeV4,
 )
 from dayu.host.durable.codec import sha256_digest_json
 
-COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3 = "dayu_context_compaction_output_v3"
-"""Provider-neutral compact output v3 JSON Schema 名称。"""
+COMPACT_OUTPUT_JSON_SCHEMA_NAME_V4 = "dayu_context_compaction_output_v4"
+"""Provider-neutral compact output v4 JSON Schema 名称。"""
 
 
 class CompactStructureParseError(ValueError):
@@ -43,7 +43,7 @@ class CompactStructureParseError(ValueError):
     def __init__(
         self,
         *,
-        code: CompactValidationIssueCodeV3,
+        code: CompactValidationIssueCodeV4,
         json_path: str,
         message: str,
     ) -> None:
@@ -57,8 +57,8 @@ class CompactStructureParseError(ValueError):
         :raises ValueError: path 格式非法或 message 为空时抛出。
         """
 
-        if not isinstance(code, CompactValidationIssueCodeV3):
-            raise TypeError("code must be CompactValidationIssueCodeV3")
+        if not isinstance(code, CompactValidationIssueCodeV4):
+            raise TypeError("code must be CompactValidationIssueCodeV4")
         if not isinstance(json_path, str):
             raise TypeError("json_path must be str")
         if not json_path.startswith("$"):
@@ -153,7 +153,7 @@ _INTENT = _ObjectDescriptor(
         _FieldDescriptor(
             "status",
             _FieldKind.ENUM,
-            enum_values=tuple(item.value for item in CompactForwardIntentStatusV3),
+            enum_values=tuple(item.value for item in CompactForwardIntentStatusV4),
         ),
         _FieldDescriptor(
             "source_labels",
@@ -178,12 +178,16 @@ _ROOT = _ObjectDescriptor(
         _FieldDescriptor(
             "schema",
             _FieldKind.CONST_TEXT,
-            const_text=COMPACT_OUTPUT_SCHEMA_V3,
+            const_text=COMPACT_OUTPUT_SCHEMA_V4,
         ),
         _FieldDescriptor(
             "session_summary",
             _FieldKind.NULLABLE_OBJECT,
             child=_SUMMARY,
+        ),
+        _FieldDescriptor(
+            "retained_previous_evidence_fact_labels",
+            _FieldKind.TEXT_ARRAY,
         ),
         _FieldDescriptor("evidence_facts", _FieldKind.OBJECT_ARRAY, child=_FACT),
         _FieldDescriptor("answer_anchors", _FieldKind.OBJECT_ARRAY, child=_ANCHOR),
@@ -197,7 +201,7 @@ _ROOT = _ObjectDescriptor(
 )
 
 
-def compact_output_template_v3() -> Mapping[str, JsonValue]:
+def compact_output_template_v4() -> Mapping[str, JsonValue]:
     """返回从 immutable descriptors 机械生成的完整 concrete template。
 
     :returns: 含 root 与全部 nested exact keys 的 fresh JSON mapping。调用方修改
@@ -207,7 +211,7 @@ def compact_output_template_v3() -> Mapping[str, JsonValue]:
     return _template_object(_ROOT)
 
 
-def compact_output_json_schema_v3() -> Mapping[str, JsonValue]:
+def compact_output_json_schema_v4() -> Mapping[str, JsonValue]:
     """返回从同一 descriptors 机械生成的 strict JSON Schema。
 
     :returns: all-fields-required、所有 object ``additionalProperties=false`` 的
@@ -217,7 +221,7 @@ def compact_output_json_schema_v3() -> Mapping[str, JsonValue]:
     return _schema_object(_ROOT)
 
 
-def compact_output_prompt_rules_v3() -> Mapping[str, JsonValue]:
+def compact_output_prompt_rules_v4() -> Mapping[str, JsonValue]:
     """返回给无状态模型阅读的精简字段结构投影。
 
     该投影与 formal provider JSON Schema 均从同一 descriptors 生成，但只保留
@@ -230,20 +234,20 @@ def compact_output_prompt_rules_v3() -> Mapping[str, JsonValue]:
     return _prompt_rules_object(_ROOT)
 
 
-def compact_output_json_schema_digest_v3() -> str:
-    """计算 compact output v3 JSON Schema 的 Host canonical digest。
+def compact_output_json_schema_digest_v4() -> str:
+    """计算 compact output v4 JSON Schema 的 Host canonical digest。
 
     :returns: ``sha256:<hex>`` schema digest。
     """
 
-    return sha256_digest_json(compact_output_json_schema_v3())
+    return sha256_digest_json(compact_output_json_schema_v4())
 
 
-def parse_compact_candidate_v3(text: str) -> CompactCandidateV3:
-    """解析 strict compact output v3 并构造 domain candidate。
+def parse_compact_candidate_v4(text: str) -> CompactCandidateV4:
+    """解析 strict compact output v4 并构造 domain candidate。
 
     :param text: LLM 返回的完整 JSON object 文本。
-    :returns: exact keys/types 均合法的 ``CompactCandidateV3``。
+    :returns: exact keys/types 均合法的 ``CompactCandidateV4``。
     :raises TypeError: ``text`` 不是字符串时抛出。
     :raises CompactStructureParseError: JSON、duplicate key、字段集合、类型或
         枚举非法时抛出。
@@ -254,7 +258,7 @@ def parse_compact_candidate_v3(text: str) -> CompactCandidateV3:
     raw = text.strip()
     if not raw:
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+            code=CompactValidationIssueCodeV4.BLANK_REQUIRED_TEXT,
             json_path="$",
             message="blank_required_text: candidate must be non-empty",
         )
@@ -262,21 +266,30 @@ def parse_compact_candidate_v3(text: str) -> CompactCandidateV3:
         parsed: JsonValue = json.loads(raw, object_pairs_hook=_strict_object_pairs)
     except JSONDecodeError as exc:
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.INVALID_JSON,
+            code=CompactValidationIssueCodeV4.INVALID_JSON,
             json_path="$",
             message=f"invalid_json: {exc.msg}",
         ) from exc
     root = _exact_object(parsed, _ROOT, path="$")
     schema = _required_text(root, "schema", path="$.schema")
-    if schema != COMPACT_OUTPUT_SCHEMA_V3:
+    if schema != COMPACT_OUTPUT_SCHEMA_V4:
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.INVALID_ENUM_VALUE,
+            code=CompactValidationIssueCodeV4.INVALID_ENUM_VALUE,
             json_path="$.schema",
             message="invalid_enum_value: $.schema",
         )
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
         session_summary=_parse_summary(root["session_summary"]),
+        retained_previous_evidence_fact_labels=_required_text_tuple(
+            root,
+            "retained_previous_evidence_fact_labels",
+            path="$.retained_previous_evidence_fact_labels",
+            allow_empty=_descriptor_field(
+                _ROOT,
+                "retained_previous_evidence_fact_labels",
+            ).allow_empty_array,
+        ),
         evidence_facts=tuple(
             _parse_fact(item, index)
             for index, item in enumerate(
@@ -467,7 +480,7 @@ def _strict_object_pairs(
     for key, value in pairs:
         if key in result:
             raise CompactStructureParseError(
-                code=CompactValidationIssueCodeV3.DUPLICATE_JSON_KEY,
+                code=CompactValidationIssueCodeV4.DUPLICATE_JSON_KEY,
                 json_path="$",
                 message=f"duplicate_json_key: {key}",
             )
@@ -492,7 +505,7 @@ def _exact_object(
 
     if not isinstance(value, Mapping):
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+            code=CompactValidationIssueCodeV4.INVALID_FIELD_TYPE,
             json_path=path,
             message=f"invalid_field_type: {path}",
         )
@@ -502,7 +515,7 @@ def _exact_object(
     if unknown:
         unknown_path = f"{path}.{unknown[0]}"
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
+            code=CompactValidationIssueCodeV4.UNKNOWN_JSON_KEY,
             json_path=unknown_path,
             message=f"unknown_json_key: {unknown_path}",
         )
@@ -510,7 +523,7 @@ def _exact_object(
     if missing:
         missing_path = f"{path}.{missing[0]}"
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.MISSING_REQUIRED_KEY,
+            code=CompactValidationIssueCodeV4.MISSING_REQUIRED_KEY,
             json_path=missing_path,
             message=f"missing_required_key: {missing_path}",
         )
@@ -535,13 +548,13 @@ def _required_text(
     value = mapping[key]
     if not isinstance(value, str):
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+            code=CompactValidationIssueCodeV4.INVALID_FIELD_TYPE,
             json_path=path,
             message=f"invalid_field_type: {path}",
         )
     if not value.strip():
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+            code=CompactValidationIssueCodeV4.BLANK_REQUIRED_TEXT,
             json_path=path,
             message=f"blank_required_text: {path}",
         )
@@ -566,7 +579,7 @@ def _required_array(
     value = mapping[key]
     if not isinstance(value, list):
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+            code=CompactValidationIssueCodeV4.INVALID_FIELD_TYPE,
             json_path=path,
             message=f"invalid_field_type: {path}",
         )
@@ -596,26 +609,26 @@ def _required_text_tuple(
         item_path = f"{path}[{index}]"
         if not isinstance(item, str):
             raise CompactStructureParseError(
-                code=CompactValidationIssueCodeV3.INVALID_FIELD_TYPE,
+                code=CompactValidationIssueCodeV4.INVALID_FIELD_TYPE,
                 json_path=item_path,
                 message=f"invalid_field_type: {item_path}",
             )
         if not item.strip():
             raise CompactStructureParseError(
-                code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+                code=CompactValidationIssueCodeV4.BLANK_REQUIRED_TEXT,
                 json_path=item_path,
                 message=f"blank_required_text: {item_path}",
             )
         if item in result:
             raise CompactStructureParseError(
-                code=CompactValidationIssueCodeV3.DUPLICATE_SOURCE_LABEL,
+                code=CompactValidationIssueCodeV4.DUPLICATE_SOURCE_LABEL,
                 json_path=item_path,
                 message=f"duplicate_source_label: {item_path}",
             )
         result.append(item)
     if not allow_empty and not result:
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.BLANK_REQUIRED_TEXT,
+            code=CompactValidationIssueCodeV4.BLANK_REQUIRED_TEXT,
             json_path=path,
             message=f"blank_required_text: {path}",
         )
@@ -640,7 +653,7 @@ def _descriptor_field(
     raise RuntimeError(f"structure descriptor is missing field: {name}")
 
 
-def _parse_summary(value: JsonValue) -> CompactSessionSummaryV3 | None:
+def _parse_summary(value: JsonValue) -> CompactSessionSummaryV4 | None:
     """解析 required nullable session summary。
 
     :param value: ``session_summary`` 字段值。
@@ -651,7 +664,7 @@ def _parse_summary(value: JsonValue) -> CompactSessionSummaryV3 | None:
     if value is None:
         return None
     data = _exact_object(value, _SUMMARY, path="$.session_summary")
-    return CompactSessionSummaryV3(
+    return CompactSessionSummaryV4(
         text=_required_text(data, "text", path="$.session_summary.text"),
         source_labels=_required_text_tuple(
             data,
@@ -665,7 +678,7 @@ def _parse_summary(value: JsonValue) -> CompactSessionSummaryV3 | None:
     )
 
 
-def _parse_fact(value: JsonValue, index: int) -> CompactEvidenceFactV3:
+def _parse_fact(value: JsonValue, index: int) -> CompactEvidenceFactV4:
     """解析单一 evidence fact。
 
     :param value: fact JSON 值。
@@ -676,7 +689,7 @@ def _parse_fact(value: JsonValue, index: int) -> CompactEvidenceFactV3:
 
     path = f"$.evidence_facts[{index}]"
     data = _exact_object(value, _FACT, path=path)
-    return CompactEvidenceFactV3(
+    return CompactEvidenceFactV4(
         claim=_required_text(data, "claim", path=f"{path}.claim"),
         support_labels=_required_text_tuple(
             data,
@@ -699,7 +712,7 @@ def _parse_fact(value: JsonValue, index: int) -> CompactEvidenceFactV3:
     )
 
 
-def _parse_anchor(value: JsonValue, index: int) -> CompactAnswerAnchorV3:
+def _parse_anchor(value: JsonValue, index: int) -> CompactAnswerAnchorV4:
     """解析单一 answer anchor。
 
     :param value: anchor JSON 值。
@@ -710,7 +723,7 @@ def _parse_anchor(value: JsonValue, index: int) -> CompactAnswerAnchorV3:
 
     path = f"$.answer_anchors[{index}]"
     data = _exact_object(value, _ANCHOR, path=path)
-    return CompactAnswerAnchorV3(
+    return CompactAnswerAnchorV4(
         title=_required_text(data, "title", path=f"{path}.title"),
         detail=_required_text(data, "detail", path=f"{path}.detail"),
         source_labels=_required_text_tuple(
@@ -725,7 +738,7 @@ def _parse_anchor(value: JsonValue, index: int) -> CompactAnswerAnchorV3:
     )
 
 
-def _parse_intent(value: JsonValue, index: int) -> CompactForwardIntentV3:
+def _parse_intent(value: JsonValue, index: int) -> CompactForwardIntentV4:
     """解析单一 forward intent。
 
     :param value: intent JSON 值。
@@ -738,15 +751,15 @@ def _parse_intent(value: JsonValue, index: int) -> CompactForwardIntentV3:
     data = _exact_object(value, _INTENT, path=path)
     status_text = _required_text(data, "status", path=f"{path}.status")
     try:
-        status = CompactForwardIntentStatusV3(status_text)
+        status = CompactForwardIntentStatusV4(status_text)
     except ValueError as exc:
         status_path = f"{path}.status"
         raise CompactStructureParseError(
-            code=CompactValidationIssueCodeV3.INVALID_ENUM_VALUE,
+            code=CompactValidationIssueCodeV4.INVALID_ENUM_VALUE,
             json_path=status_path,
             message=f"invalid_enum_value: {status_path}",
         ) from exc
-    return CompactForwardIntentV3(
+    return CompactForwardIntentV4(
         intent_type=_required_text(
             data,
             "intent_type",
@@ -769,7 +782,7 @@ def _parse_intent(value: JsonValue, index: int) -> CompactForwardIntentV3:
 def _parse_reference(
     value: JsonValue,
     index: int,
-) -> CompactReferenceContinuityV3:
+) -> CompactReferenceContinuityV4:
     """解析单一 reference continuity item。
 
     :param value: reference JSON 值。
@@ -780,7 +793,7 @@ def _parse_reference(
 
     path = f"$.reference_continuity[{index}]"
     data = _exact_object(value, _REFERENCE, path=path)
-    return CompactReferenceContinuityV3(
+    return CompactReferenceContinuityV4(
         text=_required_text(data, "text", path=f"{path}.text"),
         reason=_required_text(data, "reason", path=f"{path}.reason"),
         source_labels=_required_text_tuple(
@@ -796,11 +809,11 @@ def _parse_reference(
 
 
 __all__ = [
-    "COMPACT_OUTPUT_JSON_SCHEMA_NAME_V3",
+    "COMPACT_OUTPUT_JSON_SCHEMA_NAME_V4",
     "CompactStructureParseError",
-    "compact_output_json_schema_digest_v3",
-    "compact_output_json_schema_v3",
-    "compact_output_prompt_rules_v3",
-    "compact_output_template_v3",
-    "parse_compact_candidate_v3",
+    "compact_output_json_schema_digest_v4",
+    "compact_output_json_schema_v4",
+    "compact_output_prompt_rules_v4",
+    "compact_output_template_v4",
+    "parse_compact_candidate_v4",
 ]

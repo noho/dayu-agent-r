@@ -21,14 +21,14 @@ from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host._event_payload import tool_awaiting_payload
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactAnswerAnchorV3,
-    CompactCandidateV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentV3,
-    CompactForwardIntentStatusV3,
-    CompactReferenceContinuityV3,
-    CompactSessionSummaryV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAnswerAnchorV4,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactSessionSummaryV4,
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
@@ -440,7 +440,7 @@ def _llm_facing_memory_text_view(
 
 def _accepted_compact_payload(
     *,
-    facts: list[CompactEvidenceFactV3] | None = None,
+    facts: list[CompactEvidenceFactV4] | None = None,
     summary_text: str | None = "用户关注收入增速和毛利率变化。",
     source_boundary_refs: tuple[str, ...] = ("event:user-1",),
     policy: MemoryProjectionPolicy | None = None,
@@ -455,34 +455,35 @@ def _accepted_compact_payload(
     """
 
     effective_policy = _policy() if policy is None else policy
-    candidate = CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
+    candidate = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
         session_summary=(
             None
             if summary_text is None
-            else CompactSessionSummaryV3(
+            else CompactSessionSummaryV4(
                 text=summary_text,
                 source_labels=("u1",),
             )
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=() if facts is None else tuple(facts),
         answer_anchors=(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="收入口径",
                 detail="同比收入增速来自已接受证据。\n毛利率口径保持一致。",
                 source_labels=("a1",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="next_step_note",
                 text="下一轮继续核对费用率。",
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("u1",),
             ),
         ),
         reference_continuity=(
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text="“该公司”继续指向当前分析主体。",
                 reason="local_reference",
                 source_labels=("u1",),
@@ -509,7 +510,6 @@ def _accepted_compact_payload(
             accepted_truth=accepted_truth,
             budget_after_compact=512,
             prompt_local_label_mapping_refs=("prompt-label:u1", "prompt-label:e1"),
-            accepted_evidence_mapping_refs=(() if facts is None else ("event:tool-1",)),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(
                 operation_id="event-context-compaction-requested-1",
@@ -844,16 +844,17 @@ def _assert_tool_query_projection_fails_closed(
         )
 
 
-def _fact(claim_text: str) -> CompactEvidenceFactV3:
+def _fact(claim_text: str) -> CompactEvidenceFactV4:
     """构造 fact candidate。
 
     :param claim_text: fact claim 文本。
     :returns: typed fact candidate。
     """
 
-    return CompactEvidenceFactV3(
+    return CompactEvidenceFactV4(
         claim=claim_text,
         support_labels=("e1",),
+        context_labels=(),
     )
 
 
@@ -1252,9 +1253,47 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
         (child.display_text, child.ordinal) for child in snapshot.answer_anchor_memory.anchors[0].anchor_items
     ) == (("同比收入增速来自已接受证据。\n毛利率口径保持一致。", None),)
     assert snapshot.forward_intent_memory.intents[0].intent_type == "next_step_note"
-    assert snapshot.forward_intent_memory.intents[0].status is CompactForwardIntentStatusV3.OPEN
+    assert snapshot.forward_intent_memory.intents[0].status is CompactForwardIntentStatusV4.OPEN
     assert snapshot.forward_intent_memory.intents[0].text == "下一轮继续核对费用率。"
     assert snapshot.trace_memory.reference_continuity_items[0].reason == "local_reference"
+
+
+def test_accepted_compact_projects_each_fact_own_evidence_refs() -> None:
+    """Memory 多 fact 必须逐 atom 读取 refs，不得把 aggregate union 赋给每项。
+
+    :returns: ``None``。
+    :raises AssertionError: 两个事实共享无关 evidence refs 时抛出。
+    """
+
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-distinct-facts",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(
+                    facts=[
+                        _fact("收入同比增长 12%。"),
+                        CompactEvidenceFactV4(
+                            claim="毛利率同比提升。",
+                            support_labels=("e2",),
+                            context_labels=(),
+                        ),
+                    ]
+                ),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=_policy(),
+        built_at=_NOW,
+    )
+
+    facts = snapshot.evidence_fact_memory.evidence_backed_facts
+    assert tuple((fact.claim_text, fact.evidence_refs) for fact in facts) == (
+        ("收入同比增长 12%。", ("evidence:e1",)),
+        ("毛利率同比提升。", ("evidence:e2",)),
+    )
 
 
 def test_accepted_compact_prunes_covered_tool_raw_and_keeps_uncovered_and_new_delta() -> None:
@@ -2008,7 +2047,7 @@ def test_committed_compact_policy_digest_mismatch_fails_projection_invariant() -
 
 
 def test_committed_compact_tampered_fact_actual_fails_strict_parser() -> None:
-    """durable audit 的 fact actual 与 candidate 不同源时 fail closed。"""
+    """durable audit 的 fact actual 与 replacement 不同源时 fail closed。"""
 
     policy = _policy()
     long_claim = "这是一条超过上限且不能被前缀截断的完整事实。"
@@ -2017,7 +2056,7 @@ def test_committed_compact_tampered_fact_actual_fails_strict_parser() -> None:
     audit["evidence_fact_char_actual"] = policy.evidence_fact_char_cap + 1
     with pytest.raises(
         ValueError,
-        match="policy_usage_audit actuals must equal candidate-derived usage",
+        match="policy_usage_audit actuals must equal replacement-derived usage",
     ):
         build_conversation_memory_snapshot_from_events(
             events=(
@@ -2036,7 +2075,7 @@ def test_committed_compact_tampered_fact_actual_fails_strict_parser() -> None:
 
 
 def test_committed_compact_tampered_summary_actual_fails_strict_parser() -> None:
-    """durable audit 的 summary actual 与 candidate 不同源时 fail closed。"""
+    """durable audit 的 summary actual 与 replacement 不同源时 fail closed。"""
 
     policy = _policy()
     long_summary = "用户需要完整保留的长 summary，不能静默截断。"
@@ -2045,7 +2084,7 @@ def test_committed_compact_tampered_summary_actual_fails_strict_parser() -> None
     audit["session_summary_char_actual"] = policy.session_summary_char_cap + 1
     with pytest.raises(
         ValueError,
-        match="policy_usage_audit actuals must equal candidate-derived usage",
+        match="policy_usage_audit actuals must equal replacement-derived usage",
     ):
         build_conversation_memory_snapshot_from_events(
             events=(
@@ -2063,7 +2102,7 @@ def test_committed_compact_tampered_summary_actual_fails_strict_parser() -> None
         )
 
 
-def test_accepted_candidate_without_fact_keeps_fact_projection_empty() -> None:
+def test_accepted_proposal_without_fact_keeps_fact_projection_empty() -> None:
     """accepted candidate 无 fact 时保持空投影，不合成 fallback 或诊断。"""
 
     policy = _policy()
@@ -2129,7 +2168,7 @@ def test_snapshot_json_roundtrip_preserves_vnext_sections() -> None:
     references = cast(list[JsonValue], trace_memory["reference_continuity_items"])
     reference = cast(dict[str, JsonValue], references[0])
     assert intent["intent_type"] == "next_step_note"
-    assert intent["status"] == CompactForwardIntentStatusV3.OPEN.value
+    assert intent["status"] == CompactForwardIntentStatusV4.OPEN.value
     assert reference["reason"] == "local_reference"
 
 
@@ -2353,11 +2392,11 @@ def test_projection_consumer_invalid_persisted_enum_does_not_advance_checkpoint(
 
     policy = _policy()
     payload = _accepted_compact_payload(facts=[_fact("收入增长。")])
-    candidate = cast(dict[str, JsonValue], payload["accepted_candidate"])
+    candidate = cast(dict[str, JsonValue], payload["accepted_proposal"])
     intents = cast(list[JsonValue], candidate["forward_intents"])
     intent = cast(dict[str, JsonValue], intents[0])
     intent["status"] = "unknown_status"
-    payload["accepted_candidate_digest"] = sha256_digest_json(candidate)
+    payload["accepted_proposal_digest"] = sha256_digest_json(candidate)
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: (

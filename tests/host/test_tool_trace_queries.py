@@ -82,9 +82,9 @@ from dayu.host.context_events import (
     build_context_compaction_attempt_rejected_payload,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactCandidateV3,
-    CompactSessionSummaryV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactCandidateV4,
+    CompactSessionSummaryV4,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -948,12 +948,13 @@ def _accepted_compactor_payload(
     :raises RuntimeError: candidate 无法通过 production governance 时抛出。
     """
 
-    candidate = CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    candidate = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="Accepted compactor summary.",
             source_labels=("T1",),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(),
         answer_anchors=(),
         forward_intents=(),
@@ -973,7 +974,6 @@ def _accepted_compactor_payload(
         ),
         budget_after_compact=128,
         prompt_local_label_mapping_refs=("prompt-label:T1",),
-        accepted_evidence_mapping_refs=(),
         projection_signal="conversation_memory_projection_catchup",
         successful_response_identity=_successful_compactor_response_identity(
             compactor_engine_run_id

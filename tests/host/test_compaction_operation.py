@@ -14,26 +14,36 @@ from dayu.host.compact_material import (
     initial_segment_selection,
 )
 from dayu.host.compaction import (
+    COMPACT_INPUT_SCHEMA_V4,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAcceptedTruthV4,
+    CompactCandidateV4,
+    CompactCurrentInputV4,
+    CompactInputV4,
     CompactMaterialBlockKind,
-    CompactRepairFeedbackV3,
+    CompactRepairFeedbackV4,
     CompactSegmentTrigger,
     SelectedBlockProvenance,
-    CompactValidationIssueCodeV3,
-    CompactValidationIssueV3,
-    CompactValidationReportV3,
+    CompactValidationIssueCodeV4,
+    CompactValidationIssueV4,
+    CompactValidationReportV4,
+    CompactSourceBoundaryEntryV4,
+    CompactSourceKindV4,
     CompactionRequest,
     CompactorProposal,
     CompactorProposalError,
 )
 from dayu.host.compaction_operation import (
+    _aggregate_pass_candidates,
     CompactionOperationResult,
     CompactorProposalRunInput,
     run_compaction_attempt,
     run_compaction_operation,
 )
 from dayu.host.context_governance import (
-    build_compact_repair_feedback_v3,
-    compact_output_caps_v3_from_memory_policy,
+    accept_compact_candidate_v4,
+    build_compact_repair_feedback_v4,
+    compact_output_caps_v4_from_memory_policy,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
@@ -65,7 +75,7 @@ class _PreparedRecordingCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
-        repair_feedback: CompactRepairFeedbackV3 | None,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposalRunInput:
         """记录与真实 fake runner 同源的 prepared input。
 
@@ -145,10 +155,10 @@ class _ParserRejectOnceCompactor(_PreparedRecordingCompactor):
         self.run_calls += 1
         if self.run_calls == 1:
             raise LLMCompactionValidationError(
-                CompactValidationReportV3(
+                CompactValidationReportV4(
                     issues=(
-                        CompactValidationIssueV3(
-                            code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
+                        CompactValidationIssueV4(
+                            code=CompactValidationIssueCodeV4.UNKNOWN_JSON_KEY,
                             json_path="$.api_key=sk-secret-123",
                             message="顶层不允许字段；token=token-secret-456",
                             source_labels=(
@@ -232,7 +242,9 @@ class _AlwaysSemanticRejectCompactor(_SemanticRejectOnceCompactor):
         """
 
         self.run_calls = 0
-        return await super().run_prepared_compactor_proposal(prepared_input)
+        return await super().run_prepared_compactor_proposal(
+            replace(prepared_input, repair_feedback=None)
+        )
 
 
 class _HardBudgetRejectOnceCompactor(_PreparedRecordingCompactor):
@@ -281,13 +293,63 @@ async def test_semantic_reject_gets_bounded_feedback_and_full_replacement() -> N
     assert feedback.previous_attempt_number == 1
     assert feedback.request_digest == _request().digest()
     assert feedback.source_boundary_digest == _request().source_boundary_digest()
-    assert feedback.issues[0].code is CompactValidationIssueCodeV3.DUPLICATE_SEMANTIC_ITEM
+    assert feedback.issues[0].code is CompactValidationIssueCodeV4.DUPLICATE_SEMANTIC_ITEM
     assert "完整 replacement candidate" in feedback.required_action
     assert compactor.prepared_inputs[0].compact_input == compactor.prepared_inputs[1].compact_input
     assert (
         compactor.prepared_inputs[0].compactor_input_projection_digest
         != compactor.prepared_inputs[1].compactor_input_projection_digest
     )
+
+
+def test_multi_pass_aggregate_unions_retained_selectors_in_root_boundary_order() -> None:
+    """各 pass retained selectors 按 root boundary 做 ordered unique union。
+
+    :returns: ``None``。
+    :raises AssertionError: aggregate 丢 selector、重复或沿用 pass 顺序时抛出。
+    """
+
+    policy = _policy()
+    root_boundary = (
+        CompactSourceBoundaryEntryV4(
+            source_label="P1",
+            source_kind=CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+            source_refs=("event:previous-1",),
+            canonical_evidence_refs=("evidence:previous-1",),
+            readable_text="旧事实一",
+        ),
+        CompactSourceBoundaryEntryV4(
+            source_label="P2",
+            source_kind=CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+            source_refs=("event:previous-2",),
+            canonical_evidence_refs=("evidence:previous-2",),
+            readable_text="旧事实二",
+        ),
+    )
+    root_input = _selector_input(root_boundary, policy)
+    pass_truths: list[CompactAcceptedTruthV4] = []
+    for entry in reversed(root_boundary):
+        pass_input = _selector_input((entry,), policy)
+        proposal = CompactCandidateV4(
+            schema=COMPACT_OUTPUT_SCHEMA_V4,
+            session_summary=None,
+            retained_previous_evidence_fact_labels=(entry.source_label,),
+            evidence_facts=(),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity=(),
+        )
+        accepted = accept_compact_candidate_v4(pass_input, proposal, policy)
+        assert isinstance(accepted, CompactAcceptedTruthV4)
+        pass_truths.append(accepted)
+
+    aggregate = _aggregate_pass_candidates(
+        root_input=root_input,
+        pass_truths=tuple(pass_truths),
+    )
+
+    assert aggregate.retained_previous_evidence_fact_labels == ("P1", "P2")
+    assert aggregate.evidence_facts == ()
 
 
 @pytest.mark.asyncio
@@ -301,7 +363,7 @@ async def test_raw_parser_reject_is_semantic_repair_not_execution_retry() -> Non
     assert result.rejected_attempts[0].failure_category.value == "quality_check_rejected"
     feedback = compactor.prepared_inputs[1].repair_feedback
     assert feedback is not None
-    assert feedback.issues[0].code is CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY
+    assert feedback.issues[0].code is CompactValidationIssueCodeV4.UNKNOWN_JSON_KEY
     feedback_json = str(feedback.to_json())
     assert "<redacted>" in feedback_json
     for secret in (
@@ -381,7 +443,11 @@ async def test_root_hard_budget_reject_routes_whole_candidate_repair() -> None:
     assert result.rejected_attempts[0].failure_category.value == "hard_threshold_after_compact"
     feedback = compactor.prepared_inputs[1].repair_feedback
     assert feedback is not None
-    assert feedback.issues[0].code is CompactValidationIssueCodeV3.POLICY_SIZE_CAP_EXCEEDED
+    assert feedback.issues[0].code is CompactValidationIssueCodeV4.POLICY_SIZE_CAP_EXCEEDED
+    assert tuple(
+        fact.canonical_evidence_refs
+        for fact in result.accepted_truth.replacement.evidence_facts
+    ) == (("accepted-evidence-1",),)
 
 
 @pytest.mark.asyncio
@@ -434,11 +500,11 @@ async def test_mismatched_initial_feedback_fails_before_provider_call() -> None:
     """直接注入跨 request feedback 时复用 non-repairable failure 且不调用 provider。"""
 
     request = _request()
-    feedback = build_compact_repair_feedback_v3(
-        CompactValidationReportV3(
+    feedback = build_compact_repair_feedback_v4(
+        CompactValidationReportV4(
             issues=(
-                CompactValidationIssueV3(
-                    code=CompactValidationIssueCodeV3.UNKNOWN_JSON_KEY,
+                CompactValidationIssueV4(
+                    code=CompactValidationIssueCodeV4.UNKNOWN_JSON_KEY,
                     json_path="$.unexpected",
                     message="unexpected key",
                     source_labels=(),
@@ -692,7 +758,29 @@ def _request(
             estimator_digest=_DIGEST,
             overage_reason=None,
         ),
-        output_caps=compact_output_caps_v3_from_memory_policy(effective_policy),
+        output_caps=compact_output_caps_v4_from_memory_policy(effective_policy),
+    )
+
+
+def _selector_input(
+    source_boundary: tuple[CompactSourceBoundaryEntryV4, ...],
+    policy: MemoryProjectionPolicy,
+) -> CompactInputV4:
+    """构造 retained selector aggregation 使用的 strict pass/root input。
+
+    :param source_boundary: 当前 pass 或 root 的 previous fact boundary。
+    :param policy: 与 Context Governance 同源的 Memory policy。
+    :returns: strict v4 compact input。
+    """
+
+    return CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-selector",
+            readable_text="继续保留旧事实",
+        ),
+        source_boundary=source_boundary,
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
     )
 
 
@@ -723,5 +811,5 @@ def _policy(*, session_summary_char_cap: int = 1024) -> MemoryProjectionPolicy:
         reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
-        policy_ref="test-operation-v3",
+        policy_ref="test-operation-v4",
     )

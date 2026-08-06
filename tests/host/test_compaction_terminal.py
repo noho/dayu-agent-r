@@ -20,9 +20,9 @@ from dayu.engine.contracts.runner_identity import (
     build_runner_request_identity,
 )
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactCandidateV3,
-    CompactSessionSummaryV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactCandidateV4,
+    CompactSessionSummaryV4,
 )
 from dayu.host.compaction_terminal import (
     CompactionOperationTerminalDisposition,
@@ -904,7 +904,6 @@ def _append_terminal(
             ),
             budget_after_compact=1,
             prompt_local_label_mapping_refs=("label:test",),
-            accepted_evidence_mapping_refs=(),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(
                 operation_id=operation_id,
@@ -1011,19 +1010,20 @@ def _event_request(
     )
 
 
-def _candidate() -> CompactCandidateV3:
+def _candidate() -> CompactCandidateV4:
     """构造最小非空合法 compact candidate。
 
     :returns: 合法 vNext compact candidate。
     :raises Exception: candidate contract 构造失败时透传。
     """
 
-    return CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text="保留 terminal 测试状态",
             source_labels=("T1",),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=(),
         answer_anchors=(),
         forward_intents=(),

@@ -123,16 +123,16 @@ from dayu.host.durable.state import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.compaction import (
-    COMPACT_OUTPUT_SCHEMA_V3,
-    CompactAnswerAnchorV3,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAnswerAnchorV4,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CompactCandidateV3,
-    CompactEvidenceFactV3,
-    CompactForwardIntentV3,
-    CompactForwardIntentStatusV3,
-    CompactReferenceContinuityV3,
-    CompactSessionSummaryV3,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactSessionSummaryV4,
 )
 from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.compact_material import (
@@ -591,7 +591,7 @@ def test_durable_compact_artifact_provider_resolves_descriptor_payload_and_fails
         assert view.compaction_event_ref == compacted.event_id
         assert view.compact_artifact_ref == "compact-artifact:test"
         assert view.compact_artifact_digest == _DIGEST_A
-        assert view.represented_evidence_refs == ("evidence:memory-tool",)
+        assert view.represented_evidence_refs == ()
 
         store.transaction_runner.run_write(
             lambda transaction: transaction.execute(
@@ -7281,27 +7281,29 @@ def _compact_payload(
     :returns: compacted payload。
     """
 
-    resolved_fact_candidates: list[CompactEvidenceFactV3]
+    resolved_fact_candidates: list[CompactEvidenceFactV4]
     if fact_candidates is None:
         resolved_fact_candidates = [
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim="Revenue increased year over year",
                 support_labels=("evidence:memory-tool",),
+                context_labels=(),
             )
         ]
     else:
         resolved_fact_candidates = [
-            CompactEvidenceFactV3(
+            CompactEvidenceFactV4(
                 claim=str(candidate["claim_text"]),
                 support_labels=("evidence:memory-tool",),
+                context_labels=(),
             )
             for candidate in fact_candidates
             if isinstance(candidate, dict) and "claim_text" in candidate
         ]
-    resolved_reference_continuity_items: list[CompactReferenceContinuityV3]
+    resolved_reference_continuity_items: list[CompactReferenceContinuityV4]
     if reference_continuity_items is None:
         resolved_reference_continuity_items = [
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text="second factor: margin mix",
                 reason="recent_state",
                 source_labels=("event-memory-raw-user",),
@@ -7309,7 +7311,7 @@ def _compact_payload(
         ]
     else:
         resolved_reference_continuity_items = [
-            CompactReferenceContinuityV3(
+            CompactReferenceContinuityV4(
                 text=str(candidate["text"]),
                 reason="ordinal_reference",
                 source_labels=("event-long-input",),
@@ -7331,25 +7333,26 @@ def _compact_payload(
             values = open_questions.get("value")
             if isinstance(values, list) and values and isinstance(values[0], str):
                 forward_text = values[0]
-    candidate = CompactCandidateV3(
-        schema=COMPACT_OUTPUT_SCHEMA_V3,
-        session_summary=CompactSessionSummaryV3(
+    candidate = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
             text=summary_text,
             source_labels=("event-memory-raw-user",),
         ),
+        retained_previous_evidence_fact_labels=(),
         evidence_facts=tuple(resolved_fact_candidates),
         answer_anchors=(
-            CompactAnswerAnchorV3(
+            CompactAnswerAnchorV4(
                 title="Compacted answer anchor",
                 detail=anchor_text,
                 source_labels=("event-memory-episode",),
             ),
         ),
         forward_intents=(
-            CompactForwardIntentV3(
+            CompactForwardIntentV4(
                 intent_type="open_question",
                 text=forward_text,
-                status=CompactForwardIntentStatusV3.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("event-memory-episode",),
             ),
         ),
@@ -7379,7 +7382,6 @@ def _compact_payload(
                 "prompt-label:event-memory-episode",
                 "prompt-label:evidence:memory-tool",
             ),
-            accepted_evidence_mapping_refs=("evidence:memory-tool",),
             projection_signal="conversation_memory_projection_catchup",
             successful_response_identity=_successful_response_identity(
                 operation_id=operation_id,
