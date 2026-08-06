@@ -295,6 +295,7 @@ Allowed tests/helpers：
 - `tests/host/test_tool_trace_queries.py`（S1只迁移被删除v3 symbol与schema-5 fixture；S2仍拥有public Tool Trace新语义与断言）
 - `utils/smoke_host_public_conversation_memory_scenarios.py`（只迁移v4/schema-5 call site）
 - `utils/smoke_host_public_r03_semantic_ownership.py`（只迁移v4 call site）
+- `tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py`（只迁移配套smoke的v4 schema/selector断言）
 
 Required migration order inside the slice：
 
@@ -303,7 +304,7 @@ Required migration order inside the slice：
 3. 把 provenance refs 写入 material provenance -> source boundary；实现 governance atomic expansion/binding/caps。
 4. 切换 artifact/terminal strict payload 与 aggregate union validation，artifact schema=5。
 5. 切换 rolling、multi-pass、Memory、RunInput/reconnect consumers到 replacement。
-6. 同步所有 production call sites、fake、owner tests与仍可执行的Host smoke helper；`dayu/**/*.py`、`tests/**/*.py`与`utils/**/*.py`不得残留 v3 compact contract、旧 durable key或 `PromptLocalProvenanceEntry.accepted_evidence_id` 的定义/构造/读取。S2明确拥有的README/public Tool Trace新projection文字在S2完成最终全文扫描，不能成为S1保留已删除Python symbol或旧fixture的理由。若其它上游 typed accepted-evidence atom仍合法使用 singular `accepted_evidence_id`，必须逐处确认其不是 material-pack下游读路径并在checkpoint artifact记录；历史 evidence文档除外。
+6. 同步所有 production call sites、fake、owner tests与仍可执行的Host smoke helper；`dayu/**/*.py`、`tests/**/*.py`与`utils/**/*.py`不得残留 active v3 compact contract、旧 durable key或 `PromptLocalProvenanceEntry.accepted_evidence_id` 的定义/构造/读取。明确断言旧schema字符串“不存在/被拒绝”的negative tests可以保留并须在residue artifact逐项列明；它们不能构造v3 input、期待v3 output或提供兼容reader。S2明确拥有的README/public Tool Trace新projection文字在S2完成最终全文扫描，不能成为S1保留已删除Python symbol或旧fixture的理由。若其它上游 typed accepted-evidence atom仍合法使用 singular `accepted_evidence_id`，必须逐处确认其不是 material-pack下游读路径并在checkpoint artifact记录；历史 evidence文档除外。
 
 S1 保持一个 accepted commit，因为删掉 v3 后，core 与 durable/read-model consumers 必须在同一
 checkpoint 完整切换；把 S1a/S1b 分成可提交 slices 会制造编译不完整 checkpoint或短暂 v3/v4 双
