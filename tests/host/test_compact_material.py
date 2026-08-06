@@ -79,7 +79,11 @@ from dayu.host.compaction import (
     CompactSourceBoundaryEntryV4,
     TurnGroupMembership,
 )
-from dayu.host.context_events import build_context_compacted_payload
+from dayu.host.context_events import (
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CONTEXT_COMPACTION_FAILED,
+    build_context_compacted_payload,
+)
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import (
     accept_compact_candidate_v4,
@@ -153,6 +157,9 @@ from tests.host.memory_snapshot_factories import (
     empty_memory_snapshot,
     memory_snapshot_cursor,
     recalculate_memory_snapshot_digest,
+)
+from tests.host.fake_compaction import (
+    accepted_truth_for_candidate as accepted_truth_for_test_candidate,
 )
 from dayu.host.context_events import CompactorProposalManifestReference
 
@@ -3040,6 +3047,920 @@ def test_pre_dispatch_first_compact_empty_delta_starts_at_current_input(tmp_path
         assert view.post_compact_delta_end_sequence == run.input_event_sequence
 
 
+def test_pre_dispatch_accepted_compact_does_not_consume_protected_raw_suffix(
+    tmp_path: Path,
+) -> None:
+    """accepted terminal 不得越过未进入 boundary 的 protected raw suffix。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: coverage frontier 越过未消费完整 Run group 时抛出。
+    """
+
+    event_log = EventLogStore()
+    run: RunRow | None = None
+    view: PreDispatchCompactMaterialView | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> tuple[RunRow, int, int]:
+            """写入已消费旧 group、未消费 protected group 与 accepted terminal。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run、protected group 首序号与 compact terminal 序号。
+            """
+
+            old_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-consumed-prefix",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "consumed prefix user"},
+                run_id="run-consumed-prefix",
+            )
+            old_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-consumed-prefix",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "consumed prefix answer"},
+                run_id="run-consumed-prefix",
+            )
+            old_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-consumed-prefix",
+                run_id="run-consumed-prefix",
+            )
+            protected_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-protected-suffix",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "protected suffix user"},
+                run_id="run-protected-suffix",
+            )
+            protected_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-protected-suffix",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "protected suffix answer"},
+                run_id="run-protected-suffix",
+            )
+            protected_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-protected-suffix",
+                run_id="run-protected-suffix",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-compact-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "compact current input"},
+                run_id="run-compact-current",
+            )
+            terminal = _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-after-protected-suffix",
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (old_user.event_id,),
+                    "E1": (f"evidence:{old_evidence.event_id}",),
+                    "A1": (old_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{old_evidence.event_id}",),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-protected-suffix",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after protected suffix"},
+                run_id="run-current-after-protected-suffix",
+            )
+            assert (
+                protected_user.event_sequence
+                < protected_answer.event_sequence
+                < protected_evidence.event_sequence
+                < terminal.event_sequence
+            )
+            return _run_row(current), protected_user.event_sequence, terminal.event_sequence
+
+        run, protected_start_sequence, terminal_sequence = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after protected suffix",
+            )
+        )
+
+        assert view.latest_compacted_event_sequence == terminal_sequence
+        assert view.post_compact_delta_start_sequence == protected_start_sequence
+        assert tuple(block.kind for block in view.material_blocks) == (
+            CompactMaterialBlockKind.USER_INPUT,
+            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+            CompactMaterialBlockKind.USER_INPUT,
+        )
+        assert tuple(block.text for block in view.material_blocks[:2]) == (
+            "protected suffix user",
+            "protected suffix answer",
+        )
+        assert view.material_blocks[2].accepted_evidence_id == (
+            "evidence:event-tool-result-protected-suffix"
+        )
+        assert view.material_blocks[2].canonical_source_refs == (
+            "evidence:event-tool-result-protected-suffix",
+        )
+        assert view.material_blocks[3].text == "compact current input"
+
+    assert run is not None
+    assert view is not None
+    restarted_view: PreDispatchCompactMaterialView | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as reopened_store:
+        restarted_view = reopened_store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after protected suffix",
+            )
+        )
+
+    assert restarted_view is not None
+    assert restarted_view == view
+
+
+def test_pre_dispatch_cumulative_accepted_chain_advances_only_complete_groups(
+    tmp_path: Path,
+) -> None:
+    """三轮 accepted chain 逐阶段单调推进且精确分区 canonical material。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: frontier、顺序或 exact-once 分区漂移时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(
+            transaction: HostTransaction,
+        ) -> tuple[
+            tuple[
+                RunRow,
+                int,
+                tuple[str, ...],
+                tuple[str, ...],
+                tuple[str, ...],
+            ],
+            ...,
+        ]:
+            """写入三轮 accepted terminal 与逐轮未消费 atomic suffix。
+
+            :param transaction: Host transaction。
+            :returns: 各阶段 Run、frontier、consumed、raw suffix 与全部 eligible refs。
+            """
+
+            all_material_refs: list[str] = []
+            cumulative_consumed_refs: list[str] = []
+            pending_user_refs: list[str] = []
+            pending_answer_refs: list[str] = []
+            pending_evidence_refs: list[str] = []
+            stages: list[
+                tuple[
+                    RunRow,
+                    int,
+                    tuple[str, ...],
+                    tuple[str, ...],
+                    tuple[str, ...],
+                ]
+            ] = []
+            for ordinal in range(1, 4):
+                source_run_id = f"run-chain-source-{ordinal}"
+                source_user = _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-user-chain-source-{ordinal}",
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": f"chain source user {ordinal}"},
+                    run_id=source_run_id,
+                )
+                source_answer = _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-answer-chain-source-{ordinal}",
+                    event_type="RUN_SUCCEEDED",
+                    payload={"final_answer": f"chain source answer {ordinal}"},
+                    run_id=source_run_id,
+                )
+                source_evidence = _append_tool_result_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-tool-result-chain-source-{ordinal}",
+                    run_id=source_run_id,
+                )
+                source_evidence_ref = f"evidence:{source_evidence.event_id}"
+                all_material_refs.extend(
+                    (source_user.event_id, source_answer.event_id, source_evidence_ref)
+                )
+                consumed_user_refs = (*pending_user_refs, source_user.event_id)
+                consumed_answer_refs = (*pending_answer_refs, source_answer.event_id)
+                consumed_evidence_refs = (*pending_evidence_refs, source_evidence_ref)
+                trigger = _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-user-chain-trigger-{ordinal}",
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": f"chain trigger {ordinal}"},
+                    run_id=f"run-chain-trigger-{ordinal}",
+                )
+                all_material_refs.append(trigger.event_id)
+                _append_compacted_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-compact-chain-{ordinal}",
+                    current_input_ref=trigger.event_id,
+                    source_refs_by_label={
+                        "T1": consumed_user_refs,
+                        "E1": consumed_evidence_refs,
+                        "A1": consumed_answer_refs,
+                    },
+                    accepted_evidence_refs=(consumed_evidence_refs[-1],),
+                )
+                newly_consumed_refs = (
+                    *consumed_user_refs,
+                    *consumed_evidence_refs,
+                    *consumed_answer_refs,
+                )
+                cumulative_consumed_refs.extend(newly_consumed_refs)
+
+                suffix_run_id = f"run-chain-suffix-{ordinal}"
+                suffix_user = _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-user-chain-suffix-{ordinal}",
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": f"chain suffix user {ordinal}"},
+                    run_id=suffix_run_id,
+                )
+                suffix_answer = _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-answer-chain-suffix-{ordinal}",
+                    event_type="RUN_SUCCEEDED",
+                    payload={"final_answer": f"chain suffix answer {ordinal}"},
+                    run_id=suffix_run_id,
+                )
+                suffix_evidence = _append_tool_result_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-tool-result-chain-suffix-{ordinal}",
+                    run_id=suffix_run_id,
+                )
+                suffix_evidence_ref = f"evidence:{suffix_evidence.event_id}"
+                expected_suffix_refs = (
+                    trigger.event_id,
+                    suffix_user.event_id,
+                    suffix_answer.event_id,
+                    suffix_evidence_ref,
+                )
+                all_material_refs.extend(expected_suffix_refs[1:])
+                eligible_refs_at_stage = tuple(all_material_refs)
+                stage_current = _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-current-after-chain-{ordinal}",
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": f"current after chain {ordinal}"},
+                    run_id=f"run-current-after-chain-{ordinal}",
+                )
+                stages.append(
+                    (
+                        _run_row(stage_current),
+                        trigger.event_sequence,
+                        tuple(dict.fromkeys(cumulative_consumed_refs)),
+                        expected_suffix_refs,
+                        eligible_refs_at_stage,
+                    )
+                )
+                all_material_refs.append(stage_current.event_id)
+                pending_user_refs = [
+                    trigger.event_id,
+                    suffix_user.event_id,
+                    stage_current.event_id,
+                ]
+                pending_answer_refs = [suffix_answer.event_id]
+                pending_evidence_refs = [suffix_evidence_ref]
+            return tuple(stages)
+
+        stages = store.transaction_runner.run_write(seed)
+        observed_frontiers: list[int] = []
+        for stage_ordinal, (
+            run,
+            expected_frontier,
+            consumed_refs,
+            expected_suffix_refs,
+            eligible_refs,
+        ) in enumerate(stages, start=1):
+            view = store.transaction_runner.run_read(
+                lambda transaction, stage_run=run: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=stage_run,
+                    current_display_text=f"current after chain {stage_ordinal}",
+                )
+            )
+            observed_frontiers.append(view.post_compact_delta_start_sequence)
+            actual_suffix_refs = tuple(
+                source_ref
+                for block in view.material_blocks
+                for source_ref in block.canonical_source_refs
+            )
+            block_order = tuple(
+                (block.event_sequence, block.event_sub_index)
+                for block in view.material_blocks
+            )
+
+            assert view.post_compact_delta_start_sequence == expected_frontier
+            assert actual_suffix_refs == expected_suffix_refs
+            assert block_order == tuple(sorted(block_order))
+            assert len(actual_suffix_refs) == len(set(actual_suffix_refs))
+            assert set(consumed_refs).isdisjoint(actual_suffix_refs)
+            assert len(eligible_refs) == len(set(eligible_refs))
+            assert set(consumed_refs) | set(actual_suffix_refs) == set(eligible_refs)
+            assert len(consumed_refs) + len(actual_suffix_refs) == len(eligible_refs)
+
+        assert len(observed_frontiers) == 3
+        assert all(
+            earlier < later
+            for earlier, later in zip(observed_frontiers, observed_frontiers[1:])
+        )
+
+
+def test_pre_dispatch_partial_atomic_coverage_fails_closed(tmp_path: Path) -> None:
+    """同一 Run group 只有 evidence ref 被消费时必须 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: partial atomic coverage 被静默过滤时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 accepted payload 可表达但违反 atomic prefix 的 coverage。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            prefix_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-partial-prefix",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "partial coverage prefix user"},
+                run_id="run-partial-prefix",
+            )
+            prefix_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-partial-prefix",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "partial coverage prefix answer"},
+                run_id="run-partial-prefix",
+            )
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-partial-suffix",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "partial coverage suffix user"},
+                run_id="run-partial-suffix",
+            )
+            suffix_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-partial-suffix",
+                run_id="run-partial-suffix",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-partial-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "partial coverage compact current"},
+                run_id="run-partial-current",
+            )
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-partial-coverage",
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (prefix_user.event_id,),
+                    "E1": (f"evidence:{suffix_evidence.event_id}",),
+                    "A1": (prefix_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{suffix_evidence.event_id}",),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-partial-coverage",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after partial coverage"},
+                run_id="run-current-after-partial-coverage",
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(
+            HostDurableError,
+            match="partially consumes an atomic material unit",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current after partial coverage",
+                )
+            )
+
+
+def test_pre_dispatch_consumed_user_without_run_id_cannot_prove_atomic_group(
+    tmp_path: Path,
+) -> None:
+    """``run_id=None`` user ref 命中 consumed refs 也不能证明完整 Run group。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 缺失 Run identity 的 user row 被静默跳过时抛出。
+    """
+
+    event_log = EventLogStore()
+    summary_only_candidate = CompactCandidateV4(
+        schema="dayu.context_compaction.output.v4",
+        session_summary=CompactSessionSummaryV4(
+            text="accepted summary from ownerless user",
+            source_labels=("T1",),
+        ),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(),
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入缺失 Run identity 的 consumed user 与 accepted terminal。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            ownerless_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-consumed-without-run-id",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "ownerless consumed user"},
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-ownerless-compact-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "ownerless compact current"},
+                run_id="run-ownerless-compact-current",
+            )
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-ownerless-user",
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={"T1": (ownerless_user.event_id,)},
+                accepted_evidence_refs=(),
+                accepted_proposal=summary_only_candidate,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-ownerless-user",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after ownerless user"},
+                run_id="run-current-after-ownerless-user",
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(
+            HostDurableError,
+            match="unconsumed material atomic grouping is invalid",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current after ownerless user",
+                )
+            )
+
+
+def test_pre_dispatch_non_accepted_compaction_events_do_not_advance_frontier(
+    tmp_path: Path,
+) -> None:
+    """rejected 与 failed compaction diagnostics 不产生 accepted coverage。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: non-accepted event 改写 material frontier 时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> tuple[RunRow, int]:
+            """写入 raw group、non-accepted diagnostics 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run 与 raw group 首序号。
+            """
+
+            raw_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-before-non-accepted",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "raw before non accepted"},
+                run_id="run-before-non-accepted",
+            )
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-before-non-accepted",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "answer before non accepted"},
+                run_id="run-before-non-accepted",
+            )
+            for ordinal, event_type in enumerate(
+                (
+                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                    CONTEXT_COMPACTION_FAILED,
+                ),
+                start=1,
+            ):
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-non-accepted-compaction-{ordinal}",
+                    event_type=event_type,
+                    payload={"diagnostic": event_type},
+                    run_id="run-non-accepted-compaction",
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-non-accepted",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after non accepted"},
+                run_id="run-current-after-non-accepted",
+            )
+            return _run_row(current), raw_user.event_sequence
+
+        run, expected_frontier = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after non accepted",
+            )
+        )
+
+        assert view.latest_compacted_event_id is None
+        assert view.post_compact_delta_start_sequence == expected_frontier
+        assert tuple(block.text for block in view.material_blocks) == (
+            "raw before non accepted",
+            "answer before non accepted",
+        )
+
+
+@pytest.mark.parametrize(
+    ("reference_kind", "expected_message"),
+    (
+        ("missing", "accepted compact current input event is missing"),
+        ("cross_session", "EventLog row session mismatch"),
+        ("forward", "accepted compact current input must point to an earlier event"),
+    ),
+)
+def test_pre_dispatch_accepted_chain_rejects_invalid_current_input_reference(
+    tmp_path: Path,
+    reference_kind: str,
+    expected_message: str,
+) -> None:
+    """accepted chain 对 current input ref 缺失、跨 Session 与前向引用 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param reference_kind: 待构造的非法引用类型。
+    :param expected_message: 期望 durable error 文本。
+    :returns: ``None``。
+    :raises AssertionError: 非法 current input ref 未被 strict chain 拒绝时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入具有指定非法 current input ref 的 accepted terminal。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            source_user = _append_event(
+                transaction,
+                event_log,
+                event_id=f"event-user-invalid-current-{reference_kind}",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "invalid current source user"},
+                run_id=f"run-invalid-current-{reference_kind}",
+            )
+            source_answer = _append_event(
+                transaction,
+                event_log,
+                event_id=f"event-answer-invalid-current-{reference_kind}",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "invalid current source answer"},
+                run_id=f"run-invalid-current-{reference_kind}",
+            )
+            source_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id=f"event-tool-result-invalid-current-{reference_kind}",
+                run_id=f"run-invalid-current-{reference_kind}",
+            )
+            invalid_ref = f"event-invalid-compact-current-{reference_kind}"
+            if reference_kind == "cross_session":
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=invalid_ref,
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": "cross session compact current"},
+                    run_id="run-cross-session-current",
+                    session_id="session-cross-compact-material",
+                )
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id=f"event-compact-invalid-current-{reference_kind}",
+                current_input_ref=invalid_ref,
+                source_refs_by_label={
+                    "T1": (source_user.event_id,),
+                    "E1": (f"evidence:{source_evidence.event_id}",),
+                    "A1": (source_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{source_evidence.event_id}",),
+            )
+            if reference_kind == "forward":
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=invalid_ref,
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": "forward compact current"},
+                    run_id="run-forward-current",
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id=f"event-current-after-invalid-{reference_kind}",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after invalid compact"},
+                run_id=f"run-current-after-invalid-{reference_kind}",
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(HostDurableError, match=expected_message):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current after invalid compact",
+                )
+            )
+
+
+def test_pre_dispatch_previous_compact_ref_preserves_uncovered_raw_material(
+    tmp_path: Path,
+) -> None:
+    """合法previous compact回指只传递rolling provenance，不消费未覆盖raw。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: previous ref 被误用为terminal前raw coverage时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> tuple[RunRow, int]:
+            """写入首轮raw coverage、两轮accepted terminal与两个raw current anchors。
+
+            :param transaction: Host transaction。
+            :returns: 最终Run与首个未消费current anchor sequence。
+            :raises HostDurableError: fixture EventLog写入失败时抛出。
+            """
+
+            source_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-before-previous-chain",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "previous chain source user"},
+                run_id="run-before-previous-chain",
+            )
+            source_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-before-previous-chain",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "previous chain source answer"},
+                run_id="run-before-previous-chain",
+            )
+            source_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-before-previous-chain",
+                run_id="run-before-previous-chain",
+            )
+            first_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-first-previous-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "first previous current"},
+                run_id="run-first-previous-current",
+            )
+            first_terminal = _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-first-previous-chain",
+                current_input_ref=first_current.event_id,
+                source_refs_by_label={
+                    "T1": (source_user.event_id,),
+                    "E1": (f"evidence:{source_evidence.event_id}",),
+                    "A1": (source_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{source_evidence.event_id}",),
+            )
+            retained_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-retained-previous-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "retained previous current"},
+                run_id="run-retained-previous-current",
+            )
+            _append_retained_previous_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-retained-previous-chain",
+                current_input_ref=retained_current.event_id,
+                previous_compact_ref=first_terminal.event_id,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-previous-chain",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after previous chain"},
+                run_id="run-current-after-previous-chain",
+            )
+            return _run_row(current), first_current.event_sequence
+
+        run, expected_frontier = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after previous chain",
+            )
+        )
+
+        assert view.post_compact_delta_start_sequence == expected_frontier
+        assert tuple(block.text for block in view.material_blocks) == (
+            "first previous current",
+            "retained previous current",
+        )
+
+
+@pytest.mark.parametrize(
+    ("reference_kind", "expected_message"),
+    (
+        ("missing", "accepted compact previous source event is missing"),
+        ("self", "accepted compact previous source must point to an earlier event"),
+        ("cross_session", "EventLog row session mismatch"),
+        ("forward", "accepted compact previous source must point to an earlier event"),
+    ),
+)
+def test_pre_dispatch_accepted_chain_rejects_invalid_previous_compact_reference(
+    tmp_path: Path,
+    reference_kind: str,
+    expected_message: str,
+) -> None:
+    """accepted chain拒绝missing/self/cross-session/forward previous refs。
+
+    :param tmp_path: pytest 临时目录。
+    :param reference_kind: 待构造的previous ref类型。
+    :param expected_message: 期望durable error文本。
+    :returns: ``None``。
+    :raises AssertionError: 非法previous compact ref未被strict chain拒绝时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入具有指定非法previous ref的accepted terminal。
+
+            :param transaction: Host transaction。
+            :returns: 当前Run row。
+            :raises HostDurableError: fixture EventLog写入失败时抛出。
+            """
+
+            current_anchor = _append_event(
+                transaction,
+                event_log,
+                event_id=f"event-user-invalid-previous-{reference_kind}",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "invalid previous current"},
+                run_id=f"run-invalid-previous-{reference_kind}",
+            )
+            terminal_event_id = f"event-compact-invalid-previous-{reference_kind}"
+            previous_ref = f"event-invalid-previous-target-{reference_kind}"
+            if reference_kind == "self":
+                previous_ref = terminal_event_id
+            elif reference_kind == "cross_session":
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=previous_ref,
+                    event_type="CONTEXT_COMPACTED",
+                    payload={},
+                    session_id="session-cross-previous-compact",
+                )
+            _append_retained_previous_compacted_event(
+                transaction,
+                event_log,
+                event_id=terminal_event_id,
+                current_input_ref=current_anchor.event_id,
+                previous_compact_ref=previous_ref,
+            )
+            if reference_kind == "forward":
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=previous_ref,
+                    event_type="CONTEXT_COMPACTED",
+                    payload={},
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id=f"event-current-after-invalid-previous-{reference_kind}",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after invalid previous"},
+                run_id=f"run-current-after-invalid-previous-{reference_kind}",
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(HostDurableError, match=expected_message):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current after invalid previous",
+                )
+            )
+
+
 def test_pre_dispatch_second_compact_rolls_from_latest_accepted_proposal(tmp_path: Path) -> None:
     """第二次 compact 使用 latest accepted candidate，不重展旧 raw turn / tool result。"""
 
@@ -3053,23 +3974,47 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_proposal(tmp_pat
             :returns: 当前 Run row。
             """
 
-            _append_event(
+            old_user = _append_event(
                 transaction,
                 event_log,
                 event_id="event-user-before-compact",
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "old user before compact"},
+                run_id="run-before-compact",
             )
-            _append_tool_result_event(
+            old_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-before-compact",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "old answer before compact"},
+                run_id="run-before-compact",
+            )
+            old_evidence = _append_tool_result_event(
                 transaction,
                 event_log,
                 event_id="event-tool-result-before-compact",
+                run_id="run-before-compact",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-for-accepted-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "compact trigger input"},
+                run_id="run-for-accepted-compact",
             )
             _append_compacted_event(
                 transaction,
                 event_log,
                 event_id="event-compact-accepted",
-                accepted_evidence_refs=("evidence:event-tool-result-before-compact",),
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (old_user.event_id,),
+                    "E1": (f"evidence:{old_evidence.event_id}",),
+                    "A1": (old_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{old_evidence.event_id}",),
             )
             _append_event(
                 transaction,
@@ -3077,11 +4022,13 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_proposal(tmp_pat
                 event_id="event-user-after-compact",
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "new user after compact"},
+                run_id="run-after-compact",
             )
             _append_tool_result_event(
                 transaction,
                 event_log,
                 event_id="event-tool-result-after-compact",
+                run_id="run-after-compact",
             )
             current = _append_event(
                 transaction,
@@ -3114,13 +4061,14 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_proposal(tmp_pat
         assert tuple(item.claim_text for item in view.previous_compacted_readable_view.evidence_backed_facts) == (
             "accepted fact",
         )
-        assert view.material_blocks[0].text == "new user after compact"
-        assert view.material_blocks[1].accepted_tool_evidence is not None
-        assert view.material_blocks[1].accepted_tool_evidence.result_text == (
+        assert view.material_blocks[0].text == "compact trigger input"
+        assert view.material_blocks[1].text == "new user after compact"
+        assert view.material_blocks[2].accepted_tool_evidence is not None
+        assert view.material_blocks[2].accepted_tool_evidence.result_text == (
             '{"kind":"completed","result":{"content":"raw content event-tool-result-after-compact"}}'
         )
-        assert view.material_blocks[1].text == render_accepted_tool_evidence_for_llm(
-            view.material_blocks[1].accepted_tool_evidence
+        assert view.material_blocks[2].text == render_accepted_tool_evidence_for_llm(
+            view.material_blocks[2].accepted_tool_evidence
         )
         assert all("before compact" not in block.text for block in view.material_blocks)
         assert view.represented_evidence_refs == ("evidence:event-tool-result-before-compact",)
@@ -3141,13 +4089,65 @@ def test_pre_dispatch_previous_view_splits_each_accepted_proposal_item(
             :returns: 当前 Run row。
             """
 
+            source_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-before-multi",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "source user before multi compact"},
+                run_id="run-before-multi",
+            )
+            source_answer_one = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-before-multi-1",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "source answer one"},
+                run_id="run-before-multi",
+            )
+            source_answer_two = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-before-multi-2",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "source answer two"},
+                run_id="run-before-multi",
+            )
+            source_evidence_one = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-before-multi-1",
+                run_id="run-before-multi",
+            )
+            source_evidence_two = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-before-multi-2",
+                run_id="run-before-multi",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-for-multi-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "multi compact trigger"},
+                run_id="run-for-multi-compact",
+            )
             _append_compacted_event(
                 transaction,
                 event_log,
                 event_id="event-compact-multi-item",
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (source_user.event_id,),
+                    "E1": (f"evidence:{source_evidence_one.event_id}",),
+                    "E2": (f"evidence:{source_evidence_two.event_id}",),
+                    "A1": (source_answer_one.event_id,),
+                    "A2": (source_answer_two.event_id,),
+                },
                 accepted_evidence_refs=(
-                    "evidence:event-before-multi-1",
-                    "evidence:event-before-multi-2",
+                    f"evidence:{source_evidence_one.event_id}",
+                    f"evidence:{source_evidence_two.event_id}",
                 ),
                 accepted_proposal=_accepted_proposal_with_multiple_items(),
             )
@@ -3283,16 +4283,53 @@ def test_pre_dispatch_represented_evidence_refs_only_from_latest_compact(tmp_pat
             :returns: 当前 Run row。
             """
 
+            old_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-old-only",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "old evidence source user"},
+                run_id="run-old-only",
+            )
+            old_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-old-only",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "old evidence source answer"},
+                run_id="run-old-only",
+            )
+            old_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-old-only",
+                run_id="run-old-only",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-for-old-evidence-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "old evidence compact trigger"},
+                run_id="run-for-old-evidence-compact",
+            )
             _append_compacted_event(
                 transaction,
                 event_log,
                 event_id="event-compact-with-old-evidence",
-                accepted_evidence_refs=("evidence:event-old-only",),
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (old_user.event_id,),
+                    "E1": (f"evidence:{old_evidence.event_id}",),
+                    "A1": (old_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{old_evidence.event_id}",),
             )
             _append_tool_result_event(
                 transaction,
                 event_log,
                 event_id="event-tool-result-after-compact",
+                run_id="run-tool-result-after-compact",
             )
             current = _append_event(
                 transaction,
@@ -3317,7 +4354,11 @@ def test_pre_dispatch_represented_evidence_refs_only_from_latest_compact(tmp_pat
             "evidence:accepted",
         )
         assert view.represented_evidence_refs == ("evidence:event-old-only",)
-        assert tuple(block.accepted_evidence_id for block in view.material_blocks) == (
+        assert tuple(
+            block.accepted_evidence_id
+            for block in view.material_blocks
+            if block.accepted_evidence_id is not None
+        ) == (
             "evidence:event-tool-result-after-compact",
         )
 
@@ -3335,7 +4376,45 @@ def test_pre_dispatch_payload_damage_fails_closed_without_recovery_request(tmp_p
             :returns: 当前 Run row。
             """
 
-            compact_payload = _compacted_payload(accepted_evidence_refs=("evidence:event-old",))
+            old_user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-before-damaged-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "damaged compact source user"},
+                run_id="run-before-damaged-compact",
+            )
+            old_answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-before-damaged-compact",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "damaged compact source answer"},
+                run_id="run-before-damaged-compact",
+            )
+            old_evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-evidence-before-damaged-compact",
+                run_id="run-before-damaged-compact",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-for-damaged-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "damaged compact trigger"},
+                run_id="run-for-damaged-compact",
+            )
+            compact_payload = _compacted_payload(
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (old_user.event_id,),
+                    "E1": (f"evidence:{old_evidence.event_id}",),
+                    "A1": (old_answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{old_evidence.event_id}",),
+            )
             damaged: dict[str, JsonValue] = dict(compact_payload)
             damaged["accepted_proposal_digest"] = _DIGEST
             _append_event(
@@ -3820,6 +4899,7 @@ def _append_event(
     event_type: str,
     payload: JsonValue,
     run_id: str | None = None,
+    session_id: str = _SESSION_ID,
 ) -> EventLogRow:
     """向测试 EventLog 追加 canonical fact。
 
@@ -3829,6 +4909,7 @@ def _append_event(
     :param event_type: event type。
     :param payload: inline payload JSON。
     :param run_id: 可选 Host Run id。
+    :param session_id: event 所属 Session id。
     :returns: appended EventLog row。
     """
 
@@ -3837,7 +4918,7 @@ def _append_event(
         EventLogAppendRequest(
             event_id=event_id,
             event_class=EventClass.CANONICAL_FACT,
-            session_id=_SESSION_ID,
+            session_id=session_id,
             run_id=run_id,
             attempt_id=None,
             execution_id=None,
@@ -4031,6 +5112,8 @@ def _append_compacted_event(
     event_log: EventLogStore,
     *,
     event_id: str,
+    current_input_ref: str,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
     accepted_evidence_refs: tuple[str, ...],
     accepted_proposal: CompactCandidateV4 | None = None,
 ) -> EventLogRow:
@@ -4039,6 +5122,8 @@ def _append_compacted_event(
     :param transaction: Host transaction。
     :param event_log: EventLog store。
     :param event_id: compacted event id。
+    :param current_input_ref: 本次 compact 的真实 current input event ref。
+    :param source_refs_by_label: 每个 boundary label 的真实 canonical source refs。
     :param accepted_evidence_refs: accepted evidence mapping refs。
     :param accepted_proposal: 可选 accepted compact candidate。
     :returns: appended EventLog row。
@@ -4050,19 +5135,86 @@ def _append_compacted_event(
         event_id=event_id,
         event_type="CONTEXT_COMPACTED",
         payload=_compacted_payload(
+            current_input_ref=current_input_ref,
+            source_refs_by_label=source_refs_by_label,
             accepted_evidence_refs=accepted_evidence_refs,
             accepted_proposal=accepted_proposal,
         ),
     )
 
 
+def _append_retained_previous_compacted_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    current_input_ref: str,
+    previous_compact_ref: str,
+) -> EventLogRow:
+    """追加仅retain一个previous EvidenceFact的accepted compact terminal。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: 新 accepted terminal event id。
+    :param current_input_ref: 本次 compact 的真实 current input ref。
+    :param previous_compact_ref: ``P1`` exact 指向的 previous compact event ref。
+    :returns: appended EventLog row。
+    :raises RuntimeError: retained candidate 未通过 production acceptance 时抛出。
+    """
+
+    candidate = CompactCandidateV4(
+        schema="dayu.context_compaction.output.v4",
+        session_summary=None,
+        retained_previous_evidence_fact_labels=("P1",),
+        evidence_facts=(),
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    operation_id = f"operation-{event_id}"
+    return _append_event(
+        transaction,
+        event_log,
+        event_id=event_id,
+        event_type="CONTEXT_COMPACTED",
+        payload=dict(
+            build_context_compacted_payload(
+                operation_id=operation_id,
+                accepted_attempt_number=1,
+                compact_artifact_ref=f"artifact:{event_id}",
+                compact_artifact_digest=_DIGEST,
+                accepted_truth=accepted_truth_for_test_candidate(
+                    candidate,
+                    current_input_ref=current_input_ref,
+                    source_refs_by_label={"P1": (previous_compact_ref,)},
+                ),
+                budget_after_compact=128,
+                prompt_local_label_mapping_refs=(f"label-map:{event_id}",),
+                projection_signal="project_memory",
+                successful_response_identity=_successful_response_identity(
+                    operation_id=operation_id,
+                    compactor_engine_run_id=f"compactor-run:{operation_id}:1",
+                ),
+                accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                    operation_id=operation_id,
+                    compactor_engine_run_id=f"compactor-run:{operation_id}:1",
+                ),
+            )
+        ),
+    )
+
+
 def _compacted_payload(
     *,
+    current_input_ref: str,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
     accepted_evidence_refs: tuple[str, ...],
     accepted_proposal: CompactCandidateV4 | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 accepted compact payload。
 
+    :param current_input_ref: 本次 compact 的真实 current input event ref。
+    :param source_refs_by_label: 每个 boundary label 的真实 canonical source refs。
     :param accepted_evidence_refs: accepted evidence mapping refs。
     :param accepted_proposal: 可选 accepted compact candidate。
     :returns: compacted payload。
@@ -4077,6 +5229,8 @@ def _compacted_payload(
             compact_artifact_digest=_DIGEST,
             accepted_truth=_accepted_truth_for_candidate(
                 candidate,
+                current_input_ref=current_input_ref,
+                source_refs_by_label=source_refs_by_label,
                 accepted_evidence_refs=accepted_evidence_refs,
             ),
             budget_after_compact=128,
@@ -4097,11 +5251,15 @@ def _compacted_payload(
 def _accepted_truth_for_candidate(
     candidate: CompactCandidateV4,
     *,
+    current_input_ref: str,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
     accepted_evidence_refs: tuple[str, ...],
 ) -> CompactAcceptedTruthV4:
     """为测试 candidate 构造并验收同源 root input。
 
     :param candidate: 待验收 candidate。
+    :param current_input_ref: 本次 compact 的真实 current input event ref。
+    :param source_refs_by_label: 每个 boundary label 的真实 canonical source refs。
     :param accepted_evidence_refs: 按 evidence label 顺序给出的逐事实 refs。
     :returns: accepted truth。
     :raises AssertionError: candidate 未通过 owner accept 时抛出。
@@ -4127,14 +5285,14 @@ def _accepted_truth_for_candidate(
     compact_input = CompactInputV4(
         schema=COMPACT_INPUT_SCHEMA_V4,
         current_input=CompactCurrentInputV4(
-            source_ref="source-boundary:test",
+            source_ref=current_input_ref,
             readable_text="current",
         ),
         source_boundary=tuple(
             CompactSourceBoundaryEntryV4(
                 source_label=label,
                 source_kind=kind,
-                source_refs=(f"source:{label}",),
+                source_refs=source_refs_by_label[label],
                 canonical_evidence_refs=(
                     (evidence_refs_by_label[label],)
                     if kind

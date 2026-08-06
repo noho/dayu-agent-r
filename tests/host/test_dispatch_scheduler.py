@@ -11122,6 +11122,46 @@ def _append_previous_compacted_event(
     :returns: ``None``。
     """
 
+    source_run_id = f"{run_id}-compact-source"
+    source_user_event_id = f"{event_id}-source-user"
+    source_answer_event_id = f"{event_id}-source-answer"
+    source_tool_prefix = f"{event_id}-source"
+    source_tool_result_event_id = f"{source_tool_prefix}-tool-result"
+    compact_current_event_id = f"{event_id}-current-input"
+    _append_user_input(
+        transaction_runner,
+        session_id=session_id,
+        run_id=source_run_id,
+        event_id=source_user_event_id,
+        display_text="previous compact source user",
+        client_request_id=f"client-{source_user_event_id}",
+        idempotency_key=f"idem-{source_user_event_id}",
+    )
+    _append_run_success(
+        transaction_runner,
+        session_id=session_id,
+        run_id=source_run_id,
+        event_id=source_answer_event_id,
+        final_answer="previous compact source answer",
+    )
+    _append_accepted_tool_evidence(
+        transaction_runner,
+        session_id=session_id,
+        run_id=source_run_id,
+        event_prefix=source_tool_prefix,
+        query_text="previous compact source query",
+        raw_result_text="previous compact source result",
+    )
+    _append_user_input(
+        transaction_runner,
+        session_id=session_id,
+        run_id=f"{run_id}-compact-current",
+        event_id=compact_current_event_id,
+        display_text="previous compact current input",
+        client_request_id=f"client-{compact_current_event_id}",
+        idempotency_key=f"idem-{compact_current_event_id}",
+    )
+
     def _operation(transaction: HostTransaction) -> None:
         effective_policy = (
             default_memory_projection_policy()
@@ -11219,11 +11259,11 @@ def _append_previous_compacted_event(
                     compact_artifact_digest=_CALL_CONTEXT_DIGEST,
                     accepted_truth=accepted_truth_for_candidate(
                         _previous_compacted_candidate(),
-                        current_input_ref="current:previous-compact",
+                        current_input_ref=compact_current_event_id,
                         source_refs_by_label={
-                            "T1": ("source-boundary:previous",),
-                            "E1": ("evidence:previous",),
-                            "A1": ("answer:previous",),
+                            "T1": (source_user_event_id,),
+                            "E1": (f"evidence:{source_tool_result_event_id}",),
+                            "A1": (source_answer_event_id,),
                         },
                         memory_policy=effective_policy,
                     ),

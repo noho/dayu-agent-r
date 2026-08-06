@@ -25,6 +25,7 @@ from dayu.host.compaction import (
     CompactSegmentSelection,
     CompactSegmentSelectionScope,
     CompactSegmentTrigger,
+    CompactSourceKindV4,
     CurrentInputAnchor,
     CompactAcceptedReplacementV4,
     PromptLocalEvidenceMap,
@@ -45,7 +46,10 @@ from dayu.host.compaction import (
 from dayu.host.context_budget import BudgetTextFragment
 from dayu.host.context_event_payload import resolve_context_compacted_payload
 from dayu.host.context_events import CONTEXT_COMPACTED
-from dayu.host.compact_payload import parse_context_compacted_semantic_payload
+from dayu.host.compact_payload import (
+    ContextCompactedSemanticPayload,
+    parse_context_compacted_semantic_payload,
+)
 from dayu.host.accepted_result_projection import (
     project_accepted_tool_result,
 )
@@ -115,6 +119,15 @@ _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _PAYLOAD_REF_PREFIX = "payload"
 _PRE_DISPATCH_BUDGET_FRAGMENT_CURRENT_REF = "current_input_anchor"
 _PRE_DISPATCH_BUDGET_FRAGMENT_PREVIOUS_PREFIX = "previous:"
+_PREVIOUS_COMPACT_SOURCE_KINDS = frozenset(
+    (
+        CompactSourceKindV4.PREVIOUS_SESSION_SUMMARY,
+        CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+        CompactSourceKindV4.PREVIOUS_ANSWER_ANCHOR,
+        CompactSourceKindV4.PREVIOUS_FORWARD_INTENT,
+        CompactSourceKindV4.PREVIOUS_REFERENCE_CONTINUITY,
+    )
+)
 
 _SECTION_PREFIXES = {
     CompactMaterialSection.CURRENT_INPUT_ANCHOR: _CURRENT_INPUT_PREFIX,
@@ -339,12 +352,24 @@ class _AtomicMaterialUnit:
 
 
 @dataclass(frozen=True, slots=True)
+class _AcceptedCompactChainEntry:
+    """同一 read transaction 内已严格解析的 accepted compact terminal。
+
+    :param event: canonical ``CONTEXT_COMPACTED`` EventLog row。
+    :param semantics: 与该 row 同源的 strict semantic payload。
+    """
+
+    event: EventLogRow
+    semantics: ContextCompactedSemanticPayload
+
+
+@dataclass(frozen=True, slots=True)
 class CompactMaterialSourceBoundary:
     """Pre-dispatch compact material 的 EventLog 来源边界诊断。
 
     :param latest_compacted_event_id: 当前输入前最新 accepted compact event id。
     :param latest_compacted_event_sequence: 当前输入前最新 accepted compact sequence。
-    :param post_compact_delta_start_sequence: delta material 的包含式起点。
+    :param post_compact_delta_start_sequence: accepted coverage 后未消费material的包含式起点。
     :param post_compact_delta_end_sequence: delta material 的排他式终点。
     :param current_input_event_sequence: 当前输入 EventLog sequence 的诊断副本。
     """
@@ -388,7 +413,7 @@ class CompactMaterialSourceBoundary:
 class PreDispatchCompactMaterialView:
     """EventLog-backed pre-dispatch compact material view。
 
-    :param material_blocks: latest compact 后、当前输入前的 delta material blocks。
+    :param material_blocks: accepted chain消费prefix后、当前输入前的raw material suffix。
     :param previous_compacted_view: latest accepted compact candidate 映射出的 previous view。
     :param previous_compacted_readable_view: 与 previous blocks 同源的 typed previous view。
     :param current_input_text: 当前 USER_INPUT_ACCEPTED display text。
@@ -477,49 +502,57 @@ def build_pre_dispatch_compact_material_view(
         run=run,
         current_display_text=current_display_text,
     )
-    latest_compact = _latest_compacted_event_before_current_input(
+    accepted_chain = _accepted_compact_chain_before_current_input(
         transaction,
         event_log_store,
         session_id=run.session_id,
         before_event_sequence=run.input_event_sequence,
     )
+    latest_entry = accepted_chain[-1] if accepted_chain else None
     represented_refs = (
-        ()
-        if latest_compact is None
-        else _accepted_evidence_mapping_refs_from_compacted_event(
-            transaction,
-            latest_compact,
-        )
+        () if latest_entry is None else latest_entry.semantics.accepted_evidence_mapping_refs
     )
     previous_view, previous_readable_view = (
         ((), None)
-        if latest_compact is None
-        else _previous_compacted_view_pair_from_compacted_event(
-            transaction,
-            latest_compact,
+        if latest_entry is None
+        else _previous_compacted_view_pair_from_replacement(
+            event_id=latest_entry.event.event_id,
+            event_sequence=latest_entry.event.event_sequence,
+            replacement=latest_entry.semantics.accepted_replacement,
         )
     )
-    delta_start = _post_compact_delta_start_sequence(
-        transaction,
-        session_id=run.session_id,
-        current_input_sequence=current_event.event_sequence,
-        latest_compacted_event=latest_compact,
-    )
+    consumed_source_refs = _accepted_compacted_source_refs(accepted_chain)
     delta_rows = _post_compact_delta_rows(
         transaction,
         session_id=run.session_id,
-        start_sequence=delta_start,
         end_sequence=current_event.event_sequence,
     )
-    material_blocks = _pre_dispatch_delta_material_blocks(
+    conservative_start = _conservative_unconsumed_row_start_sequence(
+        delta_rows,
+        consumed_source_refs,
+        current_event.event_sequence,
+    )
+    projected_blocks = _pre_dispatch_delta_material_blocks(
         transaction,
-        event_log_store,
-        rows=delta_rows,
-        represented_evidence_refs=represented_refs,
+        rows=tuple(
+            row for row in delta_rows if row.event_sequence >= conservative_start
+        ),
+    )
+    material_blocks = _unconsumed_atomic_material_blocks(
+        projected_blocks,
+        consumed_source_refs,
+    )
+    delta_start = _post_compact_delta_start_sequence(
+        material_blocks,
+        current_input_sequence=current_event.event_sequence,
     )
     boundary = CompactMaterialSourceBoundary(
-        latest_compacted_event_id=None if latest_compact is None else latest_compact.event_id,
-        latest_compacted_event_sequence=(None if latest_compact is None else latest_compact.event_sequence),
+        latest_compacted_event_id=(
+            None if latest_entry is None else latest_entry.event.event_id
+        ),
+        latest_compacted_event_sequence=(
+            None if latest_entry is None else latest_entry.event.event_sequence
+        ),
         post_compact_delta_start_sequence=delta_start,
         post_compact_delta_end_sequence=current_event.event_sequence,
         current_input_event_sequence=current_event.event_sequence,
@@ -2194,33 +2227,32 @@ def _validated_current_input_event(
     return row
 
 
-def _latest_compacted_event_before_current_input(
+def _accepted_compact_chain_before_current_input(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
     *,
     session_id: str,
     before_event_sequence: int,
-) -> EventLogRow | None:
-    """读取当前 input 前最新 accepted compact canonical fact。
+) -> tuple[_AcceptedCompactChainEntry, ...]:
+    """读取并严格解析当前 input 前的完整 accepted compact chain。
 
     :param transaction: 当前 Host transaction。
     :param event_log_store: EventLog store。
     :param session_id: 当前 Session id。
     :param before_event_sequence: 当前 input EventLog sequence 排他上界。
-    :returns: 最新 ``CONTEXT_COMPACTED`` row；不存在时返回 ``None``。
-    :raises HostDurableError: 查询到的 row 消失或类型不匹配时抛出。
+    :returns: 按 accepted terminal sequence 升序排列的 strict typed entries。
+    :raises HostDurableError: row、payload、artifact 或 semantic binding 损坏时抛出。
     """
 
-    row = transaction.fetchone(
+    rows = transaction.fetchall(
         f"""
-        SELECT event_id
+        SELECT event_sequence, event_id
         FROM {TABLE_EVENT_LOG}
         WHERE session_id = ?
           AND event_type = ?
           AND event_class = ?
           AND event_sequence < ?
-        ORDER BY event_sequence DESC
-        LIMIT 1
+        ORDER BY event_sequence ASC
         """,
         (
             session_id,
@@ -2229,62 +2261,131 @@ def _latest_compacted_event_before_current_input(
             before_event_sequence,
         ),
     )
-    if row is None:
-        return None
-    event_id = _required_host_row_text(row, field_name="event_id")
-    event = event_log_store.read_event_by_id(transaction, event_id)
-    if event is None:
-        raise HostDurableError("latest compacted event disappeared during read")
-    _require_canonical_session_event(
-        event,
-        session_id=session_id,
-        expected_event_type=CONTEXT_COMPACTED,
-    )
-    return event
-
-
-def _accepted_evidence_mapping_refs_from_compacted_event(
-    transaction: HostTransaction,
-    row: EventLogRow,
-) -> tuple[str, ...]:
-    """从 accepted compact EventLog payload 读取已覆盖的 evidence refs。
-
-    :param transaction: 当前 Host transaction。
-    :param row: ``CONTEXT_COMPACTED`` EventLog row。
-    :returns: 去重后的 accepted evidence mapping refs。
-    :raises HostDurableError: compact payload 损坏时抛出。
-    """
-
-    payload = _validated_compacted_payload(transaction, row)
-    try:
-        return parse_context_compacted_semantic_payload(payload).accepted_evidence_mapping_refs
-    except (TypeError, ValueError) as exc:
-        raise HostDurableError("compact semantic payload is invalid") from exc
-
-
-def _previous_compacted_view_pair_from_compacted_event(
-    transaction: HostTransaction,
-    row: EventLogRow,
-) -> tuple[tuple[CompactMaterialBlock, ...], PreviousCompactReadableView | None]:
-    """把 latest accepted compact replacement 映射为 previous compacted pair。
-
-    :param transaction: 当前 Host transaction。
-    :param row: ``CONTEXT_COMPACTED`` EventLog row。
-    :returns: prompt-local previous compacted blocks 与 typed view。
-    :raises HostDurableError: accepted replacement JSON 或 binding 损坏时抛出。
-    """
-
-    payload = _validated_compacted_payload(transaction, row)
-    try:
-        replacement = (
-            parse_context_compacted_semantic_payload(payload).accepted_replacement
+    entries: list[_AcceptedCompactChainEntry] = []
+    for query_row in rows:
+        event_id = _required_host_row_text(query_row, field_name="event_id")
+        expected_sequence = _required_host_row_int(
+            query_row,
+            field_name="event_sequence",
         )
-    except (TypeError, ValueError) as exc:
-        raise HostDurableError("compact semantic payload is invalid") from exc
-    return _previous_compacted_view_pair_from_replacement(
-        event_id=row.event_id,
-        event_sequence=row.event_sequence,
-        replacement=replacement,
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("accepted compact event disappeared during read")
+        _require_canonical_session_event(
+            event,
+            session_id=session_id,
+            expected_event_type=CONTEXT_COMPACTED,
+        )
+        if event.event_sequence != expected_sequence:
+            raise HostDurableError("accepted compact event sequence changed during read")
+        payload = _validated_compacted_payload(transaction, event)
+        try:
+            semantics = parse_context_compacted_semantic_payload(payload)
+        except (TypeError, ValueError) as exc:
+            raise HostDurableError("compact semantic payload is invalid") from exc
+        _validate_accepted_compact_entry_references(
+            transaction,
+            event_log_store,
+            event=event,
+            semantics=semantics,
+        )
+        entries.append(
+            _AcceptedCompactChainEntry(
+                event=event,
+                semantics=semantics,
+            )
+        )
+    return tuple(entries)
+
+
+def _validate_accepted_compact_entry_references(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    event: EventLogRow,
+    semantics: ContextCompactedSemanticPayload,
+) -> None:
+    """校验 accepted compact 的 current input 与 previous compact back-reference。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param event: 当前 accepted compact terminal。
+    :param semantics: 与 terminal 同源的 strict semantic payload。
+    :returns: ``None``。
+    :raises HostDurableError: 引用缺失、跨 Session、类型错误或非严格回指时抛出。
+    """
+
+    _require_prior_canonical_event_ref(
+        transaction,
+        event_log_store,
+        event_ref=semantics.current_input_ref,
+        owner_event=event,
+        expected_event_type=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+        reference_label="accepted compact current input",
+    )
+    for boundary_entry in semantics.source_boundary:
+        if boundary_entry.source_kind not in _PREVIOUS_COMPACT_SOURCE_KINDS:
+            continue
+        for source_ref in boundary_entry.source_refs:
+            _require_prior_canonical_event_ref(
+                transaction,
+                event_log_store,
+                event_ref=source_ref,
+                owner_event=event,
+                expected_event_type=CONTEXT_COMPACTED,
+                reference_label="accepted compact previous source",
+            )
+
+
+def _require_prior_canonical_event_ref(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    event_ref: str,
+    owner_event: EventLogRow,
+    expected_event_type: str,
+    reference_label: str,
+) -> EventLogRow:
+    """要求 ref exact 指向同 Session、更早的指定 canonical event。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param event_ref: 待校验的 exact EventLog event id。
+    :param owner_event: 持有该引用的 accepted compact terminal。
+    :param expected_event_type: 引用目标必须具有的 event type。
+    :param reference_label: durable error 使用的引用语义标签。
+    :returns: 已校验的 prior canonical EventLog row。
+    :raises HostDurableError: 引用缺失、跨 Session、类型错误或非严格回指时抛出。
+    """
+
+    referenced = event_log_store.read_event_by_id(transaction, event_ref)
+    if referenced is None:
+        raise HostDurableError(f"{reference_label} event is missing")
+    _require_canonical_session_event(
+        referenced,
+        session_id=owner_event.session_id,
+        expected_event_type=expected_event_type,
+    )
+    if referenced.event_sequence >= owner_event.event_sequence:
+        raise HostDurableError(f"{reference_label} must point to an earlier event")
+    return referenced
+
+
+def _accepted_compacted_source_refs(
+    entries: tuple[_AcceptedCompactChainEntry, ...],
+) -> tuple[str, ...]:
+    """从 accepted chain 累积真正被各 immutable boundary 消费的 refs。
+
+    :param entries: 按 terminal order 排列的 strict accepted compact entries。
+    :returns: 按 terminal 与 boundary order 去重的 cumulative consumed refs。
+    """
+
+    return tuple(
+        dict.fromkeys(
+            source_ref
+            for entry in entries
+            for source_ref in entry.semantics.compacted_source_refs
+        )
     )
 
 
@@ -2530,63 +2631,38 @@ def _validated_compacted_payload(transaction: HostTransaction, row: EventLogRow)
 
 
 def _post_compact_delta_start_sequence(
-    transaction: HostTransaction,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
     *,
-    session_id: str,
     current_input_sequence: int,
-    latest_compacted_event: EventLogRow | None,
 ) -> int:
-    """计算 post-compact delta material 的 EventLog 起点。
+    """从最终未消费 material suffix 派生对外 coverage frontier。
 
-    :param transaction: 当前 Host transaction。
-    :param session_id: 当前 Session id。
+    :param material_blocks: exact proof 后保留的未消费 material blocks。
     :param current_input_sequence: 当前 input EventLog sequence。
-    :param latest_compacted_event: latest accepted compact row。
-    :returns: delta 起点 sequence。
-    :raises HostDurableError: EventLog 查询结果非法时抛出。
+    :returns: 第一条保留 block sequence；没有 block 时返回当前 input sequence。
+    :raises HostDurableError: 保留 block 缺少 EventLog sequence 时抛出。
     """
 
-    if latest_compacted_event is not None:
-        return latest_compacted_event.event_sequence + 1
-    row = transaction.fetchone(
-        f"""
-        SELECT event_sequence
-        FROM {TABLE_EVENT_LOG}
-        WHERE session_id = ?
-          AND event_class = ?
-          AND event_type IN (?, ?, ?)
-          AND event_sequence < ?
-        ORDER BY event_sequence ASC
-        LIMIT 1
-        """,
-        (
-            session_id,
-            EventClass.CANONICAL_FACT.value,
-            _EVENT_TYPE_USER_INPUT_ACCEPTED,
-            _EVENT_TYPE_RUN_SUCCEEDED,
-            _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-            current_input_sequence,
-        ),
-    )
-    if row is None:
+    if not material_blocks:
         return current_input_sequence
-    return _required_host_row_int(row, field_name="event_sequence")
+    first_sequence = material_blocks[0].event_sequence
+    if first_sequence is None:
+        raise HostDurableError("unconsumed material block event sequence is missing")
+    return first_sequence
 
 
 def _post_compact_delta_rows(
     transaction: HostTransaction,
     *,
     session_id: str,
-    start_sequence: int,
     end_sequence: int,
 ) -> tuple[EventLogRow, ...]:
-    """读取 post-compact delta canonical fact rows。
+    """读取当前 input 前全部 relevant canonical row metadata。
 
     :param transaction: 当前 Host transaction。
     :param session_id: 当前 Session id。
-    :param start_sequence: 包含式起点。
     :param end_sequence: 排他式终点，等于 current input sequence。
-    :returns: delta rows，按 EventLog sequence 升序。
+    :returns: relevant rows，按 EventLog sequence 升序。
     :raises HostDurableError: EventLog row 转换失败时抛出。
     """
 
@@ -2617,7 +2693,6 @@ def _post_compact_delta_rows(
         WHERE session_id = ?
           AND event_class = ?
           AND event_type IN (?, ?, ?)
-          AND event_sequence >= ?
           AND event_sequence < ?
         ORDER BY event_sequence ASC
         """,
@@ -2627,31 +2702,87 @@ def _post_compact_delta_rows(
             _EVENT_TYPE_USER_INPUT_ACCEPTED,
             _EVENT_TYPE_RUN_SUCCEEDED,
             _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-            start_sequence,
             end_sequence,
         ),
     )
     return tuple(_event_log_row_from_host_row(row) for row in rows)
 
 
+def _conservative_unconsumed_row_start_sequence(
+    rows: tuple[EventLogRow, ...],
+    consumed_source_refs: tuple[str, ...],
+    current_input_sequence: int,
+) -> int:
+    """用非空 Run identity 与唯一 user anchor proof 跳过已消费 group prefix。
+
+    本阶段只检查 EventLog row metadata，不读取历史 payload。缺失、重复 user
+    anchor 或 ``run_id=None`` 的 group 都无法证明已消费，因此保守地从其最早
+    row 开始投影。完整 group 的语义 owner 是 material selector 生成的
+    ``turn_group_memberships_for_material_blocks``；本 helper 只做 metadata-first
+    保守裁剪，最终 exact all-or-none / prefix proof 必须复用
+    ``_atomic_material_units``，不能把 user ref 命中本身升级成 atomic proof。
+
+    :param rows: 当前 input 前全部 relevant canonical rows。
+    :param consumed_source_refs: accepted chain 的 cumulative consumed refs。
+    :param current_input_sequence: 当前 input EventLog sequence。
+    :returns: 需要进入 typed projector 的保守包含式起点。
+    :raises HostDurableError: coverage 不是完整 Run group 的 canonical prefix 时抛出。
+    """
+
+    consumed = frozenset(consumed_source_refs)
+    grouped: dict[str, list[EventLogRow]] = {}
+    for row in rows:
+        if row.run_id is not None:
+            grouped.setdefault(row.run_id, []).append(row)
+
+    emitted_run_ids: set[str] = set()
+    seen_unconsumed = False
+    first_unconsumed_sequence = current_input_sequence
+    for row in rows:
+        if row.run_id is None:
+            group = (row,)
+        else:
+            if row.run_id in emitted_run_ids:
+                continue
+            group = tuple(grouped[row.run_id])
+            emitted_run_ids.add(row.run_id)
+        user_anchors = tuple(
+            item
+            for item in group
+            if item.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED
+        )
+        # 非空 run_id 是关联 whole-group selector proof 的最小 identity；缺失时
+        # 必须保留 row 给 typed projector / _atomic_material_units fail closed。
+        group_consumed = (
+            row.run_id is not None
+            and len(user_anchors) == 1
+            and user_anchors[0].event_id in consumed
+        )
+        if group_consumed:
+            if seen_unconsumed:
+                raise HostDurableError(
+                    "accepted compact coverage must be a complete Run group prefix"
+                )
+            continue
+        if not seen_unconsumed:
+            first_unconsumed_sequence = group[0].event_sequence
+            seen_unconsumed = True
+    return first_unconsumed_sequence
+
+
 def _pre_dispatch_delta_material_blocks(
     transaction: HostTransaction,
-    event_log_store: EventLogStore,
     *,
     rows: tuple[EventLogRow, ...],
-    represented_evidence_refs: tuple[str, ...],
 ) -> tuple[RunInputMaterialBlock, ...]:
     """把 delta EventLog rows 映射为 RunInputMaterialBlock。
 
     :param transaction: 当前 Host transaction。
-    :param event_log_store: EventLog store。
     :param rows: post-compact delta rows。
-    :param represented_evidence_refs: latest compact 已覆盖的 accepted evidence refs。
     :returns: material block tuple。
     :raises HostDurableError: payload 损坏时抛出。
     """
 
-    represented = frozenset(represented_evidence_refs)
     blocks: list[RunInputMaterialBlock] = []
     for row in rows:
         if row.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
@@ -2663,12 +2794,63 @@ def _pre_dispatch_delta_material_blocks(
         elif row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
             evidence_blocks = _accepted_tool_evidence_delta_blocks(
                 transaction,
-                event_log_store,
                 row,
-                represented_evidence_refs=represented,
             )
             blocks.extend(evidence_blocks)
     return tuple(blocks)
+
+
+def _unconsumed_atomic_material_blocks(
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    consumed_source_refs: tuple[str, ...],
+) -> tuple[RunInputMaterialBlock, ...]:
+    """用 exact source refs 证明并删除已消费 atomic unit prefix。
+
+    :param material_blocks: 保守 frontier 后完成 typed projection 的 blocks。
+    :param consumed_source_refs: accepted chain 的 cumulative consumed refs。
+    :returns: 保持 canonical order 的完整未消费 atomic unit suffix。
+    :raises HostDurableError: block/unit 部分覆盖或 coverage 不是 prefix 时抛出。
+    """
+
+    if not consumed_source_refs:
+        return material_blocks
+    consumed = frozenset(consumed_source_refs)
+    try:
+        units = _atomic_material_units(
+            _sorted_material_blocks(
+                material_blocks,
+                memory_snapshot_cursor=None,
+            )
+        )
+    except ValueError as exc:
+        raise HostDurableError("unconsumed material atomic grouping is invalid") from exc
+    retained: list[RunInputMaterialBlock] = []
+    seen_unconsumed = False
+    for unit in units:
+        block_consumption: list[bool] = []
+        for block in unit.blocks:
+            matched_ref_count = sum(
+                source_ref in consumed for source_ref in block.canonical_source_refs
+            )
+            if 0 < matched_ref_count < len(block.canonical_source_refs):
+                raise HostDurableError(
+                    "accepted compact coverage partially consumes a material block"
+                )
+            block_consumption.append(matched_ref_count == len(block.canonical_source_refs))
+        if any(block_consumption) and not all(block_consumption):
+            raise HostDurableError(
+                "accepted compact coverage partially consumes an atomic material unit"
+            )
+        unit_consumed = all(block_consumption)
+        if unit_consumed:
+            if seen_unconsumed:
+                raise HostDurableError(
+                    "accepted compact coverage must be an atomic material prefix"
+                )
+            continue
+        seen_unconsumed = True
+        retained.extend(unit.blocks)
+    return tuple(retained)
 
 
 def _user_input_delta_block(
@@ -2736,10 +2918,7 @@ def _assistant_answer_delta_block(
 
 def _accepted_tool_evidence_delta_blocks(
     transaction: HostTransaction,
-    event_log_store: EventLogStore,
     row: EventLogRow,
-    *,
-    represented_evidence_refs: frozenset[str],
 ) -> tuple[RunInputMaterialBlock, ...]:
     """把 ``TOOL_RESULT_ACCEPTED`` 映射为 evidence material blocks。
 
@@ -2748,9 +2927,7 @@ def _accepted_tool_evidence_delta_blocks(
     ``TOOL_CALL_REQUESTED`` request atom；缺失或不一致一律 fail closed。
 
     :param transaction: 当前 Host transaction。
-    :param event_log_store: EventLog store。
     :param row: accepted tool result EventLog row。
-    :param represented_evidence_refs: latest compact 已覆盖的 evidence refs。
     :returns: evidence material blocks。
     :raises HostDurableError: evidence envelope 或 raw tool payload 损坏时抛出。
     """
@@ -2772,8 +2949,6 @@ def _accepted_tool_evidence_delta_blocks(
         raise HostDurableError("accepted evidence tool_call_requested_event_ref is missing")
     if projection.request_arguments_json is None:
         raise HostDurableError("accepted evidence tool call request provenance is invalid")
-    if projection.evidence_id in represented_evidence_refs:
-        return ()
     if projection.llm_material is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
     payload_refs = tuple(dict.fromkeys((*projection.payload_refs, *_payload_refs_for_event(row))))
