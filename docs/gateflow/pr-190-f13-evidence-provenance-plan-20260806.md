@@ -87,9 +87,10 @@ compact event ref 填作 evidence ref。
 `CompactionRequest.canonical_evidence_refs` 改为当前 immutable source boundary 所有 `canonical_evidence_refs` 的 boundary-order unique union；artifact `input_snapshot_refs.canonical_evidence_refs` 与 request digest 由此同源覆盖 current + retained-eligible prior provenance。
 
 该 request union 表示“可选 evidence boundary”，允许包含最终被省略的 prior fact refs；accepted
-aggregate 表示“实际 retained/new facts 的 refs”，因此正确不变量是 accepted aggregate 为 request
-union 的有序子集，而不是二者恒等。accepted aggregate 自身必须 exact 等于 replacement 中逐 fact
-refs 的 ordered unique union。
+aggregate 表示“实际 retained/new facts 的 refs”，因此正确不变量是 accepted aggregate 的每个 ref
+都属于 request union，而不是二者恒等。accepted aggregate 自身必须 exact 等于 replacement 中逐 fact
+refs 按 fact/entry 顺序的 ordered unique union；不能再强制它遵循跨 fact 的 boundary 全局顺序，因为
+proposal 中 facts 的业务顺序可以与其各自选择的 evidence boundary 顺序不同。
 
 ### 2. LLM proposal v4
 
@@ -187,7 +188,7 @@ Host 构造顺序固定为：
   - 既有 proposal manifest / successful response identity / single terminal binding。
 - 删除旧 `accepted_candidate` durable key 与 v3/schema-4 reader；不保留兼容 alias、migration shim 或 loose parser。
 - strict payload parser 必须重验 proposal/replacement/boundary/coverage/policy/aggregate 所有绑定，产出唯一 `ContextCompactedSemanticPayload` typed view。
-- strict payload parser 还必须验证 accepted aggregate 是 request boundary evidence union 的有序子集；不得错误要求 output aggregate 等于全部可用 input refs，因为 omit 合法缩小集合。
+- strict payload parser 还必须验证 accepted aggregate 唯一且每个 ref 都属于 request boundary evidence union；不得强制跨 fact 的 boundary 全局顺序，也不得错误要求 output aggregate 等于全部可用 input refs，因为 fact 业务顺序独立且 omit 合法缩小集合。每条 fact 内部 refs 仍须按该 fact 的 canonical selection/boundary 顺序。
 - rejected attempts 只写既有 diagnostic/rejected terminal；不写 accepted artifact/replacement。repair exhaustion 只写既有 failed terminal和fallback；stale/late commit 继续由既有 terminal owner返回 no-op，不产生第二 terminal。
 
 ### 5. Rolling, Memory, reconnect and public Tool Trace
