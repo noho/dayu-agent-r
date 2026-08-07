@@ -40,12 +40,9 @@ _DEFAULT_PAGE_SIZE: Final[int] = 64
 _DEFAULT_PUBLIC_SCAN_MAX_BYTES: Final[int] = 128 * 1024 * 1024
 _FINAL_PUBLICATION_SCAN_REPORT_NAME: Final[str] = "secret-scan.json"
 _REASON_KEY: Final[str] = "reason"
-_RAW_DATABASE_SUFFIXES: Final[frozenset[str]] = frozenset(
-    (".sqlite", ".sqlite3", ".db")
-)
 _RAW_DATABASE_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?:^|[\s\"'=:(])[^\s\"'<>]*\.(?:sqlite|sqlite3|db)"
-    r"(?:$|[\s\"',;)])"
+    r"(?i)(?:^|[\s\"'=:(\[\{])[^\s\"'<>]*\.(?:sqlite|sqlite3|db)"
+    r"(?:-(?:wal|shm))?(?:$|[/\\?#\s\"',;)\]\}])"
 )
 _RUN_EVENT_TYPES: Final[tuple[str, ...]] = (
     HostRunEventType.RUN_ACCEPTED.value,
@@ -63,6 +60,13 @@ _RUN_EVENT_FILTER: Final[EventLogReadFilter] = EventLogReadFilter(
 
 class RunObservationError(RuntimeError):
     """Run terminal observation 不完整或 canonical facts 非法。"""
+
+
+class PublicEvidencePathClassification(StrEnum):
+    """public evidence 路径文本的唯一 typed 分类。"""
+
+    PUBLISHABLE = "publishable"
+    RAW_DATABASE = "raw_database"
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +240,27 @@ class RunEvidenceStatus(StrEnum):
     COMPLETE = "complete"
     INSUFFICIENT = "insufficient"
     INVALID = "invalid"
+
+
+def classify_public_evidence_path(
+    value: str,
+) -> PublicEvidencePathClassification:
+    """判断路径或包含路径的文本是否暴露 raw SQLite 文件。
+
+    本函数是 public evidence producer 与 final scanner 共用的唯一分类真源；
+    main ``.sqlite/.sqlite3/.db`` 及其 ``-wal/-shm`` sidecar 均归为 raw
+    database。调用方不得复制后缀集合或另写 regex。
+
+    :param value: 单一路径，或可能嵌入路径的待发布文本。
+    :returns: 可发布或 raw database 的 typed 分类。
+    :raises TypeError: value 不是字符串时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("value must be str")
+    if _RAW_DATABASE_PATH_PATTERN.search(value) is not None:
+        return PublicEvidencePathClassification.RAW_DATABASE
+    return PublicEvidencePathClassification.PUBLISHABLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,8 +717,8 @@ def scan_public_evidence_files(
     """扫描public evidence secrets，并独立执行raw DB/path hygiene检查。
 
     普通repo/run/corpus路径不是credential，不参与exact secret probes。路径卫生只
-    拒绝scope外文件、symlink、raw ``*.sqlite``/``*.sqlite3``/``*.db``文件，
-    以及public文本中出现的raw database路径。
+    拒绝scope外文件、symlink、raw ``*.sqlite``/``*.sqlite3``/``*.db``主库
+    及其``-wal/-shm`` sidecar，以及public文本中出现的同类raw database路径。
 
     :param evidence_root: public evidence共同root。
     :param files: 拟公开文件tuple。
@@ -757,7 +782,10 @@ def scan_public_evidence_files(
                 {"path": relative_text, "reason": "outside_evidence_root"}
             )
             continue
-        if candidate.suffix.lower() in _RAW_DATABASE_SUFFIXES:
+        if (
+            classify_public_evidence_path(relative_text)
+            is PublicEvidencePathClassification.RAW_DATABASE
+        ):
             path_violations.append(
                 {"path": relative_text, "reason": "raw_database_file_forbidden"}
             )
@@ -801,7 +829,10 @@ def scan_public_evidence_files(
                         "probe": probe.name,
                     }
                 )
-        if _RAW_DATABASE_PATH_PATTERN.search(text) is not None:
+        if (
+            classify_public_evidence_path(text)
+            is PublicEvidencePathClassification.RAW_DATABASE
+        ):
             path_violations.append(
                 {"path": relative_text, "reason": "raw_database_path_forbidden"}
             )
@@ -1201,6 +1232,7 @@ __all__ = [
     "DependencyGateStatus",
     "HarnessActionControl",
     "HarnessActionRole",
+    "PublicEvidencePathClassification",
     "PublicEvidenceScanResult",
     "PublicEvidenceSecretProbe",
     "RemainingActionDecision",
@@ -1212,6 +1244,7 @@ __all__ = [
     "RunObservationWindow",
     "RunTerminalObservation",
     "RunTerminalObservationSet",
+    "classify_public_evidence_path",
     "classify_remaining_actions_for_safe_stop",
     "classify_required_run_evidence",
     "dependent_action_accepted_ordinal",

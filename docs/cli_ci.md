@@ -1396,9 +1396,15 @@ cross-command identity。每个场景至少包含：
      `secret-scan.json`本身。report target必须经lexical traversal拒绝与resolved root containment双重校验；report已存在、
      stale、为symlink、含symlink ancestor或在scan期间出现时一律fail closed，不允许pre-scan/post-scan双真源。scan report是
      secret与path-hygiene verdict的唯一持久化真源。exact probes只能来自实际secret环境值和有意义
-     canary；普通repo/run/corpus路径不是credential。path hygiene必须拒绝raw `*.sqlite`/`*.sqlite3`/`*.db`文件、文本中的
-     raw database路径以及leaf/ancestor symlink候选，任一命中均fail closed；不得用硬编码布尔代替扫描事实。raw Host
-     SQLite不得进入public evidence；不得包含
+     canary；普通repo/run/corpus路径不是credential。path hygiene必须拒绝raw `*.sqlite`/`*.sqlite3`/`*.db`主库、其
+     `-wal/-shm` sidecar、文本中的同类raw database路径以及leaf/ancestor symlink候选，任一命中均fail closed；不得用
+     硬编码布尔代替扫描事实。raw DB路径分类必须由tracked typed helper唯一拥有，filesystem snapshot producer与final
+     scanner复用该真源；before/after snapshot在产生路径记录时排除raw main/WAL/SHM，diff与execution index只从已过滤
+     snapshot派生，不得在下游字符串替换或删除。独立`sqlite-before/after.json`仍通过物理只读查询发布业务/audit投影，
+     但不发布DB文件路径。public Tool Trace必须继续由production `dayu-cli tool_trace analyze`生成；distributable evidence以
+     canonical cold JSONL作为输入，避免workspace hot-store projection发布`hot_db_path/source_path`，同时保留cold
+     Run/tool-call/finding/audit facts；context compact accepted facts由独立只读EventLog projection提供。raw Host SQLite
+     不得进入public evidence；不得包含
      `scenario_success`、综合 `success/passed`或由exit 0推导的scenario verdict，formal oracle继续为
      `unadjudicated`。
 6. **Terminal evidence**
@@ -1406,7 +1412,8 @@ cross-command identity。每个场景至少包含：
    - 内嵌 final screen 的关键可见状态，并给出完整 cast/transcript ref，以及 ANSI 清除、prompt 恢复和增量区域的
      实际观察。
 7. **Filesystem / generated artifacts**
-   - before/after bounded manifest 和 created/modified/deleted artifact 列表；
+   - before/after bounded manifest 和 created/modified/deleted artifact 列表；filesystem manifest不得发布raw SQLite
+     main/WAL/SHM路径，created/modified/deleted必须从同一已过滤snapshot派生；
    - 每个用户相关关键生成文件的脱敏内容或 bounded literal excerpt、before/after diff、content/metadata digest、
      路径归属、CI-owned validation 和超预算内容的摘要方式；
    - secret 明文、secret ref、redacted 或未持久化的实际状态。

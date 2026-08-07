@@ -97,11 +97,32 @@ helper 的 reason 仍唯一读取 `reason_json.reason`；已知治理字段只�
   - final execution index先落盘，`evidence_status`只表达Run/context/tool collection且scan字段只引用report path；随后由同一tracked final-tree helper扫描包含index在内的完整evidence tree并独占写report，不做pre/post双扫；
   - public scan分离secret与path hygiene：exact secret probes只使用实际secret环境值和canary，不把repo/run/corpus普通路径当credential；path hygiene扫描public evidence tree中的raw `*.sqlite`/`*.sqlite3`/`*.db`文件、文本raw database路径及leaf/ancestor symlink并fail closed。report target拒绝path traversal、resolved root逃逸、stale/既有report与symlink；raw Host SQLite不进入public evidence；formal `oracle_status`精确为`unadjudicated`。
 
+### Fresh real-evidence producer correction
+
+Controller提供的fresh run `f15-f16-postfix-SfyZRB98` 证明F15/F16业务链已达到28/28 `RUN_SUCCEEDED`且观察到2次
+accepted context compact，但final publication仍因22个raw DB path violations为`invalid`。本follow-up只修public evidence
+producer owner：
+
+- tracked helper把`.sqlite/.sqlite3/.db`主库及`-wal/-shm` sidecar分类抽为唯一typed truth，final scanner保持fail-closed并
+  与filesystem snapshot复用；before/after不再产生raw DB key/target，diff与execution index自然不再嵌入这些路径；
+- `sqlite-before/after.json`与runtime lane projection继续通过物理只读查询提供独立业务/audit facts，不发布DB路径；
+- public Tool Trace仍由production `dayu-cli tool_trace analyze`生成，但改用canonical cold JSONL input；没有修改产品
+  analyzer/schema，也没有下游字符串替换或loose deletion。对同一fresh workspace的production cold分析保留28 runs、10
+  findings、9 tool calls、20 payload rankings和同一signal coverage，`hot=false`且无DB路径；2次compact由独立EventLog
+  projection保留；
+- scanner补强WAL/SHM检测，未降低secret/path/symlink/containment严格性。首次`/var` lexical direct scan的唯一失败为
+  `outside_evidence_root`，resolved direct scan与完整final-tree orchestrator均`complete`且无path/validation error；
+- Controller接受DeepSeek P3-02后，唯一raw DB regex的左右boundary补入`{`/`}`，覆盖final scanner会读取的非JSON
+  stdout/stderr文本；main/WAL/SHM花括号嵌入均由同一classifier判为raw database，既有普通反例保持publishable。
+  未修改P3-01 symlink chain、journal范围、scanner fail-closed、ignored harness控制流、Host/F14 frontier或formal Oracle；
+- owner suite为`55 passed`、helper coverage沿用`82%`，handbook focused aggregate为`150 passed`；两个ignored harness
+  `py_compile`与定向pyright、全量pyright、changed-code Ruff check、diff-check均通过。
+
 本轮 SHA-256：
 
-- tracked helper: `239bfd1f762fa44fd4e0e2131fe577f64cc2c7f240bcd2d00f2b46da2cc06872`；
-- temporary prompt harness: `15c6e2dbcc081b20c63197aba03544d00042ecf1718ab0e44214b09a5dea5e60`；
-- temporary F14 harness: `dfc3d61853e0c2bf5b7b6421ae57bd1440ad09d33446c72e5c1e28941bb1535e`。
+- tracked helper: `92047be5098f312c962f76f339d41f45d685d7790556d326cdbba0c017176869`；
+- temporary prompt harness: `7e32637439c8625b6ee78ec65484f5b4e54e98cf199f65dd50d965a1739b1223`；
+- temporary F14 harness: `236251ca3a035c435080ccb9f91b3be21faaa2b24e31003b041d207327b4636d`。
 
 ## Documentation decision
 

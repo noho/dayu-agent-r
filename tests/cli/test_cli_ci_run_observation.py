@@ -28,12 +28,14 @@ from utils.cli_ci_run_observation import (
     DependencyGateStatus,
     HarnessActionControl,
     HarnessActionRole,
+    PublicEvidencePathClassification,
     PublicEvidenceSecretProbe,
     RemainingActionDisposition,
     RunObservationError,
     RunEvidenceStatus,
     RunObservationRole,
     RunObservationWindow,
+    classify_public_evidence_path,
     classify_remaining_actions_for_safe_stop,
     classify_required_run_evidence,
     dependent_action_accepted_ordinal,
@@ -46,6 +48,91 @@ from utils.cli_ci_run_observation import (
 )
 
 _SESSION_ID = "session-cli-ci-observation"
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    (
+        ".dayu/host/dayu_host.sqlite",
+        ".dayu/host/dayu_host.sqlite-wal",
+        ".dayu/host/dayu_host.sqlite-shm",
+        ".dayu/host/dayu_host.sqlite3",
+        ".dayu/host/dayu_host.sqlite3-wal",
+        ".dayu/host/dayu_host.sqlite3-shm",
+        ".dayu/runtime/runtime_lanes.db",
+        ".dayu/runtime/runtime_lanes.db-wal",
+        ".dayu/runtime/runtime_lanes.db-shm",
+    ),
+)
+def test_public_evidence_path_classifier_rejects_sqlite_main_and_sidecars(
+    raw_path: str,
+) -> None:
+    """唯一路径分类真源必须拒绝三类主库及其WAL/SHM sidecar。
+
+    :param raw_path: raw SQLite main或sidecar路径。
+    :returns: ``None``。
+    :raises AssertionError: 任一路径未被分类为raw database时抛出。
+    """
+
+    assert (
+        classify_public_evidence_path(raw_path)
+        is PublicEvidencePathClassification.RAW_DATABASE
+    )
+    embedded = json.dumps({"path": f"/private/ci/{raw_path}"})
+    assert (
+        classify_public_evidence_path(embedded)
+        is PublicEvidencePathClassification.RAW_DATABASE
+    )
+
+
+@pytest.mark.parametrize(
+    "embedded_text",
+    (
+        "stdout: {/private/ci/.dayu/host/dayu_host.sqlite}",
+        "stderr: {.dayu/host/dayu_host.sqlite3-wal}",
+        "trace: {C:\\dayu\\runtime\\runtime_lanes.db-shm}",
+    ),
+)
+def test_public_evidence_path_classifier_rejects_brace_wrapped_database_paths(
+    embedded_text: str,
+) -> None:
+    """非JSON文本中由花括号包围的main/WAL/SHM路径必须被拒绝。
+
+    :param embedded_text: stdout/stderr风格的花括号包围raw SQLite路径。
+    :returns: ``None``。
+    :raises AssertionError: raw database路径未在唯一owner边界命中时抛出。
+    """
+
+    assert (
+        classify_public_evidence_path(embedded_text)
+        is PublicEvidencePathClassification.RAW_DATABASE
+    )
+
+
+@pytest.mark.parametrize(
+    "ordinary_path",
+    (
+        "reports/sqlite-summary.json",
+        "database/report.json",
+        "archives/report.db.backup",
+        "notes/report.sqlite3.txt",
+        ".dayu/artifacts/tool-trace/tool-trace-cold.jsonl",
+    ),
+)
+def test_public_evidence_path_classifier_keeps_ordinary_paths(
+    ordinary_path: str,
+) -> None:
+    """普通路径不得因SQLite相关词汇或中间后缀被误排除。
+
+    :param ordinary_path: 应允许发布的普通路径。
+    :returns: ``None``。
+    :raises AssertionError: 普通路径被误判为raw database时抛出。
+    """
+
+    assert (
+        classify_public_evidence_path(ordinary_path)
+        is PublicEvidencePathClassification.PUBLISHABLE
+    )
 
 
 def test_terminal_projection_keeps_each_canonical_terminal_and_reason(
@@ -705,6 +792,51 @@ def test_public_scan_detects_injected_exact_secret(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "raw_name",
+    (
+        "host.sqlite-wal",
+        "host.sqlite-shm",
+        "host.sqlite3-wal",
+        "host.sqlite3-shm",
+        "host.db-wal",
+        "host.db-shm",
+    ),
+)
+def test_public_path_hygiene_detects_raw_database_sidecar_files(
+    tmp_path: Path,
+    raw_name: str,
+) -> None:
+    """final scanner必须把WAL/SHM sidecar文件与文本路径判为invalid。
+
+    :param tmp_path: pytest 临时目录。
+    :param raw_name: 待验证的SQLite sidecar文件名。
+    :returns: ``None``。
+    :raises AssertionError: sidecar文件或嵌入路径未被拒绝时抛出。
+    """
+
+    evidence_root = tmp_path / "run"
+    evidence_root.mkdir()
+    raw_sidecar = evidence_root / raw_name
+    raw_sidecar.write_bytes(b"sqlite sidecar fixture")
+    path_record = evidence_root / "manifest.json"
+    path_record.write_text(
+        json.dumps({"raw_store": f"/private/tmp/dayu/{raw_name}"}),
+        encoding="utf-8",
+    )
+
+    result = scan_public_evidence_files(
+        evidence_root=evidence_root,
+        files=(raw_sidecar, path_record),
+        exact_secret_probes=(),
+    )
+
+    assert result.path_hygiene_violations == (
+        {"path": raw_name, "reason": "raw_database_file_forbidden"},
+        {"path": "manifest.json", "reason": "raw_database_path_forbidden"},
+    )
+
+
 def test_public_path_hygiene_detects_raw_database_and_symlink(
     tmp_path: Path,
 ) -> None:
@@ -823,6 +955,109 @@ def test_final_publication_scan_covers_final_metadata_and_only_excludes_report(
     }
     assert payload["scanned_file_count"] == 3
     assert "public/secret-scan.json" not in descriptor_paths
+
+
+def test_final_publication_scan_completes_for_owner_sanitized_bundle(
+    tmp_path: Path,
+) -> None:
+    """snapshot owner排除DB路径且cold Tool Trace发布后final scan必须complete。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: owner产出的bundle仍触发path hygiene时抛出。
+    """
+
+    evidence_root = tmp_path / "evidence"
+    scenario_root = evidence_root / "scenario-001"
+    tool_trace_root = evidence_root / "public" / "tool-trace"
+    scenario_root.mkdir(parents=True)
+    tool_trace_root.mkdir(parents=True)
+    filesystem_after = scenario_root / "filesystem-after.json"
+    filesystem_after.write_text(
+        json.dumps(
+            {
+                ".dayu/artifacts/tool-trace/tool-trace-cold.jsonl": {
+                    "kind": "file",
+                    "size_bytes": 128,
+                },
+                "portfolio/AAPL/report.json": {
+                    "kind": "file",
+                    "size_bytes": 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sqlite_projection = scenario_root / "sqlite-after.json"
+    sqlite_projection.write_text(
+        json.dumps(
+            {
+                "status": "queried",
+                "tables": {"event_log": {"row_count": 28}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    tool_trace_report = tool_trace_root / "tool-trace-analysis.json"
+    tool_trace_report.write_text(
+        json.dumps(
+            {
+                "input": {
+                    "mode": "cold_file",
+                    "capabilities": {
+                        "cold": True,
+                        "hot": False,
+                        "payload_resolution": False,
+                    },
+                    "hot_db_path": None,
+                    "requested_path": (
+                        "/private/ci/tool-trace/tool-trace-cold.jsonl"
+                    ),
+                },
+                "summary": {
+                    "run_count": 28,
+                    "tool_call_count": 9,
+                    "finding_count": 10,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    execution_index = evidence_root / "execution-index-f15-f16.json"
+    execution_index.write_text(
+        json.dumps(
+            {
+                "run_terminal_summary": {"accepted": 28, "succeeded": 28},
+                "context_compaction_observation": {"accepted_count": 2},
+                "public_evidence": {
+                    "tool_trace_input_mode": "canonical_cold_jsonl",
+                    "tool_trace_path": (
+                        "evidence/public/tool-trace/tool-trace-analysis.json"
+                    ),
+                },
+                "secret_scan": {
+                    "record_path": "evidence/public/secret-scan.json"
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report_path = evidence_root / "public" / "secret-scan.json"
+
+    write_final_publication_scan_report(
+        evidence_root=evidence_root,
+        report_path=report_path,
+        exact_secret_probes=(),
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    assert payload["status"] == "complete"
+    assert payload["path_hygiene"] == {
+        "status": "complete",
+        "violations": [],
+    }
+    assert payload["scanned_file_count"] == 4
 
 
 def test_final_publication_scan_rejects_existing_stale_report(
