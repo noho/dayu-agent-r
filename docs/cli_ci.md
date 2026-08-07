@@ -1355,52 +1355,91 @@ cross-command identity。每个场景至少包含：
    - stdin、按键、交互输入、等待动作及相对时间线；不得记录 secret value。
 4. **Observed process result**
    - started/finished timestamps 和 duration；
-   - 真实执行时记录 `execution_outcome=success/error/timeout/cancel`；`not-run/blocked` 时该字段无值，并在
-     evidence gaps 中记录；
-   - exit code、signal、timeout/cancel 原始状态；
+   - 真实执行时只记录 `process_outcome.kind=exited/timed_out/harness_error`、exit code、signal 与 timeout 原始状态；
+     `not-run/blocked` 在 dependency/evidence facts 中单独记录；
    - stdout/stderr 分离后的 raw artifact refs 和 bounded literal summary。
 
    本段只拥有 process-level raw facts，不解释“正确/错误”、不做跨层叙述、不产生 pass/fail。exit 0 或
-   `success` 不能证明 observation completeness 或 correctness。
-5. **Terminal evidence**
+   `kind=exited` 不能证明任何 accepted Run succeeded、observation completeness 或 correctness。
+5. **Per-Run terminal 与 dependency evidence**
+   - Host EventLog/shared lifecycle terminal contract 是每个 Run terminal type 的 owner；tracked helper 必须通过物理只读
+     Host store，在 frozen `(start_event_sequence, end_event_sequence]` 中使用只含 `RUN_ACCEPTED` 与 shared Run
+     terminal types 的 filtered keyset reader读尽窗口，page size不得成为 semantic cap；
+   - `run-terminals.json` 必须逐 Run 保存 accepted ordinal、session/run/event identity、terminal event type、
+     `succeeded/failed/cancelled/lost` class、显式 required/dependent/independent role及 canonical reason；`RUN_LOST`
+     保持独立且标明非 public-outbox terminal；
+   - terminal 的 `session_id` 必须与同一 Run 的 `RUN_ACCEPTED.session_id` exact 相等；terminal class 与 public-outbox
+     eligibility 必须复用 shared lifecycle projector，不得在 harness 中另写四分支或用“不是 lost”反推；
+   - reason 的唯一源是 terminal row 的 `reason_json.reason`，禁止 fallback 到 payload、Host status、diagnostic或日志。
+     validator按现有 terminal-specific canonical shape严格校验：succeeded/failed只允许 reason；cancelled可另外携带已知且
+     合法的 `mode`；lost可另外携带非空 `orphan_proof`；unknown extra、malformed/non-object、missing/blank/wrong type均
+     `observation_invalid`；
+   - 同一 Run 两条 shared Run terminal facts（无论同型或异型）是 duplicate；Attempt terminal、`RUN_CANCELLING`与其它
+     lifecycle events不参与 duplicate判断。accepted缺 terminal、terminal无 window 内 accepted、cursor不前进或越过 frozen
+     end均 fail closed；
+   - success-required action必须显式声明直接 upstream accepted ordinal。只有 `RUN_SUCCEEDED`允许 dependent chain继续；
+     failed/cancelled/lost停止该链并记录 upstream identity/type/reason，pending只允许在deadline前，deadline后为 invalid。
+     stop/invalid 后，当前 process 的所有剩余 dependent actions必须逐项记录 `not_run`，只允许发送一次显式 cleanup/EOT，
+     并使用短 cleanup deadline 尽快退出；不得继续等待原计划 terminal count，也不得把 cleanup 后 exit 0当作 Run success。
+     independent mandatory observation、process artifact、terminal evidence、public evidence与secret scan继续执行；
+   - fresh `execution-index-f15-f16.json` 分开汇总 `process_outcomes`、`run_terminal_summary/records`、
+     `dependency_gates`、`evidence_status`、`context_compaction_observation`与public evidence；其中
+     `evidence_status`只表示Run/context/tool collection完整性，不得复制或冒充publication scan verdict。逐 Run record
+     必须携带 record path/digest；terminal summary至少区分 accepted/succeeded/failed/cancelled/lost/missing/invalid，
+     valid observation必须把四类terminal summary与逐 Run `terminal_class`分布exact对账。canonical observation缺失、重复或
+     破损时，无法由typed fact确认的计数写`null`，只确定`invalid=1`并保留diagnostics；不得从diagnostic message反推
+     missing/duplicate伪精度。required Run 的合法 non-succeeded terminal只使 evidence 为 `insufficient`；
+     dependency-stopped不得标为complete。final publication必须先落盘最终`run-completion.json`或
+     `execution-index-f15-f16.json`，其中secret scan只能引用`secret-scan.json`的record path，不复制尚未形成的
+     status/digest；随后由tracked final-tree helper扫描整个evidence tree并独占创建唯一`secret-scan.json`。
+     final metadata与此前全部evidence都必须出现在report descriptors中；唯一允许自排除的是调用时尚不存在、即将生成的
+     `secret-scan.json`本身。report target必须经lexical traversal拒绝与resolved root containment双重校验；report已存在、
+     stale、为symlink、含symlink ancestor或在scan期间出现时一律fail closed，不允许pre-scan/post-scan双真源。scan report是
+     secret与path-hygiene verdict的唯一持久化真源。exact probes只能来自实际secret环境值和有意义
+     canary；普通repo/run/corpus路径不是credential。path hygiene必须拒绝raw `*.sqlite`/`*.sqlite3`/`*.db`文件、文本中的
+     raw database路径以及leaf/ancestor symlink候选，任一命中均fail closed；不得用硬编码布尔代替扫描事实。raw Host
+     SQLite不得进入public evidence；不得包含
+     `scenario_success`、综合 `success/passed`或由exit 0推导的scenario verdict，formal oracle继续为
+     `unadjudicated`。
+6. **Terminal evidence**
    - 按输入/选择顺序内嵌关键 screen 或等价 literal transcript，说明对应时间和按键；不得只列 screen 文件名；
    - 内嵌 final screen 的关键可见状态，并给出完整 cast/transcript ref，以及 ANSI 清除、prompt 恢复和增量区域的
      实际观察。
-6. **Filesystem / generated artifacts**
+7. **Filesystem / generated artifacts**
    - before/after bounded manifest 和 created/modified/deleted artifact 列表；
    - 每个用户相关关键生成文件的脱敏内容或 bounded literal excerpt、before/after diff、content/metadata digest、
      路径归属、CI-owned validation 和超预算内容的摘要方式；
    - secret 明文、secret ref、redacted 或未持久化的实际状态。
-7. **Diagnostics**
+8. **Diagnostics**
    - debug log ref、关键事件时间线和 warning/error 原始事实摘要；
    - 明确标记 debug log 为 diagnostic、非 durable truth。
-8. **Host DB / SQLite observation**
+9. **Host DB / SQLite observation**
    - `queried` / `not-queried` 及第 11.2 节 checklist 理由；
    - public read contract evidence、resolved DB path 脱敏表示和 CI-owned validation；
    - 相关 stateful 场景内嵌 SQLite schema/关键 rows 或 bounded aggregation 的 before/after 和 delta；同时给出只读
      query manifest/id、row count/digest、private-schema-dependent 标记；
    - query/redaction/row/byte/time limits，以及该证据仅为 diagnostic 的声明。
-9. **Cross-layer correlation**
+10. **Cross-layer correlation**
    - session、run、attempt、execution、tool-call identities 和映射关系；
    - CLI/Service request、Host canonical EventLog、Tool Trace、memory snapshot/source refs/diagnostics、
      runner input 和 UI/final answer refs；
    - identity 缺失或关联歧义。
-10. **Cross-command consumption**
+11. **Cross-command consumption**
     - 对生成配置、文件、Fins/Host/DB 状态，内嵌后续真实 CLI load/query/consume 的 invocation 和实际结果；
     - 明确哪些产物没有被后续命令消费，以及对应 coverage gap；创建命令的自报 summary 不能替代本节。
-11. **Observed behavior only**
+12. **Observed behavior only**
     - 引用第 4-10 项 evidence refs，按时间顺序做 bounded cross-layer narrative，只描述实际发生了什么；
     - 记录层间一致/不一致事实，不重复粘贴 raw process fields；
     - objective fact / hard-contract violation 可以标注精确 authority basis；
     - 禁止用 exit code、CLI 自报数量/summary、digest 或 raw ref 替代行为描述，禁止写期望、外部产品模仿建议、修复
       方案或未裁决产品结论。
-12. **Evidence integrity and gaps**
+13. **Evidence integrity and gaps**
     - required artifact presence、mock/fake absence proof 和 secret scan；
     - missing/corrupt/ambiguous evidence；
     - `evidence_status`，至少区分 `sufficient/missing/corrupt/ambiguous`；
     - `gap_kind`，至少区分 `none/not-run/blocked/evidence-missing/evidence-corrupt/evidence-ambiguous/
       public-observability-gap`，并记录 owner / next evidence action；
-    - 引用第 4 项 `execution_outcome`，但不得把 outcome 重写成 evidence gap 或另建 scenario verdict。
+    - 引用第 4 项 `process_outcome` 与第 5 项 per-Run/dependency facts，但不得合并重写成 scenario verdict。
 
 Scenario observation completeness 只由该 mandatory scenario 是否真实 attempted/executed 与 required evidence 是否
 sufficient 决定，不由 success/error/timeout/cancel 决定。一个 help/positive/negative 或 workspace state 的成功不能

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import NoReturn
+from typing import NoReturn, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
@@ -20,6 +20,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactMaterialPack,
     CompactMaterialSection,
+    CompactForwardIntentStatusV4,
     PreviousCompactReadableView,
     EvidenceReadableItemVNext,
     CompactSegmentSelection,
@@ -361,6 +362,100 @@ class _AcceptedCompactChainEntry:
 
     event: EventLogRow
     semantics: ContextCompactedSemanticPayload
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalMaterialText:
+    """Host material normalizer 已产生的不可变文本。
+
+    :param value: 已规范化或由 canonical typed atoms 正向渲染的文本。
+    """
+
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedToolEvidenceText:
+    """accepted tool evidence shared renderer 产生的 exact 文本。
+
+    :param value: 与 typed accepted evidence material 精确对应的 renderer 文本。
+    """
+
+    value: str
+
+
+_PreparedMaterialText: TypeAlias = (
+    _CanonicalMaterialText | _AcceptedToolEvidenceText
+)
+"""low-level block constructor 可消费的两种明确 typed 文本。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPreviousEvidenceFact:
+    """previous evidence fact 的 canonical typed atom。
+
+    :param claim: canonical claim 文本。
+    :param canonical_evidence_refs: durable accepted evidence refs。
+    """
+
+    claim: _CanonicalMaterialText
+    canonical_evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPreviousAnswerAnchor:
+    """previous answer anchor 的 canonical typed atom。
+
+    :param title: canonical title。
+    :param detail: canonical detail。
+    """
+
+    title: _CanonicalMaterialText
+    detail: _CanonicalMaterialText
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPreviousForwardIntent:
+    """previous forward intent 的 canonical typed atom。
+
+    :param intent_type: durable intent type。
+    :param text: canonical intent 文本。
+    :param status: durable intent status。
+    """
+
+    intent_type: str
+    text: _CanonicalMaterialText
+    status: CompactForwardIntentStatusV4
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPreviousReference:
+    """previous reference continuity 的 canonical typed atom。
+
+    :param text: canonical reference 文本。
+    :param reason: durable reason。
+    """
+
+    text: _CanonicalMaterialText
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPreviousReplacementProjection:
+    """accepted replacement 五区的唯一 canonical projection。
+
+    :param session_summary: nullable canonical summary。
+    :param evidence_facts: canonical evidence facts。
+    :param answer_anchors: canonical answer anchors。
+    :param forward_intents: canonical forward intents。
+    :param references: canonical reference continuity items。
+    """
+
+    session_summary: _CanonicalMaterialText | None
+    evidence_facts: tuple[_CanonicalPreviousEvidenceFact, ...]
+    answer_anchors: tuple[_CanonicalPreviousAnswerAnchor, ...]
+    forward_intents: tuple[_CanonicalPreviousForwardIntent, ...]
+    references: tuple[_CanonicalPreviousReference, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -783,6 +878,125 @@ def _normalized_material_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def _canonical_material_text(text: str) -> _CanonicalMaterialText:
+    """在唯一 normalizer boundary 构造 typed canonical text。
+
+    :param text: 待规范化的 raw material 文本。
+    :returns: 只携带规范化结果的 private typed wrapper。
+    :raises TypeError: 文本类型非法时抛出。
+    :raises ValueError: 规范化结果为空时抛出。
+    """
+
+    return _CanonicalMaterialText(value=normalized_material_text(text))
+
+
+def _accepted_tool_evidence_text(
+    text: str,
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial,
+) -> _AcceptedToolEvidenceText:
+    """校验并包装 accepted tool evidence 的 shared renderer exact 文本。
+
+    :param text: 调用方提供的 renderer 文本。
+    :param accepted_tool_evidence: typed accepted evidence material。
+    :returns: 已绑定 shared renderer 的 private exact-text wrapper。
+    :raises TypeError: typed material 或文本类型非法时抛出。
+    :raises ValueError: 文本不等于 shared renderer 输出时抛出。
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    if not isinstance(accepted_tool_evidence, AcceptedToolEvidenceLLMMaterial):
+        raise TypeError(
+            "accepted_tool_evidence must be AcceptedToolEvidenceLLMMaterial"
+        )
+    if text != render_accepted_tool_evidence_for_llm(accepted_tool_evidence):
+        raise ValueError("accepted tool evidence text must use shared renderer")
+    return _AcceptedToolEvidenceText(value=text)
+
+
+def _run_input_material_block_from_prepared_text(
+    *,
+    block_id: str,
+    section: CompactMaterialSection,
+    kind: CompactMaterialBlockKind,
+    text: _PreparedMaterialText,
+    canonical_source_refs: tuple[str, ...],
+    event_sequence: int | None,
+    turn_group_id: str | None,
+    event_sub_index: int,
+    source_labels: tuple[PromptLocalMaterialLabel, ...],
+    already_represented: bool,
+    protected_recent_raw_turn: bool,
+    accepted_evidence_id: str | None,
+    canonical_evidence_refs: tuple[str, ...],
+    tool_result_event_ref: str | None,
+    tool_call_event_ref: str | None,
+    payload_refs: tuple[str, ...],
+    artifact_refs: tuple[str, ...],
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None,
+) -> RunInputMaterialBlock:
+    """从 typed prepared text 构造唯一 ordinary input material block。
+
+    :param block_id: ordinary material list 稳定 block id。
+    :param section: compact section owner。
+    :param kind: material kind。
+    :param text: canonical normalizer 或 accepted evidence renderer 的 typed text。
+    :param canonical_source_refs: canonical source refs。
+    :param event_sequence: 来源 EventLog sequence。
+    :param turn_group_id: Host admitted user Run id。
+    :param event_sub_index: 同 event 内稳定子序。
+    :param source_labels: prompt-local source labels。
+    :param already_represented: 是否已被 compact output 代表。
+    :param protected_recent_raw_turn: 是否属于 recent raw floor。
+    :param accepted_evidence_id: evidence block canonical id。
+    :param canonical_evidence_refs: canonical evidence refs。
+    :param tool_result_event_ref: TOOL_RESULT_ACCEPTED ref。
+    :param tool_call_event_ref: TOOL_CALL_REQUESTED ref。
+    :param payload_refs: payload refs。
+    :param artifact_refs: artifact refs。
+    :param accepted_tool_evidence: typed accepted evidence material。
+    :returns: size/digest 与 canonical text 同源的 block。
+    :raises TypeError: typed wrapper 或 block 字段类型非法时抛出。
+    :raises ValueError: block contract 不成立时抛出。
+    """
+
+    if not isinstance(text, (_CanonicalMaterialText, _AcceptedToolEvidenceText)):
+        raise TypeError("text must be prepared material text")
+    if isinstance(text, _AcceptedToolEvidenceText):
+        if accepted_tool_evidence is None:
+            raise ValueError("accepted evidence text requires typed material")
+    elif accepted_tool_evidence is not None:
+        raise ValueError("canonical material text must not carry accepted evidence")
+    material_text = text.value
+    evidence_refs = (
+        (accepted_evidence_id,)
+        if accepted_evidence_id is not None and not canonical_evidence_refs
+        else canonical_evidence_refs
+    )
+    return RunInputMaterialBlock(
+        block_id=block_id,
+        section=section,
+        kind=kind,
+        text=material_text,
+        size_units=len(material_text),
+        canonical_source_refs=canonical_source_refs,
+        content_digest=_text_digest(material_text),
+        event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
+        event_sub_index=event_sub_index,
+        source_labels=source_labels,
+        already_represented=already_represented,
+        protected_recent_raw_turn=protected_recent_raw_turn,
+        accepted_evidence_id=accepted_evidence_id,
+        canonical_evidence_refs=evidence_refs,
+        tool_result_event_ref=tool_result_event_ref,
+        tool_call_event_ref=tool_call_event_ref,
+        payload_refs=payload_refs,
+        artifact_refs=artifact_refs,
+        accepted_tool_evidence=accepted_tool_evidence,
+    )
+
+
 def run_input_material_block(
     *,
     block_id: str,
@@ -830,20 +1044,17 @@ def run_input_material_block(
     :raises ValueError: 参数值非法时抛出。
     """
 
-    material_text = text if accepted_tool_evidence is not None else normalized_material_text(text)
-    evidence_refs = (
-        (accepted_evidence_id,)
-        if accepted_evidence_id is not None and not canonical_evidence_refs
-        else canonical_evidence_refs
+    prepared_text: _PreparedMaterialText = (
+        _canonical_material_text(text)
+        if accepted_tool_evidence is None
+        else _accepted_tool_evidence_text(text, accepted_tool_evidence)
     )
-    return RunInputMaterialBlock(
+    return _run_input_material_block_from_prepared_text(
         block_id=block_id,
         section=section,
         kind=kind,
-        text=material_text,
-        size_units=len(material_text),
+        text=prepared_text,
         canonical_source_refs=canonical_source_refs,
-        content_digest=_text_digest(material_text),
         event_sequence=event_sequence,
         turn_group_id=turn_group_id,
         event_sub_index=event_sub_index,
@@ -851,7 +1062,7 @@ def run_input_material_block(
         already_represented=already_represented,
         protected_recent_raw_turn=protected_recent_raw_turn,
         accepted_evidence_id=accepted_evidence_id,
-        canonical_evidence_refs=evidence_refs,
+        canonical_evidence_refs=canonical_evidence_refs,
         tool_result_event_ref=tool_result_event_ref,
         tool_call_event_ref=tool_call_event_ref,
         payload_refs=payload_refs,
@@ -2404,72 +2615,74 @@ def _previous_compacted_view_pair_from_replacement(
     :raises HostDurableError: pair invariant 不成立时抛出。
     """
 
+    projection = _canonical_previous_replacement_projection(replacement)
     blocks: list[RunInputMaterialBlock] = []
-    if replacement.session_summary is not None:
+    if projection.session_summary is not None:
         blocks.append(
-            run_input_material_block(
+            _previous_block_from_canonical_text(
                 block_id=f"previous:{event_id}:session_summary",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=replacement.session_summary.text,
-                canonical_source_refs=(event_id,),
+                text=projection.session_summary,
+                event_id=event_id,
                 event_sequence=event_sequence,
                 event_sub_index=0,
             )
         )
-    for index, fact in enumerate(replacement.evidence_facts, start=1):
+    for index, fact in enumerate(projection.evidence_facts, start=1):
         blocks.append(
-            run_input_material_block(
+            _previous_block_from_canonical_text(
                 block_id=f"previous:{event_id}:evidence_backed_fact:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
                 text=fact.claim,
-                canonical_source_refs=(event_id,),
-                canonical_evidence_refs=fact.canonical_evidence_refs,
+                event_id=event_id,
                 event_sequence=event_sequence,
                 event_sub_index=len(blocks),
+                canonical_evidence_refs=fact.canonical_evidence_refs,
             )
         )
-    readable_anchors = _readable_answer_anchors_from_replacement(replacement)
+    readable_anchors = tuple(
+        _readable_answer_anchor_from_canonical(anchor, index=index)
+        for index, anchor in enumerate(
+            projection.answer_anchors,
+            start=_FIRST_ORDINAL,
+        )
+    )
     for index, anchor in enumerate(readable_anchors, start=1):
         blocks.append(
-            run_input_material_block(
+            _previous_block_from_canonical_text(
                 block_id=f"previous:{event_id}:answer_anchor:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=previous_answer_anchor_block_text(anchor),
-                canonical_source_refs=(event_id,),
+                text=_canonical_answer_anchor_block_text(anchor),
+                event_id=event_id,
                 event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    for index, intent in enumerate(replacement.forward_intents, start=1):
+    for index, intent in enumerate(projection.forward_intents, start=1):
         blocks.append(
-            run_input_material_block(
+            _previous_block_from_canonical_text(
                 block_id=f"previous:{event_id}:forward_intent:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.FORWARD_INTENT,
                 text=intent.text,
-                canonical_source_refs=(event_id,),
+                event_id=event_id,
                 event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
-    for index, reference in enumerate(replacement.reference_continuity, start=1):
+    for index, reference in enumerate(projection.references, start=1):
         blocks.append(
-            run_input_material_block(
+            _previous_block_from_canonical_text(
                 block_id=f"previous:{event_id}:reference_continuity:{index}",
-                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
                 text=reference.text,
-                canonical_source_refs=(event_id,),
+                event_id=event_id,
                 event_sequence=event_sequence,
                 event_sub_index=len(blocks),
             )
         )
     packed_blocks = _pack_previous_blocks(tuple(blocks))
-    readable_view = _readable_previous_view_from_replacement(
-        replacement,
+    readable_view = _readable_previous_view_from_canonical_projection(
+        projection,
         packed_blocks,
         readable_anchors=readable_anchors,
     )
@@ -2480,44 +2693,158 @@ def _previous_compacted_view_pair_from_replacement(
     return packed_blocks, readable_view
 
 
-def _readable_answer_anchors_from_replacement(
+def _canonical_previous_replacement_projection(
     replacement: CompactAcceptedReplacementV4,
-) -> tuple[ReadableAnswerAnchorVNext, ...]:
-    """把 accepted replacement answer anchors 映射为无 label readable anchors。
+) -> _CanonicalPreviousReplacementProjection:
+    """一次规范化 accepted replacement 的全部 previous-view 文本叶子。
 
     :param replacement: typed accepted replacement。
-    :returns: 临时 label anchors；最终 label 由 packed blocks 覆盖。
+    :returns: packed/readable 两个输出共同消费的 canonical projection。
+    :raises TypeError: replacement 类型非法时抛出。
+    :raises ValueError: 任一文本叶子规范化后为空时抛出。
     """
 
-    anchors: list[ReadableAnswerAnchorVNext] = []
-    for index, anchor in enumerate(replacement.answer_anchors, start=_FIRST_ORDINAL):
-        anchors.append(
-            ReadableAnswerAnchorVNext(
-                source_label=material_label(
-                    CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                    index,
-                ),
-                anchor_title=anchor.title,
-                anchor_items=(
-                    ReadableAnswerAnchorItemVNext(
-                        display_text=anchor.detail,
-                        ordinal=None,
-                    ),
-                ),
+    if not isinstance(replacement, CompactAcceptedReplacementV4):
+        raise TypeError("replacement must be CompactAcceptedReplacementV4")
+    return _CanonicalPreviousReplacementProjection(
+        session_summary=(
+            None
+            if replacement.session_summary is None
+            else _canonical_material_text(replacement.session_summary.text)
+        ),
+        evidence_facts=tuple(
+            _CanonicalPreviousEvidenceFact(
+                claim=_canonical_material_text(fact.claim),
+                canonical_evidence_refs=fact.canonical_evidence_refs,
             )
-        )
-    return tuple(anchors)
+            for fact in replacement.evidence_facts
+        ),
+        answer_anchors=tuple(
+            _CanonicalPreviousAnswerAnchor(
+                title=_canonical_material_text(anchor.title),
+                detail=_canonical_material_text(anchor.detail),
+            )
+            for anchor in replacement.answer_anchors
+        ),
+        forward_intents=tuple(
+            _CanonicalPreviousForwardIntent(
+                intent_type=intent.intent_type,
+                text=_canonical_material_text(intent.text),
+                status=intent.status,
+            )
+            for intent in replacement.forward_intents
+        ),
+        references=tuple(
+            _CanonicalPreviousReference(
+                text=_canonical_material_text(reference.text),
+                reason=reference.reason,
+            )
+            for reference in replacement.reference_continuity
+        ),
+    )
 
 
-def _readable_previous_view_from_replacement(
-    replacement: CompactAcceptedReplacementV4,
+def _readable_answer_anchor_from_canonical(
+    anchor: _CanonicalPreviousAnswerAnchor,
+    *,
+    index: int,
+) -> ReadableAnswerAnchorVNext:
+    """从 canonical anchor atom 正向生成 typed readable anchor。
+
+    :param anchor: canonical answer anchor atom。
+    :param index: 临时一基顺序；最终 label 由 packed blocks 覆盖。
+    :returns: 与 canonical title/detail 同源的 readable anchor。
+    :raises TypeError: anchor 类型非法时抛出。
+    :raises ValueError: index 或 readable contract 非法时抛出。
+    """
+
+    if not isinstance(anchor, _CanonicalPreviousAnswerAnchor):
+        raise TypeError("anchor must be _CanonicalPreviousAnswerAnchor")
+    return ReadableAnswerAnchorVNext(
+        source_label=material_label(
+            CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+            index,
+        ),
+        anchor_title=anchor.title.value,
+        anchor_items=(
+            ReadableAnswerAnchorItemVNext(
+                display_text=anchor.detail.value,
+                ordinal=None,
+            ),
+        ),
+    )
+
+
+def _canonical_answer_anchor_block_text(
+    anchor: ReadableAnswerAnchorVNext,
+) -> _CanonicalMaterialText:
+    """从 canonical typed anchor 正向渲染 packed block 文本。
+
+    :param anchor: 已消费 canonical title/detail 的 typed anchor。
+    :returns: 不再经过 raw normalizer 的 canonical rendered text。
+    :raises TypeError: anchor 类型非法时抛出。
+    """
+
+    if not isinstance(anchor, ReadableAnswerAnchorVNext):
+        raise TypeError("anchor must be ReadableAnswerAnchorVNext")
+    return _CanonicalMaterialText(value=previous_answer_anchor_block_text(anchor))
+
+
+def _previous_block_from_canonical_text(
+    *,
+    block_id: str,
+    kind: CompactMaterialBlockKind,
+    text: _CanonicalMaterialText,
+    event_id: str,
+    event_sequence: int,
+    event_sub_index: int,
+    canonical_evidence_refs: tuple[str, ...] = (),
+) -> RunInputMaterialBlock:
+    """构造 previous-view canonical block，且不再次规范化文本。
+
+    :param block_id: previous block stable id。
+    :param kind: previous material kind。
+    :param text: canonical typed text。
+    :param event_id: accepted compact event id。
+    :param event_sequence: accepted compact event sequence。
+    :param event_sub_index: 同 event 内稳定子序。
+    :param canonical_evidence_refs: evidence fact refs。
+    :returns: canonical previous block。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: block contract 不成立时抛出。
+    """
+
+    return _run_input_material_block_from_prepared_text(
+        block_id=block_id,
+        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+        kind=kind,
+        text=text,
+        canonical_source_refs=(event_id,),
+        event_sequence=event_sequence,
+        turn_group_id=None,
+        event_sub_index=event_sub_index,
+        source_labels=(),
+        already_represented=False,
+        protected_recent_raw_turn=False,
+        accepted_evidence_id=None,
+        canonical_evidence_refs=canonical_evidence_refs,
+        tool_result_event_ref=None,
+        tool_call_event_ref=None,
+        payload_refs=(),
+        artifact_refs=(),
+        accepted_tool_evidence=None,
+    )
+
+
+def _readable_previous_view_from_canonical_projection(
+    projection: _CanonicalPreviousReplacementProjection,
     blocks: tuple[CompactMaterialBlock, ...],
     *,
     readable_anchors: tuple[ReadableAnswerAnchorVNext, ...],
 ) -> PreviousCompactReadableView | None:
-    """从 typed replacement 和 packed blocks 生成 typed previous view。
+    """从 canonical projection 和 packed labels 生成 typed previous view。
 
-    :param replacement: typed accepted replacement。
+    :param projection: 唯一 canonical replacement projection。
     :param blocks: 已生成的 previous compacted blocks。
     :param readable_anchors: replacement answer anchors 的 typed value。
     :returns: typed previous view；replacement 无内容时返回 ``None``。
@@ -2541,30 +2868,34 @@ def _readable_previous_view_from_replacement(
         CompactMaterialBlockKind.REFERENCE_CONTINUITY,
     )
     if (
-        len(fact_labels) != len(replacement.evidence_facts)
+        len(fact_labels) != len(projection.evidence_facts)
         or len(anchor_labels) != len(readable_anchors)
-        or len(intent_labels) != len(replacement.forward_intents)
-        or len(reference_labels) != len(replacement.reference_continuity)
+        or len(intent_labels) != len(projection.forward_intents)
+        or len(reference_labels) != len(projection.references)
     ):
         raise HostDurableError("previous compacted view label count mismatch")
     if (
-        replacement.session_summary is None
-        and len(replacement.evidence_facts) == 0
-        and len(replacement.answer_anchors) == 0
-        and len(replacement.forward_intents) == 0
-        and len(replacement.reference_continuity) == 0
+        projection.session_summary is None
+        and len(projection.evidence_facts) == 0
+        and len(projection.answer_anchors) == 0
+        and len(projection.forward_intents) == 0
+        and len(projection.references) == 0
     ):
         return None
     return PreviousCompactReadableView(
-        session_summary=(None if replacement.session_summary is None else replacement.session_summary.text),
+        session_summary=(
+            None
+            if projection.session_summary is None
+            else projection.session_summary.value
+        ),
         evidence_backed_facts=tuple(
             ReadableFactItemVNext(
                 source_label=label,
-                claim_text=fact.claim,
+                claim_text=fact.claim.value,
             )
             for label, fact in zip(
                 fact_labels,
-                replacement.evidence_facts,
+                projection.evidence_facts,
                 strict=True,
             )
         ),
@@ -2580,24 +2911,24 @@ def _readable_previous_view_from_replacement(
             ReadableForwardIntentVNext(
                 source_label=label,
                 intent_type=intent.intent_type,
-                text=intent.text,
+                text=intent.text.value,
                 status=intent.status,
             )
             for label, intent in zip(
                 intent_labels,
-                replacement.forward_intents,
+                projection.forward_intents,
                 strict=True,
             )
         ),
         reference_continuity_items=tuple(
             ReadableReferenceContinuityItemVNext(
                 source_label=label,
-                text=item.text,
+                text=item.text.value,
                 reason=item.reason,
             )
             for label, item in zip(
                 reference_labels,
-                replacement.reference_continuity,
+                projection.references,
                 strict=True,
             )
         ),

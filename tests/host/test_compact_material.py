@@ -95,7 +95,10 @@ from dayu.host.durable.codec import (
     sha256_digest_json,
 )
 from dayu.host.durable.artifact import LocalArtifactStore
-from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.connection import (
+    open_host_durable_read_store,
+    open_host_durable_store,
+)
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
@@ -2054,6 +2057,197 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
         )
         assert "current user question" not in tuple(block.text for block in view.material_blocks)
         assert tuple(fragment.text for fragment in view.budget_fragments)[-1] == ("current user question")
+
+
+def test_pre_dispatch_answer_anchor_format_matrix_keeps_packed_and_readable_exact(
+    tmp_path: Path,
+) -> None:
+    """合法多行 anchor 必须由 Host previous-pair owner 生成 exact 同源投影。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: packed/readable pair 不同源时抛出。
+    """
+
+    candidate = CompactCandidateV4(
+        schema="dayu.context_compaction.output.v4",
+        session_summary=CompactSessionSummaryV4(
+            text="  summary   first  \n\n summary second ",
+            source_labels=("T1",),
+        ),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim=" fact   first \n\n fact second ",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+        answer_anchors=(
+            CompactAnswerAnchorV4(
+                title="  FY2025   conclusion  ",
+                detail=(
+                    " first   paragraph \n\n"
+                    " - bullet   one \n"
+                    " 1. numbered   item \n\n"
+                    " | year | value | \n"
+                    " | --- | ---: | \n"
+                    " | 2025 | 21.7% | "
+                ),
+                source_labels=("A1",),
+            ),
+            CompactAnswerAnchorV4(
+                title=" second   anchor ",
+                detail=" second   detail ",
+                source_labels=("T1",),
+            ),
+        ),
+        forward_intents=(
+            CompactForwardIntentV4(
+                intent_type="next_step_note",
+                text=" next   step \n\n after reload ",
+                status=CompactForwardIntentStatusV4.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity=(
+            CompactReferenceContinuityV4(
+                text=" this   reference \n\n stays exact ",
+                reason="local_reference",
+                source_labels=("T1",),
+            ),
+        ),
+    )
+    event_log = EventLogStore()
+    run: RunRow | None = None
+    view: PreDispatchCompactMaterialView | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入含合法多行 replacement 的 accepted compact chain。
+
+            :param transaction: Host transaction。
+            :returns: 后续 ordinary Run row。
+            """
+
+            user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-canonical-pair",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "canonical pair source user"},
+                run_id="run-canonical-pair-source",
+            )
+            answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-canonical-pair",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "canonical pair source answer"},
+                run_id="run-canonical-pair-source",
+            )
+            evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-canonical-pair",
+                run_id="run-canonical-pair-source",
+            )
+            compact_current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-compact-current-canonical-pair",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "compact canonical pair"},
+                run_id="run-compact-canonical-pair",
+            )
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-canonical-pair",
+                current_input_ref=compact_current.event_id,
+                source_refs_by_label={
+                    "T1": (user.event_id,),
+                    "E1": (f"evidence:{evidence.event_id}",),
+                    "A1": (answer.event_id,),
+                },
+                accepted_evidence_refs=(f"evidence:{evidence.event_id}",),
+                accepted_proposal=candidate,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-canonical-pair",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "continue after canonical pair"},
+                run_id="run-after-canonical-pair",
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="continue after canonical pair",
+            )
+        )
+
+    assert run is not None
+    assert view is not None
+    options = _durable_options(tmp_path)
+    reopened_view: PreDispatchCompactMaterialView | None = None
+    with open_host_durable_read_store(
+        db_path=options.db_path,
+        artifact_root=options.payload_policy.artifact_root,
+        sqlite_policy=HostSQLiteStoragePolicy(),
+    ) as reopened_store:
+        reopened_view = reopened_store.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="continue after canonical pair",
+            )
+        )
+
+    assert reopened_view is not None
+    readable = view.previous_compacted_readable_view
+    reopened_readable = reopened_view.previous_compacted_readable_view
+    assert readable is not None
+    assert reopened_readable is not None
+    assert reopened_readable.to_json() == readable.to_json()
+    assert tuple(
+        (block.text, block.size_units, block.content_digest)
+        for block in reopened_view.previous_compacted_view
+    ) == tuple(
+        (block.text, block.size_units, block.content_digest)
+        for block in view.previous_compacted_view
+    )
+    answer_blocks = tuple(
+        block
+        for block in view.previous_compacted_view
+        if block.kind is CompactMaterialBlockKind.ANSWER_ANCHOR
+    )
+    assert tuple(item.source_label for item in readable.answer_anchors) == (
+        "P3",
+        "P4",
+    )
+    assert tuple(block.block_label for block in answer_blocks) == ("P3", "P4")
+    anchor = readable.answer_anchors[0]
+    anchor_block = answer_blocks[0]
+    assert anchor.anchor_title == "FY2025 conclusion"
+    assert anchor.anchor_items[0].display_text == (
+        "first paragraph\n- bullet one\n1. numbered item\n"
+        "| year | value |\n| --- | ---: |\n| 2025 | 21.7% |"
+    )
+    assert anchor_block.text == (
+        "FY2025 conclusion\n- first paragraph\n- bullet one\n"
+        "1. numbered item\n| year | value |\n| --- | ---: |\n"
+        "| 2025 | 21.7% |"
+    )
+    assert readable.answer_anchors[1].anchor_title == "second anchor"
+    assert answer_blocks[1].text == "second anchor\n- second detail"
 
 
 def test_pre_dispatch_reads_delta_rows_beyond_old_cap(tmp_path: Path) -> None:

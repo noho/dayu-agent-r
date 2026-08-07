@@ -4089,7 +4089,9 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_startup_timeout")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_startup_timeout"
+            }
         finally:
             await scheduler.close()
 
@@ -4361,7 +4363,9 @@ async def test_lane_acquire_timeout_closes_starting_attempt_failed(
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_startup_timeout")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_startup_timeout"
+            }
         finally:
             await scheduler.close()
             await claim.token.release()
@@ -4392,7 +4396,9 @@ async def test_worker_clean_eof_closes_run_failed_from_scheduler(
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("stream_ended_without_terminal")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "stream_ended_without_terminal"
+            }
         finally:
             await scheduler.close()
 
@@ -4432,7 +4438,9 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
             assert run.status == RunStatus.LOST
             assert attempt.status == AttemptStatus.LOST
             event = _read_event_by_type(store.transaction_runner, "RUN_LOST")
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_lost_before_terminal")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_lost_before_terminal"
+            }
             assert handle.closed is True
             assert (
                 registry.cancel(
@@ -5104,7 +5112,9 @@ async def test_scheduler_with_default_local_proxy_stream_error_closes_lost(
             assert run.status == RunStatus.LOST
             assert attempt.status == AttemptStatus.LOST
             event = _read_event_by_type(store.transaction_runner, "RUN_LOST")
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_lost_before_terminal")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_lost_before_terminal"
+            }
         finally:
             await scheduler.close()
 
@@ -9018,6 +9028,77 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
 
 
 @pytest.mark.asyncio
+async def test_durable_reopen_previous_pair_freezes_and_dispatches_next_ordinary_run(
+    tmp_path: Path,
+) -> None:
+    """accepted previous pair 重开后必须冻结并 dispatch 下一 ordinary Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: durable reopen 后候选未冻结、未 dispatch 或与 worker
+        实收 request 不同源时抛出。
+    """
+
+    run_id = "run-after-previous-pair-reopen"
+    factory = _FinalAnswerWorkerFactory()
+    seeded: _AcceptedSeededRun | None = None
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-previous-pair-reopen",
+            event_id="event-previous-pair-reopen",
+            candidate=_previous_compacted_normalization_candidate(),
+        )
+        seeded = _seed_accepted_run(
+            store,
+            session_id=session_id,
+            run_id=run_id,
+            display_text="continue after durable previous pair reopen",
+        )
+
+    assert seeded is not None
+    with open_host_durable_store(_options(tmp_path)) as reopened_store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            reopened_store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            await _wait_for_final_request_count(factory, 1)
+            await _wait_for_run_status(
+                reopened_store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
+            )
+
+            accepted_snapshot = factory.accepted_snapshots[0]
+            frozen_source = reopened_store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=accepted_snapshot.attempt_id,
+                    execution_id=accepted_snapshot.execution_id,
+                )
+            )
+            accepted_request = factory.accepted_requests[0]
+
+            assert frozen_source.candidate.run_id == seeded.run_id
+            assert frozen_source.candidate.session_id == seeded.session_id
+            assert frozen_source.candidate.messages == accepted_request.messages
+            assert frozen_source.candidate.input_snapshot_digest != ""
+            assert accepted_request.run_id == seeded.run_id
+            assert accepted_request.attempt_id == accepted_snapshot.attempt_id
+            assert accepted_request.execution_id == accepted_snapshot.execution_id
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
     tmp_path: Path,
 ) -> None:
@@ -11111,6 +11192,7 @@ def _append_previous_compacted_event(
     run_id: str,
     event_id: str,
     memory_policy: MemoryProjectionPolicy | None = None,
+    candidate: CompactCandidateV4 | None = None,
 ) -> None:
     """追加测试用 latest accepted ``CONTEXT_COMPACTED`` fact。
 
@@ -11119,6 +11201,8 @@ def _append_previous_compacted_event(
     :param run_id: Run id。
     :param event_id: compacted event id。
     :param memory_policy: 与后续 projection consumer 同源的 policy。
+    :param candidate: 可选 accepted compact candidate；缺失时使用默认全 section
+        fixture。
     :returns: ``None``。
     """
 
@@ -11258,7 +11342,11 @@ def _append_previous_compacted_event(
                     compact_artifact_ref="artifact:previous-compact",
                     compact_artifact_digest=_CALL_CONTEXT_DIGEST,
                     accepted_truth=accepted_truth_for_candidate(
-                        _previous_compacted_candidate(),
+                        (
+                            _previous_compacted_candidate()
+                            if candidate is None
+                            else candidate
+                        ),
                         current_input_ref=compact_current_event_id,
                         source_refs_by_label={
                             "T1": (source_user_event_id,),
@@ -11327,6 +11415,58 @@ def _previous_compacted_candidate() -> CompactCandidateV4:
         reference_continuity=(
             CompactReferenceContinuityV4(
                 text="previous reference must drop whole",
+                reason="local_reference",
+                source_labels=("T1",),
+            ),
+        ),
+    )
+
+
+def _previous_compacted_normalization_candidate() -> CompactCandidateV4:
+    """构造覆盖空白、多行、列表与表格的 previous-pair candidate。
+
+    :returns: 可复现 packed/readable 旧分叉的完整 CompactCandidateV4。
+    """
+
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
+            text="  summary   first  \n\n summary second ",
+            source_labels=("T1",),
+        ),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim=" fact   first \n\n fact second ",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+        answer_anchors=(
+            CompactAnswerAnchorV4(
+                title="  FY2025   conclusion  ",
+                detail=(
+                    " first   paragraph \n\n"
+                    " - bullet   one \n"
+                    " 1. numbered   item \n\n"
+                    " | year | value | \n"
+                    " | --- | ---: | \n"
+                    " | 2025 | 21.7% | "
+                ),
+                source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            CompactForwardIntentV4(
+                intent_type="next_step_note",
+                text=" next   step \n\n after reload ",
+                status=CompactForwardIntentStatusV4.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity=(
+            CompactReferenceContinuityV4(
+                text=" this   reference \n\n stays exact ",
                 reason="local_reference",
                 source_labels=("T1",),
             ),

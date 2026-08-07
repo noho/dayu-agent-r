@@ -352,6 +352,39 @@ def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
     )
 
 
+def test_whitespace_only_candidate_anchor_is_rejected_at_typed_accept_boundary() -> None:
+    """candidate typed owner 必须拒绝 whitespace-only anchor，不交给 projector 补救。
+
+    :returns: ``None``。
+    :raises AssertionError: whitespace-only title 被 typed boundary 接受时抛出。
+    """
+
+    with pytest.raises(ValueError, match="CompactAnswerAnchorV4.title"):
+        CompactAnswerAnchorV4(
+            title="  \n\t ",
+            detail="valid detail",
+            source_labels=("A1",),
+        )
+
+
+def test_whitespace_only_persisted_replacement_is_rejected_at_read_boundary() -> None:
+    """strict persisted parser 必须拒绝 blank replacement，不 skip 或默认化。
+
+    :returns: ``None``。
+    :raises AssertionError: 持久化 whitespace-only title 被 read owner 接受时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    anchors = _mapping_list(replacement["answer_anchors"])
+    anchors[0]["title"] = " \n\t "
+    replacement["answer_anchors"] = cast(list[JsonValue], anchors)
+    payload["accepted_replacement"] = replacement
+
+    with pytest.raises(ValueError, match="title"):
+        parse_context_compacted_semantic_payload(payload)
+
+
 def test_compact_payload_public_helpers_reject_invalid_inputs() -> None:
     """compact payload public helper 对弱类型 replacement 与非法 digest fail closed。"""
 

@@ -75,7 +75,6 @@ from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     AttemptExecutionIdentity,
     DispatchRecordStatus,
-    RunMutationResult,
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
@@ -2776,6 +2775,55 @@ def test_startup_orphan_closeout_marks_attempt_lost_then_run_recovering(
             _EVENT_TYPE_ATTEMPT_LOST,
             _EVENT_TYPE_RUN_RECOVERING,
         )
+
+
+def test_startup_orphan_run_lost_keeps_canonical_orphan_proof_reason_shape(
+    tmp_path: Path,
+) -> None:
+    """non-recoverable startup orphan 的 RUN_LOST 保留已知治理字段。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: producer reason_json 偏离 canonical shape 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> JsonValue:
+            """执行 non-recoverable orphan closeout 并读取 Run reason。
+
+            :param transaction: Host transaction。
+            :returns: RUN_LOST reason JSON value。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            _make_host_instance_stale_tx(transaction)
+            result = close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.RUNNING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=False,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:01:00.000000Z",
+                ),
+            )
+            assert result.run is not None
+            event = EventLogStore().read_event_by_id(
+                transaction,
+                "event-run-close-startup",
+            )
+            assert event is not None
+            assert event.event_type == "RUN_LOST"
+            assert event.reason_json is not None
+            return cast(JsonValue, json.loads(event.reason_json))
+
+        assert store.transaction_runner.run_write(operation) == {
+            "reason": "startup_orphan_attempt_lost",
+            "orphan_proof": "owner_pid_missing",
+        }
 
 
 def test_startup_orphan_recoverable_rejects_cancelling_expected_status(

@@ -1757,7 +1757,14 @@ async def test_scheduler_close_writes_active_cancel_closeout_terminal(
             options.db_path,
             "RUN_CANCELLED",
         )
+        run_cancelled_reason = _latest_event_reason(
+            options.db_path,
+            "RUN_CANCELLED",
+        )
         assert run_cancelled_payload["requested_at"] == cancel_requested_at
+        assert set(run_cancelled_reason) == {"reason"}
+        assert isinstance(run_cancelled_reason["reason"], str)
+        assert run_cancelled_reason["reason"].strip() != ""
     finally:
         host.close()
 
@@ -2361,6 +2368,35 @@ def _latest_event_payload(
         row = connection.execute(
             """
             SELECT payload_json
+            FROM event_log
+            WHERE event_type = ?
+            ORDER BY event_sequence DESC
+            LIMIT 1
+            """,
+            (event_type,),
+        ).fetchone()
+    assert row is not None
+    value = cast(JsonValue, json.loads(str(row[0])))
+    assert isinstance(value, Mapping)
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _latest_event_reason(
+    db_path: Path,
+    event_type: str,
+) -> Mapping[str, JsonValue]:
+    """读取指定 Run terminal 的最新 canonical reason object。
+
+    :param db_path: SQLite DB 路径。
+    :param event_type: terminal event type。
+    :returns: 最新事件的 reason JSON object。
+    :raises AssertionError: reason 缺失或不是 JSON object 时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT reason_json
             FROM event_log
             WHERE event_type = ?
             ORDER BY event_sequence DESC
