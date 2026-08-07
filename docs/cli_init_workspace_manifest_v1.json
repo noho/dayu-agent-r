@@ -37,7 +37,7 @@
     {"path": "config/prompts/scenes/audit.md", "content_sha256": "1882c9e5e2464432a09c035eee3222e83ff5f3e84b40e3019151ec1da06e9f36"},
     {"path": "config/prompts/scenes/confirm.md", "content_sha256": "e4173066add59134f8039a6bd7294747ea9549e3e81491ad8fa630a3cc41bdc7"},
     {"path": "config/prompts/scenes/conversation_compaction.md", "content_sha256": "97479acc0cc686cb9a72d18b310aff58cabba4d4b223c6773a12249b5ed333e5"},
-    {"path": "config/prompts/scenes/conversation_compaction_user.md", "content_sha256": "59b50e13ea636c434fcabe26adf6d9ed22665dfcba03533ebcf5e9b524b87b76"},
+    {"path": "config/prompts/scenes/conversation_compaction_user.md", "content_sha256": "22e7bc5015cb369ff228a754b557493594b8313c99877944b5a7c08da0dc1c88"},
     {"path": "config/prompts/scenes/decision.md", "content_sha256": "7deabbe2c856de3821e026a2ae5433ec46aa84200f8490f1a83dbde050287aa8"},
     {"path": "config/prompts/scenes/fix.md", "content_sha256": "1a248aa7987708d302088f7c6dbd6304949321ba0b95b27699947d5ccd6f7172"},
     {"path": "config/prompts/scenes/infer.md", "content_sha256": "82add86aea4cef924be959491d99ace0c7029e90d8697d4fe3ea160a44462389"},
