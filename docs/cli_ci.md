@@ -538,8 +538,13 @@ evidence、但尚待 Oracle controller 裁决的 replacement scenario 可以登�
 `accepted`。`tool-trace-formal@2` 也已由用户在 2026-08-08 根据 F18 fresh production MiMo evidence 裁决为
 `accepted`；mandatory evidence 是 public Host Tool Trace resolver/analysis response identity、canonical terminal 六字段
 6/6 exact match 与 secret scan。cold analyzer `compactor_responses=0` 与 provider-native request id unavailable 保留为
-limitation，不是 mandatory gap。`cap-constrained-memory-replacement@1` 仍待 fresh observation 与用户单独裁决；
-在它闭环前 registry 继续保持 `calibration`，overall readiness 不得标为 ready。
+limitation，不是 mandatory gap。F18 对 `cap-constrained-memory-replacement@1` 完成fixed-profile calibration、material setup
+correction与两次canonical success但non-covering的真实观察；没有观察到compactor operation，最终 verdict 为
+`needs-more-evidence`。F18冻结publication另有cross-file material digest不一致、summary缺少per-chain budget/count/terminal
+refs，且缺少plan要求的per-attempt public Tool Trace/resolver analysis与execution index，publication verdict为
+`nonconforming`，不得作为readiness proof。F19新work unit将从fresh
+workspace、新deadline与新publication root继续正式链并修复该publication contract；B2仍为`unadjudicated`，registry继续保持
+`calibration`，overall readiness不得标为ready。
 
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终

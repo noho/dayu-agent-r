@@ -75,15 +75,20 @@ sufficient、gap none 和 accepted Oracle 正交，不用业务成功改写 proc
 
 ### `interactive.interactive.g06.cap-constrained-memory-replacement@1`
 
-保持 `unadjudicated`。旧 evidence 来自被后续 schema/owner 修复取代的实现，不能直接升级为当前 Oracle。必须在全部相关修复
-完成后的最终 HEAD 上 fresh 运行真实 provider 场景，覆盖 initial caps、machine-detectable invalid candidate、bounded whole-candidate
-repair、repair exhaustion/fallback、accepted durable truth、Memory/RunInput/Tool Trace/reconnect 同源，再交用户逐项裁决。
+保持 `unadjudicated`。F18 fixed-profile production calibration通过，material setup已按owner contract修正；两条真实MiMo Run均为
+canonical `RUN_SUCCEEDED`，但分别因source contamination与typed filter zero facts而non-covering，第三条在CLI spawn前被harness
+precondition拒绝且provider未启动。F18没有观察到compactor operation，real observation verdict为`needs-more-evidence`；accepted
+replacement、bounded repair、exhausted fallback、durable closure与reconnect仍未覆盖。F19新work unit必须从fresh workspace与新
+deadline继续，不得复用本bundle durable state或把F18结果重标PASS。F18冻结publication还有cross-file material digest不一致与
+summary缺少per-chain budget/count/terminal refs、per-attempt public Tool Trace/resolver analysis与execution index的contract
+finding，publication verdict为`nonconforming`；这些缺口不能由private capture或final secret scan零命中替代。
 
 ## 执行顺序
 
 1. F18 Slice 1 把已有 B1 用户裁决投影到 registry/handbook；Issue 192 继续作为独立后续，不是 B1 mandatory gap。
-2. 只在 accepted F18 plan 的 fresh fixed-profile 约束下观察 `cap-constrained-memory-replacement@1`，不复用 B1 bundle或旧 Trial state。
-3. 产出 B2 逐项 observed-behavior report 与公开 evidence，交用户单独裁决；Agent 不替用户把 B2 标为 accepted。
+2. F18 已冻结B2 `needs-more-evidence` report；F19只在fresh fixed-profile workspace与新deadline下继续
+   `cap-constrained-memory-replacement@1`，不复用B1、旧Trial或F18 durable state。
+3. F19 补齐后再产出新的逐项 observed-behavior report 交用户单独裁决；Agent 不替用户把 B2 标为 accepted。
 4. B2 裁决后重新生成 init/prompt/interactive readiness proof；在此之前 registry 保持 `calibration`。
 
 ## 当前 readiness
