@@ -542,9 +542,14 @@ limitation，不是 mandatory gap。F18 对 `cap-constrained-memory-replacement@
 correction与两次canonical success但non-covering的真实观察；没有观察到compactor operation，最终 verdict 为
 `needs-more-evidence`。F18冻结publication另有cross-file material digest不一致、summary缺少per-chain budget/count/terminal
 refs，且缺少plan要求的per-attempt public Tool Trace/resolver analysis与execution index，publication verdict为
-`nonconforming`，不得作为readiness proof。F19新work unit将从fresh
-workspace、新deadline与新publication root继续正式链并修复该publication contract；B2仍为`unadjudicated`，registry继续保持
-`calibration`，overall readiness不得标为ready。
+`nonconforming`，不得作为readiness proof。F19随后以fresh workspace、新deadline与新publication root执行两条fixed-profile
+候选链：5个真实MiMo segment均由Host记录为canonical `RUN_SUCCEEDED`，但12次ordinary runner input之后仍没有产生
+`CONTEXT_COMPACTED`或compactor response，因此replacement、repair/fallback与reconnect前置均未到达，real observation继续为
+`needs-more-evidence`。F19 publication补齐了count/terminal refs、每条attempted chain的path-redacted public Tool Trace analysis
+与execution index，最终scan和独立digest复算也均通过；但冻结的`observation-summary.json`三个chain entries都缺少plan要求的
+逐链budget与deadline owner ref/SHA，顶层统一cap及另一文件的逐segment wrapper budget不能替代该owner record。因此F19
+publication verdict仍为`nonconforming`，不得作为readiness proof。B2仍为`unadjudicated`，registry继续保持`calibration`，
+overall readiness不得标为ready。
 
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终
