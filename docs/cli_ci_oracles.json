@@ -1995,6 +1995,11 @@
           "kind": "user-decision",
           "date": "2026-08-08",
           "summary": "用户接受F15 canonical renderer与F16逐Run terminal observation修复，并根据fresh production CLI、真实MiMo、真实AAPL财报工具、两次accepted compact及跨进程reconnect证据，裁决rolling-correction-replacement@1正确；tool-trace-formal@2和cap-constrained-memory-replacement@1须在相关修复后的最终HEAD上fresh补跑后再裁决。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-08",
+          "summary": "用户接受F18 B1总控建议并裁决tool-trace-formal@2正确：public Host Tool Trace resolver/analysis response identity与canonical terminal六字段6/6 exact match，secret scan完整；cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation，不是mandatory gap。cap-constrained-memory-replacement@1仍待单独裁决。"
         }
       ],
       "observed_behavior": {
@@ -2033,13 +2038,13 @@
           "真实running/queue/steer恢复、cancel non-resurrection、cross-entry label、财报grounding、compaction失败fallback、真实CONTEXT_COMPACTED/provider identity及compact后follow-up均已观察。",
           "用户已裁决#48至#52的五类Semantic Memory、成功compact连续性、材料指令边界、rolling修正/drop及repair/fallback为正确行为。",
           "#53至#55分别登记为无意义summary、compactor Tool Trace identity与completed Run原子性实现finding；后续F13至F17完成previous EvidenceFact provenance、coverage frontier、canonical renderer、逐Run observation与init publication digest修复。",
-          "F15/F16 fresh production observation在真实MiMo和AAPL corpus上形成28个accepted且succeeded的Run、两次accepted compact与durable reconnect；用户已裁决rolling-correction-replacement@1正确。tool-trace-formal@2与cap-constrained-memory-replacement@1仍须在相关修复后的最终HEAD上fresh补跑，修复本身不能替代conformance observation。"
+          "F15/F16 fresh production observation已支持rolling-correction-replacement@1 accepted；F18 B1 fresh production MiMo evidence以public Host Tool Trace与canonical terminal六字段6/6 exact match支持tool-trace-formal@2 accepted。cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation，不构成mandatory gap。cap-constrained-memory-replacement@1仍待裁决，registry保持calibration且overall readiness不得标ready。"
         ]
       },
       "user_adjudication": {
         "decision": "accepted",
         "date": "2026-08-05",
-        "notes": "用户明确接受F11/F12及后续F13-F17收口后的current compaction contract；rolling-correction-replacement@1已于2026-08-08裁决为accepted，tool-trace-formal@2与cap-constrained-memory-replacement@1仍须修复后fresh补跑并由Oracle controller裁决，当前不得标ready。"
+        "notes": "用户明确接受F11/F12及后续F13-F17收口后的current compaction contract；rolling-correction-replacement@1与tool-trace-formal@2已于2026-08-08裁决为accepted。tool-trace-formal@2的cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation；cap-constrained-memory-replacement@1仍待Oracle controller单独裁决，当前不得标ready。"
       },
       "applicable_from": {
         "date": "2026-08-05",

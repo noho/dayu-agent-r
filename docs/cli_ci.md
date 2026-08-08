@@ -535,8 +535,11 @@ evidence、但尚待 Oracle controller 裁决的 replacement scenario 可以登�
 它们只作为后续裁决输入，不参与正式覆盖率、不得投影成 registry ready。F11/F12 replacement 使用
 `tool-trace-formal@2`、`rolling-correction-replacement@1` 与 `cap-constrained-memory-replacement@1`。其中
 `rolling-correction-replacement@1` 已由用户在 2026-08-08 根据 F14/F15/F16 fresh production observation 裁决为
-`accepted`；`tool-trace-formal@2` 与 `cap-constrained-memory-replacement@1` 仍须在相关修复完成后的最终 HEAD 上 fresh
-补跑并再次交用户裁决，在此之前不得把旧 observation 写成 accepted Oracle verdict，也不得投影成 registry ready。
+`accepted`。`tool-trace-formal@2` 也已由用户在 2026-08-08 根据 F18 fresh production MiMo evidence 裁决为
+`accepted`；mandatory evidence 是 public Host Tool Trace resolver/analysis response identity、canonical terminal 六字段
+6/6 exact match 与 secret scan。cold analyzer `compactor_responses=0` 与 provider-native request id unavailable 保留为
+limitation，不是 mandatory gap。`cap-constrained-memory-replacement@1` 仍待 fresh observation 与用户单独裁决；
+在它闭环前 registry 继续保持 `calibration`，overall readiness 不得标为 ready。
 
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终

@@ -113044,7 +113044,7 @@
       "scenario_id": "interactive.interactive.g06.tool-trace-formal",
       "source_scenario_id": "interactive.MC32-intent-resolution-rolling-compact",
       "version": 2,
-      "status": "unadjudicated",
+      "status": "accepted",
       "command": "interactive",
       "path_kind": "state-chain",
       "coverage_claims": {
@@ -113114,38 +113114,32 @@
       ],
       "observed_evidence": {
         "bundle_ids": [
-          "interactive-memory-v3-20260805T-s4-restart-uOZytY"
+          "pr190-formal-g1a2xu"
         ],
         "report_ids": [
-          "/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY/observed-report.md"
+          "evidence/public/observed-behavior-report.md"
         ],
         "report_sha256": [
-          "bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411"
+          "de7ee64de11140add816facf9926c2cf17aa13a4176bd873bc0f91ed20b70f79"
         ],
         "relative_refs": [
-          "evidence/01-mimo-baseline/public-runner-projections.json",
-          "evidence/01-mimo-baseline/public-canonical-equality.json",
-          "evidence/03-mimo-exhausted-fallback/public-runner-projections.json",
-          "evidence/03-mimo-exhausted-fallback/public-canonical-equality.json",
-          "evidence/04-deepseek-baseline/public-runner-projections.json",
-          "evidence/04-deepseek-baseline/public-canonical-equality.json",
-          "evidence/06-deepseek-bounded-repair/public-runner-projections.json",
-          "evidence/06-deepseek-bounded-repair/public-canonical-equality.json",
-          "evidence/08-deepseek-exhausted-fallback/public-runner-projections.json",
-          "evidence/08-deepseek-exhausted-fallback/public-canonical-equality.json",
-          "metadata/secret-scan.json",
-          "digest.json#sha256=38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d"
+          "evidence/public/observed-behavior-report.md",
+          "evidence/public/observation-summary.json#b1",
+          "evidence/public/b1-cold-tool-trace/tool-trace-analysis.json",
+          "evidence/public/b1-cold-tool-trace/tool-trace-analysis.md",
+          "evidence/public/digest.json#sha256=567d5539d9e745e78379093117275231c7b96ab5ac03536f13aec9475e476153",
+          "evidence/public/secret-scan.json#sha256=6f33e30ced5dbbcc96c6cadcc93bf1c5c2ad3d261c5f3386ccbec74c3ba52ba8"
         ],
-        "execution_outcome": "success",
+        "execution_outcome": "error",
         "exit_codes": [
-          0
+          1
         ],
         "evidence_status": "sufficient",
         "gap_kind": "none",
-        "conformance_at_observation": "oracle-review-pending"
+        "conformance_at_observation": "matches-accepted-oracle"
       },
-      "user_adjudication_identity": "pending-oracle-controller-adjudication",
-      "applicable_from": "after-oracle-controller-adjudication",
+      "user_adjudication_identity": "interactive.interactive.g06.tool-trace-formal@2:user-adjudication:2026-08-08",
+      "applicable_from": "next-interactive-conformance-run-after-F18",
       "supersedes": "interactive.interactive.g06.tool-trace-formal@1",
       "superseded_by": null
     },

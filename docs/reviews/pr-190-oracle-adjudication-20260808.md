@@ -4,6 +4,7 @@
 
 - Branch：`codex/interactive-oracle`
 - F17 final target：`857f9e8d1e16b578aebd3a7205bbbabd0859809e`
+- F18 B1 evidence target：`ce0c171a022a073c6355ace44e7c5e34a668d4bb`
 - PR：190
 - 裁决日期：2026-08-08
 - 裁决 owner：用户 / Oracle controller
@@ -36,7 +37,7 @@ normalization truth。Owner tests 覆盖前后空白、重复空白、多行 Mar
 `compacted_source_refs` 累积派生，不能用 compact terminal sequence 反推；受 recent window 保护而尚未消费的完整 Run
 材料离开保护窗口后重新进入后续 boundary。Artifact、EventLog、Memory、RunInput、Tool Trace 与跨进程 reconnect 同源。
 
-## 仍待修复或补跑
+## 后续问题与 F18 B1 裁决
 
 ### Tool Trace Analyzer 信噪比
 
@@ -49,9 +50,28 @@ normalization truth。Owner tests 覆盖前后空白、重复空白、多行 Mar
 
 ### `interactive.interactive.g06.tool-trace-formal@2`
 
-保持 `unadjudicated`。成功 compact 的 provider/model/runner response identity 已在 workspace-mode public analysis 中观察到，
-但必须在相关修复后的最终 HEAD 上 fresh 补跑 successful 与 rejected/repair/exhausted 路径，并形成可公开、可分发的
-typed/JSON/Markdown evidence；不得用 private SQLite/EventLog 旁路补齐，也不得在修复前先跑旧行为冒充 post-fix evidence。
+裁决为 `accepted`。Immutable bundle `pr190-formal-g1a2xu` 在 fresh production CLI、真实 MiMo 与真实
+AAPL corpus 上形成 10 个 accepted 且 typed `RUN_SUCCEEDED` 的 Run。public Host Tool Trace resolver/analysis
+response identity 与 canonical terminal 的 terminal sequence、operation id、attempt number、proposal manifest ref、
+proposal manifest digest 与 successful response identity 六字段完成 6/6 exact match；secret/path scan 零命中。
+
+- Human report：`evidence/public/observed-behavior-report.md`，SHA-256
+  `de7ee64de11140add816facf9926c2cf17aa13a4176bd873bc0f91ed20b70f79`；
+- B1 summary：`evidence/public/observation-summary.json#b1`，文件 SHA-256
+  `dfe3604bba8c7f8bda6b0d8a80639a87ac77a2d1c03f0e7baa28236e554d7c0a`；
+- cold public analysis JSON/Markdown SHA-256：
+  `f1b162c185c977bdb24882cdc7b1eb8d273defe02cfa1dbf920248d07754ec3a` /
+  `2bba07d27ec3307a44cc0d6531c73cb7565bcd72eea7304c7f56d1e0961c41da`；
+- public digest / secret scan SHA-256：
+  `567d5539d9e745e78379093117275231c7b96ab5ac03536f13aec9475e476153` /
+  `6f33e30ced5dbbcc96c6cadcc93bf1c5c2ad3d261c5f3386ccbec74c3ba52ba8`。
+
+Raw PTY owner 记录 `execution_outcome=error`、`exit_codes=[1]`；它与 canonical 10 Runs succeeded、evidence
+sufficient、gap none 和 accepted Oracle 正交，不用业务成功改写 process outcome。cold analyzer
+`compactor_responses=0` 与 provider-native request id unavailable 继续保留为 limitation/residual question，不是
+该 scenario 的 mandatory readiness gap，也不在 F18 扩展 analyzer。
+
+## 仍待补跑或裁决
 
 ### `interactive.interactive.g06.cap-constrained-memory-replacement@1`
 
@@ -61,16 +81,15 @@ repair、repair exhaustion/fallback、accepted durable truth、Memory/RunInput/T
 
 ## 执行顺序
 
-1. 完成所有已登记修复，包括 Issue 192；F17 已在 `857f9e8d` 完成 deterministic publication closure。
-2. 只在修复后的最终 clean HEAD 上 fresh 补跑 `tool-trace-formal@2` 与
-   `cap-constrained-memory-replacement@1`。
-3. 产出逐场景 observed-behavior report 与公开 evidence，交用户裁决；Agent 不替用户把 pending scenario 标为 accepted。
-4. 两条 scenario 均裁决后重新生成 init/prompt/interactive readiness proof；在此之前 registry 保持 `calibration`。
+1. F18 Slice 1 把已有 B1 用户裁决投影到 registry/handbook；Issue 192 继续作为独立后续，不是 B1 mandatory gap。
+2. 只在 accepted F18 plan 的 fresh fixed-profile 约束下观察 `cap-constrained-memory-replacement@1`，不复用 B1 bundle或旧 Trial state。
+3. 产出 B2 逐项 observed-behavior report 与公开 evidence，交用户单独裁决；Agent 不替用户把 B2 标为 accepted。
+4. B2 裁决后重新生成 init/prompt/interactive readiness proof；在此之前 registry 保持 `calibration`。
 
 ## 当前 readiness
 
 - init Oracle/scenarios：既有 accepted 集合保留；F17 publication digest 已修复。
 - prompt Oracle/scenarios：既有 accepted 集合保留。
-- interactive：`rolling-correction-replacement@1` accepted；`tool-trace-formal@2` 与
+- interactive：`rolling-correction-replacement@1` 与 `tool-trace-formal@2` accepted；
   `cap-constrained-memory-replacement@1` pending。
 - 总体：尚不能宣称 init/prompt/interactive 已具备无条件第二轮 CI readiness。
