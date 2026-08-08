@@ -533,8 +533,10 @@ validation worktree 原地修改。
 Superseded scenario 只保留历史 invocation、evidence 与裁决解释，不得再作为 current formal scenario 执行。已有完整真实
 evidence、但尚待 Oracle controller 裁决的 replacement scenario 可以登记为 `unadjudicated` 并引用 immutable evidence；
 它们只作为后续裁决输入，不参与正式覆盖率、不得投影成 registry ready。F11/F12 replacement 使用
-`tool-trace-formal@2`、`rolling-correction-replacement@1` 与 `cap-constrained-memory-replacement@1`；在状态变为
-`accepted` 前不得把 S4 observation 写成 accepted Oracle verdict。
+`tool-trace-formal@2`、`rolling-correction-replacement@1` 与 `cap-constrained-memory-replacement@1`。其中
+`rolling-correction-replacement@1` 已由用户在 2026-08-08 根据 F14/F15/F16 fresh production observation 裁决为
+`accepted`；`tool-trace-formal@2` 与 `cap-constrained-memory-replacement@1` 仍须在相关修复完成后的最终 HEAD 上 fresh
+补跑并再次交用户裁决，在此之前不得把旧 observation 写成 accepted Oracle verdict，也不得投影成 registry ready。
 
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终

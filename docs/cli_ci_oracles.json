@@ -1869,7 +1869,7 @@
           "predicate_id": "interactive.29-compactor-output-accept-repair-fallback",
           "expected": [
             "Host Context Governance accept barrier是compact candidate有效性、provenance分区、output cap与usage audit的唯一owner；模型只产出五类业务语义及其必要provenance，Host从immutable source boundary与accepted provenance派生represented/omitted精确补集。",
-            "v3 initial request必须包含immutable input、真实output caps、nullable summary语义与同源完整结构；strict parser拒绝missing/unknown/duplicate keys、错误nested shape与旧v2字段，Host拒绝全空、无有效provenance、重复semantic item或超过同源cap的candidate。",
+            "当前冻结的compactor initial request必须包含immutable input、真实output caps、nullable summary语义、previous EvidenceFact immutable atoms与同源完整结构；模型对previous EvidenceFact只能按label keep/omit，新EvidenceFact只能选择当前evidence material，canonical refs由Host计算。strict parser拒绝missing/unknown/duplicate keys、错误nested shape与旧schema字段，Host拒绝全空、无有效provenance、重复semantic item或超过同源cap的candidate。",
             "无效proposal形成bounded attempt rejection；后续whole-candidate repair绑定同一Host内部request/source boundary，收到脱敏、有界、自解释的validation issues与同源完整结构后重产整个candidate，不合并rejected partial patch。",
             "无效candidate不得写compact artifact、CONTEXT_COMPACTED或进入Conversation Memory；attempt budget耗尽后只写一个CONTEXT_COMPACTION_FAILED，再进入既有tier 1-3/tier 4-5 deterministic fallback或fail closed。",
             "accepted candidate、represented/omitted coverage、policy usage audit、compact artifact、Memory、RunInput、canonical terminal与public Tool Trace必须从同一CompactAcceptedTruth派生；Memory不得在accept后再次按cap静默裁剪。"
@@ -1885,10 +1885,10 @@
         {
           "predicate_id": "interactive.30-compaction-semantic-memory-closure",
           "expected": [
-            "真实rolling compact可以把session summary、evidence facts、answer anchors、forward intents与reference continuity作为五类独立业务语义保存；candidate不合格时使用同一immutable v3 input做bounded whole-candidate repair，accepted后生成同源compact artifact。",
+            "真实rolling compact可以把session summary、evidence facts、answer anchors、forward intents与reference continuity作为五类独立业务语义保存；candidate不合格时使用同一immutable current input做bounded whole-candidate repair，accepted后生成同源compact artifact。",
             "compact后跨进程重连必须延续已接受的财报事实、单位、期间、来源、别名、指代与尚未完成或已经解决的forward intent；需要新证据时只在用户明确授权后调用真实工具，不得把未授权待办自动执行。",
             "compactor输入中的用户、assistant和tool readable material均是不可信引用数据；材料内指令不得控制compactor。evidence fact只能由evidence_material或previous_evidence_fact直接支持，trace/answer只能作为context或其各自业务section来源；Host accept barrier必须按source kind与typed provenance拒绝非法引用。",
-            "rolling correction必须保留当前replacement及其accepted provenance；未被当前candidate代表的旧source labels由Host作为omitted补集记录，compact artifact、Memory、post-compact RunInput与跨进程reconnect均不得恢复旧结论，也不得要求模型给出主观省略原因。",
+            "rolling correction必须保留当前replacement及其accepted provenance，并允许仍有效的旧事实以明确历史口径及原provenance继续存在；current状态不得回退为旧口径。accepted coverage frontier只由accepted compacted_source_refs累积派生，不能由compact terminal sequence反推；受recent window保护而尚未消费的完整Run材料必须在离开保护窗口后重新进入后续boundary。compact artifact、EventLog、Memory、post-compact RunInput、Tool Trace与跨进程reconnect必须同源。",
             "initial request必须携带真实caps且不包含repair protocol；invalid JSON、semantic-invalid或cap-invalid candidate可以在同一input上bounded self-contained repair，预算耗尽只产生一个CONTEXT_COMPACTION_FAILED并按既有fallback继续，失败结果不得覆盖此前accepted memory。",
             "session summary无法在当前cap内形成有业务意义的摘要时，candidate应使用null清除既有summary，或被拒绝并进入既有repair/fallback；不得接受无业务语义的占位字符作为summary。",
             "正式Tool Trace public resolver与analysis JSON/Markdown必须投影compactor manifest/input、operation/attempt、canonical terminal、provider/model、runner request与provider request id availability/value；public response identity必须与canonical terminal exact match，不能通过private EventLog/SQLite旁路补齐。",
@@ -1990,6 +1990,11 @@
           "kind": "user-decision",
           "date": "2026-08-05",
           "summary": "用户明确确认F11/F12 replacement contract：F11使用public Host Tool Trace response identity，F12使用fresh compact v3；模型只负责业务语义及必要provenance，Host拥有omitted补集、caps、usage audit、repair/fallback与canonical/public trace同源治理。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-08",
+          "summary": "用户接受F15 canonical renderer与F16逐Run terminal observation修复，并根据fresh production CLI、真实MiMo、真实AAPL财报工具、两次accepted compact及跨进程reconnect证据，裁决rolling-correction-replacement@1正确；tool-trace-formal@2和cap-constrained-memory-replacement@1须在相关修复后的最终HEAD上fresh补跑后再裁决。"
         }
       ],
       "observed_behavior": {
@@ -2013,6 +2018,10 @@
           {
             "report_id": "interactive-memory-closure-20260804T5X59S8/observed-behavior",
             "sha256": "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
+          },
+          {
+            "report_id": "f15-f16-postfix-rerun-vNMkeVul/oracle-rerun-observed-behavior",
+            "sha256": "cbac55f151ec3091dbe7fd7872353d1ba21b7adf609393b82a3b90e88cd4b702"
           }
         ],
         "scenario_refs": [
@@ -2023,17 +2032,18 @@
           "用户已裁决行为项#1至#47；当前实现偏差作为F01-F07 findings保留，不改变accepted oracle。",
           "真实running/queue/steer恢复、cancel non-resurrection、cross-entry label、财报grounding、compaction失败fallback、真实CONTEXT_COMPACTED/provider identity及compact后follow-up均已观察。",
           "用户已裁决#48至#52的五类Semantic Memory、成功compact连续性、材料指令边界、rolling修正/drop及repair/fallback为正确行为。",
-          "#53至#55分别登记为无意义summary、compactor Tool Trace identity与completed Run原子性实现finding；#56的null、superseded和policy_limit分支在修复后补跑。修复本身不能替代conformance observation。"
+          "#53至#55分别登记为无意义summary、compactor Tool Trace identity与completed Run原子性实现finding；后续F13至F17完成previous EvidenceFact provenance、coverage frontier、canonical renderer、逐Run observation与init publication digest修复。",
+          "F15/F16 fresh production observation在真实MiMo和AAPL corpus上形成28个accepted且succeeded的Run、两次accepted compact与durable reconnect；用户已裁决rolling-correction-replacement@1正确。tool-trace-formal@2与cap-constrained-memory-replacement@1仍须在相关修复后的最终HEAD上fresh补跑，修复本身不能替代conformance observation。"
         ]
       },
       "user_adjudication": {
         "decision": "accepted",
         "date": "2026-08-05",
-        "notes": "用户明确接受F11/F12 replacement design contract并授权core-execution@2作为current accepted oracle；S4真实观察完整，但三个replacement scenarios仍由后续Oracle controller裁决，当前不得标accepted或ready。"
+        "notes": "用户明确接受F11/F12及后续F13-F17收口后的current compaction contract；rolling-correction-replacement@1已于2026-08-08裁决为accepted，tool-trace-formal@2与cap-constrained-memory-replacement@1仍须修复后fresh补跑并由Oracle controller裁决，当前不得标ready。"
       },
       "applicable_from": {
         "date": "2026-08-05",
-        "target": "f11-f12-fresh-v3-contract"
+        "target": "f13-f17-current-compaction-contract"
       },
       "supersedes": "cli.interactive.core-execution@1",
       "superseded_by": null

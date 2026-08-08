@@ -113153,7 +113153,7 @@
       "scenario_id": "interactive.interactive.g06.rolling-correction-replacement",
       "source_scenario_id": null,
       "version": 1,
-      "status": "unadjudicated",
+      "status": "accepted",
       "command": "interactive",
       "path_kind": "state-chain",
       "coverage_claims": {
@@ -113193,7 +113193,7 @@
         ],
         "stdin": "PTY",
         "input_description": [
-          "建立旧事实与明确有来源的新口径，触发rolling compact；验证current replacement provenance被retained、旧labels由Host记为omitted，随后验证artifact/Memory/RunInput/reconnect均无旧结论"
+          "用真实财报工具建立FY2024历史基线，再以真实FY2025工具证据纠正当前口径并加入无证据的21.7%用户文本；第一次compact验证recent-window保护材料未被terminal sequence误判为已消费，材料自然离开recent window后第二次compact验证其重新进入boundary并写入durable replacement；最后跨进程reconnect核对FY2025当前、FY2024历史、21.7%未升级为EvidenceFact"
         ]
       },
       "precondition": {
@@ -113219,25 +113219,29 @@
         "mock_fake_policy": "forbidden"
       },
       "required_evidence": [
-        "retained-current-replacement-provenance",
-        "host-derived-omitted-old-labels",
-        "compact-artifact-memory-post-compact-runinput-without-old-conclusion",
-        "cross-process-reconnect-without-old-conclusion"
+        "real-fy2024-and-fy2025-production-tool-evidence",
+        "accepted-compacted-source-refs-frontier-not-terminal-sequence",
+        "protected-recent-material-reenters-later-boundary",
+        "durable-current-and-historical-facts-with-original-provenance",
+        "unsupported-user-number-not-promoted-to-evidence-fact",
+        "compact-artifact-eventlog-memory-runinput-tool-trace-same-truth",
+        "cross-process-reconnect-from-durable-replacement"
       ],
       "observed_evidence": {
         "bundle_ids": [
-          "interactive-memory-v3-20260805T-s4-restart-uOZytY"
+          "f15-f16-postfix-rerun-vNMkeVul"
         ],
         "report_ids": [
-          "/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY/observed-report.md"
+          "/Users/leo/workspace/.dayu-cli-ci/f15-f16-postfix-rerun-vNMkeVul/oracle-rerun-observed-behavior.md"
         ],
         "report_sha256": [
-          "bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411"
+          "cbac55f151ec3091dbe7fd7872353d1ba21b7adf609393b82a3b90e88cd4b702"
         ],
         "relative_refs": [
-          "evidence/05-deepseek-replacement-constrained",
-          "evidence/07-deepseek-reconnect",
-          "digest.json#sha256=38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d"
+          "evidence/execution-index-f15-f16.json#sha256=426acb373aa4ea0bb12232bcf987e0c23b31b4651bc8bfa56564225b585692d6",
+          "evidence/public/context-compaction-observation.json#sha256=a9a1f68107c7e29f84499290149b58a2670b6d3bb5aa9a8f005c230afb646383",
+          "evidence/public/secret-scan.json#sha256=617a1be3c5155bf1e518fc3573ab7e897d0bd3af000cf7e43c13a08c3ac1ccec",
+          "evidence/run-manifest.json#sha256=291513d68a6a497c4a8ac065f0191d41e5b1b2d75bc7bc4e4b80b74692ce0453"
         ],
         "execution_outcome": "success",
         "exit_codes": [
@@ -113245,10 +113249,10 @@
         ],
         "evidence_status": "sufficient",
         "gap_kind": "none",
-        "conformance_at_observation": "oracle-review-pending"
+        "conformance_at_observation": "matches-accepted-oracle"
       },
-      "user_adjudication_identity": "pending-oracle-controller-adjudication",
-      "applicable_from": "after-oracle-controller-adjudication",
+      "user_adjudication_identity": "interactive.interactive.g06.rolling-correction-replacement@1:user-adjudication:2026-08-08",
+      "applicable_from": "next-interactive-conformance-run-after-F17",
       "supersedes": "interactive.interactive.g06.drop-superseded@1",
       "superseded_by": null
     },
