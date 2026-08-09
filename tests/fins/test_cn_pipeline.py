@@ -19,6 +19,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
+from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
 from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.download_events import DownloadEventType
 from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
@@ -234,17 +235,24 @@ class _PipelineDownloadFakeHkDiscoveryClient:
 
 
 @dataclass
-class _PipelineDownloadFakeConverter:
-    """CnPipeline wrapper 测试用 Docling fake。"""
+class _PipelineDownloadFakeConversionRunner(CnDoclingConversionRunner):
+    """CnPipeline wrapper 测试用 typed Docling runner。"""
 
     calls: int = 0
 
-    def __call__(self, raw_data: bytes, stream_name: str) -> bytes:
+    async def convert_pdf_to_docling_json(
+        self,
+        pdf_bytes: bytes,
+        stream_name: str,
+        *,
+        cancellation_checker: Callable[[], bool],
+    ) -> bytes:
         """返回固定 Docling JSON。
 
         Args:
-            raw_data: PDF 字节。
+            pdf_bytes: PDF 字节。
             stream_name: 流名称。
+            cancellation_checker: operation-scoped 取消检查器。
 
         Returns:
             Docling JSON 字节。
@@ -253,7 +261,8 @@ class _PipelineDownloadFakeConverter:
             无。
         """
 
-        del raw_data, stream_name
+        del pdf_bytes, stream_name
+        assert cancellation_checker() is False
         self.calls += 1
         return _DOCLING_BYTES
 
@@ -328,11 +337,11 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     """
 
     discovery = _PipelineDownloadFakeDiscoveryClient(temp_dir=tmp_path)
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
     cancel_checker = _never_cancel
 
@@ -357,7 +366,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     assert len(discovery.cancellation_checkpoints) == 1
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
-    assert converter.calls == 1
+    assert runner.calls == 1
 
 
 def test_default_hk_discovery_client_is_hkexnews(tmp_path: Path) -> None:
@@ -394,11 +403,11 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     """
 
     discovery = _PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path)
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         hk_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
     cancel_checker = _never_cancel
 
@@ -426,7 +435,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     assert len(discovery.cancellation_checkpoints) == 1
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
-    assert converter.calls == 1
+    assert runner.calls == 1
 
 
 @pytest.mark.asyncio
@@ -446,11 +455,11 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     """
 
     discovery = _PipelineDownloadFakeDiscoveryClient(temp_dir=tmp_path)
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
 
     events = [
@@ -472,6 +481,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
         DownloadEventType.FILE_DOWNLOAD_STARTED,
         DownloadEventType.FILE_DOWNLOADED,
         DownloadEventType.CONVERSION_STARTED,
+        DownloadEventType.CONVERSION_COMPLETED,
         DownloadEventType.FILING_COMPLETED,
         DownloadEventType.PIPELINE_COMPLETED,
     ]
@@ -482,7 +492,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     assert result["status"] == "ok"
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
-    assert converter.calls == 1
+    assert runner.calls == 1
 
 
 def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_path: Path) -> None:
@@ -519,11 +529,11 @@ def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_p
         temp_dir=tmp_path,
         candidates=candidates,
     )
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
 
     result = pipeline.download(
@@ -539,7 +549,7 @@ def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_p
     assert isinstance(summary, dict)
     assert summary["downloaded"] == 5
     assert discovery.download_calls == 5
-    assert converter.calls == 5
+    assert runner.calls == 5
 
 
 @pytest.mark.asyncio

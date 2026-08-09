@@ -25,6 +25,7 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_protocols import (
+    CnDoclingConversionRunner,
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_download_source_upsert import (
@@ -110,7 +111,7 @@ async def run_cn_download_single_filing_stream(
     processed_repository: ProcessedDocumentRepositoryProtocol,
     discovery_client: CnReportDiscoveryClientProtocol,
     pdf_download_gate: CnDownloadPdfGateProtocol,
-    convert_pdf_to_docling_json: Callable[[bytes, str], bytes],
+    docling_conversion_runner: CnDoclingConversionRunner,
     ticker: str,
     profile: CnCompanyProfile,
     candidate: CnReportCandidate,
@@ -127,7 +128,7 @@ async def run_cn_download_single_filing_stream(
         processed_repository: processed 文档仓储。
         discovery_client: 当前市场 downloader。
         pdf_download_gate: PDF 下载段 gate。
-        convert_pdf_to_docling_json: PDF -> Docling JSON 转换函数。
+        docling_conversion_runner: 可取消 PDF -> Docling JSON conversion runner。
         ticker: 已归一化 ticker。
         profile: 公司基础元数据。
         candidate: 远端候选报告。
@@ -328,10 +329,10 @@ async def run_cn_download_single_filing_stream(
                 f"source_file={pdf_filename}",
                 module=module,
             )
-            docling_json_bytes = await asyncio.to_thread(
-                convert_pdf_to_docling_json,
+            docling_json_bytes = await docling_conversion_runner.convert_pdf_to_docling_json(
                 pdf_bytes,
                 pdf_filename,
+                cancellation_checker=_required_cancellation_checker(cancel_checker),
             )
         except CnDownloadCancelledError:
             raise
@@ -354,6 +355,22 @@ async def run_cn_download_single_filing_stream(
             )
             return
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+        yield DownloadEvent(
+            event_type=DownloadEventType.CONVERSION_COMPLETED,
+            ticker=ticker,
+            document_id=document_id,
+            payload={
+                "name": docling_filename,
+                "source_name": pdf_filename,
+                "stage": "docling_conversion_completed",
+            },
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
         reused_docling = False
         converted = True
     else:
@@ -960,6 +977,39 @@ def _raise_if_cancelled(
         module=module,
     )
     raise CnDownloadCancelledError("操作已被取消")
+
+
+def _required_cancellation_checker(
+    cancel_checker: Callable[[], bool] | None,
+) -> Callable[[], bool]:
+    """把 optional workflow checker 收敛为 runner 必需的 callable。
+
+    Args:
+        cancel_checker: workflow 调用方提供的可选取消检查器。
+
+    Returns:
+        原 checker，或稳定返回 ``False`` 的 module-level checker。
+
+    Raises:
+        无。
+    """
+
+    if cancel_checker is None:
+        return _never_cancelled
+    return cancel_checker
+
+
+def _never_cancelled() -> bool:
+    """返回未取消的稳定信号。
+
+    Returns:
+        始终为 ``False``。
+
+    Raises:
+        无。
+    """
+
+    return False
 
 
 __all__ = [

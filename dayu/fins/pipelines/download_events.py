@@ -22,6 +22,7 @@ class DownloadEventType(StrEnum):
     FILING_STARTED = "filing_started"
     FILE_DOWNLOAD_STARTED = "file_download_started"
     CONVERSION_STARTED = "conversion_started"
+    CONVERSION_COMPLETED = "conversion_completed"
     FILE_DOWNLOADED = "file_downloaded"
     FILE_SKIPPED = "file_skipped"
     FILE_FAILED = "file_failed"

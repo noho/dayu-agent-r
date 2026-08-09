@@ -9,16 +9,11 @@ Host、tool/provider 装配不在本 Slice 内。
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Final, Optional, TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
-from dayu.documents.docling_runtime import (
-    DoclingRuntimeInitializationError,
-    convert_pdf_bytes_with_docling,
-)
 from dayu.fins.downloaders.cninfo_downloader import (
     DEFAULT_MAX_RETRIES as CNINFO_DEFAULT_MAX_RETRIES,
     DEFAULT_SLEEP_SECONDS as CNINFO_DEFAULT_SLEEP_SECONDS,
@@ -52,9 +47,10 @@ from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
     NoopCnDownloadPdfGate,
 )
+from dayu.fins.pipelines.cn_docling_process import ProcessCnDoclingConversionRunner
 from dayu.fins.pipelines.cn_download_protocols import (
+    CnDoclingConversionRunner,
     CnReportDiscoveryClientProtocol,
-    PdfToDoclingJsonBytes,
 )
 from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
 from dayu.fins.pipelines.docling_upload_service import (
@@ -297,40 +293,6 @@ async def collect_cn_upload_result_from_events(
     raise RuntimeError(f"{stream_name} 未返回最终结果")
 
 
-def convert_pdf_bytes_to_docling_json_bytes(raw_data: bytes, stream_name: str) -> bytes:
-    """将 PDF 字节流转换为序列化后的 Docling JSON 字节内容。
-
-    Args:
-        raw_data: PDF 原始字节内容。
-        stream_name: 流名称，建议直接传文件名以保留扩展名。
-
-    Returns:
-        已编码为 UTF-8 的 Docling JSON 字节内容。
-
-    Raises:
-        DoclingRuntimeInitializationError: Docling 依赖缺失或装配失败时抛出。
-        RuntimeError: Docling 转换失败或导出结构非法时抛出。
-    """
-
-    try:
-        result = convert_pdf_bytes_with_docling(
-            raw_data,
-            stream_name=stream_name,
-            do_ocr=True,
-            do_table_structure=True,
-            table_mode="accurate",
-            do_cell_matching=True,
-        )
-    except DoclingRuntimeInitializationError:
-        raise
-    except Exception as exc:  # pragma: no cover - 第三方转换异常兜底
-        raise RuntimeError(f"Docling 转换失败: {stream_name}") from exc
-    payload = cast(JsonValue, result.document.export_to_dict())
-    if not isinstance(payload, Mapping):
-        raise RuntimeError(f"Docling 导出结果非法: {stream_name}")
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-
-
 class CnPipeline:
     """CN/HK 下载管线 facade。
 
@@ -347,7 +309,7 @@ class CnPipeline:
         cn_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         hk_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
-        convert_pdf_to_docling_json: PdfToDoclingJsonBytes | None = None,
+        docling_conversion_runner: CnDoclingConversionRunner | None = None,
         batching_repository: BatchingRepositoryProtocol | None = None,
         company_repository: CompanyMetaRepositoryProtocol | None = None,
         source_repository: SourceDocumentRepositoryProtocol | None = None,
@@ -365,7 +327,7 @@ class CnPipeline:
             cn_discovery_client: 可选巨潮 discovery client。
             hk_discovery_client: 可选披露易 discovery client。
             pdf_download_gate: 可选 PDF 下载段 gate。
-            convert_pdf_to_docling_json: 可选 PDF 到 Docling JSON bytes 转换函数。
+            docling_conversion_runner: 可选可取消 Docling conversion runner。
             batching_repository: 可选 batch lifecycle 仓储。
             company_repository: 可选公司元数据仓储。
             source_repository: 可选源文档仓储。
@@ -423,7 +385,7 @@ class CnPipeline:
             max_retries=max_retries,
         )
         self._pdf_download_gate = pdf_download_gate or NoopCnDownloadPdfGate()
-        self._convert_pdf_to_docling_json = convert_pdf_to_docling_json or convert_pdf_bytes_to_docling_json_bytes
+        self._docling_conversion_runner = docling_conversion_runner or ProcessCnDoclingConversionRunner()
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
@@ -574,20 +536,20 @@ class CnPipeline:
         return self._pdf_download_gate
 
     @property
-    def convert_pdf_to_docling_json(self) -> PdfToDoclingJsonBytes:
-        """返回 PDF 到 Docling JSON bytes 转换函数。
+    def docling_conversion_runner(self) -> CnDoclingConversionRunner:
+        """返回可取消 Docling conversion runner。
 
         Args:
             无。
 
         Returns:
-            转换函数。
+            typed conversion runner。
 
         Raises:
             无。
         """
 
-        return self._convert_pdf_to_docling_json
+        return self._docling_conversion_runner
 
     @property
     def user_agent(self) -> Optional[str]:
@@ -1938,5 +1900,4 @@ __all__ = [
     "build_hk_download_adapter",
     "collect_cn_download_result_from_events",
     "collect_cn_upload_result_from_events",
-    "convert_pdf_bytes_to_docling_json_bytes",
 ]

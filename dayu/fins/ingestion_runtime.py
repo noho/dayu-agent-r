@@ -1191,10 +1191,12 @@ class _RuntimeJobCancellationChecker:
 
 @dataclass
 class _DirectStreamCancellationState:
-    """direct stream 单次执行的本地取消状态。"""
+    """direct stream 单次执行的取消与终态仲裁状态。"""
 
     _lock: Lock
-    _cancelled: bool = False
+    _cancellation_requested: bool = False
+    _consumer_aborted: bool = False
+    _terminal_status: FinsResultStatus | None = None
 
     @classmethod
     def create(cls) -> "_DirectStreamCancellationState":
@@ -1212,8 +1214,27 @@ class _DirectStreamCancellationState:
 
         return cls(_lock=Lock())
 
-    def request_cancel(self) -> None:
+    def request_cancel(self) -> bool:
         """请求取消当前 direct stream。
+
+        Args:
+            无。
+
+        Returns:
+            取消在终态提交前首次生效时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            if self._consumer_aborted or self._terminal_status is not None or self._cancellation_requested:
+                return False
+            self._cancellation_requested = True
+            return True
+
+    def request_consumer_abort(self) -> None:
+        """标记 consumer 已放弃读取并请求 producer 停止。
 
         Args:
             无。
@@ -1226,7 +1247,7 @@ class _DirectStreamCancellationState:
         """
 
         with self._lock:
-            self._cancelled = True
+            self._consumer_aborted = True
 
     def is_cancelled(self) -> bool:
         """读取当前是否已请求取消。
@@ -1242,7 +1263,44 @@ class _DirectStreamCancellationState:
         """
 
         with self._lock:
-            return self._cancelled
+            return self._cancellation_requested or self._consumer_aborted
+
+    def is_consumer_aborted(self) -> bool:
+        """读取 consumer 是否已放弃当前 stream。
+
+        Args:
+            无。
+
+        Returns:
+            consumer 已放弃读取时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._consumer_aborted
+
+    def claim_terminal(self, requested_status: FinsResultStatus) -> FinsResultStatus | None:
+        """原子提交唯一终态，并使已生效取消优先。
+
+        Args:
+            requested_status: producer 请求提交的终态。
+
+        Returns:
+            实际获得的终态；已有终态或 consumer 已 abort 时
+            返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            if self._consumer_aborted or self._terminal_status is not None:
+                return None
+            resolved_status = FinsResultStatus.CANCELLED if self._cancellation_requested else requested_status
+            self._terminal_status = resolved_status
+            return resolved_status
 
 
 @dataclass(frozen=True)
@@ -1265,9 +1323,9 @@ class _DirectCancellationChecker:
             无。
         """
 
-        if self.cancellation_state.is_cancelled():
-            return True
-        return self.cancellation_token is not None and self.cancellation_token.is_cancelled()
+        if self.cancellation_token is not None and self.cancellation_token.is_cancelled():
+            self.cancellation_state.request_cancel()
+        return self.cancellation_state.is_cancelled()
 
 
 @dataclass(frozen=True)
@@ -2448,7 +2506,7 @@ class FinsIngestionRuntime:
         with self._observation_lock:
             record = self._observations.pop(handle.handle_id, None)
             if record is not None:
-                record.cancellation_state.request_cancel()
+                record.cancellation_state.request_consumer_abort()
 
     def activate_observation(self, handle: FinsObservationHandle) -> None:
         """激活已登记的 process-local observation 并提交后台执行器。
@@ -2677,8 +2735,69 @@ class FinsIngestionRuntime:
             Exception: producer 异常转换失败时由底层构造或 queue 操作抛出。
         """
 
-        queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
         cancellation_state = _DirectStreamCancellationState.create()
+        output_queue: asyncio.Queue[_DirectStreamQueueItem] = asyncio.Queue()
+        operation_task = asyncio.create_task(
+            self._run_direct_stream_operation(
+                operation_kind=operation_kind,
+                direct_operation_kind=direct_operation_kind,
+                normalized=normalized,
+                source=source,
+                source_kind=source_kind,
+                download_request=download_request,
+                cancellation_token=cancellation_token,
+                cancellation_state=cancellation_state,
+                producer=producer,
+                output_queue=output_queue,
+            )
+        )
+        try:
+            while True:
+                item = await output_queue.get()
+                if isinstance(item, _DirectStreamProducerDone):
+                    break
+                yield item
+        finally:
+            if not operation_task.done():
+                cancellation_state.request_consumer_abort()
+            await asyncio.shield(operation_task)
+
+    async def _run_direct_stream_operation(
+        self,
+        *,
+        operation_kind: FinsIngestionOperationKind,
+        direct_operation_kind: FinsOperationKind,
+        normalized: NormalizedTicker,
+        source: str | None,
+        source_kind: SourceKind | None,
+        download_request: FinsDownloadRequest | None,
+        cancellation_token: CancellationToken | None,
+        cancellation_state: _DirectStreamCancellationState,
+        producer: Callable[[_FinsIngestionExecutionContext], None],
+        output_queue: asyncio.Queue[_DirectStreamQueueItem],
+    ) -> None:
+        """唯一拥有 direct producer 线程并把有界队列泵到 async 流。
+
+        Args:
+            operation_kind: runtime 内部操作类型。
+            direct_operation_kind: 用户可见 direct 操作类型。
+            normalized: 已归一化 ticker。
+            source: 可选下载来源。
+            source_kind: 可选源文档类型。
+            download_request: download 操作的 typed request。
+            cancellation_token: operation-scoped 取消 token。
+            cancellation_state: 取消、consumer abort 与终态仲裁真源。
+            producer: 同步业务 producer。
+            output_queue: 仅向 async generator 交付事件的本地队列。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 线程启动、queue pump 或线程 join 失败时抛出。
+        """
+
+        queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
         context = _FinsIngestionExecutionContext(
             operation_kind=operation_kind,
             direct_operation_kind=direct_operation_kind,
@@ -2700,23 +2819,23 @@ class FinsIngestionRuntime:
             target=self._run_direct_stream_producer,
             name=f"fins-direct-{operation_kind.value}",
             args=(context, producer),
-            daemon=True,
+            daemon=False,
         )
-        thread.start()
+        thread_started = False
         try:
+            thread.start()
+            thread_started = True
             while True:
-                item = await asyncio.to_thread(
-                    _direct_queue_get,
-                    queue,
-                    thread,
-                )
+                item = await asyncio.to_thread(_direct_queue_get, queue, thread)
                 if item is None:
                     continue
                 if isinstance(item, _DirectStreamProducerDone):
                     break
-                yield item
+                await output_queue.put(item)
         finally:
-            cancellation_state.request_cancel()
+            if thread_started:
+                await asyncio.to_thread(thread.join)
+            await output_queue.put(_DirectStreamProducerDone())
 
     def _run_direct_stream_producer(
         self,
@@ -4566,6 +4685,31 @@ class FinsIngestionRuntime:
 
         if context.direct_queue is None:
             return
+        cancellation_state = context.cancellation_state
+        if cancellation_state is not None:
+            context.cancellation_checker()
+        resolved_status = status if cancellation_state is None else cancellation_state.claim_terminal(status)
+        if resolved_status is None:
+            return
+        status = resolved_status
+        if status is FinsResultStatus.CANCELLED:
+            details = ()
+            error_kind = FinsErrorKind.CANCELLED
+            error_message = direct_failure_message(
+                error_kind=FinsErrorKind.CANCELLED,
+                fallback_message=None,
+            )
+            download = (
+                None
+                if context.download_request is None
+                else _public_download_summary(
+                    _empty_download_summary_from_request(
+                        context.download_request,
+                        terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                    )
+                )
+            )
+            failure = None
         exit_code = _direct_exit_code(status)
         title = direct_result_title(
             operation_kind=context.direct_operation_kind,
@@ -4730,7 +4874,7 @@ def _put_direct_queue(
         return False
     while True:
         cancellation_state = context.cancellation_state
-        if cancellation_state is not None and cancellation_state.is_cancelled():
+        if cancellation_state is not None and cancellation_state.is_consumer_aborted():
             # consumer 已结束时丢弃后续事件，避免同步 producer 卡在无人读取的队列上。
             return False
         try:

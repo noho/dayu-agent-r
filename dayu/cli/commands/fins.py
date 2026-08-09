@@ -40,7 +40,6 @@ from dayu.cli.output import (
     render_cli_error,
     render_fins_direct_cancel_requested,
     render_fins_direct_event,
-    render_fins_direct_local_exit_after_cancel,
 )
 from dayu.cli.upload_script import (
     current_upload_script_platform,
@@ -78,9 +77,7 @@ from dayu.service.fins_direct import (
 _BASE_OPTION: Final[str] = "--base"
 _TICKER_OPTION: Final[str] = "--ticker"
 _MULTIPLE_MATERIAL_FORMS_MESSAGE: Final[str] = "当前 Fins upload_material request 只支持单个 --forms 值"
-_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE: Final[str] = (
-    "upload_filings_from 的 --material-forms 最多接受一个值"
-)
+_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE: Final[str] = "upload_filings_from 的 --material-forms 最多接受一个值"
 _FMP_API_KEY_ENV: Final[str] = "FMP_API_KEY"
 _EMPTY_TICKER_MESSAGE: Final[str] = "--ticker must not be empty"
 _EMPTY_DOCUMENT_ID_MESSAGE: Final[str] = "--document-id must not contain empty item"
@@ -97,16 +94,6 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 class CliFinsUsageError(ValueError):
     """Fins direct CLI 用法错误。"""
-
-
-@dataclass(frozen=True, slots=True)
-class _CliDirectLocalExit:
-    """CLI 本地 direct command 退出状态。
-
-    :param exit_code: 当前 CLI command 应返回的进程退出码。
-    """
-
-    exit_code: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,13 +294,9 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
         api_key = os.environ.get(_FMP_API_KEY_ENV)
         if api_key is None or api_key.strip() == "":
             raise CliFinsUsageError("--infer requires non-empty FMP_API_KEY")
-        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(
-            ticker.canonical
-        )
+        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(ticker.canonical)
         if resolved_info.canonical_ticker != ticker.canonical:
-            raise RuntimeError(
-                "FMP resolved canonical ticker does not match the requested ticker"
-            )
+            raise RuntimeError("FMP resolved canonical ticker does not match the requested ticker")
         aliases = _merge_ticker_aliases(
             canonical=ticker.canonical,
             explicit_aliases=ticker.aliases,
@@ -389,11 +372,7 @@ def _upload_batch_command_argv(
     :raises Exception: 不主动抛出异常。
     """
 
-    command_name = (
-        COMMAND_UPLOAD_FILING
-        if isinstance(entry, UploadBatchFilingEntry)
-        else COMMAND_UPLOAD_MATERIAL
-    )
+    command_name = COMMAND_UPLOAD_FILING if isinstance(entry, UploadBatchFilingEntry) else COMMAND_UPLOAD_MATERIAL
     parts = [
         "python",
         "-m",
@@ -523,9 +502,7 @@ def _render_upload_batch_summary(
     print(f"Material files: {material_count}")
     print(f"Skipped files: {len(skipped_entries)}")
     for skipped in skipped_entries:
-        print(
-            f"Skipped [{skipped.reason_code}] {skipped.path}: {skipped.reason}"
-        )
+        print(f"Skipped [{skipped.reason_code}] {skipped.path}: {skipped.reason}")
 
 
 def _open_direct_stream(
@@ -581,6 +558,7 @@ def _open_direct_stream(
             cancellation_token=cancellation_token,
         )
     raise CliFinsUsageError(f"unsupported fins direct command: {args.command_name}")
+
 
 def _download_stream(
     *,
@@ -780,14 +758,14 @@ async def _wait_for_terminal_handling_sigint(
     cancellation_token: _CliFinsCancellationToken,
     sigint_monitor: CliSigintMonitor,
     command_name: str,
-) -> FinsResultSummary | _CliDirectLocalExit:
+) -> FinsResultSummary:
     """等待 direct stream 终态并处理运行中 SIGINT。
 
     :param events: Fins direct event stream。
     :param cancellation_token: 当前 operation 的取消 token。
     :param sigint_monitor: SIGINT 观察器。
     :param command_name: 用户可见命令名，用于诊断。
-    :returns: direct stream 终态摘要，或 CLI 本地退出状态。
+    :returns: direct stream clean exhaustion 后的 canonical 终态摘要。
     :raises BaseException: stream 消费或 consumer task 清理失败时保持原异常向上抛出。
     """
 
@@ -795,6 +773,7 @@ async def _wait_for_terminal_handling_sigint(
     event_task = asyncio.create_task(_consume_fins_direct_events(events))
     observed_count = sigint_monitor.count
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_count))
+    cancellation_requested = False
     try:
         while True:
             await asyncio.wait(
@@ -802,32 +781,20 @@ async def _wait_for_terminal_handling_sigint(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if event_task.done():
-                sigint_task.cancel()
                 return await event_task
             if sigint_task.done():
                 observed_count = sigint_task.result()
-                runtime_log.log_verbose(
-                    _LOGGER,
-                    "Fins direct stream cancel requested; command=%s sigint_count=%s",
-                    command_name,
-                    observed_count,
-                )
-                cancellation_token.request_cancel("keyboard_interrupt")
-                event_task.cancel()
-                render_fins_direct_cancel_requested()
-                close_error: BaseException | None = None
-                try:
-                    terminal_result = await event_task
-                except asyncio.CancelledError as cancellation_error:
-                    close_error = cancellation_error.__cause__
-                else:
-                    return terminal_result
-                if close_error is not None:
-                    # 离开 child cancellation handler 后再传播 cleanup error，
-                    # 避免 Python 把 child cancellation 写入其隐式 context。
-                    raise close_error
-                render_fins_direct_local_exit_after_cancel()
-                return _CliDirectLocalExit(exit_code=EXIT_KEYBOARD_INTERRUPT)
+                if not cancellation_requested:
+                    cancellation_requested = True
+                    runtime_log.log_verbose(
+                        _LOGGER,
+                        "Fins direct stream cancel requested; command=%s sigint_count=%s",
+                        command_name,
+                        observed_count,
+                    )
+                    cancellation_token.request_cancel("keyboard_interrupt")
+                    render_fins_direct_cancel_requested()
+                sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_count))
     except BaseException as primary_error:
         cleanup_error = await _cancel_and_drain_fins_event_task(
             event_task,
@@ -839,6 +806,7 @@ async def _wait_for_terminal_handling_sigint(
     finally:
         sigint_monitor.close()
         sigint_task.cancel()
+        await asyncio.gather(sigint_task, return_exceptions=True)
 
 
 async def _cancel_and_drain_fins_event_task(
@@ -1028,7 +996,7 @@ def _append_result_details_diagnostic_parts(
     for detail in details:
         if len(rendered) >= _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS:
             break
-        rendered.append(f"{_bounded_diagnostic_text(detail.label)}=" f"{_quoted_diagnostic_text(detail.value)}")
+        rendered.append(f"{_bounded_diagnostic_text(detail.label)}={_quoted_diagnostic_text(detail.value)}")
     if rendered:
         parts.append(f"details={','.join(rendered)}")
 
@@ -1088,9 +1056,7 @@ def _parse_ticker_csv(raw_value: str | None) -> CliTickerInput:
         raise CliFinsUsageError(_EMPTY_TICKER_MESSAGE)
     try:
         canonical = normalize_ticker(parts[0]).canonical
-        normalized_aliases = tuple(
-            normalize_ticker(alias).canonical for alias in parts[1:]
-        )
+        normalized_aliases = tuple(normalize_ticker(alias).canonical for alias in parts[1:])
     except ValueError as exc:
         raise CliFinsUsageError(str(exc)) from exc
     aliases = _merge_ticker_aliases(

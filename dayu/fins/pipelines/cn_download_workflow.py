@@ -254,7 +254,7 @@ async def run_cn_download_stream_impl(
                     processed_repository=host.processed_repository,
                     discovery_client=discovery,
                     pdf_download_gate=host.pdf_download_gate,
-                    convert_pdf_to_docling_json=host.convert_pdf_to_docling_json,
+                    docling_conversion_runner=host.docling_conversion_runner,
                     ticker=normalized_ticker,
                     profile=profile,
                     candidate=candidate,

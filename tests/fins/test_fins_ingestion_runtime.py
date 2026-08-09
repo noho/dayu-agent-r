@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from threading import Event, Lock as ThreadingLock, Thread
+from threading import Event, Lock as ThreadingLock, Thread, current_thread, enumerate as enumerate_threads
 from typing import cast
 
 import pytest
@@ -826,6 +826,9 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
         self.allow_cancellation_check = Event()
         self.cancellation_checks: tuple[bool, ...] = ()
         self.late_progress_returned = Event()
+        self.producer_thread_name: str | None = None
+        self.producer_thread_ident: int | None = None
+        self.producer_thread: Thread | None = None
 
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """等待 consumer abort，再观察取消并尝试一次 late progress。
@@ -841,6 +844,10 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
             ValueError: late progress 事件违反 typed contract 时抛出。
         """
 
+        producer_thread = current_thread()
+        self.producer_thread = producer_thread
+        self.producer_thread_name = producer_thread.name
+        self.producer_thread_ident = producer_thread.ident
         self.entered.set()
         if not self.allow_cancellation_check.wait(timeout=1.0):
             raise TimeoutError("consumer abort cancellation check was not released")
@@ -1107,6 +1114,167 @@ class _NeverCancelledToken(CancellationToken):
         """
 
         return None
+
+
+class _MutableCancellationToken(CancellationToken):
+    """由测试 barrier 显式请求取消的 token。"""
+
+    def __init__(self, *, cancelled: bool = False) -> None:
+        """初始化取消状态。
+
+        Args:
+            cancelled: 是否从首个 checkpoint 开始已取消。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._cancelled = Event()
+        if cancelled:
+            self._cancelled.set()
+
+    def request_cancel(self) -> None:
+        """请求取消。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._cancelled.set()
+
+    def is_cancelled(self) -> bool:
+        """返回当前取消状态。
+
+        Returns:
+            已请求取消时返回 ``True``。
+        """
+
+        return self._cancelled.is_set()
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Returns:
+            已取消时返回固定原因，否则返回 ``None``。
+        """
+
+        return "test-cancelled" if self.is_cancelled() else None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            已取消时返回固定 UTC 时间，否则返回 ``None``。
+        """
+
+        if not self.is_cancelled():
+            return None
+        return datetime(2026, 8, 10, tzinfo=timezone.utc)
+
+
+class _CancellationThenFailureDownloadAdapter(FinsSourceDownloadAdapter):
+    """在取消 barrier 后抛出 provider 异常的竞态测试 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化跨线程 barrier 与 producer 证据。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.entered = Event()
+        self.release_failure = Event()
+        self.producer_thread_ident: int | None = None
+        self.producer_thread: Thread | None = None
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """等待 owner 请求取消后抛出迟到失败。
+
+        Args:
+            request: runtime 传入的 typed request。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            TimeoutError: 测试未在有界时间内释放 barrier。
+            RuntimeError: 固定的迟到 provider 失败。
+        """
+
+        del request
+        self.producer_thread = current_thread()
+        self.producer_thread_ident = self.producer_thread.ident
+        self.entered.set()
+        if not self.release_failure.wait(timeout=1.0):
+            raise TimeoutError("late provider failure barrier was not released")
+        raise RuntimeError("late provider failure")
+
+
+class _ConsumerTaskCancelledDownloadAdapter(FinsSourceDownloadAdapter):
+    """在有界轮询中观察 consumer task cancellation 的 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化 ready/observed/finished barriers 与线程证据。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.entered = Event()
+        self.cancellation_observed = Event()
+        self.finished = Event()
+        self.producer_thread_ident: int | None = None
+        self.producer_thread: Thread | None = None
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """等待 runtime owner 把 consumer task cancellation 投影到 checker。
+
+        Args:
+            request: runtime 传入的 typed request。
+
+        Returns:
+            固定 persisted summary。
+
+        Raises:
+            TimeoutError: owner 未在有界期限内请求取消。
+        """
+
+        self.producer_thread = current_thread()
+        self.producer_thread_ident = self.producer_thread.ident
+        self.entered.set()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if request.cancellation_checker():
+                self.cancellation_observed.set()
+                self.finished.set()
+                return FinsSourceDownloadAdapterResult(
+                    discovered_count=1,
+                    persisted_summary=_typed_download_summary(downloaded_ids=("consumer-cancelled",)),
+                )
+            time.sleep(0.01)
+        self.finished.set()
+        raise TimeoutError("consumer task cancellation was not observed")
 
 
 class _ClaimRaceJobStore:
@@ -2197,13 +2365,14 @@ async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path
     assert events[-1].result is not None
     assert events[-1].result.status is FinsResultStatus.CANCELLED
     assert events[-1].result.exit_code == 130
+    assert sum(event.event_type is FinsEventType.RESULT for event in events) == 1
 
 
 @pytest.mark.asyncio
-async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
+async def test_direct_download_very_early_cancel_skips_adapter_and_joins_thread(
     tmp_path: Path,
 ) -> None:
-    """consumer abort 必须经真实 raw generator finally 请求取消并阻止 late event。
+    """在 operation task 启动前已取消必须产生唯一终态并清理线程。
 
     Args:
         tmp_path: pytest 临时目录夹具。
@@ -2212,9 +2381,130 @@ async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation
         无。
 
     Raises:
+        AssertionError: adapter 被调用、终态非唯一或线程遗留时抛出。
+    """
+
+    adapter = _PersistedSummaryDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): adapter},
+    )
+    events = await asyncio.wait_for(
+        _collect_direct_events(
+            ingestion.download(
+                build_fins_download_request(ticker="AAPL"),
+                cancellation_token=_MutableCancellationToken(cancelled=True),
+            )
+        ),
+        timeout=1.0,
+    )
+
+    result_events = tuple(event for event in events if event.event_type is FinsEventType.RESULT)
+    assert adapter.requests == []
+    assert len(result_events) == 1
+    assert result_events[0].result is not None
+    assert result_events[0].result.status is FinsResultStatus.CANCELLED
+    assert all(thread.name != "fins-direct-download" for thread in enumerate_threads())
+
+
+@pytest.mark.asyncio
+async def test_direct_cancel_wins_late_provider_failure_and_exhausts_after_join(
+    tmp_path: Path,
+) -> None:
+    """已生效取消必须压过迟到 provider 失败并在 join 后 clean exhaust。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 竞态终态、数量或线程 cleanup 不符合契约时抛出。
+    """
+
+    adapter = _CancellationThenFailureDownloadAdapter()
+    token = _MutableCancellationToken()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): adapter},
+    )
+    collection_task = asyncio.create_task(
+        _collect_direct_events(
+            ingestion.download(
+                build_fins_download_request(ticker="AAPL"),
+                cancellation_token=token,
+            )
+        )
+    )
+    assert await asyncio.to_thread(adapter.entered.wait, 1.0)
+    token.request_cancel()
+    adapter.release_failure.set()
+
+    events = await asyncio.wait_for(collection_task, timeout=1.0)
+
+    result_events = tuple(event for event in events if event.event_type is FinsEventType.RESULT)
+    assert len(result_events) == 1
+    assert result_events[0].result is not None
+    assert result_events[0].result.status is FinsResultStatus.CANCELLED
+    assert adapter.producer_thread_ident is not None
+    assert adapter.producer_thread is not None
+    assert not adapter.producer_thread.is_alive()
+
+
+def test_direct_terminal_state_is_atomic_and_ignores_late_cancel_or_result() -> None:
+    """终态提交后的取消或第二终态不得改写 canonical outcome。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 原子终态仲裁失效时抛出。
+    """
+
+    state = ingestion_runtime._DirectStreamCancellationState.create()
+
+    assert state.claim_terminal(FinsResultStatus.SUCCESS) is FinsResultStatus.SUCCESS
+    assert not state.request_cancel()
+    assert state.claim_terminal(FinsResultStatus.FAILURE) is None
+
+    cancelled_state = ingestion_runtime._DirectStreamCancellationState.create()
+    assert cancelled_state.request_cancel()
+    assert cancelled_state.claim_terminal(FinsResultStatus.FAILURE) is FinsResultStatus.CANCELLED
+    assert cancelled_state.claim_terminal(FinsResultStatus.CANCELLED) is None
+
+    aborted_state = ingestion_runtime._DirectStreamCancellationState.create()
+    aborted_state.request_consumer_abort()
+    assert aborted_state.is_cancelled()
+    assert not aborted_state.request_cancel()
+    assert aborted_state.claim_terminal(FinsResultStatus.CANCELLED) is None
+    assert aborted_state._terminal_status is None
+
+
+@pytest.mark.asyncio
+async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """consumer abort 必须经真实 raw generator finally 请求取消并阻止 late event。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        无。
+
+    Raises:
         AssertionError: raw close、取消因果链或 late-publication fence 失效时抛出。
     """
 
+    cancellation_states = _record_direct_cancellation_states(monkeypatch)
     workspace_root = tmp_path / "fins-workspace"
     adapter = _ConsumerAbortDownloadAdapter()
     ingestion = _build_ingestion_runtime(
@@ -2228,16 +2518,88 @@ async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation
     assert first_event.event_type is FinsEventType.PROGRESS
     assert await asyncio.to_thread(adapter.entered.wait, 1.0)
 
-    await stream.aclose()
-    await stream.aclose()
-    adapter.allow_cancellation_check.set()
+    close_started = asyncio.Event()
 
-    assert await asyncio.to_thread(adapter.late_progress_returned.wait, 1.0)
+    async def close_stream() -> None:
+        """关闭 stream 并暴露 close task 已进入 owner boundary。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: stream cleanup 异常原样透传。
+        """
+
+        close_started.set()
+        await stream.aclose()
+
+    close_task = asyncio.create_task(close_stream())
+    await asyncio.wait_for(close_started.wait(), timeout=1.0)
+    assert not close_task.done()
+    adapter.allow_cancellation_check.set()
+    await asyncio.wait_for(close_task, timeout=1.0)
+    await stream.aclose()
+
+    assert adapter.late_progress_returned.is_set()
     assert adapter.cancellation_checks == (True,)
+    assert adapter.producer_thread_name == "fins-direct-download"
+    assert adapter.producer_thread_ident is not None
+    assert adapter.producer_thread is not None
+    assert not adapter.producer_thread.is_alive()
+    assert len(cancellation_states) == 1
+    assert cancellation_states[0].is_consumer_aborted()
+    assert cancellation_states[0]._terminal_status is None
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     with pytest.raises(RuntimeError):
         _ = stream.terminal_result
+
+
+@pytest.mark.asyncio
+async def test_direct_consumer_task_cancel_waits_for_producer_cleanup_and_thread_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """consumer task cancellation 必须由 raw owner 等待 producer cleanup 与 join。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancellation 未传递、cleanup 未完成或线程遗留时抛出。
+    """
+
+    cancellation_states = _record_direct_cancellation_states(monkeypatch)
+    adapter = _ConsumerTaskCancelledDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): adapter},
+    )
+    stream = ingestion.download(build_fins_download_request(ticker="AAPL"))
+    collection_task = asyncio.create_task(_collect_direct_events(stream))
+    assert await asyncio.to_thread(adapter.entered.wait, 1.0)
+
+    collection_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collection_task, timeout=1.0)
+
+    assert adapter.cancellation_observed.is_set()
+    assert adapter.finished.is_set()
+    assert adapter.producer_thread_ident is not None
+    assert adapter.producer_thread is not None
+    assert not adapter.producer_thread.is_alive()
+    assert len(cancellation_states) == 1
+    assert cancellation_states[0].is_consumer_aborted()
+    assert cancellation_states[0]._terminal_status is None
+    await stream.aclose()
 
 
 def test_start_download_production_adapter_boundary_emits_progress_events(
@@ -5014,6 +5376,50 @@ def _progress_events(
         for event in ingestion.read_job_events(job_id, after_sequence=0, limit=1000)
         if event.event_type is FinsIngestionJobEventType.PROGRESS
     )
+
+
+def _record_direct_cancellation_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[ingestion_runtime._DirectStreamCancellationState]:
+    """记录 direct stream 真实使用的 cancellation owner state。
+
+    Args:
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        按创建顺序记录的 state 列表。
+
+    Raises:
+        无。
+    """
+
+    states: list[ingestion_runtime._DirectStreamCancellationState] = []
+
+    def create_state(
+        _state_type: type[ingestion_runtime._DirectStreamCancellationState],
+    ) -> ingestion_runtime._DirectStreamCancellationState:
+        """创建并记录一个真实 owner state。
+
+        Args:
+            _state_type: 被替换 classmethod 传入的 state 类型。
+
+        Returns:
+            新的 cancellation state。
+
+        Raises:
+            无。
+        """
+
+        state = ingestion_runtime._DirectStreamCancellationState(_lock=ThreadingLock())
+        states.append(state)
+        return state
+
+    monkeypatch.setattr(
+        ingestion_runtime._DirectStreamCancellationState,
+        "create",
+        classmethod(create_state),
+    )
+    return states
 
 
 async def _collect_direct_events(events: AsyncIterator[FinsEvent]) -> tuple[FinsEvent, ...]:

@@ -34,6 +34,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
+from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
 import dayu.fins.pipelines.cn_pipeline as cn_pipeline_module
 from dayu.fins.pipelines.cn_pipeline import (
     CN_DOWNLOAD_SOURCE,
@@ -241,17 +242,24 @@ class _RuntimeFakeDiscoveryClient:
 
 
 @dataclass
-class _RuntimeFakeConverter:
-    """runtime 接入测试用 Docling fake。"""
+class _RuntimeFakeConversionRunner(CnDoclingConversionRunner):
+    """runtime 接入测试用 typed Docling runner。"""
 
     calls: int = 0
 
-    def __call__(self, raw_data: bytes, stream_name: str) -> bytes:
+    async def convert_pdf_to_docling_json(
+        self,
+        pdf_bytes: bytes,
+        stream_name: str,
+        *,
+        cancellation_checker: Callable[[], bool],
+    ) -> bytes:
         """返回固定 Docling JSON 字节。
 
         Args:
-            raw_data: PDF 字节。
+            pdf_bytes: PDF 字节。
             stream_name: 流名称。
+            cancellation_checker: operation-scoped 取消检查器。
 
         Returns:
             Docling JSON 字节。
@@ -260,7 +268,8 @@ class _RuntimeFakeConverter:
             无。
         """
 
-        del raw_data, stream_name
+        del pdf_bytes, stream_name
+        assert cancellation_checker() is False
         self.calls += 1
         return _DOCLING_BYTES
 
@@ -291,7 +300,7 @@ class _RecordingPipeline(CnPipeline):
                 title="unused",
                 source_id="unused",
             ),
-            convert_pdf_to_docling_json=_RuntimeFakeConverter(),
+            docling_conversion_runner=_RuntimeFakeConversionRunner(),
         )
         self.recorded_rebuild_values: list[bool] = []
         self.result_filings: list[JsonValue] = []
@@ -969,7 +978,7 @@ def _build_runtime_with_cn_hk_adapters(
     FinsIngestionRuntime,
     _RuntimeFakeDiscoveryClient,
     _RuntimeFakeDiscoveryClient,
-    _RuntimeFakeConverter,
+    _RuntimeFakeConversionRunner,
 ]:
     """构造带 CN/HK fake adapter 的 runtime。
 
@@ -984,7 +993,7 @@ def _build_runtime_with_cn_hk_adapters(
     """
 
     repositories = _build_runtime_repositories(tmp_path)
-    converter = _RuntimeFakeConverter()
+    runner = _RuntimeFakeConversionRunner()
     cn_discovery = _RuntimeFakeDiscoveryClient(
         temp_dir=tmp_path,
         provider="cninfo",
@@ -1011,7 +1020,7 @@ def _build_runtime_with_cn_hk_adapters(
         filing_maintenance_repository=repositories.filing_maintenance_repository,
         cn_discovery_client=cn_discovery,
         hk_discovery_client=hk_discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
     runtime = FinsIngestionRuntime.create(
         batching_repository=repositories.batching_repository,
@@ -1045,7 +1054,7 @@ def _build_runtime_with_cn_hk_adapters(
             ),
         },
     )
-    return runtime, cn_discovery, hk_discovery, converter
+    return runtime, cn_discovery, hk_discovery, runner
 
 
 def _build_runtime_repositories(tmp_path: Path) -> _RuntimeRepositorySet:
