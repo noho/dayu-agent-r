@@ -438,6 +438,8 @@ prediction 经 `ORDINARY`、`POST_COMPACT`、`DISPATCH_FALLBACK`、`REACTIVE_POS
 
 accepted compact 与 compaction failure fallback 之后的普通 runner-call manifest 都只使用 `context_governance_resolved`，表示治理已经收口并允许 dispatch。该 trigger 不承诺 compact 成功；精确结果仍只由 canonical `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED`、compact artifact 与 fallback refs 拥有。
 
+当 bounded compact repair 耗尽并由 tier 4/5 dispatch fallback 继续普通 Run 时，RunInputBuilder 会从 typed active fallback 事实投影一条业务可读的 `Execution Guidance`：当前请求可能缺少更早材料，只能使用当前可见且直接支持结论的内容；缺失事实只能在工具可用且用户允许时重新获取，否则必须明确说明材料不足并请求重新获取或提供证据。该文本不暴露 compact operation、fallback tier、artifact、ref、digest、cursor 或 policy，也不进入普通无 fallback 的 RunInput。它只约束模型如何安全使用降级输入，不改变 fallback selection、Memory 或 Run terminal。
+
 ### Conversation Memory
 
 Conversation Memory 是 Session-level projection / read model，只消费 committed canonical facts 与 accepted `CONTEXT_COMPACTED` payload。完整 accepted terminal payload 由统一 durable payload boundary 按 inline 阈值写入 EventLog 或 payload descriptor/blob，并由 terminal permit、Memory、compact material、RunInputBuilder、projection 与 Tool Trace 共用同一严格 resolver；ref、digest、descriptor、blob bytes 或 canonical contract 任一漂移都 fail closed。它维护 selected recent window、evidence-backed facts、session summary、answer anchor、forward intent、reference continuity 和 diagnostics。Memory 可以重建，不是 EventLog truth。

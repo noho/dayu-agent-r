@@ -282,6 +282,22 @@ _SYSTEM_ENVELOPE_SECTION_ORDER = (
     _SYSTEM_SECTION_RECENT_EVIDENCE,
 )
 _EXECUTION_GUIDANCE_PREFIX = "Execution guidance:"
+_FALLBACK_GROUNDING_GUIDANCE = "\n".join(
+    (
+        _EXECUTION_GUIDANCE_PREFIX,
+        "Some earlier conversation material may be unavailable in the current request.",
+        (
+            "Use only facts directly supported by material visible in the current request. "
+            "Do not treat references to missing earlier content, prior assistant claims, "
+            "or general knowledge as evidence."
+        ),
+        (
+            "If required facts are absent, use an available tool only when the user's "
+            "instruction permits it. Otherwise, state that the available material is "
+            "insufficient and ask to retrieve or provide the missing evidence."
+        ),
+    )
+)
 _RECENT_EVIDENCE_PREFIX = "Recent evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
 _MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
@@ -2351,6 +2367,7 @@ def prepare_runner_call_candidate_in_transaction(
     candidate_messages = (
         *_system_prompt_message(facts.system_prompt),
         *_default_scene_messages(tool_execution_mode),
+        *_fallback_execution_guidance_messages(fallback),
         *bounded_context_messages,
         *_pre_start_current_user_tail(facts, continuity),
     )
@@ -3732,6 +3749,7 @@ class RunInputBuilder:
                 policy_snapshot,
                 self._tool_execution_mode,
             ),
+            *_fallback_execution_guidance_messages(fallback),
             *bounded_context_messages,
             *_current_user_tail_messages(current_facts, continuity),
         )
@@ -5069,6 +5087,26 @@ def _fallback_context_messages(
             continue
         messages.append(_fallback_message_from_material_block(block))
     return tuple(messages)
+
+
+def _fallback_execution_guidance_messages(
+    fallback: ActiveRecentWindowFallback | None,
+) -> tuple[SystemMessage, ...]:
+    """把 active dispatch fallback 投影为业务可读的证据边界说明。
+
+    :param fallback: 当前 Run 的 typed fallback view；缺失表示普通输入路径。
+    :returns: fallback 路径的一条 execution guidance；普通路径返回空元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if fallback is None:
+        return ()
+    return (
+        SystemMessage(
+            role=AgentMessageRole.SYSTEM,
+            content=_FALLBACK_GROUNDING_GUIDANCE,
+        ),
+    )
 
 
 def _selected_material_render_view(

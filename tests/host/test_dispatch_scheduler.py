@@ -6960,6 +6960,9 @@ async def test_proactive_same_operation_terminal_contenders_preserve_first_truth
             factory,
             context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=1,
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
             ),
             context_compactor=compactor,
             compact_artifact_root=artifact_root,
@@ -8508,6 +8511,9 @@ async def test_proactive_exhausted_fallback_normalizes_current_input_for_replay(
             factory,
             context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -8652,9 +8658,9 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             store,
             factory,
             context_budget_policy=_soft_compact_policy(
-                context_window_size=200,
+                context_window_size=512,
                 soft_threshold_tokens=70,
-                hard_threshold_tokens=200,
+                hard_threshold_tokens=400,
             ),
             memory_projection_policy=memory_policy,
             compact_artifact_root=compact_artifact_root,
@@ -8699,13 +8705,24 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             assert isinstance(payload["fallback_budget_result"], Mapping)
             assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
             assert _compact_artifact_files(compact_artifact_root) == ()
+            accepted_request = factory.accepted_requests[0]
             rendered = "\n".join(
                 content
-                for content in (_message_text(message) for message in factory.accepted_requests[0].messages)
+                for content in (_message_text(message) for message in accepted_request.messages)
                 if content is not None
             )
+            system_contents = tuple(
+                message.content for message in accepted_request.messages if isinstance(message, SystemMessage)
+            )
+            assert len(system_contents) == 1
+            system_content = system_contents[0]
             assert "recent protected fallback floor material" in rendered
             assert "older fallback floor material that must render" not in rendered
+            assert "Some earlier conversation material may be unavailable in the current request." in system_content
+            assert "Use only facts directly supported by material visible in the current request." in system_content
+            assert "state that the available material is insufficient" in system_content
+            for internal_fragment in ("compaction", "fallback", "tier 4", "tier 5", "Host"):
+                assert internal_fragment not in system_content
         finally:
             await scheduler.close()
 
@@ -8824,7 +8841,11 @@ async def test_pre_start_governance_invalid_incomplete_snapshot_fails_same_opera
             tmp_path,
             store,
             _FakeWorkerFactory(),
-            context_budget_policy=_soft_compact_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
+            ),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
@@ -9361,7 +9382,11 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             tmp_path,
             store,
             factory,
-            context_budget_policy=_soft_compact_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
+            ),
             lane_default_timeout_seconds=1.0,
             memory_projection_policy=_compact_floor_one_memory_policy(),
         )

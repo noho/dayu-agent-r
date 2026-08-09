@@ -2795,11 +2795,13 @@ def test_fallback_provider_renders_only_selected_window_and_current_input(
 
         request = builder.build(_attempt_snapshot(seeded))
         contents = tuple(_message_content(message) for message in request.messages)
+        system_content = _single_system_content(request.messages)
 
         assert "selected recent raw turn" in contents
         assert "current prompt" in contents
         assert "dropped older raw turn" not in contents
         assert "dropped older assistant turn" not in contents
+        _assert_fallback_grounding_guidance(system_content)
 
 
 def test_fallback_context_messages_render_all_and_only_selected_blocks() -> None:
@@ -8175,6 +8177,28 @@ def _expected_system_content() -> str:
             "Tools are disabled for this runner call.",
         )
     )
+
+
+def _assert_fallback_grounding_guidance(content: str) -> None:
+    """断言 fallback guidance 自足且不泄漏内部治理术语。
+
+    :param content: ordinary RunInput 的唯一 system envelope。
+    :returns: ``None``。
+    :raises AssertionError: grounding 语义缺失、重复或泄漏内部术语时抛出。
+    """
+
+    unavailable = "Some earlier conversation material may be unavailable in the current request."
+    assert unavailable in content
+    assert "Use only facts directly supported by material visible in the current request." in content
+    assert "Do not treat references to missing earlier content" in content
+    assert "prior assistant claims" in content
+    assert "general knowledge as evidence" in content
+    assert "use an available tool only when the user's instruction permits it" in content
+    assert "state that the available material is insufficient" in content
+    assert "ask to retrieve or provide the missing evidence" in content
+    assert content.count(unavailable) == 1
+    for internal_fragment in ("compaction", "fallback", "tier 4", "tier 5", "Host"):
+        assert internal_fragment not in content
 
 
 def _single_system_content(messages: tuple[AgentMessage, ...]) -> str:
