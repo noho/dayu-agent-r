@@ -18,6 +18,7 @@ from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
     DocumentHandle,
+    DocumentMeta,
     FileObjectMeta,
     ProcessedCreateRequest,
     ProcessedHandle,
@@ -25,6 +26,11 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.pipelines import cn_download_workflow as _cn_download_workflow
 from dayu.fins.pipelines import cn_download_filing_workflow as _cn_download_filing_workflow
 from dayu.fins.pipelines import cn_download_rebuild as _cn_download_rebuild
@@ -377,6 +383,49 @@ class _FailingDownloadDiscoveryClient(_FakeDiscoveryClient):
         raise RuntimeError("forced PDF download failure")
 
 
+class _FirstCandidateFailureDiscoveryClient(_FakeDiscoveryClient):
+    """仅让第一个 candidate 失败、后续 candidate 正常完成的 fake。"""
+
+    def __init__(
+        self,
+        *,
+        temp_dir: Path,
+        candidates: tuple[CnReportCandidate, ...],
+        failure: Exception,
+    ) -> None:
+        """初始化单 candidate failure fake。
+
+        Args:
+            failure: 首个 candidate 应原样抛出的异常。
+            temp_dir: 测试临时目录。
+            candidates: 固定候选序列。
+
+        Raises:
+            TypeError: fake 构造字段非法时抛出。
+        """
+
+        super().__init__(temp_dir=temp_dir, candidates=candidates)
+        self.failure = failure
+
+    def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """首个 candidate 抛错，后续复用成功实现。
+
+        Args:
+            candidate: 当前候选。
+
+        Returns:
+            非首个 candidate 的内存 PDF 资产。
+
+        Raises:
+            Exception: 首个 candidate 抛出预构造异常。
+        """
+
+        if candidate.source_id == "A1":
+            self.download_calls += 1
+            raise self.failure
+        return super().download_report_pdf(candidate)
+
+
 @dataclass
 class _FakeConverter:
     """Docling 转换 fake。"""
@@ -400,6 +449,56 @@ class _FakeConverter:
         del raw_data, stream_name
         self.calls += 1
         return _DOCLING_BYTES
+
+
+@dataclass
+class _FailingConverter:
+    """按配置抛出预构造异常的 Docling fake。"""
+
+    failure: Exception
+    calls: int = 0
+
+    def __call__(self, raw_data: bytes, stream_name: str) -> bytes:
+        """抛出预构造异常。
+
+        Args:
+            raw_data: PDF 字节。
+            stream_name: 流名称。
+
+        Returns:
+            不返回。
+
+        Raises:
+            Exception: 原样抛出 ``failure``。
+        """
+
+        del raw_data, stream_name
+        self.calls += 1
+        raise self.failure
+
+
+@dataclass
+class _FilingFailureProjectionSpy:
+    """记录 CN/HK 单 filing failure projection 调用的 spy。"""
+
+    delegate: Callable[[Exception], tuple[str, str]]
+    calls: list[Exception] = field(default_factory=list)
+
+    def __call__(self, error: Exception) -> tuple[str, str]:
+        """记录异常并调用真实 owner helper。
+
+        Args:
+            error: 待投影异常。
+
+        Returns:
+            真实 owner helper 返回的原因 pair。
+
+        Raises:
+            无。
+        """
+
+        self.calls.append(error)
+        return self.delegate(error)
 
 
 @dataclass
@@ -631,16 +730,14 @@ def _build_pipeline(
     shared_repository_set = repository_set or build_fs_repository_set(workspace_root=tmp_path)
     return CnPipeline(
         workspace_root=tmp_path,
-        batching_repository=batching_repository
-        or FsBatchingRepository(tmp_path, repository_set=shared_repository_set),
+        batching_repository=batching_repository or FsBatchingRepository(tmp_path, repository_set=shared_repository_set),
         company_repository=company_repository
         or FsCompanyMetaRepository(tmp_path, repository_set=shared_repository_set),
         source_repository=source_repository
         or FsSourceDocumentRepository(tmp_path, repository_set=shared_repository_set),
         processed_repository=processed_repository
         or FsProcessedDocumentRepository(tmp_path, repository_set=shared_repository_set),
-        blob_repository=blob_repository
-        or FsDocumentBlobRepository(tmp_path, repository_set=shared_repository_set),
+        blob_repository=blob_repository or FsDocumentBlobRepository(tmp_path, repository_set=shared_repository_set),
         filing_maintenance_repository=FsFilingMaintenanceRepository(
             tmp_path,
             repository_set=shared_repository_set,
@@ -733,6 +830,80 @@ async def _collect_events_async(
     return events
 
 
+def _collect_single_filing_events(
+    *,
+    pipeline: CnPipeline,
+    candidate: CnReportCandidate,
+    cancel_checker: Callable[[], bool] | None = None,
+) -> list[DownloadEvent]:
+    """同步收集真实 CN/HK 单 filing owner 事件。
+
+    Args:
+        pipeline: 提供真实仓储与注入依赖的 CN pipeline。
+        candidate: 待执行候选。
+        cancel_checker: 可选取消检查器。
+
+    Returns:
+        单 filing owner 产生的完整事件列表。
+
+    Raises:
+        Exception: owner 未消费的异常原样传播。
+    """
+
+    return asyncio.run(
+        _collect_single_filing_events_async(
+            pipeline=pipeline,
+            candidate=candidate,
+            cancel_checker=cancel_checker,
+        )
+    )
+
+
+async def _collect_single_filing_events_async(
+    *,
+    pipeline: CnPipeline,
+    candidate: CnReportCandidate,
+    cancel_checker: Callable[[], bool] | None,
+) -> list[DownloadEvent]:
+    """异步收集真实 CN/HK 单 filing owner 事件。
+
+    Args:
+        pipeline: 提供真实仓储与注入依赖的 CN pipeline。
+        candidate: 待执行候选。
+        cancel_checker: 可选取消检查器。
+
+    Returns:
+        单 filing owner 产生的完整事件列表。
+
+    Raises:
+        Exception: owner 未消费的异常原样传播。
+    """
+
+    events: list[DownloadEvent] = []
+    async for event in _cn_download_filing_workflow.run_cn_download_single_filing_stream(
+        batching_repository=pipeline.batching_repository,
+        source_repository=pipeline.source_repository,
+        blob_repository=pipeline.blob_repository,
+        processed_repository=pipeline.processed_repository,
+        discovery_client=pipeline.cn_discovery_client,
+        pdf_download_gate=pipeline.pdf_download_gate,
+        convert_pdf_to_docling_json=pipeline.convert_pdf_to_docling_json,
+        ticker="600519",
+        profile=CnCompanyProfile(
+            provider="cninfo",
+            company_id="CNINFO:9900000600",
+            company_name="贵州茅台",
+            ticker="600519",
+        ),
+        candidate=candidate,
+        overwrite=False,
+        cancel_checker=cancel_checker,
+        module="TEST",
+    ):
+        events.append(event)
+    return events
+
+
 def _final_result(events: list[DownloadEvent]) -> dict[str, JsonValue]:
     """读取最终 pipeline result。
 
@@ -817,10 +988,9 @@ def test_cn_company_publication_failure_rolls_back_once(tmp_path: Path) -> None:
         ),
     )
 
-    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+    with pytest.raises(OSError, match="forced company publication failure"):
+        _collect_events(pipeline, start_is_explicit=True)
 
-    assert result["status"] == "failed"
-    assert result["reason_code"] == "cn_download_failed"
     assert batching_repository.begin_calls == 1
     assert batching_repository.commit_calls == 0
     assert batching_repository.rollback_calls == 1
@@ -925,8 +1095,10 @@ def test_cn_rebuild_cancel_checker_contract() -> None:
 
         raise ValueError("broken checker")
 
-    assert _cn_download_rebuild._is_cancel_requested(_raise_cancelled) is True
-    with pytest.raises(RuntimeError, match="broken checker"):
+    with pytest.raises(CnDownloadCancelledError) as cancel_error:
+        _cn_download_rebuild._is_cancel_requested(_raise_cancelled)
+    assert cancel_error.value is expected
+    with pytest.raises(ValueError, match="broken checker"):
         _cn_download_rebuild._is_cancel_requested(_raise_failure)
     assert _cn_download_rebuild._optional_period(None) is None
 
@@ -939,7 +1111,7 @@ def test_cn_workflow_cancel_and_log_projection_contract() -> None:
 
         raise ValueError("broken checker")
 
-    with pytest.raises(RuntimeError, match="broken checker"):
+    with pytest.raises(ValueError, match="broken checker"):
         _cn_download_workflow._is_cancel_requested(_raise_failure)
     with pytest.raises(CnDownloadCancelledError, match="操作已被取消"):
         _cn_download_workflow._raise_if_cancelled(
@@ -989,9 +1161,7 @@ def test_cn_replacement_separates_company_and_document_transactions(
     rollback_calls = batching_repository.rollback_calls
     discovery.pdf_bytes = _PDF_BYTES + b"replacement"
 
-    result = _final_result(
-        _collect_events(pipeline, start_is_explicit=True, overwrite=True)
-    )
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True, overwrite=True))
 
     phases = [phase for phase, _ in batching_repository.phases]
     batch_ids = {batch_id for _, batch_id in batching_repository.phases}
@@ -1090,9 +1260,7 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
     source_repository.fail_final = True
     discovery.pdf_bytes = _PDF_BYTES + b"replacement"
 
-    result = _final_result(
-        _collect_events(pipeline, start_is_explicit=True, overwrite=True)
-    )
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True, overwrite=True))
 
     summary = result["summary"]
     assert isinstance(summary, dict)
@@ -1235,6 +1403,7 @@ def test_cn_rebuild_updates_only_source_in_one_batch(tmp_path: Path) -> None:
         document_id,
     )
     assert result["status"] == "ok"
+    assert result["missing_periods"] == []
     assert phase_names == ["begin", "final_meta", "commit"]
     assert len(transaction_ids) == 1
     assert batching_repository.begin_calls == begin_calls + 1
@@ -1242,10 +1411,94 @@ def test_cn_rebuild_updates_only_source_in_one_batch(tmp_path: Path) -> None:
     assert batching_repository.rollback_calls == rollback_calls
     assert processed_meta["reprocess_required"] is False
     assert blob_repository.read_file_bytes(source_handle, f"{document_id}.pdf") == source_pdf_before
-    assert (
-        blob_repository.read_file_bytes(source_handle, f"{document_id}_docling.json")
-        == source_docling_before
+    assert blob_repository.read_file_bytes(source_handle, f"{document_id}_docling.json") == source_docling_before
+
+
+def test_cn_rebuild_producer_always_emits_required_missing_periods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """零文档、匹配、失败文档与取消结果都由 producer 直接发必填字段。"""
+
+    empty_pipeline = _build_pipeline(
+        tmp_path=tmp_path / "empty",
+        discovery=_FakeDiscoveryClient(temp_dir=tmp_path, candidates=()),
+        converter=_FakeConverter(),
     )
+    empty_result = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=empty_pipeline,
+        ticker="600519",
+        market="CN",
+        form_type="FY",
+        start_date="2024",
+        end_date="2026",
+        overwrite=False,
+        pipeline_name="cn",
+    )
+    assert empty_result["missing_periods"] == []
+
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path / "seeded",
+        discovery=_FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),)),
+        converter=_FakeConverter(),
+    )
+    _collect_events(pipeline, start_is_explicit=True)
+    matching_result = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=pipeline,
+        ticker="600519",
+        market="CN",
+        form_type="FY",
+        start_date="2024",
+        end_date="2026",
+        overwrite=False,
+        pipeline_name="cn",
+    )
+    assert matching_result["missing_periods"] == []
+
+    original_get_meta = pipeline.source_repository.get_source_meta
+
+    def missing_form_meta(
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> dict[str, JsonValue]:
+        """返回删除必填 form_type 的 source meta。"""
+
+        meta = dict(original_get_meta(ticker, document_id, source_kind))
+        meta.pop("form_type", None)
+        return meta
+
+    monkeypatch.setattr(pipeline.source_repository, "get_source_meta", missing_form_meta)
+    failed_result = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=pipeline,
+        ticker="600519",
+        market="CN",
+        form_type="FY",
+        start_date="2024",
+        end_date="2026",
+        overwrite=False,
+        pipeline_name="cn",
+    )
+    assert failed_result["missing_periods"] == []
+    failed_filings = failed_result["filings"]
+    assert isinstance(failed_filings, list)
+    assert isinstance(failed_filings[0], dict)
+    assert failed_filings[0]["status"] == "failed"
+
+    monkeypatch.setattr(pipeline.source_repository, "get_source_meta", original_get_meta)
+    cancelled_result = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=pipeline,
+        ticker="600519",
+        market="CN",
+        form_type="FY",
+        start_date="2024",
+        end_date="2026",
+        overwrite=False,
+        pipeline_name="cn",
+        cancel_checker=lambda: True,
+    )
+    assert cancelled_result["status"] == "cancelled"
+    assert cancelled_result["missing_periods"] == []
 
 
 def test_cn_active_batch_sync_cancelled_error_rolls_back_once(tmp_path: Path) -> None:
@@ -1341,9 +1594,7 @@ def test_cn_commit_failure_does_not_trigger_caller_rollback_or_success(tmp_path:
     assert summary["failed"] == 1
     assert batching_repository.commit_calls == 2
     assert batching_repository.rollback_calls == 0
-    assert DownloadEventType.FILING_COMPLETED not in {
-        event.event_type for event in events
-    }
+    assert DownloadEventType.FILING_COMPLETED not in {event.event_type for event in events}
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta("600519", "fil2024", SourceKind.FILING)
 
@@ -1407,12 +1658,317 @@ def test_cn_pdf_download_failure_leaves_document_absent(tmp_path: Path) -> None:
     summary = result["summary"]
     assert isinstance(summary, dict)
     assert summary["failed"] == 1
+    filings = result["filings"]
+    assert isinstance(filings, list)
+    first_filing = filings[0]
+    assert isinstance(first_filing, dict)
+    assert first_filing["reason_code"] == "filing_execution_failed"
+    assert first_filing["reason_message"] == "财报文档执行失败"
+    assert "forced PDF" not in str(first_filing)
     with pytest.raises(FileNotFoundError):
         pipeline.source_repository.get_source_meta(
             "600519",
             document_id,
             SourceKind.FILING,
         )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_reason_code", "expected_safe_message"),
+    [
+        (
+            FinsDownloadProviderError(
+                source=FinsDownloadSource.CNINFO,
+                transport_category=FinsDownloadTransportCategory.TIMEOUT,
+                retryable=True,
+                safe_message="巨潮来源请求超时",
+            ),
+            "provider_timeout",
+            "巨潮来源请求超时",
+        ),
+        (
+            OSError("/Users/private/contact-canary/report.pdf"),
+            "storage_failed",
+            "下载产物读写失败",
+        ),
+        (
+            RuntimeError("raw https://secret.invalid/payload"),
+            "filing_execution_failed",
+            "财报文档执行失败",
+        ),
+    ],
+)
+def test_cn_candidate_failure_uses_closed_safe_facts_and_continues(
+    tmp_path: Path,
+    failure: Exception,
+    expected_reason_code: str,
+    expected_safe_message: str,
+) -> None:
+    """单文档失败只投影安全事实，并允许后续 candidate 完成。"""
+
+    discovery = _FirstCandidateFailureDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(_candidate(source_id="A1"), _candidate(source_id="A2")),
+        failure=failure,
+    )
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+    )
+
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+    filings = result["filings"]
+    assert isinstance(filings, list)
+    filing_rows = [filing for filing in filings if isinstance(filing, dict)]
+    assert len(filing_rows) == len(filings)
+    assert [filing["status"] for filing in filing_rows] == ["failed", "downloaded"]
+    assert filing_rows[0]["reason_code"] == expected_reason_code
+    assert filing_rows[0]["reason_message"] == expected_safe_message
+    serialized = str(filing_rows[0])
+    assert "secret.invalid" not in serialized
+    assert "/Users/private" not in serialized
+    assert "contact-canary" not in serialized
+
+
+@pytest.mark.parametrize("stage", ["pdf", "docling"])
+@pytest.mark.parametrize(
+    ("failure", "expected_reason_code", "expected_safe_message"),
+    [
+        (
+            FinsDownloadProviderError(
+                source=FinsDownloadSource.CNINFO,
+                transport_category=FinsDownloadTransportCategory.TIMEOUT,
+                retryable=True,
+                safe_message="巨潮来源请求超时",
+            ),
+            "provider_timeout",
+            "巨潮来源请求超时",
+        ),
+        (
+            OSError("/Users/private/contact-canary/report.pdf"),
+            "storage_failed",
+            "下载产物读写失败",
+        ),
+        (
+            RuntimeError("raw https://secret.invalid/payload payload-marker contact@example.invalid"),
+            "filing_execution_failed",
+            "财报文档执行失败",
+        ),
+    ],
+)
+def test_cn_single_filing_owner_projects_closed_failure_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    failure: Exception,
+    expected_reason_code: str,
+    expected_safe_message: str,
+) -> None:
+    """PDF/Docling owner 应直接投影一次并只公开同一安全原因 pair。"""
+
+    candidate = _candidate(source_id="A1")
+    if stage == "pdf":
+        discovery: _FakeDiscoveryClient = _FirstCandidateFailureDiscoveryClient(
+            temp_dir=tmp_path,
+            candidates=(candidate,),
+            failure=failure,
+        )
+        converter: Callable[[bytes, str], bytes] = _FakeConverter()
+    elif stage == "docling":
+        discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(candidate,))
+        converter = _FailingConverter(failure=failure)
+    else:
+        raise AssertionError(f"未知测试阶段: {stage}")
+
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=converter,
+    )
+    projection_spy = _FilingFailureProjectionSpy(delegate=_cn_download_filing_workflow.project_cn_filing_failure)
+    logs: list[str] = []
+    monkeypatch.setattr(
+        _cn_download_filing_workflow,
+        "project_cn_filing_failure",
+        projection_spy,
+    )
+    monkeypatch.setattr(
+        _cn_download_filing_workflow.Log,
+        "info",
+        lambda message, *, module: logs.append(f"{module}:{message}"),
+    )
+
+    events = _collect_single_filing_events(
+        pipeline=pipeline,
+        candidate=candidate,
+    )
+
+    assert len(projection_spy.calls) == 1
+    assert projection_spy.calls[0] is failure
+    filing_terminals = [
+        event
+        for event in events
+        if event.event_type in {DownloadEventType.FILING_COMPLETED, DownloadEventType.FILING_FAILED}
+    ]
+    assert [event.event_type for event in filing_terminals] == [DownloadEventType.FILING_FAILED]
+    filing_failed = filing_terminals[0]
+    expected_pair = (expected_reason_code, expected_safe_message)
+    assert (
+        filing_failed.payload["reason_code"],
+        filing_failed.payload["reason_message"],
+    ) == expected_pair
+
+    file_failures = [event for event in events if event.event_type is DownloadEventType.FILE_FAILED]
+    if stage == "pdf":
+        assert len(file_failures) == 1
+        assert (
+            file_failures[0].payload["reason_code"],
+            file_failures[0].payload["reason_message"],
+        ) == expected_pair
+    else:
+        assert file_failures == []
+
+    serialized = f"{[event.payload for event in events]} {' '.join(logs)}"
+    for forbidden in (
+        "secret.invalid",
+        "/Users/private",
+        "contact-canary",
+        "contact@example.invalid",
+        "payload-marker",
+        "Traceback",
+    ):
+        assert forbidden not in serialized
+
+
+def test_cn_single_filing_owner_preserves_cancel_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PDF owner 应让 typed cancellation 原样逸出且不调用 failure helper。"""
+
+    expected = CnDownloadCancelledError("caller cancelled during PDF")
+    candidate = _candidate(source_id="A1")
+    discovery = _FirstCandidateFailureDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(candidate,),
+        failure=expected,
+    )
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+    )
+    projection_spy = _FilingFailureProjectionSpy(delegate=_cn_download_filing_workflow.project_cn_filing_failure)
+    monkeypatch.setattr(
+        _cn_download_filing_workflow,
+        "project_cn_filing_failure",
+        projection_spy,
+    )
+
+    with pytest.raises(CnDownloadCancelledError) as exc_info:
+        _collect_single_filing_events(
+            pipeline=pipeline,
+            candidate=candidate,
+        )
+
+    assert exc_info.value is expected
+    assert projection_spy.calls == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FinsDownloadProviderError(
+            source=FinsDownloadSource.CNINFO,
+            transport_category=FinsDownloadTransportCategory.CONNECTION,
+            retryable=True,
+            safe_message="巨潮来源连接失败",
+        ),
+        OSError("/Users/private/contact-canary/leaked-owner.pdf"),
+        RuntimeError("raw https://secret.invalid/parent payload-marker contact@example.invalid"),
+    ],
+)
+def test_cn_parent_leak_catch_reuses_filing_owner_pair_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    """父 workflow 防御 catch 应直接复用 child owner pair 并继续后续文档。"""
+
+    discovery = _FakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(_candidate(source_id="A1"), _candidate(source_id="A2")),
+    )
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+    )
+    original_get_source_meta = pipeline.source_repository.get_source_meta
+    source_meta_calls = 0
+
+    def fail_first_source_meta(
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> DocumentMeta:
+        """第一次读取抛出预构造异常，之后调用真实仓储。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: source 类型。
+
+        Returns:
+            后续调用的真实 published meta。
+
+        Raises:
+            Exception: 第一次调用原样抛出 ``failure``。
+            FileNotFoundError: 后续真实仓储没有文档时抛出。
+        """
+
+        nonlocal source_meta_calls
+        source_meta_calls += 1
+        if source_meta_calls == 1:
+            raise failure
+        return original_get_source_meta(ticker, document_id, source_kind)
+
+    monkeypatch.setattr(
+        pipeline.source_repository,
+        "get_source_meta",
+        fail_first_source_meta,
+    )
+    projection_spy = _FilingFailureProjectionSpy(delegate=_cn_download_filing_workflow.project_cn_filing_failure)
+    monkeypatch.setattr(
+        _cn_download_workflow,
+        "project_cn_filing_failure",
+        projection_spy,
+    )
+
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+
+    filings = result["filings"]
+    assert isinstance(filings, list)
+    filing_rows = [filing for filing in filings if isinstance(filing, dict)]
+    assert len(filing_rows) == len(filings)
+    assert [filing["status"] for filing in filing_rows] == ["failed", "downloaded"]
+    assert len(projection_spy.calls) == 1
+    assert projection_spy.calls[0] is failure
+    assert (
+        filing_rows[0]["reason_code"],
+        filing_rows[0]["reason_message"],
+    ) == _cn_download_filing_workflow.project_cn_filing_failure(failure)
+    serialized = str(filing_rows[0])
+    for forbidden in (
+        "secret.invalid",
+        "/Users/private",
+        "contact-canary",
+        "contact@example.invalid",
+        "payload-marker",
+        "Traceback",
+    ):
+        assert forbidden not in serialized
 
 
 def test_cn_docling_conversion_failure_leaves_document_absent(tmp_path: Path) -> None:
@@ -1497,9 +2053,7 @@ def test_cn_download_cancel_after_pdf_download_does_not_start_docling(
     assert summary["failed"] == 0
     assert discovery.download_calls == 1
     assert converter.calls == 0
-    assert DownloadEventType.CONVERSION_STARTED not in {
-        event.event_type for event in events
-    }
+    assert DownloadEventType.CONVERSION_STARTED not in {event.event_type for event in events}
 
 
 def test_cn_outer_generator_close_before_conversion_leaves_no_document(tmp_path: Path) -> None:
@@ -1617,9 +2171,7 @@ def test_cn_download_cancel_after_docling_convert_skips_source_commit(
     converter = _CancelAfterConvertConverter(cancel_state=cancel_state)
     pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
 
-    events = _collect_events(
-        pipeline, start_is_explicit=True, cancel_checker=cancel_state
-    )
+    events = _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_state)
     result = _final_result(events)
     summary = result["summary"]
     document_id, _ = build_cn_filing_ids(
@@ -1639,9 +2191,7 @@ def test_cn_download_cancel_after_docling_convert_skips_source_commit(
             document_id,
             SourceKind.FILING,
         )
-    assert DownloadEventType.FILING_COMPLETED not in {
-        event.event_type for event in events
-    }
+    assert DownloadEventType.FILING_COMPLETED not in {event.event_type for event in events}
 
 
 def test_cn_cancel_checker_preserves_cancel_exception_object() -> None:
@@ -1687,9 +2237,7 @@ def test_cn_workflow_maps_bool_true_inside_single_owned_checkpoint(
         raw_calls += 1
         return raw_calls == 4
 
-    events = _collect_events(
-        pipeline, start_is_explicit=True, cancel_checker=cancel_checker
-    )
+    events = _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
     result = _final_result(events)
 
     assert result["status"] == "cancelled"
@@ -1730,9 +2278,7 @@ def test_cn_workflow_preserves_caller_cancel_object_through_checkpoint(
             raise expected
         return False
 
-    result = _final_result(
-        _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
-    )
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker))
 
     assert result["status"] == "cancelled"
     assert discovery.checkpoint_errors == [expected]
@@ -1756,24 +2302,20 @@ def test_cn_workflow_cancel_before_first_candidate_suppresses_download(
         raw_calls += 1
         return raw_calls == 6
 
-    events = _collect_events(
-        pipeline, start_is_explicit=True, cancel_checker=cancel_checker
-    )
+    events = _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
     result = _final_result(events)
 
     assert result["status"] == "cancelled"
     assert raw_calls == 6
     assert discovery.download_calls == 0
     assert converter.calls == 0
-    assert DownloadEventType.FILING_STARTED not in {
-        event.event_type for event in events
-    }
+    assert DownloadEventType.FILING_STARTED not in {event.event_type for event in events}
 
 
-def test_cn_workflow_wraps_checkpoint_non_cancel_failure_with_direct_cause(
+def test_cn_workflow_preserves_checkpoint_non_cancel_failure_identity(
     tmp_path: Path,
 ) -> None:
-    """raw checker 非取消失败只由 workflow owner 包装，且 direct cause 不丢失。"""
+    """raw checker 非取消失败应原样越过 workflow/stream/collector。"""
 
     discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
     converter = _FakeConverter()
@@ -1788,15 +2330,11 @@ def test_cn_workflow_wraps_checkpoint_non_cancel_failure_with_direct_cause(
             raise expected
         return False
 
-    result = _final_result(
+    with pytest.raises(ValueError) as exc_info:
         _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
-    )
 
-    assert result["status"] == "failed"
-    assert len(discovery.checkpoint_errors) == 1
-    workflow_error = discovery.checkpoint_errors[0]
-    assert type(workflow_error) is RuntimeError
-    assert workflow_error.__cause__ is expected
+    assert exc_info.value is expected
+    assert discovery.checkpoint_errors == []
     assert discovery.download_calls == 0
     assert converter.calls == 0
 
@@ -1861,6 +2399,4 @@ def test_cn_download_reports_missing_independent_quarter_outside_document_counts
     assert filings == []
     assert discovery.download_calls == 0
     assert converter.calls == 0
-    assert DownloadEventType.FILING_COMPLETED not in {
-        event.event_type for event in events
-    }
+    assert DownloadEventType.FILING_COMPLETED not in {event.event_type for event in events}

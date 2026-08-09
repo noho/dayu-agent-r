@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from types import TracebackType
 from typing import BinaryIO, Literal, Optional, Protocol
 
@@ -567,6 +568,31 @@ class SourceDocumentRepositoryProtocol(Protocol):
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
         """
+        ...
+
+    def get_source_document_locator(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> PurePosixPath:
+        """返回 published source 文档目录的 workspace-relative locator。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material 来源类型。
+
+        Returns:
+            storage owner 校验且只用于定位的相对 POSIX locator。
+
+        Raises:
+            FileNotFoundError: published source meta 不存在时抛出。
+            ValueError: identity、source kind 或 meta 不一致时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published tree 读取失败时抛出。
+        """
+
         ...
 
     def read_source_snapshot(

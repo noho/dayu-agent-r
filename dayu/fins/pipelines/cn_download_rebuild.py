@@ -17,7 +17,6 @@ from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateReque
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
     CN_PIPELINE_DOWNLOAD_VERSION,
-    CnDownloadCancelledError,
     CnFiscalPeriod,
     CnMarketKind,
 )
@@ -119,6 +118,7 @@ def rebuild_cn_download_artifacts(
         "warnings": warning_values,
         "notes": note_values,
         "filings": filing_values,
+        "missing_periods": [],
         "summary": _build_rebuild_summary(filings=filings, elapsed_ms=elapsed_ms),
     }
     return result
@@ -282,17 +282,13 @@ def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
         True 表示已取消。
 
     Raises:
-        RuntimeError: 取消检查函数自身失败时抛出。
+        CnDownloadCancelledError: 检查器主动抛出的取消异常原样传播。
+        Exception: provider、storage 或 execution 异常原样传播。
     """
 
     if cancel_checker is None:
         return False
-    try:
-        return cancel_checker()
-    except CnDownloadCancelledError:
-        return True
-    except Exception as exc:
-        raise RuntimeError(f"取消检查失败: {exc}") from exc
+    return cancel_checker()
 
 
 def _resolve_source_fingerprint(*, previous_meta: JsonObject, file_entries: list[JsonObject]) -> str:

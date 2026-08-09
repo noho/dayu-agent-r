@@ -10,6 +10,7 @@ from typing import Optional, Protocol, TypeVar
 
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry, SourceHandle
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import FinsDownloadProviderError
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
@@ -155,6 +156,7 @@ class SecDownloadFilingWorkflowHost(Protocol):
 
         ...
 
+
 _AwaitableResult = TypeVar("_AwaitableResult")
 
 
@@ -282,6 +284,25 @@ async def run_download_single_filing_stream(
         )
     except SecDownloadCancelledError:
         return
+    except FinsDownloadProviderError as exc:
+        filing_result = {
+            "document_id": document_id,
+            "internal_document_id": internal_document_id,
+            "status": "failed",
+            "form_type": filing.form_type,
+            "filing_date": filing.filing_date,
+            "report_date": filing.report_date,
+            "error": f"provider_{exc.transport_category.value}",
+            "reason_code": f"provider_{exc.transport_category.value}",
+            "reason_message": exc.safe_message,
+        }
+        yield DownloadEvent(
+            event_type=DownloadEventType.FILING_FAILED,
+            ticker=ticker,
+            document_id=document_id,
+            payload=build_download_filing_event_payload(filing_result),
+        )
+        return
     source_fingerprint = build_source_fingerprint(remote_files)
     skip_reason = host._can_skip(
         previous_meta,
@@ -329,10 +350,7 @@ async def run_download_single_filing_stream(
         if not keep:
             if category == "DOWNLOAD_FAILED":
                 Log.warn(
-                    (
-                        "6-K 预下载失败，终止落盘: "
-                        f"ticker={ticker} document_id={document_id} file={selected_name}"
-                    ),
+                    "6-K 预下载筛选失败，未生成可用主文档",
                     module=host.MODULE,
                 )
                 filing_result = {

@@ -22,9 +22,8 @@
   amended 优先与 ``CnReportCandidate`` 构造由
   ``dayu.fins.pipelines.cn_report_selection`` 持有；本 downloader 只拉取
   provider raw announcement 并提供 HEAD / GET HTTP 边界。
-- HEAD 失败、PDF magic bytes 校验失败仅影响该 candidate，不让整个
-  ticker 流程崩。公告分类查询失败属于 discovery 阶段远端错误，必须抛
-  ``RuntimeError``，避免被 workflow 误报成缺报告 skipped。
+- HEAD 失败仅缺省可选元数据。公告分类请求或协议失败由本 owner 映射为
+  脱敏 typed provider failure，避免被 workflow 误报成缺报告 skipped。
 - 接口契约 / 公告字段非正式开放，参数随时变化；本模块**只**消费稳定字段，
   其余字段忽略，避免实现绑死巨潮 schema。
 """
@@ -33,7 +32,6 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import json
 import re
 import time
 from collections.abc import Callable
@@ -41,9 +39,13 @@ from dataclasses import dataclass
 from typing import Final, Optional, TypeAlias, cast
 
 import httpx
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
-    CnDownloadCancelledError,
     CnFiscalPeriod,
     CnReportHeadMeta,
     CnReportCandidate,
@@ -79,18 +81,14 @@ _PERIOD_TO_CATEGORY: Final[dict[CnFiscalPeriod, str]] = {
     "Q1": "category_yjdbg_szsh;",
     "Q3": "category_sjdbg_szsh;",
 }
-_CNINFO_UNSUPPORTED_INDEPENDENT_PERIODS: Final[frozenset[CnFiscalPeriod]] = frozenset(
-    {"Q2", "Q4"}
-)
+_CNINFO_UNSUPPORTED_INDEPENDENT_PERIODS: Final[frozenset[CnFiscalPeriod]] = frozenset({"Q2", "Q4"})
 
 _PDF_MAGIC_BYTES: Final[bytes] = b"%PDF-"
 _PDF_MIN_BYTES: Final[int] = 1024  # 1 KiB；正常财报 PDF 至少几百 KB。
 _CNINFO_ADJUNCT_TYPE_PDF: Final[str] = "PDF"
 
 # A 股 ticker 前缀 -> 巨潮 column / plate 映射。
-_TICKER_PREFIX_TO_MARKET_PARAMS: Final[
-    dict[str, tuple[str, str]]
-] = {
+_TICKER_PREFIX_TO_MARKET_PARAMS: Final[dict[str, tuple[str, str]]] = {
     # 深市主板 / 中小板 / 创业板
     "000": ("szse", "sz"),
     "001": ("szse", "sz"),
@@ -177,9 +175,7 @@ class CninfoDiscoveryClient:
         self._page_size = page_size
         if sleep_func is not None and not callable(sleep_func):
             raise ValueError("sleep_func 必须是可调用对象")
-        self._sleep_func: Callable[[float], None] = (
-            sleep_func if sleep_func is not None else time.sleep
-        )
+        self._sleep_func: Callable[[float], None] = sleep_func if sleep_func is not None else time.sleep
         self._last_request_finished_at: float | None = None
         self._stock_mapping_cache: dict[str, _CninfoCompanyLookupEntry] | None = None
 
@@ -212,7 +208,7 @@ class CninfoDiscoveryClient:
 
         Raises:
             ValueError: ``market`` 非 CN，或巨潮主源未命中此 ticker 时抛出。
-            RuntimeError: 主源接口请求失败时抛出。
+            FinsDownloadProviderError: 主源请求或响应协议失败时抛出。
         """
 
         if query.market != "CN":
@@ -256,7 +252,7 @@ class CninfoDiscoveryClient:
 
         Raises:
             ValueError: market/provider/company_id 非法时抛出。
-            RuntimeError: 任一有效财期分类的底层请求或 JSON 解析失败时抛出。
+            FinsDownloadProviderError: 任一有效财期来源请求或协议失败时抛出。
         """
 
         if query.market != "CN":
@@ -281,23 +277,16 @@ class CninfoDiscoveryClient:
                     continue
                 Log.warn(f"未知 fiscal_period={period!r}，已跳过", module=_MODULE)
                 continue
-            try:
-                announcements = self._query_announcements(
-                    column=context.column,
-                    plate=context.plate,
-                    stock=ticker,
-                    org_id=org_id,
-                    category=category,
-                    start_date=query.start_date,
-                    end_date=query.end_date,
-                    cancellation_checkpoint=cancellation_checkpoint,
-                )
-            except CnDownloadCancelledError:
-                raise
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    f"巨潮公告分类查询失败: ticker={ticker} period={period} category={category} error={exc}"
-                ) from exc
+            announcements = self._query_announcements(
+                column=context.column,
+                plate=context.plate,
+                stock=ticker,
+                org_id=org_id,
+                category=category,
+                start_date=query.start_date,
+                end_date=query.end_date,
+                cancellation_checkpoint=cancellation_checkpoint,
+            )
             raw_by_period[period] = tuple(announcements)
         return select_cninfo_report_candidates(
             query=query,
@@ -310,7 +299,8 @@ class CninfoDiscoveryClient:
 
         实现细节：
 
-        - 校验 PDF magic bytes（``%PDF-``）与最小字节数；非 PDF 抛 RuntimeError。
+        - 校验 PDF magic bytes（``%PDF-``）与最小字节数；非 PDF 抛 typed
+          protocol failure。
         - 已校验 PDF 直接通过 ``DownloadedReportAsset.pdf_bytes`` 交付。
         - HTTP 失败按 ``max_retries`` 重试（指数退避）。
 
@@ -321,22 +311,17 @@ class CninfoDiscoveryClient:
             :class:`DownloadedReportAsset`。
 
         Raises:
-            RuntimeError: 下载失败、PDF 校验失败、HTTP 状态码异常时抛出。
+            ValueError: candidate 来源不属于巨潮时抛出。
+            FinsDownloadProviderError: 下载或 PDF 协议校验失败时抛出。
         """
 
         if candidate.provider != "cninfo":
-            raise RuntimeError(
-                f"CninfoDiscoveryClient 不支持 provider={candidate.provider!r}"
-            )
+            raise ValueError(f"CninfoDiscoveryClient 不支持 provider={candidate.provider!r}")
         payload = self._http_download_bytes(candidate.source_url)
         if len(payload) < _PDF_MIN_BYTES:
-            raise RuntimeError(
-                f"PDF 字节数过小 ({len(payload)} bytes)，url={candidate.source_url}"
-            )
+            raise _cninfo_protocol_error("巨潮来源返回的 PDF 内容不符合预期")
         if not payload.startswith(_PDF_MAGIC_BYTES):
-            raise RuntimeError(
-                f"PDF magic bytes 校验失败，url={candidate.source_url}"
-            )
+            raise _cninfo_protocol_error("巨潮来源返回的 PDF 内容不符合预期")
         sha256 = _sha256_hex(payload)
         downloaded_at = _utc_now_isoformat()
         return DownloadedReportAsset(
@@ -388,7 +373,7 @@ class CninfoDiscoveryClient:
 
         Raises:
             ValueError: 公告搜索结果未命中 ticker 时抛出。
-            RuntimeError: 主源接口请求失败或响应字段缺失时抛出。
+            FinsDownloadProviderError: 主源请求或响应协议失败时抛出。
         """
 
         del context
@@ -408,7 +393,7 @@ class CninfoDiscoveryClient:
             ``code -> _CninfoCompanyLookupEntry`` 映射。
 
         Raises:
-            RuntimeError: 主源接口请求失败或响应字段缺失时抛出。
+            FinsDownloadProviderError: 主源请求或响应协议失败时抛出。
         """
 
         if self._stock_mapping_cache is not None:
@@ -416,7 +401,7 @@ class CninfoDiscoveryClient:
         payload = self._http_get_json(CNINFO_STOCK_JSON_URL)
         items = payload.get("stockList") if isinstance(payload, dict) else None
         if not isinstance(items, list):
-            raise RuntimeError(f"巨潮 stockList schema 异常: url={CNINFO_STOCK_JSON_URL}")
+            raise _cninfo_protocol_error("巨潮来源返回的公司列表格式不符合预期")
         mapping: dict[str, _CninfoCompanyLookupEntry] = {}
         for raw in items:
             if not isinstance(raw, dict):
@@ -462,7 +447,7 @@ class CninfoDiscoveryClient:
             原始公告对象列表。
 
         Raises:
-            RuntimeError: 主源响应不可解析时抛出。
+            FinsDownloadProviderError: 主源请求或响应协议失败时抛出。
         """
 
         announcements: list[CninfoRawAnnouncement] = []
@@ -483,14 +468,21 @@ class CninfoDiscoveryClient:
             )
             if cancellation_checkpoint is not None:
                 cancellation_checkpoint()
-            items = payload.get("announcements") if isinstance(payload, dict) else None
-            if not isinstance(items, list) or not items:
+            if not isinstance(payload, dict):
+                raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
+            items = payload.get("announcements")
+            if not isinstance(items, list):
+                raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
+            if not items:
                 break
             for raw in items:
                 parsed = _parse_raw_announcement(raw)
                 if parsed is not None and parsed.sec_code == stock:
                     announcements.append(parsed)
-            has_more = bool(payload.get("hasMore")) if isinstance(payload, dict) else False
+            has_more_raw = payload.get("hasMore")
+            if not isinstance(has_more_raw, bool):
+                raise _cninfo_protocol_error("巨潮来源返回的分页字段格式不符合预期")
+            has_more = has_more_raw
             if not has_more:
                 break
             page_num += 1
@@ -532,7 +524,7 @@ class CninfoDiscoveryClient:
             JSON 解析后的响应对象。
 
         Raises:
-            RuntimeError: 请求 / 解析失败时抛出。
+            FinsDownloadProviderError: 请求或响应协议失败时抛出。
         """
 
         data = {
@@ -565,27 +557,32 @@ class CninfoDiscoveryClient:
             JSON 解析后的对象（dict / list / 标量）。
 
         Raises:
-            RuntimeError: 请求 / 解析失败时抛出。
+            FinsDownloadProviderError: 请求或响应协议失败时抛出。
         """
 
-        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
             try:
                 self._throttle_before_request()
                 try:
                     response = self._client.get(url)
                     response.raise_for_status()
-                    return cast(JsonValue, response.json())
                 finally:
                     self._mark_request_finished()
-            except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
-                last_exc = exc
+            except httpx.HTTPError as exc:
+                failure = _cninfo_http_failure(exc)
                 Log.debug(
-                    f"GET JSON 失败: url={url} attempt={attempt + 1} error={exc}",
+                    f"GET JSON 请求失败: attempt={attempt + 1} transport_category={failure.transport_category.value}",
                     module=_MODULE,
                 )
+                if not failure.retryable or attempt >= self._max_retries - 1:
+                    raise failure from exc
                 self._retry_backoff(attempt)
-        raise RuntimeError(f"GET JSON 失败: url={url} error={last_exc}")
+                continue
+            try:
+                return cast(JsonValue, response.json())
+            except ValueError as exc:
+                raise _cninfo_protocol_error("巨潮来源返回的 JSON 内容无法解析") from exc
+        raise AssertionError("GET JSON retry loop terminated without result")
 
     def _http_post_form(self, url: str, data: dict[str, str]) -> JsonValue:
         """POST form-urlencoded JSON。
@@ -598,27 +595,32 @@ class CninfoDiscoveryClient:
             JSON 解析后的对象。
 
         Raises:
-            RuntimeError: 请求 / 解析失败时抛出。
+            FinsDownloadProviderError: 请求或响应协议失败时抛出。
         """
 
-        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
             try:
                 self._throttle_before_request()
                 try:
                     response = self._client.post(url, data=data)
                     response.raise_for_status()
-                    return cast(JsonValue, response.json())
                 finally:
                     self._mark_request_finished()
-            except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
-                last_exc = exc
+            except httpx.HTTPError as exc:
+                failure = _cninfo_http_failure(exc)
                 Log.debug(
-                    f"POST form 失败: url={url} attempt={attempt + 1} error={exc}",
+                    f"POST form 请求失败: attempt={attempt + 1} transport_category={failure.transport_category.value}",
                     module=_MODULE,
                 )
+                if not failure.retryable or attempt >= self._max_retries - 1:
+                    raise failure from exc
                 self._retry_backoff(attempt)
-        raise RuntimeError(f"POST form 失败: url={url} error={last_exc}")
+                continue
+            try:
+                return cast(JsonValue, response.json())
+            except ValueError as exc:
+                raise _cninfo_protocol_error("巨潮来源返回的 JSON 内容无法解析") from exc
+        raise AssertionError("POST form retry loop terminated without result")
 
     def _http_head_meta(self, url: str) -> CnReportHeadMeta:
         """HEAD 拉取 ``content-length`` / ``etag`` / ``last-modified``。
@@ -641,13 +643,15 @@ class CninfoDiscoveryClient:
             finally:
                 self._mark_request_finished()
         except httpx.HTTPError as exc:
-            Log.warn(f"HEAD 失败: url={url} error={exc}", module=_MODULE)
+            failure = _cninfo_http_failure(exc)
+            Log.warn(
+                f"HEAD 元数据请求失败: transport_category={failure.transport_category.value}",
+                module=_MODULE,
+            )
             return CnReportHeadMeta(content_length=None, etag=None, last_modified=None)
         content_length_header = response.headers.get("Content-Length")
         try:
-            content_length = (
-                int(content_length_header) if content_length_header is not None else None
-            )
+            content_length = int(content_length_header) if content_length_header is not None else None
         except (TypeError, ValueError):
             content_length = None
         return CnReportHeadMeta(
@@ -666,10 +670,9 @@ class CninfoDiscoveryClient:
             响应体字节。
 
         Raises:
-            RuntimeError: 重试耗尽仍失败时抛出。
+            FinsDownloadProviderError: 请求失败时抛出。
         """
 
-        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
             try:
                 self._throttle_before_request()
@@ -680,13 +683,15 @@ class CninfoDiscoveryClient:
                 finally:
                     self._mark_request_finished()
             except httpx.HTTPError as exc:
-                last_exc = exc
+                failure = _cninfo_http_failure(exc)
                 Log.debug(
-                    f"PDF 下载失败: url={url} attempt={attempt + 1} error={exc}",
+                    f"PDF 下载请求失败: attempt={attempt + 1} transport_category={failure.transport_category.value}",
                     module=_MODULE,
                 )
+                if not failure.retryable or attempt >= self._max_retries - 1:
+                    raise failure from exc
                 self._retry_backoff(attempt)
-        raise RuntimeError(f"PDF 下载失败: url={url} error={last_exc}")
+        raise AssertionError("PDF retry loop terminated without result")
 
     def _throttle_before_request(self) -> None:
         """按连续请求间隔限制发起 HTTP 请求。
@@ -736,6 +741,68 @@ class CninfoDiscoveryClient:
 
 
 _CNINFO_HTML_TAG_PATTERN: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
+
+
+def _cninfo_http_failure(error: httpx.HTTPError) -> FinsDownloadProviderError:
+    """把巨潮 HTTP 异常映射为封闭、脱敏的来源失败。
+
+    Args:
+        error: ``httpx`` 请求或状态异常。
+
+    Returns:
+        保留来源、transport 类别和重试事实的 typed failure。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, httpx.TimeoutException):
+        category = FinsDownloadTransportCategory.TIMEOUT
+        retryable = True
+        safe_message = "巨潮来源请求超时"
+    elif isinstance(error, httpx.NetworkError):
+        category = FinsDownloadTransportCategory.CONNECTION
+        retryable = True
+        safe_message = "无法连接巨潮来源"
+    elif isinstance(error, httpx.HTTPStatusError):
+        category = FinsDownloadTransportCategory.HTTP_STATUS
+        retryable = 500 <= error.response.status_code < 600
+        safe_message = "巨潮来源返回不可接受的 HTTP 状态"
+    elif isinstance(error, httpx.ProtocolError):
+        category = FinsDownloadTransportCategory.PROTOCOL
+        retryable = False
+        safe_message = "巨潮来源 HTTP 协议失败"
+    else:
+        category = FinsDownloadTransportCategory.UNKNOWN
+        retryable = True
+        safe_message = "巨潮来源请求失败"
+    return FinsDownloadProviderError(
+        source=FinsDownloadSource.CNINFO,
+        transport_category=category,
+        retryable=retryable,
+        safe_message=safe_message,
+    )
+
+
+def _cninfo_protocol_error(safe_message: str) -> FinsDownloadProviderError:
+    """构造巨潮响应解析或内容校验的脱敏协议失败。
+
+    Args:
+        safe_message: 不含 URL、响应值或本地路径的固定安全说明。
+
+    Returns:
+        不可重试的巨潮协议失败。
+
+    Raises:
+        ValueError: 安全说明违反 public text 约束时由共享契约抛出。
+    """
+
+    return FinsDownloadProviderError(
+        source=FinsDownloadSource.CNINFO,
+        transport_category=FinsDownloadTransportCategory.PROTOCOL,
+        retryable=False,
+        safe_message=safe_message,
+    )
 
 
 def _parse_raw_announcement(raw: JsonValue) -> Optional[CninfoRawAnnouncement]:

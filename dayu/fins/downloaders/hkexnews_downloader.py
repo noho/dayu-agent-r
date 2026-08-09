@@ -22,9 +22,13 @@ from typing import Final, Optional, TypeAlias, cast
 
 import httpx
 
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
-    CnDownloadCancelledError,
     CnFiscalPeriod,
     CnLanguage,
     CnReportCandidate,
@@ -45,15 +49,9 @@ JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 """披露易接口 JSON 响应值。"""
 
 HKEXNEWS_BASE_URL: Final[str] = "https://www1.hkexnews.hk"
-HKEXNEWS_ACTIVE_STOCK_ZH_URL: Final[str] = (
-    f"{HKEXNEWS_BASE_URL}/ncms/script/eds/activestock_sehk_c.json"
-)
-HKEXNEWS_INACTIVE_STOCK_ZH_URL: Final[str] = (
-    f"{HKEXNEWS_BASE_URL}/ncms/script/eds/inactivestock_sehk_c.json"
-)
-HKEXNEWS_TITLE_SEARCH_URL: Final[str] = (
-    f"{HKEXNEWS_BASE_URL}/search/titleSearchServlet.do"
-)
+HKEXNEWS_ACTIVE_STOCK_ZH_URL: Final[str] = f"{HKEXNEWS_BASE_URL}/ncms/script/eds/activestock_sehk_c.json"
+HKEXNEWS_INACTIVE_STOCK_ZH_URL: Final[str] = f"{HKEXNEWS_BASE_URL}/ncms/script/eds/inactivestock_sehk_c.json"
+HKEXNEWS_TITLE_SEARCH_URL: Final[str] = f"{HKEXNEWS_BASE_URL}/search/titleSearchServlet.do"
 
 DEFAULT_USER_AGENT: Final[str] = "DayuAgent/1.0 (+hk-download)"
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[float] = 30.0
@@ -85,9 +83,7 @@ _HKEXNEWS_FIELD_ROW_RANGE: Final[str] = "rowRange"
 _HKEXNEWS_FIELD_LOADED_RECORD: Final[str] = "loadedRecord"
 _HKEXNEWS_FIELD_RECORD_COUNT: Final[str] = "recordCnt"
 _HKEXNEWS_FIELD_RESULT: Final[str] = "result"
-_DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
-)
+_DATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})")
 _BR_PATTERN: Final[re.Pattern[str]] = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _TAG_PATTERN: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 
@@ -122,8 +118,28 @@ class _HkexnewsTitleSearchSnapshot:
     rows: tuple[dict[str, JsonValue], ...]
 
 
-class HkexnewsProviderProtocolError(RuntimeError):
-    """披露易 title search 官方响应违反累计协议。"""
+class HkexnewsProviderProtocolError(FinsDownloadProviderError):
+    """披露易来源响应违反官方协议。"""
+
+    def __init__(self) -> None:
+        """构造不含 provider payload 或查询参数的协议失败。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(
+            source=FinsDownloadSource.HKEXNEWS,
+            transport_category=FinsDownloadTransportCategory.PROTOCOL,
+            retryable=False,
+            safe_message="披露易来源响应格式不符合预期",
+        )
 
 
 _PERIOD_TO_CATEGORY_SPEC: Final[dict[CnFiscalPeriod, _HkCategorySpec]] = {
@@ -203,9 +219,7 @@ class HkexnewsDiscoveryClient:
         self._sleep_seconds = sleep_seconds
         self._max_retries = max_retries
         self._languages = languages
-        self._sleep_func: Callable[[float], None] = (
-            sleep_func if sleep_func is not None else time.sleep
-        )
+        self._sleep_func: Callable[[float], None] = sleep_func if sleep_func is not None else time.sleep
         self._last_request_finished_at: float | None = None
         self._stock_mapping_cache: dict[str, _HkStockMappingEntry] | None = None
 
@@ -236,7 +250,7 @@ class HkexnewsDiscoveryClient:
 
         Raises:
             ValueError: market 非 HK，或 stock list 未命中 ticker 时抛出。
-            RuntimeError: stock list 请求失败时抛出。
+            FinsDownloadProviderError: stock list 请求或协议失败时抛出。
         """
 
         if query.market != "HK":
@@ -273,7 +287,7 @@ class HkexnewsDiscoveryClient:
 
         Raises:
             ValueError: market/provider/company_id 非法时抛出。
-            RuntimeError: 任一有效财期分类的底层请求或 JSON 解析失败时抛出。
+            FinsDownloadProviderError: 任一有效财期来源请求或协议失败时抛出。
         """
 
         if query.market != "HK":
@@ -296,24 +310,15 @@ class HkexnewsDiscoveryClient:
             if period not in periods:
                 periods.append(period)
 
-        for category_spec, requested_periods in periods_by_category.items():
-            try:
-                announcements = self._query_period_announcements(
-                    stock_id=stock_id,
-                    stock_code=stock_code,
-                    category_spec=category_spec,
-                    start_date=query.start_date,
-                    end_date=query.end_date,
-                    cancellation_checkpoint=cancellation_checkpoint,
-                )
-            except CnDownloadCancelledError:
-                raise
-            except HkexnewsProviderProtocolError:
-                raise
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    f"披露易公告分类查询失败: stock_code={stock_code} periods={','.join(requested_periods)} error={exc}"
-                ) from exc
+        for category_spec in periods_by_category:
+            announcements = self._query_period_announcements(
+                stock_id=stock_id,
+                stock_code=stock_code,
+                category_spec=category_spec,
+                start_date=query.start_date,
+                end_date=query.end_date,
+                cancellation_checkpoint=cancellation_checkpoint,
+            )
             raw_announcements.extend(announcements)
         return select_hkexnews_report_candidates(
             query=query,
@@ -331,20 +336,17 @@ class HkexnewsDiscoveryClient:
             已下载 PDF 资产。
 
         Raises:
-            RuntimeError: provider 非 hkexnews、下载失败或 PDF 校验失败时抛出。
+            ValueError: candidate 来源不属于披露易时抛出。
+            FinsDownloadProviderError: 下载或 PDF 协议校验失败时抛出。
         """
 
         if candidate.provider != "hkexnews":
-            raise RuntimeError(
-                f"HkexnewsDiscoveryClient 不支持 provider={candidate.provider!r}"
-            )
+            raise ValueError(f"HkexnewsDiscoveryClient 不支持 provider={candidate.provider!r}")
         payload = self._http_download_bytes(candidate.source_url)
         if len(payload) < _PDF_MIN_BYTES:
-            raise RuntimeError(
-                f"PDF 字节数过小 ({len(payload)} bytes)，url={candidate.source_url}"
-            )
+            raise HkexnewsProviderProtocolError
         if not payload.startswith(_PDF_MAGIC_BYTES):
-            raise RuntimeError(f"PDF magic bytes 校验失败，url={candidate.source_url}")
+            raise HkexnewsProviderProtocolError
         sha256 = hashlib.sha256(payload).hexdigest()
         return DownloadedReportAsset(
             candidate=candidate,
@@ -364,7 +366,7 @@ class HkexnewsDiscoveryClient:
             ``STOCK_CODE -> _HkStockMappingEntry`` 映射。
 
         Raises:
-            RuntimeError: HTTP 或 JSON 解析失败时抛出。
+            FinsDownloadProviderError: 来源请求或响应协议失败时抛出。
         """
 
         if self._stock_mapping_cache is not None:
@@ -403,7 +405,7 @@ class HkexnewsDiscoveryClient:
             匹配目标股票且非英文的公告列表。
 
         Raises:
-            RuntimeError: HTTP 或 JSON 解析失败时抛出。
+            FinsDownloadProviderError: 来源请求或响应协议失败时抛出。
         """
 
         primary: list[HkexnewsRawAnnouncement] = []
@@ -436,8 +438,7 @@ class HkexnewsDiscoveryClient:
             parsed_rows = [
                 item
                 for item in (_parse_announcement(row, language=language) for row in rows)
-                if item is not None
-                and _announcement_matches_stock(item.stock_code_payload, stock_code)
+                if item is not None and _announcement_matches_stock(item.stock_code_payload, stock_code)
             ]
             primary.extend(parsed_rows)
         return primary
@@ -466,7 +467,7 @@ class HkexnewsDiscoveryClient:
         Raises:
             CnDownloadCancelledError: 检查点报告取消时原样传播。
             HkexnewsProviderProtocolError: 官方响应字段、轮内不变式或轮间进度矛盾时抛出。
-            RuntimeError: HTTP 请求或 JSON transport 解析失败时抛出。
+            FinsDownloadProviderError: HTTP 请求或响应协议失败时抛出。
         """
 
         current_row_range = _HKEXNEWS_INITIAL_CUMULATIVE_ROW_RANGE
@@ -489,19 +490,8 @@ class HkexnewsDiscoveryClient:
             latest_rows = snapshot.rows
             if not snapshot.has_next_row:
                 return latest_rows
-            if (
-                previous_continuation_loaded is not None
-                and snapshot.loaded_record <= previous_continuation_loaded
-            ):
-                raise HkexnewsProviderProtocolError(
-                    "披露易 title search 累计续取无进展: "
-                    f"stock_code={stock_code} lang={language} "
-                    f"t1code={category_spec.t1code} t2code={category_spec.t2code} "
-                    f"requested_row_range={current_row_range} "
-                    f"loaded_record={snapshot.loaded_record} "
-                    f"previous_loaded_record={previous_continuation_loaded} "
-                    f"record_count={snapshot.record_count}"
-                )
+            if previous_continuation_loaded is not None and snapshot.loaded_record <= previous_continuation_loaded:
+                raise HkexnewsProviderProtocolError
             previous_continuation_loaded = snapshot.loaded_record
             current_row_range = max(
                 current_row_range * 2,
@@ -524,23 +514,32 @@ class HkexnewsDiscoveryClient:
             JSON 响应。
 
         Raises:
-            RuntimeError: 重试后仍失败时抛出。
+            FinsDownloadProviderError: 请求或响应协议失败时抛出。
         """
 
-        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
             try:
                 self._throttle_before_request()
                 try:
                     response = self._client.get(url, params=params)
                     response.raise_for_status()
-                    return cast(JsonValue, response.json())
                 finally:
                     self._mark_request_finished()
-            except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
-                last_exc = exc
+            except httpx.HTTPError as exc:
+                failure = _hkexnews_http_failure(exc)
+                Log.debug(
+                    f"GET JSON 请求失败: attempt={attempt + 1} transport_category={failure.transport_category.value}",
+                    module=_MODULE,
+                )
+                if not failure.retryable or attempt >= self._max_retries - 1:
+                    raise failure from exc
                 self._retry_backoff(attempt)
-        raise RuntimeError(f"GET JSON 失败: url={url} error={last_exc}")
+                continue
+            try:
+                return cast(JsonValue, response.json())
+            except ValueError as exc:
+                raise HkexnewsProviderProtocolError from exc
+        raise AssertionError("GET JSON retry loop terminated without result")
 
     def _http_head_meta(self, url: str) -> CnReportHeadMeta:
         """HEAD 拉取 content-length / etag / last-modified。
@@ -563,7 +562,11 @@ class HkexnewsDiscoveryClient:
             finally:
                 self._mark_request_finished()
         except httpx.HTTPError as exc:
-            Log.warn(f"HEAD 失败: url={url} error={exc}", module=_MODULE)
+            failure = _hkexnews_http_failure(exc)
+            Log.warn(
+                f"HEAD 元数据请求失败: transport_category={failure.transport_category.value}",
+                module=_MODULE,
+            )
             return CnReportHeadMeta(content_length=None, etag=None, last_modified=None)
         raw_length = response.headers.get("Content-Length")
         try:
@@ -586,10 +589,9 @@ class HkexnewsDiscoveryClient:
             响应字节。
 
         Raises:
-            RuntimeError: 重试后仍失败时抛出。
+            FinsDownloadProviderError: 请求失败时抛出。
         """
 
-        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
             try:
                 self._throttle_before_request()
@@ -600,9 +602,15 @@ class HkexnewsDiscoveryClient:
                 finally:
                     self._mark_request_finished()
             except httpx.HTTPError as exc:
-                last_exc = exc
+                failure = _hkexnews_http_failure(exc)
+                Log.debug(
+                    f"PDF 下载请求失败: attempt={attempt + 1} transport_category={failure.transport_category.value}",
+                    module=_MODULE,
+                )
+                if not failure.retryable or attempt >= self._max_retries - 1:
+                    raise failure from exc
                 self._retry_backoff(attempt)
-        raise RuntimeError(f"PDF 下载失败: url={url} error={last_exc}")
+        raise AssertionError("PDF retry loop terminated without result")
 
     def _throttle_before_request(self) -> None:
         """按连续请求间隔限制发起 HTTP 请求。
@@ -657,6 +665,47 @@ class HkexnewsDiscoveryClient:
         self._sleep_func(RETRY_BACKOFF_BASE_SECONDS * (2**attempt_index))
 
 
+def _hkexnews_http_failure(error: httpx.HTTPError) -> FinsDownloadProviderError:
+    """把披露易 HTTP 异常映射为封闭、脱敏的来源失败。
+
+    Args:
+        error: ``httpx`` 请求或状态异常。
+
+    Returns:
+        保留来源、transport 类别和重试事实的 typed failure。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, httpx.TimeoutException):
+        category = FinsDownloadTransportCategory.TIMEOUT
+        retryable = True
+        safe_message = "披露易来源请求超时"
+    elif isinstance(error, httpx.NetworkError):
+        category = FinsDownloadTransportCategory.CONNECTION
+        retryable = True
+        safe_message = "无法连接披露易来源"
+    elif isinstance(error, httpx.HTTPStatusError):
+        category = FinsDownloadTransportCategory.HTTP_STATUS
+        retryable = 500 <= error.response.status_code < 600
+        safe_message = "披露易来源返回不可接受的 HTTP 状态"
+    elif isinstance(error, httpx.ProtocolError):
+        category = FinsDownloadTransportCategory.PROTOCOL
+        retryable = False
+        safe_message = "披露易来源 HTTP 协议失败"
+    else:
+        category = FinsDownloadTransportCategory.UNKNOWN
+        retryable = True
+        safe_message = "披露易来源请求失败"
+    return FinsDownloadProviderError(
+        source=FinsDownloadSource.HKEXNEWS,
+        transport_category=category,
+        retryable=retryable,
+        safe_message=safe_message,
+    )
+
+
 def _extract_json_rows(payload: JsonValue) -> list[JsonValue]:
     """从披露易 JSON 响应中提取列表行。
 
@@ -664,16 +713,16 @@ def _extract_json_rows(payload: JsonValue) -> list[JsonValue]:
         payload: JSON 响应。
 
     Returns:
-        列表行；无法识别时返回空列表。
+        已验证的列表行。
 
     Raises:
-        无。
+        HkexnewsProviderProtocolError: 响应结构无法识别时抛出。
     """
 
     if isinstance(payload, list):
         return payload
     if not isinstance(payload, dict):
-        return []
+        raise HkexnewsProviderProtocolError
     for key in (
         "stockInfo",
         "stockList",
@@ -684,14 +733,17 @@ def _extract_json_rows(payload: JsonValue) -> list[JsonValue]:
         "rows",
         "announcements",
     ):
-        value = payload.get(key)
+        if key not in payload:
+            continue
+        value = payload[key]
         if isinstance(value, list):
             return value
         if isinstance(value, str):
             parsed = _parse_embedded_json_list(value)
             if parsed is not None:
                 return parsed
-    return []
+        raise HkexnewsProviderProtocolError
+    raise HkexnewsProviderProtocolError
 
 
 def _parse_title_search_snapshot(
@@ -724,9 +776,7 @@ def _parse_title_search_snapshot(
         f"requested_row_range={requested_row_range}"
     )
     if not isinstance(payload, dict):
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 响应顶层必须是 object: {context}"
-        )
+        raise HkexnewsProviderProtocolError
     has_next_row = _require_title_search_bool(
         payload,
         field=_HKEXNEWS_FIELD_HAS_NEXT_ROW,
@@ -758,38 +808,17 @@ def _parse_title_search_snapshot(
     )
     row_count = len(snapshot.rows)
     if snapshot.response_row_range != snapshot.requested_row_range:
-        raise HkexnewsProviderProtocolError(
-            "披露易 title search 响应 rowRange 与请求不一致: "
-            f"{context} response_row_range={snapshot.response_row_range}"
-        )
+        raise HkexnewsProviderProtocolError
     if snapshot.loaded_record != row_count:
-        raise HkexnewsProviderProtocolError(
-            "披露易 title search loadedRecord 与结果行数不一致: "
-            f"{context} loaded_record={snapshot.loaded_record} rows={row_count}"
-        )
+        raise HkexnewsProviderProtocolError
     if snapshot.loaded_record > snapshot.record_count:
-        raise HkexnewsProviderProtocolError(
-            "披露易 title search loadedRecord 超过 recordCnt: "
-            f"{context} loaded_record={snapshot.loaded_record} "
-            f"record_count={snapshot.record_count}"
-        )
+        raise HkexnewsProviderProtocolError
     if snapshot.loaded_record > snapshot.requested_row_range:
-        raise HkexnewsProviderProtocolError(
-            "披露易 title search loadedRecord 超过请求 rowRange: "
-            f"{context} loaded_record={snapshot.loaded_record}"
-        )
+        raise HkexnewsProviderProtocolError
     if snapshot.has_next_row and snapshot.loaded_record >= snapshot.record_count:
-        raise HkexnewsProviderProtocolError(
-            "披露易 title search 声明有下一条但已加载全部记录: "
-            f"{context} loaded_record={snapshot.loaded_record} "
-            f"record_count={snapshot.record_count}"
-        )
+        raise HkexnewsProviderProtocolError
     if not snapshot.has_next_row and snapshot.loaded_record != snapshot.record_count:
-        raise HkexnewsProviderProtocolError(
-            "披露易 title search 声明完成但记录数不一致: "
-            f"{context} loaded_record={snapshot.loaded_record} "
-            f"record_count={snapshot.record_count} rows={row_count}"
-        )
+        raise HkexnewsProviderProtocolError
     return snapshot
 
 
@@ -815,9 +844,7 @@ def _require_title_search_bool(
 
     value = _require_title_search_field(payload, field=field, context=context)
     if not isinstance(value, bool):
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 字段 {field} 必须是 bool: {context}"
-        )
+        raise HkexnewsProviderProtocolError
     return value
 
 
@@ -843,13 +870,9 @@ def _require_title_search_non_negative_int(
 
     value = _require_title_search_field(payload, field=field, context=context)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 字段 {field} 必须是 int: {context}"
-        )
+        raise HkexnewsProviderProtocolError
     if value < 0:
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 字段 {field} 不能为负数: {context} value={value}"
-        )
+        raise HkexnewsProviderProtocolError
     return value
 
 
@@ -878,26 +901,17 @@ def _require_title_search_rows(
         context=context,
     )
     if not isinstance(value, str) or not value.strip():
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 字段 result 必须是非空字符串 JSON array: {context}"
-        )
+        raise HkexnewsProviderProtocolError
     try:
         decoded = cast(JsonValue, json.loads(value))
     except json.JSONDecodeError as exc:
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 字段 result 不是有效 JSON: {context}"
-        ) from exc
+        raise HkexnewsProviderProtocolError from exc
     if not isinstance(decoded, list):
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 字段 result 解码后必须是 array: {context}"
-        )
+        raise HkexnewsProviderProtocolError
     rows: list[dict[str, JsonValue]] = []
-    for row_index, row in enumerate(decoded):
+    for row in decoded:
         if not isinstance(row, dict):
-            raise HkexnewsProviderProtocolError(
-                "披露易 title search result 的每一行必须是 object: "
-                f"{context} row_index={row_index}"
-            )
+            raise HkexnewsProviderProtocolError
         rows.append(row)
     return tuple(rows)
 
@@ -923,9 +937,7 @@ def _require_title_search_field(
     """
 
     if field not in payload:
-        raise HkexnewsProviderProtocolError(
-            f"披露易 title search 响应缺少必填字段 {field}: {context}"
-        )
+        raise HkexnewsProviderProtocolError
     return payload[field]
 
 
@@ -1017,13 +1029,7 @@ def _parse_announcement(
     filing_date = _parse_filing_date(raw_date)
     if document_id is None and file_link is not None:
         document_id = _stable_id_from_url(file_link)
-    if (
-        document_id is None
-        or title is None
-        or file_link is None
-        or stock_code_payload is None
-        or filing_date is None
-    ):
+    if document_id is None or title is None or file_link is None or stock_code_payload is None or filing_date is None:
         return None
     return HkexnewsRawAnnouncement(
         document_id=document_id,

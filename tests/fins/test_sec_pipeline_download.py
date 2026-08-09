@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
 
+import asyncio
 import json
 import logging
 import datetime as dt
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, cast
 
 import pytest
@@ -36,7 +37,12 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
-from dayu.fins.download_contract import FinsDownloadDateRange, FinsDownloadSource
+from dayu.fins.download_contract import (
+    FinsDownloadDateRange,
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_download_state as _sec_download_state
@@ -71,7 +77,10 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
-from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
+from dayu.fins.storage.repository_protocols import (
+    SourceDocumentRepositoryProtocol,
+    SourceSnapshotProtocol,
+)
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
@@ -167,10 +176,7 @@ def test_normalize_sec_primary_document_preserves_single_filename() -> None:
         AssertionError: helper 改写合法单文件名时抛出。
     """
 
-    assert (
-        _sec_filing_collection._normalize_sec_primary_document_name("aapl-20240928.htm")
-        == "aapl-20240928.htm"
-    )
+    assert _sec_filing_collection._normalize_sec_primary_document_name("aapl-20240928.htm") == "aapl-20240928.htm"
 
 
 @pytest.mark.parametrize(
@@ -541,8 +547,25 @@ class _RecordingSecPipelineForAdapter:
             workspace_root,
             repository_set=repository_set,
         )
+        self._source_repository = FsSourceDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
         self.document_id = document_id
         self.recorded_rebuild_values: list[bool] = []
+
+    @property
+    def source_repository(self) -> SourceDocumentRepositoryProtocol:
+        """返回测试 pipeline 使用的 source repository。
+
+        Returns:
+            source repository。
+
+        Raises:
+            无。
+        """
+
+        return self._source_repository
 
     async def download_stream(
         self,
@@ -575,17 +598,34 @@ class _RecordingSecPipelineForAdapter:
             无。
         """
 
-        del form_type, start_date, end_date, overwrite, start_is_explicit, cancel_checker
+        del start_is_explicit, cancel_checker
         self.recorded_rebuild_values.append(rebuild)
+        form_values: list[JsonValue] = [] if form_type is None else [item for item in form_type.split(",")]
+        filters: dict[str, JsonValue] = {
+            "forms": form_values,
+            "start_date": start_date,
+            "end_date": end_date,
+            "overwrite": overwrite,
+            "rebuild": rebuild,
+        }
         result: sec_pipeline.SecPipelineDownloadResult = {
             "pipeline": "sec_download",
             "action": "download",
             "status": "ok",
             "ticker": ticker,
             "market_profile": {},
-            "filters": {},
+            "filters": filters,
             "warnings": [],
-            "filings": [{"document_id": self.document_id, "status": "downloaded"}],
+            "filings": [
+                {
+                    "document_id": self.document_id,
+                    "status": "skipped",
+                    "reason_code": "already_downloaded_complete",
+                    "form_type": "10-K",
+                    "filing_date": "2024-08-01",
+                    "report_date": "2024-06-30",
+                }
+            ],
             "summary": {
                 "total": 1,
                 "downloaded": 1,
@@ -910,7 +950,9 @@ class StubDownloader:
             raw_file_meta = item.get("file_meta")
             file_meta = raw_file_meta if isinstance(raw_file_meta, FileObjectMeta) else None
             raw_http_status = item.get("http_status")
-            http_status = raw_http_status if isinstance(raw_http_status, int) and not isinstance(raw_http_status, bool) else None
+            http_status = (
+                raw_http_status if isinstance(raw_http_status, int) and not isinstance(raw_http_status, bool) else None
+            )
             if status == "downloaded":
                 event_type = "file_downloaded"
             elif status == "skipped":
@@ -976,7 +1018,6 @@ class StubDownloader:
         del count, cancellation_checker
         self.browse_calls.append(filenum)
         return self._browse_entries
-
 
     def resolve_primary_document(
         self,
@@ -1254,7 +1295,7 @@ def _build_submissions() -> dict[str, JsonValue]:
                 "primaryDocument": ["sample-10k.htm"],
             },
             "files": [],
-        }
+        },
     }
 
 
@@ -1306,6 +1347,237 @@ def _make_descriptor(etag: str) -> RemoteFileDescriptor:
         remote_size=100,
         http_status=200,
     )
+
+
+def test_sec_download_filing_provider_evidence_failure_is_unique_failed_row_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """file evidence typed failure 只终止当前 filing，且下一 filing 可完成。"""
+
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.PROTOCOL,
+        retryable=False,
+        safe_message="SEC 来源响应格式不符合预期",
+    )
+    downloader = StreamStubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag-v1")],
+        download_results=[
+            {
+                "name": "sample-10k.htm",
+                "status": "downloaded",
+                "path": "sample-10k.htm",
+                "source_url": "https://example.invalid/sample-10k.htm",
+                "http_etag": "etag-v1",
+                "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
+            }
+        ],
+    )
+    original_list = downloader.list_filing_files
+    list_calls = 0
+
+    def fail_first_list(
+        cik: str,
+        accession_no_dash: str,
+        primary_document: str,
+        form_type: str,
+        include_xbrl: bool = True,
+        include_exhibits: bool = True,
+        include_http_metadata: bool = True,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> list[RemoteFileDescriptor]:
+        """首次抛 typed evidence failure，第二次返回有效列表。"""
+
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls == 1:
+            raise expected
+        return original_list(
+            cik=cik,
+            accession_no_dash=accession_no_dash,
+            primary_document=primary_document,
+            form_type=form_type,
+            include_xbrl=include_xbrl,
+            include_exhibits=include_exhibits,
+            include_http_metadata=include_http_metadata,
+            cancellation_checker=cancellation_checker,
+        )
+
+    monkeypatch.setattr(downloader, "list_filing_files", fail_first_list)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    begin_calls = 0
+    original_begin = pipeline._batching_repository.begin_batch
+
+    def record_begin(ticker: str) -> BatchToken:
+        """记录 filing mutation batch 启动次数。"""
+
+        nonlocal begin_calls
+        begin_calls += 1
+        return original_begin(ticker)
+
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", record_begin)
+    first = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-02-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000001",
+        primary_document="sample-10k.htm",
+    )
+    second = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-03-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000002",
+        primary_document="sample-10k.htm",
+    )
+    rejection_registry: dict[str, DownloadRejectionEntry] = {}
+
+    async def collect(filing: _sec_filing_collection.FilingRecord) -> list[DownloadEvent]:
+        """直接消费 single-filing owner 事件。"""
+
+        return [
+            event
+            async for event in pipeline._download_single_filing_stream(
+                ticker="AAPL",
+                cik="320193",
+                filing=filing,
+                overwrite=False,
+                rejection_registry=rejection_registry,
+            )
+        ]
+
+    first_events = asyncio.run(collect(first))
+    assert [event.event_type for event in first_events] == [DownloadEventType.FILING_FAILED]
+    first_result = first_events[0].payload["filing_result"]
+    assert isinstance(first_result, dict)
+    assert first_result["status"] == "failed"
+    assert first_result["reason_code"] == "provider_protocol"
+    assert first_result["reason_message"] == expected.safe_message
+    assert rejection_registry == {}
+    assert begin_calls == 0
+
+    second_events = asyncio.run(collect(second))
+    terminal_types = [
+        event.event_type
+        for event in second_events
+        if event.event_type in {DownloadEventType.FILING_COMPLETED, DownloadEventType.FILING_FAILED}
+    ]
+    assert terminal_types == [DownloadEventType.FILING_COMPLETED]
+    assert begin_calls == 1
+    assert list_calls == 2
+
+
+def test_sec_download_filing_6k_preview_provider_failure_stays_local_and_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """6-K preview typed failure 形成唯一 FAILED row、固定日志并允许下一 filing。"""
+
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.CONNECTION,
+        retryable=True,
+        safe_message="无法连接 SEC 来源",
+    )
+    descriptor = RemoteFileDescriptor(
+        name="sample-6k.htm",
+        source_url="https://secret.invalid/raw-preview",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=100,
+        http_status=200,
+        sec_document_type="6-K",
+    )
+    downloader = StreamStubDownloader(
+        submissions=_build_foreign_submissions(),
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "source_url": descriptor.source_url,
+            }
+        ],
+    )
+
+    def fail_preview(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        """模拟携带 raw URL/contact 的真实 provider failure。"""
+
+        del url, cancellation_checker
+        raise expected from RuntimeError("raw https://secret.invalid/payload contact-canary@example.invalid")
+
+    logs: list[str] = []
+    monkeypatch.setattr(downloader, "fetch_file_bytes", fail_preview)
+    monkeypatch.setattr(
+        sec_pipeline.Log,
+        "warn",
+        lambda message, *, module: logs.append(f"{module}:{message}"),
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    preview = asyncio.run(
+        pipeline._precheck_6k_filter(
+            remote_files=[descriptor],
+            primary_document=descriptor.name,
+            ticker="FUTU",
+            document_id="fil_0000000000-25-000101",
+        )
+    )
+    assert preview == (False, "DOWNLOAD_FAILED", descriptor.name)
+
+    six_k = _sec_filing_collection.FilingRecord(
+        form_type="6-K",
+        filing_date="2025-08-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000101",
+        primary_document=descriptor.name,
+    )
+    later = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-09-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000102",
+        primary_document=descriptor.name,
+    )
+
+    async def collect(filing: _sec_filing_collection.FilingRecord) -> list[DownloadEvent]:
+        """直接消费 single-filing owner 事件。"""
+
+        return [
+            event
+            async for event in pipeline._download_single_filing_stream(
+                ticker="FUTU",
+                cik="320193",
+                filing=filing,
+                overwrite=False,
+                rejection_registry={},
+            )
+        ]
+
+    failed_events = asyncio.run(collect(six_k))
+    assert [event.event_type for event in failed_events] == [DownloadEventType.FILING_FAILED]
+    failed_result = failed_events[0].payload["filing_result"]
+    assert isinstance(failed_result, dict)
+    assert failed_result["reason_code"] == "6k_prefetch_failed"
+    later_events = asyncio.run(collect(later))
+    assert later_events[-1].event_type is DownloadEventType.FILING_COMPLETED
+    serialized_logs = "\n".join(logs)
+    assert "transport_category=connection" in serialized_logs
+    assert "secret.invalid" not in serialized_logs
+    assert "contact-canary" not in serialized_logs
+    assert "raw " not in serialized_logs
 
 
 def _seed_complete_sec_source(
@@ -2025,8 +2297,7 @@ def test_sec_rebuild_operation_and_rollback_failure_preserve_primary_exception(
     assert exc_info.value is operation_error
     assert exc_info.value.__cause__ is rollback_error
     assert exc_info.value.__notes__ == [
-        "rollback_batch failed; recovery evidence retained: "
-        "injected rebuild rollback failure"
+        "rollback_batch failed; recovery evidence retained: injected rebuild rollback failure"
     ]
     assert batching_repository.rollback_calls == 1
 
@@ -2493,29 +2764,38 @@ def test_sec_fiscal_helper_contract_matrix() -> None:
         file_map,
         candidates=("_ins.xml",),
     ) == Path("c_ins.xml")
-    assert _sec_fiscal_fields._pick_download_xbrl_file(
-        file_map,
-        candidates=("_missing.xml",),
-    ) is None
+    assert (
+        _sec_fiscal_fields._pick_download_xbrl_file(
+            file_map,
+            candidates=("_missing.xml",),
+        )
+        is None
+    )
     assert _sec_fiscal_fields._pick_download_xbrl_file(
         file_map,
         candidates=("_missing.xml",),
         xml_fallback=True,
     ) == Path("b.xml")
-    assert _sec_fiscal_fields._mapping_get_case_insensitive(
-        {"DocumentFiscalYearFocus": "2024"},
-        ("documentfiscalyearfocus",),
-    ) == "2024"
+    assert (
+        _sec_fiscal_fields._mapping_get_case_insensitive(
+            {"DocumentFiscalYearFocus": "2024"},
+            ("documentfiscalyearfocus",),
+        )
+        == "2024"
+    )
     assert _sec_fiscal_fields._mapping_get_case_insensitive([], ("missing",)) is None
     assert _sec_fiscal_fields._pick_first_non_empty((None, " ", "FY")) == "FY"
     assert _sec_fiscal_fields._pick_first_non_empty((None, " ")) is None
     assert _sec_fiscal_fields._infer_download_fiscal_fields("10-K", "2024-12-31") == (2024, "FY")
     assert _sec_fiscal_fields._infer_download_fiscal_fields("6-K/A", "2024-12-31") == (None, None)
-    assert _sec_fiscal_fields._resolve_fiscal_period_fallback(
-        form_type="10-Q",
-        fiscal_year=2024,
-        fiscal_year_from_report_date=True,
-    ) is None
+    assert (
+        _sec_fiscal_fields._resolve_fiscal_period_fallback(
+            form_type="10-Q",
+            fiscal_year=2024,
+            fiscal_year_from_report_date=True,
+        )
+        is None
+    )
     assert _sec_fiscal_fields._coerce_optional_int(None) is None
     assert _sec_fiscal_fields._coerce_optional_int(True) is None
     assert _sec_fiscal_fields._coerce_optional_int(2024) == 2024
@@ -2559,9 +2839,7 @@ def test_sec_fiscal_payload_and_query_extractors_fail_closed() -> None:
     assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
         _XbrlQueryFixtureProcessor(RuntimeError("query failed"))
     ) == (None, None)
-    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
-        _XbrlQueryFixtureProcessor({"facts": []})
-    ) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(_XbrlQueryFixtureProcessor({"facts": []})) == (None, None)
     assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
         _XbrlQueryFixtureProcessor(
             {
@@ -3081,10 +3359,7 @@ def test_sec_pipeline_filters_6k_excluded(
 
     assert result["summary"]["skipped"] == 0
     assert result["summary"]["rejected"] == 1
-    assert (
-        "美股下载完成: ticker=TCOM total=1 downloaded=0 skipped=0 rejected=1 failed=0"
-        in caplog.text
-    )
+    assert "美股下载完成: ticker=TCOM total=1 downloaded=0 skipped=0 rejected=1 failed=0" in caplog.text
     assert downloader.download_files_called is True
     meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert not meta_path.exists()
@@ -3184,32 +3459,46 @@ def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusivel
         "status": "ok",
         "ticker": "ATAT",
         "market_profile": {},
-        "filters": {},
+        "filters": {
+            "forms": ["10-K"],
+            "start_date": None,
+            "end_date": None,
+            "overwrite": False,
+            "rebuild": False,
+        },
         "warnings": [],
         "filings": [
             {
                 "document_id": "fil-downloaded",
                 "status": "downloaded",
+                "form_type": "10-K",
+                "filing_date": "2024-08-01",
+                "report_date": "2024-06-30",
             },
             {
                 "document_id": "fil-already-complete",
                 "status": "skipped",
                 "skip_reason": "already_downloaded_complete",
                 "reason_code": "already_downloaded_complete",
+                "form_type": "10-K",
+                "filing_date": "2024-08-01",
+                "report_date": "2024-06-30",
             },
             {
                 "document_id": "fil-filtered-6k",
                 "status": "skipped",
                 "skip_reason": "6k_filtered",
                 "reason_code": "6k_filtered",
+                "form_type": "6-K",
+                "filing_date": "2024-08-02",
+                "report_date": "2024-06-30",
             },
             {
                 "document_id": "fil-failed",
                 "status": "failed",
-            },
-            {
-                "document_id": "fil-unknown-status",
-                "status": "provider_new_status",
+                "form_type": "10-Q",
+                "filing_date": "2024-08-03",
+                "report_date": "2024-06-30",
             },
         ],
         "summary": {
@@ -3224,26 +3513,67 @@ def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusivel
         },
     }
 
-    summary = sec_pipeline._summary_from_pipeline_result(result)
+    class _LocatorRepository:
+        """只为 downloaded row 提供 relative locator 的仓储桩。"""
 
-    assert summary.discovered_count == 5
+        def get_source_document_locator(
+            self,
+            ticker: str,
+            document_id: str,
+            source_kind: SourceKind,
+        ) -> PurePosixPath:
+            """返回与输入身份对应的 relative locator。"""
+
+            assert ticker == "ATAT"
+            assert source_kind is SourceKind.FILING
+            return PurePosixPath("source", document_id)
+
+    request = FinsSourceDownloadAdapterRequest(
+        normalized_ticker=normalize_ticker("ATAT"),
+        source=FinsDownloadSource.SEC,
+        form_types=("10-K",),
+        date_range=FinsDownloadDateRange(None, None, False, False),
+        overwrite_existing=False,
+        rebuild_local_artifacts=False,
+        cancellation_checker=_NeverCancelled(),
+    )
+    summary = sec_pipeline._summary_from_pipeline_result(
+        cast(dict[str, JsonValue], result),
+        request=request,
+        source_repository=cast(SourceDocumentRepositoryProtocol, _LocatorRepository()),
+    )
+
+    assert summary.discovered_count == 4
     assert summary.downloaded_count == 1
     assert summary.skipped_count == 1
     assert summary.rejected_count == 1
-    assert summary.failed_count == 2
+    assert summary.failed_count == 1
     assert summary.discovered_count == (
-        summary.downloaded_count
-        + summary.skipped_count
-        + summary.rejected_count
-        + summary.failed_count
+        summary.downloaded_count + summary.skipped_count + summary.rejected_count + summary.failed_count
     )
     assert (
         summary.discovered_count
-        == summary.downloaded_count
-        + summary.skipped_count
-        + summary.rejected_count
-        + summary.failed_count
+        == summary.downloaded_count + summary.skipped_count + summary.rejected_count + summary.failed_count
     )
+    invalid_result = cast(dict[str, JsonValue], dict(result))
+    invalid_result["filings"] = [
+        {
+            "document_id": "fil-unknown-status",
+            "status": "provider_new_status",
+            "form_type": "10-K",
+            "filing_date": "2024-08-04",
+            "report_date": "2024-06-30",
+        }
+    ]
+    with pytest.raises(ValueError, match="status 未封闭"):
+        sec_pipeline._summary_from_pipeline_result(
+            invalid_result,
+            request=request,
+            source_repository=cast(
+                SourceDocumentRepositoryProtocol,
+                _LocatorRepository(),
+            ),
+        )
 
 
 def test_sec_adapter_local_rebuild_does_not_mutate_processed_documents(tmp_path: Path) -> None:
@@ -3410,7 +3740,7 @@ def test_sec_pipeline_keeps_primary_only_6k_results_release(tmp_path: Path) -> N
 
 
 def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_path: Path) -> None:
-    """验证 6-K 封面被排除时，会提升同 filing 的季度正文 exhibit。 
+    """验证 6-K 封面被排除时，会提升同 filing 的季度正文 exhibit。
 
     Args:
         tmp_path: 临时目录。
@@ -3461,13 +3791,9 @@ def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_pa
             },
         ],
         content_by_name={
-            "sample-6k.htm": (
-                b"FORM 6-K\nEXHIBIT INDEX\n"
-                b"Exhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"
-            ),
+            "sample-6k.htm": (b"FORM 6-K\nEXHIBIT INDEX\nExhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"),
             "d123dex991.htm": (
-                b"Press Release\n"
-                b"TCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
+                b"Press Release\nTCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
             ),
         },
     )
@@ -3532,9 +3858,7 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
         ],
         content_by_name={
             "form6-k.htm": (
-                b"FORM 6-K\n"
-                b"Financial Results and Business Updates\n"
-                b"Company reported strong quarterly performance\n"
+                b"FORM 6-K\nFinancial Results and Business Updates\nCompany reported strong quarterly performance\n"
             ),
             "ex99-1.htm": b"EX-99.1\nCompany quarterly results attachment\n",
         },
@@ -3632,13 +3956,9 @@ def test_sec_pipeline_rolls_back_when_prepared_primary_selection_raises(
             },
         ],
         content_by_name={
-            "sample-6k.htm": (
-                b"FORM 6-K\nEXHIBIT INDEX\n"
-                b"Exhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"
-            ),
+            "sample-6k.htm": (b"FORM 6-K\nEXHIBIT INDEX\nExhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"),
             "d123dex991.htm": (
-                b"Press Release\n"
-                b"TCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
+                b"Press Release\nTCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
             ),
         },
     )

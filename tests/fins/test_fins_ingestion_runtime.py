@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Event, Lock as ThreadingLock, Thread
 from typing import cast
 
@@ -31,6 +31,7 @@ from dayu.fins.direct_events import (
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
+    FinsPublicFailureKind,
     FinsResultStatus,
 )
 from dayu.fins.direct_event_text import (
@@ -46,7 +47,14 @@ from dayu.fins.direct_event_text import (
     wait_failed_hint,
 )
 from dayu.fins.download_contract import (
+    FinsDownloadDocumentDisposition,
+    FinsDownloadDocumentResult,
+    FinsDownloadEffectiveFilters,
+    FinsDownloadProviderError,
+    FinsDownloadResultSummary,
     FinsDownloadSource,
+    FinsDownloadTerminalDisposition,
+    FinsDownloadTransportCategory,
     build_fins_download_request,
 )
 from dayu.fins.ingestion_events import (
@@ -73,7 +81,6 @@ from dayu.fins.ingestion_runtime import (
     FinsDownloadedFile,
     FinsDownloadedSourceDocument,
     FinsDownloadProgressEvent,
-    FinsDownloadResultSummary,
     FinsJobCancellationChecker,
     FinsIngestionExecutor,
     FinsIngestionOperationKind,
@@ -110,6 +117,77 @@ from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+
+
+def _typed_download_summary(
+    *,
+    canonical_ticker: str = "AAPL",
+    downloaded_ids: tuple[str, ...] = (),
+    skipped_ids: tuple[str, ...] = (),
+    rejected_ids: tuple[str, ...] = (),
+    failed_ids: tuple[str, ...] = (),
+    rebuild_local_artifacts: bool = False,
+) -> FinsDownloadResultSummary:
+    """构造满足 owner-level 守恒约束的测试下载摘要。
+
+    Args:
+        canonical_ticker: canonical ticker。
+        downloaded_ids: 下载成功文档 ID。
+        skipped_ids: 跳过文档 ID。
+        rejected_ids: 拒绝文档 ID。
+        failed_ids: 失败文档 ID。
+        rebuild_local_artifacts: effective local rebuild 标记。
+
+    Returns:
+        计数与 typed rows 同源的下载摘要。
+
+    Raises:
+        ValueError: 输入违反生产契约时抛出。
+    """
+
+    rows = tuple(
+        FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period="10-K",
+            filing_date="2024-08-01",
+            report_date="2024-06-30",
+            disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+            reason_category=None,
+            reason_message=None,
+            artifact_locator=PurePosixPath("source", document_id),
+        )
+        for document_id in downloaded_ids
+    )
+    rows += tuple(
+        FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period="10-K",
+            filing_date="2024-08-01",
+            report_date="2024-06-30",
+            disposition=disposition,
+            reason_category=reason_category,
+            reason_message=reason_message,
+            artifact_locator=None,
+        )
+        for disposition, reason_category, reason_message, document_ids in (
+            (FinsDownloadDocumentDisposition.SKIPPED, "already_present", "本地已存在完整文档", skipped_ids),
+            (FinsDownloadDocumentDisposition.REJECTED, "form_filter", "文档不符合筛选条件", rejected_ids),
+            (FinsDownloadDocumentDisposition.FAILED, "provider_failure", "来源未能完成文档下载", failed_ids),
+        )
+        for document_id in document_ids
+    )
+    return FinsDownloadResultSummary.from_document_rows(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker=canonical_ticker,
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=(),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=rebuild_local_artifacts,
+        ),
+        document_rows=rows,
+    )
 
 
 class _CommitFailingDownloadBatchingRepository(FsBatchingRepository):
@@ -325,9 +403,7 @@ def test_direct_event_text_helper_owns_progress_and_wait_copy() -> None:
     assert wait_failed_hint() == "请检查财报处理摘要，必要时重新发起对应操作。"
     assert wait_cancelled_message() == "财报处理已取消。"
     assert wait_cancelled_hint() == "如仍需要该财报资料，请重新发起对应操作。"
-    visible_wait_text = " ".join(
-        (wait_failed_hint(), wait_cancelled_message(), wait_cancelled_hint())
-    )
+    visible_wait_text = " ".join((wait_failed_hint(), wait_cancelled_message(), wait_cancelled_hint()))
     for forbidden in ("Host", "Engine", "wait", "poll", "runtime", "Fins ingestion"):
         assert forbidden not in visible_wait_text
 
@@ -582,14 +658,7 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
         """
 
         self.requests: list[FinsSourceDownloadAdapterRequest] = []
-        self.summary = summary or FinsDownloadResultSummary(
-            discovered_count=1,
-            downloaded_count=0,
-            skipped_count=1,
-            rejected_count=0,
-            failed_count=0,
-            written_document_ids=(),
-        )
+        self.summary = summary or _typed_download_summary(skipped_ids=("aapl-existing-10k",))
 
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """记录请求并返回已持久化摘要。
@@ -606,6 +675,64 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
 
         self.requests.append(request)
         return FinsSourceDownloadAdapterResult(discovered_count=1, persisted_summary=self.summary)
+
+
+class _ProviderFailureDownloadAdapter(FinsSourceDownloadAdapter):
+    """抛出 owner-mapped provider transport error 的测试 adapter。"""
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """抛出不携带底层敏感内容的 typed provider failure。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            FinsDownloadProviderError: 固定 connection 分类失败。
+        """
+
+        assert request.source is FinsDownloadSource.SEC
+        raw_error = RuntimeError("contact-canary@example.invalid https://provider.invalid /Users/private/raw.json")
+        raise FinsDownloadProviderError(
+            source=FinsDownloadSource.SEC,
+            transport_category=FinsDownloadTransportCategory.CONNECTION,
+            retryable=True,
+            safe_message="无法连接 SEC 来源",
+        ) from raw_error
+
+
+class _OperationFailureDownloadAdapter(FinsSourceDownloadAdapter):
+    """原样抛出预构造 storage/execution exception 的测试 adapter。"""
+
+    def __init__(self, failure: Exception) -> None:
+        """保存 adapter 调用时应抛出的异常。
+
+        Args:
+            failure: 预构造 owner exception。
+
+        Raises:
+            无。
+        """
+
+        self.failure = failure
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """原样抛出预构造异常。
+
+        Args:
+            request: runtime typed request。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            Exception: 预构造 owner exception。
+        """
+
+        del request
+        raise self.failure
 
 
 class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
@@ -651,14 +778,7 @@ class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
             )
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                skipped_count=0,
-                rejected_count=0,
-                failed_count=0,
-                written_document_ids=("fil-test",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("fil-test",)),
         )
 
 
@@ -682,11 +802,7 @@ class _CancellationAwareDownloadAdapter(FinsSourceDownloadAdapter):
         request.cancellation_checker()
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                written_document_ids=("aapl-cancel-aware-10k",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("aapl-cancel-aware-10k",)),
         )
 
 
@@ -728,9 +844,7 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
         self.entered.set()
         if not self.allow_cancellation_check.wait(timeout=1.0):
             raise TimeoutError("consumer abort cancellation check was not released")
-        self.cancellation_checks = self.cancellation_checks + (
-            request.cancellation_checker(),
-        )
+        self.cancellation_checks = self.cancellation_checks + (request.cancellation_checker(),)
         if request.progress_sink is not None:
             request.progress_sink(
                 FinsDownloadProgressEvent(
@@ -743,11 +857,7 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
         self.late_progress_returned.set()
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                written_document_ids=("fil-late-after-abort",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("fil-late-after-abort",)),
         )
 
 
@@ -862,21 +972,21 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             )
             self.source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
-                ticker=request.ticker,
-                document_id=self.document_id,
-                internal_document_id=self.document_id,
-                form_type="10-K",
-                primary_document=filename,
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
-                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
-                },
-                files=[file_meta],
+                    ticker=request.ticker,
+                    document_id=self.document_id,
+                    internal_document_id=self.document_id,
+                    form_type="10-K",
+                    primary_document=filename,
+                    meta={
+                        "fiscal_year": 2024,
+                        "fiscal_period": "FY",
+                        "filing_date": "2024-11-01",
+                        "report_date": "2024-09-28",
+                        "amended": False,
+                        "ingest_method": "upload",
+                        "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+                    },
+                    files=[file_meta],
                 ),
                 SourceKind.FILING,
                 batch=batch,
@@ -1628,8 +1738,7 @@ def test_store_rejected_artifact_double_failure_preserves_operation_identity(
     assert exc_info.value is operation_error
     assert exc_info.value.__cause__ is rollback_error
     assert exc_info.value.__notes__ == [
-        "rollback_batch failed; recovery evidence retained: "
-        "injected rejected artifact rollback failure"
+        "rollback_batch failed; recovery evidence retained: injected rejected artifact rollback failure"
     ]
     assert batching_repository.rollback_calls == 1
 
@@ -1682,8 +1791,7 @@ def test_preprocess_double_failure_preserves_operation_identity(
     assert exc_info.value is operation_error
     assert exc_info.value.__cause__ is rollback_error
     assert exc_info.value.__notes__ == [
-        "rollback_batch failed; recovery evidence retained: "
-        "injected preprocess rollback failure"
+        "rollback_batch failed; recovery evidence retained: injected preprocess rollback failure"
     ]
     assert batching_repository.rollback_calls == 1
 
@@ -1695,9 +1803,7 @@ def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
-    start = runtime.start_download(
-        build_fins_download_request(ticker="AAPL", form_types=("10-K/A",))
-    )
+    start = runtime.start_download(build_fins_download_request(ticker="AAPL", form_types=("10-K/A",)))
     record = runtime.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.QUEUED
@@ -1748,9 +1854,7 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
         download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(
-        build_fins_download_request(ticker="AAPL", form_types=("10-K",))
-    )
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL", form_types=("10-K",)))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
@@ -1832,9 +1936,7 @@ async def test_direct_download_projects_adapter_file_progress_events(
         download_adapters={("sec", "US"): adapter},
     )
 
-    events = await _collect_direct_events(
-        ingestion.download(build_fins_download_request(ticker="AAPL"))
-    )
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
     progress_events = [event for event in events if event.event_type is FinsEventType.PROGRESS]
     file_progress = [
         event
@@ -1868,13 +1970,11 @@ async def test_direct_download_result_details_preserve_exclusive_skipped_count(
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter(
-        FinsDownloadResultSummary(
-            discovered_count=18,
-            downloaded_count=15,
-            skipped_count=1,
-            rejected_count=2,
-            failed_count=0,
-            written_document_ids=tuple(f"fil-{index}" for index in range(15)),
+        _typed_download_summary(
+            canonical_ticker="FUTU",
+            downloaded_ids=tuple(f"fil-{index}" for index in range(15)),
+            skipped_ids=("fil-skipped",),
+            rejected_ids=("fil-rejected-1", "fil-rejected-2"),
         )
     )
     ingestion = _build_ingestion_runtime(
@@ -1883,20 +1983,19 @@ async def test_direct_download_result_details_preserve_exclusive_skipped_count(
         download_adapters={("sec", "US"): adapter},
     )
 
-    events = await _collect_direct_events(
-        ingestion.download(build_fins_download_request(ticker="FUTU"))
-    )
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="FUTU")))
     result_event = events[-1]
 
     assert result_event.result is not None
-    assert {detail.label: detail.value for detail in result_event.result.details} == {
-        "discovered": "18",
-        "downloaded": "15",
-        "skipped": "1",
-        "rejected": "2",
-        "failed": "0",
-        "written documents": "15",
-    }
+    assert result_event.result.details == ()
+    assert result_event.result.download is not None
+    assert result_event.result.download.discovered_count == 18
+    assert result_event.result.download.downloaded_count == 15
+    assert result_event.result.download.skipped_count == 1
+    assert result_event.result.download.rejected_count == 2
+    assert result_event.result.download.failed_count == 0
+    assert len(result_event.result.download.document_rows) == 10
+    assert result_event.result.download.omitted_count == 8
 
 
 @pytest.mark.asyncio
@@ -1910,9 +2009,7 @@ async def test_direct_download_missing_adapter_returns_failure_result(tmp_path: 
         download_adapters={},
     )
 
-    events = await _collect_direct_events(
-        ingestion.download(build_fins_download_request(ticker="AAPL"))
-    )
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
 
     assert events[0].event_type is FinsEventType.PROGRESS
     assert events[-1].event_type is FinsEventType.RESULT
@@ -1920,7 +2017,158 @@ async def test_direct_download_missing_adapter_returns_failure_result(tmp_path: 
     assert events[-1].result.status is FinsResultStatus.FAILURE
     assert events[-1].result.exit_code == 1
     assert events[-1].result.error_message is not None
-    assert "不支持的下载来源" in events[-1].result.error_message
+    assert events[-1].result.error_message == "下载执行失败"
+    assert events[-1].result.download is not None
+    assert events[-1].result.download.discovered_count == 0
+    assert events[-1].result.failure is not None
+    assert events[-1].result.failure.safe_message == "下载执行失败"
+
+
+@pytest.mark.asyncio
+async def test_direct_download_projects_typed_provider_failure_without_raw_cause(
+    tmp_path: Path,
+) -> None:
+    """runtime 应投影 owner 分类且不读取 typed error 的敏感异常链。
+
+    Args:
+        tmp_path: runtime workspace 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure 分类、空摘要或脱敏边界漂移时抛出。
+    """
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): _ProviderFailureDownloadAdapter()},
+    )
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.error_kind is FinsErrorKind.PROVIDER
+    assert result.download is not None
+    assert result.download.discovered_count == 0
+    assert result.download.omitted_count == 0
+    assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
+    assert result.failure is not None
+    assert result.failure.transport_category is FinsDownloadTransportCategory.CONNECTION
+    serialized = str(result)
+    assert "contact-canary" not in serialized
+    assert "https://provider.invalid" not in serialized
+    assert "/Users/private" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_error_kind", "expected_failure_kind", "expected_safe_message"),
+    [
+        (
+            OSError("/Users/private/contact-canary/source.json"),
+            FinsErrorKind.STORAGE,
+            FinsPublicFailureKind.STORAGE,
+            "下载产物读写失败",
+        ),
+        (
+            RuntimeError("raw https://secret.invalid/payload contact-canary@example.invalid"),
+            FinsErrorKind.EXECUTION,
+            FinsPublicFailureKind.EXECUTION,
+            "下载执行失败",
+        ),
+    ],
+)
+async def test_direct_download_projects_storage_and_execution_without_raw_text(
+    tmp_path: Path,
+    failure: Exception,
+    expected_error_kind: FinsErrorKind,
+    expected_failure_kind: FinsPublicFailureKind,
+    expected_safe_message: str,
+) -> None:
+    """runtime 只按异常 owner 类型投影 storage/execution，不复制 raw text。"""
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={
+            ("sec", "US"): _OperationFailureDownloadAdapter(failure),
+        },
+    )
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+
+    assert result is not None
+    assert result.error_kind is expected_error_kind
+    assert result.failure is not None
+    assert result.failure.kind is expected_failure_kind
+    assert result.failure.safe_message == expected_safe_message
+    serialized = str(result)
+    assert "secret.invalid" not in serialized
+    assert "contact-canary" not in serialized
+    assert "/Users/private" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("terminal", "is_allowed"),
+    [
+        (FinsDownloadTerminalDisposition.SUCCEEDED, True),
+        (FinsDownloadTerminalDisposition.FAILED, True),
+        (FinsDownloadTerminalDisposition.CANCELLED, True),
+        (FinsDownloadTerminalDisposition.PARTIAL_FAILURE, False),
+    ],
+)
+def test_download_summary_zero_candidate_terminal_override_matrix(
+    terminal: FinsDownloadTerminalDisposition,
+    is_allowed: bool,
+) -> None:
+    """零候选只接受正常 SUCCEEDED 或显式 FAILED/CANCELLED override。"""
+
+    def build_summary() -> FinsDownloadResultSummary:
+        """用当前 terminal 构造零候选 owner summary。"""
+
+        return FinsDownloadResultSummary(
+            source=FinsDownloadSource.SEC,
+            canonical_ticker="AAPL",
+            effective_filters=FinsDownloadEffectiveFilters(
+                form_types=(),
+                start_date=None,
+                end_date=None,
+                overwrite_existing=False,
+                rebuild_local_artifacts=False,
+            ),
+            discovered_count=0,
+            downloaded_count=0,
+            skipped_count=0,
+            rejected_count=0,
+            failed_count=0,
+            document_rows=(),
+            terminal_disposition=terminal,
+            missing_periods=(),
+        )
+
+    if is_allowed:
+        summary = build_summary()
+        assert summary.terminal_disposition is terminal
+    else:
+        with pytest.raises(ValueError, match="terminal_disposition"):
+            build_summary()
+
+
+def test_terminal_derivation_asserts_impossible_mixed_failure_counts() -> None:
+    """defensive discovered_count witness 非正时必须 assert，不得静默 fallback。"""
+
+    with pytest.raises(AssertionError, match="discovered_count"):
+        download_contract._terminal_disposition_from_counts(
+            discovered_count=0,
+            downloaded_count=1,
+            rejected_count=0,
+            failed_count=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -1974,9 +2222,7 @@ async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation
         executor=_HoldingExecutor(),
         download_adapters={("sec", "US"): adapter},
     )
-    stream = ingestion.download(
-        build_fins_download_request(ticker="AAPL")
-    )
+    stream = ingestion.download(build_fins_download_request(ticker="AAPL"))
 
     first_event = await anext(stream)
     assert first_event.event_type is FinsEventType.PROGRESS
@@ -2024,11 +2270,7 @@ def test_start_download_production_adapter_boundary_emits_progress_events(
         assert request.source is FinsDownloadSource.SEC
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                written_document_ids=("aapl-production-10k",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("aapl-production-10k",)),
         )
 
     monkeypatch.setattr(SecDownloadAdapter, "download", fake_sec_download)
@@ -2053,13 +2295,9 @@ def test_start_download_failed_count_emits_completed_with_failures_progress(tmp_
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter(
-        FinsDownloadResultSummary(
-            discovered_count=2,
-            downloaded_count=1,
-            skipped_count=0,
-            rejected_count=0,
-            failed_count=1,
-            written_document_ids=("aapl-partial-10k",),
+        _typed_download_summary(
+            downloaded_ids=("aapl-partial-10k",),
+            failed_ids=("aapl-failed-10q",),
         )
     )
     executor = _HoldingExecutor()
@@ -2099,7 +2337,8 @@ def test_start_download_missing_adapter_writes_failed_terminal_record(tmp_path: 
     record = ingestion.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.FAILED
-    assert record.result_summary["failed_count"] == 1
+    assert record.result_summary["discovered_count"] == 0
+    assert record.result_summary["failed_count"] == 0
     assert "不支持的下载来源" in str(record.failure_summary["message"])
     assert "source=sec" in str(record.failure_summary["message"])
     assert "market=US" in str(record.failure_summary["message"])
@@ -2203,7 +2442,12 @@ def test_start_download_persisted_summary_adapter_receives_local_rebuild(tmp_pat
     """
 
     workspace_root = tmp_path / "fins-workspace"
-    adapter = _PersistedSummaryDownloadAdapter()
+    adapter = _PersistedSummaryDownloadAdapter(
+        _typed_download_summary(
+            skipped_ids=("aapl-existing-10k",),
+            rebuild_local_artifacts=True,
+        )
+    )
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(
         workspace_root,
@@ -2364,10 +2608,13 @@ def test_preprocess_request_round_trips_hierarchical_document_id_through_storage
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["processed_document_ids"] == [document_id]
-    assert runtime.processed_repository.get_processed_meta(
-        "AAPL",
-        document_id,
-    )["document_id"] == document_id
+    assert (
+        runtime.processed_repository.get_processed_meta(
+            "AAPL",
+            document_id,
+        )["document_id"]
+        == document_id
+    )
 
 
 def test_preprocess_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
@@ -2804,7 +3051,7 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
 def test_result_summaries_allow_slash_in_document_ids() -> None:
     """结果摘要中的 document-id 类字段应允许业务合法斜杠。"""
 
-    download_summary = FinsDownloadResultSummary(written_document_ids=("sec/aapl-2024-10ka",))
+    download_summary = _typed_download_summary(downloaded_ids=("sec/aapl-2024-10ka",))
     preprocess_summary = FinsPreprocessResultSummary(
         selected_count=1,
         processed_count=1,
@@ -3199,6 +3446,7 @@ def test_observed_producer_without_result_uses_helper_failure_message(
         normalized=normalized,
         source="fake",
         source_kind=SourceKind.FILING,
+        download_request=build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
         producer=quiet_producer,
     )
@@ -3416,8 +3664,7 @@ def test_job_event_sidecar_skips_corrupted_rows_and_append_continues(
     leaked_payload_value = "SHOULD_NOT_APPEAR_IN_WARNING"
     original_text = event_path.read_text(encoding="utf-8")
     event_path.write_text(
-        f'{original_text}{{"payload":"{leaked_payload_value}"\n'
-        f'["{leaked_payload_value}"]\n',
+        f'{original_text}{{"payload":"{leaked_payload_value}"\n["{leaked_payload_value}"]\n',
         encoding="utf-8",
     )
 
@@ -4262,9 +4509,7 @@ def test_runners_return_for_preterminalized_jobs_without_executing(
         executor=download_executor,
         download_adapters={("sec", "US"): download_adapter},
     )
-    download_start = download_ingestion.start_download(
-        build_fins_download_request(ticker="AAPL")
-    )
+    download_start = download_ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     download_ingestion.job_store.save_job(
         replace(
             download_start.record,

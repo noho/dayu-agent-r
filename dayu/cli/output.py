@@ -19,11 +19,14 @@ from dayu.cli.exit_codes import (
 )
 from dayu.cli.session_identity import display_identity_from_slot
 from dayu.fins.direct_events import (
+    FinsDownloadPublicDocument,
+    FinsDownloadPublicSummary,
     FinsEvent,
     FinsEventDetail,
     FinsEventType,
     FinsResultStatus,
     FinsResultSummary,
+    FinsPublicFailure,
 )
 from dayu.host.api import (
     HostTerminalStatus,
@@ -53,9 +56,7 @@ _LOST_FALLBACK_MESSAGE: str = "Host run lost without error message."
 _USER_CANCELLED_MESSAGE: str = "Cancelled."
 _MISSING_FINAL_ANSWER_MESSAGE: str = "Host run succeeded without final answer."
 _FINS_CANCEL_REQUESTED_MESSAGE: str = "Fins operation cancel requested."
-_FINS_LOCAL_EXIT_AFTER_CANCEL_MESSAGE: str = (
-    "Fins operation already cancelling; local process exiting."
-)
+_FINS_LOCAL_EXIT_AFTER_CANCEL_MESSAGE: str = "Fins operation already cancelling; local process exiting."
 _FINS_FAILED_FALLBACK_MESSAGE: str = "Fins operation failed."
 _FINS_EVENT_PROGRESS_PREFIX: Final[str] = "Fins progress"
 _FINS_EVENT_SUMMARY_PREFIX: Final[str] = "Fins summary"
@@ -238,7 +239,7 @@ def render_fins_direct_event(
             _fins_event_line(_FINS_EVENT_SUCCEEDED_PREFIX, event),
             file=effective_stdout,
         )
-        _print_result_details(event.result, effective_stdout)
+        _print_terminal_business_summary(event.result, effective_stdout)
         return
     if event.result.status is FinsResultStatus.CANCELLED:
         print(
@@ -255,7 +256,7 @@ def render_fins_direct_event(
         ),
         file=effective_stderr,
     )
-    _print_result_details(event.result, effective_stderr)
+    _print_terminal_business_summary(event.result, effective_stderr)
 
 
 def render_fins_direct_cancel_requested(
@@ -406,6 +407,109 @@ def _print_result_details(result: FinsResultSummary, stream: TextIO) -> None:
         print(f"{_FINS_EVENT_SUMMARY_PREFIX}: {' '.join(summary_parts)}", file=stream)
 
 
+def _print_terminal_business_summary(result: FinsResultSummary, stream: TextIO) -> None:
+    """机械投影 typed terminal 业务对象。
+
+    :param result: Fins direct 终态摘要。
+    :param stream: 输出流。
+    :returns: ``None``。
+    :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+    """
+
+    if result.download is None:
+        _print_result_details(result, stream)
+        return
+    _print_download_summary(result.download, stream)
+    if result.failure is not None:
+        _print_download_failure(result.failure, stream)
+
+
+def _print_download_summary(summary: FinsDownloadPublicSummary, stream: TextIO) -> None:
+    """输出 bounded typed 下载摘要和文档行。
+
+    :param summary: runtime 构造的 public download 真源。
+    :param stream: 输出流。
+    :returns: ``None``。
+    :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+    """
+
+    filters = summary.effective_filters
+    forms = ",".join(filters.form_types) if filters.form_types else _EMPTY_CELL
+    print(
+        (
+            f"{_FINS_EVENT_SUMMARY_PREFIX}: "
+            f"source={_bounded_json_text(summary.source.value)} "
+            f"ticker={_bounded_json_text(summary.canonical_ticker)} "
+            f"forms={_bounded_json_text(forms)} "
+            f"start={_bounded_json_text(filters.start_date or _EMPTY_CELL)} "
+            f"end={_bounded_json_text(filters.end_date or _EMPTY_CELL)} "
+            f"overwrite={str(filters.overwrite_existing).lower()} "
+            f"rebuild={str(filters.rebuild_local_artifacts).lower()} "
+            f"discovered={summary.discovered_count} "
+            f"downloaded={summary.downloaded_count} "
+            f"skipped={summary.skipped_count} "
+            f"rejected={summary.rejected_count} "
+            f"failed={summary.failed_count} "
+            f"omitted={summary.omitted_count}"
+        ),
+        file=stream,
+    )
+    for row in summary.document_rows:
+        print(_download_document_line(row), file=stream)
+    if summary.missing_periods:
+        print(
+            "Fins missing periods: " + _bounded_json_text(",".join(summary.missing_periods)),
+            file=stream,
+        )
+
+
+def _download_document_line(row: FinsDownloadPublicDocument) -> str:
+    """把 typed public document row 投影为单行文本。
+
+    :param row: runtime 已有界化的下载文档行。
+    :returns: 不读取 storage 或 raw payload 的展示行。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts = [
+        "Fins document:",
+        f"document_id={_bounded_json_text(row.document_id)}",
+        f"form_or_period={_bounded_json_text(row.form_or_period or _EMPTY_CELL)}",
+        f"filing_date={_bounded_json_text(row.filing_date or _EMPTY_CELL)}",
+        f"report_date={_bounded_json_text(row.report_date or _EMPTY_CELL)}",
+        f"disposition={_bounded_json_text(row.disposition.value)}",
+    ]
+    if row.reason_category is not None:
+        parts.append(f"reason_category={_bounded_json_text(row.reason_category)}")
+    if row.reason_message is not None:
+        parts.append(f"reason={_bounded_json_text(row.reason_message)}")
+    if row.artifact_locator is not None:
+        parts.append(f"artifact_locator={_bounded_json_text(row.artifact_locator)}")
+    return " ".join(parts)
+
+
+def _print_download_failure(failure: FinsPublicFailure, stream: TextIO) -> None:
+    """机械投影 closed typed download failure。
+
+    :param failure: runtime 构造的 public failure。
+    :param stream: 输出流。
+    :returns: ``None``。
+    :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+    """
+
+    transport = _EMPTY_CELL if failure.transport_category is None else failure.transport_category.value
+    print(
+        (
+            "Fins failure detail: "
+            f"classification={_bounded_json_text(failure.kind.value)} "
+            f"source={_bounded_json_text(failure.source.value)} "
+            f"transport={_bounded_json_text(transport)} "
+            f"retry_hint={_bounded_json_text(failure.retry_hint)}"
+        ),
+        file=stream,
+    )
+
+
 def _summary_parts(values: tuple[FinsEventDetail, ...]) -> tuple[str, ...]:
     """把 result details 转为有界 key=value 片段。
 
@@ -418,9 +522,7 @@ def _summary_parts(values: tuple[FinsEventDetail, ...]) -> tuple[str, ...]:
     for detail in values:
         if len(parts) >= _FINS_SUMMARY_MAX_ITEMS:
             break
-        parts.append(
-            f"{_safe_summary_key(detail.label)}={_bounded_json_text(detail.value)}"
-        )
+        parts.append(f"{_safe_summary_key(detail.label)}={_bounded_json_text(detail.value)}")
     return tuple(parts)
 
 
@@ -463,9 +565,7 @@ def _safe_text_value(value: str) -> str:
 
     if len(value) <= _FINS_TEXT_MAX_CHARS:
         return value
-    return value[: _FINS_TEXT_MAX_CHARS - len(_FINS_TRUNCATED_SUFFIX)] + (
-        _FINS_TRUNCATED_SUFFIX
-    )
+    return value[: _FINS_TEXT_MAX_CHARS - len(_FINS_TRUNCATED_SUFFIX)] + (_FINS_TRUNCATED_SUFFIX)
 
 
 def _failure_message_or_fallback(result: FinsResultSummary) -> str:

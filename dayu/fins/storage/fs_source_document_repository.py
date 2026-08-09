@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from dayu.documents.processors.source import Source
@@ -506,6 +506,35 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
         """
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
+
+    def get_source_document_locator(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> PurePosixPath:
+        """返回 published source 文档目录的 workspace-relative locator。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material 来源类型。
+
+        Returns:
+            storage owner 校验后的相对 POSIX locator。
+
+        Raises:
+            FileNotFoundError: published source meta 不存在时抛出。
+            ValueError: identity、source kind 或 meta 不一致时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published tree 读取失败时抛出。
+        """
+
+        return self._repository_set.core.get_source_document_locator(
+            ticker,
+            document_id,
+            source_kind,
+        )
 
     def read_source_snapshot(
         self,

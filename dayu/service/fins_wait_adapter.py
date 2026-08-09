@@ -8,6 +8,7 @@ durable row、durable store、state mutator 或 Fins storage。
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,9 +70,7 @@ from dayu.host.wait_adapter import (
     WaitResumePolicy,
 )
 
-FINS_INGESTION_WAIT_ADAPTER_KEY: Final[WaitAdapterKey] = WaitAdapterKey(
-    "poll:fins-ingestion"
-)
+FINS_INGESTION_WAIT_ADAPTER_KEY: Final[WaitAdapterKey] = WaitAdapterKey("poll:fins-ingestion")
 """Fins ingestion poll adapter 的稳定 Host adapter key。"""
 
 FINS_DOWNLOAD_AWAITING_TOOL_NAME: Final[str] = DOWNLOAD_TOOL_NAME
@@ -94,9 +93,7 @@ FINS_SUPPORTED_AWAITING_TOOL_NAMES: Final[frozenset[str]] = frozenset(
 
 _ERROR_FINS_OBSERVATION_FAILED: Final[str] = "fins_observation_failed"
 _ERROR_FINS_OBSERVATION_LOST: Final[str] = "fins_observation_lost"
-_MESSAGE_FINS_OBSERVATION_LOST: Final[str] = (
-    "Fins observation is no longer available."
-)
+_MESSAGE_FINS_OBSERVATION_LOST: Final[str] = "Fins observation is no longer available."
 _ABANDON_REASON_INVALID_OBSERVATION_HANDLE: Final[str] = "invalid_observation_handle"
 _ABANDON_REASON_OBSERVATION_MISSING: Final[str] = "observation_missing"
 _ABANDON_REASON_OBSERVATION_ERROR_PREFIX: Final[str] = "observation_error"
@@ -126,9 +123,7 @@ class FinsIngestionWaitPollAdapter:
         :raises OSError: Fins runtime 仓储初始化失败时抛出。
         """
 
-        runtime = DefaultFinsRuntime.create(
-            workspace_root=workspace_root
-        ).get_ingestion_runtime()
+        runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
         return cls(runtime=runtime)
 
     def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
@@ -144,9 +139,7 @@ class FinsIngestionWaitPollAdapter:
         if handle is None:
             return WaitPollLost(_lost_outcome())
         try:
-            observation_snapshot = _run_async_observation(
-                self.runtime.poll_observation(handle)
-            )
+            observation_snapshot = _run_async_observation(self.runtime.poll_observation(handle))
         except FinsObservationPollError as exc:
             return _poll_error_result(exc)
         return _poll_snapshot_result(snapshot.tool_name, observation_snapshot)
@@ -167,17 +160,11 @@ class FinsIngestionWaitPollAdapter:
 
         handle = _handle_from_snapshot(snapshot)
         if handle is None:
-            return WaitExternalJobLifecycleNoop(
-                reason=_ABANDON_REASON_INVALID_OBSERVATION_HANDLE
-            )
+            return WaitExternalJobLifecycleNoop(reason=_ABANDON_REASON_INVALID_OBSERVATION_HANDLE)
         try:
-            observation_snapshot = _run_async_observation(
-                self.runtime.cancel_observation(handle)
-            )
+            observation_snapshot = _run_async_observation(self.runtime.cancel_observation(handle))
             if observation_snapshot.status is FinsObservationStatus.LOST:
-                return WaitExternalJobLifecycleNoop(
-                    reason=_ABANDON_REASON_OBSERVATION_MISSING
-                )
+                return WaitExternalJobLifecycleNoop(reason=_ABANDON_REASON_OBSERVATION_MISSING)
             _run_async_observation(self.runtime.abandon_observation(handle))
             return WaitExternalJobLifecycleApplied(
                 action=WaitExternalJobLifecycleAction.ABANDON,
@@ -187,12 +174,8 @@ class FinsIngestionWaitPollAdapter:
             if exc.error_kind is FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE:
                 raise
             if exc.error_kind is FinsObservationPollErrorKind.PERMANENT_NOT_FOUND:
-                return WaitExternalJobLifecycleNoop(
-                    reason=_ABANDON_REASON_OBSERVATION_MISSING
-                )
-            return WaitExternalJobLifecycleNoop(
-                reason=_observation_error_reason(exc.error_kind)
-            )
+                return WaitExternalJobLifecycleNoop(reason=_ABANDON_REASON_OBSERVATION_MISSING)
+            return WaitExternalJobLifecycleNoop(reason=_observation_error_reason(exc.error_kind))
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,8 +224,7 @@ def build_fins_wait_adapter_registry(
 
     _require_absolute_workspace_root(workspace_root)
     bindings = tuple(
-        _binding_for_tool_name(tool_name, mode)
-        for tool_name, mode in _deterministic_tool_modes(tool_modes)
+        _binding_for_tool_name(tool_name, mode) for tool_name, mode in _deterministic_tool_modes(tool_modes)
     )
     return WaitAdapterRegistry(bindings)
 
@@ -357,9 +339,7 @@ def _deterministic_tool_modes(
     return tuple((tool_name, mode_by_name[tool_name]) for tool_name in names)
 
 
-def _binding_for_tool_name(
-    tool_name: str, mode: AwaitingResolutionMode
-) -> WaitAdapterBinding:
+def _binding_for_tool_name(tool_name: str, mode: AwaitingResolutionMode) -> WaitAdapterBinding:
     """构造单个 Fins awaiting 工具 binding。
 
     :param tool_name: 已校验的 Fins awaiting 工具名。
@@ -482,9 +462,7 @@ def _poll_snapshot_result(
     return WaitPollLost(_lost_outcome())
 
 
-def _completed_outcome(
-    tool_name: str, snapshot: FinsObservationSnapshot
-) -> ResolveWaitCompletedOutcome:
+def _completed_outcome(tool_name: str, snapshot: FinsObservationSnapshot) -> ResolveWaitCompletedOutcome:
     """把 succeeded observation 转成 Host completed resolve outcome。
 
     :param tool_name: 原等待工具名。
@@ -497,21 +475,14 @@ def _completed_outcome(
     return ResolveWaitCompletedOutcome(
         result=ToolResultSuccess(
             ok=True,
-            value={
-                "operation": snapshot.handle.operation_kind.value,
-                "status": result.status.value,
-                "title": result.title,
-                "details": _details_value(result.details),
-            },
+            value=_completed_result_value(snapshot, result),
             meta=_result_meta(tool_name, snapshot),
         ),
         payload_ref=None,
     )
 
 
-def _failed_outcome(
-    tool_name: str, snapshot: FinsObservationSnapshot
-) -> ResolveWaitFailedOutcome:
+def _failed_outcome(tool_name: str, snapshot: FinsObservationSnapshot) -> ResolveWaitFailedOutcome:
     """把 failed observation 转成 Host failed resolve outcome。
 
     :param tool_name: 原等待工具名。
@@ -526,16 +497,14 @@ def _failed_outcome(
             ok=False,
             error=_ERROR_FINS_OBSERVATION_FAILED,
             message=_failure_message(result),
-            hint=wait_failed_hint(),
+            hint=(result.failure.retry_hint if result.failure is not None else wait_failed_hint()),
             meta=_result_meta(tool_name, snapshot),
         ),
         payload_ref=None,
     )
 
 
-def _cancelled_outcome(
-    tool_name: str, snapshot: FinsObservationSnapshot
-) -> ResolveWaitCancelledOutcome:
+def _cancelled_outcome(tool_name: str, snapshot: FinsObservationSnapshot) -> ResolveWaitCancelledOutcome:
     """把 cancelled observation 转成 Host cancelled resolve outcome。
 
     :param tool_name: 原等待工具名。
@@ -593,6 +562,30 @@ def _details_value(details: tuple[FinsEventDetail, ...]) -> list[JsonValue]:
     return [{"label": detail.label, "value": detail.value} for detail in details]
 
 
+def _completed_result_value(
+    snapshot: FinsObservationSnapshot,
+    result: FinsResultSummary,
+) -> dict[str, JsonValue]:
+    """从 terminal typed object 构造 LLM-facing 成功值。
+
+    :param snapshot: terminal observation snapshot。
+    :param result: 同一 observation 的 terminal result。
+    :returns: download 使用 nested 自解释对象；其它 operation 保持业务 details。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value: dict[str, JsonValue] = {
+        "operation": snapshot.handle.operation_kind.value,
+        "status": result.status.value,
+        "title": result.title,
+    }
+    if result.download is not None:
+        value["download"] = result.download.to_json_value()
+    else:
+        value["details"] = _details_value(result.details)
+    return value
+
+
 def _failure_message(result: FinsResultSummary) -> str:
     """提取模型可读失败说明。
 
@@ -601,6 +594,21 @@ def _failure_message(result: FinsResultSummary) -> str:
     :raises ValueError: failed result 缺少业务可读失败说明时抛出。
     """
 
+    if result.failure is not None:
+        if result.download is None:
+            raise ValueError("typed download failure must contain download summary")
+        return json.dumps(
+            {
+                "operation": FinsOperationKind.DOWNLOAD.value,
+                "status": result.status.value,
+                "title": result.title,
+                "download": result.download.to_json_value(),
+                "failure": result.failure.to_json_value(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     if result.error_message is not None and result.error_message.strip() != "":
         return result.error_message.strip()
     raise ValueError("failed Fins observation result must contain error_message")

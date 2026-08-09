@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import PurePosixPath
 from typing import Optional
 
 from dayu.documents.processors.source import Source
@@ -410,6 +411,52 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         finally:
             self._release_lock_token(guard_token)
 
+    def get_source_document_locator(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> PurePosixPath:
+        """返回 published source 文档目录相对 workspace 的 typed locator。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material 来源类型。
+
+        Returns:
+            只用于定位、不承载业务身份的相对 POSIX path。
+
+        Raises:
+            FileNotFoundError: source meta 不存在时抛出。
+            ValueError: identity、source kind、meta 或相对关系非法时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published tree 读取失败时抛出。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        guard_token = self._acquire_publication_guard(external_ticker)
+        try:
+            self._get_persisted_source_meta_unguarded(
+                external_ticker,
+                external_document_id,
+                normalized_source_kind,
+            )
+            document_dir = self._source_meta_path_for_read(
+                external_ticker,
+                external_document_id,
+                normalized_source_kind,
+            ).parent
+            relative = document_dir.relative_to(self.workspace_root)
+            return PurePosixPath(*relative.parts)
+        finally:
+            self._release_lock_token(guard_token)
+
     def _get_source_meta_unguarded(
         self,
         external_ticker: str,
@@ -600,9 +647,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             state,
         )
         if not meta_path.exists():
-            raise FileNotFoundError(
-                f"document_id={document_id} 的 {normalized_source_kind.value} meta.json 不存在"
-            )
+            raise FileNotFoundError(f"document_id={document_id} 的 {normalized_source_kind.value} meta.json 不存在")
         normalized_meta = _prepare_complete_source_meta(
             meta,
             ticker=external_ticker,
@@ -797,8 +842,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 return False
             if not root.is_dir():
                 raise NotADirectoryError(
-                    "source root 不是目录: "
-                    f"ticker={external_ticker} source_kind={normalized_source_kind.value}"
+                    f"source root 不是目录: ticker={external_ticker} source_kind={normalized_source_kind.value}"
                 )
             return True
         finally:
@@ -863,14 +907,10 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             external_document_id,
         )
         if not filing_dir.exists():
-            raise FileNotFoundError(
-                "filing 目录不存在: "
-                f"ticker={external_ticker} document_id={external_document_id}"
-            )
+            raise FileNotFoundError(f"filing 目录不存在: ticker={external_ticker} document_id={external_document_id}")
         if not filing_dir.is_dir():
             raise NotADirectoryError(
-                "filing 路径不是目录: "
-                f"ticker={external_ticker} document_id={external_document_id}"
+                f"filing 路径不是目录: ticker={external_ticker} document_id={external_document_id}"
             )
         try:
             return has_xbrl_instance(filing_dir)
@@ -920,13 +960,11 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         ).parent
         if not filing_dir.exists():
             raise FileNotFoundError(
-                "staging filing 目录不存在: "
-                f"ticker={external_ticker} document_id={external_document_id}"
+                f"staging filing 目录不存在: ticker={external_ticker} document_id={external_document_id}"
             )
         if not filing_dir.is_dir():
             raise NotADirectoryError(
-                "staging filing 路径不是目录: "
-                f"ticker={external_ticker} document_id={external_document_id}"
+                f"staging filing 路径不是目录: ticker={external_ticker} document_id={external_document_id}"
             )
         try:
             return has_xbrl_instance(filing_dir)
@@ -1296,13 +1334,9 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         meta_exists = meta_path.exists()
         if is_create and meta_exists:
-            raise FileExistsError(
-                f"文档已存在: ticker={ticker} document_id={document_id}"
-            )
+            raise FileExistsError(f"文档已存在: ticker={ticker} document_id={document_id}")
         if not is_create and not meta_exists:
-            raise FileNotFoundError(
-                f"文档不存在: ticker={ticker} document_id={document_id}"
-            )
+            raise FileNotFoundError(f"文档不存在: ticker={ticker} document_id={document_id}")
 
         document_dir.mkdir(parents=True, exist_ok=True)
         previous_meta = _read_json_object(meta_path) if meta_path.exists() else {}
@@ -1411,10 +1445,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             state,
         )
         if not meta_path.exists():
-            raise FileNotFoundError(
-                "文档不存在: "
-                f"ticker={external_ticker} document_id={external_document_id}"
-            )
+            raise FileNotFoundError(f"文档不存在: ticker={external_ticker} document_id={external_document_id}")
 
         meta = _read_json_object(meta_path)
         meta["is_deleted"] = deleted

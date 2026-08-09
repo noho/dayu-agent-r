@@ -28,6 +28,11 @@ from dayu.fins.downloaders.sec_downloader import (
     StoreDownloadedFile,
 )
 from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_pipeline import (
     SecPipeline,
@@ -472,6 +477,34 @@ class CancelAwareCollectionDownloader(StreamStubDownloader):
         )
 
 
+class ProviderFailureHistoryDownloader(CancelAwareCollectionDownloader):
+    """历史 submissions 请求抛出预构造 typed provider failure 的 fake。"""
+
+    def __init__(self, failure: FinsDownloadProviderError) -> None:
+        """初始化历史文件失败 fake。
+
+        Args:
+            failure: fetch_json 应原样抛出的来源失败。
+
+        Raises:
+            无。
+        """
+
+        super().__init__()
+        self.failure = failure
+
+    async def fetch_json(
+        self,
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        """在历史 submissions owner 处原样抛出 typed failure。"""
+
+        del cancellation_checker
+        self.fetch_json_calls.append(url)
+        raise self.failure
+
+
 class _SpySourceRepository(FsSourceDocumentRepository):
     """记录 SEC source repository 调用的源文档仓储 spy。"""
 
@@ -610,9 +643,7 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     )
     import asyncio
 
-    events = asyncio.run(
-        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
     event_types = [event.event_type for event in events]
     assert event_types[0] == "pipeline_started"
     assert "company_resolved" in event_types
@@ -649,9 +680,7 @@ def test_download_stream_writes_blob_before_single_complete_source(tmp_path: Pat
     )
     import asyncio
 
-    events = asyncio.run(
-        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
     final_result = _event_pipeline_result(events[-1])
     meta = source_repository.get_source_meta("AAPL", "fil_0000000000-25-000001", SourceKind.FILING)
 
@@ -686,9 +715,7 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
     )
     import asyncio
 
-    failed_events = asyncio.run(
-        _collect_events(failing_pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    failed_events = asyncio.run(_collect_events(failing_pipeline, ticker="AAPL", start_is_explicit=False))
     failed_result = _event_pipeline_result(failed_events[-1])
     failed_handle = SourceHandle(ticker="AAPL", document_id=document_id, source_kind=SourceKind.FILING.value)
     assert failed_result["summary"]["failed"] == 1
@@ -711,9 +738,7 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
         ),
         processor_registry=build_fins_processor_registry(),
     )
-    retry_events = asyncio.run(
-        _collect_events(retry_pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    retry_events = asyncio.run(_collect_events(retry_pipeline, ticker="AAPL", start_is_explicit=False))
     retry_result = _event_pipeline_result(retry_events[-1])
     completed_meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
 
@@ -793,6 +818,41 @@ def test_download_stream_cancel_stops_during_collection_before_filing_requests(
     final_result = _event_pipeline_result(events[-1])
 
     assert final_result["status"] == "cancelled"
+    assert downloader.fetch_json_calls
+    assert downloader.list_filing_files_called is False
+
+
+def test_download_stream_historical_submissions_provider_failure_is_operation_fatal(
+    tmp_path: Path,
+) -> None:
+    """历史 submissions typed failure 必须越过 collection，不能缩减候选集。"""
+
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.TIMEOUT,
+        retryable=True,
+        safe_message="SEC 来源请求超时",
+    )
+    downloader = ProviderFailureHistoryDownloader(expected)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    import asyncio
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        asyncio.run(
+            _collect_events(
+                pipeline,
+                ticker="AAPL",
+                start_is_explicit=False,
+                cancel_checker=lambda: False,
+            )
+        )
+
+    assert exc_info.value is expected
     assert downloader.fetch_json_calls
     assert downloader.list_filing_files_called is False
 
@@ -915,13 +975,9 @@ def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path)
 
     import asyncio
 
-    first_events = asyncio.run(
-        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    first_events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
     assert _event_pipeline_result(first_events[-1])["summary"]["downloaded"] == 1
-    events = asyncio.run(
-        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
     filing_event = next(event for event in events if event.event_type == "filing_completed")
     assert filing_event.payload["skip_reason"] == "already_downloaded_complete"
     assert filing_event.payload["reason_code"] == "already_downloaded_complete"
@@ -952,9 +1008,7 @@ def test_download_stream_resolves_has_xbrl_from_complete_file_entries(tmp_path: 
 
     import asyncio
 
-    events = asyncio.run(
-        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
-    )
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
     filing_event = next(event for event in events if event.event_type == "filing_completed")
     published_meta = source_repository.get_source_meta(
         "AAPL",

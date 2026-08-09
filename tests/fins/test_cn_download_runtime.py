@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -15,7 +15,9 @@ from dayu.fins.domain.document_models import FinsSourceProvider, ProcessedCreate
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.download_contract import (
     FinsDownloadDateRange,
+    FinsDownloadProviderError,
     FinsDownloadSource,
+    FinsDownloadTransportCategory,
     build_fins_download_request,
 )
 from dayu.fins.ingestion_runtime import (
@@ -55,6 +57,66 @@ from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"1" * 2048
 _DOCLING_BYTES = b'{"document": "runtime-ok"}'
+
+
+def _cn_projection_request() -> FinsSourceDownloadAdapterRequest:
+    """构造 CN adapter projection 使用的 typed request。
+
+    Returns:
+        固定 canonical request。
+
+    Raises:
+        无。
+    """
+
+    return FinsSourceDownloadAdapterRequest(
+        normalized_ticker=NormalizedTicker(
+            canonical="600519",
+            market="CN",
+            exchange="SSE",
+            raw="600519",
+        ),
+        source=FinsDownloadSource.CNINFO,
+        form_types=("FY",),
+        date_range=FinsDownloadDateRange(None, None, False, False),
+        overwrite_existing=False,
+        rebuild_local_artifacts=False,
+        cancellation_checker=lambda: False,
+    )
+
+
+def _cn_projection_result(filings: JsonValue) -> dict[str, JsonValue]:
+    """构造带完整 effective filters 的 CN workflow 私有结果。
+
+    Args:
+        filings: 待验证的 filing payload。
+
+    Returns:
+        projection 测试输入。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "status": "ok",
+        "ticker": "600519",
+        "filters": {
+            "forms": ["FY"],
+            "start_dates": {},
+            "end_date": None,
+            "overwrite": False,
+            "rebuild": False,
+        },
+        "missing_periods": [],
+        "filings": filings,
+        "summary": {
+            "total": 999,
+            "downloaded": 999,
+            "skipped": 999,
+            "failed": 999,
+        },
+    }
 
 
 class _ImmediateExecutor(FinsIngestionExecutor):
@@ -267,26 +329,27 @@ class _RecordingPipeline(CnPipeline):
             无。
         """
 
-        del (
-            form_type,
-            start_date,
-            end_date,
-            overwrite,
-            ticker_aliases,
-            start_is_explicit,
-            cancel_checker,
-        )
+        del ticker_aliases, start_is_explicit, cancel_checker
         self.recorded_rebuild_values.append(rebuild)
+        form_values: list[JsonValue] = [] if form_type is None else [item for item in form_type.split(",")]
+        filters: dict[str, JsonValue] = {
+            "forms": form_values,
+            "start_dates": {} if start_date is None else {"requested": start_date},
+            "end_date": end_date,
+            "overwrite": overwrite,
+            "rebuild": rebuild,
+        }
         return {
             "pipeline": "cn",
             "action": "download",
             "status": "ok",
             "ticker": ticker,
             "company_info": {},
-            "filters": {},
+            "filters": filters,
             "warnings": [],
             "notes": [],
             "filings": self.result_filings,
+            "missing_periods": [],
             "summary": {
                 "total": len(self.result_filings),
                 "downloaded": len(self.result_filings),
@@ -397,13 +460,24 @@ def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Pa
     assert isinstance(written_ids, list)
     document_id = str(written_ids[0])
     source_meta = runtime.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
-    assert source_meta["source_provider"] == "cninfo"
-    assert source_meta["ingest_complete"] is True
-    assert runtime.source_repository.get_source_document_provenance(
+    locator = runtime.source_repository.get_source_document_locator(
         "600519",
         document_id,
         SourceKind.FILING,
-    ).source_provider is FinsSourceProvider.CNINFO
+    )
+    assert source_meta["source_provider"] == "cninfo"
+    assert source_meta["ingest_complete"] is True
+    assert isinstance(locator, PurePosixPath)
+    assert not locator.is_absolute()
+    assert str(tmp_path) not in locator.as_posix()
+    assert (
+        runtime.source_repository.get_source_document_provenance(
+            "600519",
+            document_id,
+            SourceKind.FILING,
+        ).source_provider
+        is FinsSourceProvider.CNINFO
+    )
 
 
 def test_start_download_hk_uses_ticker_resolved_hkexnews_adapter(tmp_path: Path) -> None:
@@ -442,11 +516,14 @@ def test_start_download_hk_uses_ticker_resolved_hkexnews_adapter(tmp_path: Path)
     source_meta = runtime.source_repository.get_source_meta("0700", document_id, SourceKind.FILING)
     assert source_meta["source_provider"] == "hkexnews"
     assert source_meta["company_id"] == "0700_HKEX"
-    assert runtime.source_repository.get_source_document_provenance(
-        "0700",
-        document_id,
-        SourceKind.FILING,
-    ).source_provider is FinsSourceProvider.HKEXNEWS
+    assert (
+        runtime.source_repository.get_source_document_provenance(
+            "0700",
+            document_id,
+            SourceKind.FILING,
+        ).source_provider
+        is FinsSourceProvider.HKEXNEWS
+    )
 
 
 def test_default_runtime_registers_cn_hk_download_adapters(tmp_path: Path) -> None:
@@ -555,6 +632,119 @@ def test_cn_adapter_routes_local_rebuild_to_existing_pipeline(tmp_path: Path) ->
     assert pipeline.recorded_rebuild_values == [True]
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FinsDownloadProviderError(
+            source=FinsDownloadSource.CNINFO,
+            transport_category=FinsDownloadTransportCategory.TIMEOUT,
+            retryable=True,
+            safe_message="巨潮来源请求超时",
+        ),
+        OSError("/Users/private/contact-canary/source.json"),
+        RuntimeError("raw execution https://secret.invalid/payload"),
+    ],
+)
+def test_cn_adapter_preserves_stream_failure_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    """generator -> stream -> collector -> adapter 不得替换异常 owner identity。"""
+
+    pipeline = _RecordingPipeline(workspace_root=tmp_path)
+
+    async def failing_stream(
+        ticker: str,
+        form_type: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        overwrite: bool = False,
+        rebuild: bool = False,
+        ticker_aliases: list[str] | None = None,
+        *,
+        start_is_explicit: bool,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[DownloadEvent]:
+        """在 workflow async generator 边界抛出预构造异常。"""
+
+        del (
+            ticker,
+            form_type,
+            start_date,
+            end_date,
+            overwrite,
+            rebuild,
+            ticker_aliases,
+            start_is_explicit,
+            cancel_checker,
+        )
+        raise failure
+        yield DownloadEvent(event_type=DownloadEventType.PIPELINE_STARTED, ticker="unused")
+
+    monkeypatch.setattr(pipeline, "download_stream", failing_stream)
+    adapter = CnDownloadAdapter(pipeline=pipeline, source=CN_DOWNLOAD_SOURCE, market="CN")
+
+    with pytest.raises(type(failure)) as exc_info:
+        adapter.download(_cn_projection_request())
+    assert exc_info.value is failure
+
+
+def test_cn_adapter_rejects_legacy_failed_terminal_without_guessing_provider(
+    tmp_path: Path,
+) -> None:
+    """legacy status=failed 必须 strict ValueError，不能猜成 provider UNKNOWN。"""
+
+    result = _cn_projection_result([])
+    result["status"] = "failed"
+
+    with pytest.raises(ValueError, match="status 未封闭"):
+        cn_pipeline_module._summary_from_pipeline_result(
+            result,
+            request=_cn_projection_request(),
+            source_repository=FsSourceDocumentRepository(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("invalid_missing_periods", [None, "FY", [""]])
+def test_cn_rebuild_projection_requires_exact_missing_periods_field(
+    tmp_path: Path,
+    invalid_missing_periods: JsonValue,
+) -> None:
+    """rebuild 也必须严格消费 producer 的 list-of-non-empty-text 字段。"""
+
+    request = FinsSourceDownloadAdapterRequest(
+        normalized_ticker=NormalizedTicker(
+            canonical="600519",
+            market="CN",
+            exchange="SSE",
+            raw="600519",
+        ),
+        source=FinsDownloadSource.CNINFO,
+        form_types=("FY",),
+        date_range=FinsDownloadDateRange(None, None, False, False),
+        overwrite_existing=False,
+        rebuild_local_artifacts=True,
+        cancellation_checker=lambda: False,
+    )
+    result = _cn_projection_result([])
+    result["status"] = "ok"
+    filters = result["filters"]
+    assert isinstance(filters, dict)
+    filters["rebuild"] = True
+    if invalid_missing_periods is None:
+        del result["missing_periods"]
+    else:
+        result["missing_periods"] = invalid_missing_periods
+
+    with pytest.raises(ValueError, match="missing_periods"):
+        cn_pipeline_module._summary_from_pipeline_result(
+            result,
+            request=request,
+            source_repository=FsSourceDocumentRepository(tmp_path),
+        )
+
+
 def test_cn_adapter_rejects_invalid_binding_and_request_identity(tmp_path: Path) -> None:
     """CN/HK adapter 必须拒绝非法装配、market 与 source 错配。
 
@@ -612,19 +802,33 @@ def test_cn_adapter_rejects_invalid_binding_and_request_identity(tmp_path: Path)
 @pytest.mark.parametrize(
     ("result", "error_pattern"),
     [
-        ({"filings": "invalid"}, "filings 字段必须是列表"),
-        ({"filings": [], "summary": {"total": []}}, "summary.total 不是整数"),
-        ({"filings": [], "summary": {"total": "invalid"}}, "summary.total 不是整数"),
-        ({"filings": [], "summary": {"total": -1}}, "summary.total 不能为负数"),
+        (_cn_projection_result("invalid"), "filings 字段必须是列表"),
+        (_cn_projection_result(["invalid"]), r"filings\[0\] 必须是对象"),
+        (
+            _cn_projection_result(
+                [
+                    {
+                        "document_id": "fil-unknown",
+                        "status": "provider_new_status",
+                        "form_type": "FY",
+                        "filing_date": "2024-08-01",
+                        "report_date": "2023-12-31",
+                    }
+                ]
+            ),
+            "status 未封闭",
+        ),
     ],
 )
 def test_cn_adapter_summary_projection_rejects_invalid_shapes(
+    tmp_path: Path,
     result: dict[str, JsonValue],
     error_pattern: str,
 ) -> None:
     """CN/HK adapter summary projection 必须拒绝非法结果 shape。
 
     Args:
+        tmp_path: source repository 使用的临时根目录。
         result: source workflow 返回的非法结果。
         error_pattern: 预期错误文本。
 
@@ -636,14 +840,18 @@ def test_cn_adapter_summary_projection_rejects_invalid_shapes(
     """
 
     with pytest.raises(ValueError, match=error_pattern):
-        cn_pipeline_module._summary_from_pipeline_result(result)
+        cn_pipeline_module._summary_from_pipeline_result(
+            result,
+            request=_cn_projection_request(),
+            source_repository=FsSourceDocumentRepository(tmp_path),
+        )
 
 
-def test_cn_adapter_empty_forms_and_non_mapping_filing_projection() -> None:
-    """空 form 与非 mapping filing 应按 adapter contract 稳定投影。
+def test_cn_adapter_summary_counts_are_derived_from_typed_rows(tmp_path: Path) -> None:
+    """adapter 必须忽略 raw summary counts 并从 typed rows 派生计数。
 
     Args:
-        无。
+        tmp_path: source repository 使用的临时根目录。
 
     Returns:
         无。
@@ -652,15 +860,27 @@ def test_cn_adapter_empty_forms_and_non_mapping_filing_projection() -> None:
         AssertionError: adapter projection 发生语义漂移时抛出。
     """
 
-    assert cn_pipeline_module._form_type_from_adapter_request(()) is None
-    assert cn_pipeline_module._summary_int({"summary": []}, "total") == 0
     summary = cn_pipeline_module._summary_from_pipeline_result(
-        {
-            "filings": ["not-a-filing"],
-            "summary": {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0},
-        }
+        _cn_projection_result(
+            [
+                {
+                    "document_id": "fil-existing",
+                    "status": "skipped",
+                    "reason_code": "already_downloaded_complete",
+                    "form_type": "FY",
+                    "filing_date": "2024-08-01",
+                    "report_date": "2023-12-31",
+                }
+            ]
+        ),
+        request=_cn_projection_request(),
+        source_repository=FsSourceDocumentRepository(tmp_path),
     )
-    assert summary.discovered_count == 0
+    assert cn_pipeline_module._form_type_from_adapter_request(()) is None
+    assert summary.discovered_count == 1
+    assert summary.skipped_count == 1
+    assert summary.downloaded_count == 0
+    assert summary.failed_count == 0
     assert summary.written_document_ids == ()
 
 
@@ -698,7 +918,14 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
 
     pipeline = _RecordingPipeline(workspace_root=tmp_path)
     document_id = "fil_cn_rebuild"
-    filing_payload: dict[str, JsonValue] = {"document_id": document_id, "status": "downloaded"}
+    filing_payload: dict[str, JsonValue] = {
+        "document_id": document_id,
+        "status": "skipped",
+        "reason_code": "already_downloaded_complete",
+        "form_type": "FY",
+        "filing_date": "2024-08-01",
+        "report_date": "2023-12-31",
+    }
     pipeline.result_filings = [filing_payload]
     setup_batch = pipeline.batching_repository.begin_batch(ticker)
     pipeline.processed_repository.create_processed(
@@ -716,9 +943,7 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
     )
     pipeline.batching_repository.commit_batch(setup_batch)
     adapter = CnDownloadAdapter(pipeline=pipeline, source=source, market=market)
-    request_source = (
-        FinsDownloadSource.CNINFO if market == "CN" else FinsDownloadSource.HKEXNEWS
-    )
+    request_source = FinsDownloadSource.CNINFO if market == "CN" else FinsDownloadSource.HKEXNEWS
 
     adapter.download(
         FinsSourceDownloadAdapterRequest(

@@ -15,7 +15,7 @@ from typing import TypeAlias, cast
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.pipelines.cn_download_company_meta import upsert_company_meta_for_cn_download
 from dayu.fins.pipelines.cn_download_filing_workflow import (
-    CnDownloadFilingError,
+    project_cn_filing_failure,
     run_cn_download_single_filing_stream,
 )
 from dayu.fins.pipelines.cn_download_models import (
@@ -107,58 +107,30 @@ async def run_cn_download_stream_impl(
                 "rebuild": True,
             },
         )
-        try:
-            rebuild_result = rebuild_cn_download_artifacts(
-                host=host,
-                ticker=normalized_ticker,
-                market=market,
-                form_type=form_type,
-                start_date=start_date,
-                end_date=end_date,
-                overwrite=overwrite,
-                pipeline_name=pipeline_name,
-                cancel_checker=cancel_checker,
-            )
-        except Exception as exc:
-            failed = _build_result(
-                pipeline_name=pipeline_name,
-                status="failed",
-                ticker=normalized_ticker,
-                reason_code=_reason_code_from_exception(exc),
-                message=str(exc),
-                filings=[],
-            )
-            yield DownloadEvent(
-                event_type=DownloadEventType.PIPELINE_COMPLETED,
-                ticker=normalized_ticker,
-                payload={"result": failed},
-            )
-            return
+        rebuild_result = rebuild_cn_download_artifacts(
+            host=host,
+            ticker=normalized_ticker,
+            market=market,
+            form_type=form_type,
+            start_date=start_date,
+            end_date=end_date,
+            overwrite=overwrite,
+            pipeline_name=pipeline_name,
+            cancel_checker=cancel_checker,
+        )
         raw_filings = rebuild_result.get("filings")
         rebuild_filings = raw_filings if isinstance(raw_filings, list) else []
         for raw_filing in rebuild_filings:
             try:
                 if _is_cancel_requested(cancel_checker):
                     break
-            except Exception as exc:
-                rebuild_result = _build_result(
-                    pipeline_name=pipeline_name,
-                    status="failed",
-                    ticker=normalized_ticker,
-                    reason_code=_reason_code_from_exception(exc),
-                    message=str(exc),
-                    filings=[],
-                )
+            except CnDownloadCancelledError:
                 break
             if not isinstance(raw_filing, dict):
                 continue
             filing_result: JsonObject = dict(raw_filing)
             status = str(filing_result.get("status", "failed"))
-            event_type = (
-                DownloadEventType.FILING_FAILED
-                if status == "failed"
-                else DownloadEventType.FILING_COMPLETED
-            )
+            event_type = DownloadEventType.FILING_FAILED if status == "failed" else DownloadEventType.FILING_COMPLETED
             document_id = str(filing_result.get("document_id", ""))
             yield DownloadEvent(
                 event_type=event_type,
@@ -308,11 +280,12 @@ async def run_cn_download_stream_impl(
                 cancelled = True
                 break
             except Exception as exc:
+                reason_code, reason_message = project_cn_filing_failure(exc)
                 failed_item = _build_candidate_failed_result(
                     ticker=normalized_ticker,
                     candidate=candidate,
-                    reason_code=_reason_code_from_exception(exc),
-                    reason_message=str(exc),
+                    reason_code=reason_code,
+                    reason_message=reason_message,
                 )
                 filings.append(failed_item)
                 _log_filing_download_result(
@@ -329,41 +302,11 @@ async def run_cn_download_stream_impl(
     except CnDownloadCancelledError:
         notes.append("cancelled")
         cancelled = True
-    except Exception as exc:
-        failed = _build_result(
-            pipeline_name=pipeline_name,
-            status="failed",
-            ticker=normalized_ticker,
-            reason_code=_reason_code_from_exception(exc),
-            message=str(exc),
-            filings=filings,
-            missing_periods=missing_periods,
-        )
-        yield DownloadEvent(
-            event_type=DownloadEventType.PIPELINE_COMPLETED,
-            ticker=normalized_ticker,
-            payload={"result": failed},
-        )
-        return
 
     try:
         final_cancelled = cancelled or _is_cancel_requested(cancel_checker)
-    except Exception as exc:
-        failed = _build_result(
-            pipeline_name=pipeline_name,
-            status="failed",
-            ticker=normalized_ticker,
-            reason_code=_reason_code_from_exception(exc),
-            message=str(exc),
-            filings=filings,
-            missing_periods=missing_periods,
-        )
-        yield DownloadEvent(
-            event_type=DownloadEventType.PIPELINE_COMPLETED,
-            ticker=normalized_ticker,
-            payload={"result": failed},
-        )
-        return
+    except CnDownloadCancelledError:
+        final_cancelled = True
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     summary = _build_summary(filings=filings, elapsed_ms=elapsed_ms)
@@ -421,17 +364,12 @@ def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
 
     Raises:
         CnDownloadCancelledError: ``cancel_checker`` 主动抛出取消异常时原样传播。
-        RuntimeError: ``cancel_checker`` 自身失败时抛出。
+        Exception: provider、storage 或 execution 异常原样传播。
     """
 
     if cancel_checker is None:
         return False
-    try:
-        return cancel_checker()
-    except Exception as exc:
-        if isinstance(exc, CnDownloadCancelledError):
-            raise
-        raise RuntimeError(f"取消检查失败: {exc}") from exc
+    return cancel_checker()
 
 
 def _raise_if_cancelled(
@@ -770,7 +708,8 @@ def _build_result(
         "notes": note_values,
         "filings": filing_values,
         "missing_periods": list(missing_periods),
-        "summary": summary or {
+        "summary": summary
+        or {
             "total": 0,
             "downloaded": 0,
             "skipped": 0,
@@ -804,14 +743,6 @@ def _candidate_document_id(ticker: str, candidate: CnReportCandidate) -> str:
         amended=candidate.amended,
     )
     return document_id
-
-
-def _reason_code_from_exception(exc: Exception) -> str:
-    """把异常映射为稳定 reason code。"""
-
-    if isinstance(exc, CnDownloadFilingError):
-        return "filing_download_failed"
-    return "cn_download_failed"
 
 
 __all__ = ["run_cn_download_stream_impl"]

@@ -15,6 +15,7 @@ from typing import cast
 
 from dayu.fins.domain.document_models import BatchToken, SourceHandle
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import FinsDownloadProviderError
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
     CN_PIPELINE_DOWNLOAD_VERSION,
@@ -53,6 +54,26 @@ _SOURCE_LABEL_DOCLING = "docling"
 
 class CnDownloadFilingError(RuntimeError):
     """CN/HK 单 filing 下载失败。"""
+
+
+def project_cn_filing_failure(error: Exception) -> tuple[str, str]:
+    """把 CN/HK 单 filing 异常投影为封闭原因与安全说明。
+
+    Args:
+        error: 单 filing 阶段抛出的异常。
+
+    Returns:
+        稳定原因码与不含 URL、raw exception 或绝对路径的安全说明。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, FinsDownloadProviderError):
+        return f"provider_{error.transport_category.value}", error.safe_message
+    if isinstance(error, OSError):
+        return "storage_failed", "下载产物读写失败"
+    return "filing_execution_failed", "财报文档执行失败"
 
 
 def _download_report_pdf_with_gate(
@@ -182,6 +203,7 @@ async def run_cn_download_single_filing_stream(
     except CnDownloadCancelledError:
         raise
     except Exception as exc:
+        reason_code, reason_message = project_cn_filing_failure(exc)
         yield DownloadEvent(
             event_type=DownloadEventType.FILE_FAILED,
             ticker=ticker,
@@ -190,16 +212,16 @@ async def run_cn_download_single_filing_stream(
                 "name": pdf_filename,
                 "stage": "pdf_download_failed",
                 "status": "failed",
-                "reason_code": "pdf_download_failed",
-                "reason_message": str(exc),
+                "reason_code": reason_code,
+                "reason_message": reason_message,
             },
         )
         failed = _build_filing_result(
             document_id=document_id,
             status="failed",
             candidate=candidate,
-            reason_code="pdf_download_failed",
-            reason_message=str(exc),
+            reason_code=reason_code,
+            reason_message=reason_message,
             downloaded_files=0,
             skipped_files=0,
         )
@@ -314,12 +336,13 @@ async def run_cn_download_single_filing_stream(
         except CnDownloadCancelledError:
             raise
         except Exception as exc:
+            reason_code, reason_message = project_cn_filing_failure(exc)
             failed = _build_filing_result(
                 document_id=document_id,
                 status="failed",
                 candidate=candidate,
-                reason_code="docling_convert_failed",
-                reason_message=str(exc),
+                reason_code=reason_code,
+                reason_message=reason_message,
                 downloaded_files=1,
                 skipped_files=0,
             )
@@ -673,10 +696,7 @@ def _rollback_cn_batch_preserving_primary(
         batching_repository.rollback_batch(token)
     except Exception as rollback_error:
         if operation_error is not None:
-            operation_error.add_note(
-                "rollback_batch failed; recovery evidence retained: "
-                f"{rollback_error}"
-            )
+            operation_error.add_note(f"rollback_batch failed; recovery evidence retained: {rollback_error}")
             raise operation_error from rollback_error
         raise
 
@@ -944,5 +964,6 @@ def _raise_if_cancelled(
 
 __all__ = [
     "CnDownloadFilingError",
+    "project_cn_filing_failure",
     "run_cn_download_single_filing_stream",
 ]
